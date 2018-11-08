@@ -179,8 +179,8 @@ retry_next:
 		return;
         }
 
-		reader->zstream.next_in = (Byte *)reader->in;
-		reader->zstream.avail_in = hasRead;
+	reader->zstream.next_in = (Byte *)reader->in;
+	reader->zstream.avail_in = hasRead;
 	} 
 	else
 	{
