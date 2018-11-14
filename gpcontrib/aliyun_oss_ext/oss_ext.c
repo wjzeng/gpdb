@@ -12,10 +12,10 @@
 #include "utils/guc.h"
 #include "utils/memutils.h"
 #include <inttypes.h>
+#include "cdb/cdbvars.h"
+#include "utils/resowner.h"
 
 #include "ossapi.h"
-#include "cdb/cdbvars.h"
-
 #include "decompress_reader.h"
 #include "compress_writer.h"
 
@@ -42,6 +42,7 @@ static char *find_delimiter(const char *url_with_options);
 static char *get_opt_oss(const char *url, const char *key);
 static ext_oss_t *parse_oss_protocol(Relation rel, char *url, bool is_export);
 static void free_data(ext_oss_t *myData);
+static void oss_ext_abort_callback(ResourceReleasePhase phase, bool isCommit, bool isTopLevel, void *arg);
 
 /* Do the module magic dance */
 PG_MODULE_MAGIC; 
@@ -49,10 +50,28 @@ PG_FUNCTION_INFO_V1(oss_import);
 PG_FUNCTION_INFO_V1(oss_export);
 PG_FUNCTION_INFO_V1(oss_validate_urls);
 
-
 Datum		oss_import(PG_FUNCTION_ARGS);
 Datum		oss_export(PG_FUNCTION_ARGS);
 Datum		oss_validate_urls(PG_FUNCTION_ARGS);
+
+static bool is_oss_ext_callback_registered = false;
+static ext_oss_t	*curr_mydata = NULL;
+
+static void
+oss_ext_abort_callback(ResourceReleasePhase phase, bool isCommit, bool isTopLevel, void *arg)
+{
+	ext_oss_t  *myData;
+
+	if (phase != RESOURCE_RELEASE_AFTER_LOCKS)
+		return;
+
+	myData = curr_mydata;
+	if (myData)
+	{
+		free_data(myData);
+		curr_mydata = NULL;
+	}
+}
 
 /*
  * Import data into GPDB.
@@ -78,8 +97,10 @@ oss_import(PG_FUNCTION_ARGS)
 		if (myData)
 		{
 			free_data(myData);
+			curr_mydata = NULL;
 		}
 
+		EXTPROTOCOL_SET_USER_CTX(fcinfo, NULL);
 		PG_RETURN_INT32(0);
 	}
 
@@ -92,6 +113,12 @@ oss_import(PG_FUNCTION_ARGS)
 		{
 			oss_env_init();
 			init_env = true;
+		}
+
+		if (is_oss_ext_callback_registered == false)
+		{
+			RegisterResourceReleaseCallback(oss_ext_abort_callback, NULL);
+			is_oss_ext_callback_registered = true;
 		}
 
 		myData = parse_oss_protocol(rel, url_with_options, false);
@@ -115,6 +142,8 @@ oss_import(PG_FUNCTION_ARGS)
 			CreateOssSource(myData);
 		}
 
+		Assert(curr_mydata == NULL);
+		curr_mydata = myData;
 		EXTPROTOCOL_SET_USER_CTX(fcinfo, myData);
 	}
 
@@ -633,12 +662,14 @@ oss_export(PG_FUNCTION_ARGS)
 	myData = (ext_oss_t *) EXTPROTOCOL_GET_USER_CTX(fcinfo);
 
 	if(EXTPROTOCOL_IS_LAST_CALL(fcinfo))
-	{	
+	{
 		if (myData)
 		{
 			free_data(myData);
+			curr_mydata = NULL;
 		}
 
+		EXTPROTOCOL_SET_USER_CTX(fcinfo, NULL);
 		PG_RETURN_INT32(0);
 	}	
 
@@ -652,6 +683,12 @@ oss_export(PG_FUNCTION_ARGS)
 		{
 			oss_env_init();
 			init_env = true;
+		}
+
+		if (is_oss_ext_callback_registered == false)
+		{
+			RegisterResourceReleaseCallback(oss_ext_abort_callback, NULL);
+			is_oss_ext_callback_registered = true;
 		}
 
 		myData = parse_oss_protocol(rel, url_with_options, true);
@@ -684,6 +721,8 @@ oss_export(PG_FUNCTION_ARGS)
 			}
 		}
 
+		Assert(curr_mydata == NULL);
+		curr_mydata = myData;
 		EXTPROTOCOL_SET_USER_CTX(fcinfo, myData);
 	}
 
