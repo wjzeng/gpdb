@@ -1305,27 +1305,24 @@ extract_nodes_walker(Node *node, extract_context *context)
 		SubPlan	   *subplan = (SubPlan *) node;
 
 		/*
-		 * SubPlan has both of expressions and subquery.
-		 * In case the caller wants non-subquery version,
-		 * still we need to walk through its expressions.
+		 * SubPlan has both of expressions and subquery.  In case the caller wants
+		 * non-subquery version, still we need to walk through its expressions.
+		 * NB: Since we're not going to descend into SUBPLANs anyway (see below),
+		 * look at the SUBPLAN node here, even if descendIntoSubqueries is false
+		 * lest we miss some nodes there.
 		 */
-		if (!context->descendIntoSubqueries)
-		{
-			if (extract_nodes_walker((Node *) subplan->testexpr,
-									 context))
-				return true;
-			if (expression_tree_walker((Node *) subplan->args,
-									   extract_nodes_walker, context))
-				return true;
+		if (extract_nodes_walker((Node *) subplan->testexpr,
+								 context))
+			return true;
+		if (expression_tree_walker((Node *) subplan->args,
+								   extract_nodes_walker, context))
+			return true;
 
-			/* Do not descend into subplans */
-			return false;
-		}
 		/*
-		 * Although the flag indicates the caller wants to
-		 * descend into subqueries, SubPlan seems special;
-		 * Some partitioning code assumes this should return
-		 * immediately without descending.  See MPP-17168.
+		 * Do not descend into subplans.
+		 * Even if descendIntoSubqueries indicates the caller wants to descend into
+		 * subqueries, SubPlan seems special; Some partitioning code assumes this
+		 * should return immediately without descending.  See MPP-17168.
 		 */
 		return false;
 	}
@@ -1452,6 +1449,61 @@ find_nodes_walker(Node *node, find_nodes_context *context)
 	}
 
 	return expression_tree_walker(node, find_nodes_walker, (void *) context);
+}
+
+typedef struct find_nested_nodes_context
+{
+	NodeTag nodeTag;
+	Node * parentNode;
+	bool foundNestedNode;
+} find_nested_nodes_context;
+
+static bool find_nested_nodes_walker(Node *node, find_nested_nodes_context *context);
+
+bool find_nested_nodes(Node *node, NodeTag nodeTag)
+{
+	find_nested_nodes_context context;
+	Assert(NULL != node);
+	context.nodeTag = nodeTag;
+	context.parentNode = NULL;
+	context.foundNestedNode = false;
+	find_nested_nodes_walker(node, &context);
+
+	return context.foundNestedNode;
+}
+
+static bool
+find_nested_nodes_walker(Node *node, find_nested_nodes_context *context)
+{
+	if (NULL == node)
+	{
+		return false;
+	}
+
+	bool result = false;
+
+	if (nodeTag(node) == context->nodeTag)
+	{
+		if (context->parentNode == NULL)
+		{
+			context->parentNode = node;
+			// found one node, now see whether we see a second one below it
+			result = expression_tree_walker(node, find_nested_nodes_walker, (void *) context);
+			context->parentNode = NULL;
+		}
+		else
+		{
+			// both context->parentNode and node have the same type, this
+			// is the pattern we are looking for
+			context->foundNestedNode = true;
+			result = true;
+		}
+	}
+	else
+	{
+		result = expression_tree_walker(node, find_nested_nodes_walker, (void *) context);
+	}
+	return result;
 }
 
 /*

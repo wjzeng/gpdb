@@ -4,6 +4,7 @@
 #include "cmockery.h"
 #include "postgres.h"
 
+#include "cdb/cdbtm.h"
 #include "../cdbtm.c"
 
 #define SIZE_OF_IN_PROGRESS_ARRAY (10 * sizeof(DistributedTransactionId))
@@ -32,6 +33,49 @@ void setup(TmControlBlock *controlBlock, TMGXACT *gxact_array)
 }
 
 void
+test_canSuperuserPerformRecovery_when_no_login_expiration_date_exists(void **state)
+{
+  bool hasExpirationDate;
+  Datum expirationDate;
+
+  hasExpirationDate = false;
+  
+  bool result = canSuperuserPerformRecovery(hasExpirationDate, expirationDate);
+
+  assert_true(result);
+}
+
+void
+test_canSuperuserPerformRecovery_when_login_has_not_expired(void **state)
+{
+  bool hasExpirationDate;
+  Datum expirationDate;
+
+  hasExpirationDate = true;
+  
+  Datum jan1st2100 = TimestampGetDatum(4102444800000000);
+  
+  bool result = canSuperuserPerformRecovery(hasExpirationDate, jan1st2100);
+
+  assert_true(result);
+}
+
+void
+test_canSuperuserPerformRecovery_when_login_has_expired(void **state)
+{
+  bool hasExpirationDate;
+  Datum expirationDate;
+
+  hasExpirationDate = true;
+  
+  Datum aMillisecondAgo = TimestampGetDatum(GetCurrentTimestamp() - 1);
+  
+  bool result = canSuperuserPerformRecovery(hasExpirationDate, aMillisecondAgo);
+
+  assert_false(result);
+}
+
+void
 test__createDtxSnapshot(void **state)
 {
 	TMGXACT gxact_array[5];
@@ -54,6 +98,10 @@ test__createDtxSnapshot(void **state)
 	will_be_called_count(LWLockAcquire, -1);
 	expect_value_count(LWLockRelease, lockid, shmControlLock, -1);
 	will_be_called_count(LWLockRelease, -1);
+#ifdef USE_ASSERT_CHECKING
+	expect_value_count(LWLockHeldByMe, lockid, shmControlLock, -1);
+	will_return_count(LWLockHeldByMe, true, -1);
+#endif
 
 	/* This is going to act as our gxact */
 	shmGxactArray[0]->gxid = 20;
@@ -141,7 +189,10 @@ main(int argc, char* argv[])
 
 	const UnitTest tests[] =
 	{
-		unit_test(test__createDtxSnapshot)
+	  unit_test(test__createDtxSnapshot),
+	  unit_test(test_canSuperuserPerformRecovery_when_no_login_expiration_date_exists),
+	  unit_test(test_canSuperuserPerformRecovery_when_login_has_not_expired),
+	  unit_test(test_canSuperuserPerformRecovery_when_login_has_expired)
 	};
 
 	MemoryContextInit();

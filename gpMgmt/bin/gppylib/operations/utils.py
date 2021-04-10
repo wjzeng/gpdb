@@ -35,10 +35,11 @@ class RemoteOperation(Operation):
        reside in the __main__ module as opposed to gppylib.test_something. Again, this can be circumvented by invoking unit tests
        through PyUnit or python -m unittest, etc. 
     """
-    def __init__(self, operation, host):
+    def __init__(self, operation, host, msg_ctx=""):
         super(RemoteOperation, self).__init__()
         self.operation = operation
         self.host = host
+        self.msg_ctx = msg_ctx
     def execute(self):
         execname = os.path.split(sys.argv[0])[-1]
         pickled_execname = pickle.dumps(execname) 
@@ -46,7 +47,12 @@ class RemoteOperation(Operation):
         cmd = Command('pickling an operation', '$GPHOME/sbin/gpoperation.py',
                       ctxt=REMOTE, remoteHost=self.host, stdin = pickled_execname + pickled_operation)
         cmd.run(validateAfter=True)
-        logger.debug(cmd.get_results().stdout)
+        msg = "on host %s: %s" % (self.host, cmd.get_results().stdout)
+        if self.msg_ctx:
+            msg = "Output for %s %s" % (self.msg_ctx, msg)
+        else:
+            msg = "Output %s" %(msg)
+        logger.debug(msg)
         ret = self.operation.ret = pickle.loads(cmd.get_results().stdout)
         if isinstance(ret, Exception):
             raise ret

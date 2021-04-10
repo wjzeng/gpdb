@@ -868,6 +868,8 @@ _equalQuery(Query *a, Query *b)
 	if (!GpPolicyEqual(a->intoPolicy, b->intoPolicy))
 		return false;
 
+	COMPARE_SCALAR_FIELD(isCopy);
+
 	return true;
 }
 
@@ -1133,6 +1135,7 @@ _equalSingleRowErrorDesc(SingleRowErrorDesc *a, SingleRowErrorDesc *b)
 	COMPARE_SCALAR_FIELD(rejectlimit);
 	COMPARE_SCALAR_FIELD(is_limit_in_rows);
 	COMPARE_SCALAR_FIELD(into_file);
+	COMPARE_SCALAR_FIELD(log_errors_type);
 
 	return true;
 }

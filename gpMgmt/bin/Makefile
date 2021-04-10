@@ -58,13 +58,13 @@ PYGRESQL_DIR=PyGreSQL-$(PYGRESQL_VERSION)
 
 pygresql:
 	@echo "--- PyGreSQL"
-	. $(prefix)/greenplum_path.sh && unset PYTHONHOME && \
+	PATH=$(bindir):$$PATH && \
 	if [ `uname -s` = 'HP-UX' ]; then \
 	    cd $(PYLIB_SRC)/$(PYGRESQL_DIR) && DESTDIR="$(DESTDIR)" CC="$(CC)" LDFLAGS="-L../../../../gpAux/ext/hpux_ia64/python-2.5.6/lib" python setup.py build; \
 	elif [ "$(BLD_ARCH)" = 'aix7_ppc_64' ]; then \
 	    cd $(PYLIB_SRC)/$(PYGRESQL_DIR) && DESTDIR="$(DESTDIR)" CC="$(CC)" python_64 setup.py build; \
 	else \
-	    cd $(PYLIB_SRC)/$(PYGRESQL_DIR) && DESTDIR="$(DESTDIR)" CC="$(CC)" python setup.py build; \
+	    cd $(PYLIB_SRC)/$(PYGRESQL_DIR) && DESTDIR="$(DESTDIR)" CC="$(CC)" LDFLAGS='$(LDFLAGS) $(PYGRESQL_LDFLAGS)' python setup.py build; \
 	fi
 	mkdir -p $(PYLIB_DIR)/pygresql
 	if [ `uname -s` = 'Darwin' ]; then \
@@ -122,6 +122,7 @@ subprocess32:
 	@if [ `uname -s` = 'Linux' ]; then \
 		  cd $(PYLIB_SRC)/subprocess32 && CC="$(CC)" python setup.py build; \
 		  cp -f $(PYLIB_SRC)/subprocess32/build/lib.*/* $(PYLIB_DIR)/;  \
+		  cp -f $(PYLIB_SRC)/subprocess32/ChangeLog $(PYLIB_DIR)/subprocess32-ChangeLog;  \
 	  fi
 
 #
@@ -211,7 +212,7 @@ pylint:
 $(MOCK_BIN):
 	@echo "--- mock for platform $(UBUNTU_PLATFORM)"
 	@if [ $(UBUNTU_PLATFORM) = "Ubuntu" ]; then\
-       pip install mock;\
+       pip install mock==1.0.1;\
      else\
        mkdir -p $(PYTHONSRC_INSTALL_SITE) && \
 	   cd $(PYLIB_SRC_EXT)/ && $(TAR) xzf $(MOCK_DIR).tar.gz && \
@@ -272,8 +273,14 @@ solarisTest:
 		echo "SOLARIS" ; \
 	fi
 
+
+.PHONY: installcheck-bash
+installcheck-bash:
+	./test-generate-greenplum-path.bash
+	./test/suite.bash
+
 .PHONY: installcheck
-installcheck:
+installcheck: installcheck-bash
 	$(MAKE) -C gpload_test $@
 
 clean distclean:

@@ -1510,6 +1510,36 @@ drop table if exists s1;
 drop table if exists s2;
 -- end_ignore
 
+-- the following case is to test when we have a template
+-- we can correct add new subpartition with relation options.
+create table test_part_relops_tmpl (id int,  p1 text, p2 text, count int)
+distributed by (id)
+partition by list (p1)
+subpartition by list (p2)
+(
+  partition m1 values ('m1')
+  (subpartition l1 values ('l1'),
+   subpartition l2 values ('l2')),
+  partition m2 values ('m2')
+  (subpartition l1 values ('l1'),
+   subpartition l2 values ('l2'))
+);
+
+alter table test_part_relops_tmpl
+set subpartition template
+(
+   subpartition l1 values('l1')
+);
+
+-- previously, we do wrong in the function of `add_partition_rule`
+-- which invokes `transformRelOptions`, and transformRelOptions
+-- may return NULL in some cases. For example, the invokation of
+-- transformRelOptions in add_partition_rule set ignoreOids = true,
+-- so the following statement creates such senario by passing oids options,
+-- then transformRelOptions return NULL and we should correctly handle
+-- null pointers.
+alter table test_part_relops_tmpl alter partition for ('m1') add partition l3 values ('l3')
+with (oids=false);
 
 create table mpp_2914A(id int,  buyDate date, kind char(1))
 DISTRIBUTED BY (id)
@@ -1931,19 +1961,27 @@ select dat, count(*) from mpp7863 group by 1 order by 2,1;
 -- Test that pg_get_expr() can be used on the pg_partition_rule columns that
 -- store expressions, even by non-superusers. pg_get_expr() is restricted
 -- to specific system catalogs, for security reasons.
+--
+-- While we're at it, also test the same for pg_class.proargdefaults column,
+-- even though that's got nothing to do with partitions. We originally missed
+-- allowing that in the GPDB 5 release, because GPDB 5 is based on PostgreSQL
+-- 8.4, but function defaults was backported 9.0.
 create role part_expr_role;
 
 CREATE TABLE part_expr_test_range (id int) DISTRIBUTED BY (id)
 PARTITION BY RANGE(id) (START (1::int) END (10::int) EVERY (5));
 CREATE TABLE part_expr_test_list (id int) DISTRIBUTED BY (id)
 PARTITION BY list(id) (partition p1 values(1, 2, 3));
+CREATE FUNCTION dfunc_expr_test(a int = 1, int = 2) RETURNS int
+AS $$ select $1 + $2; $$
+LANGUAGE SQL;
 
 set session authorization part_expr_role;
 
 -- This should throw a "not allowed" error.
 select pg_get_expr('bogus', 'pg_class'::regclass);
 
--- But this should
+-- But these should work.
 select p.parrelid::regclass, pr.parchildrelid::regclass,
        pg_get_expr(parrangestart, pr.parchildrelid),
        pg_get_expr(parrangeend, pr.parchildrelid),
@@ -1953,8 +1991,52 @@ from pg_partition_rule pr, pg_partition p
 where pr.paroid = p.oid
 and p.parrelid in ('part_expr_test_range'::regclass, 'part_expr_test_list'::regclass);
 
+select pg_get_expr(proargdefaults, 'pg_class'::regclass) from pg_proc pr
+where oid = 'dfunc_expr_test'::regproc;
+
 reset session authorization;
 
 DROP TABLE part_expr_test_range;
 DROP TABLE part_expr_test_list;
+DROP FUNCTION dfunc_expr_test(int, int);
 DROP ROLE part_expr_role;
+
+--
+-- Test handling of dropped columns in SPLIT PARTITION. (PR #9386)
+--
+DROP TABLE IF EXISTS users_test;
+
+CREATE TABLE users_test
+(
+  id          INT,
+  dd          TEXT,
+  user_name   VARCHAR(40),
+  user_email  VARCHAR(60),
+  born_time   TIMESTAMP,
+  create_time TIMESTAMP
+)
+DISTRIBUTED BY (id)
+PARTITION BY RANGE (create_time)
+(
+  PARTITION p2019 START ('2019-01-01'::TIMESTAMP) END ('2020-01-01'::TIMESTAMP),
+  DEFAULT PARTITION extra
+);
+
+-- Drop useless column dd for some reason
+ALTER TABLE users_test DROP COLUMN dd;
+
+-- Assume we forgot/failed to split out new partitions beforehand
+INSERT INTO users_test VALUES(1, 'A', 'A@abc.com', '1970-01-01', '2019-01-01 12:00:00');
+INSERT INTO users_test VALUES(2, 'B', 'B@abc.com', '1980-01-01', '2020-01-01 12:00:00');
+INSERT INTO users_test VALUES(3, 'C', 'C@abc.com', '1990-01-01', '2021-01-01 12:00:00');
+
+-- New partition arrives late
+ALTER TABLE users_test SPLIT DEFAULT PARTITION START ('2020-01-01'::TIMESTAMP) END ('2021-01-01'::TIMESTAMP)
+ INTO (PARTITION p2020, DEFAULT PARTITION);
+
+-- Expect A
+SELECT user_name FROM users_test_1_prt_p2019;
+-- Expect B
+SELECT user_name FROM users_test_1_prt_p2020;
+-- Expect C
+SELECT user_name FROM users_test_1_prt_extra;

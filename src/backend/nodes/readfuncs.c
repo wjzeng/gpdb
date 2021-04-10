@@ -409,6 +409,7 @@ _readSingleRowErrorDesc(void)
 	READ_INT_FIELD(rejectlimit);
 	READ_BOOL_FIELD(is_limit_in_rows);
 	READ_BOOL_FIELD(into_file);
+	READ_ENUM_FIELD(log_errors_type, LogErrorsType);
 
 	READ_DONE();
 }
@@ -649,6 +650,20 @@ _readIntoClause(void)
 	READ_NODE_FIELD(options);
 	READ_ENUM_FIELD(onCommit, OnCommitAction);
 	READ_STRING_FIELD(tableSpaceName);
+
+	READ_DONE();
+}
+
+static CopyIntoClause *
+_readCopyIntoClause(void)
+{
+	READ_LOCALS(CopyIntoClause);
+
+	READ_NODE_FIELD(attlist);
+	READ_BOOL_FIELD(is_program);
+	READ_STRING_FIELD(filename);
+	READ_NODE_FIELD(options);
+	READ_NODE_FIELD(ao_segnos);
 
 	READ_DONE();
 }
@@ -2893,6 +2908,8 @@ parseNodeString(void)
 		return_value = _readRangeVar();
 	else if (MATCH("INTOCLAUSE", 10))
 		return_value = _readIntoClause();
+	else if (MATCH("COPYINTOCLAUSE", 10))
+		return_value = _readCopyIntoClause();
 	else if (MATCH("VAR", 3))
 		return_value = _readVar();
 	else if (MATCH("CONST", 5))

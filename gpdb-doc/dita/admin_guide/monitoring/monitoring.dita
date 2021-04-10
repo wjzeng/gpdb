@@ -537,7 +537,10 @@ WHERE logseverity in ('FATAL', 'ERROR')
                                     <entry>Vacuum, reindex, and analyze system catalogs to maintain
                                         an efficient catalog.<p>Recommended frequency: weekly, or
                                             more often if database objects are created and dropped
-                                            frequently</p></entry>
+                                            frequently</p><note>Starting in Greenplum 5.x,
+                                                <codeph>VACUUM</codeph> is supported with persistent
+                                            table system catalogs, and is required to manage free
+                                            space.</note></entry>
                                     <entry>
                                         <ol id="ol_frs_nlh_rp">
                                             <li><codeph>VACUUM</codeph> the system tables in each

@@ -19,7 +19,10 @@ import tempfile
 import thread
 import json
 import csv
-import subprocess
+try:
+    import subprocess32 as subprocess
+except:
+    import subprocess
 import commands
 import signal
 from collections import defaultdict
@@ -742,6 +745,9 @@ def impl(context, command, out_msg):
 def impl(context, command, out_msg):
     check_string_not_present_stdout(context, out_msg)
 
+@then('{command} should not print "{err_msg}" error message')
+def impl(context, command, err_msg):
+    check_string_not_present_stderr(context, err_msg)
 
 @then('{command} should print "{out_msg}" to stdout {num} times')
 def impl(context, command, out_msg, num):
@@ -1487,6 +1493,9 @@ def verify_file_contents(context, file_type, file_dir, text_find, should_contain
     if not hasattr(context, "dump_prefix"):
         context.dump_prefix = ''
 
+    file_dir = get_dump_dir(context, file_dir)
+    subdirectory = context.backup_timestamp[0:8]
+
     if file_type == 'pg_dump_log':
         fn = 'pg_dump_log'
         context.backup_timestamp = '0'
@@ -1504,12 +1513,17 @@ def verify_file_contents(context, file_type, file_dir, text_find, should_contain
         fn = '%sgp_cdatabase_*_1_%s' % (context.dump_prefix, context.backup_timestamp)
     elif file_type == 'dump':
         fn = '%sgp_dump_*_1_%s.gz' % (context.dump_prefix, context.backup_timestamp)
+    elif file_type == 'restore_status':
+        fn = '%sgp_restore_status_*_1_%s' % (context.dump_prefix, context.backup_timestamp)
+        file_dir = master_data_dir
+    elif file_type == 'restore_report':
+        fn = '%sgp_restore_%s.rpt' % (context.dump_prefix, context.backup_timestamp)
+        file_dir = master_data_dir
 
-    file_dir = get_dump_dir(context, file_dir)
-    subdirectory = context.backup_timestamp[0:8]
-
-    if file_type == 'pg_dump_log':
+    if file_type == 'pg_dump_log' or file_type == 'restore_report':
         full_path = os.path.join(file_dir, fn)
+    elif file_type == 'restore_status':
+        full_path = glob.glob(os.path.join(file_dir, fn))[0]
     else:
         full_path = glob.glob(os.path.join(file_dir, subdirectory, fn))[0]
 
@@ -1529,7 +1543,6 @@ def verify_file_contents(context, file_type, file_dir, text_find, should_contain
         raise Exception("Did not find '%s' in file %s" % (text_find, full_path))
     elif not should_contain and text_find in contents:
         raise Exception("Found '%s' in file '%s'" % (text_find, full_path))
-
 
 @then('verify that the "{file_type}" file in "{file_dir}" dir contains "{text_find}"')
 def impl(context, file_type, file_dir, text_find):
@@ -4222,6 +4235,7 @@ def impl(context):
         context.standby_host = standby
         run_gpcommand(context, 'gpinitstandby -ra')
 
+@given('the catalog has a standby master entry')
 @then('verify the standby master entries in catalog')
 def impl(context):
 	check_segment_config_query = "SELECT * FROM gp_segment_configuration WHERE content = -1 AND role = 'm'"
@@ -4235,6 +4249,8 @@ def impl(context):
 
 	if len(statrep) != 1:
 		raise Exception("pg_stat_replication did not have standby master")
+
+	context.standby_dbid = segconfig[0][0]
 
 @when('user can "{can_ssh}" ssh locally on standby')
 @then('user can "{can_ssh}" ssh locally on standby')
@@ -4747,6 +4763,7 @@ def impl(context, filename):
 
 
 @then('an attribute of table "{table}" in database "{dbname}" is deleted on segment with content id "{segid}"')
+@when('an attribute of table "{table}" in database "{dbname}" is deleted on segment with content id "{segid}"')
 def impl(context, table, dbname, segid):
     local_cmd = 'psql %s -t -c "SELECT port,hostname FROM gp_segment_configuration WHERE content=%s and role=\'p\';"' % (
     dbname, segid)
@@ -5451,6 +5468,19 @@ def impl(context, gppkg_name):
             raise Exception( '"%s" gppkg is not installed on host: %s. \nInstalled packages: %s' % (gppkg_name, hostname, cmd.get_stdout()))
 
 
+@given('the user runs command "{command}" on all hosts without validation')
+@when('the user runs command "{command}" on all hosts without validation')
+@then('the user runs command "{command}" on all hosts without validation')
+def impl(context, command):
+    hostlist = get_all_hostnames_as_list(context, 'template1')
+
+    for hostname in set(hostlist):
+        cmd = Command(name='running command:%s' % command,
+                      cmdStr=command,
+                      ctxt=REMOTE,
+                      remoteHost=hostname)
+        cmd.run(validateAfter=False)
+
 @given('"{gppkg_name}" gppkg files do not exist on any hosts')
 @when('"{gppkg_name}" gppkg files do not exist on any hosts')
 @then('"{gppkg_name}" gppkg files do not exist on any hosts')
@@ -5842,3 +5872,21 @@ def impl(context, config_file):
 def impl(context, config_file):
     run_gpcommand(context, 'gpinitsystem -a -c ../gpAux/gpdemo/clusterConfigFile -O %s' % config_file)
     check_return_code(context, 0)
+
+@given(u'a mirror has crashed')
+def step_impl(context):
+    host, datadir = execute_sql("postgres", """
+        SELECT hostname, fselocation
+          FROM gp_segment_configuration c
+          JOIN pg_filespace_entry e
+            ON c.dbid = e.fsedbid
+         WHERE role = 'm' AND content = 0
+    """).fetchone()
+
+    # NOTE that these commands are manually escaped; beware when adding dollar
+    # signs or double-quotes!
+    cmd = "ps aux | grep '[p]ostgres .* %s' | awk '{print \$2}' | xargs kill -9" % datadir
+    cmd = 'ssh %s "%s"' % (host, cmd)
+    run_command(context, cmd)
+
+    wait_for_unblocked_transactions(context)

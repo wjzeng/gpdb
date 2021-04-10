@@ -333,6 +333,25 @@ explain select * from csq_pullup t0 where 1= (select count(*) from csq_pullup t1
 
 select * from csq_pullup t0 where 1= (select count(*) from csq_pullup t1 where t0.n + 1=t1.i + 1);
 
+--
+-- Test a few cases where pulling up an aggregate subquery is not possible
+--
+
+-- subquery contains a LIMIT
+explain select * from csq_pullup t0 where 1= (select count(*) from csq_pullup t1 where t0.t=t1.t LIMIT 1);
+
+select * from csq_pullup t0 where 1= (select count(*) from csq_pullup t1 where t0.t=t1.t LIMIT 1);
+
+-- subquery contains a HAVING clause
+explain select * from csq_pullup t0 where 1= (select count(*) from csq_pullup t1 where t0.t=t1.t HAVING count(*) < 10);
+
+select * from csq_pullup t0 where 1= (select count(*) from csq_pullup t1 where t0.t=t1.t HAVING count(*) < 10);
+
+-- subquery contains quals of form 'function(outervar, innervar1) = innvervar2'
+explain select * from csq_pullup t0 where 1= (select count(*) from csq_pullup t1 where t0.n + t1.n =t1.i);
+
+select * from csq_pullup t0 where 1= (select count(*) from csq_pullup t1 where t0.n + t1.n =t1.i);
+
 
 --
 -- NOT EXISTS CSQs to joins
@@ -742,8 +761,67 @@ EXPLAIN SELECT * FROM dedup_test3, dedup_test1 WHERE c = 7 AND dedup_test3.b IN 
 EXPLAIN SELECT * FROM dedup_test3, dedup_test1 WHERE c = 7 AND dedup_test3.b IN (SELECT a FROM dedup_test1);
 EXPLAIN SELECT * FROM dedup_test3, dedup_test1 WHERE c = 7 AND EXISTS (SELECT b FROM dedup_test1) AND dedup_test3.b IN (SELECT b FROM dedup_test1);
 
+-- A subplan whose targetlist might be expanded to make sure all entries of its
+-- hashExpr are in its targetlist, test the motion node above it also updated
+-- its targetlist, otherwise, a wrong answer or a crash happens.
+DROP TABLE IF EXISTS TEST_IN;
+CREATE TABLE TEST_IN(
+    C01  FLOAT,
+    C02  NUMERIC(10,0)
+) DISTRIBUTED RANDOMLY;
+
+--insert repeatable records:
+INSERT INTO TEST_IN
+SELECT
+    ROUND(RANDOM()*1E1),ROUND(RANDOM()*1E1)
+FROM GENERATE_SERIES(1,1E4::BIGINT) I;
+
+ANALYZE TEST_IN;
+
+SELECT COUNT(*) FROM
+TEST_IN A
+WHERE A.C01 IN(SELECT C02 FROM TEST_IN);
+
 -- start_ignore
+DROP TABLE IF EXISTS TEST_IN;
 DROP TABLE IF EXISTS dedup_test1;
 DROP TABLE IF EXISTS dedup_test2;
 DROP TABLE IF EXISTS dedup_test3;
+-- end_ignore
+
+
+--
+-- NOT EXISTS sublink with limit (issue 8396)
+--
+
+-- start_ignore
+DROP TABLE IF EXISTS dedup_test1;
+DROP TABLE IF EXISTS dedup_test2;
+-- end_ignore
+
+CREATE TABLE dedup_test1 ( a int, b int ) DISTRIBUTED BY (a);
+CREATE TABLE dedup_test2 ( e int, f int ) DISTRIBUTED BY (e);
+
+INSERT INTO dedup_test1 select i, i from generate_series(1,4)i;
+
+
+EXPLAIN
+SELECT * FROM dedup_test1 WHERE NOT EXISTS (SELECT 1 FROM dedup_test2 WHERE dedup_test2.e = dedup_test1.a LIMIT 0);
+SELECT * FROM dedup_test1 WHERE NOT EXISTS (SELECT 1 FROM dedup_test2 WHERE dedup_test2.e = dedup_test1.a LIMIT 0);
+
+EXPLAIN
+SELECT * FROM dedup_test1 WHERE NOT EXISTS (SELECT 1 FROM dedup_test2 WHERE dedup_test2.e = dedup_test1.a LIMIT 1);
+SELECT * FROM dedup_test1 WHERE NOT EXISTS (SELECT 1 FROM dedup_test2 WHERE dedup_test2.e = dedup_test1.a LIMIT 1);
+
+EXPLAIN
+SELECT * FROM dedup_test1 WHERE NOT EXISTS (SELECT 1 FROM dedup_test2 WHERE dedup_test2.e = dedup_test1.a LIMIT NULL);
+SELECT * FROM dedup_test1 WHERE NOT EXISTS (SELECT 1 FROM dedup_test2 WHERE dedup_test2.e = dedup_test1.a LIMIT NULL);
+
+EXPLAIN
+SELECT * FROM dedup_test1 WHERE NOT EXISTS (SELECT 1 FROM dedup_test2 WHERE dedup_test2.e = dedup_test1.a LIMIT ALL);
+SELECT * FROM dedup_test1 WHERE NOT EXISTS (SELECT 1 FROM dedup_test2 WHERE dedup_test2.e = dedup_test1.a LIMIT ALL);
+
+-- start_ignore
+DROP TABLE IF EXISTS dedup_test1;
+DROP TABLE IF EXISTS dedup_test2;
 -- end_ignore

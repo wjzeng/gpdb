@@ -131,6 +131,12 @@ typedef struct GroupExtContext
 	List *pathkeys;
 } GroupExtContext;
 
+typedef struct replace_grouping_columns_targetlist_context
+{
+	List *grpcols;
+	List *sub_tlist;
+} replace_grouping_columns_targetlist_context;
+
 static void destroyGroupExtContext(GroupExtContext *context);
 static List *convert_gs_to_rollups(AttrNumber *grpColIdx, Oid *grpOperators,
 								   int numGroupCols,
@@ -2341,16 +2347,19 @@ replace_grouping_columns_quals(Node *node, void *grpcols)
 }
 
 static Node *
-replace_grouping_columns_targetlist(Node *node, void *grpcols)
+replace_grouping_columns_targetlist(Node *node, replace_grouping_columns_targetlist_context *ctx)
 {
 	ListCell *lc = NULL;
 	
-	if (node == NULL)
-		return NULL;
+	/*
+	 * Do not replace any column inside an aggregation function.
+	 */
+	if (node == NULL || IsA(node, Aggref))
+		return node;
 
-	Assert(IsA(grpcols, List));
+	Assert(IsA(ctx->grpcols, List));
 
-	foreach (lc, (List*)grpcols)
+	foreach (lc, (List*)ctx->grpcols)
 	{
 		Node *grpcol = lfirst(lc);
 		if (equal(node, grpcol)) {
@@ -2361,7 +2370,10 @@ replace_grouping_columns_targetlist(Node *node, void *grpcols)
 		}
 	}
 
-	return node;
+	if (tlist_member_ignore_relabel(node, ctx->sub_tlist))
+		return node;
+
+	return expression_tree_mutator(node, replace_grouping_columns_targetlist, ctx);
 }
 
 
@@ -2379,7 +2391,6 @@ replace_grouping_columns(Node *node,
 	int attno;
 	List *grpcols = NIL;
 	List* new_node = NIL;
-	ListCell* lc;
 
 	Assert(start_colno <= end_colno);
 
@@ -2398,13 +2409,11 @@ replace_grouping_columns(Node *node,
 
 	if(is_targetlist)
 	{
-		foreach(lc, (List*)node)
-		{
-			TargetEntry *te;
-			te = copyObject(lfirst(lc));
-			te->expr = (Expr *)replace_grouping_columns_targetlist((Node *)te->expr, grpcols);
-			new_node = lappend(new_node, te);
-		}
+		replace_grouping_columns_targetlist_context ctx;
+		ctx.grpcols = grpcols;
+		ctx.sub_tlist = sub_tlist;
+
+		new_node = (List*)replace_grouping_columns_targetlist((Node *)node, &ctx);
 	}
 	else
 	{

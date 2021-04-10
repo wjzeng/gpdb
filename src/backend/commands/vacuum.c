@@ -1558,7 +1558,9 @@ get_rel_oids(List *relids, VacuumStmt *vacstmt, bool isVacuum)
 					}
 					RelationClose(onerel);
 				}
-				if(leaf_parts_analyzed(root_rel_oid, relationOid, va_root_attnums))
+				if(optimizer_analyze_enable_merge_of_leaf_stats &&
+				   leaf_parts_analyzed(root_rel_oid, relationOid, va_root_attnums))
+					/* remember to merge the partition stats into the root partition */
 					oid_list = lappend_oid(oid_list, root_rel_oid);
 			}
 			else if (ps == PART_STATUS_INTERIOR) /* analyze an interior partition directly */
@@ -1739,14 +1741,29 @@ vac_update_relstats_from_list(Relation rel,
 		ListCell *lc;
 		num_pages = 0;
 		num_tuples = 0.0;
-		foreach (lc, updated_stats)
+
+		/*
+		 * If the relation is a partition root, we wont have any statistics
+		 * to update with as we've looked at the root in isolation. Avoid
+		 * resetting the statistics to zero. This means that the root won't
+		 * have the correct aggregate statistics until it has been ANALYZEd.
+		 */
+		if (rel_is_partitioned(RelationGetRelid(rel)))
 		{
-			VPgClassStats *stats = (VPgClassStats *) lfirst(lc);
-			if (stats->relid == RelationGetRelid(rel))
+			num_pages = rel->rd_rel->relpages;
+			num_tuples = rel->rd_rel->reltuples;
+		}
+		else
+		{
+			foreach (lc, updated_stats)
 			{
-				num_pages += stats->rel_pages;
-				num_tuples += stats->rel_tuples;
-				break;
+				VPgClassStats *stats = (VPgClassStats *) lfirst(lc);
+				if (stats->relid == RelationGetRelid(rel))
+				{
+					num_pages += stats->rel_pages;
+					num_tuples += stats->rel_tuples;
+					break;
+				}
 			}
 		}
 	}
@@ -1900,6 +1917,36 @@ vac_update_relstats(Oid relid, BlockNumber num_pages, double num_tuples,
 
 
 /*
+ * fetch_database_tuple - Fetch a copy of database tuple from pg_database.
+ *
+ * This using disk heap table instead of system cache.
+ * relation: opened pg_database relation in vac_update_datfrozenxid().
+ */
+static HeapTuple
+fetch_database_tuple(Relation relation, Oid dbOid)
+{
+	ScanKeyData skey[1];
+	SysScanDesc sscan;
+	HeapTuple	tuple = NULL;
+
+	ScanKeyInit(&skey[0],
+				ObjectIdAttributeNumber,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(dbOid));
+
+	sscan = systable_beginscan(relation, DatabaseOidIndexId, true,
+							   SnapshotNow, 1, skey);
+
+	tuple = systable_getnext(sscan);
+	if (HeapTupleIsValid(tuple))
+		tuple = heap_copytuple(tuple);
+
+	systable_endscan(sscan);
+
+	return tuple;
+}
+
+/*
  *	vac_update_datfrozenxid() -- update pg_database.datfrozenxid for our DB
  *
  *		Update pg_database's datfrozenxid entry for our database to be the
@@ -1917,8 +1964,8 @@ vac_update_relstats(Oid relid, BlockNumber num_pages, double num_tuples,
 void
 vac_update_datfrozenxid(void)
 {
-	HeapTuple	tuple;
-	Form_pg_database dbform;
+	HeapTuple	cached_tuple;
+	Form_pg_database cached_dbform;
 	Relation	relation;
 	SysScanDesc scan;
 	HeapTuple	classTup;
@@ -1982,30 +2029,41 @@ vac_update_datfrozenxid(void)
 	relation = heap_open(DatabaseRelationId, RowExclusiveLock);
 
 	/* Fetch a copy of the tuple to scribble on */
-	tuple = SearchSysCacheCopy(DATABASEOID,
-							   ObjectIdGetDatum(MyDatabaseId),
-							   0, 0, 0);
-	if (!HeapTupleIsValid(tuple))
-		elog(ERROR, "could not find tuple for database %u", MyDatabaseId);
-	dbform = (Form_pg_database) GETSTRUCT(tuple);
+	cached_tuple = SearchSysCache1(DATABASEOID, ObjectIdGetDatum(MyDatabaseId));
+	cached_dbform = (Form_pg_database) GETSTRUCT(cached_tuple);
 
 	/*
 	 * Don't allow datfrozenxid to go backward (probably can't happen anyway);
 	 * and detect the common case where it doesn't go forward either.
 	 */
-	if (TransactionIdPrecedes(dbform->datfrozenxid, newFrozenXid))
+	if (TransactionIdPrecedes(cached_dbform->datfrozenxid, newFrozenXid))
 	{
-		dbform->datfrozenxid = newFrozenXid;
 		dirty = true;
 	}
 
 	if (dirty)
 	{
+		HeapTuple			tuple;
+		Form_pg_database	tmp_dbform;
+		/*
+		 * Fetch a copy of the tuple to scribble on from pg_database disk
+		 * heap table instead of system cache
+		 * "SearchSysCacheCopy1(DATABASEOID, ObjectIdGetDatum(MyDatabaseId))".
+		 * Since the cache already flatten toast tuple, so the
+		 * heap_inplace_update will fail with "wrong tuple length".
+		 */
+		tuple = fetch_database_tuple(relation, MyDatabaseId);
+		if (!HeapTupleIsValid(tuple))
+			elog(ERROR, "could not find tuple for database %u", MyDatabaseId);
+		tmp_dbform = (Form_pg_database) GETSTRUCT(tuple);
+		tmp_dbform->datfrozenxid = newFrozenXid;
+
 		heap_inplace_update(relation, tuple);
+		heap_freetuple(tuple);
 		SIMPLE_FAULT_INJECTOR(VacuumUpdateDatFrozenXid);
 	}
 
-	heap_freetuple(tuple);
+	ReleaseSysCache(cached_tuple);
 	heap_close(relation, RowExclusiveLock);
 
 	/*
@@ -5475,7 +5533,19 @@ open_relation_and_check_permission(VacuumStmt *vacstmt,
 		 * marked.
 		 */
 		lmode = AccessExclusiveLock;
-		dontWait = true;
+		/*
+		 * We don't block trying to acquire the Access Exclusive lock on QD.
+		 * Since lazy vacuum is a best-effort to reclaim space, it is okay to
+		 * defer a drop of the segfile and leave the segment file in the
+		 * AOSEG_STATE_AWAITING_DROP state. If this is the QE, we should not
+		 * skip the drop phase as the current QD code (post drop phase update of
+		 * AppendOnlyHash) assumes that if a dispatch is successful, the segfile
+		 * always is dropped successfully and put into the AVAILABLE state on
+		 * the QE (unless the drop phase transaction aborts on the QE). Hence,
+		 * we block on QE but not on QD.
+		 */
+		if (Gp_role == GP_ROLE_DISPATCH)
+			dontWait = true;
 		SIMPLE_FAULT_INJECTOR(VacuumRelationOpenRelationDuringDropPhase);
 	}
 	else if (!vacstmt->vacuum)

@@ -167,7 +167,7 @@ select count(*) from sync1_heap_films8;
 --
 --ADD table_constraint
 --
-ALTER TABLE sync1_heap_films1 ADD UNIQUE(code, date_prod);
+ALTER TABLE sync1_heap_films1 ADD UNIQUE(date_prod, code);
 select count(*) from sync1_heap_films1;
 
 --

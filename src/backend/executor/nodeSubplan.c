@@ -1140,6 +1140,18 @@ PG_TRY();
 		prm->isnull = false;
 	}
 
+	/* Clean up the interconnect. */
+	if (shouldTeardownInterconnect)
+	{
+		shouldTeardownInterconnect = false;
+
+		TeardownInterconnect(queryDesc->estate->interconnect_context,
+							 queryDesc->estate->motionlayer_context,
+							 false, false); /* following success on QD */
+		queryDesc->estate->interconnect_context = NULL;
+		queryDesc->estate->es_interconnect_is_setup = false;
+	}
+
 	/*
 	 * If we dispatched to QEs, wait for completion and check for errors.
 	 */
@@ -1173,24 +1185,14 @@ PG_TRY();
 
 	/* teardown the sequence server */
 	TeardownSequenceServer();
-
-	/* Clean up the interconnect. */
-	if (shouldTeardownInterconnect)
-	{
-		shouldTeardownInterconnect = false;
-
-		TeardownInterconnect(queryDesc->estate->interconnect_context,
-							 queryDesc->estate->motionlayer_context,
-							 false, false); /* following success on QD */
-		queryDesc->estate->interconnect_context = NULL;
-	}
 }
 PG_CATCH();
 {
 	/* If EXPLAIN ANALYZE, collect local and distributed execution stats. */
 	if (planstate->instrument && planstate->instrument->need_cdb)
 	{
-		cdbexplain_localExecStats(planstate, econtext->ecxt_estate->showstatctx);
+		if(Gp_role == GP_ROLE_DISPATCH)
+			cdbexplain_localExecStats(planstate, econtext->ecxt_estate->showstatctx);
 		if (!explainRecvStats &&
 			shouldDispatch)
 		{
@@ -1211,17 +1213,6 @@ PG_CATCH();
 	MemoryContextSetPeakSpace(planstate->state->es_query_cxt, savepeakspace);
 
 	/*
-	 * Request any commands still executing on qExecs to stop.
-	 * Wait for them to finish and clean up the dispatching structures.
-	 * Replace current error info with QE error info if more interesting.
-	 */
-	if (shouldDispatch && queryDesc && queryDesc->estate && queryDesc->estate->dispatcherState && queryDesc->estate->dispatcherState->primaryResults)
-		CdbDispatchHandleError(queryDesc->estate->dispatcherState);
-		
-	/* teardown the sequence server */
-	TeardownSequenceServer();
-		
-	/*
 	 * Clean up the interconnect.
 	 * CDB TODO: Is this needed following failure on QD?
 	 */
@@ -1231,7 +1222,20 @@ PG_CATCH();
 							 queryDesc->estate->motionlayer_context,
 							 true, false);
 		queryDesc->estate->interconnect_context = NULL;
+		queryDesc->estate->es_interconnect_is_setup = false;
 	}
+
+	/*
+	 * Request any commands still executing on qExecs to stop.
+	 * Wait for them to finish and clean up the dispatching structures.
+	 * Replace current error info with QE error info if more interesting.
+	 */
+	if (shouldDispatch && queryDesc && queryDesc->estate && queryDesc->estate->dispatcherState && queryDesc->estate->dispatcherState->primaryResults)
+		CdbDispatchHandleError(queryDesc->estate->dispatcherState);
+		
+	/* teardown the sequence server */
+	TeardownSequenceServer();
+
 	PG_RE_THROW();
 }
 PG_END_TRY();
@@ -1239,7 +1243,7 @@ PG_END_TRY();
 	planstate->state->currentSubplanLevel--;
 
 	/* If EXPLAIN ANALYZE, collect local execution stats. */
-	if (planstate->instrument && planstate->instrument->need_cdb)
+	if (Gp_role == GP_ROLE_DISPATCH && planstate->instrument && planstate->instrument->need_cdb)
 		cdbexplain_localExecStats(planstate, econtext->ecxt_estate->showstatctx);
 
 	/* Restore memory high-water mark for root slice of main query. */

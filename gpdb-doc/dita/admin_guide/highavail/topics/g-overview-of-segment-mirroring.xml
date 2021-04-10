@@ -7,9 +7,13 @@
         <p>When Greenplum Database High Availability is enabled, there are two types of segments:
                 <i>primary</i> and <i>mirror</i>. Each primary segment has one corresponding mirror
             segment. A primary segment receives requests from the master to make changes to the
-            segment's database and then replicates those changes to the corresponding mirror. If a
-            primary segment becomes unavailable, database queries fail over to the mirror
-            segment.</p>
+            segment's database and then replicates those changes to the corresponding mirror. If 
+            Greenplum Database detects that a primary segment has failed or become
+            unavailable, it changes the role of its mirror segment to primary segment and the role
+            of the unavailable primary segment to mirror segment. Transactions in progress when the
+            failure occurred roll back and must be restarted. The administrator must then recover
+            the mirror segment, allow the mirror to syncronize with the current primary segment, and
+            then exchange the primary and mirror segments so they are in their preferred roles.</p>
         <p>Segment mirroring employs a physical file replication scheme—data file I/O at the primary
             is replicated to the secondary so that the mirror's files are identical to the primary's
             files. Data in Greenplum Database are represented with <i>tuples</i>, which are packed

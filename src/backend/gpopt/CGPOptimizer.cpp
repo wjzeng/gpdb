@@ -14,16 +14,22 @@
 //---------------------------------------------------------------------------
 
 #include "gpopt/CGPOptimizer.h"
+
+#include "gpopt/utils/CMemoryPoolPalloc.h"
+#include "gpopt/utils/CMemoryPoolPallocManager.h"
 #include "gpopt/utils/COptTasks.h"
 
 // the following headers are needed to reference optimizer library initializers
-#include "naucrates/init.h"
-#include "gpopt/init.h"
 #include "gpos/_api.h"
-#include "gpopt/gpdbwrappers.h"
+#include "gpos/memory/CMemoryPoolManager.h"
 
+#include "gpopt/gpdbwrappers.h"
+#include "gpopt/init.h"
 #include "naucrates/exception.h"
+#include "naucrates/init.h"
+
 #include "utils/guc.h"
+#include "utils/memutils.h"
 
 extern MemoryContext MessageContext;
 
@@ -36,24 +42,26 @@ extern MemoryContext MessageContext;
 //
 //---------------------------------------------------------------------------
 PlannedStmt *
-CGPOptimizer::GPOPTOptimizedPlan
-	(
+CGPOptimizer::GPOPTOptimizedPlan(
 	Query *query,
-	bool *had_unexpected_failure // output : set to true if optimizer unexpectedly failed to produce plan
-	)
+	bool *
+		had_unexpected_failure	// output : set to true if optimizer unexpectedly failed to produce plan
+)
 {
 	SOptContext gpopt_context;
-	PlannedStmt* plStmt = NULL;
+	PlannedStmt *plStmt = NULL;
 	GPOS_TRY
 	{
-		plStmt = COptTasks::GPOPTOptimizedPlan(query, &gpopt_context, had_unexpected_failure);
+		plStmt = COptTasks::GPOPTOptimizedPlan(query, &gpopt_context,
+											   had_unexpected_failure);
 		// clean up context
 		gpopt_context.Free(gpopt_context.epinQuery, gpopt_context.epinPlStmt);
 	}
 	GPOS_CATCH_EX(ex)
 	{
 		// clone the error message before context free.
-		CHAR* serialized_error_msg = gpopt_context.CloneErrorMsg(MessageContext);
+		CHAR *serialized_error_msg =
+			gpopt_context.CloneErrorMsg(MessageContext);
 		// clean up context
 		gpopt_context.Free(gpopt_context.epinQuery, gpopt_context.epinPlStmt);
 
@@ -62,36 +70,41 @@ CGPOptimizer::GPOPTOptimizedPlan
 		// tries to do something smart with them. Also, ERRCODE_INTERNAL_ERROR
 		// is handled specially in elog.c, and we don't want that for "normal"
 		// application errors.
-		if (GPOS_MATCH_EX(ex, gpdxl::ExmaDXL, gpdxl::ExmiQuery2DXLNotNullViolation))
+		if (GPOS_MATCH_EX(ex, gpdxl::ExmaDXL,
+						  gpdxl::ExmiQuery2DXLNotNullViolation))
 		{
 			errstart(ERROR, ex.Filename(), ex.Line(), NULL, TEXTDOMAIN);
 			errfinish(errcode(ERRCODE_NOT_NULL_VIOLATION),
-				  errmsg("%s", serialized_error_msg));
+					  errmsg("%s", serialized_error_msg));
 		}
 
 		else if (GPOS_MATCH_EX(ex, gpdxl::ExmaDXL, gpdxl::ExmiOptimizerError) ||
-			NULL != serialized_error_msg)
+				 NULL != serialized_error_msg)
 		{
 			Assert(NULL != serialized_error_msg);
 			errstart(ERROR, ex.Filename(), ex.Line(), NULL, TEXTDOMAIN);
 			errfinish(errcode(ERRCODE_INTERNAL_ERROR),
-					errmsg("%s", serialized_error_msg));
+					  errmsg("%s", serialized_error_msg));
 		}
 		else if (GPOS_MATCH_EX(ex, gpdxl::ExmaGPDB, gpdxl::ExmiGPDBError))
 		{
 			PG_RE_THROW();
 		}
-		else if (GPOS_MATCH_EX(ex, gpdxl::ExmaDXL, gpdxl::ExmiNoAvailableMemory))
+		else if (GPOS_MATCH_EX(ex, gpdxl::ExmaDXL,
+							   gpdxl::ExmiNoAvailableMemory))
 		{
 			errstart(ERROR, ex.Filename(), ex.Line(), NULL, TEXTDOMAIN);
 			errfinish(errcode(ERRCODE_INTERNAL_ERROR),
-					errmsg("No available memory to allocate string buffer."));
+					  errmsg("No available memory to allocate string buffer."));
 		}
-		else if (GPOS_MATCH_EX(ex, gpdxl::ExmaDXL, gpdxl::ExmiInvalidComparisonTypeCode))
+		else if (GPOS_MATCH_EX(ex, gpdxl::ExmaDXL,
+							   gpdxl::ExmiInvalidComparisonTypeCode))
 		{
 			errstart(ERROR, ex.Filename(), ex.Line(), NULL, TEXTDOMAIN);
-			errfinish(errcode(ERRCODE_INTERNAL_ERROR),
-					errmsg("Invalid comparison type code. Valid values are Eq, NEq, LT, LEq, GT, GEq."));
+			errfinish(
+				errcode(ERRCODE_INTERNAL_ERROR),
+				errmsg(
+					"Invalid comparison type code. Valid values are Eq, NEq, LT, LEq, GT, GEq."));
 		}
 	}
 	GPOS_CATCH_END;
@@ -108,10 +121,7 @@ CGPOptimizer::GPOPTOptimizedPlan
 //
 //---------------------------------------------------------------------------
 char *
-CGPOptimizer::SerializeDXLPlan
-	(
-	Query *query
-	)
+CGPOptimizer::SerializeDXLPlan(Query *query)
 {
 	return COptTasks::Optimize(query);
 }
@@ -125,21 +135,18 @@ CGPOptimizer::SerializeDXLPlan
 //
 //---------------------------------------------------------------------------
 void
-CGPOptimizer::InitGPOPT ()
+CGPOptimizer::InitGPOPT()
 {
-  // Use GPORCA's default allocators
-  void *(*gpos_alloc)(size_t) = NULL;
-  void (*gpos_free)(void *) = NULL;
-  if (optimizer_use_gpdb_allocators)
-  {
-	gpos_alloc = gpdb::OptimizerAlloc;
-	gpos_free = gpdb::OptimizerFree;
-  }
-  struct gpos_init_params params =
-	{gpos_alloc, gpos_free, gpdb::IsAbortRequested};
-  gpos_init(&params);
-  gpdxl_init();
-  gpopt_init();
+	if (optimizer_use_gpdb_allocators)
+	{
+		CMemoryPoolPallocManager::Init();
+	}
+
+	struct gpos_init_params params = {gpdb::IsAbortRequested};
+
+	gpos_init(&params);
+	gpdxl_init();
+	gpopt_init();
 }
 
 //---------------------------------------------------------------------------
@@ -151,11 +158,11 @@ CGPOptimizer::InitGPOPT ()
 //
 //---------------------------------------------------------------------------
 void
-CGPOptimizer::TerminateGPOPT ()
+CGPOptimizer::TerminateGPOPT()
 {
-  gpopt_terminate();
-  gpdxl_terminate();
-  gpos_terminate();
+	gpopt_terminate();
+	gpdxl_terminate();
+	gpos_terminate();
 }
 
 //---------------------------------------------------------------------------
@@ -166,13 +173,9 @@ CGPOptimizer::TerminateGPOPT ()
 //		Expose GP optimizer API to C files
 //
 //---------------------------------------------------------------------------
-extern "C"
-{
-PlannedStmt *GPOPTOptimizedPlan
-	(
-	Query *query,
-	bool *had_unexpected_failure
-	)
+extern "C" {
+PlannedStmt *
+GPOPTOptimizedPlan(Query *query, bool *had_unexpected_failure)
 {
 	return CGPOptimizer::GPOPTOptimizedPlan(query, had_unexpected_failure);
 }
@@ -186,12 +189,9 @@ PlannedStmt *GPOPTOptimizedPlan
 //		Serialize planned statement to DXL
 //
 //---------------------------------------------------------------------------
-extern "C"
-{
-char *SerializeDXLPlan
-	(
-	Query *query
-	)
+extern "C" {
+char *
+SerializeDXLPlan(Query *query)
 {
 	return CGPOptimizer::SerializeDXLPlan(query);
 }
@@ -205,11 +205,22 @@ char *SerializeDXLPlan
 //		Initialize GPTOPT and dependent libraries
 //
 //---------------------------------------------------------------------------
-extern "C"
+extern "C" {
+void
+InitGPOPT()
 {
-void InitGPOPT ()
-{
-	return CGPOptimizer::InitGPOPT();
+	GPOS_TRY
+	{
+		return CGPOptimizer::InitGPOPT();
+	}
+	GPOS_CATCH_EX(ex)
+	{
+		if (GPOS_MATCH_EX(ex, gpdxl::ExmaGPDB, gpdxl::ExmiGPDBError))
+		{
+			PG_RE_THROW();
+		}
+	}
+	GPOS_CATCH_END;
 }
 }
 
@@ -221,11 +232,22 @@ void InitGPOPT ()
 //		Terminate GPOPT and dependent libraries
 //
 //---------------------------------------------------------------------------
-extern "C"
+extern "C" {
+void
+TerminateGPOPT()
 {
-void TerminateGPOPT ()
-{
-	return CGPOptimizer::TerminateGPOPT();
+	GPOS_TRY
+	{
+		return CGPOptimizer::TerminateGPOPT();
+	}
+	GPOS_CATCH_EX(ex)
+	{
+		if (GPOS_MATCH_EX(ex, gpdxl::ExmaGPDB, gpdxl::ExmiGPDBError))
+		{
+			PG_RE_THROW();
+		}
+	}
+	GPOS_CATCH_END;
 }
 }
 

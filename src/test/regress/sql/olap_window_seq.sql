@@ -5,6 +5,11 @@
 
 set gp_enable_sequential_window_plans to true;
 
+-- start_ignore
+create schema olap_window_seq;
+set search_path to olap_window_seq, public;
+-- end_ignore
+
 ---- 1 -- Null window specification -- OVER () ----
 
 select row_number() over (), cn,pn,vn 
@@ -1547,8 +1552,8 @@ select stddev(n) over(order by d range between current row and interval '1 day' 
        sum(n) over(order by d range between current row and interval '1 day' following),
        avg(n) over(order by d range between current row and interval '1 day' following), n from olap_window_seq_test;
 
--- This test examines the case that a statement invokes multiple lead functions, 
--- which are not sorted regarding the rows that they use and projected attributes are varlen. 
+-- This test examines the case that a statement invokes multiple lead functions,
+-- which are not sorted regarding the rows that they use and projected attributes are varlen.
 DROP TABLE IF EXISTS empsalary;
 CREATE TABLE empsalary(
   depname varchar,
@@ -1561,15 +1566,15 @@ INSERT INTO empsalary VALUES('develop', 8, '6000', '2006/10/01');
 INSERT INTO empsalary VALUES('develop', 11, '5200', '2007/08/15');
 INSERT INTO empsalary VALUES('develop', 9, '4500', '2008/01/01');
 
--- First lead retrieves data from one tuple ahead, second lead function retrieves data from two tuples ahead, while third one 
--- gets data from one tuple ahead again.  
+-- First lead retrieves data from one tuple ahead, second lead function retrieves data from two tuples ahead, while third one
+-- gets data from one tuple ahead again.
 select * ,
 lead(salary,1) over (partition by depname order by salary desc) qianzhi1,
 lead(salary,2) over (partition by depname order by salary desc) qianzhi2,
 lead(empno,1) over (partition by depname order by salary desc) qianzhi11
 from empsalary;
 
--- Lead functions are in order. 
+-- Lead functions are in order.
 select * ,
 lead(salary,1) over (partition by depname order by salary desc) qianzhi1,
 lead(empno,1) over (partition by depname order by salary desc) qianzhi11,
@@ -1607,7 +1612,7 @@ INSERT INTO empsalary VALUES('develop', 8, 6000, '2006/10/01');
 INSERT INTO empsalary VALUES('develop', 11, 5200, '2007/08/15');
 INSERT INTO empsalary VALUES('develop', 9, 4500, '2008/01/01');
 
--- Similar to the first statement using int. 
+-- Similar to the first statement using int.
 select * ,
 lead(salary,1) over (partition by depname order by salary desc) qianzhi1,
 lead(salary,2) over (partition by depname order by salary desc) qianzhi2,
@@ -1660,7 +1665,7 @@ create table foo (a int, b int) distributed by (a);
 create table bar (c int, d int) distributed by (c);
 insert into foo select i,i from generate_series(1,10) i;
 insert into bar select i,i from generate_series(1,10) i;
-set optimizer_segments to 1; 
+set optimizer_segments to 1;
 SELECT bar.*, count(*) OVER() AS e FROM foo, bar where foo.b = bar.d;
 
 reset optimizer_segments;
@@ -1727,5 +1732,32 @@ select dt, pn, corr(distinct pn, pn) over (partition by dt), sum(pn) over (parti
 create view distinct_windowagg_view as select sum(distinct g/2) OVER (partition by g/4) from generate_series (1, 5) g;
 \d+ distinct_windowagg_view
 
+-- These are tests for pushing down filter predicates in window functions.
+CREATE TABLE window_part_sales (trans_id int, date date, region text)
+DISTRIBUTED BY (trans_id)
+PARTITION BY RANGE (date)
+SUBPARTITION BY LIST (region)
+SUBPARTITION TEMPLATE
+( SUBPARTITION usa VALUES ('usa'),
+DEFAULT SUBPARTITION other_regions)
+(START (date '2011-01-01') INCLUSIVE
+END (date '2011-06-01') EXCLUSIVE
+EVERY (INTERVAL '1 month'),
+DEFAULT PARTITION outlying_dates );
+
+-- When there is no PARTITION BY in the window function, we do not want to push down any of the filter predicates.
+EXPLAIN WITH cte as (SELECT *, row_number() over () FROM window_part_sales) SELECT * FROM cte WHERE date > '2011-03-01' AND region = 'usa';
+
+-- If there is a PARTITION BY in the window function, we can push down ONLY the predicates that match the PARTITION BY column.
+EXPLAIN WITH cte as (SELECT *, row_number() over (PARTITION BY region) FROM window_part_sales) SELECT * FROM cte WHERE date > '2011-03-01' AND region = 'usa';
+
+-- When both columns in the filter predicates are in the window function, it is possible to push both down.
+EXPLAIN WITH cte as (SELECT *, row_number() over (PARTITION BY date,region) FROM window_part_sales) SELECT * FROM cte WHERE date > '2011-03-01' AND region = 'usa';
+
+-- When the column in the filter predicates is also present in the window function, it is possible to push it down.
+EXPLAIN WITH cte as (SELECT *, row_number() over (PARTITION BY date,region) FROM window_part_sales) SELECT * FROM cte WHERE region = 'usa';
+
+-- When there is a disjunct in the filter predicates, it is not possible to push down either into the window function.
+EXPLAIN WITH cte as (SELECT *, row_number() over (PARTITION BY date,region) FROM window_part_sales) SELECT * FROM cte WHERE date > '2011-03-01' OR region = 'usa';
 
 -- End of Test

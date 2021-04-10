@@ -1026,6 +1026,15 @@ select * from fstest;
   999 |  999
 (1000 rows)
 
+-- The size output is found to differ based on platform (e.g. on OSX
+-- it returns 97kB, on Ubuntu 112kB).  Pass the test as long as the
+-- size is greater than 50kB.
+SELECT pg_tablespace_size('regressionts1') > (50 * 1024) as result;
+ result 
+--------
+ t
+(1 row)
+
 comment on filespace regressionfs1 is 'groovy';
 comment on tablespace regressionts1 is 'also groovy';
 -- partition coverage

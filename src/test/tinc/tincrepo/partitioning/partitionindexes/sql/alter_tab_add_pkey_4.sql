@@ -5,5 +5,5 @@
 -- @tags partitionindexes
 -- @negtest True
 -- @description ALTER TABLE, Unique index with Primary Key
-ALTER TABLE pt_lt_tab ADD primary key(col2,col1);
+ALTER TABLE pt_lt_tab ADD primary key(col1,col2);
 SELECT * FROM pt_lt_tab WHERE col2 <> 10 ORDER BY col2,col3 LIMIT 5;

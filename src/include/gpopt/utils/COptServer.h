@@ -15,164 +15,132 @@
 #ifndef COptServer_H
 #define COptServer_H
 
-#include "naucrates/md/CSystemId.h"
-
 #include "gpos/base.h"
 #include "gpos/common/CSyncHashtable.h"
-#include "gpos/common/CSyncHashtableAccessByKey.h"
 #include "gpos/common/CSyncHashtableAccessByIter.h"
+#include "gpos/common/CSyncHashtableAccessByKey.h"
 #include "gpos/common/CSyncHashtableIter.h"
 #include "gpos/net/CSocket.h"
-#include "gpos/sync/CSpinlock.h"
 #include "gpos/task/CTask.h"
+
+#include "naucrates/md/CSystemId.h"
 
 // forward declarations
 namespace gpopt
 {
-	class CExpression;
-	class CMDAccessor;
-	class CMiniDumperDXL;
-	class CQueryContext;
-}
+class CExpression;
+class CMDAccessor;
+class CMiniDumperDXL;
+class CQueryContext;
+}  // namespace gpopt
 
 namespace gpnaucrates
 {
-	class CCommunicator;
+class CCommunicator;
 }
 
 
 namespace gpoptudfs
 {
-	using namespace gpos;
-	using namespace gpopt;
-	using namespace gpnaucrates;
+using namespace gpos;
+using namespace gpopt;
+using namespace gpnaucrates;
 
-	//---------------------------------------------------------------------------
-	//	@class:
-	//		COptServer
-	//
-	//	@doc:
-	//		Optimizer server; processes optimization requests from QDs;
-	//
-	//---------------------------------------------------------------------------
-	class COptServer
+//---------------------------------------------------------------------------
+//	@class:
+//		COptServer
+//
+//	@doc:
+//		Optimizer server; processes optimization requests from QDs;
+//
+//---------------------------------------------------------------------------
+class COptServer
+{
+private:
+	// connection descriptor
+	struct SConnectionDescriptor
 	{
-		private:
+		// ID
+		ULONG_PTR m_id;
 
-			// connection descriptor
-			struct SConnectionDescriptor
-			{
-				// ID
-				ULONG_PTR m_id;
+		// task
+		CTask *m_task;
 
-				// task
-				CTask *m_task;
+		// socket
+		CSocket *m_socket;
 
-				// socket
-				CSocket *m_socket;
+		// link for hashtable
+		SLink m_link;
 
-				// link for hashtable
-				SLink m_link;
+		// invalid connection id
+		static ULONG_PTR m_invalid_id;
 
-				// invalid connection id
-				static
-				ULONG_PTR m_invalid_id;
+		// ctor
+		SConnectionDescriptor(CTask *task, CSocket *socket)
+			: m_id((ULONG_PTR) task), m_task(task), m_socket(socket)
+		{
+		}
+	};
 
-				// ctor
-				SConnectionDescriptor
-					(
-					CTask *task,
-					CSocket *socket
-					)
-					:
-					m_id((ULONG_PTR) task),
-					m_task(task),
-					m_socket(socket)
-				{}
+	typedef CSyncHashtable<SConnectionDescriptor, ULONG_PTR> ConnectionHT;
 
-			};
+	// path where socket is initialized
+	const CHAR *m_socket_path;
 
-			typedef CSyncHashtable<SConnectionDescriptor, ULONG_PTR, CSpinlockOS>
-				ConnectionHT;
+	// memory pool for connections
+	CMemoryPool *m_mp;
 
-			typedef CSyncHashtableAccessByKey<SConnectionDescriptor, ULONG_PTR, CSpinlockOS>
-				ConnectionKeyAccessor;
+	// hashtable of connections
+	ConnectionHT *m_connections_ht;
 
-			typedef CSyncHashtableIter<SConnectionDescriptor, ULONG_PTR, CSpinlockOS>
-				ConnectionIter;
+	// default id for the source system
+	static const CSystemId m_default_id;
 
-			typedef CSyncHashtableAccessByIter<SConnectionDescriptor, ULONG_PTR, CSpinlockOS>
-				ConnectionIterAccessor;
+	// ctor
+	explicit COptServer(const CHAR *path);
 
-			// path where socket is initialized
-			const CHAR *m_socket_path;
+	// dtor
+	~COptServer();
 
-			// memory pool for connections
-			IMemoryPool *m_mp;
+	// start serving requests
+	void Loop();
 
-			// hashtable of connections
-			ConnectionHT *m_connections_ht;
+	// initialize hashtable
+	void InitHT();
 
-			// default id for the source system
-			static
-			const CSystemId m_default_id;
+	// register connection for status checking
+	void TrackConnection(CTask *task, CSocket *socket);
 
-			// ctor
-			explicit
-			COptServer(const CHAR *path);
+	// release connection
+	void ReleaseConnection(CTask *task);
 
-			// dtor
-			~COptServer();
+	// connection check task
+	static void *CheckConnections(void *ptr);
 
-			// start serving requests
-			void Loop();
+	// optimization task
+	static void *Optimize(void *ptr);
 
-			// initialize hashtable
-			void InitHT();
+	// receive optimization request and construct query context for it
+	static CQueryContext *RecvQuery(CMemoryPool *mp,
+									CCommunicator *communicator,
+									CMDAccessor *md_accessor);
 
-			// register connection for status checking
-			void TrackConnection(CTask *task, CSocket *socket);
+	// extract query plan, serialize it and send it to client
+	static void SendPlan(CMemoryPool *mp, CCommunicator *communicator,
+						 CMDAccessor *md_accessor, CQueryContext *query_ctxt,
+						 CExpression *plan_expr);
 
-			// release connection
-			void ReleaseConnection(CTask *task);
+	// dump collected artifacts to file
+	static void FinalizeMinidump(CMiniDumperDXL *dump);
 
-			// connection check task
-			static
-			void * CheckConnections(void *ptr);
+public:
+	// invoke optimizer instance
+	static void *Run(void *ptr);
 
-			// optimization task
-			static
-			void *Optimize(void *ptr);
+};	// class COptServer
+}  // namespace gpoptudfs
 
-			// receive optimization request and construct query context for it
-			static
-			CQueryContext *RecvQuery(IMemoryPool *mp, CCommunicator *communicator, CMDAccessor *md_accessor);
-
-			// extract query plan, serialize it and send it to client
-			static
-			void SendPlan
-				(
-				IMemoryPool *mp,
-				CCommunicator *communicator,
-				CMDAccessor *md_accessor,
-				CQueryContext *query_ctxt,
-				CExpression *plan_expr
-				);
-
-			// dump collected artifacts to file
-			static
-			void FinalizeMinidump(CMiniDumperDXL *dump);
-
-		public:
-
-			// invoke optimizer instance
-			static
-			void *Run(void *ptr);
-
-	}; // class COptServer
-}
-
-#endif // !COptServer_H
+#endif	// !COptServer_H
 
 
 // EOF

@@ -7,4 +7,3 @@ resgroup_cpu_rate_limit.sql
 resgroup_alter_memory.sql
 resgroup_bypass.sql
 resgroup_cpuset.sql
-resgroup_dumpinfo.sql

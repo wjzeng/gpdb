@@ -195,10 +195,8 @@ cdbsubselect_drop_orderby(Query *subselect)
  * safe_to_convert_NOT_EXISTS
  */
 static bool
-safe_to_convert_NOT_EXISTS(SubLink *sublink, ConvertSubqueryToJoinContext *ctx1)
+safe_to_convert_NOT_EXISTS(Query *subselect, ConvertSubqueryToJoinContext *ctx1)
 {
-	Query	   *subselect = (Query *) sublink->subselect;
-
 	if (subselect->jointree->fromlist == NULL)
 		return false;
 
@@ -243,6 +241,12 @@ safe_to_convert_NOT_EXISTS(SubLink *sublink, ConvertSubqueryToJoinContext *ctx1)
 	if (subselect->limitOffset)
 		return false;
 
+	/**
+	 * If there is a limit count, then don't bother.
+	 */
+	if (subselect->limitCount)
+		return false;
+
 	ProcessSubqueryToJoin(subselect, ctx1);
 
 	return ctx1->safeToConvert;
@@ -272,55 +276,39 @@ InitConvertSubqueryToJoinContext(ConvertSubqueryToJoinContext *ctx)
 static bool
 IsCorrelatedOpExpr(OpExpr *opexp, Expr **innerExpr)
 {
-	Assert(opexp);
-	Assert(list_length(opexp->args) > 1);
-	Assert(innerExpr);
+	Expr	   *e1;
+	Expr	   *e2;
 
 	if (list_length(opexp->args) != 2)
-	{
 		return false;
-	}
 
-	Expr	   *e1 = (Expr *) list_nth(opexp->args, 0);
-	Expr	   *e2 = (Expr *) list_nth(opexp->args, 1);
+	e1 = (Expr *) list_nth(opexp->args, 0);
+	e2 = (Expr *) list_nth(opexp->args, 1);
 
-	/**
+	/*
 	 * One of the vars must be outer, and other must be inner.
-	 *
-	 * If both sides of the condition referring to outer variable,
-	 * then fail to extract the innerExpr.
 	 */
-	if (contain_vars_of_level((Node *) e1, 1) && contain_vars_of_level((Node *) e2, 1))
+	if (contain_vars_of_level((Node *) e1, 1) &&
+			!contain_vars_of_level((Node *) e1, 0) &&
+			contain_vars_of_level((Node *) e2, 0) &&
+			!contain_vars_of_level((Node *) e2, 1))
 	{
-		return false;
+		*innerExpr = (Expr *) copyObject(e2);
+
+		return true;
 	}
 
-	Expr	   *tOuterExpr = NULL;
-	Expr	   *tInnerExpr = NULL;
-
-	if (contain_vars_of_level((Node *) e1, 1))
+	if (contain_vars_of_level((Node *) e1, 0) &&
+			!contain_vars_of_level((Node *) e1, 1) &&
+			contain_vars_of_level((Node *) e2, 1) &&
+			!contain_vars_of_level((Node *) e2, 0))
 	{
-		tOuterExpr = (Expr *) copyObject(e1);
-		tInnerExpr = (Expr *) copyObject(e2);
-	}
-	else if ((contain_vars_of_level((Node *) e2, 1)))
-	{
-		tOuterExpr = (Expr *) copyObject(e2);
-		tInnerExpr = (Expr *) copyObject(e1);
-	}
+		*innerExpr = (Expr *) copyObject(e1);
 
-	/**
-	 * It is correlated only if we found an outer var and inner expr
-	 */
-
-	if (tOuterExpr && contain_vars_of_level((Node *) tInnerExpr, 0))
-	{
-		*innerExpr = tInnerExpr;
 		return true;
 	}
 
 	return false;
-
 }
 
 /**
@@ -541,11 +529,14 @@ SubqueryToJoinWalker(Node *node, ConvertSubqueryToJoinContext *context)
 
 		if (considerOpExpr)
 		{
+			TargetEntry *tle;
 
-			TargetEntry *tle = makeTargetEntry(copyObject(innerExpr),
-										list_length(context->targetList) + 1,
+			tle = makeTargetEntry(innerExpr,
+											   list_length(context->targetList) + 1,
 											   NULL,
 											   false);
+			tle->ressortgroupref = list_length(context->targetList) + 1;
+			context->targetList = lappend(context->targetList, tle);
 
 			if (context->extractGrouping)
 			{
@@ -554,13 +545,12 @@ SubqueryToJoinWalker(Node *node, ConvertSubqueryToJoinContext *context)
 				gc->sortop = sortOp;
 				gc->tleSortGroupRef = list_length(context->groupClause) + 1;
 				context->groupClause = lappend(context->groupClause, gc);
-				tle->ressortgroupref = list_length(context->targetList) + 1;
 			}
 
-			context->targetList = lappend(context->targetList, tle);
 			context->joinQual = make_and_qual(context->joinQual, (Node *) opexp);
 
-			AssertImply(context->extractGrouping, list_length(context->groupClause) == list_length(context->targetList));
+			AssertImply(context->extractGrouping,
+					list_length(context->groupClause) == list_length(context->targetList));
 
 			return;
 		}
@@ -634,6 +624,16 @@ safe_to_convert_EXPR(SubLink *sublink, ConvertSubqueryToJoinContext *ctx1)
 	 * If it does not have aggs, then don't bother. This could result in a run-time error.
 	 */
 	if (!subselect->hasAggs)
+		return false;
+
+	/**
+	 * A LIMIT or OFFSET could interfere with the transformation of the
+	 * correlated qual to GROUP BY. (LIMIT >0 in a subquery that contains a
+	 * plain aggregate is actually a no-op, so we could try to remove it,
+	 * but it doesn't seem worth the trouble to optimize queries with
+	 * pointless limits like that.)
+	 */
+	if (subselect->limitOffset || subselect->limitCount)
 		return false;
 
 	/**
@@ -786,38 +786,38 @@ convert_NOT_EXISTS_to_antijoin(PlannerInfo *root, List **rtrlist_inout, SubLink 
 	InitConvertSubqueryToJoinContext(&ctx1);
 	ctx1.considerNonEqualQual = true;
 
-	if (safe_to_convert_NOT_EXISTS(sublink, &ctx1))
+	/*
+	 * 'LIMIT n' makes NOT EXISTS true when n <= 0, and doesn't affect the
+	 * outcome when n > 0. Return true to be ANDed into the parent qual if n <=
+	 * 0. If there's a LIMIT with positive value (or NULL), though, just ignore
+	 * such clauses.
+	 *
+	 */
+	if (subselect->limitCount != NULL)
+	{
+
+		Node    *node = eval_const_expressions(root, subselect->limitCount);
+
+		subselect->limitCount = node;
+
+		if (IsA(node, Const))
+		{
+			Const   *limit = (Const *) node;
+
+			Assert(limit->consttype == INT8OID);
+			if (!limit->constisnull && DatumGetInt64(limit->constvalue) <= 0)
+				return makeBoolConst(true, false);
+
+			subselect->limitCount = NULL;
+		}
+	}
+
+	if (safe_to_convert_NOT_EXISTS(subselect, &ctx1))
 	{
 
 		/* Delete ORDER BY and DISTINCT. */
 		cdbsubselect_drop_orderby(subselect);
 		cdbsubselect_drop_distinct(subselect);
-
-		/*
-		 * 'LIMIT n' makes NOT EXISTS true when n <= 0, and doesn't affect the
-		 * outcome when n > 0.  Delete subquery's LIMIT and build (0 < n) expr to
-		 * be ANDed into the parent qual.
-		 *
-		 */
-		if (subselect->limitCount != NULL)
-		{
-			Node	   *limitqual = NULL;
-			Expr	   *lnode;
-			Expr	   *rnode;
-
-			/* Do not handle limit offset for now */
-			Assert(!subselect->limitOffset);
-
-			rnode = copyObject(subselect->limitCount);
-			IncrementVarSublevelsUp((Node *) rnode, -1, 1);
-			lnode = (Expr *) makeConst(INT8OID, -1, sizeof(int64), Int64GetDatum(0),
-									   false, true);
-			limitqual = (Node *) make_opclause(Int8LessOperator, BOOLOID, false, lnode, rnode);
-
-			subselect->limitCount = NULL;
-
-			return (Node *) make_notclause((Expr *) limitqual);
-		}
 
 		/*
 		 * Trivial NOT EXISTS subquery without a LIMIT can be eliminated altogether.
@@ -1694,6 +1694,89 @@ find_nonnullable_vars_walker(Node *node, NonNullableVarsContext *context)
 }
 
 
+/*
+ * This function is used to determine whether the parameters of an expression in
+ * ALL Sublink can be NULL.
+ */
+static bool
+is_param_nullable(Node *node, Query *query, Value *oprname)
+{
+	bool result = false;
+	NonNullableVarsContext context;
+	Expr *expr;
+	ListCell *lc;
+	Expr *arg;
+
+	Assert(query);
+	context.query = query;
+	context.nonNullableVars = NIL;
+
+	/* Find nullable vars in the jointree */
+	expression_tree_walker((Node *) query->jointree, find_nonnullable_vars_walker, &context);
+
+	/*
+	 * A null value "not in / > all / < all" a non-empty set, the result is
+	 * always false, but a null value "not in / > all / < all" a empty set, the
+	 * result is always true. So if the param is nullable, we should not make
+	 * the locus as "Partitioned".
+	 * If the sql is "... a not in (select ...)", the node should be a BoolExpr.
+	 * if the sql is "... a < all (select ...), the node should be a OpExpr"
+	 */
+	if (nodeTag(node) == T_BoolExpr)
+	{
+		if(((BoolExpr *) node)->boolop != NOT_EXPR)
+			return false;
+		expr = lfirst(list_head(((BoolExpr*) node)->args));
+	}
+	else if (nodeTag(node) == T_OpExpr)
+	{
+		expr = (Expr *) node;
+	}
+	else
+		return true;
+
+	if (nodeTag(expr) != T_OpExpr)
+		return true;
+
+	foreach(lc, ((OpExpr*)expr)->args)
+	{
+		arg = lfirst(lc);
+
+		if (nodeTag(arg) == T_RelabelType)
+			arg = ((RelabelType*)arg)->arg;
+
+		if (nodeTag(arg) == T_Param)
+			continue;
+		else if (nodeTag(arg) == T_Const)
+		{
+			/*
+			 * Is the constant entry in the targetlist null?
+			 */
+			Const	   *constant = (Const *) arg;
+
+			/*
+			 * Note: the 'dummy' column is not NULL, so we don't need any special handling for it
+			 */
+			if (constant->constisnull == true)
+				result = true;
+		}
+		else if (nodeTag(arg) == T_Var)
+		{
+			Var		   *var = (Var *) arg;
+
+			/* Was this var determined to be non-nullable? */
+			if (!list_member(context.nonNullableVars, var))
+			{
+				result = true;
+			}
+		}
+		else
+			result = true;
+	}
+
+	return result;
+}
+
 /**
  * This method determines if the targetlist of a query is nullable.
  * Consider a query of the form: select t1.x, t2.y from t1, t2 where t1.x > 5
@@ -1818,9 +1901,14 @@ convert_IN_to_antijoin(PlannerInfo *root, List **rtrlist_inout __attribute__((un
 		bool		inner_nullable = is_targetlist_nullable(subselect);
 		JoinExpr   *join_expr = make_join_expr(larg, subq_indx, JOIN_LASJ_NOTIN);
 
+		ListCell   *lc = list_head(sublink->operName);
+		bool		outer_nullable = is_param_nullable(sublink->testexpr,
+										   root->parse,
+										   lc? list_head(sublink->operName)->data.ptr_value : NULL);
+
 		join_expr->quals = make_lasj_quals(root, sublink, subq_indx);
 
-		if (inner_nullable)
+		if (inner_nullable || outer_nullable)
 		{
 			join_expr->quals = add_null_match_clause(join_expr->quals);
 		}

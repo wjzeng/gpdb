@@ -10,6 +10,8 @@ from gppylib.operations.unix import CheckDir, CheckFile, ListFiles, ListFilesByP
 from gppylib.operations.utils import RemoteOperation, ParallelOperation
 from gppylib.operations.backup_utils import *
 
+from pygresql.pg import DatabaseError
+
 logger = gplog.get_default_logger()
 
 FULL_DUMP_TS_WITH_NBU = None
@@ -146,7 +148,7 @@ def get_partition_state_tuples(context, catalog_schema, partition_info):
 
         Thus, partition state returns 0 also when the aoseg relation is empty.
         Why is that correct?
-        A table that as a modcount of 0 can only be there iff the last operation
+        A table that has a modcount of 0 can only be there iff the last operation
         was a special operation (TRUNCATE, CREATE, ALTER TABLE). That is handled
         in a special way by backup. Every DML operation will increase the
         modcount by 1. Therefore it is save to assume that to relations with
@@ -155,6 +157,41 @@ def get_partition_state_tuples(context, catalog_schema, partition_info):
 
         The result is a list of tuples, of the format:
         (schema_schema, partition_name, modcount)
+    """
+    partition_list = list()
+
+    dburl = dbconn.DbURL(port=context.master_port, dbname=context.target_db)
+    num_sqls = 0
+    with dbconn.connect(dburl) as conn:
+        for (oid, schemaname, partition_name, tupletable) in partition_info:
+            try:
+                modcount_sql = "select to_char(coalesce(sum(modcount::bigint), 0), '999999999999999999999') from %s.%s" % (catalog_schema, tupletable)
+                modcount = execSQLForSingleton(conn, modcount_sql)
+            except DatabaseError as e:
+                if "does not exist" in str(e):
+                    logger.info("Table %s.%s (%s) no longer exists and will not be analyzed", schemaname, partition_name, tupletable)
+                else:
+                    logger.error(str(e))
+                # If there's an exception, the transaction is closed so we need to reconnect
+                conn = dbconn.connect(dburl)
+            else:
+                num_sqls += 1
+                if num_sqls == 1000: # The choice of batch size was chosen arbitrarily
+                    logger.debug('Completed executing batch of 1000 tuple count SQLs')
+                    conn.commit()
+                    num_sqls = 0
+                if modcount:
+                    modcount = modcount.strip()
+                validate_modcount(schemaname, partition_name, modcount)
+                partition_list.append((schemaname, partition_name, modcount))
+
+    return partition_list
+
+def get_partition_state(context, catalog_schema, partition_info):
+    """
+    A legacy version of get_partition_state_tuples() that returns a list of strings
+    instead of tuples. Should not be used in new code, because the string
+    representation doesn't handle schema or table names with commas.
     """
     partition_list = list()
 
@@ -174,15 +211,7 @@ def get_partition_state_tuples(context, catalog_schema, partition_info):
             validate_modcount(schemaname, partition_name, modcount)
             partition_list.append((schemaname, partition_name, modcount))
 
-    return partition_list
-
-def get_partition_state(context, catalog_schema, partition_info):
-    """
-    A legacy version of get_partition_state_tuples() that returns a list of strings
-    instead of tuples. Should not be used in new code, because the string
-    representation doesn't handle schema or table names with commas.
-    """
-    tuples = get_partition_state_tuples(context, catalog_schema, partition_info)
+    tuples = partition_list
 
     # Don't put space after comma, which can mess up with the space in schema and table name
     return map((lambda x: '%s, %s, %s' % x), tuples)
@@ -772,13 +801,16 @@ class PostDumpDatabase(Operation):
         operations = []
         primaries = self.context.get_current_primaries()
         for seg in primaries:
-            status_file = self.context.generate_filename("status", timestamp=timestamp, dbid=seg.getSegmentDbId())
-            dump_file = self.context.generate_filename("dump", timestamp=timestamp, dbid=seg.getSegmentDbId())
-            operations.append(RemoteOperation(PostDumpSegment(self.context, status_file, dump_file), seg.getSegmentHostName()))
+            dbid = seg.getSegmentDbId()
+            status_file = self.context.generate_filename("status", timestamp=timestamp, dbid=dbid)
+            dump_file = self.context.generate_filename("dump", timestamp=timestamp, dbid=dbid)
+            operations.append(RemoteOperation(PostDumpSegment(self.context, status_file, dump_file), seg.getSegmentHostName(), "dbid %s"%dbid))
 
         ParallelOperation(operations, self.context.batch_default).run()
 
         success = 0
+        failed_dbids = []
+
         for remote in operations:
             host = remote.host
             status_file = remote.operation.status_file
@@ -786,16 +818,20 @@ class PostDumpDatabase(Operation):
             try:
                 remote.get_ret()
             except NoStatusFile, e:
-                logger.warn('Status file %s not found on %s' % (status_file, host))
+                logger.warn('Status file %s not found on %s for %s' % (status_file, host, remote.msg_ctx))
+                failed_dbids.append(remote.msg_ctx)
             except StatusFileError, e:
-                logger.warn('Status file %s on %s indicates errors' % (status_file, host))
+                logger.warn('Status file %s on %s indicates errors for %s' % (status_file, host, remote.msg_ctx))
+                failed_dbids.append(remote.msg_ctx)
             except NoDumpFile, e:
-                logger.warn('Dump file %s not found on %s' % (dump_file, host))
+                logger.warn('Dump file %s not found on %s for %s' % (dump_file, host, remote.msg_ctx))
+                failed_dbids.append(remote.msg_ctx)
             else:
                 success += 1
 
         if success < len(operations):
             logger.warn("Dump was unsuccessful. %d segment(s) failed post-dump checks." % (len(operations) - success))
+            logger.warn("The following segments had failed checks: %s" % str(failed_dbids))
             return {'exit_status': 1, 'timestamp': timestamp}
         return {'exit_status': 0, 'timestamp': timestamp}
 

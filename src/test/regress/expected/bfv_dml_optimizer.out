@@ -32,14 +32,12 @@ explain update update_pk_test set a = 5;
          ->  Sort  (cost=0.00..431.00 rows=1 width=22)
                Sort Key: (DMLAction)
                ->  Redistribute Motion 3:3  (slice1; segments: 3)  (cost=0.00..431.00 rows=1 width=22)
-                     Hash Key: "outer".a
-                     ->  Result  (cost=0.00..431.00 rows=1 width=22)
-                           ->  Split  (cost=0.00..431.00 rows=1 width=22)
-                                 ->  Result  (cost=0.00..431.00 rows=1 width=22)
-                                       ->  Table Scan on update_pk_test  (cost=0.00..431.00 rows=1 width=18)
- Settings:  optimizer=on
- Optimizer status: PQO version 2.48.0
-(12 rows)
+                     Hash Key: public.update_pk_test.a
+                     ->  Split  (cost=0.00..431.00 rows=1 width=22)
+                           ->  Result  (cost=0.00..431.00 rows=1 width=22)
+                                 ->  Table Scan on update_pk_test  (cost=0.00..431.00 rows=1 width=18)
+ Optimizer status: PQO version 3.39.0
+(10 rows)
 
 update update_pk_test set a = 5;
 select * from update_pk_test order by 1,2;

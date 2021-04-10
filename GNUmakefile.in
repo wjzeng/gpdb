@@ -7,12 +7,13 @@
 subdir =
 top_builddir = .
 include $(top_builddir)/src/Makefile.global
-
+OS := $(shell uname -s)
 
 all:
 #	$(MAKE) -C doc all
 	$(MAKE) -C src all
 	$(MAKE) -C config all
+	$(MAKE) -C contrib/amcheck all
 	$(MAKE) -C contrib/xlogdump all
 	$(MAKE) -C contrib/changetrackingdump all
 	$(MAKE) -C contrib/formatter all
@@ -20,7 +21,12 @@ all:
 	$(MAKE) -C contrib/fuzzystrmatch all
 	$(MAKE) -C contrib/extprotocol all	
 	$(MAKE) -C contrib/citext all	
+ifeq ($(OS),Darwin)
+	@echo "dblink can't be built on Mac"
+else
 	$(MAKE) -C contrib/dblink all
+endif
+	$(MAKE) -C contrib/gp_error_handling all
 	$(MAKE) -C contrib/gp_sparse_vector all
 	$(MAKE) -C contrib/gp_distribution_policy all
 	$(MAKE) -C contrib/gp_inject_fault all
@@ -40,6 +46,7 @@ install:
 #	$(MAKE) -C doc $@
 	$(MAKE) -C src $@
 	$(MAKE) -C config $@
+	$(MAKE) -C contrib/amcheck $@
 	$(MAKE) -C contrib/xlogdump $@
 	$(MAKE) -C contrib/changetrackingdump $@
 	$(MAKE) -C contrib/formatter $@
@@ -47,7 +54,10 @@ install:
 	$(MAKE) -C contrib/fuzzystrmatch $@
 	$(MAKE) -C contrib/extprotocol $@
 	$(MAKE) -C contrib/citext $@
+ifneq ($(OS),Darwin)
 	$(MAKE) -C contrib/dblink $@
+endif
+	$(MAKE) -C contrib/gp_error_handling $@
 	$(MAKE) -C contrib/gp_sparse_vector $@
 	$(MAKE) -C contrib/gp_distribution_policy $@
 	$(MAKE) -C contrib/gp_inject_fault $@
@@ -68,6 +78,7 @@ installdirs uninstall:
 #	$(MAKE) -C doc $@
 	$(MAKE) -C src $@
 	$(MAKE) -C config $@
+	$(MAKE) -C contrib/amcheck $@
 	$(MAKE) -C contrib/xlogdump $@
 	$(MAKE) -C contrib/changetrackingdump $@
 	$(MAKE) -C contrib/formatter $@
@@ -75,7 +86,10 @@ installdirs uninstall:
 	$(MAKE) -C contrib/fuzzystrmatch $@
 	$(MAKE) -C contrib/extprotocol $@
 	$(MAKE) -C contrib/citext $@
+ifneq ($(OS),Darwin)
 	$(MAKE) -C contrib/dblink $@
+endif
+	$(MAKE) -C contrib/gp_error_handling $@
 	$(MAKE) -C contrib/gp_sparse_vector $@
 	$(MAKE) -C contrib/gp_distribution_policy $@
 	$(MAKE) -C contrib/gp_inject_fault $@
@@ -100,6 +114,7 @@ clean:
 	$(MAKE) -C contrib $@
 	$(MAKE) -C src $@
 	$(MAKE) -C config $@
+	$(MAKE) -C contrib/amcheck $@
 	$(MAKE) -C contrib/xlogdump $@
 	$(MAKE) -C contrib/changetrackingdump $@
 	$(MAKE) -C contrib/formatter $@
@@ -107,7 +122,10 @@ clean:
 	$(MAKE) -C contrib/fuzzystrmatch $@
 	$(MAKE) -C contrib/extprotocol $@
 	$(MAKE) -C contrib/citext $@
+ifneq ($(OS),Darwin)
 	$(MAKE) -C contrib/dblink $@
+endif
+	$(MAKE) -C contrib/gp_error_handling $@
 	$(MAKE) -C contrib/gp_sparse_vector $@
 	$(MAKE) -C contrib/gp_distribution_policy $@
 	$(MAKE) -C contrib/gp_inject_fault $@
@@ -154,10 +172,13 @@ installcheck-world:
 	$(MAKE) -C src/pl installcheck
 	#$(MAKE) -C src/interfaces/ecpg installcheck
 	#$(MAKE) -C contrib installcheck
+	$(MAKE) -C contrib/amcheck installcheck
 	$(MAKE) -C contrib/formatter_fixedwidth installcheck
 	$(MAKE) -C contrib/extprotocol installcheck
 	$(MAKE) -C contrib/citext installcheck
+ifneq ($(OS),Darwin)
 	$(MAKE) -C contrib/dblink installcheck
+endif
 	$(MAKE) -C contrib/indexscan installcheck
 	$(MAKE) -C contrib/hstore installcheck
 	$(MAKE) -C contrib/pgcrypto installcheck
@@ -187,7 +208,6 @@ destroy-demo-cluster:
 unittest-check:
 	$(MAKE) -C src/backend unittest-check
 	$(MAKE) -C src/bin unittest-check
-	$(MAKE) -C gpAux/extensions unittest-check
 
 
 GNUmakefile: GNUmakefile.in $(top_builddir)/config.status

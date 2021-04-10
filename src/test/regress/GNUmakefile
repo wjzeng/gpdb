@@ -146,7 +146,7 @@ endif
 
 # And finally some extra C modules...
 
-all: all-spi tablespace-setup includecheck hooktest query_info_hook_test
+all: all-spi tablespace-setup hooktest query_info_hook_test
 
 .PHONY: all-spi
 all-spi:
@@ -157,11 +157,6 @@ all-spi:
 tablespace-setup:
 	-rm -rf ./testtablespace
 	mkdir ./testtablespace
-
-# Check for include files that are not being shipped
-.PHONY: includecheck
-includecheck:
-	$(srcdir)/checkinc.py
 
 .PHONY: hooktest
 hooktest:

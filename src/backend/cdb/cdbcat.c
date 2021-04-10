@@ -473,8 +473,7 @@ GpPolicyIsRandomly(GpPolicy *policy)
  * attributes?
  *
  * If the table is distributed randomly, no unique indexing is supported.
- * Otherwise, the set of columns being indexed should be a superset of the
- * policy.
+ * Otherwise, the policy should be a left-subset of the columns being indexed.
  *
  * If the proposed index does not match the distribution policy but the relation
  * is empty and does not have a primary key or unique index, update the
@@ -486,10 +485,9 @@ checkPolicyForUniqueIndex(Relation rel, AttrNumber *indattr, int nidxatts,
 			 			  bool isprimary, bool has_exprs, bool has_pkey,
 						  bool has_ukey)
 {
-	Bitmapset *polbm = NULL;
-	Bitmapset *indbm = NULL;
 	int i;
 	GpPolicy *pol = rel->rd_cdbpolicy;
+	bool compatible = true;
 
 	/* 
 	 * Firstly, unique/primary key indexes aren't supported if we're
@@ -503,30 +501,10 @@ checkPolicyForUniqueIndex(Relation rel, AttrNumber *indattr, int nidxatts,
 						isprimary ? "PRIMARY KEY" : "UNIQUE")));
 	}
 
-	/* 
-	 * We use bitmaps to make intersection tests easier. As noted, order is
-	 * not relevant so looping is just painful.
-	 */
-	for (i = 0; i < pol->nattrs; i++)
-		polbm = bms_add_member(polbm, pol->attrs[i]);
-	for (i = 0; i < nidxatts; i++)
-	{
-		if (indattr[i] < 0)
-        	ereport(ERROR,
-					(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
-					 errmsg("cannot create %s on system column",
-							isprimary ? "primary key" : "unique index")));
-
-		indbm = bms_add_member(indbm, indattr[i]);
-	}
-
-	Assert(bms_membership(polbm) != BMS_EMPTY_SET);
-	Assert(bms_membership(indbm) != BMS_EMPTY_SET);
-
-	/* 
-	 * If the existing policy is not a subset, we must either error out or
+	/*
+	 * If the existing policy is not a left-subset, we must either error out or
 	 * update the distribution policy. It might be tempting to say that even
-	 * when the policy is a subset, we should update it to match the index
+	 * when the policy is a left-subset, we should update it to match the index
 	 * definition. The problem then is that if the user actually wants a
 	 * distribution on (a, b) but then creates an index on (a, b, c) we'll
 	 * change the policy underneath them.
@@ -534,16 +512,36 @@ checkPolicyForUniqueIndex(Relation rel, AttrNumber *indattr, int nidxatts,
 	 * What is really needed is a new field in gp_distribution_policy telling us
 	 * if the policy has been explicitly set.
 	 */
-	if (!bms_is_subset(polbm, indbm))
+	Assert(nidxatts > 0 && pol->nattrs > 0);
+
+	if (nidxatts < pol->nattrs)
+		compatible = false;
+
+	for (i = 0; i < pol->nattrs; i++)
+	{
+		if (indattr[i] < 0)
+        	ereport(ERROR,
+					(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
+					 errmsg("cannot create %s on system column",
+							isprimary ? "primary key" : "unique index")));
+
+		if (indattr[i] != pol->attrs[i])
+		{
+			compatible = false;
+			break;
+		}
+	}
+
+	if (!compatible)
 	{
 		if (cdbRelMaxSegSize(rel) != 0 || has_pkey || has_ukey || has_exprs)
 		{
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
-					 errmsg("%s must contain all columns in the "
-							"distribution key of relation \"%s\"",
-							isprimary ? "PRIMARY KEY" : "UNIQUE index",
-						RelationGetRelationName(rel))));
+					 errmsg("The existing distribution key of \"%s\""
+							" must be equal to or a left-subset of the %s",
+							RelationGetRelationName(rel),
+							isprimary ? "PRIMARY KEY" : "UNIQUE index")));
 		}
 		else
 		{

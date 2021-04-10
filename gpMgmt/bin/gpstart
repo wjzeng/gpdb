@@ -38,7 +38,6 @@ try:
 except ImportError, e:
     sys.exit('Cannot import modules.  Please check that you have sourced greenplum_path.sh.  Detail: ' + str(e))
 
-DEFAULT_NUM_WORKERS = 64
 logger = get_default_logger()
 
 
@@ -49,7 +48,7 @@ class GpStart:
                  wrapper,
                  wrapper_args,
                  skip_standby_check,
-                 parallel=DEFAULT_NUM_WORKERS,
+                 parallel=gp.DEFAULT_GPSTART_NUM_WORKERS,
                  quiet=False,
                  masteronly=False,
                  interactive=False,
@@ -123,12 +122,19 @@ class GpStart:
             if self.masteronly:
                 return 0
 
+            num_workers = min(len(self.gparray.get_hostlist()), self.parallel)
+            # We check for unreachable segment hosts first thing, because if a host is down but its segments
+            # are marked up, later checks can return invalid or misleading results and the cluster may not
+            # start in a good state.
+            unreachable_hosts = self.get_unreachable_segment_hosts(num_workers)
+            if unreachable_hosts:
+                self.mark_segments_down_for_unreachable_hosts(unreachable_hosts)
+
             if self.skip_heap_checksum_validation:
                 self.master_checksum_value = None
                 logger.warning("Because of --skip-heap-checksum-validation, the GUC for data_checksums "
                                    "will not be checked between master and segments")
             else:
-                num_workers = min(len(self.gparray.get_hostlist()), self.parallel)
                 self.master_checksum_value = HeapChecksum(gparray=self.gparray, num_workers=num_workers,
                                                           logger=logger).get_master_value()
 
@@ -140,7 +146,7 @@ class GpStart:
                 self.gparray = GpArray.initFromCatalog(self.dburl, utility=True)
 
             if not self.skip_standby_check:
-                self._check_standby_activated()
+                self.check_standby()
             else:
                 logger.info("Skipping Standby activation status checking.")
 
@@ -148,19 +154,13 @@ class GpStart:
             inconsistent_filespace = False
             if filespace_configured:
                 # Check for filespace consistency
-                if not CheckFilespaceConsistency(self.gparray, FileType.TRANSACTION_FILES).run() or \
-                        not CheckFilespaceConsistency(self.gparray, FileType.TEMPORARY_FILES).run():
+                if not CheckFilespaceConsistency(self.gparray, FileType.TRANSACTION_FILES, self.skip_standby_check).run() or \
+                        not CheckFilespaceConsistency(self.gparray, FileType.TEMPORARY_FILES, self.skip_standby_check).run():
                     logger.error('Filespaces are inconsistent. Abort Greenplum Database start.')
                     inconsistent_filespace = True
 
             logger.info("Shutting down master")
-            cmd = gp.GpStop("Shutting down master", masterOnly=True,
-                            fast=True, quiet=logging_is_quiet(),
-                            verbose=logging_is_verbose(),
-                            datadir=self.master_datadir,
-                            logfileDirectory=self.logfileDirectory)
-            cmd.run()
-            logger.debug("results of forcing master shutdown: %s" % cmd)
+            self.shutdown_master_only()
             # TODO: check results of command.
 
             # in order to fail out here we must have filespace configured and also
@@ -259,37 +259,118 @@ class GpStart:
 
         self._remove_postmaster_tmpfile(self.port)
 
+    def shutdown_master_only(self):
+        cmd = gp.GpStop("Shutting down master", masterOnly=True,
+                        fast=True, quiet=logging_is_quiet(),
+                        verbose=logging_is_verbose(),
+                        datadir=self.master_datadir,
+                        parallel=self.parallel,
+                        logfileDirectory=self.logfileDirectory)
+        cmd.run()
+        logger.debug("results of forcing master shutdown: %s" % cmd)
+
     def fetch_tli(self, data_dir_path, remoteHost=None):
         if not remoteHost:
-            controldata = PgControlData("Latest checkpoint's TimeLineID", data_dir_path)
+            controldata = PgControlData("fetching pg_controldata locally", data_dir_path)
         else:
-            controldata = PgControlData("Latest checkpoint's TimeLineID", data_dir_path, REMOTE, remoteHost)
+            controldata = PgControlData("fetching pg_controldata remotely", data_dir_path, REMOTE, remoteHost)
 
         controldata.run(validateAfter=True)
         return int(controldata.get_value("Latest checkpoint's TimeLineID"))
 
-    def _check_standby_activated(self):
+    class StandbyUnreachable(Exception):
+        pass
+
+    def _standby_activated(self):
         logger.debug("Checking if standby has been activated...")
 
-        if self.gparray.standbyMaster:
+        if not self.gparray.standbyMaster:
+            return False
 
-            # fetch timelineids for both primary and standby (post-promote)
-            primary_tli = self.fetch_tli(self.master_datadir)
+        # fetch timelineids for both primary and standby (post-promote)
+        primary_tli = self.fetch_tli(self.master_datadir)
+        try:
             standby_tli = self.fetch_tli(self.gparray.standbyMaster.getSegmentDataDirectory(),
                                          self.gparray.standbyMaster.getSegmentHostName())
+        except base.ExecutionError as err:
+            raise GpStart.StandbyUnreachable(err)
 
-            logger.debug("Primary TLI = %d" % primary_tli)
-            logger.debug("Standby TLI = %d" % standby_tli)
+        logger.debug("Primary TLI = %d" % primary_tli)
+        logger.debug("Standby TLI = %d" % standby_tli)
+        return primary_tli < standby_tli
 
-            if primary_tli < standby_tli:
-                # stop the master we've started up.
-                cmd = gp.GpStop("Shutting down master", masterOnly=True,
-                                fast=True, quiet=logging_is_quiet(),
-                                verbose=logging_is_verbose(),
-                                datadir=self.master_datadir)
-                cmd.run(validateAfter=True)
-                logger.info("Master Stopped...")
-                raise ExceptionNoStackTraceNeeded("Standby activated, this node no more can act as master.")
+    def check_standby(self):
+        try:
+            standby_activated = self._standby_activated()
+        except GpStart.StandbyUnreachable as err:
+            logger.warning("Standby host is unreachable, cannot determine whether the standby is currently acting as the master. Received error: %s" % err)
+            logger.warning("Continue only if you are certain that the standby is not acting as the master.")
+            if not self.interactive or not userinput.ask_yesno(None, "\nContinue with startup", 'N'):
+                if not self.interactive:
+                    logger.warning("Non interactive mode detected. Not starting the cluster. Start the cluster in interactive mode.")
+                self.shutdown_master_only()
+                raise UserAbortedException()
+
+            # If the user wants to continue when the standby is unreachable,
+            # set skip_standby_check so that checking filespaces does not fail.
+            # To prevent starting the unreachable standy later in the startup
+            # process set start_standby to False.
+            self.skip_standby_check = True
+            self.start_standby = False
+            return
+
+        if not standby_activated:
+            return
+
+        # stop the master we've started up.
+        cmd = gp.GpStop("Shutting down master", masterOnly=True,
+                        fast=True, quiet=logging_is_quiet(),
+                        verbose=logging_is_verbose(),
+                        datadir=self.master_datadir,
+                        parallel=self.parallel)
+        cmd.run(validateAfter=True)
+        logger.info("Master Stopped...")
+        raise ExceptionNoStackTraceNeeded("Standby activated, this node no more can act as master.")
+
+    def get_unreachable_segment_hosts(self, num_workers):
+        hostlist = set(self.gparray.get_hostlist(includeMaster=False))
+
+        pool = base.WorkerPool(numWorkers=num_workers)
+        try:
+            for host in hostlist:
+                cmd = Command(name='check %s is up' % host, cmdStr="ssh %s 'echo %s'" % (host, host))
+                pool.addCommand(cmd)
+            pool.join()
+        finally:
+            pool.haltWork()
+            pool.joinWorkers()
+
+        # There's no good way to map a CommandResult back to its originating Command so instead
+        # of looping through and finding the hosts that errored out, we remove any hosts that
+        # succeeded from the hostlist and any remaining hosts will be ones that were unreachable.
+        for item in pool.getCompletedItems():
+            result = item.get_results()
+            if result.rc == 0:
+                host = result.stdout.strip()
+                hostlist.remove(host)
+
+        if len(hostlist) > 0:
+            logger.warning("One or more hosts are not reachable via SSH.  Any segments on those hosts will be marked down")
+            for host in sorted(hostlist):
+                logger.warning("Host %s is unreachable" % host)
+            return hostlist
+        return None
+
+    def mark_segments_down_for_unreachable_hosts(self, unreachable_hosts):
+        # We only mark the segment down in gparray for use by later checks, as
+        # setting the actual segment down in gp_segment_configuration leads to
+        # an inconsistent state and may prevent the database from starting.
+        for segment in self.gparray.segments:
+            for seg in [segment.primaryDB] + segment.mirrorDBs:
+                host = seg.getSegmentHostName()
+                if host in unreachable_hosts:
+                    logger.warning("Marking segment %d down because %s is unreachable" % (seg.dbid, host))
+                    seg.setSegmentStatus(STATUS_DOWN)
 
     ######
     def _recovery_startup(self):
@@ -329,7 +410,7 @@ class GpStart:
         gp.GpStop.local("forcing master shutdown", masterOnly=True,
                         verbose=logging_is_verbose,
                         quiet=self.quiet, fast=False,
-                        force=True, datadir=self.master_datadir)
+                        force=True, datadir=self.master_datadir, parallel=self.parallel)
 
     ######
     def _remove_postmaster_tmpfile(self, port):
@@ -457,7 +538,7 @@ class GpStart:
         # this will eventually start gpsegstart.py
         segmentStartOp = StartSegmentsOperation(self.pool, self.quiet, localeData, self.gpversion,
                                                 self.gphome, self.master_datadir, self.master_checksum_value,
-                                                self.timeout, self.specialMode, self.wrapper, self.wrapper_args,
+                                                self.timeout, self.specialMode, self.wrapper, self.wrapper_args, self.parallel,
                                                 logfileDirectory=self.logfileDirectory)
         segmentStartResult = segmentStartOp.startSegments(self.gparray, segmentsToStart, startMode, self.era)
 
@@ -496,11 +577,6 @@ class GpStart:
 
         # segments marked down
         invalid_segs = self.gparray.get_invalid_segdbs()
-
-        inactiveDbIds = {}
-        for segment in invalid_segs:
-            inactiveDbIds[segment.getSegmentDbId()] = True
-        invalid_segs = [segment for segment in invalid_segs if inactiveDbIds.get(segment.getSegmentDbId()) is None]
 
         # now produce the list of segments to actually start
         dbIdsToNotStart = {}
@@ -823,8 +899,8 @@ class GpStart:
                          help='start master instance only in maintenance mode')
         addTo.add_option('-y', '--no_standby', dest="start_standby", action='store_false', default=True,
                          help='do not start master standby server')
-        addTo.add_option('-B', '--parallel', type="int", default=DEFAULT_NUM_WORKERS, metavar="<parallel_processes>",
-                         help='number of segment hosts to run in parallel. Default is %d' % DEFAULT_NUM_WORKERS)
+        addTo.add_option('-B', '--parallel', type="int", default=gp.DEFAULT_GPSTART_NUM_WORKERS, metavar="<parallel_processes>",
+                         help='number of segment hosts to run in parallel. Default is %d' % gp.DEFAULT_GPSTART_NUM_WORKERS)
         addTo.add_option('-R', '--restricted', action='store_true',
                          help='start in restricted mode. Only users with superuser privilege are allowed to connect.')
         addTo.add_option('-t', '--timeout', dest='timeout', default=SEGMENT_TIMEOUT_DEFAULT, type='int',

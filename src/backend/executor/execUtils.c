@@ -77,7 +77,7 @@
 #include "utils/metrics_utils.h"
 
 static void ShutdownExprContext(ExprContext *econtext);
-
+static List *flatten_logic_exprs(Node *node);
 
 /* ----------------------------------------------------------------
  *				 Executor state and memory management functions
@@ -1317,6 +1317,118 @@ ExecGetShareNodeEntry(EState* estate, int shareidx, bool fCreate)
 	return (ShareNodeEntry *) list_nth(*estate->es_sharenode, shareidx);
 }
 
+/*
+ * flatten_logic_exprs
+ * This function is only used by ExecPrefetchJoinQual.
+ * ExecPrefetchJoinQual need to prefetch subplan in join
+ * qual that contains motion to materialize it to avoid
+ * motion deadlock. This function is going to flatten
+ * the bool exprs to avoid shortcut of bool logic.
+ * An example is:
+ * (a and b or c) or (d or e and f or g) and (h and i or j)
+ * will be transformed to
+ * (a, b, c, d, e, f, g, h, i, j).
+ */
+static List *
+flatten_logic_exprs(Node *node)
+{
+	if (node == NULL)
+		return NIL;
+
+	if (IsA(node, BoolExprState))
+	{
+		BoolExprState *be = (BoolExprState *) node;
+		return flatten_logic_exprs((Node *) (be->args));
+	}
+
+	if (IsA(node, List))
+	{
+		List     *es = (List *) node;
+		List     *result = NIL;
+		ListCell *lc = NULL;
+
+		foreach(lc, es)
+		{
+			Node *n = (Node *) lfirst(lc);
+			result = list_concat(result,
+								 flatten_logic_exprs(n));
+		}
+
+		return result;
+	}
+
+	return list_make1(node);
+}
+
+/*
+ * Prefetch JoinQual to prevent motion hazard.
+ *
+ * A motion hazard is a deadlock between motions, a classic motion hazard in a
+ * join executor is formed by its inner and outer motions, it can be prevented
+ * by prefetching the inner plan, refer to motion_sanity_check() for details.
+ *
+ * A similar motion hazard can be formed by the outer motion and the join qual
+ * motion.  A join executor fetches a outer tuple, filters it with the join
+ * qual, then repeat the process on all the outer tuples.  When there are
+ * motions in both outer plan and the join qual then below state is possible:
+ *
+ * 0. processes A and B belong to the join slice, process C belongs to the
+ *    outer slice, process D belongs to the JoinQual slice;
+ * 1. A has read the first outer tuple and is fetching tuples from D;
+ * 2. D is waiting for ACK from B;
+ * 3. B is fetching the first outer tuple from C;
+ * 4. C is waiting for ACK from A;
+ *
+ * So a deadlock is formed A->D->B->C->A.  We can prevent it also by
+ * prefetching the join qual.
+ *
+ * An example is demonstrated and explained in test case
+ * src/test/regress/sql/deadlock2.sql.
+ *
+ * Return true if the JoinQual is prefetched.
+ */
+void
+ExecPrefetchJoinQual(JoinState *node)
+{
+	EState	   *estate = node->ps.state;
+	ExprContext *econtext = node->ps.ps_ExprContext;
+	PlanState  *inner = innerPlanState(node);
+	PlanState  *outer = outerPlanState(node);
+	List	   *joinqual = node->joinqual;
+	TupleTableSlot *innertuple = econtext->ecxt_innertuple;
+
+	ListCell   *lc = NULL;
+	List       *quals = NIL;
+
+	Assert(joinqual);
+
+	/* Outer tuples should not be fetched before us */
+	Assert(econtext->ecxt_outertuple == NULL);
+
+	/* Build fake inner & outer tuples */
+	econtext->ecxt_innertuple = ExecInitNullTupleSlot(estate,
+													  ExecGetResultType(inner));
+	econtext->ecxt_outertuple = ExecInitNullTupleSlot(estate,
+													  ExecGetResultType(outer));
+
+	quals = flatten_logic_exprs((Node *) joinqual);
+
+	/* Fetch subplan with the fake inner & outer tuples */
+	foreach(lc, quals)
+	{
+		/*
+		 * Force every joinqual is prefech because
+		 * our target is to materialize motion node.
+		 */
+		ExprState  *clause = (ExprState *) lfirst(lc);
+		(void) ExecQual(list_make1(clause), econtext, false);
+	}
+
+	/* Restore previous state */
+	econtext->ecxt_innertuple = innertuple;
+	econtext->ecxt_outertuple = NULL;
+}
+
 /* ----------------------------------------------------------------
  *		CDB Slice Table utilities
  * ----------------------------------------------------------------
@@ -1484,7 +1596,8 @@ InitRootSlices(QueryDesc *queryDesc)
 			{
 				case CMD_SELECT:
 					Assert(slice->gangType == GANGTYPE_UNALLOCATED && slice->gangSize == 0);
-					if (queryDesc->plannedstmt->intoClause != NULL)
+					if (queryDesc->plannedstmt->intoClause != NULL ||
+						queryDesc->plannedstmt->copyIntoClause != NULL)
 					{
 						slice->gangType = GANGTYPE_PRIMARY_WRITER;
 						slice->gangSize = getgpsegmentCount();
@@ -1629,7 +1742,7 @@ AssignGangs(QueryDesc *queryDesc)
 			}
 			else
 			{
-				inv.vecNgangs[i] = AllocateReaderGang(GANGTYPE_PRIMARY_READER, queryDesc->portal_name);
+				inv.vecNgangs[i] = AllocateReaderGang(GANGTYPE_PRIMARY_READER, queryDesc->portal_name, estate);
 			}
 		}
 	}
@@ -1638,7 +1751,7 @@ AssignGangs(QueryDesc *queryDesc)
 		inv.vec1gangs_primary_reader = (Gang **) palloc(sizeof(Gang *) * inv.num1gangs_primary_reader);
 		for (i = 0; i < inv.num1gangs_primary_reader; i++)
 		{
-			inv.vec1gangs_primary_reader[i] = AllocateReaderGang(GANGTYPE_SINGLETON_READER, queryDesc->portal_name);
+			inv.vec1gangs_primary_reader[i] = AllocateReaderGang(GANGTYPE_SINGLETON_READER, queryDesc->portal_name, estate);
 		}
 	}
 	if (inv.num1gangs_entrydb_reader > 0)
@@ -1646,7 +1759,7 @@ AssignGangs(QueryDesc *queryDesc)
 		inv.vec1gangs_entrydb_reader = (Gang **) palloc(sizeof(Gang *) * inv.num1gangs_entrydb_reader);
 		for (i = 0; i < inv.num1gangs_entrydb_reader; i++)
 		{
-			inv.vec1gangs_entrydb_reader[i] = AllocateReaderGang(GANGTYPE_ENTRYDB_READER, queryDesc->portal_name);
+			inv.vec1gangs_entrydb_reader[i] = AllocateReaderGang(GANGTYPE_ENTRYDB_READER, queryDesc->portal_name, estate);
 		}
 	}
 
@@ -1680,7 +1793,7 @@ ReleaseGangs(QueryDesc *queryDesc)
 {
 	Assert(queryDesc != NULL);
 
-	freeGangsForPortal(queryDesc->portal_name);
+	freeGangsForPortal(queryDesc->portal_name, queryDesc->estate);
 }
 
 
@@ -1906,6 +2019,21 @@ void mppExecutorFinishup(QueryDesc *queryDesc)
 
 	currentSlice = getCurrentSlice(estate, LocallyExecutingSliceIndex(estate));
 
+	/* Teardown the Interconnect */
+	if (estate->es_interconnect_is_setup)
+	{
+		/*
+		 * MPP-3413: If we got here during cancellation of a cursor,
+		 * we need to set the "forceEos" argument correctly --
+		 * otherwise we potentially hang (cursors cancel on the QEs,
+		 * mark the estate to "cancelUnfinished" and then try to do a
+		 * normal interconnect teardown).
+		 */
+		TeardownInterconnect(estate->interconnect_context, estate->motionlayer_context, estate->cancelUnfinished, false);
+		estate->interconnect_context = NULL;
+		estate->es_interconnect_is_setup = false;
+	}
+
 	/*
 	 * If QD, wait for QEs to finish and check their results.
 	 */
@@ -2008,20 +2136,6 @@ void mppExecutorFinishup(QueryDesc *queryDesc)
 		 */
 		cdbdisp_finishCommand(estate->dispatcherState);
 	}
-
-	/* Teardown the Interconnect */
-	if (estate->es_interconnect_is_setup)
-	{
-		/*
-		 * MPP-3413: If we got here during cancellation of a cursor,
-		 * we need to set the "forceEos" argument correctly --
-		 * otherwise we potentially hang (cursors cancel on the QEs,
-		 * mark the estate to "cancelUnfinished" and then try to do a
-		 * normal interconnect teardown).
-		 */
-		TeardownInterconnect(estate->interconnect_context, estate->motionlayer_context, estate->cancelUnfinished, false);
-		estate->es_interconnect_is_setup = false;
-	}
 }
 
 /*
@@ -2039,6 +2153,14 @@ void mppExecutorCleanup(QueryDesc *queryDesc)
 	/* GPDB hook for collecting query info */
 	if (query_info_collect_hook && QueryCancelCleanup)
 		(*query_info_collect_hook)(METRICS_QUERY_CANCELING, queryDesc);
+
+	/* Clean up the interconnect. */
+	if (estate && estate->es_interconnect_is_setup)
+	{
+		TeardownInterconnect(estate->interconnect_context, estate->motionlayer_context, true /* force EOS */, true);
+		estate->interconnect_context = NULL;
+		estate->es_interconnect_is_setup = false;
+	}
 
 	/*
 	 * If this query is being canceled, record that when the gpperfmon
@@ -2074,7 +2196,7 @@ void mppExecutorCleanup(QueryDesc *queryDesc)
 	 * Wait for them to finish and clean up the dispatching structures.
 	 * Replace current error info with QE error info if more interesting.
 	 */
-	if (estate->dispatcherState && estate->dispatcherState->primaryResults)
+	if (estate && estate->dispatcherState && estate->dispatcherState->primaryResults)
 	{
 		/*
 		 * If we are finishing a query before all the tuples of the query
@@ -2086,13 +2208,6 @@ void mppExecutorCleanup(QueryDesc *queryDesc)
 			ExecSquelchNode(queryDesc->planstate);
 
 		CdbDispatchHandleError(estate->dispatcherState);
-	}
-
-	/* Clean up the interconnect. */
-	if (estate->es_interconnect_is_setup)
-	{
-		TeardownInterconnect(estate->interconnect_context, estate->motionlayer_context, true /* force EOS */, true);
-		estate->es_interconnect_is_setup = false;
 	}
 
 	/* GPDB hook for collecting query info */

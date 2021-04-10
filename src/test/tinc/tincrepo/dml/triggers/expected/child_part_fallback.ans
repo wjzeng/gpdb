@@ -12,6 +12,6 @@ SELECT * FROM dml_trigger_table order by 2;
  TEST |  10 | a
 (1 row)
 
-\!sed -n '/Planner/p' %MYD%/output/child_part_fallback_orca.out
-psql:%MYD%/output/child_part_fallback_orca.sql:18: LOG:  Planner produced plan :0
-\!sed -n '/Planner/p' %MYD%/output/child_part_fallback_orca.out
+\!sed -n '/Pivotal/p' %MYD%/output/child_part_fallback_orca.out
+psql:%MYD%/output/child_part_fallback_orca.sql:18: LOG: Pivotal Optimizer (GPORCA) failed to produce plan 
+\!sed -n '/Pivotal/p' %MYD%/output/child_part_fallback_orca.out

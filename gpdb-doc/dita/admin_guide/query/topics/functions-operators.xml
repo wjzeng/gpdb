@@ -163,9 +163,9 @@ SELECT foo();
             <table id="in204913">
                 <title>Built-in functions and operators</title>
                 <tgroup cols="4">
-                    <colspec colname="col1" colnum="1" colwidth="129.02*"/>
-                    <colspec colname="col2" colnum="2" colwidth="108*"/>
-                    <colspec colname="col3" colnum="3" colwidth="144*"/>
+                    <colspec colname="col1" colnum="1" colwidth="75*"/>
+                    <colspec colname="col2" colnum="2" colwidth="50*"/>
+                    <colspec colname="col3" colnum="3" colwidth="60*"/>
                     <colspec colname="col4" colnum="4" colwidth="86*"/>
                     <thead>
                         <row>
@@ -457,25 +457,25 @@ SELECT foo();
                                     text)</p>
                                 <p>database_to_xmlschema(nulls boolean, tableforest boolean,
                                     targetns text)</p>
-                                <p>database_to_xml_and_xmlschema(nulls boolean, tableforest boolean,
-                                    targetns text)</p>
+                                <p>database_to_xml_and_xmlschema( nulls boolean, tableforest
+                                    boolean, targetns text)</p>
                                 <p>query_to_xml(query text, nulls boolean, tableforest boolean,
                                     targetns text)</p>
                                 <p>query_to_xmlschema(query text, nulls boolean, tableforest
                                     boolean, targetns text)</p>
-                                <p>query_to_xml_and_xmlschema(query text, nulls boolean, tableforest
-                                    boolean, targetns text)</p>
+                                <p>query_to_xml_and_xmlschema( query text, nulls boolean,
+                                    tableforest boolean, targetns text)</p>
                                 <p>schema_to_xml(schema name, nulls boolean, tableforest boolean,
                                     targetns text)</p>
-                                <p>schema_to_xmlschema(schema name, nulls boolean, tableforest
+                                <p>schema_to_xmlschema( schema name, nulls boolean, tableforest
                                     boolean, targetns text)</p>
-                                <p>schema_to_xml_and_xmlschema(schema name, nulls boolean,
+                                <p>schema_to_xml_and_xmlschema( schema name, nulls boolean,
                                     tableforest boolean, targetns text)</p>
                                 <p>table_to_xml(tbl regclass, nulls boolean, tableforest boolean,
                                     targetns text)</p>
-                                <p>table_to_xmlschema(tbl regclass, nulls boolean, tableforest
+                                <p>table_to_xmlschema( tbl regclass, nulls boolean, tableforest
                                     boolean, targetns text)</p>
-                                <p>table_to_xml_and_xmlschema(tbl regclass, nulls boolean,
+                                <p>table_to_xml_and_xmlschema( tbl regclass, nulls boolean,
                                     tableforest boolean, targetns text)</p>
                                 <p>xmlagg(xml)</p>
                                 <p>xmlconcat(xml[, ...])</p>
@@ -707,7 +707,8 @@ SELECT foo();
         <title id="in184703">Advanced Aggregate Functions</title>
         <body>
             <p>The following built-in advanced aggregate functions are Greenplum extensions of the
-                PostgreSQL database. These functions are <i>immutable</i>.
+                PostgreSQL database. These functions are <i>immutable</i>. Greenplum Database does
+                not support the PostgreSQL ordered-set aggregate functions.
                 <note>The Greenplum MADlib Extension for Analytics provides additional advanced
                     functions to perform statistical analysis and machine learning with Greenplum
                     Database data. See <xref href="../../../ref_guide/extensions/madlib.xml#topic1"
@@ -716,10 +717,10 @@ SELECT foo();
             <table id="in2073121">
                 <title>Advanced Aggregate Functions</title>
                 <tgroup cols="4">
-                    <colspec colname="col1" colnum="1" colwidth="102.44*"/>
+                    <colspec colname="col1" colnum="1" colwidth="75*"/>
                     <colspec colname="col2" colnum="2" colwidth="59*"/>
-                    <colspec colname="col3" colnum="3" colwidth="201.99*"/>
-                    <colspec colname="col4" colnum="4" colwidth="128*"/>
+                    <colspec colname="col3" colnum="3" colwidth="101.99*"/>
+                    <colspec colname="col4" colnum="4" colwidth="90*"/>
                     <thead>
                         <row>
                             <entry colname="col1">Function</entry>
@@ -750,58 +751,10 @@ GROUP BY department_id; </codeblock>
                         </row>
                         <row>
                             <entry colname="col1">
-                                <codeph>PERCENTILE_CONT (<i>expr</i>) WITHIN GROUP (ORDER BY
-                                        <i>expr</i> [DESC/ASC])</codeph>
-                            </entry>
-                            <entry colname="col2">
-                                <codeph>timestamp, timestamptz, interval, float</codeph>
-                            </entry>
-                            <entry colname="col3">
-                                <codeph>PERCENTILE_CONT(<i>percentage</i>) WITHIN GROUP (ORDER BY
-                                        <i>expression</i>)</codeph>
-                                <p>
-                                    <i>Example:</i>
-                                </p>
-                                <codeblock>SELECT department_id,
-PERCENTILE_CONT (0.5) WITHIN GROUP (ORDER BY salary DESC)
-"Median_cont"; 
-FROM employees GROUP BY department_id;</codeblock>
-                            </entry>
-                            <entry colname="col4">Performs an inverse distribution function that
-                                assumes a continuous distribution model. It takes a percentile value
-                                and a sort specification and returns the same datatype as the
-                                numeric datatype of the argument. This returned value is a computed
-                                result after performing linear interpolation. Null are ignored in
-                                this calculation.</entry>
-                        </row>
-                        <row>
-                            <entry colname="col1"><codeph>PERCENTILE_DISC (<i>expr</i>) WITHIN GROUP
-                                    (ORDER BY <i>expr</i> [DESC/ASC])</codeph></entry>
-                            <entry colname="col2">
-                                <codeph>timestamp, timestamptz, interval, float</codeph>
-                            </entry>
-                            <entry colname="col3">
-                                <codeph>PERCENTILE_DISC(<i>percentage</i>) WITHIN GROUP (ORDER BY
-                                        <i>expression</i>)</codeph>
-                                <p>
-                                    <i>Example:</i>
-                                </p>
-                                <codeblock>SELECT department_id, 
-PERCENTILE_DISC (0.5) WITHIN GROUP (ORDER BY salary DESC)
-"Median_desc"; 
-FROM employees GROUP BY department_id;</codeblock>
-                            </entry>
-                            <entry colname="col4">Performs an inverse distribution function that
-                                assumes a discrete distribution model. It takes a percentile value
-                                and a sort specification. This returned value is an element from the
-                                set. Null are ignored in this calculation.</entry>
-                        </row>
-                        <row>
-                            <entry colname="col1">
                                 <codeph>sum(array[])</codeph>
                             </entry>
                             <entry colname="col2">
-                                <codeph>smallint[]int[], bigint[], float[]</codeph>
+                                <codeph>smallint[], int[], bigint[], float[]</codeph>
                             </entry>
                             <entry colname="col3">
                                 <codeph>sum(array[[1,2],[3,4]])</codeph>
@@ -809,8 +762,10 @@ FROM employees GROUP BY department_id;</codeblock>
                                     <i>Example:</i>
                                 </p>
                                 <codeblock>CREATE TABLE mymatrix (myvalue int[]);
-INSERT INTO mymatrix VALUES (array[[1,2],[3,4]]);
-INSERT INTO mymatrix VALUES (array[[0,1],[1,0]]);
+INSERT INTO mymatrix 
+   VALUES (array[[1,2],[3,4]]);
+INSERT INTO mymatrix 
+   VALUES (array[[0,1],[1,0]]);
 SELECT sum(myvalue) FROM mymatrix;
  sum 
 ---------------

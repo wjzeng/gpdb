@@ -35,7 +35,7 @@
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/utils/cache/plancache.c,v 1.23 2008/10/04 21:56:54 tgl Exp $
+ *	  $PostgreSQL: pgsql/src/backend/utils/cache/plancache.c,v 1.27.2.2 2010/01/13 16:57:03 tgl Exp $
  *
  *-------------------------------------------------------------------------
  */
@@ -463,6 +463,13 @@ RevalidateCachedPlanWithParams(CachedPlanSource *plansource, bool useResOwner,
 			plan->dead = true;
 
 		/*
+		 * If the search_path has changed, invalidate the plan
+		 */
+		Assert(plansource->search_path != NULL);
+		if (!OverrideSearchPathMatchesCurrent(plansource->search_path))
+			plan->dead = true;
+
+		/*
 		 * By now, if any invalidation has happened, the inval callback
 		 * functions will have marked the plan dead.
 		 */
@@ -493,14 +500,6 @@ RevalidateCachedPlanWithParams(CachedPlanSource *plansource, bool useResOwner,
 	{
 		Snapshot	saveActiveSnapshot = ActiveSnapshot;
 		List	   *slist;
-
-		/*
-		 * Restore the search_path that was in use when the plan was made.
-		 * See comments for PushOverrideSearchPath about limitations of this.
-		 *
-		 * (XXX is there anything else we really need to restore?)
-		 */
-		PushOverrideSearchPath(plansource->search_path);
 
 		/*
 		 * If a snapshot is already set (the normal case), we can just use
@@ -631,9 +630,6 @@ RevalidateCachedPlanWithParams(CachedPlanSource *plansource, bool useResOwner,
 		PG_END_TRY();
 
 		ActiveSnapshot = saveActiveSnapshot;
-
-		/* Now we can restore current search path */
-		PopOverrideSearchPath();
 
 		/*
 		 * Store the plans into the plancache entry, advancing the generation
@@ -1201,14 +1197,57 @@ PlanCacheSysCallback(Datum arg, int cacheid, ItemPointer tuplePtr)
 void
 ResetPlanCache(void)
 {
-	ListCell   *lc;
+	ListCell   *lc1;
 
-	foreach(lc, cached_plans_list)
+	foreach(lc1, cached_plans_list)
 	{
-		CachedPlanSource *plansource = (CachedPlanSource *) lfirst(lc);
+		CachedPlanSource *plansource = (CachedPlanSource *) lfirst(lc1);
 		CachedPlan *plan = plansource->plan;
+		ListCell   *lc2;
 
-		if (plan)
-			plan->dead = true;
+		/* No work if it's already invalidated */
+		if (!plan || plan->dead)
+			continue;
+
+		/*
+		 * We *must not* mark transaction control statements as dead,
+		 * particularly not ROLLBACK, because they may need to be executed in
+		 * aborted transactions when we can't revalidate them (cf bug #5269).
+		 * In general there is no point in invalidating utility statements
+		 * since they have no plans anyway.  So mark it dead only if it
+		 * contains at least one non-utility statement.
+		 */
+		if (plan->fully_planned)
+		{
+			/* Search statement list for non-utility statements */
+			foreach(lc2, plan->stmt_list)
+			{
+				PlannedStmt *plannedstmt = (PlannedStmt *) lfirst(lc2);
+
+				Assert(!IsA(plannedstmt, Query));
+				if (IsA(plannedstmt, PlannedStmt))
+				{
+					/* non-utility statement, so invalidate */
+					plan->dead = true;
+					break;		/* out of stmt_list scan */
+				}
+			}
+		}
+		else
+		{
+			/* Search Query list for non-utility statements */
+			foreach(lc2, plan->stmt_list)
+			{
+				Query	   *query = (Query *) lfirst(lc2);
+
+				Assert(IsA(query, Query));
+				if (query->commandType != CMD_UTILITY)
+				{
+					/* non-utility statement, so invalidate */
+					plan->dead = true;
+					break;		/* out of stmt_list scan */
+				}
+			}
+		}
 	}
 }

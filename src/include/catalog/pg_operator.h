@@ -336,6 +336,7 @@ DATA(insert OID = 641 (  "~"	   PGNSP PGUID b f f	25	25	16 0 642 textregexeq reg
 DATA(insert OID = 642 (  "!~"	   PGNSP PGUID b f f	25	25	16 0 641 textregexne regexnesel regexnejoinsel ));
 DATA(insert OID = 643 (  "<>"	   PGNSP PGUID b f f	19	19	16 643 93 namene neqsel neqjoinsel ));
 DATA(insert OID = 654 (  "||"	   PGNSP PGUID b f f	25	25	25	 0 0 textcat - - ));
+#define OID_TEXT_CONCAT_OP 654
 
 DATA(insert OID = 660 (  "<"	   PGNSP PGUID b f f	19	19	16 662 663 namelt scalarltsel scalarltjoinsel ));
 DATA(insert OID = 661 (  "<="	   PGNSP PGUID b f f	19	19	16 663 662 namele scalarltsel scalarltjoinsel ));

@@ -6598,6 +6598,11 @@ StartupXLOG(void)
 					ereport(FATAL,
 							(errmsg("could not find redo location referenced by checkpoint record"),
 							 errhint("If you are not restoring from a backup, try removing the file \"%s/backup_label\".", DataDir)));
+				/*
+				 * Reload the checkpoint xlog again since we need to process
+				 * it later.
+				 * */
+				record = ReadCheckpointRecord(checkPointLoc, 0);
 			}
 		}
 		else
@@ -8708,8 +8713,9 @@ CreateCheckPoint(int flags)
 	XLogRecPtr	recptr;
 	XLogCtlInsert *Insert = &XLogCtl->Insert;
 	XLogRecData rdata[6];
-	char* 		dtxCheckPointInfo;
-	int			dtxCheckPointInfoSize;
+	void 		*dataptr[6];
+	/* pnext is used to link the valid XLogRecData */
+	XLogRecData **pnext;
 	uint32		freespace;
 	uint32		_logId;
 	uint32		_logSeg;
@@ -9050,17 +9056,21 @@ CreateCheckPoint(int flags)
 	 * dropped on the master, break the consistency between the master and the standby.
 	 */
 
-	getDtxCheckPointInfoAndLock(&dtxCheckPointInfo, &dtxCheckPointInfoSize);
-
 	rdata[0].data = (char *) (&checkPoint);
 	rdata[0].len = sizeof(checkPoint);
 	rdata[0].buffer = InvalidBuffer;
 	rdata[0].next = &(rdata[1]);
 
-	rdata[1].data = (char *) dtxCheckPointInfo;
-	rdata[1].len = dtxCheckPointInfoSize;
+	{
+		char* 		dtxCheckPointInfo;
+		int			dtxCheckPointInfoSize;
+		getDtxCheckPointInfoAndLock(&dtxCheckPointInfo, &dtxCheckPointInfoSize);
+		rdata[1].data = dtxCheckPointInfo;
+		rdata[1].len = dtxCheckPointInfoSize;
+	}
 	rdata[1].buffer = InvalidBuffer;
 	rdata[1].next = NULL;
+	pnext = &rdata[1].next;
 
 	/*
 	 * Have the master mirror sync code add filespace and tablespace
@@ -9068,17 +9078,31 @@ CreateCheckPoint(int flags)
 	 * as this is a NOOP if we're not the master.
 	 */
 	READ_PERSISTENT_STATE_ORDERED_LOCK;
-	mmxlog_append_checkpoint_data(rdata);
+	/* mmxlog_append_checkpoint_data() may use rdata[2,3,4] */
+	pnext = mmxlog_append_checkpoint_data(&rdata[2], pnext);
 
 	prepared_transaction_agg_state *p = NULL;
 
 	getTwoPhasePreparedTransactionData(&p, "CreateCheckPoint");
 	elog(PersistentRecovery_DebugPrintLevel(), "CreateCheckPoint: prepared transactions = %d", p->count);
+	*pnext = &rdata[5];
 	rdata[5].data = (char*)p;
 	rdata[5].buffer = InvalidBuffer;
 	rdata[5].len = PREPARED_TRANSACTION_CHECKPOINT_BYTES(p->count);
-	rdata[4].next = &(rdata[5]);
 	rdata[5].next = NULL;
+	/*
+	 * Save the data pointers that need to be pfreed after XLogInsert.
+	 * This is essential because rdata[x].data may be changed in XLogInsert.
+	 */
+	MemSet(dataptr, 0, sizeof(dataptr));
+	{
+		XLogRecData *pdata = &rdata[1];
+		for (int i = 0; pdata && i < 6; i++)
+		{
+			dataptr[i] = pdata->data;
+			pdata = pdata->next;
+		}
+	}
 
 	if (Debug_persistent_recovery_print)
 	{
@@ -9111,7 +9135,7 @@ CreateCheckPoint(int flags)
 
 	memset(&ptrd_oldest, 0, sizeof(ptrd_oldest));
 
-	ptrd_oldest_ptr = getTwoPhaseOldestPreparedTransactionXLogRecPtr(&rdata[5]);
+	ptrd_oldest_ptr = getTwoPhaseOldestPreparedTransactionXLogRecPtr(p);
 
 	if (Debug_persistent_recovery_print)
 	{
@@ -9138,7 +9162,12 @@ CreateCheckPoint(int flags)
 			 XLogLastInsertDataLen());
 	}
 
-	freeDtxCheckPointInfoAndUnlock(dtxCheckPointInfo, dtxCheckPointInfoSize, &recptr);
+	freeDtxCheckPointInfoAndUnlock(&recptr);
+	{
+		for (int i = 0; i < 6 && dataptr[i]; i++)
+			pfree(dataptr[i]);
+		p = NULL;
+	}
 
 	XLogFlush(recptr);
 

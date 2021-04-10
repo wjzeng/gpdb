@@ -198,13 +198,7 @@ standard_planner(Query *parse, int cursorOptions, ParamListInfo boundParams)
 		if (gp_log_optimization_time)
 			INSTR_TIME_SET_CURRENT(starttime);
 
-		curMemoryAccountId = MemoryAccounting_GetOrCreateOptimizerAccount();
-
-		START_MEMORY_ACCOUNT(curMemoryAccountId);
-		{
-			result = optimize_query(parse, boundParams);
-		}
-		END_MEMORY_ACCOUNT();
+		result = optimize_query(parse, boundParams);
 
 		if (gp_log_optimization_time)
 		{
@@ -1289,6 +1283,23 @@ grouping_planner(PlannerInfo *root, double tuple_fraction)
 	gp_motion_cost_per_row :
 	2.0 * cpu_tuple_cost;
 
+	/*
+	 * If limit clause contains volatile functions, they should be
+	 * evaluated only once. For such cases, we should not push down
+	 * the limit.
+	 *
+	 * Words on multi-stage limit: current interconnect implementation
+	 * model is sender will send when buffer is full. Under such
+	 * condition, multi-stage limit might improve performance for
+	 * some cases.
+	 *
+	 * TODO: we might investigate that evaluating limit clause first,
+	 * and then doing pushdown it in future.
+	 */
+	bool        limit_contain_volatile_functions;
+	limit_contain_volatile_functions = (contain_volatile_functions(parse->limitCount)
+					    || contain_volatile_functions(parse->limitOffset));
+
 	CdbPathLocus_MakeNull(&current_locus);
 
 	/* Tweak caller-supplied tuple_fraction if have LIMIT/OFFSET */
@@ -1638,9 +1649,16 @@ grouping_planner(PlannerInfo *root, double tuple_fraction)
 				 * change the previous root->parse Query node, which makes the
 				 * current sort_pathkeys invalid.
 				 */
-				sort_pathkeys = make_pathkeys_for_sortclauses(root, parse->sortClause,
+				PlannerInfo *scroot = NULL;
+				scroot = makeNode(PlannerInfo);
+				memcpy(scroot, root, sizeof(PlannerInfo));
+				scroot->eq_classes = NULL;
+
+				sort_pathkeys = make_pathkeys_for_sortclauses(scroot, parse->sortClause,
 											  result_plan->targetlist, true);
 				sort_pathkeys = canonicalize_pathkeys(root, sort_pathkeys);
+
+				pfree(scroot);
 			}
 		}
 		else	/* Not GP_ROLE_DISPATCH */
@@ -1943,7 +1961,6 @@ grouping_planner(PlannerInfo *root, double tuple_fraction)
 		result_plan->flow = pull_up_Flow(result_plan,
 										 getAnySubplan(result_plan),
 										 (current_pathkeys != NIL));
-
 	/*
 	 * MPP: If there's a DISTINCT clause and we're not collocated on the
 	 * distinct key, we need to redistribute on that key.  In addition, we
@@ -2029,7 +2046,8 @@ grouping_planner(PlannerInfo *root, double tuple_fraction)
 					 * the entire sorted result-set by plunking a limit on the
 					 * top of the unique-node.
 					 */
-					if (parse->limitCount)
+					if (parse->limitCount &&
+					    !limit_contain_volatile_functions)
 					{
 						/*
 						 * Our extra limit operation is basically a
@@ -2119,7 +2137,8 @@ grouping_planner(PlannerInfo *root, double tuple_fraction)
 		if (Gp_role == GP_ROLE_DISPATCH && result_plan->flow->flotype == FLOW_PARTITIONED)
 		{
 			/* pushdown the first phase of multi-phase limit (which takes offset into account) */
-			result_plan = pushdown_preliminary_limit(result_plan, parse->limitCount, count_est, parse->limitOffset, offset_est);
+		        if(!limit_contain_volatile_functions)
+			    result_plan = pushdown_preliminary_limit(result_plan, parse->limitCount, count_est, parse->limitOffset, offset_est);
 			
 			/* Focus on QE [merge to preserve order], prior to final LIMIT. */
 			result_plan = (Plan *) make_motion_gather_to_QE(result_plan, current_pathkeys != NIL);

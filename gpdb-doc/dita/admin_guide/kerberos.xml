@@ -292,9 +292,8 @@ mymap       /^(.*)_gp)@GPDB.KRB$   \1</codeblock>
         user-defined Java functions. </p>
       <ol id="steps_tj3_q3w_c2b">
         <li>
-          <p id="nr161502">Ensure that Kerberos is installed and configured on
-            the Greenplum Database master. See <xref href="#topic6" type="task"
-              format="dita"/>.</p>
+          <p id="nr161502">Ensure that Kerberos is installed and configured on the Greenplum
+            Database master. See <xref href="#topic6" format="dita"/>.</p>
         </li>
         <li>
           <p id="nr161503">Create the file

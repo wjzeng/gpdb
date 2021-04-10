@@ -128,8 +128,6 @@ extern struct config_generic *find_option(const char *name, bool create_placehol
 
 extern bool enable_partition_rules;
 
-extern int listenerBacklog;
-
 /* GUC lists for gp_guc_list_show().  (List of struct config_generic) */
 List	   *gp_guc_list_for_explain;
 List	   *gp_guc_list_for_no_plan;
@@ -165,7 +163,6 @@ int			Debug_appendonly_bad_header_print_level = ERROR;
 bool		Debug_appendonly_print_datumstream = false;
 bool		Debug_appendonly_print_visimap = false;
 bool		Debug_appendonly_print_compaction = false;
-bool		Debug_resource_group = false;
 bool		gp_crash_recovery_abort_suppress_fatal = false;
 bool		gp_persistent_statechange_suppress_error = false;
 bool		Debug_bitmap_print_insert = false;
@@ -173,6 +170,7 @@ bool		Test_appendonly_override = false;
 bool		Test_print_direct_dispatch_info = false;
 bool		gp_test_orientation_override = false;
 bool		gp_permit_persistent_metadata_update = false;
+bool        Test_print_prefetch_joinqual = false;
 bool		gp_permit_relation_node_change = false;
 int			Test_compresslevel_override = 0;
 int			Test_blocksize_override = 0;
@@ -299,9 +297,6 @@ int			Debug_dtm_action_protocol = DEBUG_DTM_ACTION_PROTOCOL_DEFAULT;
 
 int			Debug_dtm_action_segment = DEBUG_DTM_ACTION_SEGMENT_DEFAULT;
 int			Debug_dtm_action_nestinglevel = DEBUG_DTM_ACTION_NESTINGLEVEL_DEFAULT;
-
-/* Enable check for compatibility of encoding and locale in createdb */
-bool		gp_encoding_check_locale_compatibility;
 
 int			gp_connection_send_timeout;
 
@@ -527,6 +522,7 @@ bool		optimizer_enable_bitmapscan;
 bool		optimizer_enable_outerjoin_to_unionall_rewrite;
 bool		optimizer_enable_ctas;
 bool		optimizer_enable_partial_index;
+bool		optimizer_enable_dml;
 bool		optimizer_enable_dml_triggers;
 bool		optimizer_enable_dml_constraints;
 bool		optimizer_enable_master_only_queries;
@@ -534,6 +530,7 @@ bool		optimizer_enable_hashjoin;
 bool		optimizer_enable_dynamictablescan;
 bool		optimizer_enable_indexscan;
 bool		optimizer_enable_tablescan;
+bool		optimizer_enable_full_join;
 
 /* Optimizer plan enumeration related GUCs */
 bool		optimizer_enumerate_plans;
@@ -567,6 +564,8 @@ int			optimizer_cte_inlining_bound;
 bool		optimizer_force_multistage_agg;
 bool		optimizer_force_three_stage_scalar_dqa;
 bool		optimizer_force_expanded_distinct_aggs;
+bool		optimizer_force_agg_skew_avoidance;
+bool		optimizer_penalize_skew;
 bool		optimizer_prune_computed_columns;
 bool		optimizer_push_requirements_from_consumer_to_producer;
 bool		optimizer_enforce_subplans;
@@ -579,10 +578,12 @@ bool		optimizer_array_constraints;
 bool		optimizer_cte_inlining;
 bool		optimizer_enable_space_pruning;
 bool		optimizer_enable_associativity;
+bool		optimizer_prune_unused_columns;
 
 /* Analyze related GUCs for Optimizer */
 bool		optimizer_analyze_root_partition;
 bool		optimizer_analyze_midlevel_partition;
+bool		optimizer_analyze_enable_merge_of_leaf_stats;
 
 /* GUCs for slice table*/
 int			gp_max_slices;
@@ -1851,6 +1852,17 @@ struct config_bool ConfigureNamesBool_gp[] =
 	},
 
 	{
+		{"test_print_prefetch_joinqual", PGC_SUSET, DEVELOPER_OPTIONS,
+			gettext_noop("For testing purposes, print information about if we prefetch join qual."),
+			NULL,
+			GUC_SUPERUSER_ONLY | GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE
+		},
+		&Test_print_prefetch_joinqual,
+		false,
+		NULL, NULL, NULL
+	},
+
+	{
 		{"debug_print_xlog_relation_change_info", PGC_SUSET, DEVELOPER_OPTIONS,
 			gettext_noop("Print relation change information"),
 			NULL,
@@ -1990,6 +2002,17 @@ struct config_bool ConfigureNamesBool_gp[] =
 	},
 
 	{
+		{"gp_resgroup_debug_wait_queue", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Enable the debugging check on the wait queue of resource group."),
+			NULL,
+			GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE
+		},
+		&gp_resgroup_debug_wait_queue,
+		true,
+		NULL, NULL, NULL
+	},
+
+	{
 		{"enable_partition_rules", PGC_USERSET, DEVELOPER_OPTIONS,
 			gettext_noop("Enable creation of RULEs to implement partitioning"),
 			NULL,
@@ -2005,7 +2028,7 @@ struct config_bool ConfigureNamesBool_gp[] =
 			NULL,
 		},
 		&gp_enable_gpperfmon,
-		false, gpvars_assign_gp_enable_gpperfmon, NULL
+		false, NULL, NULL
 	},
 
 	{
@@ -2900,6 +2923,26 @@ struct config_bool ConfigureNamesBool_gp[] =
 	},
 
 	{
+		{"optimizer_force_agg_skew_avoidance", PGC_USERSET, QUERY_TUNING_METHOD,
+			gettext_noop("Always pick a plan for aggregate distinct that minimizes skew."),
+			NULL,
+			GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE
+		},
+		&optimizer_force_agg_skew_avoidance,
+		true, NULL, NULL
+	},
+
+	{
+		{"optimizer_penalize_skew", PGC_USERSET, QUERY_TUNING_METHOD,
+			gettext_noop("Penalize operators with a skewed hash redistribute below it."),
+			NULL,
+			GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE
+		},
+		&optimizer_penalize_skew,
+		false, NULL, NULL
+	},
+
+	{
 		{"optimizer_multilevel_partitioning", PGC_USERSET, DEVELOPER_OPTIONS,
 			gettext_noop("Enable optimization of queries on multilevel partitioned tables."),
 			NULL,
@@ -2988,14 +3031,22 @@ struct config_bool ConfigureNamesBool_gp[] =
 		true, NULL, NULL
 	},
 	{
+		{"optimizer_enable_full_join", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Enables the optimizer's support of full outer joins."),
+			NULL,
+			GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE
+		},
+		&optimizer_enable_full_join,
+		false, NULL, NULL
+	},
+	{
 		{"optimizer_enable_streaming_material", PGC_USERSET, DEVELOPER_OPTIONS,
 			gettext_noop("Enable plans with a streaming material node in the optimizer."),
 			NULL,
 			GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE
 		},
 		&optimizer_enable_streaming_material,
-		true,
-		NULL, NULL, NULL
+		true, NULL, NULL
 	},
 	{
 		{"optimizer_enable_gather_on_segment_for_dml", PGC_USERSET, DEVELOPER_OPTIONS,
@@ -3004,8 +3055,7 @@ struct config_bool ConfigureNamesBool_gp[] =
 			GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE
 		},
 		&optimizer_enable_gather_on_segment_for_dml,
-		true,
-		NULL, NULL, NULL
+		true, NULL, NULL
 	},
 	{
 		{"optimizer_enforce_subplans", PGC_USERSET, DEVELOPER_OPTIONS,
@@ -3072,6 +3122,16 @@ struct config_bool ConfigureNamesBool_gp[] =
 		},
 		&optimizer_analyze_midlevel_partition,
 		false, NULL, NULL
+	},
+
+	{
+		{"optimizer_analyze_enable_merge_of_leaf_stats", PGC_USERSET, STATS_ANALYZE,
+			gettext_noop("Enable merging of leaf stats into the root stats during ANALYZE when analyzing partitions"),
+			NULL,
+			GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE
+		},
+		&optimizer_analyze_enable_merge_of_leaf_stats,
+		true, NULL, NULL
 	},
 
 	{
@@ -3151,6 +3211,16 @@ struct config_bool ConfigureNamesBool_gp[] =
 			GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE
 		},
 		&optimizer_enable_partial_index,
+		true, NULL, NULL
+	},
+
+	{
+		{"optimizer_enable_dml", PGC_USERSET, QUERY_TUNING,
+			gettext_noop("Enable DML plans in Pivotal Optimizer (GPORCA)."),
+			NULL,
+			GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE
+		},
+		&optimizer_enable_dml,
 		true, NULL, NULL
 	},
 
@@ -3343,6 +3413,16 @@ struct config_bool ConfigureNamesBool_gp[] =
 		&gp_resource_group_bypass,
 		false,
 		assign_gp_resource_group_bypass, NULL
+	},
+
+	{
+		{"optimizer_prune_unused_columns", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Prune unused table columns during query optimization"),
+			NULL,
+			GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE
+		},
+		&optimizer_prune_unused_columns,
+		true, NULL, NULL
 	},
 
 	/* End-of-list marker */
@@ -4053,7 +4133,7 @@ struct config_int ConfigureNamesInt_gp[] =
 
 	{
 		{"gp_interconnect_tcp_listener_backlog", PGC_USERSET, GP_ARRAY_TUNING,
-			gettext_noop("Size of the listening queue for each TCP interconnect socket"),
+			gettext_noop("Size of the listening queue for each TCP interconnect socket and sequence server socket"),
 			gettext_noop("Cooperate with kernel parameter net.core.somaxconn and net.ipv4.tcp_max_syn_backlog to tune network performance."),
 			GUC_NOT_IN_SAMPLE | GUC_GPDB_ADDOPT
 		},
@@ -4274,13 +4354,13 @@ struct config_int ConfigureNamesInt_gp[] =
 	},
 
 	{
-		{"gp_gpperfmon_send_interval", PGC_USERSET, LOGGING_WHAT,
+		{"gp_gpperfmon_send_interval", PGC_SUSET, LOGGING_WHAT,
 			gettext_noop("Interval in seconds between sending messages to gpperfmon."),
 			NULL,
 			GUC_GPDB_ADDOPT
 		},
 		&gp_gpperfmon_send_interval,
-		1, 1, 3600, gpvars_assign_gp_gpperfmon_send_interval, NULL
+		1, 1, 3600, NULL, NULL
 	},
 
 	{
@@ -4677,7 +4757,7 @@ struct config_int ConfigureNamesInt_gp[] =
 			GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE
 		},
 		&optimizer_penalize_broadcast_threshold,
-		10000000, 0, INT_MAX, NULL, NULL
+		100000, 0, INT_MAX, NULL, NULL
 	},
 
 	{
@@ -4757,7 +4837,7 @@ struct config_int ConfigureNamesInt_gp[] =
 			GUC_SUPERUSER_ONLY |  GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE | GUC_GPDB_ADDOPT
 		},
 		&dtx_phase2_retry_count,
-		2, 0, 15, NULL, NULL
+		10, 0, INT_MAX, NULL, NULL
 	},
 
 	{
@@ -5049,7 +5129,7 @@ struct config_string ConfigureNamesString_gp[] =
 			GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE
 		},
 		&optimizer_log_failure_str,
-		"all", assign_optimizer_log_failure, NULL
+		"unexpected", assign_optimizer_log_failure, NULL
 	},
 
 	{
@@ -5064,7 +5144,7 @@ struct config_string ConfigureNamesString_gp[] =
 	{
 		{"optimizer_cost_model", PGC_USERSET, DEVELOPER_OPTIONS,
 			gettext_noop("Set optimizer cost model."),
-			gettext_noop("Valid values are legacy, calibrated"),
+			gettext_noop("Valid values are legacy, calibrated, experimental"),
 			GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE
 		},
 		&optimizer_cost_model_str,
@@ -5749,13 +5829,15 @@ assign_pljava_classpath_insecure(bool newval, bool doit, GucSource source)
 static const char *
 assign_optimizer_minidump(const char *val, bool assign, GucSource source)
 {
-	if (pg_strcasecmp(val, "onerror") == 0 && assign)
+	if (pg_strcasecmp(val, "onerror") == 0)
 	{
-		optimizer_minidump = OPTIMIZER_MINIDUMP_FAIL;
+		if (assign)
+			optimizer_minidump = OPTIMIZER_MINIDUMP_FAIL;
 	}
-	else if (pg_strcasecmp(val, "always") == 0 && assign)
+	else if (pg_strcasecmp(val, "always") == 0)
 	{
-		optimizer_minidump = OPTIMIZER_MINIDUMP_ALWAYS;
+		if (assign)
+			optimizer_minidump = OPTIMIZER_MINIDUMP_ALWAYS;
 	}
 	else
 	{
@@ -5768,13 +5850,20 @@ assign_optimizer_minidump(const char *val, bool assign, GucSource source)
 static const char *
 assign_optimizer_cost_model(const char *val, bool assign, GucSource source)
 {
-	if (pg_strcasecmp(val, "legacy") == 0 && assign)
+	if (pg_strcasecmp(val, "legacy") == 0)
 	{
-		optimizer_cost_model = OPTIMIZER_GPDB_LEGACY;
+		if (assign)
+			optimizer_cost_model = OPTIMIZER_GPDB_LEGACY;
 	}
-	else if (pg_strcasecmp(val, "calibrated") == 0 && assign)
+	else if (pg_strcasecmp(val, "calibrated") == 0)
 	{
-		optimizer_cost_model = OPTIMIZER_GPDB_CALIBRATED;
+		if (assign)
+			optimizer_cost_model = OPTIMIZER_GPDB_CALIBRATED;
+	}
+	else if (pg_strcasecmp(val, "experimental") == 0)
+	{
+		if (assign)
+			optimizer_cost_model = OPTIMIZER_GPDB_EXPERIMENTAL;
 	}
 	else
 	{
@@ -5844,6 +5933,11 @@ assign_optimizer_join_order_options(const char *newval, bool doit, GucSource sou
 	{
 		if (doit)
 			optimizer_join_order = JOIN_ORDER_EXHAUSTIVE_SEARCH;
+	}
+	else if (pg_strcasecmp(newval, "exhaustive2") == 0)
+	{
+		if (doit)
+			optimizer_join_order = JOIN_ORDER_EXHAUSTIVE2_SEARCH;
 	}
 	else
 	{

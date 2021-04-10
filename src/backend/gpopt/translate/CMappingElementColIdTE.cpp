@@ -15,10 +15,11 @@
 //---------------------------------------------------------------------------
 
 #include "postgres.h"
-#include "nodes/makefuncs.h"
-#include "nodes/primnodes.h"
 
 #include "gpopt/translate/CMappingElementColIdTE.h"
+
+#include "nodes/makefuncs.h"
+#include "nodes/primnodes.h"
 
 using namespace gpdxl;
 using namespace gpos;
@@ -31,16 +32,9 @@ using namespace gpos;
 //		Constructor
 //
 //---------------------------------------------------------------------------
-CMappingElementColIdTE::CMappingElementColIdTE
-	(
-	ULONG colid,
-	ULONG query_level,
-	TargetEntry *target_entry
-	)
-	:
-	m_colid(colid),
-	m_query_level(query_level),
-	m_target_entry(target_entry)
+CMappingElementColIdTE::CMappingElementColIdTE(ULONG colid, ULONG query_level,
+											   TargetEntry *target_entry)
+	: m_colid(colid), m_query_level(query_level), m_target_entry(target_entry)
 {
 }
 

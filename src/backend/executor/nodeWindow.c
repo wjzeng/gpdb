@@ -4854,6 +4854,20 @@ ExecWindow(WindowState * wstate)
 
 	econtext = wstate->ps.ps_ExprContext;
 
+	/*
+	 * Check to see if we're still projecting out tuples from a previous
+	 * output tuple (because there is a function-returning-set in the
+	 * projection expressions).  If so, try to project another one.
+	 */
+	if (wstate->ps_TupFromTlist)
+	{
+		resultSlot = ExecProject(wstate->ps.ps_ProjInfo, &isDone);
+		if (isDone == ExprMultipleResult)
+			return resultSlot;
+		/* Done with that source tuple... */
+		wstate->ps_TupFromTlist = false;
+	}
+
 	/* Fetch the current_row */
 	econtext->ecxt_outertuple = fetchCurrentRow(wstate);
 
@@ -4934,6 +4948,9 @@ ExecWindow(WindowState * wstate)
 	{
 		ExecEagerFreeWindow(wstate);
 	}
+
+	wstate->ps_TupFromTlist =
+		(isDone == ExprMultipleResult);
 
 	return resultSlot;
 }
@@ -6155,6 +6172,8 @@ ExecInitWindow(Window * node, EState *estate, int eflags)
 	ExecAssignResultTypeFromTL(&wstate->ps);
 	ExecAssignProjectionInfo(&wstate->ps, NULL);
 
+	wstate->ps_TupFromTlist = false;
+
 	desc = ExecGetResultType(wstate->ps.lefttree);
 
 	/* Precompute fmgr lookup data for partition key equality function. */
@@ -6273,6 +6292,7 @@ ExecReScanWindow(WindowState * node, ExprContext *exprCtxt)
 	ExecEagerFreeWindow(node);
 
 	node->is_input_done = false;
+	node->ps_TupFromTlist = false;
 
 	Assert(outerPlanState(node));
 

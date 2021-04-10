@@ -770,7 +770,6 @@ enable_profiling
 enable_debug
 enable_gpperfmon
 enable_gphdfs
-enable_pxf
 enable_gpfdist
 enable_rpath
 enable_shared
@@ -841,7 +840,6 @@ enable_rpath
 enable_spinlocks
 enable_atomics
 enable_gpfdist
-enable_pxf
 enable_gphdfs
 enable_gpperfmon
 enable_debug
@@ -1524,7 +1522,6 @@ Optional Features:
   --disable-spinlocks     do not use spinlocks
   --disable-atomics       do not use atomic operations
   --disable-gpfdist       do not use gpfdist
-  --enable-pxf            build with pxf
   --enable-gphdfs         build with gphdfs
   --enable-gpperfmon      build with gpperfmon
   --enable-debug          build with debugging symbols (-g)
@@ -3574,35 +3571,6 @@ if test "${enable_gpfdist+set}" = set; then :
 
 else
   enable_gpfdist=yes
-
-fi
-
-
-
-
-#
-# pxf
-#
-
-pgac_args="$pgac_args enable_pxf"
-
-# Check whether --enable-pxf was given.
-if test "${enable_pxf+set}" = set; then :
-  enableval=$enable_pxf;
-  case $enableval in
-    yes)
-      :
-      ;;
-    no)
-      :
-      ;;
-    *)
-      as_fn_error $? "no argument expected for --enable-pxf option" "$LINENO" 5
-      ;;
-  esac
-
-else
-  enable_pxf=yes
 
 fi
 
@@ -7905,7 +7873,7 @@ fi
 
 
 #
-# libcurl. Used for external table support and the PXF extension
+# libcurl. Used for external table support
 #
 
 pgac_args="$pgac_args with_libcurl"
@@ -7933,10 +7901,6 @@ fi
 
 
 
-
-if test "$with_libcurl" = "no" && test "$enable_pxf" = "yes"; then
-  as_fn_error $? "libcurl is required by PXF" "$LINENO" 5
-fi
 
 #
 # libapr. Used for gpfdist and gpperfmon
@@ -12523,7 +12487,7 @@ int
 main ()
 {
 
-return strncmp("3.9.", GPORCA_VERSION_STRING, 4);
+return strncmp("3.116.", GPORCA_VERSION_STRING, 6);
 
   ;
   return 0;
@@ -12533,7 +12497,7 @@ if ac_fn_cxx_try_run "$LINENO"; then :
   { $as_echo "$as_me:${as_lineno-$LINENO}: result: ok" >&5
 $as_echo "ok" >&6; }
 else
-  as_fn_error $? "Your ORCA version is expected to be 3.9.XXX" "$LINENO" 5
+  as_fn_error $? "Your ORCA version is expected to be 3.116.XXX" "$LINENO" 5
 
 fi
 rm -f core *.core core.conftest.* gmon.out bb.out conftest$ac_exeext \
@@ -16479,8 +16443,10 @@ int does_int64_work()
     return 0;
   return 1;
 }
+
+int
 main() {
-  exit(! does_int64_work());
+  return (! does_int64_work());
 }
 _ACEOF
 if ac_fn_c_try_run "$LINENO"; then :
@@ -16561,8 +16527,10 @@ int does_int64_work()
     return 0;
   return 1;
 }
+
+int
 main() {
-  exit(! does_int64_work());
+  return (! does_int64_work());
 }
 _ACEOF
 if ac_fn_c_try_run "$LINENO"; then :
@@ -16663,8 +16631,10 @@ int does_int64_snprintf_work()
     return 0;			/* either multiply or snprintf is busted */
   return 1;
 }
+
+int
 main() {
-  exit(! does_int64_snprintf_work());
+  return (! does_int64_snprintf_work());
 }
 _ACEOF
 if ac_fn_c_try_run "$LINENO"; then :

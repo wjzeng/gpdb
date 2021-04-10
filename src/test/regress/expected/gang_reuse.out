@@ -1,0 +1,197 @@
+-- This test is to verify the order of reusing idle gangs.
+--
+-- For example:
+-- In the same session,
+-- query 1 has 3 slices and it creates gang B, gang C and gang D.
+-- query 2 has 2 slices, we hope it reuses gang B and gang C instead of other
+-- cases like gang D and gang C.
+--
+-- In this way, the two queries can have the same send-receive port pair. It's
+-- useful in platform like Azure. Because Azure limits the number of different
+-- send-receive port pairs (AKA flow) in a certain time period.
+-- To verify the order we show the gang id in EXPLAIN ANALYZE output when
+-- gp_log_gang is 'debug', turn on this output.
+set gp_log_gang to 'debug';
+set gp_cached_segworkers_threshold to 10;
+set gp_vmem_idle_resource_timeout to '60s';
+set optimizer_enable_motion_broadcast to off;
+create table test_gang_reuse_t1 (c1 int, c2 int);
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column named 'c1' as the Greenplum Database data distribution key for this table.
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
+-- this query will create 3 reader gangs with ids C, D and E, we expect they
+-- will always be reused in the same order
+explain analyze select count(*) from test_gang_reuse_t1 a
+  join test_gang_reuse_t1 b using (c2)
+  join test_gang_reuse_t1 c using (c2)
+;
+                                                             QUERY PLAN                                                             
+------------------------------------------------------------------------------------------------------------------------------------
+ Aggregate  (cost=9695775.68..9695775.69 rows=1 width=8)
+   Rows out:  1 rows with 5.290 ms to end.
+   ->  Gather Motion 3:1  (slice4; gang1; segments: 3)  (cost=9695775.62..9695775.67 rows=1 width=8)
+         Rows out:  3 rows at destination with 3.393 ms to first row, 5.276 ms to end.
+         ->  Aggregate  (cost=9695775.62..9695775.63 rows=1 width=8)
+               Rows out:  Avg 1.0 rows x 3 workers.  Max 1 rows (seg0) with 3.209 ms to first row, 3.210 ms to end.
+               ->  Hash Join  (cost=7518.50..8100082.16 rows=212759127 width=0)
+                     Hash Cond: a.c2 = b.c2
+                     Rows out:  0 rows (seg0) with 3.581 ms to end.
+                     ->  Hash Join  (cost=3759.25..99322.62 rows=2471070 width=8)
+                           Hash Cond: a.c2 = c.c2
+                           Rows out:  (No row requested) 0 rows (seg0) with 0 ms to end.
+                           ->  Redistribute Motion 3:3  (slice1; gang2; segments: 3)  (cost=0.00..2683.00 rows=28700 width=4)
+                                 Hash Key: a.c2
+                                 Rows out:  (No row requested) 0 rows at destination (seg0) with 0 ms to end.
+                                 ->  Seq Scan on test_gang_reuse_t1 a  (cost=0.00..961.00 rows=28700 width=4)
+                                       Rows out:  0 rows (seg0) with 0.039 ms to end.
+                           ->  Hash  (cost=2683.00..2683.00 rows=28700 width=4)
+                                 Rows in:  (No row requested) 0 rows (seg0) with 0 ms to end.
+                                 ->  Redistribute Motion 3:3  (slice2; gang3; segments: 3)  (cost=0.00..2683.00 rows=28700 width=4)
+                                       Hash Key: c.c2
+                                       Rows out:  (No row requested) 0 rows at destination (seg0) with 0 ms to end.
+                                       ->  Seq Scan on test_gang_reuse_t1 c  (cost=0.00..961.00 rows=28700 width=4)
+                                             Rows out:  0 rows (seg0) with 0.038 ms to end.
+                     ->  Hash  (cost=2683.00..2683.00 rows=28700 width=4)
+                           Rows in:  0 rows (seg0) with 0.007 ms to end, start offset by 16 ms.
+                           ->  Redistribute Motion 3:3  (slice3; gang4; segments: 3)  (cost=0.00..2683.00 rows=28700 width=4)
+                                 Hash Key: b.c2
+                                 Rows out:  0 rows at destination (seg0) with 0.006 ms to end.
+                                 ->  Seq Scan on test_gang_reuse_t1 b  (cost=0.00..961.00 rows=28700 width=4)
+                                       Rows out:  0 rows (seg0) with 0.039 ms to end.
+ Slice statistics:
+   (slice0)    Executor memory: 386K bytes.
+   (slice1)    Executor memory: 183K bytes avg x 3 workers, 183K bytes max (seg0).
+   (slice2)    Executor memory: 183K bytes avg x 3 workers, 183K bytes max (seg0).
+   (slice3)    Executor memory: 183K bytes avg x 3 workers, 183K bytes max (seg0).
+   (slice4)    Executor memory: 4331K bytes avg x 3 workers, 4331K bytes max (seg0).
+ Statement statistics:
+   Memory used: 128000K bytes
+ Optimizer status: legacy query optimizer
+ Total runtime: 18.173 ms
+(41 rows)
+
+-- so in this query the gangs C and D should be used
+explain analyze select count(*) from test_gang_reuse_t1 a
+  join test_gang_reuse_t1 b using (c2)
+;
+                                                          QUERY PLAN                                                          
+------------------------------------------------------------------------------------------------------------------------------
+ Aggregate  (cost=117855.72..117855.73 rows=1 width=8)
+   Rows out:  1 rows with 5.035 ms to end.
+   ->  Gather Motion 3:1  (slice3; gang1; segments: 3)  (cost=117855.65..117855.70 rows=1 width=8)
+         Rows out:  3 rows at destination with 3.929 ms to first row, 5.021 ms to end.
+         ->  Aggregate  (cost=117855.65..117855.66 rows=1 width=8)
+               Rows out:  Avg 1.0 rows x 3 workers.  Max 1 rows (seg0) with 4.779 ms to end.
+               ->  Hash Join  (cost=3759.25..99322.62 rows=2471070 width=0)
+                     Hash Cond: a.c2 = b.c2
+                     Rows out:  0 rows (seg0) with 4.777 ms to end.
+                     ->  Redistribute Motion 3:3  (slice1; gang2; segments: 3)  (cost=0.00..2683.00 rows=28700 width=4)
+                           Hash Key: a.c2
+                           Rows out:  (No row requested) 0 rows at destination (seg0) with 0 ms to end.
+                           ->  Seq Scan on test_gang_reuse_t1 a  (cost=0.00..961.00 rows=28700 width=4)
+                                 Rows out:  0 rows (seg0) with 0.018 ms to end.
+                     ->  Hash  (cost=2683.00..2683.00 rows=28700 width=4)
+                           Rows in:  0 rows (seg0) with 0.715 ms to end, start offset by 3.835 ms.
+                           ->  Redistribute Motion 3:3  (slice2; gang3; segments: 3)  (cost=0.00..2683.00 rows=28700 width=4)
+                                 Hash Key: b.c2
+                                 Rows out:  0 rows at destination (seg0) with 0.714 ms to end.
+                                 ->  Seq Scan on test_gang_reuse_t1 b  (cost=0.00..961.00 rows=28700 width=4)
+                                       Rows out:  0 rows (seg0) with 0.018 ms to end.
+ Slice statistics:
+   (slice0)    Executor memory: 386K bytes.
+   (slice1)    Executor memory: 171K bytes avg x 3 workers, 171K bytes max (seg0).
+   (slice2)    Executor memory: 171K bytes avg x 3 workers, 171K bytes max (seg0).
+   (slice3)    Executor memory: 8363K bytes avg x 3 workers, 8363K bytes max (seg0).
+ Statement statistics:
+   Memory used: 128000K bytes
+ Optimizer status: legacy query optimizer
+ Total runtime: 6.204 ms
+(30 rows)
+
+-- so in this query the gangs C, D and E should be used
+explain analyze select count(*) from test_gang_reuse_t1 a
+  join test_gang_reuse_t1 b using (c2)
+  join test_gang_reuse_t1 c using (c2)
+;
+                                                             QUERY PLAN                                                             
+------------------------------------------------------------------------------------------------------------------------------------
+ Aggregate  (cost=9695775.68..9695775.69 rows=1 width=8)
+   Rows out:  1 rows with 2.958 ms to first row, 2.959 ms to end.
+   ->  Gather Motion 3:1  (slice4; gang1; segments: 3)  (cost=9695775.62..9695775.67 rows=1 width=8)
+         Rows out:  3 rows at destination with 2.201 ms to first row, 2.947 ms to end.
+         ->  Aggregate  (cost=9695775.62..9695775.63 rows=1 width=8)
+               Rows out:  Avg 1.0 rows x 3 workers.  Max 1 rows (seg0) with 2.310 ms to end.
+               ->  Hash Join  (cost=7518.50..8100082.16 rows=212759127 width=0)
+                     Hash Cond: a.c2 = b.c2
+                     Rows out:  0 rows (seg0) with 2.732 ms to end.
+                     ->  Hash Join  (cost=3759.25..99322.62 rows=2471070 width=8)
+                           Hash Cond: a.c2 = c.c2
+                           Rows out:  (No row requested) 0 rows (seg0) with 0 ms to end.
+                           ->  Redistribute Motion 3:3  (slice1; gang2; segments: 3)  (cost=0.00..2683.00 rows=28700 width=4)
+                                 Hash Key: a.c2
+                                 Rows out:  (No row requested) 0 rows at destination (seg0) with 0 ms to end.
+                                 ->  Seq Scan on test_gang_reuse_t1 a  (cost=0.00..961.00 rows=28700 width=4)
+                                       Rows out:  0 rows (seg0) with 0.012 ms to end.
+                           ->  Hash  (cost=2683.00..2683.00 rows=28700 width=4)
+                                 Rows in:  (No row requested) 0 rows (seg0) with 0 ms to end.
+                                 ->  Redistribute Motion 3:3  (slice2; gang3; segments: 3)  (cost=0.00..2683.00 rows=28700 width=4)
+                                       Hash Key: c.c2
+                                       Rows out:  (No row requested) 0 rows at destination (seg0) with 0 ms to end.
+                                       ->  Seq Scan on test_gang_reuse_t1 c  (cost=0.00..961.00 rows=28700 width=4)
+                                             Rows out:  0 rows (seg0) with 0.012 ms to end.
+                     ->  Hash  (cost=2683.00..2683.00 rows=28700 width=4)
+                           Rows in:  0 rows (seg0) with 1.279 ms to end, start offset by 2.221 ms.
+                           ->  Redistribute Motion 3:3  (slice3; gang4; segments: 3)  (cost=0.00..2683.00 rows=28700 width=4)
+                                 Hash Key: b.c2
+                                 Rows out:  0 rows at destination (seg0) with 1.278 ms to end.
+                                 ->  Seq Scan on test_gang_reuse_t1 b  (cost=0.00..961.00 rows=28700 width=4)
+                                       Rows out:  0 rows (seg0) with 0.014 ms to end.
+ Slice statistics:
+   (slice0)    Executor memory: 386K bytes.
+   (slice1)    Executor memory: 171K bytes avg x 3 workers, 171K bytes max (seg0).
+   (slice2)    Executor memory: 171K bytes avg x 3 workers, 171K bytes max (seg0).
+   (slice3)    Executor memory: 171K bytes avg x 3 workers, 171K bytes max (seg0).
+   (slice4)    Executor memory: 4331K bytes avg x 3 workers, 4331K bytes max (seg0).
+ Statement statistics:
+   Memory used: 128000K bytes
+ Optimizer status: legacy query optimizer
+ Total runtime: 4.583 ms
+(41 rows)
+
+-- so in this query the gangs C and D should be used
+explain analyze select count(*) from test_gang_reuse_t1 a
+  join test_gang_reuse_t1 b using (c2)
+;
+                                                          QUERY PLAN                                                          
+------------------------------------------------------------------------------------------------------------------------------
+ Aggregate  (cost=117855.72..117855.73 rows=1 width=8)
+   Rows out:  1 rows with 4.315 ms to end.
+   ->  Gather Motion 3:1  (slice3; gang1; segments: 3)  (cost=117855.65..117855.70 rows=1 width=8)
+         Rows out:  3 rows at destination with 3.083 ms to first row, 4.302 ms to end.
+         ->  Aggregate  (cost=117855.65..117855.66 rows=1 width=8)
+               Rows out:  Avg 1.0 rows x 3 workers.  Max 1 rows (seg0) with 2.793 ms to end.
+               ->  Hash Join  (cost=3759.25..99322.62 rows=2471070 width=0)
+                     Hash Cond: a.c2 = b.c2
+                     Rows out:  0 rows (seg0) with 3.941 ms to end.
+                     ->  Redistribute Motion 3:3  (slice1; gang2; segments: 3)  (cost=0.00..2683.00 rows=28700 width=4)
+                           Hash Key: a.c2
+                           Rows out:  (No row requested) 0 rows at destination (seg0) with 0 ms to end.
+                           ->  Seq Scan on test_gang_reuse_t1 a  (cost=0.00..961.00 rows=28700 width=4)
+                                 Rows out:  0 rows (seg0) with 0.012 ms to end.
+                     ->  Hash  (cost=2683.00..2683.00 rows=28700 width=4)
+                           Rows in:  0 rows (seg0) with 1.351 ms to end, start offset by 2.359 ms.
+                           ->  Redistribute Motion 3:3  (slice2; gang3; segments: 3)  (cost=0.00..2683.00 rows=28700 width=4)
+                                 Hash Key: b.c2
+                                 Rows out:  0 rows at destination (seg0) with 1.349 ms to end.
+                                 ->  Seq Scan on test_gang_reuse_t1 b  (cost=0.00..961.00 rows=28700 width=4)
+                                       Rows out:  0 rows (seg0) with 0.015 ms to end.
+ Slice statistics:
+   (slice0)    Executor memory: 386K bytes.
+   (slice1)    Executor memory: 171K bytes avg x 3 workers, 171K bytes max (seg0).
+   (slice2)    Executor memory: 171K bytes avg x 3 workers, 171K bytes max (seg0).
+   (slice3)    Executor memory: 8363K bytes avg x 3 workers, 8363K bytes max (seg0).
+ Statement statistics:
+   Memory used: 128000K bytes
+ Optimizer status: legacy query optimizer
+ Total runtime: 5.753 ms
+(30 rows)
+

@@ -42,6 +42,7 @@
 #include "utils/tuplesort.h"
 #include "utils/tuplesort_mk.h"
 #include "cdb/cdbdisp.h"                /* CheckDispatchResult() */
+#include "cdb/cdbgang.h"                /* Gang */
 #include "cdb/cdbexplain.h"             /* cdbexplain_recvExecStats */
 #include "cdb/cdbpartition.h"
 #include "cdb/cdbpullup.h"              /* cdbpullup_targetlist() */
@@ -462,8 +463,7 @@ ExplainOnePlan(PlannedStmt *plannedstmt, ParamListInfo params,
 	    totaltime += elapsed_time(&starttime);
 
         /* Get local stats if root slice was executed here in the qDisp. */
-        if (!es->currentSlice ||
-            sliceRunsOnQD(es->currentSlice))
+        if (Gp_role == GP_ROLE_DISPATCH && (!es->currentSlice || sliceRunsOnQD(es->currentSlice)))
             cdbexplain_localExecStats(queryDesc->planstate, es->showstatctx);
 
         /* Fill in the plan's Instrumentation with stats from qExecs. */
@@ -811,6 +811,9 @@ appendGangAndDirectDispatchInfo(StringInfo str, PlanState *planstate, int sliceI
 		{
 			int numSegments;
 			appendStringInfo(str, "  (slice%d;", sliceId);
+
+			if (slice->primaryGang && gp_log_gang >= GPVARS_VERBOSITY_DEBUG)
+				appendStringInfo(str, " gang%d;", slice->primaryGang->gang_id);
 
 			if (slice->directDispatch.isDirectDispatch)
 			{

@@ -1231,7 +1231,16 @@ _bt_split(Relation rel, Buffer buf, OffsetNumber firstright,
 		xlrec.firstright = firstright;
 
 		/* Set persistentTid and persistentSerialNum like xl_btreetid_set() does */
-		RelationGetPTInfo(rel, &xlrec.persistentTid, &xlrec.persistentSerialNum);
+		if (RelationNeedToFetchGpRelationNodeForXLog(rel))
+		{
+			RelationGetPTInfo(rel, &xlrec.persistentTid, &xlrec.persistentSerialNum);
+		}
+		else
+		{
+			/* set invalid persistentTid and persistentSerialNum if in recovery */
+			ItemPointerSetInvalid(&xlrec.persistentTid);
+			xlrec.persistentSerialNum = 0;
+		}
 
 		rdata[0].data = (char *) &xlrec;
 		rdata[0].len = SizeOfBtreeSplit;

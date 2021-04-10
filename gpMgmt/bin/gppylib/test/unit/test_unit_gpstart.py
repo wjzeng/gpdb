@@ -1,14 +1,15 @@
 import imp
-import logging
 import os
 import sys
 
 from mock import Mock, patch
 
-from gparray import GpDB, GpArray
+from gppylib.gparray import GpDB, GpArray
 from gppylib.operations.startSegments import StartSegmentsResult
 from gppylib.test.unit.gp_unittest import GpTestCase, run_tests
 from gppylib.commands import gp
+from gppylib.commands.base import ExecutionError
+from gppylib.mainUtils import ExceptionNoStackTraceNeeded, UserAbortedException
 
 
 class GpStart(GpTestCase):
@@ -56,7 +57,6 @@ class GpStart(GpTestCase):
             patch("gpstart.gp.MasterStart.local"),
             patch("gpstart.pg.DbStatus.local"),
             patch("gpstart.TableLogger"),
-            patch('gpstart.PgControlData'),
         ])
 
         self.mockFilespaceConsistency = self.get_mock_from_apply_patch("CheckFilespaceConsistency")
@@ -79,10 +79,17 @@ class GpStart(GpTestCase):
         self.mock_gp.get_masterdatadir.return_value = 'masterdatadir'
         self.mock_gp.GpCatVersion.local.return_value = 1
         self.mock_gp.GpCatVersionDirectory.local.return_value = 1
+        self.mock_gp.DEFAULT_GPSTART_NUM_WORKERS = gp.DEFAULT_GPSTART_NUM_WORKERS
         sys.argv = ["gpstart"]  # reset to relatively empty args list
 
     def tearDown(self):
         super(GpStart, self).tearDown()
+
+    def setup_gpstart(self):
+        parser = self.subject.GpStart.createParser()
+        options, args = parser.parse_args()
+        gpstart = self.subject.GpStart.createProgram(options, args)
+        return gpstart
 
     def test_option_master_success_without_auto_accept(self):
         sys.argv = ["gpstart", "-m"]
@@ -91,10 +98,7 @@ class GpStart(GpTestCase):
 
         self.mock_os_path_exists.side_effect = os_exists_check
 
-        parser = self.subject.GpStart.createParser()
-        options, args = parser.parse_args()
-
-        gpstart = self.subject.GpStart.createProgram(options, args)
+        gpstart = self.setup_gpstart()
         return_code = gpstart.run()
 
         self.assertEqual(self.mock_userinput.ask_yesno.call_count, 1)
@@ -110,10 +114,7 @@ class GpStart(GpTestCase):
 
         self.mock_os_path_exists.side_effect = os_exists_check
 
-        parser = self.subject.GpStart.createParser()
-        options, args = parser.parse_args()
-
-        gpstart = self.subject.GpStart.createProgram(options, args)
+        gpstart = self.setup_gpstart()
         return_code = gpstart.run()
 
         self.assertEqual(self.mock_userinput.ask_yesno.call_count, 0)
@@ -126,9 +127,7 @@ class GpStart(GpTestCase):
         self.mock_userinput.ask_yesno.return_value = True
         self.subject.unix.PgPortIsActive.local.return_value = False
         self.mock_os_path_exists.side_effect = os_exists_check
-        parser = self.subject.GpStart.createParser()
-        options, args = parser.parse_args()
-        gpstart = self.subject.GpStart.createProgram(options, args)
+        gpstart = self.setup_gpstart()
 
         return_code = gpstart.run()
 
@@ -145,9 +144,7 @@ class GpStart(GpTestCase):
         self.mock_heap_checksum.return_value.get_segments_checksum_settings.return_value = ([1], [1])
         self.subject.unix.PgPortIsActive.local.return_value = False
         self.mock_os_path_exists.side_effect = os_exists_check
-        parser = self.subject.GpStart.createParser()
-        options, args = parser.parse_args()
-        gpstart = self.subject.GpStart.createProgram(options, args)
+        gpstart = self.setup_gpstart()
 
         return_code = gpstart.run()
 
@@ -166,14 +163,165 @@ class GpStart(GpTestCase):
         start_failure.addFailure(self.mirror1, "fictitious reason", gp.SEGSTART_ERROR_CHECKSUM_MISMATCH)
         self.mock_start_result.return_value.startSegments.return_value.getFailedSegmentObjs.return_value = start_failure.getFailedSegmentObjs()
 
-        parser = self.subject.GpStart.createParser()
-        options, args = parser.parse_args()
-        gpstart = self.subject.GpStart.createProgram(options, args)
+        gpstart = self.setup_gpstart()
 
         return_code = gpstart.run()
         self.assertEqual(return_code, 1)
         messages = [msg[0][0] for msg in self.subject.logger.info.call_args_list]
         self.assertIn("DBID:5  FAILED  host:'sdw1' datadir:'/data/mirror1' with reason:'fictitious reason'", messages)
+
+    def test_prepare_segment_start_returns_up_and_down_segments(self):
+        # Boilerplate: create a gpstart object
+        parser = self.subject.GpStart.createParser()
+        options, args = parser.parse_args([])
+        gpstart = self.subject.GpStart.createProgram(options, args)
+
+        # Up segments
+        master = GpDB.initFromString("1|-1|p|p|n|u|mdw|mdw|5432|5532|/data/master||")
+        primary1 = GpDB.initFromString("3|1|p|p|n|u|sdw2|sdw2|40001|41001|/data/primary1||")
+        mirror0 = GpDB.initFromString("4|0|m|m|n|u|sdw2|sdw2|50000|51000|/data/mirror0||")
+
+        # Down segments
+        primary0 = GpDB.initFromString("2|0|p|p|n|d|sdw1|sdw1|40000|41000|/data/primary0||")
+        mirror1 = GpDB.initFromString("5|1|m|m|n|d|sdw1|sdw1|50001|51001|/data/mirror1||")
+        standby = GpDB.initFromString("6|-1|m|m|n|d|sdw3|sdw3|5433|5533|/data/standby||")
+
+        gpstart.gparray = GpArray([master, primary0, primary1, mirror0, mirror1, standby])
+
+        up, down = gpstart._prepare_segment_start()
+
+        # The master and standby should not be accounted for in these lists.
+        self.assertItemsEqual(up, [primary1, mirror0])
+        self.assertItemsEqual(down, [primary0, mirror1])
+
+
+    @patch("gppylib.commands.pg.PgControlData.run")
+    @patch("gppylib.commands.pg.PgControlData.get_value", return_value="2")
+    def test_fetch_tli_returns_TimeLineID_when_standby_is_accessible(self, mock1, mock2):
+        gpstart = self.setup_gpstart()
+
+        self.assertEqual(gpstart.fetch_tli("", "foo"), 2)
+
+    @patch("gpstart.GpStart.fetch_tli", autospec=True)
+    def test_standby_activated_returns_false_when_primary_tli_is_before_standby_tli(self, mock_fetch_tli):
+        def mock_fetch_tli_func(self, data_dir, remote_host=None):
+            if "master" in data_dir:
+                return 3
+            if "standby" in data_dir:
+                return 2
+            return 1
+
+        mock_fetch_tli.side_effect = mock_fetch_tli_func
+
+        gpstart = self.setup_gpstart()
+        gpstart.master_datadir = "/data/master"
+
+        master = GpDB.initFromString("1|-1|p|p|n|u|mdw|mdw|5432|5532|/data/master||")
+        standby = GpDB.initFromString("6|-1|m|m|n|d|sdw3|sdw3|5433|5533|/data/standby||")
+        gpstart.gparray = GpArray([master, standby])
+
+        self.assertFalse(gpstart._standby_activated())
+
+    @patch("gpstart.GpStart.fetch_tli", autospec=True)
+    def test_standby_activated_returns_true_when_standby_tli_is_before_primary_tli(self, mock_fetch_tli):
+        def mock_fetch_tli_func(self, data_dir, remote_host=None):
+            if "master" in data_dir:
+                return 1
+            if "standby" in data_dir:
+                return 2
+            return 3
+
+        mock_fetch_tli.side_effect = mock_fetch_tli_func
+
+        gpstart = self.setup_gpstart()
+        gpstart.master_datadir = "/data/master"
+
+        master = GpDB.initFromString("1|-1|p|p|n|u|mdw|mdw|5432|5532|/data/master||")
+        standby = GpDB.initFromString("6|-1|m|m|n|d|sdw3|sdw3|5433|5533|/data/standby||")
+        gpstart.gparray = GpArray([master, standby])
+
+        self.assertTrue(gpstart._standby_activated())
+
+    @patch("gpstart.GpStart.fetch_tli", autospec=True)
+    def test_standby_activated_raises_StandbyUnreachable_exception_when_fetching_standby_tli_fails(self, mock_fetch_tli):
+        def mock_fetch_tli_func(self, data_dir, remote_host=None):
+            if "standby" in data_dir:
+                raise ExecutionError("oops", None)
+            return 10
+
+        mock_fetch_tli.side_effect = mock_fetch_tli_func
+
+        gpstart = self.setup_gpstart()
+        gpstart.master_datadir = "/data/master"
+
+        master = GpDB.initFromString("1|-1|p|p|n|u|mdw|mdw|5432|5532|/data/master||")
+        standby = GpDB.initFromString("6|-1|m|m|n|d|sdw3|sdw3|5433|5533|/data/standby||")
+        gpstart.gparray = GpArray([master, standby])
+
+        with self.assertRaises(gpstart.StandbyUnreachable):
+            gpstart._standby_activated()
+
+    @patch("gpstart.gp.GpStop")
+    @patch("gpstart.GpStart._standby_activated", return_value=False)
+    def test_check_standby_returns_when_standby_is_not_activated(self, mock_standby_activated, mock_gp_stop):
+        gpstart = self.setup_gpstart()
+        gpstart.check_standby()
+        self.assertFalse(mock_gp_stop.called)
+
+    @patch("gpstart.gp.GpStop")
+    @patch("gpstart.GpStart._standby_activated", return_value=True)
+    def test_check_standby_stops_master_and_raises_an_exception_when_standby_is_activated(self, mock_standby_activated, mock_gp_stop):
+        gpstart = self.setup_gpstart()
+        with self.assertRaises(ExceptionNoStackTraceNeeded):
+            gpstart.check_standby()
+        self.assertTrue(mock_gp_stop.return_value.run.called)
+
+    @patch("gpstart.GpStart.shutdown_master_only")
+    @patch("gpstart.gp.GpStop")
+    @patch("gpstart.GpStart._standby_activated")
+    def test_check_standby_logs_warning_and_returns_when_standby_is_unreachable_and_user_proceeds(self, mock_standby_activated, mock_gp_stop, mock_shutdown_master):
+        gpstart = self.setup_gpstart()
+
+        mock_standby_activated.side_effect = gpstart.StandbyUnreachable()
+        gpstart.interactive = True
+        self.mock_userinput.ask_yesno.return_value = True
+
+        gpstart.check_standby()
+        self.subject.logger.warning.assert_any_call(StringContains("Standby host is unreachable, cannot determine whether the standby is currently acting as the master"))
+        self.assertFalse(mock_shutdown_master.called)
+        self.assertFalse(mock_gp_stop.called)
+
+    @patch("gpstart.GpStart.shutdown_master_only")
+    @patch("gpstart.gp.GpStop")
+    @patch("gpstart.GpStart._standby_activated")
+    def test_check_standby_logs_warning_and_stops_master_and_raises_exception_when_standby_is_unreachable_and_user_does_not_proceeed(self, mock_standby_activated, mock_gp_stop, mock_shutdown_master):
+        gpstart = self.setup_gpstart()
+
+        mock_standby_activated.side_effect = gpstart.StandbyUnreachable()
+        gpstart.interactive = True
+        self.mock_userinput.ask_yesno.return_value = False
+
+        with self.assertRaises(UserAbortedException):
+            gpstart.check_standby()
+        self.subject.logger.warning.assert_any_call(StringContains("Standby host is unreachable, cannot determine whether the standby is currently acting as the master"))
+        self.assertTrue(mock_shutdown_master.called)
+        self.assertFalse(mock_gp_stop.called)
+
+    @patch("gpstart.GpStart.shutdown_master_only")
+    @patch("gpstart.gp.GpStop")
+    @patch("gpstart.GpStart._standby_activated")
+    def test_check_standby_logs_warning_and_stops_master_and_raises_exception_in_non_interactive_mode_and_standby_is_unreachable(self, mock_standby_activated, mock_gp_stop, mock_shutdown_master):
+        gpstart = self.setup_gpstart()
+
+        mock_standby_activated.side_effect = gpstart.StandbyUnreachable()
+        gpstart.interactive = False
+
+        with self.assertRaises(UserAbortedException):
+            gpstart.check_standby()
+        self.subject.logger.warning.assert_any_call(StringContains("Standby host is unreachable, cannot determine whether the standby is currently acting as the master"))
+        self.subject.logger.warning.assert_any_call("Non interactive mode detected. Not starting the cluster. Start the cluster in interactive mode.")
+        self.assertTrue(mock_shutdown_master.called)
+        self.assertFalse(mock_gp_stop.called)
 
     def _createGpArrayWith2Primary2Mirrors(self):
         self.master = GpDB.initFromString(
@@ -203,6 +351,11 @@ def os_exists_check(arg):
     elif 'postmaster.pid' in arg or '.s.PGSQL' in arg:
         return False
     return False
+
+
+class StringContains(str):
+    def __eq__(self, other):
+        return self in other
 
 
 if __name__ == '__main__':

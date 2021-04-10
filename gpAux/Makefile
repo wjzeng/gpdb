@@ -159,8 +159,8 @@ endif
 
 APU_CONFIG=--with-apu-config=$(BLD_THIRDPARTY_BIN_DIR)/apu-1-config
 
-aix7_ppc_64_CONFIGFLAGS=--disable-gpcloud --without-readline --without-libcurl --disable-orca --disable-pxf $(APR_CONFIG)
-win32_CONFIGFLAGS=--with-gssapi --without-libcurl --disable-orca --disable-pxf --disable-gpcloud $(APR_CONFIG)
+aix7_ppc_64_CONFIGFLAGS=--disable-gpcloud --without-readline --without-libcurl --disable-orca $(APR_CONFIG)
+win32_CONFIGFLAGS=--with-gssapi --without-libcurl --disable-orca --disable-gpcloud $(APR_CONFIG)
 sol10_x86_64_CONFIGFLAGS=--enable-snmp --with-libxml $(APR_CONFIG)
 rhel5_x86_32_CONFIGFLAGS=--host=i686-pc-linux-gnu --enable-snmp --enable-ddboost --with-gssapi --enable-netbackup --with-libxml $(APR_CONFIG)
 rhel5_x86_64_CONFIGFLAGS=--enable-snmp --enable-gpperfmon --enable-ddboost --with-gssapi --enable-netbackup ${ORCA_CONFIG} --with-libxml $(APR_CONFIG) $(APU_CONFIG)
@@ -174,7 +174,7 @@ suse11_x86_64_CONFIGFLAGS=--enable-ddboost --enable-gpperfmon --with-gssapi ${OR
 sles11_x86_64_CONFIGFLAGS=--enable-ddboost --enable-gpperfmon --with-gssapi ${ORCA_CONFIG} --with-libxml $(APR_CONFIG) $(APU_CONFIG)
 linux_x86_64_CONFIGFLAGS=--enable-snmp ${ORCA_CONFIG} --with-libxml $(APR_CONFIG)
 osx106_x86_CONFIGFLAGS=--enable-snmp ${ORCA_CONFIG} --with-libxml $(APR_CONFIG)
-ubuntu1604_amd64_CONFIGFLAGS=--enable-snmp --enable-tap-tests --enable-gpperfmon --with-gssapi --enable-mapreduce ${ORCA_CONFIG} --with-libxml $(APR_CONFIG) $(APU_CONFIG)
+ubuntu1604_amd64_CONFIGFLAGS=--with-gssapi --enable-mapreduce ${ORCA_CONFIG} --with-libxml $(APR_CONFIG) $(APU_CONFIG)
 
 BLD_CONFIGFLAGS=$($(BLD_ARCH)_CONFIGFLAGS)
 
@@ -251,6 +251,14 @@ CONFIGFLAGS+= $(CONFIG_ADDITIONS)
 
 ifdef ADDON_DIR
 CONFIGFLAGS+=ADDON_DIR=$(ADDON_DIR)
+endif
+
+# if $BLD_ARCH is rhel6_x86_64 of rhel7_x86_64
+# compile with relative rpath
+ifeq "$(findstring rhel,$(BLD_ARCH))" "rhel"
+CONFIGFLAGS+= --disable-rpath
+CONFIGFLAGS+= LDFLAGS='-Wl,--enable-new-dtags -Wl,-rpath,\$$$$ORIGIN/../lib'
+CONFIGFLAGS+= LDFLAGS_SL='-Wl,--enable-new-dtags -Wl,-rpath,\$$$$ORIGIN/../lib'
 endif
 
 RECONFIG :
@@ -330,12 +338,18 @@ sol10_sparc_32_GPDB_BUILDSET=partial
 win64_GPDB_BUILDSET=partial
 win32_GPDB_BUILDSET=partial
 BLD_GPDB_BUILDSET=$($(BLD_ARCH)_GPDB_BUILDSET)
+perl_archlibexp:=$(shell perl -MConfig -e 'print $$Config{archlibexp}')
 
 # set default build steps
 define BUILD_STEPS
 	@rm -rf $(INSTLOC)
-	cd $(BUILDDIR) && $(MAKE) $(PARALLEL_MAKE_OPTS) install
-	#@$(MAKE) greenplum_path INSTLOC=$(INSTLOC)
+	if [ "$(findstring rhel,$(BLD_ARCH))" = "rhel" ]; then \
+	  cd $(BUILDDIR) && PYGRESQL_LDFLAGS='-Wl,-rpath,\$$$$ORIGIN/../../../lib -Wl,--enable-new-dtags' $(MAKE) $(PARALLEL_MAKE_OPTS) install; \
+	  cd $(BUILDDIR)/src/pl/plpython && $(MAKE) clean && echo 'LDFLAGS += -Wl,-rpath,\$$$$ORIGIN/../../ext/python/lib/ -Wl,--enable-new-dtags' >> Makefile && echo 'LDFLAGS_SL += -Wl,-rpath,\$$$$ORIGIN/../../ext/python/lib/ -Wl,--enable-new-dtags' >> Makefile && $(MAKE) $(PARALLEL_MAKE_OPTS) install && cd $(BUILDDIR) ; \
+	  cd $(BUILDDIR)/src/pl/plperl && $(MAKE) clean && echo "LDFLAGS += -Wl,-rpath,$(perl_archlibexp)/CORE -Wl,--enable-new-dtags" >> GNUmakefile && echo "LDFLAGS_SL += -Wl,-rpath,$(perl_archlibexp)/CORE -Wl,--enable-new-dtags" >> GNUmakefile && $(MAKE) $(PARALLEL_MAKE_OPTS) install && cd $(BUILDDIR) ; \
+	else \
+	  cd $(BUILDDIR) && $(MAKE) $(PARALLEL_MAKE_OPTS) install; \
+	fi \
 	#@$(MAKE) mgmtcopy INSTLOC=$(INSTLOC)
 	@$(MAKE) mkpgbouncer INSTLOC=$(INSTLOC) BUILDDIR=$(BUILDDIR)
 	@$(MAKE) mkpgbench INSTLOC=$(INSTLOC) BUILDDIR=$(BUILDDIR)
@@ -345,6 +359,7 @@ define BUILD_STEPS
 	fi
 	@$(MAKE) copydocs INSTLOC=$(INSTLOC)
 	@$(MAKE) copylibs INSTLOC=$(INSTLOC)
+	@$(MAKE) greenplum_path INSTLOC=$(INSTLOC)
 	@$(MAKE) clients INSTLOC=$(INSTLOC) CLIENTINSTLOC=$(CLIENTINSTLOC)
 	@$(MAKE) set_scripts_version INSTLOC=$(CLIENTINSTLOC)
 	@$(MAKE) loaders INSTLOC=$(INSTLOC) LOADERSINSTLOC=$(LOADERSINSTLOC)
@@ -722,6 +737,7 @@ else
 	(cd $(INSTLOC)/bin/ && $(TAR) cf - $(LOADERS_FILESET_BIN)) | (cd $(LOADERSINSTLOC_BIN)/ && $(TAR) xpf -)$(check_pipe_for_errors)
 	mkdir -p $(LOADERSINSTLOC_BINEXT)
 	(cd $(GPMGMT)/bin/ext/ && $(TAR) cf - $(LOADERS_FILESET_BINEXT)) | (cd $(LOADERSINSTLOC_BINEXT)/ && $(TAR) xpf -)$(check_pipe_for_errors)
+	(cd $(GPMGMT)/bin/ && $(TAR) cf - gppylib) | (cd $(LOADERSINSTLOC_BINEXT)/ && $(TAR) xpf -)$(check_pipe_for_errors)
 ifeq "$(findstring win,$(BLD_ARCH))" "win"
 	# ---- copy pygresql from ext/win32 ----
 	(cd $(BLD_THIRDPARTY)/win32 && $(TAR) cf - pygresql) | (cd $(LOADERSINSTLOC_BINEXT)/ && $(TAR) xpf -)$(check_pipe_for_errors)
@@ -881,17 +897,23 @@ set_scripts_version :
 #---------------------------------------------------------------------
 
 mkgphdfs:
+ifneq ($(BLD_ARCH),$(filter $(BLD_ARCH),ubuntu1604_amd64))
 	@cd extensions && $(MAKE) mkgphdfs OPT="$(INSTCFLAGS)" INSTLOC=$(INSTLOC)
+endif
 
 mkorafce:
+ifneq ($(BLD_ARCH),$(filter $(BLD_ARCH),ubuntu1604_amd64))
 	@cd extensions && $(MAKE) mkorafce OPT="$(INSTCFLAGS)" INSTLOC=$(INSTLOC)
+endif
 
 mkpgbench:
+ifneq ($(BLD_ARCH),$(filter $(BLD_ARCH),ubuntu1604_amd64))
 	@cd $(BUILDDIR)/contrib/pgbench && $(MAKE) install
+endif
 
 mkpgbouncer:
-ifeq "$(shell uname -s)" "Darwin"
-	echo "pgbouncer can't build on Mac"
+ifeq ($(BLD_ARCH),$(filter $(BLD_ARCH),osx106_x86_64 ubuntu1604_amd64))
+	echo "pgbouncer can't build on $(BLD_ARCH)"
 else
 	@if [ ! -f extensions/pgbouncer/source/configure ]; then cd extensions/pgbouncer/source && ./autogen.sh ;fi
 	@cd extensions/pgbouncer/source && ./configure --with-libevent=$(BLD_TOP)/ext/$(BLD_ARCH) --prefix=$(INSTLOC) --enable-evdns --with-pam
@@ -1036,8 +1058,12 @@ endif
 
 greenplum_path:
 	mkdir -p $(INSTLOC)
-	unset LIBPATH; \
-	  releng/generate-greenplum-path.sh $(INSTLOC) > $(INSTLOC)/greenplum_path.sh
+ifeq ($(BLD_ARCH),$(filter $(BLD_ARCH),ubuntu1604_amd64))
+	# python is not vendored in the enterpise builds of Ubuntu 16.04
+	$(BUILDDIR)/gpMgmt/bin/generate-greenplum-path.sh no > $(INSTLOC)/greenplum_path.sh
+else
+	$(BUILDDIR)/gpMgmt/bin/generate-greenplum-path.sh yes > $(INSTLOC)/greenplum_path.sh
+endif
 
 copylicense:
 	for proddir in $(INSTLOC) $(CLIENTINSTLOC) $(LOADERSINSTLOC); do \

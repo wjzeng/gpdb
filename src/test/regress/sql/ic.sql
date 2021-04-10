@@ -212,3 +212,12 @@ SELECT gp_inject_fault('interconnect_setup_palloc', 'error', 1);
 SELECT * FROM a;
 DROP TABLE a;
 SELECT gp_inject_fault('interconnect_setup_palloc', 'reset', 1);
+
+
+-- Test sender QE errors out when setup outgoing connection, the receiver QE is waiting,
+-- at this time, QD should be able to process the error and cancel the receiver QE.
+CREATE TABLE test_ic_error(a INT, b int);
+SELECT gp_inject_fault('interconnect_setup_palloc', 'error', 2);
+SELECT * FROM test_ic_error t1, test_ic_error t2 where t1.a=t2.b;
+SELECT gp_inject_fault('interconnect_setup_palloc', 'reset', 2);
+DROP TABLE test_ic_error;

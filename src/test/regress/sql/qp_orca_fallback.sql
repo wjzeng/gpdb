@@ -75,13 +75,18 @@ SELECT * FROM homer;
 DELETE FROM ONLY homer WHERE a = 3;
 SELECT * FROM homer;
 
--- ORCA should not fallback when ONLY clause is used on external tables
+-- ORCA should not fallback just because external tables are in FROM clause
 -- start_ignore
-DROP TABLE IF EXISTS t1;
-DROP TABLE IF EXISTS ext_table_no_fallback;
 CREATE TABLE heap_t1 (a int, b int) DISTRIBUTED BY (b);
 CREATE EXTERNAL TABLE ext_table_no_fallback (a int, b int) LOCATION ('gpfdist://myhost:8080/test.csv') FORMAT 'CSV';
 -- end_ignore
 EXPLAIN SELECT * FROM ext_table_no_fallback;
+-- ORCA should fallback due to ONLY keyword
 EXPLAIN SELECT * FROM ONLY ext_table_no_fallback;
 EXPLAIN INSERT INTO heap_t1 SELECT * FROM ONLY ext_table_no_fallback;
+
+set optimizer_enable_dml=off;
+EXPLAIN INSERT INTO homer VALUES (1,0,40),(2,1,43),(3,2,41),(4,3,44);
+EXPLAIN UPDATE ONLY homer SET c = c + 1;
+EXPLAIN DELETE FROM ONLY homer WHERE a = 3;
+set optimizer_enable_dml=on;

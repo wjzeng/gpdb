@@ -248,42 +248,6 @@ ProcArrayEndTransaction(PGPROC *proc, TransactionId latestXid, bool isCommit)
 {
 	bool needNotifyCommittedDtxTransaction;
 
-	/*
-	 * MyProc->localDistribXactData is only used for debugging purpose by
-	 * backend itself on segments only hence okay to modify without holding
-	 * the lock.
-	 */
-	if (MyProc->localDistribXactData.state != LOCALDISTRIBXACT_STATE_NONE)
-	{
-		switch (DistributedTransactionContext)
-		{
-			case DTX_CONTEXT_QE_TWO_PHASE_EXPLICIT_WRITER:
-			case DTX_CONTEXT_QE_TWO_PHASE_IMPLICIT_WRITER:
-			case DTX_CONTEXT_QE_AUTO_COMMIT_IMPLICIT:
-				LocalDistribXact_ChangeState(MyProc,
-											 isCommit ?
-											 LOCALDISTRIBXACT_STATE_COMMITTED :
-											 LOCALDISTRIBXACT_STATE_ABORTED);
-				break;
-
-			case DTX_CONTEXT_QE_READER:
-			case DTX_CONTEXT_QE_ENTRY_DB_SINGLETON:
-				// QD or QE Writer will handle it.
-				break;
-
-			case DTX_CONTEXT_QD_DISTRIBUTED_CAPABLE:
-			case DTX_CONTEXT_QD_RETRY_PHASE_2:
-			case DTX_CONTEXT_QE_PREPARED:
-			case DTX_CONTEXT_QE_FINISH_PREPARED:
-				elog(PANIC, "Unexpected distribute transaction context: '%s'",
-					 DtxContextToString(DistributedTransactionContext));
-
-			default:
-				elog(PANIC, "Unrecognized DTX transaction context: %d",
-					 (int) DistributedTransactionContext);
-		}
-	}
-
 	if (isCommit && notifyCommittedDtxTransactionIsNeeded())
 		needNotifyCommittedDtxTransaction = true;
 	else
@@ -350,6 +314,43 @@ ProcArrayEndTransaction(PGPROC *proc, TransactionId latestXid, bool isCommit)
 		Assert(proc->subxids.overflowed == false);
 	}
 
+	/*
+	 * MyProc->localDistribXactData is used by backend itself hence okay to
+	 * modify without holding the lock.
+	 */
+	if (MyProc->localDistribXactData.state != LOCALDISTRIBXACT_STATE_NONE)
+	{
+		switch (DistributedTransactionContext)
+		{
+			case DTX_CONTEXT_QE_TWO_PHASE_EXPLICIT_WRITER:
+			case DTX_CONTEXT_QE_TWO_PHASE_IMPLICIT_WRITER:
+			case DTX_CONTEXT_QE_AUTO_COMMIT_IMPLICIT:
+			case DTX_CONTEXT_QD_DISTRIBUTED_CAPABLE:
+			case DTX_CONTEXT_QD_RETRY_PHASE_2:
+			case DTX_CONTEXT_LOCAL_ONLY:
+			case DTX_CONTEXT_QE_FINISH_PREPARED:
+				LocalDistribXact_ChangeState(MyProc,
+											 isCommit ?
+											 LOCALDISTRIBXACT_STATE_COMMITTED :
+											 LOCALDISTRIBXACT_STATE_ABORTED);
+				break;
+
+			case DTX_CONTEXT_QE_READER:
+			case DTX_CONTEXT_QE_ENTRY_DB_SINGLETON:
+				// QD or QE Writer will handle it.
+				break;
+
+			case DTX_CONTEXT_QE_PREPARED:
+				elog(PANIC, "Unexpected distribute transaction context: '%s'",
+					 DtxContextToString(DistributedTransactionContext));
+				break;
+
+			default:
+				elog(PANIC, "Unrecognized DTX transaction context: %d",
+					 (int) DistributedTransactionContext);
+		}
+	}
+
 	return needNotifyCommittedDtxTransaction;
 }
 
@@ -374,8 +375,6 @@ ProcArrayClearTransaction(PGPROC *proc, bool commit)
 	 */
 	proc->xid = InvalidTransactionId;
 	proc->xmin = InvalidTransactionId;
-
-	proc->localDistribXactData.state = LOCALDISTRIBXACT_STATE_NONE;
 
 	/* redundant, but just in case */
 	proc->vacuumFlags &= ~PROC_VACUUM_STATE_MASK;
@@ -1001,7 +1000,7 @@ QEwriterSnapshotUpToDate(void)
  * We also update the following backend-global variables:
  *		TransactionXmin: the oldest xmin of any snapshot in use in the
  *			current transaction (this is the same as MyProc->xmin).  This
- *			is just the xmin computed for the first, serializable snapshot.
+ *			is just the xmin computed for the first snapshot.
  *		RecentXmin: the xmin computed for the most recent snapshot.  XIDs
  *			older than this are known not running any more.
  *		RecentGlobalXmin: the global xmin (oldest TransactionXmin across all
@@ -1009,7 +1008,7 @@ QEwriterSnapshotUpToDate(void)
  *			the same computation done by GetOldestXmin(true, true).
  */
 Snapshot
-GetSnapshotData(Snapshot snapshot, bool serializable)
+GetSnapshotData(Snapshot snapshot)
 {
 	ProcArrayStruct *arrayP = procArray;
 	TransactionId xmin;
@@ -1236,6 +1235,8 @@ GetSnapshotData(Snapshot snapshot, bool serializable)
 
 				if (total_sleep_time_us >= segmate_timeout_us)
 				{
+					LWLockRelease(SharedLocalSnapshotSlot->slotLock);
+					LWLockAcquire(SharedSnapshotLock, LW_SHARED); /* For SharedSnapshotDump() */
 					ereport(ERROR,
 							(errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
 							 errmsg("GetSnapshotData timed out waiting for Writer to set the shared snapshot."),
@@ -1295,12 +1296,7 @@ GetSnapshotData(Snapshot snapshot, bool serializable)
 
 	/* Serializable snapshot must be computed before any other... */
 	ereport((Debug_print_full_dtm ? LOG : DEBUG5),
-			(errmsg("GetSnapshotData serializable %s, xmin %u",
-					(serializable ? "true" : "false"),
-					MyProc->xmin)));
-	Assert(serializable ?
-		   !TransactionIdIsValid(MyProc->xmin) :
-		   TransactionIdIsValid(MyProc->xmin));
+			(errmsg("GetSnapshotData xmin %u", MyProc->xmin)));
 
 	/*
 	 * It is sufficient to get shared lock on ProcArrayLock, even if we are
@@ -1319,44 +1315,6 @@ GetSnapshotData(Snapshot snapshot, bool serializable)
 	ereport((Debug_print_full_dtm ? LOG : DEBUG5),
 			(errmsg("GetSnapshotData setting globalxmin and xmin to %u",
 					xmin)));
-
-	/*
-	 * Get the distributed snapshot if needed and copy it into the field 
-	 * called distribSnapshotWithLocalMapping in the snapshot structure.
-	 *
-	 * For a distributed transaction:
-	 *   => The corrresponding distributed snapshot is made up of distributed
-	 *      xids from the DTM that are considered in-progress will be kept in
-	 *      the snapshot structure separately from any local in-progress xact.
-	 *
-	 *      The MVCC function XidInSnapshot is used to evaluate whether
-	 *      a tuple is visible through a snapshot. Only committed xids are
-	 *      given to XidInSnapshot for evaluation. XidInSnapshot will first
-	 *      determine if the committed tuple is for a distributed transaction.  
-	 *      If the xact is distributed it will be evaluated only against the
-	 *      distributed snapshot and not the local snapshot.
-	 *
-	 *      Otherwise, when the committed transaction being evaluated is local,
-	 *      then it will be evaluated only against the local portion of the
-	 *      snapshot.
-	 *
-	 * For a local transaction:
-	 *   => Only the local portion of the snapshot: xmin, xmax, xcnt,
-	 *      in-progress (xip), etc, will be filled in.
-	 *
-	 *      Note that in-progress distributed transactions that have reached
-	 *      this database instance and are active will be represented in the
-	 *      local in-progress (xip) array with the distributed transaction's
-	 *      local xid.
-	 *
-	 * In summary: This 2 snapshot scheme (optional distributed, required local)
-	 * handles late arriving distributed transactions properly since that work
-	 * is only evaluated against the distributed snapshot. And, the scheme
-	 * handles local transaction work seeing distributed work properly by
-	 * including distributed transactions in the local snapshot via their
-	 * local xids.
-	 */
-	FillInDistributedSnapshot(snapshot);
 
 	/*
 	 * Spin over procArray checking xid, xmin, and subxids.  The goal is to
@@ -1435,7 +1393,7 @@ GetSnapshotData(Snapshot snapshot, bool serializable)
 		}
 	}
 
-	if (serializable)
+	if (!TransactionIdIsValid(MyProc->xmin))
 	{
 		/* Not that these values are not set atomically. However,
 		 * each of these assignments is itself assumed to be atomic. */
@@ -1459,6 +1417,46 @@ GetSnapshotData(Snapshot snapshot, bool serializable)
 	 */
 	if (TransactionIdPrecedes(xmin, globalxmin))
 		globalxmin = xmin;
+
+	/*
+	 * Get the distributed snapshot if needed and copy it into the field
+	 * called distribSnapshotWithLocalMapping in the snapshot structure.
+	 *
+	 * For a distributed transaction:
+	 *   => The corrresponding distributed snapshot is made up of distributed
+	 *      xids from the DTM that are considered in-progress will be kept in
+	 *      the snapshot structure separately from any local in-progress xact.
+	 *
+	 *      The MVCC function XidInSnapshot is used to evaluate whether
+	 *      a tuple is visible through a snapshot. Only committed xids are
+	 *      given to XidInSnapshot for evaluation. XidInSnapshot will first
+	 *      determine if the committed tuple is for a distributed transaction.
+	 *      If the xact is distributed it will be evaluated only against the
+	 *      distributed snapshot and not the local snapshot.
+	 *
+	 *      Otherwise, when the committed transaction being evaluated is local,
+	 *      then it will be evaluated only against the local portion of the
+	 *      snapshot.
+	 *
+	 * For a local transaction:
+	 *   => Only the local portion of the snapshot: xmin, xmax, xcnt,
+	 *      in-progress (xip), etc, will be filled in.
+	 *
+	 *      Note that in-progress distributed transactions that have reached
+	 *      this database instance and are active will be represented in the
+	 *      local in-progress (xip) array with the distributed transaction's
+	 *      local xid.
+	 *
+	 * In summary: This 2 snapshot scheme (optional distributed, required local)
+	 * handles late arriving distributed transactions properly since that work
+	 * is only evaluated against the distributed snapshot. And, the scheme
+	 * handles local transaction work seeing distributed work properly by
+	 * including distributed transactions in the local snapshot via their
+	 * local xids.
+	 *
+	 * (We do this after releasing ProcArrayLock, to reduce contention.)
+	 */
+	FillInDistributedSnapshot(snapshot);
 
 	/* Update global variables too */
 	RecentGlobalXmin = globalxmin;

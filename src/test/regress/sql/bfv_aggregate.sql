@@ -1361,7 +1361,7 @@ INSERT INTO t1 VALUES ('bbbbbbb', 'eeee');
 INSERT INTO t1 VALUES ('bbbbbbb', 'eeef');
 INSERT INTO t1 VALUES ('bbbbb', 'dfafa');
 SELECT substr(a, 1) as a FROM (SELECT ('-'||a)::varchar as a FROM (SELECT a FROM t1) t2) t3 GROUP BY a ORDER BY a;
-SELECT array_agg(f)  FROM (SELECT b::text as f FROM t1 GROUP BY b ORDER BY b) q;
+SELECT array_agg(f ORDER BY f)  FROM (SELECT b::text as f FROM t1 GROUP BY b ORDER BY b) q;
 
 
 -- Check that ORDER BY NULLS FIRST/LAST in an aggregate is respected (these are
@@ -1407,6 +1407,12 @@ select * from int2vectortab union select * from int2vectortab;
 -- end_matchsubs
 select count(*) over (partition by t) from int2vectortab;
 
+-- This is currently broken on 5X_STABLE, although it's been fixed in master.
+CREATE TABLE distinct_agg1 (a int, b int, c int);
+CREATE TABLE distinct_agg2 (d int, e int, f int);
+INSERT INTO distinct_agg1 SELECT i%50, i%2, i%5 from generate_series(1, 100) i ;
+INSERT INTO distinct_agg2 SELECT i%50, i, i%2 from generate_series(1, 100) i ;
+SELECT DISTINCT c, e FROM distinct_agg1 AS t1, distinct_agg2 AS t2 WHERE t1.a = t2.d AND t1.b = 0 GROUP BY 1,2;
 
 -- CLEANUP
 set client_min_messages='warning';

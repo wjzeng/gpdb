@@ -74,7 +74,7 @@ bool		Debug_print_prelim_plan;	/* Shall we log argument of
 
 bool		Debug_print_slice_table;	/* Shall we log the slice table? */
 
-bool		Debug_resource_group;	/* Shall we log the resource group? */
+bool		Debug_resource_group = false;	/* Shall we log the resource group? */
 
 bool		gp_backup_directIO = false; /* disable\enable direct I/O dump */
 
@@ -1100,56 +1100,6 @@ const char *
 gpvars_show_gp_autostats_mode_in_functions(void)
 {
 	return gpvars_show_gp_autostats_mode_common(true /* inFunctions */ );
-}
-
-/* gp_enable_gpperfmon and gp_gpperfmon_send_interval are GUCs that we'd like
- * to have propagate from master to segments but we don't want non-super users
- * to be able to set it.  Unfortunately, as long as we use libpq to connect to
- * the segments its hard to create a clean way of doing this.
- *
- * Here we check and enforce that if the value is being set on the master its being
- * done as superuser and not a regular user.
- *
- */
-bool
-gpvars_assign_gp_enable_gpperfmon(bool newval, bool doit, GucSource source)
-{
-	if (doit)
-	{
-
-		if (Gp_role == GP_ROLE_DISPATCH && IsUnderPostmaster && GetCurrentRoleId() != InvalidOid && !superuser())
-		{
-			ereport(ERROR,
-					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-					 errmsg("must be superuser to set gp_enable_gpperfmon")));
-		}
-		else
-		{
-			gp_enable_gpperfmon = newval;
-		}
-	}
-
-	return true;
-}
-
-bool
-gpvars_assign_gp_gpperfmon_send_interval(int newval, bool doit, GucSource source)
-{
-	if (doit)
-	{
-		if (Gp_role == GP_ROLE_DISPATCH && IsUnderPostmaster && GetCurrentRoleId() != InvalidOid && !superuser())
-		{
-			ereport(ERROR,
-					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-			 errmsg("must be superuser to set gp_gpperfmon_send_interval")));
-		}
-		else
-		{
-			gp_gpperfmon_send_interval = newval;
-		}
-	}
-
-	return true;
 }
 
 const char *

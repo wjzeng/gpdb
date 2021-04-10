@@ -618,9 +618,7 @@ setupOutgoingConnection(ChunkTransportState *transportStates, ChunkTransportStat
 {
 	CdbProcess         *cdbProc = conn->cdbProc;
 
-	int                 sockopt;
 	int                 n;
-
 	int			ret;
 	char		portNumberStr[32];
 	char	   *service;
@@ -634,13 +632,10 @@ setupOutgoingConnection(ChunkTransportState *transportStates, ChunkTransportStat
 	conn->remoteContentId = cdbProc->contentid;
 
 	/*
-	 * record the destination IP addr and port for error messages.
-	 * Since the IP addr might be IPv6, it might have ':' embedded, so in
-	 * that case, put '[]' around it so we can see that the string is an
-	 * IP and port (otherwise it might look just like an IP).
-	 *
-	 * Should we really put this info into these fields? Later we replace this with
-	 * the source IP and port (after the bind call).
+	 * record the destination IP addr and port for error messages. Since the
+	 * IP addr might be IPv6, it might have ':' embedded, so in that case, put
+	 * '[]' around it so we can see that the string is an IP and port
+	 * (otherwise it might look just like an IP).
 	 */
 	if (strchr(cdbProc->listenerAddr,':')!=0)
 		snprintf(conn->remoteHostAndPort, sizeof(conn->remoteHostAndPort),
@@ -701,82 +696,6 @@ setupOutgoingConnection(ChunkTransportState *transportStates, ChunkTransportStat
 							   "connection."),
 						errdetail("%s: %m", "fcntl(O_NONBLOCK)")));
 	}
-
-	/* Allow bind() to succeed even if the port is in TIME_WAIT state. */
-	sockopt = 1;
-	if (setsockopt(conn->sockfd, SOL_SOCKET, SO_REUSEADDR,
-				   (void *)&sockopt, sizeof(sockopt)) < 0)
-		ereport(ERROR, (errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
-						errmsg("Interconnect error setting up outgoing "
-							   "connection."),
-						errdetail("%s: %m", "setsockopt(SO_REUSEADDR)")));
-
-
-	/*
-	 * To help with fault tolerance, try to use the same LAN adapter as was used
-	 * to connect the session to us.
-	 *
-	 * Bind that IP address to the socket.   But, we must insure that the source
-	 * address is the same address family as the destination address.
-	 *
-	 * The is especially important to check on the QD, since local
-	 * sessions are often AF_UNIX, and even if TCP, they could be either v6 or v4.
-	 *
-	 */
-
-
-	struct sockaddr_storage  saddr;
-	int saddr_len = addrs->ai_addrlen;
-	memset(&saddr, 0, sizeof(saddr));
-
-	if (MyProcPort->laddr.addr.ss_family == addrs->ai_family)
-	{
-		/* We need to copy the address so we can clear the port */
-
-		memcpy(&saddr, &MyProcPort->laddr.addr, MyProcPort->laddr.salen);
-		if (saddr.ss_family == AF_INET)
-			((struct sockaddr_in *)&saddr)->sin_port = 0; /* pick any available outbound port */
-		else if (saddr.ss_family == AF_INET6)
-			((struct sockaddr_in6 *)&saddr)->sin6_port = 0;
-
-
-		if (gp_log_interconnect >= GPVARS_VERBOSITY_DEBUG)
-		{
-			char debugmsg[128];
-			inet_ntop(saddr.ss_family, (struct sockaddr *)&saddr, debugmsg, sizeof(debugmsg));
-			ereport(DEBUG4, (errmsg("bind outbound  %s", debugmsg)));
-		}
-	}
-	else
-	{
-		/*
-		 * bind to the "any ip address" "any port".  Not really necessary to use bind()
-		 * but this allows us to get the system assigned source IP and port without
-		 * waiting until after the connect() call.
-		 */
-		saddr.ss_family = addrs->ai_family;
-
-		/* We could set the address to INADDR_ANY or INADDR_ANY6 but those are just zeros anyway */
-	}
-
-	if (bind(conn->sockfd, (struct sockaddr *)&saddr, saddr_len) < 0)
-	{
-		char debugmsg[128];
-		inet_ntop(saddr.ss_family, (struct sockaddr *)&saddr, debugmsg, sizeof(debugmsg));
-		/* Should never get EADDRINUSE because we know it's our port. */
-		ereport(ERROR, (errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
-						errmsg("Interconnect error setting up outgoing "
-							   "connection."),
-						errdetail("Could not bind to local addr %s. %m",
-								  debugmsg)));
-	}
-
-	/*
-	 * Get the source IP address and Port
-	 */
-	format_sockaddr((struct sockaddr *) &saddr, conn->remoteHostAndPort,
-					sizeof(conn->remoteHostAndPort));
-
 
 	if (gp_log_interconnect >= GPVARS_VERBOSITY_DEBUG)
 		ereport(DEBUG1, (errmsg("Interconnect connecting to seg%d slice%d %s "
@@ -1403,6 +1322,7 @@ SetupTCPInterconnect(EState *estate)
 
 	estate->interconnect_context->teardownActive = false;
 	estate->interconnect_context->activated = false;
+	estate->interconnect_context->networkTimeoutIsLogged = false;
 	estate->interconnect_context->incompleteConns = NIL;
 	estate->interconnect_context->sliceTable = NULL;
 	estate->interconnect_context->sliceId = -1;
@@ -1426,10 +1346,6 @@ SetupTCPInterconnect(EState *estate)
 	gp_interconnect_id = estate->interconnect_context->sliceTable->ic_instance_id;
 
 	gp_set_monotonic_begin_time(&startTime);
-
-	/* Initiate outgoing connections. */
-	if (mySlice->parentIndex != -1)
-		sendingChunkTransportState = startOutgoingConnections(estate->interconnect_context, mySlice, &expectedTotalOutgoing);
 
 	/* now we'll do some setup for each of our Receiving Motion Nodes. */
 	foreach(cell, mySlice->children)
@@ -1465,6 +1381,17 @@ SetupTCPInterconnect(EState *estate)
 
 		expectedTotalIncoming += activeNumProcs;
 	}
+
+	/*
+	 * Initiate outgoing connections.
+	 *
+	 * startOutgoingConnections() and createChunkTransportState() must not be
+	 * called during the lifecycle of sendingChunkTransportState, they will
+	 * repalloc() interconnect_context->states so sendingChunkTransportState
+	 * points to invalid memory.
+	 */
+	if (mySlice->parentIndex != -1)
+		sendingChunkTransportState = startOutgoingConnections(estate->interconnect_context, mySlice, &expectedTotalOutgoing);
 
 	if (expectedTotalIncoming > listenerBacklog)
 		ereport(WARNING, (errmsg("SetupTCPInterconnect: too many expected incoming connections(%d), Interconnect setup might possibly fail", expectedTotalIncoming),
@@ -1750,6 +1677,9 @@ SetupTCPInterconnect(EState *estate)
 			ereport(ERROR, (errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
 							errmsg("Interconnect error: %s: %m", "select")));
 		}
+
+		if (Gp_role == GP_ROLE_DISPATCH)
+			checkForCancelFromQD(estate->interconnect_context);
 
 		/*
 		 * check our connections that are accepted'd but no register

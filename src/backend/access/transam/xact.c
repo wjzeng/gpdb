@@ -747,9 +747,8 @@ TransactionIdIsCurrentTransactionIdInternal(TransactionId xid)
  * - case 3: if overflowed, check topmostxid from pg_subtrans with writer's top transaction id
  */
 static
-bool IsCurrentTransactionIdForReader(TransactionId xid) {
-	TransactionId topxid;
-
+bool IsCurrentTransactionIdForReader(TransactionId xid)
+{
 	Assert(!Gp_is_writer);
 
 	Assert(SharedLocalSnapshotSlot);
@@ -761,12 +760,12 @@ bool IsCurrentTransactionIdForReader(TransactionId xid) {
 	if (!writer_proc)
 	{
 		LWLockRelease(SharedLocalSnapshotSlot->slotLock);
-		elog(ERROR, "SharedLocalSnapshotSlot is not initialized with writer_proc.");
+		elog(ERROR, "reference to writer proc not found in shared snapshot");
 	}
 	else if (!writer_proc->pid)
 	{
 		LWLockRelease(SharedLocalSnapshotSlot->slotLock);
-		elog(ERROR, "SharedLocalSnapshotSlot->writer_proc is invalid.");
+		elog(ERROR, "writer proc reference shared with reader is invalid");
 	}
 
 	TransactionId writer_xid = writer_proc->xid;
@@ -807,15 +806,31 @@ bool IsCurrentTransactionIdForReader(TransactionId xid) {
 	if (!isCurrent && overflowed)
 	{
 		Assert(TransactionIdIsValid(writer_xid));
-
-		topxid = SubTransGetTopmostTransaction(xid);
-		Assert(TransactionIdIsValid(topxid));
-
-		if (TransactionIdEquals(topxid, writer_xid))
+		/*
+		 * QE readers don't have access to writer's transaction state.
+		 * Therefore, unlike writer, readers have to lookup pg_subtrans, which
+		 * is more expensive than searching for an xid in transaction state.  If
+		 * xid is older than the oldest running transaction we know of, it is
+		 * definitely not current and we can skip pg_subtrans.  Note that
+		 * pg_subtrans is not guaranteed to exist for transactions that are
+		 * known to be finished.
+		 */
+		if (TransactionIdFollowsOrEquals(xid, TransactionXmin) &&
+			TransactionIdEquals(SubTransGetTopmostTransaction(xid), writer_xid))
 		{
-			isCurrent = true;
+			/*
+			 * xid is a subtransaction of current transaction.  Did it abort?
+			 * If this was a writer, TransactionIdIsCurrentTransactionId()
+			 * returns false for aborted subtransactions.  We must therefore
+			 * consult clog.  In a writer, this information is available in
+			 * CurrentTransactionState.
+			 */
+			isCurrent = TransactionIdDidAbortForReader(xid) ? false : true;
 		}
 	}
+
+	ereportif(isCurrent && Debug_print_full_dtm, LOG,
+			  (errmsg("reader encountered writer's subxact ID %u", xid)));
 
 	return isCurrent;
 }
@@ -1747,7 +1762,9 @@ RecordTransactionAbort(bool isSubXact)
 	 * wrote a commit record for it, there's no turning back. The Distributed
 	 * Transaction Manager will take care of completing the transaction for us.
 	 */
-	if (isQEReader || getCurrentDtxState() == DTX_STATE_NOTIFYING_COMMIT_PREPARED)
+	if (isQEReader ||
+		getCurrentDtxState() == DTX_STATE_NOTIFYING_COMMIT_PREPARED ||
+		MyProc->localDistribXactData.state == LOCALDISTRIBXACT_STATE_ABORTED)
 		xid = InvalidTransactionId;
 	else
 		xid = GetCurrentTransactionIdIfAny();
@@ -2300,6 +2317,12 @@ StartTransaction(void)
 		case DTX_CONTEXT_QD_RETRY_PHASE_2:
 		case DTX_CONTEXT_QE_FINISH_PREPARED:
 		{
+			if (DistributedTransactionContext == DTX_CONTEXT_LOCAL_ONLY &&
+				Gp_role == GP_ROLE_UTILITY)
+			{
+				LocalDistribXactData *ele = &MyProc->localDistribXactData;
+				ele->state = LOCALDISTRIBXACT_STATE_ACTIVE;
+			}
 			/*
 			 * MPP: we're in utility-mode or a QE starting a pure-local
 			 * transaction without any synchronization to segmates!
@@ -2330,6 +2353,8 @@ StartTransaction(void)
 						(errmsg("setting SharedLocalSnapshotSlot->startTimestamp = " INT64_FORMAT "[old=" INT64_FORMAT "])",
 								stmtStartTimestamp, oldStartTimestamp)));
 			}
+			LocalDistribXactData *ele = &MyProc->localDistribXactData;
+			ele->state = LOCALDISTRIBXACT_STATE_ACTIVE;
 		}
 		break;
 
@@ -2415,14 +2440,18 @@ StartTransaction(void)
 			 */
 			Assert (SharedLocalSnapshotSlot != NULL);
 			s->distribXid = QEDtxContextInfo.distributedXid;
+			if (Debug_print_full_dtm)
+			{
+				LWLockAcquire(SharedSnapshotLock, LW_SHARED); /* For SharedSnapshotDump() */
 
-			ereport((Debug_print_full_dtm ? LOG : DEBUG5),
-					(errmsg("qExec reader: distributedXid %d currcid %d gxid = %u DtxContext '%s' sharedsnapshots: %s",
-							QEDtxContextInfo.distributedXid,
-							QEDtxContextInfo.curcid,
-							getDistributedTransactionId(),
-							DtxContextToString(DistributedTransactionContext),
-							SharedSnapshotDump())));
+				ereport(LOG, (errmsg("qExec reader: distributedXid %d currcid %d gxid = %u DtxContext '%s' sharedsnapshots: %s",
+						 QEDtxContextInfo.distributedXid,
+						 QEDtxContextInfo.curcid,
+						 getDistributedTransactionId(),
+						 DtxContextToString(DistributedTransactionContext),
+						 SharedSnapshotDump())));
+				LWLockRelease(SharedSnapshotLock);
+			}
 		}
 		break;
 	
@@ -2789,6 +2818,8 @@ CommitTransaction(void)
 	MyProc->inCommit = false;
 	MyProc->lxid = InvalidLocalTransactionId;
 
+	MyProc->localDistribXactData.state = LOCALDISTRIBXACT_STATE_NONE;
+
 	AtEOXact_MultiXact();
 
 	ResourceOwnerRelease(TopTransactionResourceOwner,
@@ -2847,7 +2878,7 @@ CommitTransaction(void)
 	/* we're now in a consistent state to handle an interrupt. */
 	RESUME_INTERRUPTS();
 
-	freeGangsForPortal(NULL);
+	freeGangsForPortal(NULL, NULL);
 
 	/* Release resource group slot at the end of a transaction */
 	if (ShouldUnassignResGroup())
@@ -3271,6 +3302,7 @@ AbortTransaction(void)
 	 */
 	ProcArrayEndTransaction(MyProc, latestXid, false);
 
+	SIMPLE_FAULT_INJECTOR(AbortAfterProcarrayEnd);
 	/*
 	 * Post-abort cleanup.	See notes in CommitTransaction() concerning
 	 * ordering.  We can skip all of it if the transaction failed before
@@ -3339,7 +3371,7 @@ AbortTransaction(void)
 	 */
 	RESUME_INTERRUPTS();
 
-	freeGangsForPortal(NULL);
+	freeGangsForPortal(NULL, NULL);
 
 	/* If a query was cancelled, then cleanup reader gangs. */
 	if (QueryCancelCleanup)

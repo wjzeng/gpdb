@@ -496,7 +496,7 @@ static ICGlobalControlInfo ic_control_info;
  *
  */
 #define UNACK_QUEUE_RING_SLOTS_NUM (2000)
-#define TIMER_SPAN (Gp_interconnect_timer_period * 1000) /* default: 5ms */
+#define TIMER_SPAN (Gp_interconnect_timer_period * 1000ULL) /* default: 5ms */
 #define TIMER_CHECKING_PERIOD (Gp_interconnect_timer_checking_period) /* default: 20ms */
 #define UNACK_QUEUE_RING_LENGTH (UNACK_QUEUE_RING_SLOTS_NUM * TIMER_SPAN)
 
@@ -1904,20 +1904,21 @@ sendStatusQueryMessage(MotionConn *conn, int fd, uint32 seq)
 static void
 putRxBufferAndSendAck(MotionConn *conn, AckSendParam *param)
 {
-	icpkthdr *buf=NULL;
+	icpkthdr *buf;
+	uint32 seq;
 
 	buf = (icpkthdr *)conn->pkt_q[conn->pkt_q_head];
-	uint32 seq = buf->seq;
-
-#ifdef AMS_VERBOSE_LOGGING
-	elog(LOG, "putRxBufferAndSendAck conn %p pkt [seq %d] for node %d route %d, [head seq] %d queue size %d, queue head %d queue tail %d", conn, buf->seq, buf->motNodeId, conn->route, conn->conn_info.seq - conn->pkt_q_size, conn->pkt_q_size, conn->pkt_q_head, conn->pkt_q_tail);
-#endif
-
 	if (buf == NULL)
 	{
 		pthread_mutex_unlock(&ic_control_info.lock);
 		elog(FATAL, "putRxBufferAndSendAck: buffer is NULL");
 	}
+
+	seq = buf->seq;
+
+#ifdef AMS_VERBOSE_LOGGING
+	elog(LOG, "putRxBufferAndSendAck conn %p pkt [seq %d] for node %d route %d, [head seq] %d queue size %d, queue head %d queue tail %d", conn, buf->seq, buf->motNodeId, conn->route, conn->conn_info.seq - conn->pkt_q_size, conn->pkt_q_size, conn->pkt_q_head, conn->pkt_q_tail);
+#endif
 
 	conn->pkt_q[conn->pkt_q_head] = NULL;
 	conn->pBuff = NULL;
@@ -2459,8 +2460,7 @@ initUnackQueueRing(UnackQueueRing *uqr)
 {
 	int i = 0;
 
-	uqr->currentTime = getCurrentTime();
-	uqr->currentTime = uqr->currentTime - (uqr->currentTime % TIMER_SPAN);
+	uqr->currentTime = 0;
 	uqr->idx = 0;
 	uqr->numOutStanding = 0;
 	uqr->numSharedOutStanding = 0;
@@ -2990,6 +2990,7 @@ SetupUDPIFCInterconnect_Internal(EState *estate)
 
 	estate->interconnect_context->teardownActive = false;
 	estate->interconnect_context->activated = false;
+	estate->interconnect_context->networkTimeoutIsLogged = false;
 	estate->interconnect_context->incompleteConns = NIL;
 	estate->interconnect_context->sliceTable = NULL;
 	estate->interconnect_context->sliceId = -1;
@@ -3173,6 +3174,10 @@ SetupUDPIFCInterconnect_Internal(EState *estate)
 	estate->interconnect_context->activated = true;
 
 	pthread_mutex_unlock(&ic_control_info.lock);
+
+	/* Check if any of the QEs has already finished with error */
+	if (Gp_role == GP_ROLE_DISPATCH)
+		checkForCancelFromQD(estate->interconnect_context);
 }
 
 /*
@@ -3200,7 +3205,30 @@ SetupUDPIFCInterconnect(EState *estate)
 	}
 	PG_CATCH();
 	{
+		/*
+		 * Remove connections from hash table to avoid packet handling in the
+		 * rx pthread, else the packet handling code could use memory whose
+		 * context (InterconnectContext) would be soon reset - that could
+		 * panic the process.
+		 */
+		ConnHashTable *ht = &ic_control_info.connHtab;
+
+		for (int i = 0; i < ht->size; i++)
+		{
+			struct ConnHtabBin *trash;
+			MotionConn *conn;
+
+			trash = ht->table[i];
+			while (trash != NULL)
+			{
+				conn = trash->conn;
+				/* Get trash at first as trash will be pfree-ed in connDelHash. */
+				trash = trash->next;
+				connDelHash(ht, conn);
+			}
+		}
 		pthread_mutex_unlock(&ic_control_info.lock);
+
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
@@ -3520,7 +3548,7 @@ TeardownUDPIFCInterconnect_Internal(ChunkTransportState *transportStates,
 	elog((gp_interconnect_log_stats ? LOG: DEBUG1), "Interconnect State: "
 			"isSender %d isReceiver %d "
 			"snd_queue_depth %d recv_queue_depth %d Gp_max_packet_size %d "
-			"UNACK_QUEUE_RING_SLOTS_NUM %d TIMER_SPAN %d DEFAULT_RTT %d "
+			"UNACK_QUEUE_RING_SLOTS_NUM %d TIMER_SPAN %lld DEFAULT_RTT %d "
 			"forceEOS %d, gp_interconnect_id %d ic_id_last_teardown %d "
 			"snd_buffer_pool.count %d snd_buffer_pool.maxCount %d snd_sock_bufsize %d recv_sock_bufsize %d "
 			"snd_pkt_count %d retransmits %d crc_errors %d"
@@ -4897,7 +4925,7 @@ handleAckForDuplicatePkt(MotionConn *conn, icpkthdr *pkt)
  *		check network timeout case.
  */
 static inline void
-checkNetworkTimeout(ICBuffer *buf, uint64 now)
+checkNetworkTimeout(ICBuffer *buf, uint64 now, bool *networkTimeoutIsLogged)
 {
 	/* Using only the time to first sent time to decide timeout is not enough,
 	 * since there is a possibility the sender process is not scheduled or blocked
@@ -4918,6 +4946,28 @@ checkNetworkTimeout(ICBuffer *buf, uint64 now)
 						errmsg("Interconnect encountered a network error, please check your network"),
 						errdetail("Failed to send packet (seq %d) to %s (pid %d cid %d) after %d retries in %d seconds", buf->pkt->seq, buf->conn->remoteHostAndPort, buf->pkt->dstPid, buf->pkt->dstContentId, buf->nRetry, Gp_interconnect_transmit_timeout)));
 	}
+
+	/*
+	 * Default value of Gp_interconnect_transmit_timeout is one hours.
+	 * It taks too long time to detect a network error and it is not user friendly.
+	 *
+	 * Packets would be dropped repeatly on some specific ports. We'd better have
+	 * a warning messgage for this case and give the DBA a chance to detect this error
+	 * earlier. Since packets would also be dropped when network is bad, we should not
+	 * error out here, but just give a warning message. Erroring our is still handled
+	 * by GUC Gp_interconnect_transmit_timeout as above. Note that warning message should
+	 * be printed for each statement only once.
+	 */
+	if ((buf->nRetry >= Gp_interconnect_min_retries_before_timeout) && !(*networkTimeoutIsLogged))
+	{
+		ereport(WARNING,
+				(errmsg("interconnect may encountered a network error, please check your network"),
+				 errdetail("Failed to send packet (seq %d) to %s (pid %d cid %d) after %d retries.",
+						   buf->pkt->seq, buf->conn->remoteHostAndPort,
+						   buf->pkt->dstPid, buf->pkt->dstContentId,
+						   buf->nRetry)));
+		*networkTimeoutIsLogged = true;
+	}
 }
 
 /*
@@ -4932,6 +4982,8 @@ checkExpiration(ChunkTransportState *transportStates, ChunkTransportStateEntry *
 	/* check for expiration */
 	int count = 0;
 	int retransmits = 0;
+
+	Assert(unack_queue_ring.currentTime != 0);
 	while (now >= (unack_queue_ring.currentTime + TIMER_SPAN) && count++ < UNACK_QUEUE_RING_SLOTS_NUM)
 	{
 		/* expired, need to resend them */
@@ -4955,7 +5007,7 @@ checkExpiration(ChunkTransportState *transportStates, ChunkTransportStateEntry *
 			curBuf->conn->stat_count_resent++;
 			curBuf->conn->stat_max_resent = Max(curBuf->conn->stat_max_resent, curBuf->conn->stat_count_resent);
 
-			checkNetworkTimeout(curBuf, now);
+			checkNetworkTimeout(curBuf, now, &transportStates->networkTimeoutIsLogged);
 
 		#ifdef AMS_VERBOSE_LOGGING
 			write_log("RESEND pkt with seq %d (retry %d, rtt " UINT64_FORMAT ") to route %d", curBuf->pkt->seq, curBuf->nRetry, curBuf->conn->rtt, curBuf->conn->route);
@@ -5114,7 +5166,7 @@ checkExpirationCapacityFC(ChunkTransportState *transportStates, ChunkTransportSt
 		ic_control_info.lastPacketSendTime = now;
 
 		updateRetransmitStatistics(conn);
-		checkNetworkTimeout(buf, now);
+		checkNetworkTimeout(buf, now, &transportStates->networkTimeoutIsLogged);
 	}
 }
 
@@ -5706,9 +5758,14 @@ getCurrentTime(void)
 static void
 putIntoUnackQueueRing(UnackQueueRing *uqr, ICBuffer *buf, uint64 expTime, uint64 now)
 {
-	uint64 diff = now + expTime - uqr->currentTime;
+	uint64 diff = 0;
 	int idx = 0;
 
+	/* The first packet, currentTime is not initialized */
+	if (uqr->currentTime == 0)
+		uqr->currentTime = now - (now % TIMER_SPAN);
+
+	diff = now + expTime - uqr->currentTime;
 	if (diff >= UNACK_QUEUE_RING_LENGTH)
 	{
 	#ifdef AMS_VERBOSE_LOGGING

@@ -45,6 +45,17 @@ typedef struct ExternalInsertDescData
 
 typedef ExternalInsertDescData *ExternalInsertDesc;
 
+/*
+ * ExternalSelectDescData is used for storing state related
+ * to selecting data from an external table.
+ */
+typedef struct ExternalSelectDescData
+{
+	ProjectionInfo *projInfo;   /* Information for column projection */
+	List *filter_quals;         /* Information for filter pushdown */
+
+} ExternalSelectDescData;
+
 typedef enum DataLineStatus
 {
 	LINE_OK,
@@ -61,11 +72,17 @@ extern FileScanDesc external_beginscan(Relation relation, Index scanrelid,
 extern void external_rescan(FileScanDesc scan);
 extern void external_endscan(FileScanDesc scan);
 extern void external_stopscan(FileScanDesc scan);
-extern HeapTuple external_getnext(FileScanDesc scan, ScanDirection direction, List* filter_quals);
+extern ExternalSelectDesc
+external_getnext_init(PlanState *state);
+extern HeapTuple
+external_getnext(FileScanDesc scan,
+                 ScanDirection direction,
+                 ExternalSelectDesc desc);
 extern ExternalInsertDesc external_insert_init(Relation rel);
 extern Oid	external_insert(ExternalInsertDesc extInsertDesc, HeapTuple instup);
 extern void external_insert_finish(ExternalInsertDesc extInsertDesc);
 extern void external_set_env_vars(extvar_t *extvar, char *uri, bool csv, char *escape, char *quote, bool header, uint32 scancounter);
 extern char *linenumber_atoi(char buffer[20], int64 linenumber);
+extern char *strtokx2(const char *s, const char *whitespace, const char *delim, const char *quote, char escape, bool e_strings, bool del_quotes, int encoding);
 
 #endif   /* FILEAM_H */

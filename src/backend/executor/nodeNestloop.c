@@ -23,9 +23,12 @@
 
 #include "postgres.h"
 
+#include "cdb/cdbvars.h"
 #include "executor/execdebug.h"
 #include "executor/nodeNestloop.h"
 #include "utils/memutils.h"
+
+extern bool Test_print_prefetch_joinqual;
 
 static void splitJoinQualExpr(NestLoopState *nlstate);
 static void extractFuncExprArgs(FuncExprState *fstate, List **lclauses, List **rclauses);
@@ -157,6 +160,17 @@ ExecNestLoop(NestLoopState *node)
 		node->nl_innerSquelchNeeded = false; /* no need to squelch inner since it was completely prefetched */
 		node->prefetch_inner = false;
 		node->reset_inner = false;
+	}
+
+	/*
+	 * Prefetch JoinQual to prevent motion hazard.
+	 *
+	 * See ExecPrefetchJoinQual() for details.
+	 */
+	if (node->prefetch_joinqual)
+	{
+		ExecPrefetchJoinQual(&node->js);
+		node->prefetch_joinqual = false;
 	}
 
 	/*
@@ -382,7 +396,13 @@ ExecInitNestLoop(NestLoop *node, EState *estate, int eflags)
 	nlstate->shared_outer = node->shared_outer;
 
 	nlstate->prefetch_inner = node->join.prefetch_inner;
-	
+	nlstate->prefetch_joinqual = node->join.prefetch_joinqual;
+
+	if (Test_print_prefetch_joinqual && nlstate->prefetch_joinqual)
+		elog(NOTICE,
+			 "prefetch join qual in slice %d of plannode %d",
+			 currentSliceId, ((Plan *) node)->plan_node_id);
+
 	/*CDB-OLAP*/
 	nlstate->reset_inner = false;
 	nlstate->require_inner_reset = !node->singleton_outer;
@@ -580,7 +600,13 @@ ExecReScanNestLoop(NestLoopState *node, ExprContext *exprCtxt)
 	node->nl_NeedNewOuter = true;
 	node->nl_MatchedOuter = false;
 	node->nl_innerSideScanned = false;
-	/* CDB: We intentionally leave node->nl_innerSquelchNeeded unchanged on ReScan */
+
+	/*
+	 * If the parameter is used in the filter of the outer table scan, the outer returns
+	 * NULL doesn't mean we can squelch the inner, because next parameter to the outer
+	 * may return a valid tuple.
+	 */
+	node->nl_innerSquelchNeeded = false;
 }
 
 void

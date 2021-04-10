@@ -590,8 +590,6 @@ make_join_rel(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2)
 			 * JOIN_IN is set later in cdb_jointype_to_join_in()
 			 * Rest are obsolete. Refer JoinType for more information.
 			 */
-			elog(ERROR, "unexpected join type. Should never reach here for %d");
-			break;
 		default:
 			elog(ERROR, "unrecognized join type: %d",
 				 (int) jointype);

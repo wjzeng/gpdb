@@ -7,6 +7,7 @@
     <p>This chapter includes the following information:</p>
     <ul>
       <li id="pz219023"><xref href="#topic2" type="topic" format="dita"/></li>
+      <li><xref href="#topic_khs_klx_g3b" format="dita"/></li>
       <li id="pz213664" otherprops="pivotal"><xref href="#topic3" type="topic" format="dita"/></li>
       <li otherprops="pivotal"><xref href="#topic_eqm_klx_hw" format="dita"/></li>
       <li id="pz213668" otherprops="pivotal"><xref href="#topic6" type="topic" format="dita"/></li>
@@ -28,18 +29,24 @@
       <p>MADlib can be used with PivotalR, an R package that enables users to interact with data
         resident in Greenplum Database using the R client. See <xref href="#topic_dxp_vq2_sv"
           format="dita"/>.</p>
-      <note>When using MADlib 1.11 and earlier, set the server configuration parameter
-          <codeph>optimizer_control</codeph> to <codeph>on</codeph> (the default). If the parameter
-        is set to <codeph>off</codeph>, these MADlib functions do not work: decision tree, random
-        forest, LDA, k-Means, PMML export for decision tree, PMML export for random forest. <ph
-          otherprops="pivotal">The installation checks for these functions also fail.</ph><p>The
-          parameter <codeph>optimizer_control</codeph> controls whether the server configuration
-          parameter <codeph>optimizer</codeph> can be changed. The parameter
-            <codeph>optimizer</codeph> controls whether the GPORCA optimizer is enabled when running
-          SQL queries. Some MADlib installation checks and functions change the value of
-            <codeph>optimizer</codeph> to improve performance. If <codeph>optimizer_control</codeph>
-          is set to <codeph>off</codeph>, the value of <codeph>optimizer</codeph> cannot be changed
-          and the function fails. </p></note>
+    </body>
+  </topic>
+  <topic id="topic_khs_klx_g3b">
+    <title>About Deep Learning</title>
+    <body>
+      <p>Deep learning is a type of machine learning, originally inspired by biology of the brain,
+        that uses a class of algorithms called artificial neural networks. Given the important use
+        cases that can be effectively addressed with deep learning, it is starting to become a more
+        important part of enterprise computing. </p>
+      <p>Deep learning support for Keras and TensorFlow was added to Apache MADlib starting with the
+        1.16 release. Refer to the following documents for more information about deep learning on
+        Greenplum using Apache MADlib:<ul id="ul_kyh_rlx_g3b">
+          <li><xref href="http://madlib.apache.org/docs/latest/group__grp__dl.html" format="html"
+              scope="external">MADlib user documentation</xref></li>
+          <li><xref href="https://cwiki.apache.org/confluence/display/MADLIB/Deep+Learning"
+              format="html" scope="external">Supported libraries and configuration
+              instructions</xref></li>
+        </ul></p>
     </body>
   </topic>
   <topic id="topic3" xml:lang="en" otherprops="pivotal">
@@ -56,7 +63,7 @@
     <topic id="topic4" xml:lang="en">
       <title>Installing the Greenplum Database MADlib Package</title>
       <body>
-        <p>Before you install the MADlib package, make sure that your Greenplum database is running,
+        <p>Before you install the MADlib package, make sure that your Greenplum atabase is running,
           you have sourced <codeph>greenplum_path.sh</codeph>, and that the<codeph>
             $MASTER_DATA_DIRECTORY</codeph> and <codeph>$GPHOME</codeph> variables are set.</p>
         <ol>
@@ -65,10 +72,10 @@
               >Pivotal Network</xref>.</li>
           <li>Copy the MADlib package to the Greenplum Database master host.</li>
           <li>Unpack the MADlib distribution package. For
-            example:<codeblock>$ tar xzvf madlib-1.15-gp5-rhel7-x86_64.tar.gz</codeblock></li>
+            example:<codeblock>$ tar xzvf madlib-1.17.0-gp5-rhel7-x86_64.tar.gz</codeblock></li>
           <li id="pz216990">Install the software package by running the <codeph>gppkg</codeph>
             command. For
-            example:<codeblock>$ gppkg -i ./madlib-1.15-gp5-rhel7-x86_64/madlib-1.15-gp5-rhel7-x86_64.gppkg</codeblock></li>
+            example:<codeblock>$ gppkg -i ./madlib-1.17.0-gp5-rhel7-x86_64/madlib-1.17.0-gp5-rhel7-x86_64.gppkg</codeblock></li>
         </ol>
       </body>
     </topic>
@@ -79,8 +86,8 @@
           MADlib functions to Greenplum Database. <codeph>madpack</codeph> is in
             <codeph>$GPHOME/madlib/bin</codeph>. </p>
         <codeblock>$ madpack [-s <varname>schema_name</varname>] -p greenplum -c <varname>user</varname>@<varname>host</varname>:<varname>port</varname>/<varname>database</varname> install</codeblock>
-        <p>For example, this command creates MADlib functions in the Greenplum database
-            <codeph>testdb</codeph> running on server <codeph>mdw</codeph> on port
+        <p>For example, this command creates MADlib functions in the 
+            <codeph>testdb</codeph> database running on server <codeph>mdw</codeph> on port
             <codeph>5432</codeph>. The <codeph>madpack</codeph> command logs in as the user
             <codeph>gpadmin</codeph> and prompts for password. The target schema is
             <codeph>madlib</codeph>.</p>
@@ -112,7 +119,20 @@
       <body>
         <p>To upgrade MADlib, run the <codeph>gppkg</codeph> utility with the <codeph>-u</codeph>
           option. This command upgrades an installed MADlib package to MADlib
-          1.15.<codeblock>$ gppkg -u madlib-1.15-gp5-rhel7-x86_64.gppkg</codeblock></p>
+          1.17.<codeblock>$ gppkg -u madlib-1.17.0-gp5-rhel7-x86_64.gppkg</codeblock></p>
+        <note>Upgrading from MADlib version 1.15 using <codeph>gppkg -U</codeph> does not work
+          because of a change in the post-uninstall script that was introduced in version 1.15.1. If
+          you are upgrading from MADlib version 1.15 to version 1.15.1 or newer, follow these
+            steps:<ol id="ol_itj_l4v_g3b">
+            <li>Remove the existing MADlib version 1.15 rpm (this does not affect the Greenplum
+              Database installation):<codeblock>gppkg -r madlib-1.15.0</codeblock></li>
+            <li>Manually remove the remaining MADlib
+              files:<codeblock>rm -rf /usr/local/greenplum-db-5.13.0/madlib/Versions</codeblock></li>
+            <li>Install the newer MADlib version. For
+              example:<codeblock>$ gppkg -i ./madlib-1.17.0-gp5-rhel7-x86_64.gppkg</codeblock></li>
+            <li>Upgrade the MADlib functions in each database. For
+              example:<codeblock>madpack -p greenplum -c gpadmin@mdw:5432/testdb upgrade</codeblock></li>
+          </ol></note>
       </body>
     </topic>
     <topic id="topic_bql_bgd_3w">
@@ -151,7 +171,7 @@ psql <varname>db_name</varname> -c "DROP FUNCTION IF EXISTS <varname>schema</var
       <title id="pz217588">Remove MADlib objects from the database</title>
       <body>
         <p>Use the <codeph>madpack uninstall</codeph> command to remove MADlib objects from a
-          Greenplum database. For example, this command removes MADlib objects from the database
+          database. For example, this command removes MADlib objects from the database
             <codeph>testdb</codeph>.</p>
         <codeblock>$ madpack  -s madlib -p greenplum -c gpadmin@mdw:5432/testdb uninstall</codeblock>
       </body>
@@ -162,8 +182,8 @@ psql <varname>db_name</varname> -c "DROP FUNCTION IF EXISTS <varname>schema</var
         <p>If no databases use the MADlib functions, use the Greenplum <codeph>gppkg</codeph>
           utility with the <codeph>-r</codeph> option to uninstall the MADlib package. When removing
           the package you must specify the package and version. This example uninstalls MADlib
-          package version 1.4.</p>
-        <codeblock>$ gppkg -r madlib-1.14-gp5-rhel7-x86_64</codeblock>
+          package version 1.17.</p>
+        <codeblock>$ gppkg -r madlib-1.17.0-gp5-rhel7-x86_64</codeblock>
         <p>You can run the <codeph>gppkg</codeph> utility with the options <codeph>-q --all</codeph>
           to list the installed extensions and their versions.</p>
         <p>After you uninstall the package, restart the database.</p>

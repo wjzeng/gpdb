@@ -61,6 +61,10 @@
 #define WRITE_INT_FIELD(fldname) \
 	{ appendBinaryStringInfo(str, (const char *)&node->fldname, sizeof(int)); }
 
+/* Write an int8 field  */
+#define WRITE_INT8_FIELD(fldname) \
+	{ appendBinaryStringInfo(str, (const char *)&node->fldname, sizeof(int8)); }
+
 /* Write an integer field  */
 #define WRITE_INT16_FIELD(fldname) \
 	{ appendBinaryStringInfo(str, (const char *)&node->fldname, sizeof(int16)); }
@@ -346,6 +350,8 @@ _outPlannedStmt(StringInfo str, PlannedStmt *node)
 	/* Don't serialize policy */
 
 	WRITE_UINT64_FIELD(query_mem);
+	WRITE_INT8_FIELD(metricsQueryType);
+	WRITE_NODE_FIELD(copyIntoClause);
 }
 
 static void
@@ -1387,6 +1393,9 @@ _outNode(StringInfo str, void *obj)
 				break;
 			case T_IntoClause:
 				_outIntoClause(str, obj);
+				break;
+			case T_CopyIntoClause:
+				_outCopyIntoClause(str, obj);
 				break;
 			case T_Var:
 				_outVar(str, obj);

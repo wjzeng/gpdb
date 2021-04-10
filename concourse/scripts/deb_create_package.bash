@@ -28,4 +28,4 @@ popd
 pushd ${SRC_DIR}
     debuild -us -uc -b
 popd
-cp greenplum-db*.deb deb_package_ubuntu16/greenplum-db.deb
+cp greenplum-db*.deb deb_package_open_source_ubuntu16/greenplum-db.deb

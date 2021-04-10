@@ -31,25 +31,33 @@
  *	macros at the bottom of the file.  Check if your platform can use
  *	these or needs to override them.
  *
- *  Usually, S_LOCK() is implemented in terms of an even lower-level macro
- *	TAS():
+ *  Usually, S_LOCK() is implemented in terms of even lower-level macros
+ *	TAS() and TAS_SPIN():
  *
  *	int TAS(slock_t *lock)
  *		Atomic test-and-set instruction.  Attempt to acquire the lock,
  *		but do *not* wait.	Returns 0 if successful, nonzero if unable
  *		to acquire the lock.
  *
- *	TAS() is NOT part of the API, and should never be called directly.
+ *	int TAS_SPIN(slock_t *lock)
+ *		Like TAS(), but this version is used when waiting for a lock
+ *		previously found to be contended.  Typically, this is the
+ *		same as TAS(), but on some architectures it's better to poll a
+ *		contended lock using an unlocked instruction and retry the
+ *		atomic test-and-set only when it appears free.
  *
- *	CAUTION: on some platforms TAS() may sometimes report failure to acquire
- *	a lock even when the lock is not locked.  For example, on Alpha TAS()
- *	will "fail" if interrupted.  Therefore TAS() should always be invoked
- *	in a retry loop, even if you are certain the lock is free.
+ *	TAS() and TAS_SPIN() are NOT part of the API, and should never be called
+ *	directly.
  *
- *	ANOTHER CAUTION: be sure that TAS() and S_UNLOCK() represent sequence
- *	points, ie, loads and stores of other values must not be moved across
- *	a lock or unlock.  In most cases it suffices to make the operation be
- *	done through a "volatile" pointer.
+ *	CAUTION: on some platforms TAS() and/or TAS_SPIN() may sometimes report
+ *	failure to acquire a lock even when the lock is not locked.  For example,
+ *	on Alpha TAS() will "fail" if interrupted.  Therefore a retry loop must
+ *	always be used, even if you are certain the lock is free.
+ *
+ *	ANOTHER CAUTION: be sure that TAS(), TAS_SPIN(), and S_UNLOCK() represent
+ *	sequence points, ie, loads and stores of other values must not be moved
+ *	across a lock or unlock.  In most cases it suffices to make the operation
+ *	be done through a "volatile" pointer.
  *
  *	On most supported platforms, TAS() uses a tas() function written
  *	in assembly language to execute a hardware atomic-test-and-set
@@ -124,6 +132,12 @@ tas(volatile slock_t *lock)
 	 * Use a non-locking test before asserting the bus lock.  Note that the
 	 * extra test appears to be a small loss on some x86 platforms and a small
 	 * win on others; it's by no means clear that we should keep it.
+	 *
+	 * When this was last tested, we didn't have separate TAS() and TAS_SPIN()
+	 * macros.  Nowadays it probably would be better to do a non-locking test
+	 * in TAS_SPIN() but not in TAS(), like on x86_64, but no-one's done the
+	 * testing to verify that.  Without some empirical evidence, better to
+	 * leave it alone.
 	 */
 	__asm__ __volatile__(
 		"	cmpb	$0,%1	\n"
@@ -179,16 +193,22 @@ typedef unsigned char slock_t;
 
 #define TAS(lock) tas(lock)
 
+/*
+ * On Intel EM64T, it's a win to use a non-locking test before the xchg proper,
+ * but only when spinning.
+ *
+ * See also Implementing Scalable Atomic Locks for Multi-Core Intel(tm) EM64T
+ * and IA32, by Michael Chynoweth and Mary R. Lee. As of this writing, it is
+ * available at:
+ * http://software.intel.com/en-us/articles/implementing-scalable-atomic-locks-for-multi-core-intel-em64t-and-ia32-architectures
+ */
+#define TAS_SPIN(lock)    (*(lock) ? 1 : TAS(lock))
+
 static __inline__ int
 tas(volatile slock_t *lock)
 {
 	register slock_t _res = 1;
 
-	/*
-	 * On Opteron, using a non-locking test before the locking instruction
-	 * is a huge loss.  On EM64T, it appears to be a wash or small loss,
-	 * so we needn't bother to try to distinguish the sub-architectures.
-	 */
 	__asm__ __volatile__(
 		"	lock			\n"
 		"	xchgb	%0,%1	\n"
@@ -698,6 +718,7 @@ typedef unsigned int slock_t;
 
 #include <ia64/sys/inline.h>
 #define TAS(lock) _Asm_xchg(_SZ_W, lock, 1, _LDHINT_NONE)
+#define TAS_SPIN(lock) (*(lock) ? 1 : TAS(lock))
 
 #endif	/* HPUX on IA64, non gcc */
 
@@ -895,6 +916,10 @@ extern int	tas(volatile slock_t *lock);		/* in port/.../tas.s, or
 
 #define TAS(lock)		tas(lock)
 #endif	 /* TAS */
+
+#if !defined(TAS_SPIN)
+#define TAS_SPIN(lock)	TAS(lock)
+#endif	 /* TAS_SPIN */
 
 extern slock_t dummy_spinlock;
 

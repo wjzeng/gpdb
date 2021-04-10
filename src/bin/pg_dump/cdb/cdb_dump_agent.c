@@ -1228,7 +1228,7 @@ dumpMain(bool oids, const char *dumpencoding, int outputBlobs, int plainText, Re
 	 * If supported, set extra_float_digits so that we can dump float data
 	 * exactly (given correctly implemented float I/O code, anyway)
 	 */
-	do_sql_command(g_conn, "SET extra_float_digits TO 2");
+	do_sql_command(g_conn, "SET extra_float_digits TO 3");
 
 	/*
 	 * Let cdb_dump_include functions know whether or not to include
@@ -2351,8 +2351,11 @@ dumpTableComment(Archive *fout, TableInfo *tbinfo,
 		if (objsubid == 0)
 		{
 			resetPQExpBuffer(target);
-			appendPQExpBuffer(target, "%s %s", reltypename,
-							  fmtId(tbinfo->dobj.name));
+			if (strcmp(reltypename, "EXTERNAL TABLE") == 0)
+				reltypename = "TABLE";
+			appendPQExpBuffer(target, "%s %s.", reltypename,
+							  fmtId(tbinfo->dobj.namespace->dobj.name));
+			appendPQExpBuffer(target, "%s ", fmtId(tbinfo->dobj.name));
 
 			resetPQExpBuffer(query);
 			appendPQExpBuffer(query, "COMMENT ON %s IS ", target->data);

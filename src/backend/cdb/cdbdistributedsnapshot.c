@@ -51,7 +51,14 @@ bool
 localXidSatisfiesAnyDistributedSnapshot(TransactionId localXid)
 {
 	DistributedSnapshotCommitted distributedSnapshotCommitted;
-	Assert(TransactionIdIsNormal(localXid));
+
+	/*
+	 * In the QD, the distributed transactions become visible at the same time
+	 * as the corresponding local ones, so we can rely on the local XIDs and
+	 * don't have to consult distributed log for vacuum or page prunning.
+	 */
+	if (GpIdentity.segindex == MASTER_CONTENT_ID)
+		return false;
 
 	/*
 	 * In general expect this function to be called only for normal xid, as

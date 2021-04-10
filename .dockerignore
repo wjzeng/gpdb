@@ -1,0 +1,11 @@
+# Local excludes in root directory
+/GNUmakefile
+/config.log
+/config.status
+/VERSION
+/CMakeLists.txt
+
+# Reduce docker context
+/gpAux/gpdemo/datadirs
+**/*.so
+**/*.o

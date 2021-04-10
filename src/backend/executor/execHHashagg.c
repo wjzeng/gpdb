@@ -49,6 +49,7 @@ struct BatchFileInfo
 	int64 total_bytes;
 	int64 ntuples;
 	ExecWorkFile *wfile;
+	bool suspended;
 };
 
 #define BATCHFILE_METADATA \
@@ -1084,6 +1085,7 @@ getSpillFile(workfile_set *work_set, SpillSet *set, int file_no, int *p_alloc_si
 		/* Initialize to NULL in case the create function below throws an exception */
 		spill_file->file_info->wfile = NULL; 
 		spill_file->file_info->wfile = workfile_mgr_create_file(work_set);
+		spill_file->file_info->suspended = false;
 
 		elog(HHA_MSG_LVL, "HashAgg: create %d level batch file %d with compression %d",
 			 set->level, file_no, work_set->metadata.bfz_compress_type);
@@ -1115,7 +1117,9 @@ suspendSpillFiles(SpillSet *spill_set)
 		if (spill_file->file_info &&
 			spill_file->file_info->wfile != NULL)
 		{
+			Assert(spill_file->file_info->suspended == false);
 			ExecWorkFile_Suspend(spill_file->file_info->wfile);
+			spill_file->file_info->suspended = true;
 
 			freed_size += FREEABLE_BATCHFILE_METADATA;
 
@@ -1155,7 +1159,8 @@ closeSpillFile(AggState *aggstate, SpillSet *spill_set, int file_no)
 		workfile_mgr_close_file(hashtable->work_set, spill_file->file_info->wfile);
 		spill_file->file_info->wfile = NULL;
 		freedspace += (BATCHFILE_METADATA - sizeof(BatchFileInfo));
-		
+		if (spill_file->file_info->suspended)
+			freedspace -= FREEABLE_BATCHFILE_METADATA;
 	}
 	if (spill_file->file_info)
 	{
@@ -1285,7 +1290,7 @@ spill_hash_table(AggState *aggstate)
 	/* Book keeping. */
 	hashtable->is_spilling = true;
 
-	Assert(hashtable->nbuckets > spill_set->num_spill_files);
+	Assert(hashtable->nbuckets >= spill_set->num_spill_files);
 
 	/*
 	 * Write each spill file. Write the last spill file first, since it will
@@ -1719,7 +1724,9 @@ agg_hash_reload(AggState *aggstate)
 
 	if (spill_file->file_info->wfile != NULL)
 	{
+		Assert(spill_file->file_info->suspended);
 		ExecWorkFile_Restart(spill_file->file_info->wfile);
+		spill_file->file_info->suspended = false;
 		hashtable->mem_for_metadata  += FREEABLE_BATCHFILE_METADATA;
 	}
 

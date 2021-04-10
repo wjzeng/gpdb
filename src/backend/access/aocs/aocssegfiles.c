@@ -90,6 +90,8 @@ InsertInitialAOCSFileSegInfo(Relation prel, int4 segno, int4 nvp)
 	Relation segrel;
 	int16		formatVersion;
 
+	ValidateAppendonlySegmentDataBeforeStorage(segno);
+
 	/* New segments are always created in the latest format */
 	formatVersion = AORelationVersion_GetLatest();
 
@@ -1911,6 +1913,7 @@ CheckCOConsistencyWithGpRelationNode( Snapshot snapshot, Relation rel, int total
 
 		if (segmentCount > totalsegs + 1)
 		{
+			PrintPgaocssegAndGprelationNodeEntries(allseginfo, totalsegs, segmentFileNumMap);
 			elog(ERROR, "gp_relation_node (%d) has more entries than pg_aocsseg (%d) for relation %s",
 				segmentCount,
 				totalsegs,

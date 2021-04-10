@@ -110,13 +110,13 @@ select count(*) from ct_heap_films5;
 --
 --ADD table_constraint
 --
-ALTER TABLE sync1_heap_films4 ADD UNIQUE(code, date_prod);
+ALTER TABLE sync1_heap_films4 ADD UNIQUE(date_prod, code);
 select count(*) from sync1_heap_films4;
 
-ALTER TABLE ck_sync1_heap_films3 ADD UNIQUE(code, date_prod);
+ALTER TABLE ck_sync1_heap_films3 ADD UNIQUE(date_prod, code);
 select count(*) from ck_sync1_heap_films3;
 
-ALTER TABLE ct_heap_films1 ADD UNIQUE(code, date_prod);
+ALTER TABLE ct_heap_films1 ADD UNIQUE(date_prod, code);
 select count(*) from ct_heap_films1;
 
 --

@@ -175,8 +175,13 @@ typedef struct Query
 	 * policy for SELECT ... INTO and set operations.
 	 */
 	struct GpPolicy *intoPolicy;
-} Query;
 
+	/*
+	 * GPDB: Used to indicate this query is COPY so that its plan
+	 * would always be dispatched in parallel.
+	 */
+	bool isCopy;
+} Query;
 
 /****************************************************************************
  *	Supporting data structures for Parse Trees
@@ -1389,6 +1394,12 @@ typedef struct GrantRoleStmt
 	DropBehavior behavior;		/* drop behavior (for REVOKE) */
 } GrantRoleStmt;
 
+typedef enum LogErrorsType
+{
+	LOG_ERRORS_DISABLE,			/* disable log errors */
+	LOG_ERRORS_ENABLE,			/* drop the error log when relation drops */
+	LOG_ERRORS_PERSISTENTLY		/* keep the error log when relation drops */
+} LogErrorsType;
 /*
  * Node that represents the single row error handling (SREH) clause.
  * used in COPY and External Tables.
@@ -1399,6 +1410,7 @@ typedef struct SingleRowErrorDesc
 	int			rejectlimit;		/* per segment error reject limit */
 	bool		is_limit_in_rows;	/* true for ROWS false for PERCENT */
 	bool		into_file;			/* log into file not table */
+	LogErrorsType log_errors_type;	/* log errors type */
 } SingleRowErrorDesc;
 
 /* ----------------------

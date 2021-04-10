@@ -9,26 +9,17 @@
             <title>Synopsis</title>
             <codeblock><b>gpload</b> <b>-f</b> <varname>control_file</varname> [<b>-l</b> <varname>log_file</varname>] [<b>-h</b> <varname>hostname</varname>] [<b>-p</b> <varname>port</varname>] 
    [<b>-U</b> <varname>username</varname>] [<b>-d</b> <varname>database</varname>] [<b>-W</b>] [<b>--gpfdist_timeout</b> <varname>seconds</varname>] 
-   [<b>--no_auto_trans</b>] [[<b>-v</b> | <b>-V</b>] [<b>-q</b>]] [<b>-D</b>]
+   [<b>--no_auto_trans</b>] [<b>--max_retries</b> <varname>retry_times</varname>] [[<b>-v</b> | <b>-V</b>] [<b>-q</b>]] [<b>-D</b>]
 
 <b>gpload</b> <b>-?</b> 
 
 <b>gpload</b> <b>--version</b></codeblock>
         </section>
         <section id="section3">
-            <title id="ke141293">Prerequisites</title>
+            <title id="ke141293">Requirements</title>
             <p>The client machine where <codeph>gpload</codeph> is executed must have the
                 following:</p>
             <ul>
-                <li id="ke147914">Python 2.6.2 or later, <codeph>pygresql</codeph> (the Python
-                    interface to PostgreSQL), and <codeph>pyyaml</codeph>. Note that Python and the
-                    required Python libraries are included with the Greenplum Database server
-                    installation, so if you have Greenplum Database installed on the machine where
-                        <codeph>gpload</codeph> is running, you do not need a separate Python
-                        installation.<note>Greenplum Database Loaders for Windows supports only
-                        Python 2.5 (available from <xref href="https://www.python.org"
-                            scope="external" format="html"
-                    >https://www.python.org</xref>).</note></li>
                 <li id="ke147925">The <codeph><xref href="gpfdist.xml#topic1" type="topic"
                             format="dita"/></codeph> parallel file distribution program installed
                     and in your <codeph>$PATH</codeph>. This program is located in
@@ -50,7 +41,19 @@
                 creating an external table definition based on the source data defined, and
                 executing an <codeph>INSERT</codeph>, <codeph>UPDATE</codeph> or
                     <codeph>MERGE</codeph> operation to load the source data into the target table
-                in the database.</p>
+                in the database.
+                <note><codeph>gpfdist</codeph> is compatible only with
+                    the Greenplum Database major version in which it is shipped. For example, a
+                        <codeph>gpfdist</codeph> utility that is installed with Greenplum Database
+                    4.x cannot be used with Greenplum Database 5.x or 6.x.</note>
+                <note>The Greenplum Database 5.22 and later <codeph>gpload</codeph> for Linux is
+                  compatible with Greenplum Database 6.x. The Greenplum Database 6.x
+                  <codeph>gpload</codeph> for both Linux and Windows is compatible with Greenplum
+                  5.x.</note>
+                <note id="gpload-limitation"><codeph>MERGE</codeph> and <codeph>UPDATE</codeph>
+                    operations are not supported if the target table column name is a reserved
+                    keyword, has capital letters, or includes any character that requires quotes ("
+                    ") to identify the column.</note></p>
             <p>The operation, including any SQL commands specified in the <codeph>SQL</codeph>
                 collection of the YAML control file (see <xref href="#topic1/section7"
                     type="section" format="dita"/>), are performed as a single transaction to
@@ -137,6 +140,17 @@
                             server is listening for connections. If not specified, reads from the
                             load control file, the environment variable <codeph>$PGPORT</codeph> or
                             defaults to 5432.</pd>
+                    </plentry>
+                    <plentry>
+                        <pt>--max_retries <varname>retry_times</varname></pt>
+                        <pd>
+                            <p>Specifies the maximum number of times <codeph>gpload</codeph>
+                                attempts to connect to Greenplum Database after a connection
+                                timeout. The default value is <codeph>0</codeph>, do not attempt to
+                                connect after a connection timeout. A negative integer, such as
+                                    <codeph>-1</codeph>, specifies an unlimited number of
+                                attempts.</p>
+                        </pd>
                     </plentry>
                     <plentry>
                         <pt>-U <varname>username</varname></pt>
@@ -544,8 +558,18 @@
                                                 default client encoding. If not specified, the
                                                 default client encoding is used. For information
                                                 about supported character sets, see the
-                                                  <cite>Greenplum Database Reference
-                                                Guide</cite>.</pd>
+                                                  <cite>Greenplum Database Reference Guide</cite>.
+                                                <note>If you <i>change</i> the
+                                                  <codeph>ENCODING</codeph> value in an existing
+                                                  <codeph>gpload</codeph> control file, you must
+                                                  manually drop any external tables that were
+                                                  creating using the previous
+                                                  <codeph>ENCODING</codeph> configuration.
+                                                  <codeph>gpload</codeph> does not drop and recreate
+                                                  external tables to use the new
+                                                  <codeph>ENCODING</codeph> if
+                                                  <codeph>REUSE_TABLES</codeph> is set to
+                                                  <codeph>true</codeph>.</note></pd>
                                         </plentry>
                                         <plentry>
                                             <pt id="cferrorlimit">ERROR_LIMIT</pt>
@@ -597,7 +621,15 @@
                                                 information about formatting errors is returned. You
                                                 can delete the formatting errors from the error logs
                                                 with the Greenplum Database function
-                                                  <codeph>gp_truncate_error_log()</codeph>.</pd>
+                                                  <codeph>gp_truncate_error_log()</codeph>.
+                                                <note>When <codeph>gpfdist</codeph> reads data and
+                                                  encounters a data formatting error, the error
+                                                  message includes a row number indicating the
+                                                  location of the formatting error.
+                                                  <codeph>gpfdist</codeph> attempts to capture the
+                                                  row that contains the error. However,
+                                                  <codeph>gpfdist</codeph> might not capture the
+                                                  exact row for some formatting errors.</note></pd>
                                             <pd>For more information about handling load errors, see
                                                 "Loading and Unloading Data" in the <cite>Greenplum
                                                   Database Administrator Guide</cite>. For
@@ -655,7 +687,11 @@
                                                 table where the rows have
                                                   <codeph>MATCH_COLUMNS</codeph> attribute values
                                                 equal to those of the input data, and the optional
-                                                  <codeph>UPDATE_CONDITION</codeph> is true. </pd>
+                                                  <codeph>UPDATE_CONDITION</codeph> is true.
+                                                  <codeph>UPDATE</codeph> is not supported if the
+                                                target table column name is a reserved keyword, has
+                                                capital letters, or includes any character that
+                                                requires quotes (" ") to identify the column.</pd>
                                             <pd><option>MERGE</option> - Inserts new rows and
                                                 updates the <codeph>UPDATE_COLUMNS</codeph> of
                                                 existing rows where <codeph>FOOBAR</codeph>
@@ -673,7 +709,11 @@
                                                 that are the same, only one new row for that value
                                                 will be inserted. Use
                                                   <codeph>UPDATE_CONDITION</codeph> to filter out
-                                                the rows to discard.</pd>
+                                                the rows to discard. <codeph>MERGE</codeph> is not
+                                                supported if the target table column name is a
+                                                reserved keyword, has capital letters, or includes
+                                                any character that requires quotes (" ") to identify
+                                                the column.</pd>
                                         </plentry>
                                         <plentry>
                                             <pt id="cfmatchcolumns">MATCH_COLUMNS</pt>
@@ -699,8 +739,7 @@
                                             <pd>Optional. Specifies a Boolean condition (similar to
                                                 what you would declare in a <codeph>WHERE</codeph>
                                                 clause) that must be met in order for a row in the
-                                                target table to be updated (or inserted in the case
-                                                of a <codeph>MERGE</codeph>).</pd>
+                                                target table to be updated.</pd>
                                         </plentry>
                                         <plentry>
                                             <pt id="cfmapping">MAPPING</pt>

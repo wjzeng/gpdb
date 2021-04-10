@@ -25,6 +25,8 @@ Python module requirements:
   - jinja2 (install through pip or easy_install)
 """
 
+from __future__ import print_function
+
 import argparse
 import datetime
 import os
@@ -46,7 +48,7 @@ TEMPLATE_ENVIRONMENT = Environment(
     extensions=['jinja2.ext.loopcontrols'])
 
 # Variables that govern pipeline validation
-RELEASE_VALIDATOR_JOB = ['Release_Candidate']
+RELEASE_VALIDATOR_JOB = ['Release_Candidate', 'Build_Release_Candidate_RPMs']
 JOBS_THAT_ARE_GATES = ['gate_compile_start', 'gate_compile_end',
                        'gate_icw_start', 'gate_icw_end',
                        'gate_cs_start', 'gate_cs_end',
@@ -58,7 +60,7 @@ JOBS_THAT_ARE_GATES = ['gate_compile_start', 'gate_compile_end',
                        'gate_filerep_start', 'gate_filerep_end',
                        'gate_release_candidate_start']
 JOBS_THAT_ARE_PAUSED = ['DPM_backup-restore_netbackup_part1', 'DPM_backup-restore_netbackup_part2', 'DPM_backup-restore_netbackup_part3']
-JOBS_THAT_SHOULD_NOT_BLOCK_RELEASE = ['compile_gpdb_binary_swap_centos6'] + RELEASE_VALIDATOR_JOB + JOBS_THAT_ARE_GATES + JOBS_THAT_ARE_PAUSED
+JOBS_THAT_SHOULD_NOT_BLOCK_RELEASE = ['prepare_binary_swap_gpdb_centos6', 'compile_gpdb_ubuntu16_oss_abi', 'client_loader_remote_test_aix'] + RELEASE_VALIDATOR_JOB + JOBS_THAT_ARE_GATES + JOBS_THAT_ARE_PAUSED
 
 def suggested_git_remote():
     default_remote = "<https://github.com/<github-user>/gpdb>"
@@ -91,30 +93,30 @@ def render_template(template_filename, context):
     return TEMPLATE_ENVIRONMENT.get_template(template_filename).render(context)
 
 def validate_pipeline_release_jobs(raw_pipeline_yml):
-    print "======================================================================"
-    print "Validate Pipeline Release Jobs"
-    print "----------------------------------------------------------------------"
+    print("======================================================================")
+    print("Validate Pipeline Release Jobs")
+    print("----------------------------------------------------------------------")
 
     pipeline_yml_cleaned = re.sub('{{', '', re.sub('}}', '', raw_pipeline_yml)) # ignore concourse v2.x variable interpolation
-    pipeline = yaml.load(pipeline_yml_cleaned)
+    pipeline = yaml.safe_load(pipeline_yml_cleaned)
 
     jobs_raw = pipeline['jobs']
     all_job_names = [job['name'] for job in jobs_raw]
 
     release_candidate_job = [ job for job in jobs_raw if job['name'] == 'gate_release_candidate_start' ][0]
-    release_qualifying_job_names = release_candidate_job['plan'][0]['aggregate'][0]['passed']
+    release_qualifying_job_names = release_candidate_job['plan'][0]['in_parallel'][0]['passed']
 
     jobs_that_are_not_blocking_release = [job for job in all_job_names if job not in release_qualifying_job_names]
 
     unaccounted_for_jobs = [job for job in jobs_that_are_not_blocking_release if job not in JOBS_THAT_SHOULD_NOT_BLOCK_RELEASE]
 
     if unaccounted_for_jobs:
-        print "Please add the following jobs as a Release_Candidate dependency or ignore them"
-        print "by adding them to JOBS_THAT_SHOULD_NOT_BLOCK_RELEASE in "+ __file__
-        print unaccounted_for_jobs
+        print("Please add the following jobs as a Release_Candidate dependency or ignore them")
+        print("by adding them to JOBS_THAT_SHOULD_NOT_BLOCK_RELEASE in "+ __file__)
+        print(unaccounted_for_jobs)
         return False
 
-    print "Pipeline validated: all jobs accounted for"
+    print("Pipeline validated: all jobs accounted for")
     return True
 
 def create_pipeline():
@@ -144,7 +146,7 @@ def create_pipeline():
     if ARGS.pipeline_type == 'prod':
         validated = validate_pipeline_release_jobs(pipeline_yml)
         if not validated:
-            print "Refusing to update the pipeline file"
+            print("Refusing to update the pipeline file")
             return False
 
     with open(ARGS.output_filepath, 'w') as output:
@@ -165,25 +167,29 @@ def how_to_use_generated_pipeline_message():
     msg += '  test_trigger ............. : %s\n' % ARGS.test_trigger_false
     msg += '======================================================================\n\n'
     if ARGS.pipeline_type == 'prod':
+        pipeline_name = '5X_STABLE'
         msg += 'NOTE: You can set the production pipelines with the following:\n\n'
         msg += 'fly -t gpdb-prod \\\n'
         msg += '    set-pipeline \\\n'
-        msg += '    -p 5X_STABLE \\\n'
+        msg += '    -p %s \\\n' % pipeline_name
         msg += '    -c %s \\\n' % ARGS.output_filepath
-        msg += '    -l ~/workspace/continuous-integration/secrets/gpdb_common-ci-secrets.yml \\\n'
-        msg += '    -l ~/workspace/continuous-integration/secrets/gpdb_5X_STABLE-ci-secrets.yml\n'
+        msg += '    -l ~/workspace/gp-continuous-integration/secrets/gpdb_common-ci-secrets.yml \\\n'
+        msg += '    -l ~/workspace/gp-continuous-integration/secrets/gpdb_5X_STABLE-ci-secrets.yml\\\n'
+        msg += '    -v pipeline-name=%s\n' % pipeline_name
     else:
+        pipeline_name  = os.path.basename(ARGS.output_filepath).rsplit('.', 1)[0]
         msg += 'NOTE: You can set the developer pipeline with the following:\n\n'
         msg += 'fly -t gpdb-dev \\\n'
         msg += '    set-pipeline \\\n'
-        msg += '    -p %s \\\n' % os.path.basename(ARGS.output_filepath).rsplit('.', 1)[0]
+        msg += '    -p %s \\\n' % pipeline_name
         msg += '    -c %s \\\n' % ARGS.output_filepath
-        msg += '    -l ~/workspace/continuous-integration/secrets/gpdb_common-ci-secrets.yml \\\n'
-        msg += '    -l ~/workspace/continuous-integration/secrets/gpdb_5X_STABLE-ci-secrets.yml \\\n'
-        msg += '    -l ~/workspace/continuous-integration/secrets/ccp_ci_secrets_gpdb-dev.yml \\\n'
+        msg += '    -l ~/workspace/gp-continuous-integration/secrets/gpdb_common-ci-secrets.yml \\\n'
+        msg += '    -l ~/workspace/gp-continuous-integration/secrets/gpdb_5X_STABLE-ci-secrets.dev.yml \\\n'
+        msg += '    -l ~/workspace/gp-continuous-integration/secrets/ccp_ci_secrets_dev.yml \\\n'
         msg += '    -v bucket-name=gpdb5-concourse-builds-dev \\\n'
         msg += '    -v gpdb-git-remote=%s \\\n' % suggested_git_remote()
-        msg += '    -v gpdb-git-branch=%s \n' % suggested_git_branch()
+        msg += '    -v gpdb-git-branch=%s \\\n' % suggested_git_branch()
+        msg += '    -v pipeline-name=%s\n' % pipeline_name
 
     return msg
 
@@ -256,7 +262,7 @@ if __name__ == "__main__":
     pipeline_created = create_pipeline()
 
     if pipeline_created:
-        print how_to_use_generated_pipeline_message()
+        print(how_to_use_generated_pipeline_message())
     else:
         exit(1)
 

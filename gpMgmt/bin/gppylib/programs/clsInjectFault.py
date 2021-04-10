@@ -438,6 +438,7 @@ class GpInjectFaultProgram:
                   "finish_prepared_after_record_commit_prepared (inject fault in FinishPreparedTransaction() after recording the commit prepared record), " \
                   "resgroup_assigned_on_master (inject fault in AssignResGroupOnMaster() after slot is assigned), " \
                   "copy_from_high_processed (inject fault to pretend copying from very high number of processed rows), " \
+                  "abort_after_procarray_end (inject fault in AbortTransaction after ProcArrayEndTransaction), " \
 			      "all (affects all faults injected, used for 'status' and 'reset'), ") 
         addTo.add_option("-c", "--ddl_statement", dest="ddlStatement", type="string",
                          metavar="ddlStatement",

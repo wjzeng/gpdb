@@ -939,7 +939,10 @@ typedef NameData *Name;
  */
 
 #if !HAVE_DECL_SNPRINTF
-extern int	snprintf(char *str, size_t count, const char *fmt,...) pg_attribute_printf(3, 4);
+extern int
+snprintf(char *str, size_t count, const char *fmt,...)
+/* This extension allows gcc to check the format string */
+__attribute__((format(PG_PRINTF_ATTRIBUTE, 3, 4)));
 #endif
 
 #if !HAVE_DECL_VSNPRINTF

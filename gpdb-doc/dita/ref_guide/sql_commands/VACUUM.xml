@@ -19,6 +19,8 @@ VACUUM [FULL] [FREEZE] [VERBOSE] ANALYZE
         removed from their table; they remain present on disk until a <codeph>VACUUM</codeph> is
         done. Therefore it is necessary to do <codeph>VACUUM</codeph> periodically, especially on
         frequently-updated tables.</p>
+      <note>Starting in Greenplum 5.x, <codeph>VACUUM</codeph> is supported with persistent table
+        system catalogs, and is required to manage free space.</note>
       <p>With no parameter, <codeph>VACUUM</codeph> processes every table in the current database.
         With a parameter, <codeph>VACUUM</codeph> processes only that table.</p>
       <p><codeph>VACUUM ANALYZE</codeph> performs a <codeph>VACUUM</codeph> and then an

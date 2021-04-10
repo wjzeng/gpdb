@@ -5,7 +5,7 @@
 -- @tags partitionindexes
 -- @negtest True
 -- @description ALTER TABLE, Unique index with Primary Key
-ALTER TABLE pt_lt_tab ADD primary key(col2,col1);
+ALTER TABLE pt_lt_tab ADD primary key(col1,col2);
 psql:alter_tab_add_pkey_6.sql:7: NOTICE:  ALTER TABLE / ADD PRIMARY KEY will create implicit index "pt_lt_tab_pkey" for table "pt_lt_tab"
 psql:alter_tab_add_pkey_6.sql:7: NOTICE:  ALTER TABLE / ADD PRIMARY KEY will create implicit index "pt_lt_tab_1_prt_part1_pkey" for table "pt_lt_tab_1_prt_part1"
 psql:alter_tab_add_pkey_6.sql:7: NOTICE:  ALTER TABLE / ADD PRIMARY KEY will create implicit index "pt_lt_tab_1_prt_part2_pkey" for table "pt_lt_tab_1_prt_part2"

@@ -17,6 +17,8 @@ Feature: gpperfmon
         Given the database "gpperfmon" does not exist
         When the user runs "gpperfmon_install --port 15432 --enable --password foo"
         Then gpperfmon_install should return a return code of 0
+        Then gpperfmon_install should not print "foo" to stdout
+        Then gpperfmon_install should print "\*\*\*\*\*\*\*\*" to stdout
         Then verify that the last line of the file "postgresql.conf" in the master data directory contains the string "gpperfmon_log_alert_level='warning'"
         Then verify that the last line of the file "pg_hba.conf" in the master data directory contains the string "host     all         gpmon         ::1/128    md5"
         And verify that there is a "heap" table "database_history" in "gpperfmon"
@@ -174,3 +176,15 @@ Feature: gpperfmon
         And wait until the process "gpsmon" is up
         # Note that the code considers partition_age + 1 as the number of partitions to keep
         Then wait until the results from boolean sql "SELECT count(*) = 5 FROM pg_partitions WHERE tablename = 'diskspace_history'" is "true"
+
+    @gpperfmon_index_scan
+    Scenario: Gpmon should not return "WARNING:  gpmon - bad magic 0" with explain plan includes index_scan
+        Given gpperfmon is configured and running in qamode
+        Then the user runs "psql -f 'test/behave/mgmt_utils/steps/data/gpperfmon/index_scan.sql'"
+        Then psql should not print "gpmon - bad magic 0" error message
+
+    @gpperfmon_bitmap_index_scan
+    Scenario: Gpmon should not return "WARNING:  gpmon - bad magic 0" with explain plan includes bitmap index_scan
+        Given gpperfmon is configured and running in qamode
+        Then the user runs "psql -f 'test/behave/mgmt_utils/steps/data/gpperfmon/bitmap_index_scan.sql'"
+        Then psql should not print "gpmon - bad magic 0" error message

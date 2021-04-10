@@ -12,6 +12,7 @@ WANTED_DIRS = \
 		formatter_fixedwidth \
 		extprotocol \
 		citext \
+		gp_error_handling \
 		gp_distribution_policy \
 		gp_internal_tools \
 		gp_inject_fault \
@@ -19,6 +20,7 @@ WANTED_DIRS = \
 		indexscan \
 		dict_int \
 		dict_xsyn \
+		amcheck		\
 		citext		\
 		hstore		\
 		intarray \

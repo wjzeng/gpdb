@@ -94,7 +94,7 @@ create or replace temp view v1 as
   select 2+2+4+(select max(unique1) from tenk1) as f1;
 select cache_test_2();
 
---- Check that change of search_path is ignored by replans
+--- Check that change of search_path is honored when re-using cached plan
 
 create schema s1
   create table abc (f1 int);
@@ -120,6 +120,41 @@ execute p1;
 alter table s1.abc add column f2 float8;   -- force replan
 
 execute p1;
+
+-- GPDB: Check that search_path change is honored in the plpgsql body
+-- (bug in upstream and fixed in v9.3)
+
+CREATE OR REPLACE FUNCTION s1.test_searchpath() RETURNS integer
+LANGUAGE 'plpgsql' AS $BODY$
+BEGIN
+	RETURN 1;
+END;
+$BODY$;
+
+CREATE OR REPLACE FUNCTION s2.test_searchpath() RETURNS integer
+LANGUAGE 'plpgsql' AS $BODY$
+BEGIN
+	RETURN 2;
+END;
+$BODY$;
+
+CREATE OR REPLACE FUNCTION public.test_searchpath(p_search_path character varying) RETURNS integer
+LANGUAGE 'plpgsql' AS $BODY$
+DECLARE v_ret integer = -1;
+BEGIN
+	-- The EXECUTE statement will force replanning
+	EXECUTE 'SET search_path to ' || p_search_path;
+	SELECT test_searchpath() into v_ret;
+	RETURN v_ret;
+END;
+$BODY$;
+
+SELECT * FROM public.test_searchpath('s1');
+SELECT * FROM public.test_searchpath('s2');
+
+DROP FUNCTION s1.test_searchpath();
+DROP FUNCTION s2.test_searchpath();
+DROP FUNCTION public.test_searchpath(p_search_path character varying);
 
 drop schema s1 cascade;
 drop schema s2 cascade;

@@ -16,9 +16,9 @@
         <xref href="#topic4" type="topic" format="dita"/>
       </li>
       <li otherprops="pivotal">
-        <xref href="#topic7" format="dita"/></li>
-      <li otherprops="pivotal">
         <xref href="#topic6" format="dita"/></li>
+      <li otherprops="pivotal">
+        <xref href="#topic7" format="dita"/></li>
       <li id="pv161254">
         <xref href="#topic13" type="topic" format="dita"/>
       </li>
@@ -246,26 +246,69 @@
       </body>
     </topic>
   </topic>
+  <topic id="topic6" xml:lang="en">
+    <title id="pv161784">Enabling PL/Java and Installing JAR Files</title>
+    <body>
+      <p>Perform the following steps as the Greenplum Database administrator
+          <codeph>gpadmin</codeph>.</p>
+      <ol id="ol_dpn_qr5_b1b">
+        <li id="pv162268">Enable PL/Java in a database by executing the <codeph>CREATE
+            EXTENSION</codeph> command to register the language. For example, this command enables
+          PL/Java in the <codeph>testdb</codeph>
+            database:<codeblock>$ psql -d testdb -c 'CREATE EXTENSION pljava;'</codeblock><note>The
+            PL/Java <codeph>install.sql</codeph> script, used in previous releases to register the
+            language, is deprecated.</note></li>
+        <li id="pv160325">Copy your Java archives (JAR files) to the same directory on all Greenplum
+          Database hosts. This example uses the Greenplum Database <codeph>gpscp</codeph> utility to
+          copy the file <codeph>myclasses.jar</codeph> to the directory
+            <codeph>$GPHOME/lib/postgresql/java/</codeph>:<codeblock>$ gpscp -f gphosts_file myclasses.jar 
+=:/usr/local/greenplum-db/lib/postgresql/java/</codeblock><p>The
+            file <codeph>gphosts_file</codeph> contains a list of the Greenplum Database
+          hosts.</p></li>
+        <li id="pv160327">Set the <codeph>pljava_classpath</codeph> server configuration parameter
+          in the master <codeph>postgresql.conf</codeph> file. For this example, the parameter value
+          is a colon (:) separated list of the JAR files. For
+            example:<codeblock>$ gpconfig -c pljava_classpath -v 'examples.jar:myclasses.jar'</codeblock><p>The
+            file <codeph>examples.jar</codeph> is installed when you install the PL/Java extension
+            package with the <codeph>gppkg</codeph> utility.</p>
+          <note>If you install JAR files in a directory other than
+              <codeph>$GPHOME/lib/postgresql/java/</codeph>, you must specify the absolute path to
+            the JAR file. Each JAR file must be in the same location on all Greenplum Database
+            hosts. For more information about specifying the location of JAR files, see the
+            information about the <codeph>pljava_classpath</codeph> server configuration parameter
+            in the <cite>Greenplum Database Reference Guide</cite>.</note></li>
+        <li id="pv160329">Reload the <codeph>postgresql.conf</codeph>
+          file.<codeblock>$ gpstop -u</codeblock></li>
+        <li id="pv160335">(optional) Greenplum provides an <codeph>examples.sql</codeph> file
+          containing sample PL/Java functions that you can use for testing. Run the commands in this
+          file to create the test functions (which use the Java classes in
+            <codeph>examples.jar</codeph>).
+          <codeblock>$ psql -f $GPHOME/share/postgresql/pljava/examples.sql</codeblock></li>
+      </ol>
+    </body>
+  </topic>
   <topic id="topic7" xml:lang="en" otherprops="pivotal">
     <title>Uninstalling PL/Java</title>
     <body>
       <ul id="ul_zsz_fs5_b1b">
-        <li id="pv165655">
-          <xref href="#topic8" type="topic" format="dita"/>
+        <li id="pv165655"><xref href="#topic8" type="topic" format="dita"/>
         </li>
-        <li id="pv165686">
-          <xref href="#topic9" type="topic" format="dita"/>
+        <li id="pv165686"><xref href="#topic9" type="topic" format="dita"/>
         </li>
       </ul>
     </body>
     <topic id="topic8" xml:lang="en">
       <title id="pv165472">Remove PL/Java Support for a Database</title>
       <body>
-        <p>For a database that no long requires the PL/Java language, remove support for PL/Java.
-          Run the <codeph>uninstall.sql</codeph> file as the gpadmin user. For example, this command
-          disables the PL/Java language in the specified database. </p>
-        <codeblock>$ psql -d mydatabase
-  -f $GPHOME/share/postgresql/pljava/uninstall.sql</codeblock>
+        <p>Use the <codeph>DROP EXTENSION</codeph> command to remove support for PL/Java from a
+          database. For example, this command disables the PL/Java language in the
+            <codeph>testdb</codeph> database: </p>
+        <codeblock>$ psql -d testdb -c 'DROP EXTENSION pljava;'</codeblock>
+        <p> The default command fails if any existing objects (such as functions) depend on the
+          language. Specify the <codeph>CASCADE</codeph> option to also drop all dependent objects,
+          including functions that you created with PL/Java. </p>
+        <note>The PL/Java <codeph>uninstall.sql</codeph> script, used in previous releases to remove
+          the language registration, is deprecated.</note>
       </body>
     </topic>
     <topic id="topic9" xml:lang="en">
@@ -292,48 +335,6 @@
         </ol>
       </body>
     </topic>
-  </topic>
-  <topic id="topic6" xml:lang="en">
-    <title id="pv161784">Enabling PL/Java and Installing JAR Files</title>
-    <body>
-      <p>Perform the following steps as the Greenplum Database administrator
-          <codeph>gpadmin</codeph>.</p>
-      <ol id="ol_dpn_qr5_b1b">
-        <li id="pv162268">Enable PL/Java by running the SQL script
-            <codeph>$GPHOME/share/postgresql/pljava/install.sql</codeph> in the databases that will
-          use PL/Java. For example, this example enables PL/Java on the database
-            <codeph>mytestdb</codeph>:<codeblock>$ psql -d mytestdb \
-  -f $GPHOME/share/postgresql/pljava/install.sql</codeblock><p>The
-            script <codeph>install.sql</codeph> registers both the trusted and untrusted PL/Java
-            language.</p></li>
-        <li id="pv160325">Copy your Java archives (JAR files) to the same directory on all Greenplum
-          Database hosts. This example uses the Greenplum Database <codeph>gpscp</codeph> utility to
-          copy the file <codeph>myclasses.jar</codeph> to the directory
-            <codeph>$GPHOME/lib/postgresql/java/</codeph>:<codeblock>$ gpscp -f gphosts_file myclasses.jar 
-=:/usr/local/greenplum-db/lib/postgresql/java/</codeblock><p>The
-            file <codeph>gphosts_file</codeph> contains a list of the Greenplum Database
-          hosts.</p></li>
-        <li id="pv160327">Set the <codeph>pljava_classpath</codeph> server configuration parameter
-          in the master <codeph>postgresql.conf</codeph> file. For this example, the parameter value
-          is a colon (:) separated list of the JAR files. For
-            example:<codeblock>$ gpconfig -c pljava_classpath -v 'examples.jar:myclasses.jar'</codeblock><p>The
-            file <codeph>examples.jar</codeph> is installed when you install the PL/Java extension
-            package with the <codeph>gppkg</codeph> utility.</p><note>If you install JAR files in a
-            directory other than <codeph>$GPHOME/lib/postgresql/java/</codeph>, you must specify the
-            absolute path to the JAR file. Each JAR file must be in the same location on all
-            Greenplum Database hosts. For more information about specifying the location of JAR
-            files, see the information about the <codeph>pljava_classpath</codeph> server
-            configuration parameter in the <cite>Greenplum Database Reference
-          Guide</cite>.</note></li>
-        <li id="pv160329">Reload the <codeph>postgresql.conf</codeph>
-          file.<codeblock>$ gpstop -u</codeblock></li>
-        <li id="pv160335">(optional) Greenplum provides an <codeph>examples.sql</codeph> file
-          containing sample PL/Java functions that you can use for testing. Run the commands in this
-          file to create the test functions (which use the Java classes in
-            <codeph>examples.jar</codeph>).
-          <codeblock>$ psql -f $GPHOME/share/postgresql/pljava/examples.sql</codeblock></li>
-      </ol>
-    </body>
   </topic>
   <topic id="topic13" xml:lang="en">
     <title id="pv158066">Writing PL/Java functions</title>

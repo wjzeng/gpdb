@@ -54,19 +54,19 @@ select count(*) from sync2_heap_films2;
 --
 --ADD table_constraint
 --
-ALTER TABLE sync1_heap_films7 ADD UNIQUE(code, date_prod);
+ALTER TABLE sync1_heap_films7 ADD UNIQUE(date_prod, code);
 select count(*) from sync1_heap_films7;
 
-ALTER TABLE ck_sync1_heap_films6 ADD UNIQUE(code, date_prod);
+ALTER TABLE ck_sync1_heap_films6 ADD UNIQUE(date_prod, code);
 select count(*) from ck_sync1_heap_films6;
 
-ALTER TABLE ct_heap_films4 ADD UNIQUE(code, date_prod);
+ALTER TABLE ct_heap_films4 ADD UNIQUE(date_prod, code);
 select count(*) from ct_heap_films4;
 
-ALTER TABLE resync_heap_films2 ADD UNIQUE(code, date_prod);
+ALTER TABLE resync_heap_films2 ADD UNIQUE(date_prod, code);
 select count(*) from resync_heap_films2;
 
-ALTER TABLE sync2_heap_films1 ADD UNIQUE(code, date_prod);
+ALTER TABLE sync2_heap_films1 ADD UNIQUE(date_prod, code);
 select count(*) from sync2_heap_films1;
 
 --

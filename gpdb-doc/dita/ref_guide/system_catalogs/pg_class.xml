@@ -168,12 +168,12 @@
             </entry>
             <entry colname="col2">char</entry>
             <entry colname="col3"/>
-            <entry colname="col4">The type of object<p><codeph>r</codeph> = heap or append-optimized
-                table, <codeph>i</codeph> = index, <codeph>S</codeph> = sequence, <codeph>v</codeph>
-                = view, <codeph>c</codeph> = composite type, <codeph>t</codeph> = TOAST value,
-                  <codeph>o</codeph> = internal append-optimized segment files and EOFs,
-                  <codeph>c</codeph> = composite type, <codeph>u</codeph> = uncataloged temporary
-                heap table</p></entry>
+            <entry colname="col4">The type of object<p><codeph>i</codeph> = index,
+                  <codeph>r</codeph> = heap or append-optimized table, <codeph>S</codeph> =
+                sequence, <codeph>u</codeph> = uncataloged temporary heap table, <codeph>t</codeph>
+                = TOAST value, <codeph>o</codeph> = internal append-optimized segment files and
+                EOFs, <codeph>b</codeph> = append-optimized block directory, <codeph>m</codeph> =
+              append-only visibility map, <codeph>v</codeph> = view, <codeph>c</codeph> = composite type</p></entry>
           </row>
           <row>
             <entry colname="col1">

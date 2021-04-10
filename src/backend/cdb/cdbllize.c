@@ -183,7 +183,7 @@ cdbparallelize(PlannerInfo *root,
 	switch (query->commandType)
 	{
 		case CMD_SELECT:
-			if (query->intoClause)
+			if (query->intoClause || query->isCopy)
 			{
 				/* SELECT INTO always created partitioned tables. */
 				context->resultSegments = true;	
@@ -1113,7 +1113,7 @@ repartitionPlan(Plan *plan, bool stable, bool rescannable, List *hashExpr)
            plan->flow->flotype == FLOW_SINGLETON);
 
     /* Already partitioned on the given hashExpr?  Do nothing. */
-    if (hashExpr) 
+    if (hashExpr && plan->flow->locustype == CdbLocusType_Hashed)
     {
     	if (equal(hashExpr, plan->flow->hashExpr))
     		return true;

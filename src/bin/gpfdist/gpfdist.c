@@ -104,8 +104,9 @@ static void flush_ssl_buffer(int fd, short event, void* arg);
  ================
  When a gpdb segment connects to gpfdist, it provides the following parameters:
  X-GP-XID   - transaction ID
- X-GP-CID   - command ID
- X-GP-SN    - session ID
+ X-GP-CID   - command ID to distinguish different queries.
+ X-GP-SN    - scan number to distinguish scans on the same external tables
+              within the same query.
  X-GP-PROTO - protocol number, report error if not provided:
 
  X-GP-PROTO = 0
@@ -339,6 +340,7 @@ static void session_active_segs_dump(session_t* session);
 static int session_active_segs_isempty(session_t* session);
 static int request_validate(request_t *r);
 static int request_set_path(request_t *r, const char* d, char* p, char* pp, char* path);
+static int request_path_validate(request_t *r, const char* path);
 static int request_parse_gp_headers(request_t *r, int opt_g);
 static void free_session_cb(int fd, short event, void* arg);
 #ifdef GPFXDIST
@@ -1178,7 +1180,11 @@ static int local_send(request_t *r, const char* buf, int buflen)
 			if (r->session)
 				session_end(r->session, 0);
 		} else {
-			gdebug(r, "gpfdist_send failed - due to (%d: %s)", e, strerror(e));
+			if (!ok) {
+				gwarning(r, "gpfdist_send failed - due to (%d: %s)", e, strerror(e));
+			} else {
+				gdebug(r, "gpfdist_send failed - due to (%d: %s), should try again", e, strerror(e));
+			}
 		}
 		return ok ? 0 : -1;
 	}
@@ -1344,13 +1350,14 @@ session_get_block(const request_t* r, block_t* retblock, char* line_delim_str, i
 /* finish the session - close the file */
 static void session_end(session_t* session, int error)
 {
-	gprintln(NULL, "session end.");
+	gprintln(NULL, "session end. id = %ld, is_error = %d, error = %d", session->id, session->is_error, error);
 
 	if (error)
 		session->is_error = error;
 
 	if (session->fstream)
 	{
+		gprintln(NULL, "close fstream");
 		fstream_close(session->fstream);
 		session->fstream = 0;
 	}
@@ -1549,11 +1556,27 @@ static int session_attach(request_t* r)
 			int quote = 0;
 			int escape = 0;
 			int eol_type = 0;
-			sscanf(r->csvopt, "m%dx%dq%dn%dh%d", &fstream_options.is_csv, &escape,
+			/* csvopt is different in gp4 and later version */
+			/* for gp4, csv opt is like "mxqnh"; for later version of gpdb, csv opt is like "mxqhn" */
+			/* we check the number of successful match here to make sure eol_type and header is right */
+			if ( strcmp(r->csvopt, "") != 0 ){    //writable external table doesn't have csvopt
+				int n = sscanf(r->csvopt, "m%dx%dq%dn%dh%d", &fstream_options.is_csv, &escape,
 					&quote, &eol_type, &fstream_options.header);
-			fstream_options.quote = quote;
-			fstream_options.escape = escape;
-			fstream_options.eol_type = eol_type;
+				if (n!=5){
+					n = sscanf(r->csvopt, "m%dx%dq%dh%dn%d", &fstream_options.is_csv, &escape,
+						&quote, &fstream_options.header, &eol_type);
+				}
+				if (n==5){
+					fstream_options.quote = quote;
+					fstream_options.escape = escape;
+					fstream_options.eol_type = eol_type;
+				}
+				else{
+					http_error(r, FDIST_BAD_REQUEST, "bad request, csvopt doesn't meet the format");
+					request_end(r, 1, 0);
+					return -1;
+				}
+			}
 		}
 
 		/* set fstream for read (GET) or write (PUT) */
@@ -1632,14 +1655,6 @@ static int session_attach(request_t* r)
 
 	/* found a session in hashtable*/
 
-	/* if error, send an error and close */
-	if (session->is_error)
-	{
-		http_error(r, FDIST_INTERNAL_ERROR, "session error");
-		request_end(r, 1, 0);
-		return -1;
-	}
-
 	/* session already ended. send an empty response, and close. */
 	if (NULL == session->fstream)
 	{
@@ -1647,6 +1662,14 @@ static int session_attach(request_t* r)
 
 		http_empty(r);
 		request_end(r, 0, 0);
+		return -1;
+	}
+
+	/* if error, send an error and close */
+	if (session->is_error)
+	{
+		http_error(r, FDIST_INTERNAL_ERROR, "session error");
+		request_end(r, 1, 0);
 		return -1;
 	}
 
@@ -1770,6 +1793,10 @@ static void do_write(int fd, short event, void* arg)
 				n = local_send(r, datablock->hdr.hbyte + datablock->hdr.hbot, n);
 				if (n < 0)
 				{
+					/*
+					 * TODO: It is not safe to check errno here, should check and
+					 * return special value in local_send()
+					 */
 					if (errno == EPIPE || errno == ECONNRESET)
 						r->outblock.bot = r->outblock.top;
 					request_end(r, 1, "gpfdist send block header failure");
@@ -1977,6 +2004,12 @@ static void do_read_request(int fd, short event, void* arg)
 
 	/* decode %xx to char */
 	percent_encoding_to_char(p, pp, path);
+
+	/* legit check for the path */
+	if (request_path_validate(r, path) != 0)
+	{
+		return;
+	}
 
 	/*
 	 * This is a debug hook. We'll get here By creating an external table with
@@ -2336,6 +2369,17 @@ signal_register()
 
 }
 
+static void clear_listen_sock(void)
+{
+	SOCKET sock = -1;
+	while(gcb.listen_sock_count > 0)
+	{
+		sock = gcb.listen_socks[gcb.listen_sock_count-1];
+		closesocket(sock);
+		gcb.listen_socks[gcb.listen_sock_count-1] = -1;
+		gcb.listen_sock_count--;
+	}
+}
 /* Create HTTP port and start to receive request */
 static void
 http_setup(void)
@@ -2350,6 +2394,10 @@ http_setup(void)
 
 	char service[32];
 	const char *hostaddr = NULL;
+#if defined(IPV6_V6ONLY) && defined(IPPROTO_IPV6)
+	int ipv6only_val = 1;
+#endif
+	bool create_failed = false;
 
 #ifdef USE_SSL
 	if (opt.ssl)
@@ -2469,6 +2517,17 @@ http_setup(void)
 				gwarning(NULL, "Setting SO_LINGER on socket failed");
 				continue;
 			}
+#if defined(IPV6_V6ONLY) && defined(IPPROTO_IPV6)
+			if(rp->ai_family == AF_INET6)
+			{
+				if (setsockopt(f, IPPROTO_IPV6, IPV6_V6ONLY, (void*) &ipv6only_val, sizeof(ipv6only_val)) == -1)
+				{
+					gwarning(NULL, "Setting IPV6_V6ONLY on socket failed");
+					closesocket(f);
+					continue;
+				}
+			}
+#endif
 
 			if (bind(f, rp->ai_addr, rp->ai_addrlen) != 0)
 			{
@@ -2488,9 +2547,12 @@ http_setup(void)
 						gwarning(NULL, "%s (errno = %d), port: %d",
 					               		strerror(errno), errno, opt.p);
 					}
+					closesocket(f);
+					create_failed = true;
+					break;
 				}
 				else
-			    {
+				{
 					gwarning(NULL, "%s (errno=%d), port: %d",strerror(errno), errno, opt.p);
 				}
 
@@ -2523,6 +2585,11 @@ http_setup(void)
 		{
 			/* don't need this any more */
 			freeaddrinfo(addrs);
+		}
+		if(create_failed)
+		{
+			clear_listen_sock();
+			create_failed = false;
 		}
 
 		if (gcb.listen_sock_count > 0)
@@ -3119,24 +3186,6 @@ done_processing_request:
 
 static int request_set_path(request_t *r, const char* d, char* p, char* pp, char* path)
 {
-
-	/*
-	 * disallow using a relative path in the request
-	 */
-	if (strstr(path, ".."))
-	{
-		gwarning(r, "reject invalid request from %s [%s %s] - request "
-						"is using a relative path",
-						r->peer,
-						r->in.req->argv[0],
-						r->in.req->argv[1]);
-
-		http_error(r, FDIST_BAD_REQUEST, "invalid request due to relative path");
-		request_end(r, 1, 0);
-
-		return -1;
-	}
-
 	r->path = 0;
 
 	/*
@@ -3172,6 +3221,51 @@ static int request_set_path(request_t *r, const char* d, char* p, char* pp, char
 	if (!r->path)
 	{
 		http_error(r, FDIST_BAD_REQUEST, "invalid request (unable to set path)");
+		request_end(r, 1, 0);
+		return -1;
+	}
+
+	return 0;
+}
+
+static int request_path_validate(request_t *r, const char* path)
+{
+	const char* warn_msg = NULL;
+	const char* http_err_msg = NULL;
+
+#ifdef WIN32
+	if (strstr(path, ".."))
+#else
+	if (strstr(path, "\\"))
+	{
+		/*
+		 * '\' is the path separator under windows.
+		 * For *nix, escape char may cause some unexpected result with
+		 * the file API. e.g.: 'ls \.\.' equals to 'ls ..'.
+		 */
+		warn_msg = "contains escape character backslash '\\'";
+		http_err_msg = "invalid request, "
+			"escape character backslash '\\' is not allowed.";
+	}
+	else if (strstr(path, ".."))
+#endif
+	{
+		/*
+		 * disallow using a relative path in the request. CWE23
+		 */
+		warn_msg = "is using a relative path";
+		http_err_msg = "invalid request due to relative path";
+	}
+
+	if (warn_msg)
+	{
+		gwarning(r, "reject invalid request from %s [%s %s] - request %s",
+						r->peer,
+						r->in.req->argv[0],
+						r->in.req->argv[1],
+						warn_msg);
+
+		http_error(r, FDIST_BAD_REQUEST, http_err_msg);
 		request_end(r, 1, 0);
 		return -1;
 	}

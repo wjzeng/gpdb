@@ -1,0 +1,18 @@
+platform: linux
+image_resource:
+  type: docker-image
+  source:
+    repository: pivotaldata/ccp
+    tag: "7"
+inputs:
+ - name: ccp_src
+ - name: cluster_env_files
+run:
+  path: bash
+  args:
+  - -c
+  - |
+    set -ex
+    ccp_src/scripts/setup_ssh_to_cluster.sh
+    ssh -t mdw "bash /home/gpadmin/gpdb_src/concourse/scripts/run_fips_tests.sh"
+

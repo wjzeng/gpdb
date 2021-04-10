@@ -1,0 +1,28 @@
+#! /bin/bash
+#
+# A helper for syncing a folder to an S3 bucket, since Concourse resources can't
+# do that for you.
+#
+# Usage: ./s3_sync SRC DST
+#
+# You need to set the AWS_* envvars for authentication and region (see below).
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+if [ $# -ne 2 ]; then
+    echo "Usage: $0 SRC DST"
+	exit 1
+fi
+
+required_envvars="AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_DEFAULT_REGION"
+for var in $required_envvars; do
+    if [ -z "${!var:-}" ]; then
+        echo "This script requires ($required_envvars) to be set."
+        exit 1
+    fi
+done
+
+pip install awscli
+aws s3 sync "$1" "$2"

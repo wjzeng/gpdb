@@ -286,15 +286,15 @@ reindex_system_catalogs(const char *dbname, const char *host, const char *port,
 						const char *username, enum trivalue prompt_password,
 						const char *progname, bool echo)
 {
+	PGconn	   *conn;
 	PQExpBufferData sql;
 
-	PGconn	   *conn;
+	conn = connectDatabase(dbname, host, port, username, prompt_password,
+						   progname);
 
 	initPQExpBuffer(&sql);
 
-	appendPQExpBuffer(&sql, "REINDEX SYSTEM %s;\n", dbname);
-
-	conn = connectDatabase(dbname, host, port, username, prompt_password, progname);
+	appendPQExpBuffer(&sql, "REINDEX SYSTEM %s;", fmtId(PQdb(conn)));
 	if (!executeMaintenanceCommand(conn, sql.data, echo))
 	{
 		fprintf(stderr, _("%s: reindexing of system catalogs failed: %s"),

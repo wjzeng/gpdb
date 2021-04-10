@@ -1,0 +1,43 @@
+--
+-- Test queries that can lead to deadlock on the gp_segment_configuration table
+-- between the QD backend and FTS. The queries could be gp_add_segment_mirror()
+-- and gp_remove_segment_mirror(), both are called during gprecoverseg.
+--
+-- The tests does not directly call the above functions but mimics them by
+-- locking gp_segment_configuration with ExclusiveLock from the same session
+-- that requests FTS probe.
+--
+CREATE EXTENSION IF NOT EXISTS gp_inject_fault;
+CREATE OR REPLACE FUNCTION cleanupAllGangs() RETURNS BOOL
+AS '@abs_builddir@/regress@DLSUFFIX@', 'cleanupAllGangs' LANGUAGE C;
+begin;
+lock gp_segment_configuration in exclusive mode;
+-- destroy current gang
+select cleanupAllGangs();
+ cleanupallgangs 
+-----------------
+ t
+(1 row)
+
+-- error out when creating a gang, that should trigger FTS probe
+select gp_inject_fault_new('create_gang_in_progress', 'error', 1);
+NOTICE:  Success:
+ gp_inject_fault_new 
+---------------------
+ t
+(1 row)
+
+-- trigger the fault by executing a MPP command
+create table dummy();
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause, and no column type is suitable for a distribution key. Creating a NULL policy entry.
+ERROR:  fault triggered, fault name:'create_gang_in_progress' fault type:'error'
+-- the previous command should not block because of deadlock
+-- between FTS and the QD backend serving this session
+end;
+SELECT gp_inject_fault('create_gang_in_progress', 'reset', 1);
+NOTICE:  Success:
+ gp_inject_fault 
+-----------------
+ t
+(1 row)
+

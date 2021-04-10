@@ -8343,3 +8343,26 @@ FROM
      2
 (1 row)
 
+-- check SRF in Window's targetlist can be handled correctly
+explain
+select unnest(array[a,a]), rank() over (order by a) from generate_series(2,3) a;
+                                      QUERY PLAN                                      
+--------------------------------------------------------------------------------------
+ Window  (cost=62.33..69.83 rows=1000 width=4)
+   Order By: a
+   ->  Sort  (cost=62.33..64.83 rows=1000 width=4)
+         Sort Key: a
+         ->  Function Scan on generate_series a  (cost=0.00..12.50 rows=1000 width=4)
+ Settings:  gp_enable_sequential_window_plans=off
+ Optimizer status: legacy query optimizer
+(7 rows)
+
+select unnest(array[a,a]), rank() over (order by a) from generate_series(2,3) a;
+ unnest | rank 
+--------+------
+      2 |    1
+      2 |    1
+      3 |    2
+      3 |    2
+(4 rows)
+

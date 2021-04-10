@@ -2216,7 +2216,7 @@ make_plan_for_one_dqa(PlannerInfo *root, MppGroupContext *ctx, int dqa_index,
 		groups_sorted = true;
 		current_pathkeys = root->group_pathkeys;
 		mark_sort_locus(result_plan);
-		/* Fall though. */
+		/* fallthrough */
 		
 	case DQACOPLAN_GGS:
 		aggstrategy = AGG_SORTED;
@@ -2860,7 +2860,14 @@ cdbpathlocus_collocates(PlannerInfo *root, CdbPathLocus locus, List *pathkeys,
 		return true;
 
 	if (!CdbPathLocus_IsHashed(locus))
-		return false;  /* Or would HashedOJ ok, too? */
+	{
+		/*
+		 * Note: HashedOJ can *not* be used for grouping. In HashedOJ, NULL
+		 * values can be located on any segment, so we would end up with
+		 * multiple NULL groups.
+		 */
+		return false;
+	}
 
 	if (exact_match && list_length(pathkeys) != list_length(locus.partkey_h))
 		return false;
@@ -3554,7 +3561,6 @@ Node *split_aggref(Aggref *aggref, MppGroupContext *ctx)
 	ListCell *cell;
 	Node *final_node;
 	Oid transtype = InvalidOid;
-	AttrNumber attrno = OUTER;
 	TargetEntry *prelim_tle = NULL;
 
 	Assert(aggref != NULL  && aggref->agglevelsup == 0);
@@ -3640,7 +3646,8 @@ Node *split_aggref(Aggref *aggref, MppGroupContext *ctx)
 		Aggref *pref;
 		Aggref *iref;
 		Aggref *fref;
-		
+		AttrNumber attrno;
+
 		/*
 		 * We may have seen an Aggref just like this one already.  Look for
 		 * the preliminary form of such in the preliminary Aggref target
@@ -4246,7 +4253,9 @@ reconstruct_pathkeys(PlannerInfo *root, List *pathkeys, int *resno_map,
 
 				new_eclass = get_eclass_for_sort_expr(root, new_tle->expr,
 													  em->em_datatype,
-													  pathkey->pk_eclass->ec_opfamilies, 0);
+													  pathkey->pk_eclass->ec_opfamilies,
+													  0,
+													  true);
 				new_pathkey = makePathKey(new_eclass, pathkey->pk_opfamily, pathkey->pk_strategy,
 										  pathkey->pk_nulls_first);
 
@@ -5361,7 +5370,10 @@ make_parallel_or_sequential_agg(PlannerInfo *root, AggClauseCounts *agg_counts,
 										agg_counts->numAggs,
 										agg_counts->transitionSpace,
 										result_plan);
-		mark_passthru_locus(result_plan, true, current_pathkeys != NIL);
+		result_plan->flow = pull_up_Flow(result_plan,
+										 result_plan->lefttree,
+										 (current_pathkeys != NIL)
+										 && aggstrategy != AGG_HASHED );
 	}
 	else
 		current_pathkeys = *group_context->pcurrent_pathkeys;
@@ -6878,9 +6890,11 @@ within_agg_planner(PlannerInfo *root,
 			 */
 			memcpy(&root_copy, root, sizeof(PlannerInfo));
 			sz = root->simple_rel_array_size * sizeof(RelOptInfo *);
-			root_copy.simple_rel_array =
-				(RelOptInfo **) palloc(sz);
+			root_copy.simple_rel_array = (RelOptInfo **) palloc(sz);
 			memcpy(root_copy.simple_rel_array, root->simple_rel_array, sz);
+			sz = root->simple_rel_array_size * sizeof(RangeTblEntry *);
+			root_copy.simple_rte_array = (RangeTblEntry **) palloc(sz);
+			memcpy(root_copy.simple_rte_array, root->simple_rte_array, sz);
 
 			/*
 			 * Query should be copied deeply for the planner changes it.

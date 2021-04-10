@@ -55,5 +55,5 @@ psql -d greenplum
 ```
 
 # Docker container with GPDB database running
-For more information follow the [link](ubuntu-16.04/README.md)
+For more information follow the [link](ubuntu16/runner/README.md)
 

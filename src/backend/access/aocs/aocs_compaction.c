@@ -431,7 +431,6 @@ AOCSDrop(Relation aorel,
 	int total_segfiles;
 	AOCSFileSegInfo** segfile_array;
 	int i, segno;
-	LockAcquireResult acquireResult;
 	AOCSFileSegInfo* fsinfo;
 
 	Assert (Gp_role == GP_ROLE_EXECUTE || Gp_role == GP_ROLE_UTILITY);
@@ -455,21 +454,14 @@ AOCSDrop(Relation aorel,
 		}
 
 		/*
-		 * Try to get the transaction write-lock for the Append-Only segment file.
+		 * Get the transaction write-lock for the Append-Only segment file.
 		 *
 		 * NOTE: This is a transaction scope lock that must be held until commit / abort.
 		 */
-		acquireResult = LockRelationAppendOnlySegmentFile(
-												&aorel->rd_node,
-												segfile_array[i]->segno,
-												AccessExclusiveLock,
-												/* dontWait */ true);
-		if (acquireResult == LOCKACQUIRE_NOT_AVAIL)
-		{
-			elog(DEBUG5, "drop skips AOCS segfile %d, "
-					 "relation %s", segfile_array[i]->segno, relname);
-			continue;
-		}
+		LockRelationAppendOnlySegmentFile(&aorel->rd_node,
+										  segfile_array[i]->segno,
+										  AccessExclusiveLock,
+										  /* dontWait */ false);
 
 		/* Re-fetch under the write lock to get latest committed eof. */
 		fsinfo = GetAOCSFileSegInfo(aorel, SnapshotNow, segno);

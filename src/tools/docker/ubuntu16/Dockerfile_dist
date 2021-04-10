@@ -1,0 +1,100 @@
+FROM pivotaldata/ubuntu16.04-build:gpdb5-latest
+
+#############################
+# get the GPDB repo
+#############################
+COPY . /tmp/gpdb_src/
+WORKDIR /tmp
+
+ENV BUILDDIR=/tmp/gpdb_src
+WORKDIR ${BUILDDIR}
+
+#############################
+# build ORCA
+#############################
+ENV INSTLOC=/usr/local/greenplum-db-devel
+ENV BLD_ARCH=ubuntu1604_amd64
+
+WORKDIR ${BUILDDIR}/depends
+
+# fix the /root/.ccache missing issue during build
+RUN mkdir -p /root/.ccache && \
+    touch  /root/.ccache/ccache.conf && \
+    ./configure --prefix=${BUILDDIR}/gpAux/ext/${BLD_ARCH} && \
+    make install_local
+
+#############################
+# get ready for `make dist`
+#############################
+WORKDIR ${BUILDDIR}/gpAux
+
+ENV GPROOT=/usr/local
+ENV ADDON_DIR=addon
+
+RUN rm -rf ${INSTLOC}
+
+#############################
+# required by `apr-1-config` and `curl-config` in `gpfdist`
+#############################
+ENV BLD_THIRDPARTY_BIN_DIR=${BUILDDIR}/gpAux/ext/${BLD_ARCH}/bin/
+
+RUN mkdir -p ${BLD_THIRDPARTY_BIN_DIR} && \
+    cp /usr/bin/apu-1-config ${BLD_THIRDPARTY_BIN_DIR} && \
+    cp /usr/bin/apr-1-config ${BLD_THIRDPARTY_BIN_DIR} && \
+    cp /usr/bin/curl-config ${BLD_THIRDPARTY_BIN_DIR} && \
+    #############################
+    # required by `make copydocs`
+    #############################
+    mkdir -p ${BUILDDIR}/gpAux/docs/release
+
+#############################
+# required by `make copylibs`
+#############################
+RUN cp -r /usr/include/curl/ ${BUILDDIR}/gpAux/ext/${BLD_ARCH}/include/curl/ && \
+    mkdir -p ${BUILDDIR}/gpAux/ext/${BLD_ARCH}/bin/ && \
+    cp /usr/bin/openssl ${BUILDDIR}/gpAux/ext/${BLD_ARCH}/bin/ && \
+    mkdir -p ${BUILDDIR}/gpAux/ext/${BLD_ARCH}/ssl/ && \
+    cp -r /usr/include/openssl/ ${BUILDDIR}/gpAux/ext/${BLD_ARCH}/include/openssl/ && \
+    cp -r /usr/lib/ssl/openssl.cnf ${BUILDDIR}/gpAux/ext/${BLD_ARCH}/ssl/
+
+#############################
+# Setup libsigar
+#############################
+RUN cp /usr/lib/jni/libsigar.so /usr/lib/
+RUN sed -i '/deb-src/s/^# *//' /etc/apt/sources.list && \
+    apt-get update && apt-get source libhyperic-sigar-java && \
+    cp hyperic-sigar-*/include/sigar.h ${BUILDDIR}/gpAux/ext/${BLD_ARCH}/include
+
+#############################
+# required by `make clients`
+#############################
+ENV CLIENTINSTLOC=${INSTLOC}/greenplum-clients
+
+#############################
+# TARGET: `make dist` to build enterprise edition
+#############################
+WORKDIR ${BUILDDIR}/gpAux
+RUN make PARALLEL_MAKE_OPTS=-j8 -s dist
+
+#############################
+# prepare for `make loaders`
+#############################
+ENV LOADERSINSTLOC=${INSTLOC}/greenplum-loaders
+
+# copy the dependencies for runtime
+RUN cp ${BUILDDIR}/depends/build/lib/lib* ${INSTLOC}/lib/ && \
+    # We copy both symlinks and its target if they are under the same
+    # directory.  If the symlink redirected to different directory, we
+    # dereference and only copy the target over.
+    cp -L /usr/lib/x86_64-linux-gnu/libcrypto.so ${INSTLOC}/lib/; \
+    cp /lib/x86_64-linux-gnu/libssl.so.1.0.0 ${INSTLOC}/lib/; \
+    ln -s libssl.so.1.0.0 ${INSTLOC}/lib/libssl.so; \
+    cp -L /usr/lib/x86_64-linux-gnu/libkrb5.so ${INSTLOC}/lib/; \
+    cp -L /usr/lib/x86_64-linux-gnu/libcom_err.so ${INSTLOC}/lib/; \
+    cp -L /usr/lib/x86_64-linux-gnu/libk5crypto.so ${INSTLOC}/lib/; \
+    cp -L /usr/lib/x86_64-linux-gnu/libkrb5support.so ${INSTLOC}/lib/; \
+    cp /usr/lib/x86_64-linux-gnu/liblber.so* ${INSTLOC}/lib/; \
+    cp /usr/lib/x86_64-linux-gnu/libldap_r*so* ${INSTLOC}/lib/; \
+    cp -L /usr/lib/x86_64-linux-gnu/libgssapi_krb5.so ${INSTLOC}/lib/; \
+    cp /usr/lib/x86_64-linux-gnu/libyaml*so* ${INSTLOC}/lib/; \
+    cp /usr/lib/jni/libsigar.so ${INSTLOC}/lib/;

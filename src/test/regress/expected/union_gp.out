@@ -1923,9 +1923,230 @@ ORDER BY a;
  5
 (4 rows)
 
+create table t1_ncols(a int, b int, c text, d date) distributed by (a);
+create table t2_ncols(a smallint, b bigint, c varchar(20), d date) distributed by (c, b)
+ partition by range (a) (start (0) end (8) every (4));
+NOTICE:  CREATE TABLE will create partition "t2_ncols_1_prt_1" for table "t2_ncols"
+NOTICE:  CREATE TABLE will create partition "t2_ncols_1_prt_2" for table "t2_ncols"
+create view v1_ncols(id, a, b, c, d) as select 1,* from t1_ncols union all select 2,* from t2_ncols;
+insert into t1_ncols values (1, 11, 'one', '2001-01-01');
+insert into t2_ncols values (2, 22, 'two', '2002-02-02');
+insert into t2_ncols values (4, 44, 'four','2004-04-04');
+select b from t1_ncols union all select a from t2_ncols;
+ b  
+----
+  4
+  2
+ 11
+(3 rows)
+
+select a+100, b, d from t1_ncols union select b, a+200, d from t2_ncols order by 1;
+ ?column? |  b  |     d      
+----------+-----+------------
+       22 | 202 | 02-02-2002
+       44 | 204 | 04-04-2004
+      101 |  11 | 01-01-2001
+(3 rows)
+
+select c, a from v1_ncols;
+  c   | a 
+------+---
+ one  | 1
+ four | 4
+ two  | 2
+(3 rows)
+
+with cte1(aa, b, c, d) as (select a*100, b, c, d from t1_ncols union select * from t2_ncols)
+select x.aa/100 aaa, x.c, y.c from cte1 x join cte1 y on x.aa=y.aa;
+ aaa |  c   |  c   
+-----+------+------
+   0 | two  | two
+   0 | four | four
+   1 | one  | one
+(3 rows)
+
+-- Test that we push quals into UNION sub-selects only when it's safe
+explain
+SELECT * FROM
+  (SELECT 1 AS t, 2 AS x
+   UNION
+   SELECT 2 AS t, 4 AS x) ss
+WHERE x < 4;
+                         QUERY PLAN                         
+------------------------------------------------------------
+ Unique  (cost=0.05..0.07 rows=1 width=0)
+   Group By: "outer".t, "outer".x
+   ->  Sort  (cost=0.05..0.06 rows=1 width=0)
+         Sort Key (Distinct): "outer".t, "outer".x
+         ->  Append  (cost=0.00..0.04 rows=1 width=0)
+               ->  Result  (cost=0.00..0.01 rows=1 width=0)
+               ->  Result  (cost=0.00..0.01 rows=1 width=0)
+                     One-Time Filter: false
+ Settings:  optimizer=off
+ Optimizer status: legacy query optimizer
+(10 rows)
+
+ SELECT * FROM
+  (SELECT 1 AS t, 2 AS x
+   UNION
+   SELECT 2 AS t, 4 AS x) ss
+WHERE x < 4;
+ t | x 
+---+---
+ 1 | 2
+(1 row)
+
+explain
+SELECT * FROM
+  (SELECT 1 AS t, generate_series(1,10) AS x
+   UNION
+   SELECT 2 AS t, 4 AS x) ss
+WHERE x < 4
+ORDER BY x;
+                                  QUERY PLAN                                  
+------------------------------------------------------------------------------
+ Sort  (cost=0.10..0.11 rows=1 width=8)
+   Sort Key: ss.x
+   ->  Subquery Scan ss  (cost=0.05..0.09 rows=1 width=8)
+         Filter: ss.x < 4
+         ->  Unique  (cost=0.05..0.07 rows=1 width=0)
+               Group By: "outer".t, (generate_series(1, 10))
+               ->  Sort  (cost=0.05..0.06 rows=1 width=0)
+                     Sort Key (Distinct): "outer".t, (generate_series(1, 10))
+                     ->  Append  (cost=0.00..0.04 rows=1 width=0)
+                           ->  Result  (cost=0.00..0.01 rows=1 width=0)
+                           ->  Result  (cost=0.00..0.01 rows=1 width=0)
+ Settings:  optimizer=off
+ Optimizer status: legacy query optimizer
+(13 rows)
+
+SELECT * FROM
+  (SELECT 1 AS t, generate_series(1,10) AS x
+   UNION
+   SELECT 2 AS t, 4 AS x) ss
+WHERE x < 4
+ORDER BY x;
+ t | x 
+---+---
+ 1 | 1
+ 1 | 2
+ 1 | 3
+(3 rows)
+
+explain
+SELECT * FROM
+  (SELECT 1 AS t, (random()*3)::int AS x
+   UNION
+   SELECT 2 AS t, 4 AS x) ss
+WHERE x > 3;
+                                     QUERY PLAN                                      
+-------------------------------------------------------------------------------------
+ Subquery Scan ss  (cost=0.07..0.11 rows=1 width=8)
+   Filter: ss.x > 3
+   ->  Unique  (cost=0.07..0.08 rows=1 width=0)
+         Group By: "outer".t, (($0 * 3::double precision)::integer)
+         ->  Sort  (cost=0.07..0.07 rows=1 width=0)
+               Sort Key (Distinct): "outer".t, (($0 * 3::double precision)::integer)
+               ->  Append  (cost=0.01..0.06 rows=1 width=0)
+                     ->  Result  (cost=0.01..0.03 rows=1 width=0)
+                           InitPlan
+                             ->  Result  (cost=0.00..0.01 rows=1 width=0)
+                     ->  Result  (cost=0.00..0.01 rows=1 width=0)
+ Settings:  optimizer=off
+ Optimizer status: legacy query optimizer
+(13 rows)
+
+SELECT * FROM
+  (SELECT 1 AS t, (random()*3)::int AS x
+   UNION
+   SELECT 2 AS t, 4 AS x) ss
+WHERE x > 3;
+ t | x 
+---+---
+ 2 | 4
+(1 row)
+
+CREATE TABLE foo_union (a int, b int);
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column named 'a' as the Greenplum Database data distribution key for this table.
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
+CREATE TABLE bar_union (c int, d int);
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column named 'c' as the Greenplum Database data distribution key for this table.
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
+INSERT INTO foo_union VALUES (1,1), (5,5);
+INSERT INTO bar_union VALUES (5,5), (2,2);
+EXPLAIN SELECT *
+from
+    (
+    SELECT 1 AS ss
+    UNION
+    SELECT DISTINCT
+        (
+           SELECT bar_union.c FROM bar_union WHERE bar_union.c = foo_union.b 
+        ) AS ss
+        FROM foo_union
+) ABC
+where ABC.ss = 5;
+                                                                             QUERY PLAN                                                                              
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice5; segments: 3)  (cost=10.32..10.38 rows=1 width=4)
+   ->  Subquery Scan abc  (cost=10.32..10.38 rows=1 width=4)
+         Filter: abc.ss = 5
+         ->  Unique  (cost=10.32..10.34 rows=1 width=3)
+               Group By: "outer".ss
+               ->  Sort  (cost=10.32..10.33 rows=1 width=3)
+                     Sort Key (Distinct): "outer".ss
+                     ->  Redistribute Motion 3:3  (slice4; segments: 3)  (cost=0.00..10.30 rows=1 width=3)
+                           Hash Key: "outer".ss
+                           ->  Append  (cost=0.00..10.30 rows=1 width=3)
+                                 ->  Redistribute Motion 1:3  (slice1; segments: 1)  (cost=0.00..0.02 rows=1 width=0)
+                                       Hash Key: "outer".ss
+                                       ->  Result  (cost=0.00..0.01 rows=1 width=0)
+                                 ->  GroupAggregate  (cost=10.21..10.26 rows=1 width=4)
+                                       Group By: ((subplan))
+                                       ->  Sort  (cost=10.21..10.21 rows=1 width=4)
+                                             Sort Key: ((subplan))
+                                             ->  Redistribute Motion 3:3  (slice3; segments: 3)  (cost=6.08..10.20 rows=1 width=4)
+                                                   Hash Key: ((subplan))
+                                                   ->  GroupAggregate  (cost=6.08..10.16 rows=1 width=4)
+                                                         Group By: ((subplan))
+                                                         ->  Sort  (cost=6.08..6.08 rows=1 width=4)
+                                                               Sort Key: ((subplan))
+                                                               ->  Seq Scan on foo_union  (cost=0.00..6.07 rows=1 width=4)
+                                                                     SubPlan 1
+                                                                       ->  Result  (cost=2.03..2.04 rows=1 width=4)
+                                                                             Filter: bar_union.c = $0
+                                                                             ->  Materialize  (cost=2.03..2.04 rows=1 width=4)
+                                                                                   ->  Broadcast Motion 3:3  (slice2; segments: 3)  (cost=0.00..2.02 rows=1 width=4)
+                                                                                         ->  Seq Scan on bar_union  (cost=0.00..2.02 rows=1 width=4)
+ Settings:  optimizer=off
+ Optimizer status: legacy query optimizer
+(32 rows)
+
+SELECT *
+from
+    (
+    SELECT 1 AS ss
+    UNION
+    SELECT DISTINCT
+        (
+           SELECT bar_union.c FROM bar_union WHERE bar_union.c = foo_union.b 
+        ) AS ss
+        FROM foo_union
+) ABC
+where ABC.ss = 5;
+ ss 
+----
+  5
+(1 row)
+
 --
 -- Clean up
 --
 DROP TABLE IF EXISTS T_a1 CASCADE;
 DROP TABLE IF EXISTS T_b2 CASCADE;
 DROP TABLE IF EXISTS T_random CASCADE;
+DROP VIEW IF EXISTS v1_ncols CASCADE;
+DROP TABLE IF EXISTS t1_ncols CASCADE;
+DROP TABLE IF EXISTS t2_ncols CASCADE;
+DROP TABLE IF EXISTS foo_union;
+DROP TABLE IF EXISTS bar_union;

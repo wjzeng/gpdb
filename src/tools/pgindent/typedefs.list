@@ -327,6 +327,8 @@ bool_t
 BoolTestType
 BooleanTest
 BpChar
+BtreeCheckState
+BtreeLevel
 Bucket
 BufFile
 BufFlags

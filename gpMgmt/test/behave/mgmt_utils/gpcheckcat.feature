@@ -13,6 +13,17 @@ Feature: gpcheckcat tests
         Then gpcheckcat should return a return code of 0
         And the user runs "dropdb all_good"
 
+    Scenario: gpcheckcat should report vpinfo inconsistent error 
+        Given database "vpinfo_inconsistent_db" is dropped and recreated
+        And there is a "co" table "public.co_vpinfo" in "vpinfo_inconsistent_db" with data
+        When the user runs "gpcheckcat vpinfo_inconsistent_db"
+        Then gpcheckcat should return a return code of 0
+        When an attribute of table "co_vpinfo" in database "vpinfo_inconsistent_db" is deleted on segment with content id "0"
+        Then psql should return a return code of 0
+        When the user runs "gpcheckcat -R aoseg_table vpinfo_inconsistent_db" 
+        Then gpcheckcat should print "Failed test\(s\) that are not reported here: aoseg_table" to stdout
+        And the user runs "dropdb vpinfo_inconsistent_db"
+
     @leak
     Scenario: gpcheckcat should drop leaked schemas
         Given database "leak_db" is dropped and recreated
@@ -46,6 +57,14 @@ Feature: gpcheckcat tests
         Then gpcheckcat should return a return code of 3
         And gpcheckcat should print "Table pg_compression has a violated unique index: pg_compression_compname_index" to stdout
         And the user runs "dropdb unique_index_db"
+
+    @persistent_filesystem
+    Scenario: gpcheckcat should report filesystem persistence errors.
+        Given database "persistent_filesystem_db" is dropped and recreated
+		And the user runs "psql -t -c "select fselocation || '/base/' || pg_database.oid || '/123456789.2' from pg_catalog.pg_filespace_entry, pg_database where fsedbid = 1 and datname = 'persistent_filesystem_db'" postgres | xargs touch"
+        When the user runs "gpcheckcat -R persistent persistent_filesystem_db"
+        Then gpcheckcat should print "Failed test\(s\) that are not reported here: persistent" to stdout
+        And the user runs "dropdb persistent_filesystem_db"
 
     @miss_attr_table
     Scenario Outline: gpcheckcat should discover missing attributes for tables

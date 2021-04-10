@@ -34,6 +34,7 @@
 #include "utils/syscache.h"
 
 #include "cdb/cdbdisp_query.h"
+#include "cdb/cdbsreh.h"
 #include "cdb/cdbsrlz.h"
 #include "cdb/cdbvars.h"
 
@@ -70,7 +71,7 @@ CreateSchemaCommand(CreateSchemaStmt *stmt, const char *queryString)
 	{
 		Assert(Gp_role == GP_ROLE_EXECUTE);
 
-		Assert(stmt->schemaname == InvalidOid);
+		Assert(stmt->schemaname == NULL);
 		Assert(stmt->authid == NULL);
 		Assert(stmt->schemaElts == NIL);
 
@@ -313,6 +314,11 @@ RemoveSchemaById(Oid schemaOid)
 	ReleaseSysCache(tup);
 
 	heap_close(relation, RowExclusiveLock);
+
+	/*
+	 * Remove all persistent error logs belonging to the the schema.
+	 */
+	PersistentErrorLogDelete(MyDatabaseId, schemaOid, NULL);
 }
 
 /*

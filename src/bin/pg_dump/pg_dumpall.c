@@ -606,7 +606,7 @@ help(void)
 /*
  * Build the WITH clause for resource queue dump
  */
-static void 
+static void
 buildWithClause(const char *resname, const char *ressetting, PQExpBuffer buf)
 {
 	if (0 == strncmp("memory_limit", resname, 12) && (strncmp(ressetting, "-1", 2) != 0))
@@ -723,7 +723,7 @@ dumpResGroups(PGconn *conn)
 		{
 			const char *memory_auditor_name;
 			const char *cpu_prop;
-			const char cpu_setting[1024];
+			char cpu_setting[1024];
 
 			/*
 			 * Possible values of memory_auditor:
@@ -1218,7 +1218,7 @@ dumpRoleMembership(PGconn *conn)
 }
 
 /*
- * Dump role time constraints. 
+ * Dump role time constraints.
  *
  * Note: we expect dumpRoles already created all the roles, but there are
  * no time constraints yet.
@@ -1245,7 +1245,7 @@ dumpRoleConstraints(PGconn *conn)
 		char		*end_day 	= PQgetvalue(res, i, 3);
 		char 		*end_time 	= PQgetvalue(res, i, 4);
 
-		fprintf(OPF, "ALTER ROLE %s DENY BETWEEN DAY %s TIME '%s' AND DAY %s TIME '%s';\n", 
+		fprintf(OPF, "ALTER ROLE %s DENY BETWEEN DAY %s TIME '%s' AND DAY %s TIME '%s';\n",
 				fmtId(rolname), start_day, start_time, end_day, end_time);
 	}
 
@@ -1380,7 +1380,7 @@ dumpTablespaces(PGconn *conn)
 	 * --gp-syntax or --no-gp-syntax.
 	 */
 	if (server_version < 80214)
-	{							
+	{
 		/* Filespaces were introduced in GP 4.0 (server_version 8.2.14) */
 		return;
 	}

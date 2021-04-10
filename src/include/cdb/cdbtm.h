@@ -264,7 +264,7 @@ typedef struct TmControlBlock
 
 
 #define TMCONTROLBLOCK_BYTES(num_gxacts) \
-	(offsetof(TmControlBlock, gxact_array) + sizeof(TMGXACT) * (num_gxacts))
+	(offsetof(TmControlBlock, gxact_array) + sizeof(TMGXACT *) * (num_gxacts))
 
 extern DtxContext DistributedTransactionContext;
 
@@ -316,7 +316,7 @@ extern int	tmShmemSize(void);
 extern void initTM(void);
 
 extern void getDtxCheckPointInfoAndLock(char **result, int *result_size);
-extern void freeDtxCheckPointInfoAndUnlock(char *info, int info_size, XLogRecPtr *recptr);
+extern void freeDtxCheckPointInfoAndUnlock(XLogRecPtr *recptr);
 
 extern void verify_shared_snapshot_ready(void);
 
@@ -343,5 +343,6 @@ extern void UtilityModeFindOrCreateDtmRedoFile(void);
 extern void UtilityModeCloseDtmRedoFile(void);
 
 extern bool doDispatchSubtransactionInternalCmd(DtxProtocolCommand cmdType);
+extern bool canSuperuserPerformRecovery(bool hasExpirationDate, TimestampTz expirationDate);
 
 #endif   /* CDBTM_H */

@@ -17,12 +17,11 @@
 #define GPDXL_CMappingColIdVarPlStmt_H
 
 #include "gpos/base.h"
-#include "gpos/common/CHashMap.h"
 #include "gpos/common/CDynamicPtrArray.h"
+#include "gpos/common/CHashMap.h"
 
-
-#include "gpopt/translate/CMappingColIdVar.h"
 #include "gpopt/translate/CDXLTranslateContext.h"
+#include "gpopt/translate/CMappingColIdVar.h"
 
 //fwd decl
 struct Var;
@@ -30,61 +29,55 @@ struct Plan;
 
 namespace gpdxl
 {
+// fwd decl
+class CDXLTranslateContextBaseTable;
+class CContextDXLToPlStmt;
 
-	// fwd decl
-	class CDXLTranslateContextBaseTable;
-	class CContextDXLToPlStmt;
+//---------------------------------------------------------------------------
+//	@class:
+//		CMappingColIdVarPlStmt
+//
+//	@doc:
+//	Class defining functions that provide the mapping between Var, Param
+//	and variables of Sub-query to CDXLNode during Query->DXL translation
+//
+//---------------------------------------------------------------------------
+class CMappingColIdVarPlStmt : public CMappingColIdVar
+{
+private:
+	const CDXLTranslateContextBaseTable *m_base_table_context;
 
-	//---------------------------------------------------------------------------
-	//	@class:
-	//		CMappingColIdVarPlStmt
-	//
-	//	@doc:
-	//	Class defining functions that provide the mapping between Var, Param
-	//	and variables of Sub-query to CDXLNode during Query->DXL translation
-	//
-	//---------------------------------------------------------------------------
-	class CMappingColIdVarPlStmt : public CMappingColIdVar
-	{
-		private:
+	// the array of translator context (one for each child of the DXL operator)
+	CDXLTranslationContextArray *m_child_contexts;
 
-			const CDXLTranslateContextBaseTable *m_base_table_context;
+	CDXLTranslateContext *m_output_context;
 
-			// the array of translator context (one for each child of the DXL operator)
-			CDXLTranslationContextArray *m_child_contexts;
+	// translator context used to translate initplan and subplans associated
+	// with a param node
+	CContextDXLToPlStmt *m_dxl_to_plstmt_context;
 
-			CDXLTranslateContext *m_output_context;
+public:
+	CMappingColIdVarPlStmt(
+		CMemoryPool *mp,
+		const CDXLTranslateContextBaseTable *base_table_context,
+		CDXLTranslationContextArray *child_contexts,
+		CDXLTranslateContext *output_context,
+		CContextDXLToPlStmt *dxl_to_plstmt_context);
 
-			// translator context used to translate initplan and subplans associated
-			// with a param node
-			CContextDXLToPlStmt *m_dxl_to_plstmt_context;
+	// translate DXL ScalarIdent node into GPDB Var node
+	virtual Var *VarFromDXLNodeScId(const CDXLScalarIdent *dxlop);
 
-		public:
+	// translate DXL ScalarIdent node into GPDB Param node
+	Param *ParamFromDXLNodeScId(const CDXLScalarIdent *dxlop);
 
-			CMappingColIdVarPlStmt
-				(
-				IMemoryPool *mp,
-				const CDXLTranslateContextBaseTable *base_table_context,
-				CDXLTranslationContextArray *child_contexts,
-				CDXLTranslateContext *output_context,
-				CContextDXLToPlStmt *dxl_to_plstmt_context
-				);
+	// get the output translator context
+	CDXLTranslateContext *GetOutputContext();
 
-			// translate DXL ScalarIdent node into GPDB Var node
-			virtual
-			Var *VarFromDXLNodeScId(const CDXLScalarIdent *dxlop);
+	// return the context of the DXL->PlStmt translation
+	CContextDXLToPlStmt *GetDXLToPlStmtContext();
+};
+}  // namespace gpdxl
 
-			// translate DXL ScalarIdent node into GPDB Param node
-			Param *ParamFromDXLNodeScId(const CDXLScalarIdent *dxlop);
-
-			// get the output translator context
-			CDXLTranslateContext *GetOutputContext();
-
-			// return the context of the DXL->PlStmt translation
-			CContextDXLToPlStmt *GetDXLToPlStmtContext();
-	};
-}
-
-#endif // GPDXL_CMappingColIdVarPlStmt_H
+#endif	// GPDXL_CMappingColIdVarPlStmt_H
 
 // EOF

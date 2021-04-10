@@ -310,6 +310,9 @@ SwitchGroupLeader(int newLeaderIndex)
 	BackoffBackendSharedEntry *oldLeaderEntry = NULL;
 	BackoffBackendSharedEntry *newLeaderEntry = NULL;
 
+	if (backoffSingleton->sweeperInProgress == true)
+		return;
+
 	Assert(newLeaderIndex < myEntry->groupLeaderIndex);
 	Assert(newLeaderIndex >= 0 && newLeaderIndex < backoffSingleton->numEntries);
 
@@ -365,6 +368,9 @@ findBetterGroupLeader()
 
 	Assert(myEntry);
 	leadersLeaderIndex = leaderEntry->groupLeaderIndex;
+
+	if (backoffSingleton->sweeperInProgress == true)
+		return;
 
 	/* If my leader has a different leader, then jump pointer */
 	if (myEntry->groupLeaderIndex != leadersLeaderIndex)
@@ -835,6 +841,7 @@ BackoffSweeper()
 																 * backend can get */
 
 		Assert(maxCPU > 0.0);
+		Assert(activeWeight > 0.0);
 
 		if (gp_debug_resqueue_priority)
 		{
@@ -858,19 +865,33 @@ BackoffSweeper()
 					double		targetCPU = 0.0;
 					const BackoffBackendSharedEntry *gl = getBackoffEntryRO(se->groupLeaderIndex);
 
-					Assert(gl->numFollowersActive > 0);
-
-					if (activeWeight <= 0.0) {
+					if (gl->numFollowersActive <= 0)
+					{
 						/*
-						 * If activeWeight <= 0.0, it should be considered unexpected
-						 * behavior. Error out here instead of risking an underflow.
+						 * There is a race condition here:
+						 * Backend A, B belong to the same statement. Backend A remains inactive
+						 * longer than gp_resqueue_priority_inactivity_timeout.
+						 * 
+						 * Timestamp1: backend A's leader is A, backend B's leader is B.
+						 *
+						 * Timestamp2: backend A's numFollowersActive remains zero due to timeout.
+						 *
+						 * Timestamp3: Sweeper calculates leader B's numFollowersActive to 1.
+						 *
+						 * Timestamp4: backend B changes it's leader to A.
+						 *
+						 * Backend process can change the backoff group leader without checking whether
+						 * the leader is an active backend due to performance consideration. This leads
+						 * to a backend could switch to an inactive leader whose numFollowersActive is
+						 * zero. Since backoff sweeper is not an accurate control, we could just skip
+						 * it in the current loop.
 						 */
-						elog(ERROR, "activeWeight underflow!");
+						backoffSingleton->sweeperInProgress = false;
+						elog(LOG, "numFollowersActive underflow!");
+						return;
 					}
 
-					Assert(activeWeight > 0.0);
 					Assert(se->weight > 0.0);
-
 					targetCPU = (CPUAvailable) * (se->weight) / activeWeight / gl->numFollowersActive;
 
 					/**
@@ -887,6 +908,32 @@ BackoffSweeper()
 
 						CPUAvailable -= maxCPU;
 						found = true;
+					}
+
+					if (activeWeight <= 0.0)
+					{
+						/*
+						 * There is a race condition here:
+						 * Backend A,B,C belong to the same statement and have weight of
+						 * 100000.
+						 *
+						 * Timestamp1: backend A's leader is A, backend B's leader is B
+						 * backend C's leader is also B.
+						 *
+						 * Timestamp2: Sweeper calculates the activeWeight to 200000.
+						 *
+						 * Timestamp3: backend B changes it's leader to A.
+						 *
+						 * Timestamp4: Sweeper try to find the backends who deserve maxCPU,
+						 * if backend A, B, C all deserve maxCPU, then activeWeight = 
+						 * 200000 - 100000/1 - 100000/1 - 100000/2 which is less than zero.
+						 *
+						 * We can stop sweeping for such race condition because current
+						 * backoff mechanism dose not ask for accurate control.
+						 */
+						backoffSingleton->sweeperInProgress = false;
+						elog(LOG, "activeWeight underflow!");
+						return;
 					}
 				}
 			}
@@ -912,8 +959,6 @@ BackoffSweeper()
 			{
 				const BackoffBackendSharedEntry *gl = getBackoffEntryRO(se->groupLeaderIndex);
 
-				Assert(activeWeight > 0.0);
-				Assert(gl->numFollowersActive > 0);
 				Assert(se->weight > 0.0);
 				se->targetUsage = (CPUAvailable) * (se->weight) / activeWeight / gl->numFollowersActive;
 			}

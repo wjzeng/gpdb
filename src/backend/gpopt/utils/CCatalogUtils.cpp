@@ -65,9 +65,11 @@ CCatalogUtils::GetFunctionOids()
 //		Return list of all oids_list from the catalog
 //
 //---------------------------------------------------------------------------
-List *CCatalogUtils::GetAllOids()
+List *
+CCatalogUtils::GetAllOids()
 {
-	return list_concat(list_concat(GetRelationOids(), GetOperatorOids()), GetFunctionOids());
+	return list_concat(list_concat(GetRelationOids(), GetOperatorOids()),
+					   GetFunctionOids());
 }
 
 // EOF

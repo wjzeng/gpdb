@@ -495,7 +495,7 @@ drop table atacc1;
 create table atacc1 (test int, test2 int, unique(test)) distributed by (test);
 NOTICE:  CREATE TABLE / UNIQUE will create implicit index "atacc1_test_key" for table "atacc1"
 alter table atacc1 add unique (test2);
-ERROR:  UNIQUE index must contain all columns in the distribution key of relation "atacc1"
+ERROR:  The existing distribution key of "atacc1" must be equal to or a left-subset of the UNIQUE index
 -- should fail for @@ second one @@
 insert into atacc1 (test2, test) values (3, 3);
 insert into atacc1 (test2, test) values (2, 3);

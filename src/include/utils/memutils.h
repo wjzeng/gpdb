@@ -39,10 +39,7 @@
  */
 #define MaxAllocSize	((Size) 0x3fffffff)		/* 1 gigabyte - 1 */
 
-static inline bool AllocSizeIsValid(Size sz)
-{
-        return (sz < MaxAllocSize);
-}
+#define AllocSizeIsValid(size)	((Size) (size) <= MaxAllocSize)
 
 /*
  * Multiple chunks can share a SharedChunkHeader if their shared information
@@ -182,6 +179,7 @@ extern PGDLLIMPORT MemoryContext TopTransactionContext;
 extern PGDLLIMPORT MemoryContext CurTransactionContext;
 extern PGDLLIMPORT MemoryContext MemoryAccountMemoryContext;
 extern PGDLLIMPORT MemoryContext MemoryAccountDebugContext;
+extern PGDLLIMPORT MemoryContext OptimizerMemoryContext;
 
 /* This is a transient link to the active portal's memory context: */
 extern PGDLLIMPORT MemoryContext PortalContext;

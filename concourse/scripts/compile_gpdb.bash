@@ -154,7 +154,6 @@ function _main() {
       ;;
     win32)
         export BLD_ARCH=win32
-        CONFIGURE_FLAGS="${CONFIGURE_FLAGS} --disable-pxf"
         ;;
     *)
         echo "only centos, sles and win32 are supported TARGET_OS'es"
@@ -166,6 +165,13 @@ function _main() {
   
   # Copy input ext dir; assuming ext doesnt exist
   mv gpAux_ext/ext ${GPDB_SRC_PATH}/gpAux
+
+  # Copy .ant dir
+  mv gphdfs_dist/.ant /root/
+  mkdir -p ${GPDB_SRC_PATH}/gpAux/extensions/gphdfs/dist
+  mv gphdfs_dist/dist/*.jar ${GPDB_SRC_PATH}/gpAux/extensions/gphdfs/dist/
+  mv gphdfs_dist/dist/*.tar ${GPDB_SRC_PATH}/gpAux/extensions/gphdfs/
+
 
   case "${TARGET_OS}" in
     sles) link_tools_for_sles ;;
@@ -197,10 +203,6 @@ function _main() {
       # Don't unit test when cross compiling. Tests don't build because they
       # require `./configure --with-zlib`.
       unittest_check_gpdb
-  fi
-  if [ "${EXTRACT_PXF}" == "true" ] ; then
-      # Bundle PXF server
-      tar -xzf pxf_tarball/pxf.tar.gz -C ${GREENPLUM_INSTALL_DIR}
   fi
   export_gpdb
   export_gpdb_extensions

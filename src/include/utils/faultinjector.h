@@ -232,8 +232,11 @@ typedef enum FaultInjectorIdentifier_e {
 	FinishPreparedAfterRecordCommitPrepared,
 
 	GangCreated,
+	FreeGangInitPlan,
 
 	ResGroupAssignedOnMaster,
+	Unassign_Resgroup_Start_Entrydb,
+	Unassign_Resgroup_End_QD,
 
 	BeforeReadCommand,
 
@@ -246,6 +249,10 @@ typedef enum FaultInjectorIdentifier_e {
 	CreateGangInProgress,
 
 	DecreaseToastMaxChunkSize,
+
+	DynamicIndexScanContextReset,
+
+	AbortAfterProcarrayEnd,
 
 	/* INSERT has to be done before that line */
 	FaultInjectorIdMax,

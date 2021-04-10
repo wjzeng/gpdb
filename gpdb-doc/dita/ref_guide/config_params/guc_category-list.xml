@@ -345,22 +345,33 @@
             <p>
               <xref href="guc-list.xml#optimizer_array_expansion_threshold" type="section"
                 >optimizer_array_expansion_threshold</xref></p>
+            <p><xref href="guc-list.xml#optimizer_control" type="section">optimizer_control</xref>
+            </p>
+            <p><xref href="guc-list.xml#optimizer_cost_model" type="section"
+                >optimizer_cost_model</xref>
+            </p>
             <p><xref href="guc-list.xml#optimizer_cte_inlining_bound" type="section"
                 >optimizer_cte_inlining_bound</xref>
             </p>
-            <p><xref href="guc-list.xml#optimizer_control" type="section">optimizer_control</xref>
+            <p><xref href="guc-list.xml#optimizer_dpe_stats" type="section"
+                >optimizer_dpe_stats</xref>
             </p>
-            <p><xref href="guc-list.xml#optimizer_enable_associativit" type="section"
+            <p><xref href="guc-list.xml#optimizer_enable_associativity" type="section"
                 >optimizer_enable_associativity</xref></p>
+            <p><xref href="guc-list.xml#optimizer_enable_dml" type="section"
+                >optimizer_enable_dml</xref>
+            </p>
             <p><xref href="guc-list.xml#optimizer_enable_master_only_queries" type="section"
                 >optimizer_enable_master_only_queries</xref></p>
+            <p><xref href="guc-list.xml#optimizer_force_agg_skew_avoidance" type="section"
+                >optimizer_force_agg_skew_avoidance</xref></p>
             <p><xref href="guc-list.xml#optimizer_force_multistage_agg" type="section"
                 >optimizer_force_multistage_agg</xref>
             </p>
-            <p><xref href="guc-list.xml#optimizer_force_three_stage_scalar_dqa" type="section"
-                >optimizer_force_three_stage_scalar_dqa</xref></p>
           </stentry>
           <stentry>
+            <p><xref href="guc-list.xml#optimizer_force_three_stage_scalar_dqa" type="section"
+                >optimizer_force_three_stage_scalar_dqa</xref></p>
             <p><xref href="guc-list.xml#optimizer_join_arity_for_associativity_commutativity"
                 type="section">optimizer_join_arity_for_associativity_commutativity</xref></p>
             <p><xref href="guc-list.xml#optimizer_join_order" format="dita" type="section"
@@ -375,6 +386,8 @@
             </p>
             <p><xref href="guc-list.xml#optimizer_parallel_union" type="section"
                 >optimizer_parallel_union</xref></p>
+            <p><xref href="guc-list.xml#optimizer_penalize_skew" type="section"
+                >optimizer_penalize_skew</xref></p>
             <p><xref href="guc-list.xml#optimizer_print_missing_stats" type="section"
                 >optimizer_print_missing_stats</xref>
             </p>
@@ -383,6 +396,8 @@
             </p>
             <p><xref href="guc-list.xml#optimizer_sort_factor" format="dita"
                 >optimizer_sort_factor</xref></p>
+            <p><xref href="guc-list.xml#optimizer_use_gpdb_allocators" format="dita"
+                >optimizer_use_gpdb_allocators</xref></p>
           </stentry>
         </strow>
       </simpletable>
@@ -395,10 +410,10 @@
     <topic id="topic22" xml:lang="en">
       <title>Legacy Query Optimizer Operator Control Parameters</title>
       <body>
-        <p>The following parameters control the types of plan operations the legacy query optimizer
-          can use. Enable or disable plan operations to force the legacy optimizer to choose a
-          different plan. This is useful for testing and comparing query performance using different
-          plan types.</p>
+        <p>The following parameters control the types of plan operations the Postgres Planner can
+          use. Enable or disable plan operations to force the Postgres Planner to choose a different
+          plan. This is useful for testing and comparing query performance using different plan
+          types.</p>
         <simpletable id="kh158625" frame="none">
           <strow>
             <stentry>
@@ -431,10 +446,6 @@
               </p>
               <p>
                 <xref href="guc-list.xml#enable_tidscan" type="section">enable_tidscan</xref>
-              </p>
-              <p>
-                <xref href="guc-list.xml#gp_enable_adaptive_nestloop" type="section"
-                  >gp_enable_adaptive_nestloop</xref>
               </p>
               <p>
                 <xref href="guc-list.xml#gp_enable_agg_distinct" type="section"
@@ -954,8 +965,8 @@
     <title id="kh171364">Runtime Statistics Collection Parameters</title>
     <body>
       <p>These parameters control the server statistics collection feature. When statistics
-        collection is enabled, you can access the statistics data using the <i>pg_stat</i> and
-          <i>pg_statio</i> family of system catalog views.</p>
+        collection is enabled, you can access the statistics data using the <i>pg_stat</i> family of
+        system catalog views.</p>
       <simpletable id="kh171301" frame="none">
         <strow>
           <stentry>
@@ -972,8 +983,7 @@
             </p>
             <p>
               <xref href="guc-list.xml#update_process_title" type="section"
-                >update_process_title</xref>
-            </p>
+                >update_process_title</xref></p>
           </stentry>
         </strow>
       </simpletable>
@@ -1244,6 +1254,9 @@
               <xref href="guc-list.xml#gp_resource_group_memory_limit" type="section"
                 >gp_resource_group_memory_limit</xref>
             </p><p>
+              <xref href="guc-list.xml#gp_resource_group_queuing_timeout" type="section"
+                >gp_resource_group_queuing_timeout</xref>
+            </p><p>
               <xref href="guc-list.xml#gp_resource_manager" type="section"
                 >gp_resource_manager</xref>
             </p></stentry>
@@ -1257,7 +1270,17 @@
                 >gp_vmem_protect_segworker_cache_limit</xref>
             </p>
             <p>
+              <xref href="guc-list.xml#max_statement_mem" type="section">max_statement_mem</xref>
+            </p>
+            <p>
               <xref href="guc-list.xml#memory_spill_ratio" type="section">memory_spill_ratio</xref>
+            </p>
+            <p>
+              <xref href="guc-list.xml#runaway_detector_activation_percent" type="section"
+                >runaway_detector_activation_percent</xref>
+            </p>
+            <p>
+              <xref href="guc-list.xml#statement_mem" type="section">statement_mem</xref>
             </p>
             <p><xref href="guc-list.xml#vmem_process_interrupt" type="section"
                 >vmem_process_interrupt</xref></p>
@@ -1463,15 +1486,19 @@
                 <xref href="guc-list.xml#gp_interconnect_queue_depth" type="section"
                   >gp_interconnect_queue_depth</xref>
               </p>
-            </stentry>
-            <stentry>
               <p>
                 <xref href="guc-list.xml#gp_interconnect_setup_timeout" type="section"
                   >gp_interconnect_setup_timeout</xref>
               </p>
+            </stentry>
+            <stentry>
               <p>
                 <xref href="guc-list.xml#gp_interconnect_snd_queue_depth" type="section"
                   >gp_interconnect_snd_queue_depth</xref>
+              </p>
+              <p>
+                <xref href="guc-list.xml#gp_interconnect_transmit_timeout" type="section"
+                  >gp_interconnect_transmit_timeout</xref>
               </p>
               <p>
                 <xref href="guc-list.xml#gp_interconnect_type" type="section"
@@ -1566,6 +1593,12 @@
                   >gp_max_local_distributed_cache</xref>
               </p>
             </stentry>
+            <stentry>
+              <p>
+                <xref href="guc-list.xml#dtx_phase2_retry_count" type="section"
+                  >dtx_phase2_retry_count</xref>
+              </p>
+            </stentry>
           </strow>
         </simpletable>
       </body>
@@ -1658,6 +1691,9 @@
         <strow>
           <stentry>
             <p>
+              <xref href="guc-list.xml#pgcrypto.fips"/>
+            </p>
+            <p>
               <xref href="guc-list.xml#pljava_classpath"/>
             </p>
             <p><xref href="guc-list.xml#pljava_classpath_insecure"/></p>
@@ -1674,22 +1710,24 @@
         </strow>
       </simpletable>
     </body>
-    <topic id="topic_t3n_qml_rz">
-      <title>XML Data Parameters</title>
-      <body>
-        <simpletable frame="none" id="simpletable_yyd_tml_rz">
-          <strow>
-            <stentry>
-              <p>
-                <xref href="guc-list.xml#xmlbinary">xmlbinary</xref>
-              </p>
-              <p>
-                <xref href="guc-list.xml#xmloption">xmloption</xref>
-              </p>
-            </stentry>
-          </strow>
-        </simpletable>
-      </body>
-    </topic>
+  </topic>
+  <topic id="topic_t3n_qml_rz">
+    <title>XML Data Parameters</title>
+    <body>
+      <p>The parameters in this topic control the configuration of the Greenplum Database XML data
+        type. </p>
+      <simpletable frame="none" id="simpletable_yyd_tml_rz">
+        <strow>
+          <stentry>
+            <p>
+              <xref href="guc-list.xml#xmlbinary">xmlbinary</xref>
+            </p>
+            <p>
+              <xref href="guc-list.xml#xmloption">xmloption</xref>
+            </p>
+          </stentry>
+        </strow>
+      </simpletable>
+    </body>
   </topic>
 </topic>

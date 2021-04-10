@@ -1,0 +1,21 @@
+FROM ubuntu_ent_build:16.04_dist
+
+ENV GPDB_DIR=/tmp/gpdb_src
+
+WORKDIR /tmp
+RUN gpdb_src/concourse/scripts/setup_gpadmin_user.bash
+RUN chown gpadmin:gpadmin ${GPDB_DIR} && \
+    chown -R gpadmin:gpadmin ${GPDB_DIR}/gpAux
+
+CMD /usr/sbin/sshd; \
+    su --login gpadmin -c "\
+    . /usr/local/greenplum-db-devel/greenplum_path.sh; \
+    cd ${GPDB_DIR}/gpAux/gpdemo; \
+    make cluster; \
+    . ${GPDB_DIR}/gpAux/gpdemo/gpdemo-env.sh; \
+    createdb; \
+    psql -c 'CREATE TABLE T1 (c1 varchar ENCODING (compresstype=quicklz, blocksize=65536)) WITH (appendonly=true, orientation=column)'; \
+    psql -c 'INSERT INTO T1 SELECT i FROM generate_series(1, 1000) i'; \
+    psql -c '\d+ T1'; \
+    psql -c 'SELECT xmlcomment(c1) from T1 limit 1'; \
+    "

@@ -38,7 +38,6 @@
 #undef small                    /*  but I want it for a variable name */
 #endif
 
-
 /*
  * cdbpath_cost_motion
  *    Fills in the cost estimate fields in a MotionPath node.
@@ -322,6 +321,13 @@ cdbpath_match_preds_to_partkey_tail(CdbpathMatchPredsContext *ctx,
 	 * so the caller can join T and U by redistributing only U.
 	 * (Note that "T.D = <constant expr>" won't be in the mergeclause_list
 	 * because it isn't a join pred.)
+	 *
+	 * In gpdb5, items in an EC may have different cdbhash values,
+	 * which means their distributed keys may be different as well.
+	 * For example, in T.D = <constant expr>, if T.D is float4, while
+	 * <constant expr> is float8. Even if they are both 1.0, we could not
+	 * consider they could be distributed on the same segment after motion.
+	 * So isGreenplumDbPathkeyDistCompatible() is added to fix this issue.
 	 *----------------
 	 */
 	copathkey = NULL;
@@ -330,7 +336,12 @@ cdbpath_match_preds_to_partkey_tail(CdbpathMatchPredsContext *ctx,
 	{
 		PathKey    *pathkey = (PathKey *) lfirst(partkeycell);
 
-		if (CdbPathkeyEqualsConstant(pathkey))
+		/*
+		 * In gpdb5 items in an EC may have different cdbhash values,
+		 * which means their distributed key may be different.
+		 *
+		 */
+		if (CdbPathkeyEqualsConstant(pathkey) && isGreenplumDbPathkeyDistCompatible(pathkey))
 			copathkey = pathkey;
 	}
 	else if (ctx->locus.locustype == CdbLocusType_HashedOJ)
@@ -342,7 +353,7 @@ cdbpath_match_preds_to_partkey_tail(CdbpathMatchPredsContext *ctx,
 		{
 			PathKey    *pathkey = (PathKey *) lfirst(cell);
 
-			if (CdbPathkeyEqualsConstant(pathkey))
+			if (CdbPathkeyEqualsConstant(pathkey) && isGreenplumDbPathkeyDistCompatible(pathkey))
 			{
 				copathkey = pathkey;
 				break;
@@ -362,7 +373,7 @@ cdbpath_match_preds_to_partkey_tail(CdbpathMatchPredsContext *ctx,
 			RestrictInfo *rinfo = (RestrictInfo *) lfirst(rcell);
 
 			if (!rinfo->left_ec)
-				cache_mergeclause_eclasses(ctx->root, rinfo);
+				update_mergeclause_eclasses(ctx->root, rinfo);
 
 			if (bms_is_subset(rinfo->right_relids, ctx->path->parent->relids))
 			{
@@ -535,7 +546,7 @@ cdbpath_match_preds_to_both_partkeys(PlannerInfo   *root,
             RestrictInfo   *rinfo = (RestrictInfo *)lfirst(rcell);
 
             if (!rinfo->left_ec)
-                cache_mergeclause_eclasses(root, rinfo);
+                update_mergeclause_eclasses(root, rinfo);
 
             /* Skip predicate if neither side matches outer partkey item. */
             if (CdbPathLocus_IsHashed(outer_locus))
@@ -652,7 +663,7 @@ cdbpath_partkeys_from_preds(PlannerInfo    *root,
 
         if (!rinfo->left_ec)
         {
-            cache_mergeclause_eclasses(root, rinfo);
+            update_mergeclause_eclasses(root, rinfo);
             Assert(rinfo->left_ec);
         }
 
@@ -994,7 +1005,7 @@ cdbpath_motion_for_join(PlannerInfo    *root,
      */
     else if (cdbpath_match_preds_to_both_partkeys(root, redistribution_clauses,
                                                   outer.locus, inner.locus))
-        return cdbpathlocus_join(outer.locus, inner.locus);
+        return cdbpathlocus_join(jointype, outer.locus, inner.locus);
 
     /*
      * Kludge used internally for querying catalogs on segment dbs.
@@ -1116,7 +1127,7 @@ cdbpath_motion_for_join(PlannerInfo    *root,
     *p_inner_path = inner.path;
 
     /* Tell caller where the join will be done. */
-    return cdbpathlocus_join(outer.path->locus, inner.path->locus);
+    return cdbpathlocus_join(jointype, outer.path->locus, inner.path->locus);
 
 fail:                           /* can't do this join */
     CdbPathLocus_MakeNull(&outer.move_to);

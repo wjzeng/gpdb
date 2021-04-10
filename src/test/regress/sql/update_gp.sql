@@ -71,7 +71,7 @@ CREATE TABLE keo4 ( keo_para_required_period character varying(6), keo_para_budg
 INSERT INTO keo4 VALUES ('1', '1');
 -- Explicit Redistribution motion should be added in case of GPDB Planner (test case not applicable for ORCA)
 EXPLAIN UPDATE keo1 SET user_vie_act_cntr_marg_cum = 234.682 FROM
-    ( SELECT a.user_vie_project_code_pk FROM keo1 a INNER JOIN keo2 b 
+    ( SELECT a.user_vie_project_code_pk FROM keo1 a INNER JOIN keo2 b
         ON b.projects_pk=a.user_vie_project_code_pk
         WHERE a.user_vie_fiscal_year_period_sk =
           (SELECT MAX (sky_per) FROM keo3 WHERE bky_per =
@@ -80,7 +80,7 @@ EXPLAIN UPDATE keo1 SET user_vie_act_cntr_marg_cum = 234.682 FROM
     ) t1
 WHERE t1.user_vie_project_code_pk = keo1.user_vie_project_code_pk;
 UPDATE keo1 SET user_vie_act_cntr_marg_cum = 234.682 FROM
-    ( SELECT a.user_vie_project_code_pk FROM keo1 a INNER JOIN keo2 b 
+    ( SELECT a.user_vie_project_code_pk FROM keo1 a INNER JOIN keo2 b
         ON b.projects_pk=a.user_vie_project_code_pk
         WHERE a.user_vie_fiscal_year_period_sk =
           (SELECT MAX (sky_per) FROM keo3 WHERE bky_per =
@@ -98,8 +98,42 @@ DELETE FROM keo5 WHERE x IN (SELECT x FROM keo5 WHERE EXISTS (SELECT x FROM keo5
 SELECT x FROM keo5;
 
 RESET gp_autostats_mode;
+
+CREATE TABLE update_gp_foo (
+    a_dist int,
+    b int,
+    c_part int,
+    d int
+)
+WITH (appendonly=false) DISTRIBUTED BY (a_dist) PARTITION BY RANGE(c_part)
+          (
+          PARTITION p20190305 START (1) END (2) WITH (tablename='update_gp_foo_1_prt_p20190305', appendonly=false)
+          );
+
+CREATE TABLE update_gp_foo1 (
+        a_dist int,
+        b int,
+        c_part int,
+        d int
+)
+WITH (appendonly=false) DISTRIBUTED BY (a_dist) PARTITION BY RANGE(c_part)
+          (
+          PARTITION p20190305 START (1) END (2) WITH (tablename='update_gp_foo1_1_prt_p20190305', appendonly=false)
+          );
+
+INSERT INTO update_gp_foo VALUES (12, 40, 1, 50);
+INSERT INTO update_gp_foo1 VALUES (12, 3, 1, 50);
+
+UPDATE update_gp_foo
+SET    b = update_gp_foo.c_part,
+       d = update_gp_foo1.a_dist
+FROM   update_gp_foo1; 
+
+SELECT * FROM update_gp_foo;
 DROP TABLE keo1;
 DROP TABLE keo2;
 DROP TABLE keo3;
 DROP TABLE keo4;
 DROP TABLE keo5;
+DROP TABLE update_gp_foo;
+DROP TABLE update_gp_foo1;

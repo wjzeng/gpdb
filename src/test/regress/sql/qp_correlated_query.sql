@@ -131,6 +131,8 @@ select A.i, B.i, C.j from A, B, C where A.j = (select C.j from C where C.j = A.j
 explain select A.j from A, B, C where A.j = (select C.j from C where C.j = A.j and C.i not in (select B.i from B where C.i = B.i and B.i !=10)) order by A.j limit 10;
 select A.j from A, B, C where A.j = (select C.j from C where C.j = A.j and C.i not in (select B.i from B where C.i = B.i and B.i !=10)) order by A.j limit 10;
 
+explain select A.i from A where A.j = (select C.j from C where C.j = A.j and C.i = any (select B.i from B where C.i = B.i and B.i !=10));
+select A.i from A where A.j = (select C.j from C where C.j = A.j and C.i = any (select B.i from B where C.i = B.i and B.i !=10));
 
 
 -- ----------------------------------------------------------------------
@@ -864,6 +866,40 @@ SELECT * FROM qp_non_eq_a, qp_non_eq_b WHERE qp_non_eq_a.i = qp_non_eq_b.i AND q
 
 EXPLAIN SELECT * FROM qp_non_eq_a, qp_non_eq_b WHERE qp_non_eq_a.i = qp_non_eq_b.i AND qp_non_eq_a.i = ANY('{1,2,3}'::numeric[]);
 SELECT * FROM qp_non_eq_a, qp_non_eq_b WHERE qp_non_eq_a.i = qp_non_eq_b.i AND qp_non_eq_a.i = ANY('{1,2,3}'::numeric[]);
+
+-- ----------------------------------------------------------------------
+-- Test: Various single & skip-level correlated subqueries
+-- ----------------------------------------------------------------------
+DROP TABLE IF EXISTS t1;
+DROP TABLE IF EXISTS supplier;
+create table t1(a int, b int);
+create table supplier(city text);
+insert into t1 values (1, 1), (2, 2), (3, 3);
+insert into supplier values ('a'),('b'),('c'),('d'),('e');
+analyze t1;
+analyze supplier;
+
+set optimizer_enforce_subplans = 1;
+
+-- with TVF
+explain select x1.a, (select count(*) from generate_series(1, x1.a)) from t1 x1;
+select x1.a, (select count(*) from generate_series(1, x1.a)) from t1 x1;
+
+-- with limit
+explain select t1.a, (select count(*) c from (select city from supplier limit t1.a) x) from t1;
+select t1.a, (select count(*) c from (select city from supplier limit t1.a) x) from t1;
+
+-- with nested join
+explain select t1.*, (select count(*) as ct from generate_series(1, a), t1) from t1;
+select t1.*, (select count(*) as ct from generate_series(1, a), t1) from t1;
+
+explain select * from t1 where 0 < (select count(*) from generate_series(1, a), t1);
+select * from t1 where 0 < (select count(*) from generate_series(1, a), t1);
+
+reset optimizer_enforce_subplans;
+
+DROP TABLE IF EXISTS t1;
+DROP TABLE IF EXISTS supplier;
 
 -- ----------------------------------------------------------------------
 -- Test: teardown.sql

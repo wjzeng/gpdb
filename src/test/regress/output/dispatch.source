@@ -10,6 +10,38 @@ CREATE EXTENSION IF NOT EXISTS gp_inject_fault;
 -- s/^DETAIL:  Internal error: No motion listener port \(seg\d.*:.*\)/DETAIL:  Internal error: No motion listener port/
 -- end_matchsubs
 -- Test quoting of GUC values and database names when they're sent to segments
+-- set_config() used to have quoting problems as well when dispatching to
+-- segments.
+DROP TABLE IF EXISTS should_be_visible;
+NOTICE:  table "should_be_visible" does not exist, skipping
+CREATE TABLE should_be_visible();
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause, and no column type is suitable for a distribution key. Creating a NULL policy entry.
+CREATE TABLE distribute_table_oid_to_all_segs (distribution_key INT, tbl OID) DISTRIBUTED RANDOMLY;
+INSERT INTO distribute_table_oid_to_all_segs SELECT *, 'public.should_be_visible'::regclass FROM generate_series(1, 10);
+-- Spin up any gangs necessary to handle the SELECT DISTINCT so that they
+-- receive the new search_path setting from the set_config() dispatch.
+SELECT DISTINCT pg_catalog.pg_table_is_visible(tbl) FROM distribute_table_oid_to_all_segs;
+ pg_table_is_visible 
+---------------------
+ t
+(1 row)
+
+-- Now change search_path. This setting should not affect the visibility of the
+-- public schema if it's dispatched correctly.
+SELECT set_config('search_path', 'pg_catalog,public', false);
+    set_config     
+-------------------
+ pg_catalog,public
+(1 row)
+
+-- Check that our test table is still visible.
+SELECT DISTINCT pg_catalog.pg_table_is_visible(tbl) FROM distribute_table_oid_to_all_segs;
+ pg_table_is_visible 
+---------------------
+ t
+(1 row)
+
+RESET search_path;
 -- There used to be a bug in the quoting when the search_path setting was sent
 -- to the segment. It was not easily visible when search_path was set with a
 -- SET command, only when the setting was sent as part of the startup packet.
@@ -210,7 +242,7 @@ select cleanupAllGangs();
 select * from dispatch_test_t1, dispatch_test_t2, dispatch_test_t3
 where dispatch_test_t1.c2 = dispatch_test_t2.c2 and dispatch_test_t2.c3 = dispatch_test_t3.c3;
 ERROR:  failed to acquire resources on one or more segments
-DETAIL:  segments is in recovery mode
+DETAIL:  segment(s) are in recovery mode
 set gp_gang_creation_retry_count to 10;
 -- should success and process_startup_packet will be invalid after this query
 select * from dispatch_test_t1, dispatch_test_t2, dispatch_test_t3
@@ -548,6 +580,44 @@ NOTICE:  Success:
 (1 row)
 
 --
+-- Test when error happens in createGang, it can correctly clean up
+--
+select cleanupAllGangs();
+ cleanupallgangs 
+-----------------
+ t
+(1 row)
+
+select gp_inject_fault('gang_created', 'reset', 1);
+NOTICE:  Success:
+ gp_inject_fault 
+-----------------
+ t
+(1 row)
+
+select gp_inject_fault('gang_created', 'skip', 1);
+NOTICE:  Success:
+ gp_inject_fault 
+-----------------
+ t
+(1 row)
+
+select 1 from gp_dist_random('gp_id') limit 1;
+ERROR:  failed to acquire resources on one or more segments
+select gp_inject_fault('gang_created', 'reset', 1);
+NOTICE:  Success:
+ gp_inject_fault 
+-----------------
+ t
+(1 row)
+
+select 1 from gp_dist_random('gp_id') limit 1;
+ ?column? 
+----------
+        1
+(1 row)
+
+--
 -- Test that an error happens after a big command is dispatched.
 --
 select gp_inject_fault('after_one_slice_dispatched', 'error', 1);
@@ -573,5 +643,52 @@ select * from gp_dist_random('gp_id')
 --------+-------------+------+---------
 (0 rows)
 
+--
+-- Test portal cleanup
+-- prepare a query contains init plan, main plan create a unnamed portal
+-- and will need multiple slices , init plan also need to allocated multiple
+-- slices in a named portal (eg: a cursor). The executing order is:
+-- 1. gangs of main plan is pre-assigned 2. init plan is executed 3. main plan
+-- is executed. This test it meant to test that cleanup of the named portal in
+-- the end of step2 will not affect the pre-allocated gangs of the main plan.
+--
+create table foo (c1 int, c2 int);
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column named 'c1' as the Greenplum Database data distribution key for this table.
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
+create table bar (c1 int, c2 int);
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column named 'c1' as the Greenplum Database data distribution key for this table.
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
+create or replace function foo_func()
+returns int
+as
+$BODY$
+declare
+t_record record;
+BEGIN
+	drop table if exists tmp1;
+	create temp table tmp1 as select foo.c1, bar.c2 from foo, bar;
+	for t_record in (select count(*) from foo, bar)
+	loop
+		NULL;
+	end loop;
+	return 1;
+END;
+$BODY$
+language plpgsql volatile;
+set gp_cached_segworkers_threshold to 1;
+select count(*) from foo, bar where exists (select foo_func());
+NOTICE:  table "tmp1" does not exist, skipping
+CONTEXT:  SQL statement "drop table if exists tmp1"
+PL/pgSQL function "foo_func" line 4 at SQL statement
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column(s) named 'c1' as the Greenplum Database data distribution key for this table.
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
+CONTEXT:  SQL statement "create temp table tmp1 as select foo.c1, bar.c2 from foo, bar"
+PL/pgSQL function "foo_func" line 5 at SQL statement
+ count 
+-------
+     0
+(1 row)
+
+reset gp_cached_segworkers_threshold;
 \c regression
 DROP DATABASE dispatch_test_db;

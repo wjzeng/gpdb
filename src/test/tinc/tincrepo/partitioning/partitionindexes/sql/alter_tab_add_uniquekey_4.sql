@@ -4,5 +4,5 @@
 -- @db_name ptidx
 -- @tags partitionindexes
 -- @description ALTER TABLE, Unique index with Primary Key, unique index on the default partition 
-ALTER TABLE pt_lt_tab ADD unique(col2,col1);
+ALTER TABLE pt_lt_tab ADD unique(col1,col2);
 SELECT * FROM pt_lt_tab WHERE col1 > 50 ORDER BY col2,col3 LIMIT 5;

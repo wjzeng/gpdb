@@ -54,6 +54,7 @@ extern struct Port *MyProcPort;
 
 #define DTM_DEBUG3 (Debug_print_full_dtm ? LOG : DEBUG3)
 #define DTM_DEBUG5 (Debug_print_full_dtm ? LOG : DEBUG5)
+#define DTX_PHASE2_SLEEP_TIME_BETWEEN_RETRIES_MSECS 100
 
 /*
  * Directory where Utility Mode DTM REDO file reside within PGDATA
@@ -810,6 +811,13 @@ doNotifyingCommitPrepared(void)
 
 	while (!succeeded && dtx_phase2_retry_count > retry++)
 	{
+		/*
+		 * sleep for brief duration before retry, to increase chances of
+		 * success if first try failed due to segment panic/restart. Otherwise
+		 * all the retries complete in less than a sec, defeating the purpose
+		 * of the retry.
+		 */
+		pg_usleep(DTX_PHASE2_SLEEP_TIME_BETWEEN_RETRIES_MSECS * 1000);
 		elog(WARNING, "the distributed transaction 'Commit Prepared' broadcast "
 			 "failed to one or more segments for gid = %s.  Retrying ... try %d",
 			 currentGxact->gid, retry);
@@ -874,7 +882,17 @@ retryAbortPrepared(void)
 		 * segment instances.  And, we will abort the transactions in the
 		 * segments. What's left are possibily prepared transactions.
 		 */
-		elog(NOTICE, "Releasing segworker groups to retry broadcast.");
+		if (retry > 1)
+		{
+			elog(NOTICE, "Releasing segworker groups to retry broadcast.");
+			/*
+			 * sleep for brief duration before retry, to increase chances of
+			 * success if first try failed due to segment panic/restart. Otherwise
+			 * all the retries complete in less than a sec, defeating the purpose
+			 * of the retry.
+			 */
+			pg_usleep(DTX_PHASE2_SLEEP_TIME_BETWEEN_RETRIES_MSECS * 1000);
+		}
 		DisconnectAndDestroyAllGangs(true);
 
 		/*
@@ -1025,8 +1043,8 @@ doNotifyingAbort(void)
 			setCurrentGxactState( DTX_STATE_RETRY_ABORT_PREPARED );
 			setDistributedTransactionContext(DTX_CONTEXT_QD_RETRY_PHASE_2);
 			releaseTmLock();
+			retryAbortPrepared();
 		}
-		retryAbortPrepared();
 	}
 
 	SIMPLE_FAULT_INJECTOR(DtmBroadcastAbortPrepared);
@@ -1369,11 +1387,16 @@ getSuperuser(Oid *userOid)
 	{
 		Datum   attrName;
 		Datum   attrNameOid;
+		Datum   attrRolvaliduntil;
+		bool    hasExpirationDate;
 
-		(void) heap_getattr(auth_tup, Anum_pg_authid_rolvaliduntil,
+		attrRolvaliduntil = heap_getattr(auth_tup, Anum_pg_authid_rolvaliduntil,
 							auth_rel->rd_att, &isNull);
+
 		/* we actually want it to be NULL, that means always valid */
-		if (!isNull)
+		hasExpirationDate = !isNull;
+
+		if (!canSuperuserPerformRecovery(hasExpirationDate, attrRolvaliduntil))
 			continue;
 
 		attrName = heap_getattr(auth_tup, Anum_pg_authid_rolname,
@@ -1397,6 +1420,17 @@ getSuperuser(Oid *userOid)
 	return suser;
 }
 
+
+bool
+canSuperuserPerformRecovery(bool hasExpirationTimestamp, TimestampTz expirationTimestamp)
+{
+  if (!hasExpirationTimestamp)
+     return true;
+
+  return expirationTimestamp >= GetCurrentTimestamp();
+}
+
+
 static char *
 ChangeToSuperuser()
 {
@@ -1410,8 +1444,13 @@ ChangeToSuperuser()
 		oldcontext = MemoryContextSwitchTo(TopMemoryContext);
 		newuser = getSuperuser(&userOid);
 		MemoryContextSwitchTo(oldcontext);
-
 		olduser = MyProcPort->user_name;
+
+		if (userOid == InvalidOid)
+		  ereport(ERROR, (errmsg("could not switch to superuser from %s", olduser),
+			       errdetail("No superuser found."),
+				  errhint("Use single-user mode to setup a valid superuser.")));
+
 		SetSessionUserId(userOid, true);
 		MyProcPort->user_name = newuser;
 	}
@@ -1539,7 +1578,7 @@ initTM(void)
 
 		RestoreToUser(olduser);
 
-		freeGangsForPortal(NULL);
+		freeGangsForPortal(NULL, NULL);
 	}
 	else
 	{
@@ -1573,7 +1612,7 @@ initTM(void)
 					Persistent_PostDTMRecv_RemoveHashEntry(MyDatabaseId);
 
 					RestoreToUser(olduser);
-					freeGangsForPortal(NULL);
+					freeGangsForPortal(NULL, NULL);
 				}
 				releaseTmLock();
 			}
@@ -1637,6 +1676,7 @@ tmShmemInit(void)
 			elog(PANIC, "cannot generate global transaction id");
 		}
 
+		MemSet(shared, 0, tmShmemSize());
 		*shmDistribTimeStamp = (DistributedTransactionTimeStamp)t;
   		elog(DEBUG1, "DTM start timestamp %u", *shmDistribTimeStamp);
 
@@ -1788,9 +1828,10 @@ isMppTxOptions_ExplicitBegin(int txnOptions)
 void
 getTmLock(void)
 {
-
 	if (ControlLockCount++ == 0)
 		LWLockAcquire(shmControlLock, LW_EXCLUSIVE);
+
+	Assert(LWLockHeldByMe(shmControlLock));
 }
 
 /* release tm lw lock */
@@ -1799,7 +1840,6 @@ releaseTmLock(void)
 {
 	if (--ControlLockCount == 0)
 		LWLockRelease(shmControlLock);
-
 }
 
 /*
@@ -2611,6 +2651,7 @@ releaseGxact_UnderLocks(void)
 {
 	int			i;
 	int			curr;
+	int			numGxacts;
 
 	if (currentGxact == NULL)
 	{
@@ -2622,8 +2663,8 @@ releaseGxact_UnderLocks(void)
 		 currentGxact->gid, currentGxact->debugIndex);
 
 	/* find slot of current transaction */
-	curr = *shmNumGxacts;	/* A bad value we can safely test. */
-	for (i = 0; i < *shmNumGxacts; i++)
+	numGxacts = curr = *shmNumGxacts;	/* A bad value we can safely test. */
+	for (i = 0; i < numGxacts; i++)
 	{
 		if (shmGxactArray[i] == currentGxact)
 		{
@@ -2632,6 +2673,12 @@ releaseGxact_UnderLocks(void)
 		}
 	}
 
+	if (curr == numGxacts)
+		ereport(PANIC, (errcode(ERRCODE_INTERNAL_ERROR),
+						errmsg("Cannot find my global transaction in the array"),
+						errdetail("ControlLockCount: %u, numGxacts: %u, gid: %s, currentGxact: %p",
+								   ControlLockCount, numGxacts, currentGxact->gid, currentGxact)));
+
 	/* move this to the next available slot */
 	(*shmNumGxacts)--;
 	if (curr != *shmNumGxacts)
@@ -2639,6 +2686,10 @@ releaseGxact_UnderLocks(void)
 		shmGxactArray[curr] = shmGxactArray[*shmNumGxacts];
 		shmGxactArray[*shmNumGxacts] = currentGxact;
 	}
+
+	if (*shmNumGxacts != numGxacts - 1)
+		ereport(PANIC, (errcode(ERRCODE_INTERNAL_ERROR),
+						errmsg("Shared memory corrupted")));
 
 	currentGxact = NULL;
 }
@@ -2826,10 +2877,8 @@ getDtxCheckPointInfoAndLock(char **result, int *result_size)
 }
 
 void
-freeDtxCheckPointInfoAndUnlock(char *info, int info_size  __attribute__((unused)) , XLogRecPtr *recptr)
+freeDtxCheckPointInfoAndUnlock(XLogRecPtr *recptr)
 {
-	pfree(info);
-
 	releaseTmLock();
 
 	elog(DTM_DEBUG5, "Checkpoint with DTM information written at %X/%X.",
@@ -3979,6 +4028,7 @@ performDtxProtocolCommand(DtxProtocolCommand dtxProtocolCommand,
 				case DTX_CONTEXT_QE_READER:
 					elog(FATAL, "Unexpected segment distribute transaction context: '%s'",
 						 DtxContextToString(DistributedTransactionContext));
+					break;
 
 				default:
 					elog(PANIC, "Unexpected segment distribute transaction context value: %d",
@@ -4013,6 +4063,7 @@ performDtxProtocolCommand(DtxProtocolCommand dtxProtocolCommand,
 				case DTX_CONTEXT_QE_READER:
 					elog(PANIC, "Unexpected segment distribute transaction context: '%s'",
 						 DtxContextToString(DistributedTransactionContext));
+					break;
 
 				default:
 					elog(PANIC, "Unexpected segment distribute transaction context value: %d",

@@ -3448,6 +3448,7 @@ DecodeISO8601Interval(char *str,
 						continue;
 					}
 					/* Else fall through to extended alternative format */
+					/* FALL THROUGH */
 				case '-':		/* ISO 8601 4.4.3.3 Alternative Format,
 								 * Extended */
 					if (havefield)
@@ -3526,6 +3527,7 @@ DecodeISO8601Interval(char *str,
 						return 0;
 					}
 					/* Else fall through to extended alternative format */
+					/* FALL THROUGH */
 				case ':':		/* ISO 8601 4.4.3.3 Alternative Format,
 								 * Extended */
 					if (havefield)
@@ -4502,8 +4504,16 @@ pg_timezone_names(PG_FUNCTION_ARGS)
 						 &tzoff, &tm, &fsec, &tzn, tz) != 0)
 			continue;			/* ignore if conversion fails */
 
-		/* Ignore zic's rather silly "Factory" time zone */
-		if (tzn && strcmp(tzn, "Local time zone must be set--see zic manual page") == 0)
+		/*
+		 * IANA's rather silly "Factory" time zone used to emit ridiculously
+		 * long "abbreviations" such as "Local time zone must be set--see zic
+		 * manual page" or "Local time zone must be set--use tzsetup".  While
+		 * modern versions of tzdb emit the much saner "-00", it seems some
+		 * benighted packagers are hacking the IANA data so that it continues
+		 * to produce these strings.  To prevent producing a weirdly wide
+		 * abbrev column, reject ridiculously long abbreviations.
+		 */
+		if (tzn && strlen(tzn) > 31)
 			continue;
 
 		/* Found a displayable zone */

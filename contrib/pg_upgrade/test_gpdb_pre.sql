@@ -1,3 +1,10 @@
+-- If a custom GUC is set on an old database, then it's not clear to me how the
+-- new database can/should recognize it. This is an issue for 'pgcrypto.fips'.
+-- One way to solve this may be to use 'custom_variable_classes'. But when/how
+-- should pg_upgrade handle that? For now an ugly solution is to remove custom
+-- GUC from the old database.
+SET allow_system_table_mods='dml';
+UPDATE pg_database SET datconfig='{lc_messages=C,lc_monetary=C,lc_numeric=C,lc_time=C,timezone_abbreviations=Default}' WHERE datname = 'contrib_regression';
 DROP TABLE IF EXISTS alter_ao_part_tables_column.sto_altap3 CASCADE;
 DROP TABLE IF EXISTS alter_ao_part_tables_row.sto_altap3 CASCADE;
 DROP TABLE IF EXISTS co_cr_sub_partzlib8192_1_2 CASCADE;

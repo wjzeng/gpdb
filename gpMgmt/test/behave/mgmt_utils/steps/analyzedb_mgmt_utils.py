@@ -1,6 +1,8 @@
 import re
 import os
 import shutil
+import time
+from datetime import datetime, timedelta
 from gppylib.db import dbconn
 from test.behave_utils.utils import check_schema_exists, check_table_exists, drop_table_if_exists
 from gppylib.operations.backup_utils import get_lines_from_file
@@ -95,6 +97,13 @@ def impl(context, qualified_table):
             assert False, "no state files found for database %s" % context.dbname
         else:
             assert False, "table %s not found in state file %s" % (qualified_table, os.path.basename(filename))
+
+
+@then('"{qualified_table}" should not appear in the latest state files')
+def impl(context, qualified_table):
+    found, filename = table_found_in_state_file(context.dbname, qualified_table)
+    if found:
+        assert False, "table %s found in state file %s" % (qualified_table, os.path.basename(filename))
 
 
 @given('"{expected_result}" should appear in the latest ao_state file in database "{dbname}"')
@@ -215,6 +224,32 @@ def impl(context, mod_count, table, schema, dbname):
         raise Exception(
             "mod_count %s does not match mod_count %s in state file for %s.%s" %
              (mod_count, mod_count_in_state_file, schema, table))
+
+
+@given('the state files for "{dbname}" are artificially aged by {num_days} days')
+@when('the state files for "{dbname}" are artificially aged by {num_days} days')
+def impl(context, dbname, num_days):
+    analyze_dir = get_analyze_dir(dbname)
+    folders = get_list_of_analyze_dirs(dbname)
+    for f in folders:
+        time_of_analyze = datetime.strptime(os.path.basename(f), '%Y%m%d%H%M%S')
+        aged_time_of_analyze = time_of_analyze - timedelta(days=int(num_days))
+        new_folder_name = os.path.join(analyze_dir, aged_time_of_analyze.strftime('%Y%m%d%H%M%S'))
+        shutil.move(f, new_folder_name)
+
+@then('there should be {num_dirs} state directories for database "{dbname}"')
+@then('there should be {num_dirs} state directory for database "{dbname}"')
+def impl(context, num_dirs, dbname):
+    folders = get_list_of_analyze_dirs(dbname)
+    if len(folders) != int(num_dirs):
+        raise Exception("Found %d state directories, expected %s" % (len(folders), num_dirs))
+
+@given('the user waits {num_secs} seconds')
+@when('the user waits {num_secs} seconds')
+@given('the user waits {num_secs} second')
+@when('the user waits {num_secs} second')
+def impl(context, num_secs):
+    time.sleep(int(num_secs))
 
 
 def get_mod_count_in_state_file(dbname, schema, table):

@@ -4672,6 +4672,49 @@ explain select 1 as t1 where 1 <= ALL (select x from tbl_z);
 drop table if exists tbl_z;
 reset optimizer_metadata_caching;
 reset gp_enable_relsize_collection;
+create table epsilon_test (b smallint);
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column named 'b' as the Greenplum Database data distribution key for this table.
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
+set allow_system_table_mods="DML";
+UPDATE pg_class
+SET
+        relpages = 4901842::int,
+        reltuples = 495454000.0::real
+WHERE relname = 'epsilon_test';
+INSERT INTO pg_statistic VALUES (
+        'epsilon_test'::regclass,
+        1::smallint,
+        0.0::real,
+        2::integer,
+        10.0::real,
+        1::smallint,
+        2::smallint,
+        0::smallint,
+        0::smallint,
+        94::oid,
+        95::oid,
+        0::oid,
+        0::oid,
+        E'{0.259358,0.15047,0.124118,0.117294,0.117195,0.11612,0.115285}'::real[],
+        NULL::real[],
+        NULL::real[],
+        NULL::real[],
+        E'{25,7,143,6,107,10,21}'::int2[],
+        E'{0,30}'::int2[],
+        NULL::int2[],
+        NULL::int2[]);
+explain select b from epsilon_test where b in (11,30) limit 30;
+                                                                           QUERY PLAN                                                                            
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=0.00..8771.18 rows=10 width=2)
+   ->  Gather Motion 3:1  (slice1; segments: 3)  (cost=0.00..8771.18 rows=30 width=2)
+         ->  Limit  (cost=0.00..8771.18 rows=10 width=2)
+               ->  Table Scan on epsilon_test  (cost=0.00..8771.18 rows=10677 width=2)
+                     Filter: b = ANY ('{11,30}'::integer[])
+ Settings:  enable_bitmapscan=off; enable_groupagg=on; enable_indexscan=on; enable_seqscan=off; optimizer_force_three_stage_scalar_dqa=off; optimizer_segments=3
+ Optimizer status: PQO version 3.79.0
+(7 rows)
+
 -- start_ignore
 drop schema qp_misc_jiras cascade;
 NOTICE:  drop cascades to table qp_misc_jiras._tbl10050_test

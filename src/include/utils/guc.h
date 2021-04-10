@@ -159,7 +159,6 @@ extern bool Debug_appendonly_print_scan;
 extern bool Debug_appendonly_print_scan_tuple;
 extern bool Debug_appendonly_print_delete;
 extern bool Debug_appendonly_print_storage_headers;
-extern bool Debug_appendonly_print_verify_write_block;
 extern bool Debug_appendonly_use_no_toast;
 extern bool Debug_appendonly_print_blockdirectory;
 extern bool Debug_appendonly_print_read_block;
@@ -364,6 +363,8 @@ extern int	tcp_keepalives_count;
 
 extern int	gp_connection_send_timeout;
 
+extern int	listenerBacklog;
+
 extern int	gp_filerep_tcp_keepalives_idle;
 extern int	gp_filerep_tcp_keepalives_interval;
 extern int	gp_filerep_tcp_keepalives_count;
@@ -388,6 +389,7 @@ extern char  *data_directory;
 /* optimizer cost model */
 #define OPTIMIZER_GPDB_LEGACY           0       /* GPDB's legacy cost model */
 #define OPTIMIZER_GPDB_CALIBRATED       1       /* GPDB's calibrated cost model */
+#define OPTIMIZER_GPDB_EXPERIMENTAL     2       /* GPDB's experimental cost model */
 
 /* Optimizer related gucs */
 extern bool	optimizer;
@@ -441,6 +443,7 @@ extern bool optimizer_enable_bitmapscan;
 extern bool optimizer_enable_outerjoin_to_unionall_rewrite;
 extern bool optimizer_enable_ctas;
 extern bool optimizer_enable_partial_index;
+extern bool optimizer_enable_dml;
 extern bool optimizer_enable_dml_triggers;
 extern bool	optimizer_enable_dml_constraints;
 extern bool optimizer_enable_direct_dispatch;
@@ -449,6 +452,7 @@ extern bool optimizer_enable_hashjoin;
 extern bool optimizer_enable_dynamictablescan;
 extern bool optimizer_enable_indexscan;
 extern bool optimizer_enable_tablescan;
+extern bool optimizer_enable_full_join;
 
 /* Optimizer plan enumeration related GUCs */
 extern bool optimizer_enumerate_plans;
@@ -482,6 +486,8 @@ extern int optimizer_cte_inlining_bound;
 extern bool optimizer_force_multistage_agg;
 extern bool optimizer_force_three_stage_scalar_dqa;
 extern bool optimizer_force_expanded_distinct_aggs;
+extern bool optimizer_force_agg_skew_avoidance;
+extern bool optimizer_penalize_skew;
 extern bool optimizer_prune_computed_columns;
 extern bool optimizer_push_requirements_from_consumer_to_producer;
 extern bool optimizer_enforce_subplans;
@@ -494,10 +500,12 @@ extern bool optimizer_array_constraints;
 extern bool optimizer_cte_inlining;
 extern bool optimizer_enable_space_pruning;
 extern bool optimizer_enable_associativity;
+extern bool optimizer_prune_unused_columns;
 
 /* Analyze related GUCs for Optimizer */
 extern bool optimizer_analyze_root_partition;
 extern bool optimizer_analyze_midlevel_partition;
+extern bool optimizer_analyze_enable_merge_of_leaf_stats;
 
 extern bool optimizer_use_gpdb_allocators;
 
@@ -511,9 +519,10 @@ extern int	gp_max_slices;
 extern bool	optimizer_partition_selection_log;
 
 /* optimizer join heuristic models */
-#define JOIN_ORDER_IN_QUERY                 0
-#define JOIN_ORDER_GREEDY_SEARCH            1
-#define JOIN_ORDER_EXHAUSTIVE_SEARCH        2
+#define JOIN_ORDER_IN_QUERY                  0
+#define JOIN_ORDER_GREEDY_SEARCH             1
+#define JOIN_ORDER_EXHAUSTIVE_SEARCH         2
+#define JOIN_ORDER_EXHAUSTIVE2_SEARCH        3
 
 extern char  *gp_email_smtp_server;
 extern char  *gp_email_smtp_userid;

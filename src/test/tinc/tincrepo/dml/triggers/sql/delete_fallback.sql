@@ -1,6 +1,7 @@
 SELECT * FROM dml_trigger_table_1 order by 2;
 
 --start_ignore
+SET optimizer_log_failure = 'all';
 SET client_min_messages='log';
 DELETE FROM dml_trigger_table_1 where age=10;
 SET client_min_messages='notice';
@@ -8,4 +9,4 @@ SET client_min_messages='notice';
 
 SELECT * FROM dml_trigger_table_1 order by 2;
 
-\!sed -n '/Planner/p' %MYD%/output/delete_fallback_orca.out
+\!sed -n '/Pivotal/p' %MYD%/output/delete_fallback_orca.out

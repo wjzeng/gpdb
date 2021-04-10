@@ -1,3 +1,9 @@
+-- Test vacuum a catalog can succeed.
+-- Previously, we have a redundant Assert in the function
+-- localXidSatisfiesAnyDistributedSnapshot that will fail this.
+-- See Github Issue 6793.
+vacuum full pg_proc;
+
 set optimizer_print_missing_stats = off;
 -- MPP-23647 Create a partitioned appendonly table, let its age
 -- increase during the test.  We will vacuum it at the end of the
@@ -191,3 +197,60 @@ ALTER TABLE s_priv_test.t_priv_table OWNER TO r_priv_test;
 VACUUM ANALYZE s_priv_test.t_priv_table;
 DROP SCHEMA s_priv_test CASCADE;
 DROP ROLE r_priv_test;
+
+-- Ensure that VACUUM doesn't reset the statistics on the parent table
+CREATE TABLE pt (a int, b int) DISTRIBUTED BY (a) PARTITION BY range (b) (END(5), START(5));
+INSERT INTO pt SELECT 0, 6 FROM generate_series(1, 12);
+ANALYZE pt;
+SELECT reltuples FROM pg_catalog.pg_class WHERE relname = 'pt';
+VACUUM pt;
+SELECT reltuples FROM pg_catalog.pg_class WHERE relname = 'pt';
+VACUUM ANALYZE pt;
+SELECT reltuples FROM pg_catalog.pg_class WHERE relname = 'pt';
+
+-- Vacuum freeze for database with toast attribute in pg_database tuple cause
+-- heap_inplace_update raise error "wrong tuple length". This is because system
+-- cache flatten toast tuple.
+DROP DATABASE IF EXISTS vacuum_freeze_test;
+CREATE DATABASE vacuum_freeze_test;
+-- start_ignore
+create or replace function toast_pg_database_datacl() returns text as $body$
+declare
+	mycounter int;
+begin
+	for mycounter in select i from generate_series(1, 2800) i loop
+		execute 'create role aaaabbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' || mycounter;
+		execute 'grant ALL on database vacuum_freeze_test to aaaabbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' || mycounter;
+	end loop;
+	return 'ok';
+end;
+$body$ language plpgsql volatile strict;
+
+create or replace function clean_roles() returns text as $body$
+declare
+	mycounter int;
+begin
+	for mycounter in select i from generate_series(1, 2800) i loop
+		execute 'drop role aaaabbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' || mycounter;
+	end loop;
+	return 'ok';
+end;
+$body$ language plpgsql volatile strict;
+
+select toast_pg_database_datacl();
+-- end_ignore
+\c vacuum_freeze_test
+create temp table before_vacuum as select datname, pg_column_size(datacl) > 8192 as datacl_size, age(datfrozenxid) from pg_database where datname='vacuum_freeze_test';
+select datname, datacl_size from before_vacuum;
+vacuum freeze;
+select datname, pg_column_size(datacl) > 8192 as datacl_size, age(datfrozenxid) != (select age from before_vacuum) as age_changed from pg_database where datname='vacuum_freeze_test';
+\c regression
+DROP DATABASE vacuum_freeze_test;
+-- start_ignore
+select clean_roles();
+drop function toast_pg_database_datacl();
+drop function clean_roles();
+-- end_ignore
+-- free pg_global space, otherwise it fails db_size_functions
+VACUUM FULL pg_authid;
+VACUUM FULL pg_database;

@@ -56,6 +56,7 @@
 #include "commands/trigger.h"
 #include "commands/typecmds.h"
 #include "executor/executor.h"
+#include "executor/instrument.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "nodes/parsenodes.h"
@@ -87,6 +88,7 @@
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/metrics_utils.h"
 #include "utils/relcache.h"
 #include "utils/syscache.h"
 
@@ -510,16 +512,14 @@ DefineRelation(CreateStmt *stmt, char relkind, char relstorage, bool dispatch)
 
 	/*
 	 * Look up inheritance ancestors and generate relation schema, including
-	 * inherited attributes. Update the offsets of the distribution attributes
-	 * in GpPolicy if necessary. Save result to stmt->tableElts and dispatch to
-	 * QEs.
+	 * inherited attributes. Save result to stmt->tableElts and dispatch to QEs.
 	 */
 	isPartitioned = stmt->partitionBy ? true : false;
 	if (Gp_role == GP_ROLE_DISPATCH || Gp_role == GP_ROLE_UTILITY)
 		stmt->tableElts = MergeAttributes(stmt->tableElts, stmt->inhRelations,
 							 	 	 	  stmt->relation->istemp, isPartitioned,
 							 	 	 	  &stmt->inhOids, &old_constraints,
-							 	 	 	  &stmt->parentOidCount, stmt->policy);
+							 	 	 	  &stmt->parentOidCount);
 
 	/*
 	 * Create a relation descriptor from the relation schema and create the
@@ -1087,6 +1087,12 @@ ExecuteTruncate(TruncateStmt *stmt)
 	ListCell   *cell;
     int partcheck = 2;
 	List *partList = NIL;
+	TruncateStmt *truncateStatement;
+
+	/*
+	 * Copy the statement to ensure we do not modify a cached plan
+	 */
+	truncateStatement = (TruncateStmt *) copyObject(stmt);
 
 	/*
 	 * Open, exclusive-lock, and check all the explicitly-specified relations
@@ -1095,7 +1101,7 @@ ExecuteTruncate(TruncateStmt *stmt)
 	 */
 	while (partcheck)
 	{
-		foreach(cell, stmt->relations)
+		foreach(cell, truncateStatement->relations)
 		{
 			RangeVar   *rv = lfirst(cell);
 			Relation	rel;
@@ -1132,9 +1138,9 @@ ExecuteTruncate(TruncateStmt *stmt)
 			/* add the partitions to the relation list and try again */
 			if (partcheck == 1)
 			{
-				stmt->relations = list_concat(partList, stmt->relations);
+				truncateStatement->relations = list_concat(partList, truncateStatement->relations);
 
-				cell = list_head(stmt->relations);
+				cell = list_head(truncateStatement->relations);
 				while (cell != NULL)
 				{
 					RangeVar   *rv = lfirst(cell);
@@ -1160,7 +1166,7 @@ ExecuteTruncate(TruncateStmt *stmt)
 	/*
 	 * Open, exclusive-lock, and check all the explicitly-specified relations
 	 */
-	foreach(cell, stmt->relations)
+	foreach(cell, truncateStatement->relations)
 	{
 		RangeVar   *rv = lfirst(cell);
 		Relation	rel;
@@ -1182,7 +1188,7 @@ ExecuteTruncate(TruncateStmt *stmt)
 	 * soon as we open it, to avoid a faux pas such as holding lock for a long
 	 * time on a rel we have no permissions for.
 	 */
-	if (stmt->behavior == DROP_CASCADE)
+	if (truncateStatement->behavior == DROP_CASCADE)
 	{
 		for (;;)
 		{
@@ -1212,6 +1218,12 @@ ExecuteTruncate(TruncateStmt *stmt)
 		}
 	}
 
+	/* GPDB does not support all FK feature but keeps FK grammar recognition,
+	 * which reduces migration manual workload from other databases.
+	 * We do not want to reject relation truncate if the relation contains FK
+	 * satisfied tuple, so skip heap_truncate_check_FKs function call.
+	 */
+#if 0
 	/*
 	 * Check foreign key references.  In CASCADE mode, this should be
 	 * unnecessary since we just pulled in all the references; but as a
@@ -1220,8 +1232,9 @@ ExecuteTruncate(TruncateStmt *stmt)
 #ifdef USE_ASSERT_CHECKING
 	heap_truncate_check_FKs(rels, false);
 #else
-	if (stmt->behavior == DROP_RESTRICT)
+	if (truncateStatement->behavior == DROP_RESTRICT)
 		heap_truncate_check_FKs(rels, false);
+#endif
 #endif
 
 	/*
@@ -1244,7 +1257,7 @@ ExecuteTruncate(TruncateStmt *stmt)
 	{
 		ListCell	*lc;
 
-		CdbDispatchUtilityStatement((Node *) stmt,
+		CdbDispatchUtilityStatement((Node *) truncateStatement,
 									DF_CANCEL_ON_ERROR |
 									DF_WITH_SNAPSHOT |
 									DF_NEED_TWO_PHASE,
@@ -1363,15 +1376,13 @@ truncate_check_rel(Relation rel)
  *		of ColumnDef's.) It is destructively changed.
  * 'supers' is a list of names (as RangeVar nodes) of parent relations.
  * 'istemp' is TRUE if we are creating a temp relation.
- * 'GpPolicy *' is NULL if the distribution policy is not to be updated
+ * 'isPartitioned' is TRUE if we are creating a partitioned relation.
  *
  * Output arguments:
  * 'supOids' receives a list of the OIDs of the parent relations.
  * 'supconstr' receives a list of constraints belonging to the parents,
  *		updated as necessary to be valid for the child.
  * 'supOidCount' is set to the number of parents that have OID columns.
- * 'GpPolicy' is updated with the offsets of the distribution
- *      attributes in the new schema
  *
  * Return value:
  * Completed schema list.
@@ -1417,7 +1428,7 @@ truncate_check_rel(Relation rel)
  */
 List *
 MergeAttributes(List *schema, List *supers, bool istemp, bool isPartitioned,
-				List **supOids, List **supconstr, int *supOidCount, GpPolicy *policy)
+				List **supOids, List **supconstr, int *supOidCount)
 {
 	ListCell   *entry;
 	List	   *inhSchema = NIL;
@@ -1590,28 +1601,6 @@ MergeAttributes(List *schema, List *supers, bool istemp, bool isPartitioned,
 				def->is_not_null |= attribute->attnotnull;
 				/* Default and other constraints are handled below */
 				newattno[parent_attno - 1] = exist_attno;
-
-				/*
-				 * Update GpPolicy
-				 */
-				if (policy != NULL)
-				{
-					int attr_ofst = 0;
-
-					Assert(policy->nattrs >= 0 && "the number of distribution attributes is not negative");
-
-					/* Iterate over all distribution attribute offsets */
-					for (attr_ofst = 0; attr_ofst < policy->nattrs; attr_ofst++)
-					{
-						/* Check if any distribution attribute has higher offset than the current */
-						if (policy->attrs[attr_ofst] > child_attno)
-						{
-							Assert(policy->attrs[attr_ofst] > 0 && "index should not become negative");
-							policy->attrs[attr_ofst]--;
-						}
-					}
-				}
-
 			}
 			else
 			{
@@ -3961,6 +3950,7 @@ ATPrepCmd(List **wqueue, Relation rel, AlterTableCmd *cmd,
 					   (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						errmsg("Cannot modify subpartition template for partitioned table")));
 			}
+			/* FALL THRU */
 		case AT_PartAdd:				/* Add */
 		case AT_PartAddForSplit:		/* Add, as part of a split */
 		case AT_PartCoalesce:			/* Coalesce */
@@ -8706,6 +8696,7 @@ ATPostAlterTypeCleanup(List **wqueue, AlteredTableInfo *tab)
 {
 	ObjectAddress obj;
 	ListCell   *l;
+	ListCell   *oid_item;
 
 	/*
 	 * Re-parse the index and constraint definitions, and attach them to the
@@ -8728,8 +8719,39 @@ ATPostAlterTypeCleanup(List **wqueue, AlteredTableInfo *tab)
 		/*ATPostAlterTypeParse((char *) lfirst(l), wqueue);*/
 	}
 
-	foreach(l, tab->changedConstraintDefs)
+	forboth(oid_item, tab->changedConstraintOids,
+	        l, tab->changedConstraintDefs)
+	{
+		Oid			oldId = lfirst_oid(oid_item);
+		HeapTuple	tup;
+		Form_pg_constraint con;
+		char		contype;
+
+		tup = SearchSysCache1(CONSTROID, ObjectIdGetDatum(oldId));
+		if (!HeapTupleIsValid(tup))		/* should not happen */
+			elog(ERROR, "cache lookup failed for constraint %u", oldId);
+		con = (Form_pg_constraint) GETSTRUCT(tup);
+		contype = con->contype;
+		ReleaseSysCache(tup);
+
+		if (contype == CONSTRAINT_PRIMARY || contype == CONSTRAINT_UNIQUE)
+		{
+			/*
+			 * Currently, GPDB doesn't support alter type on primary key and unique
+			 * constraint column. Because it requires drop - recreate logic.
+			 * The drop currently only performs on master which lead error when
+			 * recreating index (since recreate index will dispatch to segments and
+			 * there still old constraint index exists)
+			 * Related issue: https://github.com/greenplum-db/gpdb/issues/10561.
+			 */
+			ereport(ERROR,
+			        (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				        errmsg("cannot alter column with primary key or unique constraint"),
+				        errhint("DROP the constraint first, and recreate it after the ALTER")));
+		}
+
 		ATPostAlterTypeParse((char *) lfirst(l), wqueue);
+	}
 
 	/*
 	 * Now we can drop the existing constraints and indexes --- constraints
@@ -9579,14 +9601,7 @@ copy_append_only_data(
 							  &mirroredDstOpen,
 							  buffer,
 							  bufferLen,
-							  &primaryError,
 							  &mirrorDataLossOccurred);
-		if (primaryError != 0)
-			ereport(ERROR,
-					(errcode_for_file_access(),
-					 errmsg("could not write file \"%s\": %s",
-							dstFileName,
-							strerror(primaryError))));
 		
 		readOffset += bufferLen;
 		
@@ -11296,9 +11311,9 @@ build_ctas_with_dist(Relation rel, List *dist_clause,
 	dest = CreateDestReceiver(DestIntoRel, NULL);
 
 	/* Create a QueryDesc requesting no output */
-	queryDesc = CreateQueryDesc(stmt,  pstrdup("(internal SELECT INTO query)"),
+	queryDesc = CreateQueryDesc(stmt, debug_query_string,
 								ActiveSnapshot, InvalidSnapshot,
-								dest, NULL, INSTRUMENT_NONE);
+								dest, NULL, GP_INSTRUMENT_OPTS);
 
 	return queryDesc;
 }
@@ -11531,11 +11546,11 @@ prebuild_temp_table(Relation rel, RangeVar *tmpname, List *distro, List *opts,
 					/* bound of -1 are fine because this has no effect on data */
 					tname->arrayBounds = lappend(tname->arrayBounds,
 												 makeInteger(-1));
-
-				/* Per column encoding settings */
-				if (col_encs)
-					cd->encoding = col_encs[attno];
 			}
+
+			/* Per column encoding settings */
+			if (col_encs)
+				cd->encoding = col_encs[attno];
 
 			tname->location = -1;
 			cd->typeName = tname;
@@ -11578,14 +11593,10 @@ static void checkUniqueIndexCompatible(Relation rel, GpPolicy *pol)
 {
 	List *indexoidlist = RelationGetIndexList(rel);
 	ListCell *indexoidscan = NULL;
-	Bitmapset *polbm = NULL;
-	int i = 0;
+	bool compatible;
 
 	if(pol == NULL || pol->nattrs == 0)
 		return;
-
-	for (i = 0; i < pol->nattrs; i++)
-		polbm = bms_add_member(polbm, pol->attrs[i]);
 
 	/* Loop over all indexes on the relation */
 	foreach(indexoidscan, indexoidlist)
@@ -11594,7 +11605,6 @@ static void checkUniqueIndexCompatible(Relation rel, GpPolicy *pol)
 		HeapTuple	indexTuple;
 		Form_pg_index indexStruct;
 		int			i;
-		Bitmapset  *indbm = NULL;
 
 		indexTuple = SearchSysCache1(INDEXRELID,
 									 ObjectIdGetDatum(indexoid));
@@ -11605,28 +11615,43 @@ static void checkUniqueIndexCompatible(Relation rel, GpPolicy *pol)
 		/* If the index is not a unique key, skip the check */
 		if (indexStruct->indisunique)
 		{
-			for (i = 0; i < indexStruct->indnatts; i++)
-			{
-				indbm = bms_add_member(indbm, indexStruct->indkey.values[i]);
-			}
+			compatible = true;
+			if (indexStruct->indnatts < pol->nattrs)
+				compatible = false;
 
-			if (!bms_is_subset(polbm, indbm))
+			for (i = 0; i < pol->nattrs; i++)
 			{
+				if (indexStruct->indkey.values[i] != pol->attrs[i])
+				{
+					compatible = false;
+					break;
+				}
+			}
+			if (!compatible)
+			{
+				HeapTuple		classTuple;
+				Form_pg_class	classStruct;
+
+				classTuple = SearchSysCache1(RELOID,
+											 ObjectIdGetDatum(indexoid));
+				if (!HeapTupleIsValid(classTuple))
+					elog(FATAL, "cache lookup failed for incompatible index %u", indexoid);
+				classStruct = (Form_pg_class) GETSTRUCT(classTuple);
+
 				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-						 errmsg("UNIQUE INDEX and DISTRIBUTED BY definitions incompatible"),
-						 errhint("the DISTRIBUTED BY columns must be equal to "
-								 "or a left-subset of the UNIQUE INDEX columns.")));
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("UNIQUE INDEX and DISTRIBUTED BY definitions incompatible"),
+					 errhint("The DISTRIBUTED BY columns must be equal to "
+							 "or a left-subset of the UNIQUE INDEX \"%s\" columns.",
+							 NameStr(classStruct->relname))));
+				ReleaseSysCache(classTuple);
 			}
-
-			bms_free(indbm);
 		}
 
 		ReleaseSysCache(indexTuple);
 	}
 
 	list_free(indexoidlist);
-	bms_free(polbm);
 }
 
 /*
@@ -12032,6 +12057,10 @@ ATExecSetDistributedBy(Relation rel, Node *node, AlterTableCmd *cmd)
 
 		PG_TRY();
 		{
+			/* GPDB hook for collecting query info */
+			if (query_info_collect_hook)
+				(*query_info_collect_hook)(METRICS_QUERY_SUBMIT, queryDesc);
+
 			/* 
 			 * We need to update our snapshot here to make sure we see all
 			 * committed work. We have an exclusive lock on the table so no one
@@ -12039,7 +12068,6 @@ ATExecSetDistributedBy(Relation rel, Node *node, AlterTableCmd *cmd)
 			 */
 			saveSnapshot = ActiveSnapshot;
 			ActiveSnapshot = CopySnapshot(GetLatestSnapshot());
-
 	
 			/* Step (c) - run on all nodes */
 			ExecutorStart(queryDesc, 0);
@@ -12716,6 +12744,7 @@ ATPExecPartAlter(List **wqueue, AlteredTableInfo *tab, Relation rel,
 		{
 			prepCmd = true; /* if sub-command is split partition then it will require some preprocessing */
 		}
+		/* FALL THRU */
 		case AT_PartAdd:				/* Add */
 		case AT_PartAddForSplit:		/* Add, as part of a split */
 		case AT_PartCoalesce:			/* Coalesce */
@@ -14197,19 +14226,31 @@ split_rows(Relation intoa, Relation intob, Relation temprel)
 				break;
 		}
 
-		/* prepare for ExecQual */
-		econtext->ecxt_scantuple = slotT;
+		/*
+		 * Map attributes from origin to target. We should consider dropped
+		 * columns in the origin.
+		 * 
+		 * ExecQual should use targetSlot rather than slotT in case possible 
+		 * partition key mapping.
+		 */
+		AssertImply(!PointerIsValid(achk), PointerIsValid(bchk));
+		targetSlot = reconstructMatchingTupleSlot(slotT, achk ? rria : rrib);
+		econtext->ecxt_scantuple = targetSlot;
 
 		/* determine if we are inserting into a or b */
 		if (achk)
 		{
 			targetIsA = ExecQual((List *)achk, econtext, false);
+
+			if (!targetIsA)
+				targetSlot = reconstructMatchingTupleSlot(slotT, rrib);
 		}
 		else
 		{
-			Assert(PointerIsValid(bchk));
-
 			targetIsA = !ExecQual((List *)bchk, econtext, false);
+
+			if (targetIsA)
+				targetSlot = reconstructMatchingTupleSlot(slotT, rria);
 		}
 
 		/* load variables for the specific target */
@@ -14227,12 +14268,6 @@ split_rows(Relation intoa, Relation intob, Relation temprel)
 			targetAOCSDescPtr = &aocsinsertdesc_b;
 			targetRelInfo = rrib;
 		}
-
-		/*
-		 * Map attributes from origin to target.  We should consider dropped
-		 * columns in the origin.
-		 */
-		targetSlot = reconstructMatchingTupleSlot(slotT, targetRelInfo);
 
 		/* insert into the target table */
 		if (RelationIsHeap(targetRelation))
@@ -14258,7 +14293,7 @@ split_rows(Relation intoa, Relation intob, Relation temprel)
 				MemoryContextSwitchTo(GetPerTupleMemoryContext(estate));
 			}
 
-			mtuple = ExecFetchSlotMemTuple(targetSlot, false);
+			mtuple = ExecFetchSlotMemTuple(targetSlot);
 			appendonly_insert(*targetAODescPtr, mtuple, &tupleOid, &aoTupleId);
 
 			/* cache TID for later updating of indexes */

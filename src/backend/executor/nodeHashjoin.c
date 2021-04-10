@@ -28,6 +28,8 @@
 #include "cdb/cdbvars.h"
 #include "miscadmin.h"			/* work_mem */
 
+extern bool Test_print_prefetch_joinqual;
+
 static TupleTableSlot *ExecHashJoinOuterGetTuple(PlanState *outerNode,
 						  HashJoinState *hjstate,
 						  uint32 *hashvalue);
@@ -211,6 +213,24 @@ ExecHashJoin(HashJoinState *node)
 		elog(gp_workfile_caching_loglevel, "HashJoin built table with %.1f tuples by executing subplan for batch 0", hashtable->totalTuples);
 #endif
 
+		/*
+		 * Prefetch JoinQual to prevent motion hazard.
+		 *
+		 * See ExecPrefetchJoinQual() for details.
+		 */
+		if (node->prefetch_joinqual)
+		{
+			ExecPrefetchJoinQual(&node->js);
+			node->prefetch_joinqual = false;
+		}
+
+		/*
+		 * We just scanned the entire inner side and built the hashtable
+		 * (and its overflow batches). Check here and remember if the inner
+		 * side is empty.
+		 */
+		node->hj_InnerEmpty = (hashtable->totalTuples == 0);
+
 		/**
 		 * If LASJ_NOTIN and a null was found on the inner side, then clean out.
 		 */
@@ -329,7 +349,7 @@ ExecHashJoin(HashJoinState *node)
 				 */
 				Assert(batchno != 0);
 				Assert(batchno > hashtable->curbatch);
-				ExecHashJoinSaveTuple(&node->js.ps, ExecFetchSlotMemTuple(outerTupleSlot, false),
+				ExecHashJoinSaveTuple(&node->js.ps, ExecFetchSlotMemTuple(outerTupleSlot),
 									  hashvalue,
 									  hashtable,
 									  &hashtable->batches[batchno]->outerside,
@@ -516,6 +536,12 @@ ExecInitHashJoin(HashJoin *node, EState *estate, int eflags)
 	 * the fix to MPP-989)
 	 */
 	hjstate->prefetch_inner = node->join.prefetch_inner;
+	hjstate->prefetch_joinqual = node->join.prefetch_joinqual;
+
+	if (Test_print_prefetch_joinqual && hjstate->prefetch_joinqual)
+		elog(NOTICE,
+			 "prefetch join qual in slice %d of plannode %d",
+			 currentSliceId, ((Plan *) node)->plan_node_id);
 
 	/*
 	 * initialize child nodes

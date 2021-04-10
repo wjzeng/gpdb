@@ -73,6 +73,13 @@
         configuration file. See <xref
           href="../../admin_guide/managing/backup-gpbackup.xml#topic_qwd_d5d_tbb" format="dita"
         />.</p>
+      <note>This utility uses secure shell (SSH) connections between systems to perform its tasks.
+        In large Greenplum Database deployments, cloud deployments, or deployments with a large
+        number of segments per host, this utility may exceed the host's maximum threshold for
+        unauthenticated connections. Consider updating the SSH <codeph>MaxStartups</codeph> and
+          <codeph>MaxSessions</codeph> configuration parameters to increase this threshold. For more
+        information about SSH configuration options, refer to the SSH documentation for your Linux
+        distribution.</note>
     </section>
     <section>
       <title>Options</title>
@@ -172,10 +179,12 @@
           <pd>Optional. Specifies a table to include in the backup. The table must be in the format
               <codeph>&lt;schema-name>.&lt;table-name></codeph>. If a table or schema name uses any
             character other than a lowercase letter, number, or an underscore character, then you
-            must include that name in double quotes. You can specify this option multiple times. You
-            cannot combine this option with a schema filtering option such as
-              <codeph>--include-schema</codeph>, or another table filtering option such as
-              <codeph>--exclude-table-file</codeph>.</pd>
+            must include that name single quotes. See <xref href="#topic1/table_names" format="dita"
+              >Schema and Table Names</xref> for information about characters that are supported in
+            schema and table names.</pd>
+          <pd>You can specify this option multiple times. You cannot combine this option with a
+            schema filtering option such as <codeph>--include-schema</codeph>, or another table
+            filtering option such as <codeph>--exclude-table-file</codeph>.</pd>
           <pd>You can also specify the qualified name of a sequence or a view. </pd>
           <pd>If you specify this option, the utility does not automatically back up dependent
             objects. You must also explicitly specify dependent objects that are required. For
@@ -194,9 +203,9 @@
           <pd>Optional. Specifies a text file containing a list of tables to include in the backup.
             Each line in the text file must define a single table using the format
               <codeph>&lt;schema-name>.&lt;table-name></codeph>. The file must not include trailing
-            lines. If a table or schema name uses any character other than a lowercase letter,
-            number, or an underscore character, then you must include that name in double quotes.
-            Any tables not listed in this file are omitted from the backup set. You cannot combine
+            lines. See <xref href="#topic1/table_names" format="dita">Schema and Table Names</xref>
+            for information about characters that are supported in schema and table names. </pd>
+          <pd>Any tables not listed in this file are omitted from the backup set. You cannot combine
             this option with a schema filtering option such as <codeph>--include-schema</codeph>, or
             another table filtering option such as <codeph>--exclude-table-file</codeph>.</pd>
           <pd>You can also specify the qualified name of a sequence or a view. </pd>
@@ -254,7 +263,7 @@
             backs up tables in a separate transaction. For example, if you specify <codeph>--jobs
               2</codeph>, the utility creates two processes, each process starts a single
             transaction, and the utility backs up the tables in parallel using the two processes.
-              <note type="important">If you specify a value higher than 1, the database must be in a
+            <note type="important">If you specify a value higher than 1, the database must be in a
               quiescent state while the utility acquires a lock on the tables that are being backed
               up. If database operations are being performed on tables that are being backed up
               during the table locking process, consistency between tables that are backed up in
@@ -303,9 +312,9 @@
           <pt><b>--single-data-file</b></pt>
           <pd>Optional. Create a single data file on each segment host for all tables backed up on
             that segment. By default, each <codeph>gpbackup</codeph> creates one compressed CSV file
-            for each table that is backed up on the segment.<note>If you use the
-                <codeph>--single-data-file</codeph> option to combine table backups into a single
-              file per segment, you cannot set the <codeph>gprestore</codeph> option
+            for each table that is backed up on the segment.
+            <note>If you use the <codeph>--single-data-file</codeph> option to combine table backups
+              into a single file per segment, you cannot set the <codeph>gprestore</codeph> option
                 <codeph>--jobs</codeph> to a value higher than 1 to perform a parallel restore
               operation.</note></pd>
         </plentry>
@@ -336,6 +345,27 @@
             information.</li>
           <li><b>2</b> – Backup failed with a fatal error. See log file for more information.</li>
         </ul></p>
+    </section>
+    <section id="table_names">
+      <title>Schema and Table Names</title>
+      <p>When specifying the table filtering option <codeph>--include-table</codeph> or
+          <codeph>--include-table-file</codeph> to list tables to be backed up, the
+          <codeph>gpbackup</codeph> utility supports backing up schemas or tables when the name
+        contains upper-case characters or these special characters. </p>
+      <p><codeph> ~ # $ % ^ &amp; * ( ) _ - + [ ] { } > &lt; \ | ; : / ? ! ,</codeph>
+      </p>
+      <p>If a name contains an upper-case or special character and is specified on the command line
+        with <codeph>--include-table</codeph>, the name must be enclosed in single quotes.
+        <codeblock>gpbackup --dbname test --include-table 'my#1schema'.'my_$42_Table'</codeblock></p>
+      <p>When the table is listed in a file for use with <codeph>--include-table-file</codeph>,
+        single quotes are not required. For example, this is the contents of a text file that is
+        used with <codeph>--include-table-file</codeph> to back up two
+        tables.<codeblock>my#1schema.my_$42_Table
+my#1schema.my_$590_Table</codeblock></p>
+      <note>The <codeph>--include-table</codeph> and <codeph>--include-table-file</codeph> options
+        do not support schema or table names that contain the character double quote
+          (<codeph>"</codeph>), period (<codeph>.</codeph>) , newline (<codeph>\n</codeph>), or
+        space (<codeph> </codeph>).</note>
     </section>
     <section>
       <title>Examples</title>

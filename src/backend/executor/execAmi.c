@@ -586,6 +586,7 @@ ExecMayReturnRawTuples(PlanState *node)
 		case T_MotionState:
 			if (node->lefttree == NULL)
 				return false;
+			/* fallthrough */
 		case T_HashState:
 		case T_MaterialState:
 		case T_UniqueState:
@@ -772,6 +773,22 @@ EagerFreeWalker(PlanState *node, void *context)
 				/* Skip the subtree */
 				return CdbVisit_Skip;
 			}
+		}
+	}
+
+	/*
+	 * If we have a Material node on top of Motion, there is a good chance the
+	 * Material was added to prevent Rescans of the underlying Motion node.
+	 * It is safer to not eagerly free the memory for the Material node in case
+	 * the subtree is rescanned.
+	 */
+	if (IsA(node, MaterialState))
+	{
+		PlanState *lefttree = node->lefttree;
+		if ((lefttree != NULL && IsA(lefttree, MotionState)) || node->delayEagerFree)
+		{
+			/* Skip the subtree */
+			return CdbVisit_Skip;
 		}
 	}
 

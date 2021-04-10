@@ -27,6 +27,11 @@ insert into fstest select i, i from generate_series (1,1000) i;
 
 select * from fstest;
 
+-- The size output is found to differ based on platform (e.g. on OSX
+-- it returns 97kB, on Ubuntu 112kB).  Pass the test as long as the
+-- size is greater than 50kB.
+SELECT pg_tablespace_size('regressionts1') > (50 * 1024) as result;
+
 comment on filespace regressionfs1 is 'groovy';
 comment on tablespace regressionts1 is 'also groovy';
 

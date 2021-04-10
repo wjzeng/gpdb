@@ -190,13 +190,11 @@ con6 /gpdata/*/pg_log/gpdb*.csv' &gt; seglog.out
             <body>
                 <p>The Greenplum Magic Tool (GPMT) utility can run diagnostics and collect
                     information from a Greenplum Database system. You can then send the information
-                    to Pivotal Customer Support to aid the diagnosis of Greenplum Database errors or
-                    system failures.</p>
-                <p>The GPMT  utility is available from the <xref
-                        href="https://discuss.pivotal.io/hc/en-us/categories/200072608-Pivotal-Greenplum-Knowledge-Base"
-                        format="html" scope="external">Pivotal Knowledge Base</xref> on the <xref
-                        href="https://discuss.pivotal.io/hc/en-us/articles/217546277-Greenplum-Magic-Tool-GPMT-"
-                        format="html" scope="external">GPMT</xref> page.</p>
+                    to VMware Customer Support to aid in the diagnosis of Greenplum Database errors
+                    or system failures.</p>
+                <p>The <codeph>gpmt</codeph> utility command is available in the
+                        <codeph>bin</codeph> directory of your Greenplum Database installation. See
+                        <xref href="../utility_guide/ref/gpmt.xml"/> for usage information.</p>
             </body>
         </topic>
     </topic>

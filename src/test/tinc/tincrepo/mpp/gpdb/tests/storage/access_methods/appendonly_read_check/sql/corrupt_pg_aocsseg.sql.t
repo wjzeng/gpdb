@@ -2,7 +2,7 @@ set allow_system_table_mods='DML';
 
 --pgaocsseg has more entries than gp_relation_node
 begin;
-    insert into pg_aoseg.pg_aocsseg_<oid> values(5, 6, 7, '0'::bytea, 1, 1, 1);
+    insert into pg_aoseg.pg_aocsseg_<oid> values(5, 6, 7, '0'::bytea, 1, 3, 1);
     select * from co1;
 abort;
 

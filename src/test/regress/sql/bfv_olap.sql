@@ -447,6 +447,29 @@ FROM (
 WHERE c = 87 ;
 
 
+--
+-- This used to crash or fail an assertion, because 'simple_rte_array' was not
+-- copied correctly in WITHIN GROUP planning, causing reference-after-free.
+--
+CREATE TABLE hundred_parts(a int, b int, c int, d int) DISTRIBUTED RANDOMLY
+  PARTITION BY RANGE (a) (START (1) END (100) EVERY (1));
+
+INSERT INTO hundred_parts SELECT g, g/10, g/20, g/25 from generate_series(1,99) g;
+
+SELECT a,
+       percentile_disc(1) WITHIN GROUP (ORDER BY b) AS perc100,
+       percentile_disc(0.90) WITHIN GROUP (ORDER BY c) AS perc90,
+       percentile_disc(0.80) WITHIN GROUP (ORDER BY d) AS perc80,
+       percentile_disc(0.70) WITHIN GROUP (ORDER BY b) AS perc70,
+       percentile_disc(0.60) WITHIN GROUP (ORDER BY c) AS perc60,
+       percentile_disc(0.50) WITHIN GROUP (ORDER BY d) AS perc50,
+       percentile_disc(0.40) WITHIN GROUP (ORDER BY b) AS perc40,
+       percentile_disc(0.30) WITHIN GROUP (ORDER BY c) AS perc30,
+       percentile_disc(0.20) WITHIN GROUP (ORDER BY d) AS perc20,
+       percentile_disc(0.10) WITHIN GROUP (ORDER BY b) AS perc10
+FROM hundred_parts
+GROUP BY a;
+
 -- CLEANUP
 -- start_ignore
 drop schema bfv_olap cascade;

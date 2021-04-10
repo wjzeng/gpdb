@@ -780,17 +780,16 @@ EXPLAIN SELECT * FROM geometricTypesPartition
  WHERE c ~= SeedToCircle(101);
                                                       QUERY PLAN                                                       
 -----------------------------------------------------------------------------------------------------------------------
- Gather Motion 3:1  (slice1; segments: 3)  (cost=0.00..0.01 rows=1 width=68)
-   ->  Sequence  (cost=0.00..0.00 rows=1 width=68)
+ Gather Motion 3:1  (slice1; segments: 3)  (cost=0.00..6.00 rows=1 width=68)
+   ->  Sequence  (cost=0.00..6.00 rows=1 width=68)
          ->  Partition Selector for geometrictypespartition (dynamic scan id: 1)  (cost=10.00..100.00 rows=34 width=4)
                Partitions selected: 2 (out of 2)
-         ->  Bitmap Table Scan on geometrictypespartition (dynamic scan id: 1)  (cost=0.00..0.00 rows=1 width=68)
-               Recheck Cond: c ~= '<(8479,-3121),8441>'::circle
-               ->  Bitmap Index Scan on gt_index_c_part_1_prt_1  (cost=0.00..0.00 rows=0 width=0)
-                     Index Cond: c ~= '<(8479,-3121),8441>'::circle
+         ->  Dynamic Index Scan on geometrictypespartition (dynamic scan id: 1)  (cost=0.00..6.00 rows=1 width=68)
+               Index Cond: c ~= '<(8479,-3121),8441>'::circle
+               Filter: c ~= '<(8479,-3121),8441>'::circle
  Settings:  enable_seqscan=off
- Optimizer status: PQO version 2.65.1
-(10 rows)
+ Optimizer status: PQO version 3.50.0
+(9 rows)
 
 DROP TABLE IF EXISTS geometricTypesPartition;
 -- ----------------------------------------------------------------------

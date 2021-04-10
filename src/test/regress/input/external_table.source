@@ -25,6 +25,8 @@
 -- s/cat\: cannot open (.*)$/cat\: $1\: NO SUCH FILE/
 --
 -- end_matchsubs
+CREATE EXTENSION IF NOT EXISTS gp_inject_fault;
+
 CREATE TABLE REG_REGION (R_REGIONKEY INT, R_NAME CHAR(25), R_COMMENT VARCHAR(152)) DISTRIBUTED BY (R_REGIONKEY);
 
 -- --------------------------------------
@@ -266,6 +268,32 @@ CREATE EXTERNAL WEB TABLE cascadetest (x text) EXECUTE 'echo "cascadetest";' FOR
 SELECT count(*) FROM pg_exttable WHERE command = 'echo "cascadetest";';
 DROP EXTERNAL TABLE cascadetest;
 SELECT count(*) FROM pg_exttable WHERE command = 'echo "cascadetest";';
+
+-- Verify that an external table can be dropped and then recreated in consecutive attempts
+CREATE OR REPLACE FUNCTION drop_and_recreate_external_table()
+	RETURNS void
+	LANGUAGE plpgsql
+	VOLATILE
+AS $function$
+DECLARE
+BEGIN
+DROP EXTERNAL TABLE IF EXISTS t_ext_r;
+CREATE EXTERNAL TABLE t_ext_r (
+	name varchar
+)
+LOCATION ('GPFDIST://127.0.0.1/tmp/dummy') ON ALL
+FORMAT 'CSV' ( delimiter ' ' null '' escape '"' quote '"' )
+ENCODING 'UTF8';
+END;
+$function$;
+
+do $$
+begin
+  for i in 1..5 loop
+	PERFORM drop_and_recreate_external_table();
+  end loop;
+end;
+$$;
 
 CREATE SCHEMA exttabletest;
 CREATE
@@ -526,6 +554,15 @@ SELECT gp_truncate_error_log('exttab_cursor_2');
 -- the segments reaches the reject limit and reports the error back to the QD
 -- before the others, the transaction gets aborted. The timing of fetching the
 -- results will  influence the order of the ERROR in the output.
+--
+-- For gp_interconnect_type=tcp:
+-- If the segment errors out before QD call 'SetupInterconnect', QD will report
+-- this error in 'SetupInterconnect', or else, QD will report the error in the
+-- following FETCH command.
+-- To make this test deterministic, we use gp_inject_fault to let QD sleep 1
+-- second before 'SetupInterconnect' to make sure QD calls 'SetupInterconnect'
+-- after segment errors out.
+SELECT gp_inject_fault('interconnect_setup_palloc', 'sleep', '', '', '', 1, 1, 1::smallint);
 BEGIN;
 DECLARE exttab_cur1 no scroll cursor FOR
 SELECT e1.i, e2.j from exttab_cursor_2 e1 INNER JOIN exttab_cursor_2 e2 ON e1.i = e2.i
@@ -533,11 +570,8 @@ UNION ALL
 SELECT e1.i, e2.j from exttab_cursor_2 e1 INNER JOIN exttab_cursor_2 e2 ON e1.i = e2.i
 UNION ALL
 SELECT e1.i, e2.j from exttab_cursor_2 e1 INNER JOIN exttab_cursor_2 e2 ON e1.i = e2.i;
--- Should not fail as we would not have reached segment reject limit yet. This fails currently though
--- because how cursors scan the rows internally is implementation dependant. 
--- The test is here to track the issue.
-FETCH exttab_cur1;
 COMMIT;
+SELECT gp_inject_fault('interconnect_setup_palloc', 'reset', 1);
 -- This should have errors populated already
 SELECT count(*) > 0 FROM gp_read_error_log('exttab_cursor_2');
 
@@ -1656,3 +1690,37 @@ LOCATION (
 FORMAT 'CUSTOM' (formatter='gpformatter');
 
 SELECT * FROM tbl_ext_gpformatter;
+
+-- Test notice reject message when execute on master
+
+CREATE EXTERNAL WEB TABLE web_exec_on_master_with_err_limit (c1 int) EXECUTE 'for i in `seq 1 2`; do echo 1 3;done; echo 22' ON MASTER FORMAT 'TEXT' SEGMENT REJECT LIMIT 3;
+
+SELECT * FROM web_exec_on_master_with_err_limit;
+
+DROP EXTERNAL TABLE web_exec_on_master_with_err_limit;
+
+-- Test notice reject message when execute on master with multiple commands
+
+CREATE EXTERNAL WEB TABLE web_exec_on_master_with_multiple_commands (c1 int) EXECUTE 'for i in `seq 1 `; do echo 2 1;
+done; echo 2 ; echo 1 2; echo 2;  echo 3 4' ON MASTER FORMAT 'TEXT' SEGMENT REJECT LIMIT 6;
+
+SELECT * FROM  web_exec_on_master_with_multiple_commands;
+
+DROP EXTERNAL TABLE web_exec_on_master_with_multiple_commands;
+
+-- Test notice reject message when execute on segments with multiple commands
+
+CREATE EXTERNAL WEB TABLE web_exec_on_segments_with_multiple_commands (c1 int) EXECUTE 'for i in `seq 1 `; do echo 2 1;
+done; echo 2 ; echo 1 2; echo 2;  echo 3 4' FORMAT 'TEXT' SEGMENT REJECT LIMIT 6;
+
+SELECT * FROM  web_exec_on_segments_with_multiple_commands;
+
+DROP EXTERNAL TABLE web_exec_on_segments_with_multiple_commands;
+
+-- Test reject number reached when execute on master
+
+CREATE EXTERNAL WEB TABLE web_exec_on_master_with_err_limit_reached (c1 int) EXECUTE 'for i in `seq 1 3`; do echo 1 3;done; echo 22' ON MASTER FORMAT 'TEXT' SEGMENT REJECT LIMIT 3;
+
+SELECT * FROM web_exec_on_master_with_err_limit_reached;
+
+DROP EXTERNAL TABLE web_exec_on_master_with_err_limit_reached;

@@ -68,7 +68,8 @@ static void InitParseState(CopyState pstate, Relation relation,
 			   Datum *values, bool *nulls, bool writable,
 			   List *fmtOpts, char fmtType,
 			   char *uri, int rejectlimit,
-			   bool islimitinrows, Oid fmterrtbl, int encoding);
+			   bool islimitinrows, Oid fmterrtbl, int encoding,
+			   List *extOptions);
 
 static void FunctionCallPrepareFormatter(FunctionCallInfoData *fcinfo,
 							 int nArgs,
@@ -79,7 +80,7 @@ static void FunctionCallPrepareFormatter(FunctionCallInfoData *fcinfo,
 							 FmgrInfo *convFuncs,
 							 Oid *typioparams);
 
-static void open_external_readable_source(FileScanDesc scan, List* filter_quals);
+static void open_external_readable_source(FileScanDesc scan, ExternalSelectDesc desc);
 static void open_external_writable_source(ExternalInsertDesc extInsertDesc);
 static int	external_getdata(URL_FILE *extfile, CopyState pstate, int maxread);
 static void external_senddata(URL_FILE *extfile, CopyState pstate);
@@ -127,6 +128,7 @@ external_beginscan(Relation relation, Index scanrelid, uint32 scancounter,
 	int			attnum;
 	int			segindex = GpIdentity.segindex;
 	char	   *uri = NULL;
+	ExtTableEntry *extentry = NULL;
 
 	/*
 	 * increment relation ref count while scanning relation
@@ -267,8 +269,11 @@ external_beginscan(Relation relation, Index scanrelid, uint32 scancounter,
 	scan->fs_pstate = (CopyStateData *) palloc0(sizeof(CopyStateData));
 
 	/* Initialize all the parsing and state variables */
-	InitParseState(scan->fs_pstate, relation, NULL, NULL, false, fmtOpts, fmtType,
-				scan->fs_uri, rejLimit, rejLimitInRows, fmterrtbl, encoding);
+	extentry = GetExtTableEntry(RelationGetRelid(relation));
+	InitParseState(scan->fs_pstate, relation, NULL, NULL,
+				   false, fmtOpts, fmtType,
+				   scan->fs_uri, rejLimit, rejLimitInRows,
+				   fmterrtbl, encoding, extentry->options);
 
 	if (fmttype_is_custom(fmtType))
 	{
@@ -313,6 +318,23 @@ void
 external_endscan(FileScanDesc scan)
 {
 	char	   *relname = pstrdup(RelationGetRelationName(scan->fs_rd));
+
+	/*
+	 * report Sreh results if external web table execute on master with reject limit.
+	 * if external web table execute on segment, these messages are printed
+	 * in cdbdisp_sumRejectedRows()
+	*/
+	if (Gp_role == GP_ROLE_DISPATCH)
+	{
+		CopyState cstate = scan->fs_pstate;
+		if (cstate && cstate->cdbsreh)
+		{
+			CdbSreh	 *cdbsreh = cstate->cdbsreh;
+			uint64	total_rejected_from_qd = cdbsreh->rejectcount;
+			if (total_rejected_from_qd > 0)
+				ReportSrehResults(cdbsreh, total_rejected_from_qd);
+		}
+	}
 
 	if (scan->fs_pstate != NULL)
 	{
@@ -433,6 +455,19 @@ external_stopscan(FileScanDesc scan)
 	}
 }
 
+/*	----------------
+ *		external_getnext_init - prepare ExternalSelectDesc struct before external_getnext
+ *	----------------
+ */
+ExternalSelectDesc
+external_getnext_init(PlanState *state)
+{
+	ExternalSelectDesc
+		desc = (ExternalSelectDesc) palloc0(sizeof(ExternalSelectDescData));
+	if (state != NULL)
+		desc->projInfo = state->ps_ProjInfo;
+	return desc;
+}
 
 /* ----------------------------------------------------------------
 *		external_getnext
@@ -441,7 +476,7 @@ external_stopscan(FileScanDesc scan)
 * ----------------------------------------------------------------
 */
 HeapTuple
-external_getnext(FileScanDesc scan, ScanDirection direction, List* filter_quals)
+external_getnext(FileScanDesc scan, ScanDirection direction, ExternalSelectDesc desc)
 {
 	HeapTuple	tuple;
 
@@ -461,7 +496,7 @@ external_getnext(FileScanDesc scan, ScanDirection direction, List* filter_quals)
 	 * only.
 	 */
 	if (!scan->fs_file)
-		open_external_readable_source(scan, filter_quals);
+		open_external_readable_source(scan, desc);
 
 	/* Note: no locking manipulations needed */
 	FILEDEBUG_1;
@@ -569,7 +604,8 @@ external_insert_init(Relation rel)
 				   extentry->rejectlimit,
 				   (extentry->rejectlimittype == 'r'),
 				   extentry->fmterrtbl,
-				   extentry->encoding);
+				   extentry->encoding,
+				   extentry->options);
 
 	if (fmttype_is_custom(extentry->fmtcode))
 	{
@@ -1172,7 +1208,7 @@ externalgettup_custom(FileScanDesc scan)
 */
 static HeapTuple
 externalgettup(FileScanDesc scan,
-			   ScanDirection dir __attribute__((unused)))
+               ScanDirection dir __attribute__((unused)))
 {
 	CopyState	pstate = scan->fs_pstate;
 	bool		custom = pstate->custom;
@@ -1277,7 +1313,8 @@ InitParseState(CopyState pstate, Relation relation,
 			   Datum *values, bool *nulls, bool iswritable,
 			   List *fmtOpts, char fmtType,
 			   char *uri, int rejectlimit,
-			   bool islimitinrows, Oid fmterrtbl, int encoding)
+			   bool islimitinrows, Oid fmterrtbl, int encoding,
+			   List *extOptions)
 {
 	TupleDesc	tupDesc = NULL;
 	char	   *format_str = NULL;
@@ -1342,6 +1379,9 @@ InitParseState(CopyState pstate, Relation relation,
 									  log_to_file);
 
 		pstate->cdbsreh->relid = RelationGetRelid(relation);
+		/* whether make the error log persistent*/
+		if (log_to_file && NeedErrorLogPersistent(extOptions))
+			pstate->cdbsreh->error_log_persistent = true;
 
 		pstate->num_consec_csv_err = 0;
 	}
@@ -1546,7 +1586,7 @@ FunctionCallPrepareFormatter(FunctionCallInfoData *fcinfo,
  * 4) a command to execute
  */
 static void
-open_external_readable_source(FileScanDesc scan, List* filter_quals)
+open_external_readable_source(FileScanDesc scan, ExternalSelectDesc desc)
 {
 	extvar_t	extvar;
 
@@ -1567,7 +1607,7 @@ open_external_readable_source(FileScanDesc scan, List* filter_quals)
 							  false /* for read */ ,
 							  &extvar,
 							  scan->fs_pstate,
-							  filter_quals);
+							  desc);
 }
 
 /*
@@ -1925,7 +1965,7 @@ strip_quotes(char *source, char quote, char escape, int encoding)
  * next on a single source string, but changing whitespace is a bad idea
  * since you might lose data.
  */
-static char *
+char *
 strtokx2(const char *s,
 		 const char *whitespace,
 		 const char *delim,
@@ -2437,7 +2477,7 @@ external_set_env_vars_ext(extvar_t *extvar, char *uri, bool csv, char *escape, c
 	char	   *encoded_delim;
 	int			line_delim_len;
 
-	sprintf(extvar->GP_CSVOPT,
+	snprintf(extvar->GP_CSVOPT, sizeof(extvar->GP_CSVOPT),
 			"m%dx%dq%dn%dh%d",
 			csv ? 1 : 0,
 			escape ? 255 & *escape : 0,
@@ -2486,7 +2526,7 @@ external_set_env_vars_ext(extvar_t *extvar, char *uri, bool csv, char *escape, c
 				(errcode_for_file_access(),
 				 errmsg("cannot get distributed transaction identifier while %s", uri)));
 
-	sprintf(extvar->GP_CID, "%x", QEDtxContextInfo.curcid);
+	sprintf(extvar->GP_CID, "%x", gp_command_count);
 	sprintf(extvar->GP_SN, "%x", scancounter);
 	sprintf(extvar->GP_SEGMENT_ID, "%d", Gp_segment);
 	sprintf(extvar->GP_SEG_PORT, "%d", PostPortNumber);

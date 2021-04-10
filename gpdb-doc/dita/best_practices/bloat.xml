@@ -192,7 +192,7 @@ where a.relnamespace=b.oid and b.nspname='pg_catalog' and a.relkind='r'"
 
 reindexdb -s -d $DBNAME
 psql -tc "SELECT 'VACUUM' || $SYSTABLES" $DBNAME | psql -a $DBNAME
-analyzedb -s pg_catalog -d $DBNAME</pre></p>
+analyzedb -a -s pg_catalog -d $DBNAME</pre></p>
       <p>If the system catalogs become significantly bloated, you must perform an intensive system
         catalog maintenance procedure. The <codeph>CREATE TABLE AS SELECT</codeph> and
         redistribution key methods for removing bloat cannot be used with system catalogs. You must

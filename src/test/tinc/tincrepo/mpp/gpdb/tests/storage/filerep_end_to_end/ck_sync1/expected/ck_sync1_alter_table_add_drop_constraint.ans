@@ -201,7 +201,7 @@ select count(*) from ck_sync1_heap_films7;
 --
 --ADD table_constraint
 --
-ALTER TABLE sync1_heap_films2 ADD UNIQUE(code, date_prod);
+ALTER TABLE sync1_heap_films2 ADD UNIQUE(date_prod, code);
 psql:/path/sql_file:1: NOTICE:  ALTER TABLE / ADD UNIQUE will create implicit index "sync1_heap_films2_code_key" for table "sync1_heap_films2"
 ALTER TABLE
 select count(*) from sync1_heap_films2;
@@ -210,7 +210,7 @@ select count(*) from sync1_heap_films2;
      5
 (1 row)
 
-ALTER TABLE ck_sync1_heap_films1 ADD UNIQUE(code, date_prod);
+ALTER TABLE ck_sync1_heap_films1 ADD UNIQUE(date_prod, code);
 psql:/path/sql_file:1: NOTICE:  ALTER TABLE / ADD UNIQUE will create implicit index "ck_sync1_heap_films1_code_key" for table "ck_sync1_heap_films1"
 ALTER TABLE
 select count(*) from ck_sync1_heap_films1;

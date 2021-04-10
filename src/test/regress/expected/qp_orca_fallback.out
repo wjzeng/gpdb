@@ -105,12 +105,8 @@ SELECT * FROM homer;
  4 | 3 | 44
 (4 rows)
 
--- ORCA should not fallback when ONLY clause is used on external tables
+-- ORCA should not fallback just because external tables are in FROM clause
 -- start_ignore
-DROP TABLE IF EXISTS t1;
-NOTICE:  table "t1" does not exist, skipping
-DROP TABLE IF EXISTS ext_table_no_fallback;
-NOTICE:  table "ext_table_no_fallback" does not exist, skipping
 CREATE TABLE heap_t1 (a int, b int) DISTRIBUTED BY (b);
 CREATE EXTERNAL TABLE ext_table_no_fallback (a int, b int) LOCATION ('gpfdist://myhost:8080/test.csv') FORMAT 'CSV';
 -- end_ignore
@@ -122,6 +118,7 @@ EXPLAIN SELECT * FROM ext_table_no_fallback;
  Optimizer: legacy query optimizer
 (3 rows)
 
+-- ORCA should fallback due to ONLY keyword
 EXPLAIN SELECT * FROM ONLY ext_table_no_fallback;
                                        QUERY PLAN                                        
 -----------------------------------------------------------------------------------------
@@ -140,3 +137,32 @@ EXPLAIN INSERT INTO heap_t1 SELECT * FROM ONLY ext_table_no_fallback;
  Optimizer: legacy query optimizer
 (5 rows)
 
+set optimizer_enable_dml=off;
+EXPLAIN INSERT INTO homer VALUES (1,0,40),(2,1,43),(3,2,41),(4,3,44);
+                                       QUERY PLAN                                        
+-----------------------------------------------------------------------------------------
+ Insert (slice0; segments: 3)  (rows=2 width=12)
+   ->  Redistribute Motion 1:3  (slice1; segments: 1)  (cost=0.00..0.05 rows=4 width=12)
+         Hash Key: "*VALUES*".column1
+         ->  Values Scan on "*VALUES*"  (cost=0.00..0.05 rows=2 width=12)
+ Optimizer: Postgres query optimizer
+(5 rows)
+
+EXPLAIN UPDATE ONLY homer SET c = c + 1;
+                            QUERY PLAN                             
+-------------------------------------------------------------------
+ Update (cost=0.00..1073.75 rows=25967 width=22)
+   ->  Seq Scan on homer  (cost=0.00..1073.75 rows=25967 width=22)
+ Optimizer: Postgres query optimizer
+(3 rows)
+
+EXPLAIN DELETE FROM ONLY homer WHERE a = 3;
+                           QUERY PLAN                           
+----------------------------------------------------------------
+ Delete (cost=0.00..1073.75 rows=78 width=10)
+   ->  Seq Scan on homer  (cost=0.00..1073.75 rows=26 width=10)
+         Filter: (a = 3)
+ Optimizer: Postgres query optimizer
+(4 rows)
+
+set optimizer_enable_dml=on;

@@ -122,6 +122,7 @@ extern int xid_warn_limit;
  */
 extern bool TransactionIdDidCommit(TransactionId transactionId);
 extern bool TransactionIdDidAbort(TransactionId transactionId);
+extern bool TransactionIdDidAbortForReader(TransactionId transactionId);
 extern void TransactionIdCommit(TransactionId transactionId);
 extern void TransactionIdAsyncCommit(TransactionId transactionId, XLogRecPtr lsn);
 extern void TransactionIdAbort(TransactionId transactionId);

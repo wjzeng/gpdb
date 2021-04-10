@@ -275,7 +275,7 @@ DROP TABLE concur_heap;
 
 CREATE TABLE onek_with_null AS SELECT unique1, unique2 FROM onek DISTRIBUTED BY (unique1);
 INSERT INTO onek_with_null (unique1,unique2) VALUES (NULL, -1), (NULL, NULL);
-CREATE UNIQUE INDEX onek_nulltest ON onek_with_null (unique2,unique1);
+CREATE UNIQUE INDEX onek_nulltest ON onek_with_null (unique1,unique2);
 
 SET enable_seqscan = OFF;
 SET enable_indexscan = ON;
@@ -286,21 +286,21 @@ SELECT count(*) FROM onek_with_null WHERE unique1 IS NULL AND unique2 IS NULL;
 
 DROP INDEX onek_nulltest;
 
-CREATE UNIQUE INDEX onek_nulltest ON onek_with_null (unique2 desc,unique1);
+CREATE UNIQUE INDEX onek_nulltest ON onek_with_null (unique1,unique2 desc);
 
 SELECT count(*) FROM onek_with_null WHERE unique1 IS NULL;
 SELECT count(*) FROM onek_with_null WHERE unique1 IS NULL AND unique2 IS NULL;
 
 DROP INDEX onek_nulltest;
 
-CREATE UNIQUE INDEX onek_nulltest ON onek_with_null (unique2 desc nulls last,unique1);
+CREATE UNIQUE INDEX onek_nulltest ON onek_with_null (unique1, unique2 desc nulls last);
 
 SELECT count(*) FROM onek_with_null WHERE unique1 IS NULL;
 SELECT count(*) FROM onek_with_null WHERE unique1 IS NULL AND unique2 IS NULL;
 
 DROP INDEX onek_nulltest;
 
-CREATE UNIQUE INDEX onek_nulltest ON onek_with_null (unique2  nulls first,unique1);
+CREATE UNIQUE INDEX onek_nulltest ON onek_with_null (unique1,unique2 nulls first);
 
 SELECT count(*) FROM onek_with_null WHERE unique1 IS NULL;
 SELECT count(*) FROM onek_with_null WHERE unique1 IS NULL AND unique2 IS NULL;

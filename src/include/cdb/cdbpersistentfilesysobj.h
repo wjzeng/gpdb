@@ -254,6 +254,8 @@ extern void PersistentFileSysObj_GetAppendOnlyCatchupMirrorStartEof(
 
 extern void PersistentFileSysObj_RequestResynchronizeTransition(void);
 
+extern void PersistentFileSysObj_DebugPrintPersistentState(bool is_start);
+
 extern void PersistentFileSysObj_MarkWholeMirrorFullCopy(void);
 
 extern void PersistentFileSysObj_MarkAppendOnlyCatchup(void);

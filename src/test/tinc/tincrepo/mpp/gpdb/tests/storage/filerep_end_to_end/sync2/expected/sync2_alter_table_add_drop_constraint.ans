@@ -66,7 +66,7 @@ select count(*) from sync2_heap_films2;
 --
 --ADD table_constraint
 --
-ALTER TABLE sync1_heap_films7 ADD UNIQUE(code, date_prod);
+ALTER TABLE sync1_heap_films7 ADD UNIQUE(date_prod, code);
 psql:/path/sql_file:1: NOTICE:  ALTER TABLE / ADD UNIQUE will create implicit index "sync1_heap_films7_code_key" for table "sync1_heap_films7"
 ALTER TABLE
 select count(*) from sync1_heap_films7;
@@ -75,7 +75,7 @@ select count(*) from sync1_heap_films7;
      5
 (1 row)
 
-ALTER TABLE ck_sync1_heap_films6 ADD UNIQUE(code, date_prod);
+ALTER TABLE ck_sync1_heap_films6 ADD UNIQUE(date_prod, code);
 psql:/path/sql_file:1: NOTICE:  ALTER TABLE / ADD UNIQUE will create implicit index "ck_sync1_heap_films6_code_key" for table "ck_sync1_heap_films6"
 ALTER TABLE
 select count(*) from ck_sync1_heap_films6;
@@ -84,7 +84,7 @@ select count(*) from ck_sync1_heap_films6;
      5
 (1 row)
 
-ALTER TABLE ct_heap_films4 ADD UNIQUE(code, date_prod);
+ALTER TABLE ct_heap_films4 ADD UNIQUE(date_prod, code);
 psql:/path/sql_file:1: NOTICE:  ALTER TABLE / ADD UNIQUE will create implicit index "ct_heap_films4_code_key" for table "ct_heap_films4"
 ALTER TABLE
 select count(*) from ct_heap_films4;
@@ -93,7 +93,7 @@ select count(*) from ct_heap_films4;
      5
 (1 row)
 
-ALTER TABLE resync_heap_films2 ADD UNIQUE(code, date_prod);
+ALTER TABLE resync_heap_films2 ADD UNIQUE(date_prod, code);
 psql:/path/sql_file:1: NOTICE:  ALTER TABLE / ADD UNIQUE will create implicit index "resync_heap_films2_code_key" for table "resync_heap_films2"
 ALTER TABLE
 select count(*) from resync_heap_films2;
@@ -102,7 +102,7 @@ select count(*) from resync_heap_films2;
      5
 (1 row)
 
-ALTER TABLE sync2_heap_films1 ADD UNIQUE(code, date_prod);
+ALTER TABLE sync2_heap_films1 ADD UNIQUE(date_prod, code);
 psql:/path/sql_file:1: NOTICE:  ALTER TABLE / ADD UNIQUE will create implicit index "sync2_heap_films1_code_key" for table "sync2_heap_films1"
 ALTER TABLE
 select count(*) from sync2_heap_films1;

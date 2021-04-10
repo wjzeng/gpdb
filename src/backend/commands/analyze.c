@@ -46,7 +46,7 @@
 #include "utils/builtins.h"
 #include "utils/datum.h"
 #include "utils/guc.h"
-#include "utils/hyperloglog/hyperloglog.h"
+#include "utils/hyperloglog/gp_hyperloglog.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/pg_rusage.h"
@@ -56,7 +56,8 @@
 
 /*
  * To avoid consuming too much memory during analysis and/or too much space
- * in the resulting pg_statistic rows, we ignore varlena datums that are wider
+ * in the resulting pg_statistic rows, we truncate text and varchar datums
+ * to WIDTH_THRESHOLD and we ignore other varlena datums that are wider
  * than WIDTH_THRESHOLD (after detoasting!).  This is legitimate for MCV
  * and distinct-value calculations since a wide value is unlikely to be
  * duplicated at all, much less be a most-common value.  For the same reason,
@@ -70,7 +71,7 @@
  * distinct values estimated by hyperloglog is within an error of 3%,
  * we consider everything as distinct.
  */
-#define HLL_ERROR_MARGIN  0.03
+#define GP_HLL_ERROR_MARGIN  0.03
 
 /* Data structure for Algorithm S from Knuth 3.4.2 */
 typedef struct
@@ -138,6 +139,7 @@ static Datum ind_fetch_func(VacAttrStatsP stats, int rownum, bool *isNull);
 static bool std_typanalyze(VacAttrStats *stats);
 
 static void analyzeEstimateReltuplesRelpages(Oid relationOid, float4 *relTuples, float4 *relPages, bool rootonly);
+static void analyzeGetReltuplesRelpages(Oid relationOid, float4 *relTuples, float4 *relPages, bool rootonly);
 static void analyzeEstimateIndexpages(Relation onerel, Relation indrel, BlockNumber *indexPages);
 
 static void analyze_rel_internal(Oid relid, VacuumStmt *vacstmt,
@@ -484,8 +486,9 @@ analyze_rel_internal(Oid relid, VacuumStmt *vacstmt,
 	{
 		float4 relTuples;
 		float4 relPages;
-		analyzeEstimateReltuplesRelpages(RelationGetRelid(onerel), &relTuples, &relPages,
+		analyzeGetReltuplesRelpages(RelationGetRelid(onerel), &relTuples, &relPages,
 										 vacstmt->rootonly);
+
 		totalrows = relTuples;
 		totalpages = relPages;
 		totaldeadrows = 0;
@@ -579,10 +582,10 @@ analyze_rel_internal(Oid relid, VacuumStmt *vacstmt,
 					int2 stakind = 0;
 					if(stats->stahll != NULL)
 					{
-						((HLLCounter) (stats->stahll))->relPages = totalpages;
-						((HLLCounter) (stats->stahll))->relTuples = totalrows;
+						((GpHLLCounter) (stats->stahll))->relPages = totalpages;
+						((GpHLLCounter) (stats->stahll))->relTuples = totalrows;
 
-						hll_length = hyperloglog_len((HLLCounter)stats->stahll);
+						hll_length = gp_hyperloglog_len((GpHLLCounter)stats->stahll);
 						hll_values[0] = datumCopy(PointerGetDatum(stats->stahll), false, hll_length);
 						stakind = STATISTIC_KIND_HLL;
 					}
@@ -1521,6 +1524,17 @@ acquire_sample_rows_by_query(Relation onerel, int nattrs, VacAttrStats **attrsta
 	*totalrows = relTuples;
 	*totaldeadrows = 0;
 	*totalblocks = relPages;
+
+	if (RelationIsHeap(onerel) && relTuples == 0 && relPages > 0)
+	{
+		/*
+		 * NOTICE user when all sampled pages are empty
+		 */
+		ereport(NOTICE,
+			(errmsg("ANALYZE detected all empty sample pages for relation \"%s\".",
+				RelationGetRelationName(onerel)),
+			 errhint("Run VACUUM FULL on the relation to generate more accurate statistics.")));
+	}
 	if (relTuples == 0.0)
 		return 0;
 
@@ -1546,12 +1560,33 @@ acquire_sample_rows_by_query(Relation onerel, int nattrs, VacAttrStats **attrsta
 		{
 			isVarlenaCol[i] = false;
 			const char *attname = quote_identifier(NameStr(attrstats[i]->attr->attname));
+			bool is_text = (attrstats[i]->attr->atttypid == TEXTOID ||
+							attrstats[i]->attr->atttypid == VARCHAROID ||
+							attrstats[i]->attr->atttypid == BPCHAROID ||
+							attrstats[i]->attr->atttypid == BYTEAOID);
 			bool is_varlena = (!attrstats[i]->attr->attbyval &&
 									  attrstats[i]->attr->attlen == -1);
 			bool is_varwidth = (!attrstats[i]->attr->attbyval &&
 									   attrstats[i]->attr->attlen < 0);
+			bool is_numeric = attrstats[i]->attr->atttypid == NUMERICOID;
 
-			if (is_varlena || is_varwidth)
+			if (is_text)
+			{
+				// For text types and similar types where we can apply the substring function,
+				// truncate the value at WIDTH_THRESHOLD, to limit the amount of memory
+				// consumed by this value. Note that this should be more than enough to
+				// build bucket boundaries and that usually it will also be enough to compute
+				// reasonable NDV estimates. It will, however, result in an artificially low
+				// average width estimate for the column (similar to the varlena case below).
+				appendStringInfo(&columnStr,
+								 "substring(Ta.%s, 1, %d) as %s",
+								 attname,
+								 WIDTH_THRESHOLD,
+								 attname);
+
+			}
+			// numeric can be safely ignored while considering large varlen type.
+			else if (!is_numeric && (is_varlena || is_varwidth))
 			{
 				appendStringInfo(&columnStr,
 								 "(case when pg_column_size(Ta.%s) > %d then NULL else Ta.%s  end) as %s, ",
@@ -1566,7 +1601,6 @@ acquire_sample_rows_by_query(Relation onerel, int nattrs, VacAttrStats **attrsta
 								 "true"); // Greater than WIDTH_THRESHOLD
 				isVarlenaCol[i] = true;
 			}
-
 			else
 			{
 				appendStringInfo(&columnStr, "Ta.%s ", attname);
@@ -1815,6 +1849,46 @@ analyzeEstimateReltuplesRelpages(Oid relationOid, float4 *relTuples, float4 *rel
 		*relPages += DatumGetFloat4(values[1]);
 
 		SPI_finish();
+	}
+}
+
+
+static void
+analyzeGetReltuplesRelpages(Oid relationOid, float4 *relTuples, float4 *relPages, bool rootonly)
+{
+	*relPages = 0.0;
+	*relTuples = 0.0;
+
+	List *allRelOids = NIL;
+
+	/* if GUC optimizer_analyze_root_partition is off, we do not analyze root partitions, unless
+	 * using the 'ANALYZE ROOTPARTITION tablename' command.
+	 * This is done by estimating the reltuples to be 0 and thus bypass the actual analyze.
+	 * See MPP-21427.
+	 * For mid-level partitions, we aggregate the reltuples and relpages from all leaf children beneath.
+	 */
+	if (rel_part_status(relationOid) == PART_STATUS_INTERIOR ||
+		(rel_is_partitioned(relationOid) && (optimizer_analyze_root_partition || rootonly)))
+	{
+		allRelOids = rel_get_leaf_children_relids(relationOid);
+	}
+	else
+	{
+		allRelOids = list_make1_oid(relationOid);
+	}
+
+	/* iterate over all parts and add up estimates */
+	ListCell *lc = NULL;
+	foreach (lc, allRelOids)
+	{
+		Oid			singleOid = lfirst_oid(lc);
+		float4 		num_tuples = 0.0;
+
+		num_tuples = get_rel_reltuples(singleOid);
+		if (0 == num_tuples)
+			continue;
+		*relTuples += num_tuples;
+		*relPages += get_rel_relpages(singleOid);
 	}
 
 	return;
@@ -2293,7 +2367,7 @@ compute_minimal_stats(VacAttrStatsP stats,
 
 	fmgr_info(mystats->eqfunc, &f_cmpeq);
 
-	stats->stahll = (bytea *)hyperloglog_init_def();
+	stats->stahll = (bytea *)gp_hyperloglog_init_def();
 
 	elog(LOG, "Computing Minimal Stats : column %s", get_attname(stats->attr->attrelid, stats->attr->attnum));
 
@@ -2317,7 +2391,7 @@ compute_minimal_stats(VacAttrStatsP stats,
 		}
 		nonnull_cnt++;
 
-		stats->stahll = (bytea *)hyperloglog_add_item((HLLCounter) stats->stahll, value, stats->attr->attlen, stats->attr->attbyval, stats->attr->attalign);
+		stats->stahll = (bytea *)gp_hyperloglog_add_item((GpHLLCounter) stats->stahll, value, stats->attr->attlen, stats->attr->attbyval, stats->attr->attalign);
 
 		/*
 		 * If it's a variable-width field, add up widths for average width
@@ -2418,9 +2492,9 @@ compute_minimal_stats(VacAttrStatsP stats,
 			summultiple += track[nmultiple].count;
 		}
 
-		((HLLCounter) (stats->stahll))->nmultiples = nmultiple;
-		((HLLCounter) (stats->stahll))->ndistinct = track_cnt;
-		((HLLCounter) (stats->stahll))->samplerows = samplerows;
+		((GpHLLCounter) (stats->stahll))->nmultiples = nmultiple;
+		((GpHLLCounter) (stats->stahll))->ndistinct = track_cnt;
+		((GpHLLCounter) (stats->stahll))->samplerows = samplerows;
 
 		if (nmultiple == 0)
 		{
@@ -2685,8 +2759,12 @@ compute_scalar_stats(VacAttrStatsP stats,
 	int			nonnull_cnt = 0;
 	int			toowide_cnt = 0;
 	double		total_width = 0;
-	bool		is_varlena = (!stats->attr->attbyval &&
-							  stats->attr->attlen == -1);
+	bool		is_text     = (stats->attr->atttypid == TEXTOID ||
+							   stats->attr->atttypid == VARCHAROID ||
+							   stats->attr->atttypid == BPCHAROID ||
+							   stats->attr->atttypid == BYTEAOID);
+	bool		is_varlena  = (!stats->attr->attbyval &&
+							   stats->attr->attlen == -1);
 	bool		is_varwidth = (!stats->attr->attbyval &&
 							   stats->attr->attlen < 0);
 	double		corr_xysum;
@@ -2710,7 +2788,7 @@ compute_scalar_stats(VacAttrStatsP stats,
 	fmgr_info(cmpFn, &f_cmpfn);
 
 	// Initialize HLL counter to be stored in stats
-	stats->stahll = (bytea *)hyperloglog_init_def();
+	stats->stahll = (bytea *)gp_hyperloglog_init_def();
 
 	elog(LOG, "Computing Scalar Stats : column %s", get_attname(stats->attr->attrelid, stats->attr->attnum));
 
@@ -2732,7 +2810,7 @@ compute_scalar_stats(VacAttrStatsP stats,
 		}
 		nonnull_cnt++;
 
-		stats->stahll = (bytea *)hyperloglog_add_item((HLLCounter) stats->stahll, value, stats->attr->attlen, stats->attr->attbyval, stats->attr->attalign);
+		stats->stahll = (bytea *)gp_hyperloglog_add_item((GpHLLCounter) stats->stahll, value, stats->attr->attlen, stats->attr->attbyval, stats->attr->attalign);
 
 		/*
 		 * If it's a variable-width field, add up widths for average width
@@ -2751,7 +2829,7 @@ compute_scalar_stats(VacAttrStatsP stats,
 			 * excessively wide, and if so don't detoast at all --- just
 			 * ignore the value.
 			 */
-			if (toast_raw_datum_size(value) > WIDTH_THRESHOLD)
+			if (!is_text && toast_raw_datum_size(value) > WIDTH_THRESHOLD)
 			{
 				toowide_cnt++;
 				continue;
@@ -2863,9 +2941,9 @@ compute_scalar_stats(VacAttrStatsP stats,
 		// interpolate NDV calculation based on the hll distinct count
 		// for each column in leaf partitions which will be used later
 		// to merge root stats
-		((HLLCounter) (stats->stahll))->nmultiples = nmultiple;
-		((HLLCounter) (stats->stahll))->ndistinct = ndistinct;
-		((HLLCounter) (stats->stahll))->samplerows = samplerows;
+		((GpHLLCounter) (stats->stahll))->nmultiples = nmultiple;
+		((GpHLLCounter) (stats->stahll))->ndistinct = ndistinct;
+		((GpHLLCounter) (stats->stahll))->samplerows = samplerows;
 
 		if (nmultiple == 0)
 		{
@@ -3016,7 +3094,7 @@ compute_scalar_stats(VacAttrStatsP stats,
 		{
 			MemoryContext old_context;
 			Datum	   *hist_values;
-			int			nvals;
+			int64			nvals;
 
 			/* Sort the MCV items into position order to speed next loop */
 			qsort((void *) track, num_mcv,
@@ -3072,7 +3150,7 @@ compute_scalar_stats(VacAttrStatsP stats,
 			hist_values = (Datum *) palloc(num_hist * sizeof(Datum));
 			for (i = 0; i < num_hist; i++)
 			{
-				int			pos;
+				int64			pos;
 
 				pos = (i * (nvals - 1)) / (num_hist - 1);
 				hist_values[i] = datumCopy(values[pos].value,
@@ -3190,7 +3268,6 @@ merge_leaf_stats(VacAttrStatsP stats,
 	float *relTuples = (float *) palloc0(sizeof(float) * numPartitions);
 	float *nDistincts = (float *) palloc0(sizeof(float) * numPartitions);
 	float *nMultiples = (float *) palloc0(sizeof(float) * numPartitions);
-	float *nUniques = (float *) palloc0(sizeof(float) * numPartitions);
 	int relNum = 0;
 	float totalTuples = 0;
 	float nmultiple = 0; // number of values that appeared more than once
@@ -3221,27 +3298,50 @@ merge_leaf_stats(VacAttrStatsP stats,
 	// NDV calculations
 	float4 colAvgWidth = 0;
 	float4 nullCount = 0;
-	HLLCounter *hllcounters = (HLLCounter *) palloc0(numPartitions * sizeof(HLLCounter));
-	HLLCounter *hllcounters_copy = (HLLCounter *) palloc0(numPartitions * sizeof(HLLCounter));
+	GpHLLCounter *hllcounters = (GpHLLCounter *) palloc0(numPartitions * sizeof(GpHLLCounter));
+	GpHLLCounter *hllcounters_copy = (GpHLLCounter *) palloc0(numPartitions * sizeof(GpHLLCounter));
 
-	HLLCounter finalHLL = NULL;
-	int i = 0, j;
+	GpHLLCounter finalHLL = NULL;
+	int i = 0;
 	double ndistinct = 0.0;
 	int samplehll_count = 0;
 	int totalhll_count = 0;
 	foreach (lc, oid_list)
 	{
-		Oid relid = lfirst_oid(lc);
+		Oid		leaf_relid = lfirst_oid(lc);
+		int32	stawidth = 0;
+		float4	stanullfrac = 0.0;
+
+		/*
+		 * Here, using the root table's attnum to retrieve the attname. And then use
+		 * the attname to retrieve the real attnum in current leaf table.
+		 * This is required because modification on root partition columns will cause
+		 * inconsistent attnum between root table and new added leaf tables.
+		 */
 		const char *attname = get_relid_attribute_name(stats->attr->attrelid, stats->attr->attnum);
-		AttrNumber child_attno = get_attnum(relid, attname);
 
-		colAvgWidth =
-			colAvgWidth +
-			get_attavgwidth(relid, child_attno) * relTuples[i];
-		nullCount = nullCount +
-					get_attnullfrac(relid, child_attno) * relTuples[i];
-
-		heaptupleStats[i] = get_att_stats(relid, child_attno);
+		/*
+		 * fetch_leaf_attnum and fetch_leaf_att_stats retrieve leaf partition
+		 * table's pg_attribute tuple and pg_statistic tuple through index scan
+		 * instead of system catalog cache. Since if using system catalog cache,
+		 * the total tuple entries insert into the cache will up to:
+		 * (number_of_leaf_tables * number_of_column_in_this_table) pg_attribute tuples
+		 * +
+		 * (number_of_leaf_tables * number_of_column_in_this_table) pg_statistic tuples
+		 * which could use extremely large memroy in CacheMemoryContext.
+		 * This happens when all of the leaf tables are analyzed. And the current function
+		 * will execute for all columns.
+		 *
+		 * fetch_leaf_att_stats copy the original tuple, so remember to free it.
+		 *
+		 * As a side-effect, ANALYZE same root table serveral times in same session is much
+		 * more slower than before since we don't rely on system catalog cache.
+		 *
+		 * But we still using the tuple descriptor in system catalog cache to retrieve
+		 * attribute in fetched tuples. See get_attstatsslot.
+		 */
+		AttrNumber child_attno = fetch_leaf_attnum(leaf_relid, attname);
+		heaptupleStats[i] = fetch_leaf_att_stats(leaf_relid, child_attno);
 
 		// if there is no colstats, we can skip this partition's stats
 		if (!HeapTupleIsValid(heaptupleStats[i]))
@@ -3250,6 +3350,11 @@ merge_leaf_stats(VacAttrStatsP stats,
 			continue;
 		}
 
+		stawidth = ((Form_pg_statistic) GETSTRUCT(heaptupleStats[i]))->stawidth;
+		stanullfrac = ((Form_pg_statistic) GETSTRUCT(heaptupleStats[i]))->stanullfrac;
+		colAvgWidth = colAvgWidth + (stawidth > 0 ? stawidth : 0) * relTuples[i];
+		nullCount = nullCount + (stanullfrac > 0.0 ? stanullfrac : 0.0) * relTuples[i];
+
 		AttStatsSlot hllSlot;
 
 		get_attstatsslot(&hllSlot, heaptupleStats[i], STATISTIC_KIND_HLL,
@@ -3257,12 +3362,17 @@ merge_leaf_stats(VacAttrStatsP stats,
 
 		if (hllSlot.nvalues > 0)
 		{
-			hllcounters[i] = (HLLCounter) DatumGetByteaP(hllSlot.values[0]);
+			hllcounters[i] = (GpHLLCounter) DatumGetByteaP(hllSlot.values[0]);
 			nDistincts[i] = (float) hllcounters[i]->ndistinct;
 			nMultiples[i] = (float) hllcounters[i]->nmultiples;
 			samplerows += hllcounters[i]->samplerows;
-			hllcounters_copy[i] = hll_copy(hllcounters[i]);
-			finalHLL = hyperloglog_merge_counters(finalHLL, hllcounters[i]);
+			hllcounters_copy[i] = gp_hll_copy(hllcounters[i]);
+			GpHLLCounter finalHLL_intermediate = finalHLL;
+			finalHLL = gp_hyperloglog_merge_counters(finalHLL_intermediate, hllcounters[i]);
+			if (NULL != finalHLL_intermediate)
+			{
+				pfree(finalHLL_intermediate);
+			}
 			free_attstatsslot(&hllSlot);
 			samplehll_count++;
 			totalhll_count++;
@@ -3287,7 +3397,7 @@ merge_leaf_stats(VacAttrStatsP stats,
 		 */
 		if (finalHLL != NULL && samplehll_count == totalhll_count)
 		{
-			ndistinct = hyperloglog_estimate(finalHLL);
+			ndistinct = gp_hyperloglog_estimate(finalHLL);
 			/*
 			 * For sampled HLL counter, the ndistinct calculated is based on the
 			 * sampled data. We consider everything distinct if the ndistinct
@@ -3295,14 +3405,14 @@ merge_leaf_stats(VacAttrStatsP stats,
 			 * the number of distinct values for the table based on the estimator
 			 * proposed by Haas and Stokes, used later in the code.
 			 */
-			if ((fabs(samplerows - ndistinct) / (float) samplerows) < HLL_ERROR_MARGIN)
+			if ((fabs(samplerows - ndistinct) / (float) samplerows) < GP_HLL_ERROR_MARGIN)
 			{
 				allDistinct = true;
 			}
 			else
 			{
 				/*
-				 * The hyperloglog_estimate() utility merges the number of
+				 * The gp_hyperloglog_estimate() utility merges the number of
 				 * distnct values accurately, but for the NDV estimator used later
 				 * in the code, we also need additional information for nmultiples,
 				 * i.e., the number of values that appeared more than once.
@@ -3314,42 +3424,101 @@ merge_leaf_stats(VacAttrStatsP stats,
 				 * P1 -> ndistinct1 , nmultiple1
 				 * P2 -> ndistinct2 , nmultiple2
 				 * P3 -> ndistinct3 , nmultiple3
-				 * Root -> ndistinct(Root) (using hyperloglog_estimate)
-				 * nunique1 = ndistinct(Root) - hyperloglog_estimate(P2 & P3)
-				 * nunique2 = ndistinct(Root) - hyperloglog_estimate(P1 & P3)
-				 * nunique3 = ndistinct(Root) - hyperloglog_estimate(P2 & P1)
+				 * Root -> ndistinct(Root) (using gp_hyperloglog_estimate)
+				 * nunique1 = ndistinct(Root) - gp_hyperloglog_estimate(P2 & P3)
+				 * nunique2 = ndistinct(Root) - gp_hyperloglog_estimate(P1 & P3)
+				 * nunique3 = ndistinct(Root) - gp_hyperloglog_estimate(P2 & P1)
 				 * And finally once we have unique values in individual partitions,
 				 * we can get the nmultiples on the ROOT as seen below,
 				 * nmultiple(Root) = ndistinct(Root) - (sum of uniques in each partition)
 				 */
+
+				/*
+				 * hllcounters_left array stores the merged hll result of all the
+				 * hll counters towards the left of index i and excluding the hll
+				 * counter at index i
+				 */
+				GpHLLCounter *hllcounters_left = (GpHLLCounter *) palloc0(numPartitions * sizeof(GpHLLCounter));
+
+				/*
+				 * hllcounters_right array stores the merged hll result of all the
+				 * hll counters towards the right of index i and excluding the hll
+				 * counter at index i
+				 */
+				GpHLLCounter *hllcounters_right = (GpHLLCounter *) palloc0(numPartitions * sizeof(GpHLLCounter));
+
+				hllcounters_left[0] = gp_hyperloglog_init_def();
+				hllcounters_right[numPartitions - 1] = gp_hyperloglog_init_def();
+
+				/*
+				 * The following loop populates the left and right array by accumulating the merged
+				 * result of all the hll counters towards the left/right of the given index i excluding
+				 * the counter at index i.
+				 * Note that there might be empty values for some partitions, in which case the
+				 * corresponding element in the left/right arrays will simply be the value
+				 * of its neighbor.
+				 * For E.g If the hllcounters_copy array is 1, null, 2, 3, null, 4
+				 * the left and right arrays will be as follows:
+				 * hllcounters_left:  default, 1, 1, (1,2), (1,2,3), (1,2,3)
+				 * hllcounters_right: (2,3,4), (2,3,4), (3,4), 4, 4, default
+				 */
+				/*
+				 * The first and the last element in the left and right arrays
+				 * are default values since there is no element towards
+				 * the left or right of them
+				 */
+				for (i = 1; i < numPartitions; i++)
+				{
+					/* populate left array */
+					if (nDistincts[i - 1] == 0)
+					{
+						hllcounters_left[i] = gp_hll_copy(hllcounters_left[i - 1]);
+					}
+					else
+					{
+						GpHLLCounter hllcounter_temp1 = gp_hll_copy(hllcounters_copy[i - 1]);
+						GpHLLCounter hllcounter_temp2 = gp_hll_copy(hllcounters_left[i - 1]);
+						hllcounters_left[i] = gp_hyperloglog_merge_counters(hllcounter_temp1, hllcounter_temp2);
+						pfree(hllcounter_temp1);
+						pfree(hllcounter_temp2);
+					}
+
+					/* populate right array */
+					if (nDistincts[numPartitions - i] == 0)
+					{
+						hllcounters_right[numPartitions - i - 1] = gp_hll_copy(hllcounters_right[numPartitions - i]);
+					}
+					else
+					{
+						GpHLLCounter hllcounter_temp1 = gp_hll_copy(hllcounters_copy[numPartitions - i]);
+						GpHLLCounter hllcounter_temp2 = gp_hll_copy(hllcounters_right[numPartitions - i]);
+						hllcounters_right[numPartitions - i - 1] = gp_hyperloglog_merge_counters(hllcounter_temp1, hllcounter_temp2);
+						pfree(hllcounter_temp1);
+						pfree(hllcounter_temp2);
+					}
+				 }
+
 				int nUnique = 0;
 				for (i = 0; i < numPartitions; i++)
 				{
-					// i -> partition number for which we wish
-					// to calculate the number of unique values
+					/* Skip if statistics are missing for the partition */
 					if (nDistincts[i] == 0)
-						continue;
+						 continue;
 
-					HLLCounter finalHLL_temp = NULL;
-					for (j = 0; j < numPartitions; j++)
+					GpHLLCounter hllcounter_temp1 = gp_hll_copy(hllcounters_left[i]);
+					GpHLLCounter hllcounter_temp2 = gp_hll_copy(hllcounters_right[i]);
+					GpHLLCounter final = NULL;
+					final = gp_hyperloglog_merge_counters(hllcounter_temp1, hllcounter_temp2);
+
+					pfree(hllcounter_temp1);
+					pfree(hllcounter_temp2);
+
+					if (final != NULL)
 					{
-						// merge the HLL counters for each partition
-						// except the current partition (i)
-						if (i != j && hllcounters_copy[j] != NULL)
-						{
-							HLLCounter temp_hll_counter =
-								hll_copy(hllcounters_copy[j]);
-							finalHLL_temp =
-								hyperloglog_merge_counters(finalHLL_temp, temp_hll_counter);
-						}
-					}
-					if (finalHLL_temp != NULL)
-					{
-						// Calculating uniques in each partition
-						nUniques[i] =
-							ndistinct - hyperloglog_estimate(finalHLL_temp);
-						nUnique += nUniques[i];
-						nmultiple += nMultiples[i] * (nUniques[i] / nDistincts[i]);
+						float nUniques = ndistinct - gp_hyperloglog_estimate(final);
+						nUnique += nUniques;
+						nmultiple += nMultiples[i] * (nUniques / nDistincts[i]);
+						pfree(final);
 					}
 					else
 					{
@@ -3362,9 +3531,10 @@ merge_leaf_stats(VacAttrStatsP stats,
 				nmultiple += ndistinct - nUnique;
 
 				if (nmultiple < 0)
-				{
 					nmultiple = 0;
-				}
+
+				pfree(hllcounters_left);
+				pfree(hllcounters_right);
 			}
 		}
 		else
@@ -3374,7 +3544,6 @@ merge_leaf_stats(VacAttrStatsP stats,
 			pfree(hllcounters_copy);
 			pfree(nDistincts);
 			pfree(nMultiples);
-			pfree(nUniques);
 			ereport(ERROR,
 					 (errmsg("ANALYZE cannot merge since not all non-empty leaf partitions have consistent hyperloglog statistics for merge"),
 					 errhint("Re-run ANALYZE")));
@@ -3384,7 +3553,6 @@ merge_leaf_stats(VacAttrStatsP stats,
 	pfree(hllcounters_copy);
 	pfree(nDistincts);
 	pfree(nMultiples);
-	pfree(nUniques);
 
 	if (allDistinct || (!OidIsValid(eqopr) && !OidIsValid(ltopr)))
 	{

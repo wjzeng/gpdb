@@ -26,9 +26,9 @@ SRCS		= pgcrypto.c px.c px-hmac.c px-crypt.c \
 
 MODULE_big	= pgcrypto
 OBJS		= $(SRCS:.c=.o)
-DATA_built	= pgcrypto.sql
-DATA		= uninstall_pgcrypto.sql
-EXTRA_CLEAN	= gen-rtab
+
+EXTENSION = pgcrypto
+DATA = pgcrypto--1.0.sql pgcrypto--unpackaged--1.0.sql
 
 REGRESS_OPTS = --dbname=$(CONTRIB_TESTDB) --init-file=$(top_builddir)/src/test/regress/init_file 
 
@@ -36,8 +36,10 @@ REGRESS = init md5 sha1 hmac-md5 hmac-sha1 blowfish rijndael \
 	$(CF_TESTS) \
 	crypt-des crypt-md5 crypt-blowfish crypt-xdes \
 	pgp-armor pgp-decrypt pgp-encrypt $(CF_PGP_TESTS) \
-	pgp-pubkey-decrypt pgp-pubkey-encrypt pgp-info
+	pgp-pubkey-decrypt pgp-pubkey-encrypt pgp-info \
+	setup_fips fips
 
+EXTRA_CLEAN = gen-rtab
 
 ifdef USE_PGXS
 PG_CONFIG = pg_config
@@ -65,10 +67,3 @@ rijndael.o: rijndael.tbl
 rijndael.tbl:
 	$(CC) $(CPPFLAGS) $(CFLAGS) -DPRINT_TABS rijndael.c -o gen-rtab
 	./gen-rtab > rijndael.tbl
-
-installcheck: prepare_pgcrypto_sql
-
-prepare_pgcrypto_sql:
-	cp $(GPHOME)/share/postgresql/contrib/pgcrypto.sql ./pgcrypto.sql
-
-.PHONY: prepare_pgcrypto_sql

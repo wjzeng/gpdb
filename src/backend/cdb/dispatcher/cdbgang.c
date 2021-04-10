@@ -115,7 +115,7 @@ static bool readerGangsExist(void);
  * @type can be GANGTYPE_ENTRYDB_READER, GANGTYPE_SINGLETON_READER or GANGTYPE_PRIMARY_READER.
  */
 Gang *
-AllocateReaderGang(GangType type, char *portal_name)
+AllocateReaderGang(GangType type, char *portal_name, EState *estate)
 {
 	MemoryContext oldContext = NULL;
 	Gang *gp = NULL;
@@ -193,6 +193,7 @@ AllocateReaderGang(GangType type, char *portal_name)
 
 	/* let the gang know which portal it is being assigned to */
 	gp->portal_name = (portal_name ? pstrdup(portal_name) : (char *) NULL);
+	gp->estate = estate;
 
 	addGangToAllocated(gp);
 
@@ -274,10 +275,12 @@ AllocateWriterGang()
 
 		MemoryContextSwitchTo(oldContext);
 	}
-	
+
 	ELOG_DISPATCHER_DEBUG("AllocateWriterGang end.");
 
 	primaryWriterGang = writerGang;
+	writerGang->estate = NULL;
+
 	return writerGang;
 }
 
@@ -492,6 +495,7 @@ buildGangDefinition(GangType type, int gang_id, int size, int content)
 	newGangDefinition->noReuse = false;
 	newGangDefinition->dispatcherActive = false;
 	newGangDefinition->portal_name = NULL;
+	newGangDefinition->estate = NULL;
 	newGangDefinition->perGangContext = perGangContext;
 	newGangDefinition->db_descriptors =
 			(SegmentDatabaseDescriptor *) palloc0(size * sizeof(SegmentDatabaseDescriptor));
@@ -527,6 +531,12 @@ buildGangDefinition(GangType type, int gang_id, int size, int content)
 			cdbinfo = &cdb_component_dbs->segment_db_info[i];
 			if (SEGMENT_IS_ACTIVE_PRIMARY(cdbinfo))
 			{
+				if (segCount >= size)
+				{
+					FtsReConfigureMPP(false);
+					elog(ERROR, "Not all primary segment instances are active and connected");
+				}
+
 				segdbDesc = &newGangDefinition->db_descriptors[segCount];
 				cdbInfoCopy = copyCdbComponentDatabaseInfo(cdbinfo);
 				cdbconn_initSegmentDescriptor(segdbDesc, cdbInfoCopy);
@@ -540,6 +550,7 @@ buildGangDefinition(GangType type, int gang_id, int size, int content)
 			FtsReConfigureMPP(false);
 			elog(ERROR, "Not all primary segment instances are active and connected");
 		}
+
 		break;
 
 	default:
@@ -1203,6 +1214,7 @@ void DisconnectAndDestroyAllGangs(bool resetSession)
 	 */
 	if (NULL != GangContext)
 	{
+		destroyCdbSegmentIPCache();
 		MemoryContextReset(GangContext);
 		cdb_component_dbs = NULL;
 	}
@@ -1285,6 +1297,13 @@ void DisconnectAndDestroyUnusedGangs(void)
 static bool cleanupGang(Gang *gp)
 {
 	int i = 0;
+
+#ifdef FAULT_INJECTOR
+	if (SIMPLE_FAULT_INJECTOR(FreeGangInitPlan) == FaultInjectorTypeSkip &&
+		gp->size == 1 &&
+		gp->type == GANGTYPE_SINGLETON_READER)
+		return false;
+#endif
 
 	ELOG_DISPATCHER_DEBUG("cleanupGang: cleaning gang id %d type %d size %d, "
 			"was used for portal: %s",
@@ -1394,7 +1413,7 @@ bool isTargetPortal(const char *p1, const char *p2)
  * 2. max mop of this gang > gp_vmem_protect_gang_cache_limit
  */
 static List *
-cleanupPortalGangList(List *gplist, int cachelimit)
+cleanupPortalGangList(List *gplist, int cachelimit, const char *portal_name)
 {
 	ListCell *cell = NULL;
 	ListCell *prevcell = NULL;
@@ -1409,8 +1428,9 @@ cleanupPortalGangList(List *gplist, int cachelimit)
 		Gang *gang = (Gang *) lfirst(cell);
 		Assert(gang->type != GANGTYPE_PRIMARY_WRITER);
 
-		if (nLeft > cachelimit ||
-			getGangMaxVmem(gang) > gp_vmem_protect_gang_cache_limit)
+		if (isTargetPortal(gang->portal_name, portal_name) &&
+			(nLeft > cachelimit ||
+			 getGangMaxVmem(gang) > gp_vmem_protect_gang_cache_limit))
 		{
 			DisconnectAndDestroyGang(gang);
 			gplist = list_delete_cell(gplist, cell, prevcell);
@@ -1455,8 +1475,8 @@ void cleanupPortalGangs(Portal portal)
 	else
 		oldContext = MemoryContextSwitchTo(TopMemoryContext);
 
-	availableReaderGangsN = cleanupPortalGangList(availableReaderGangsN, gp_cached_gang_threshold);
-	availableReaderGangs1 = cleanupPortalGangList(availableReaderGangs1, MAX_CACHED_1_GANGS);
+	availableReaderGangsN = cleanupPortalGangList(availableReaderGangsN, gp_cached_gang_threshold, portal_name);
+	availableReaderGangs1 = cleanupPortalGangList(availableReaderGangs1, MAX_CACHED_1_GANGS, portal_name);
 
 	ELOG_DISPATCHER_DEBUG("cleanupPortalGangs '%s'. Reader gang inventory: "
 			"allocatedN=%d availableN=%d allocated1=%d available1=%d",
@@ -1479,12 +1499,19 @@ void cleanupPortalGangs(Portal portal)
  * cleanupGang() tells us that the gang has a problem, the gang has
  * been free()ed and we should discard it -- otherwise it is good as
  * far as we can tell.
+ *
+ * An extra parameter `estate` is passed to this function:
+ *   - If estate is NULL, the function will try to recyle the gangs
+ *     in the specific portal
+ *   - otherwise, this function only touches those gangs with
+ *     gang->estate same as the parameter.
  */
-void freeGangsForPortal(char *portal_name)
+void freeGangsForPortal(char *portal_name, EState *estate)
 {
 	MemoryContext oldContext;
 	ListCell *cur_item = NULL;
 	ListCell *prev_item = NULL;
+	List *reuseList = NULL;
 
 	if (Gp_role != GP_ROLE_DISPATCH)
 		return;
@@ -1542,7 +1569,21 @@ void freeGangsForPortal(char *portal_name)
 		Gang *gp = (Gang *) lfirst(cur_item);
 		ListCell *next_item = lnext(cur_item);
 
-		if (isTargetPortal(gp->portal_name, portal_name))
+		/*
+		 * When estate is not NULL, we are sure that this
+		 * function is called by ExecutorEnd, and it should
+		 * ingore those gangs not allocated by the specific
+		 * executor context.
+		 *
+		 * Think of a case: main plan contains a initplan,
+		 * and initplan will invoke spi_execute which will
+		 * build a new executor context and allocate gangs.
+		 * When SPI finish executing, it should not touch
+		 * the gangs allocated in the main plan's executor
+		 * context.
+		 */
+		if (isTargetPortal(gp->portal_name, portal_name) &&
+			(estate == NULL || estate == gp->estate))
 		{
 			ELOG_DISPATCHER_DEBUG("Returning a reader N-gang to the available list");
 
@@ -1552,7 +1593,10 @@ void freeGangsForPortal(char *portal_name)
 
 			/* we only return the gang to the available list if it is good */
 			if (cleanupGang(gp))
-				availableReaderGangsN = lappend(availableReaderGangsN, gp);
+			{
+				gp->estate = NULL;
+				reuseList = lappend(reuseList, gp);
+			}
 			else
 				DisconnectAndDestroyGang(gp);
 
@@ -1568,6 +1612,14 @@ void freeGangsForPortal(char *portal_name)
 		}
 	}
 
+	/*
+	 * Keep the order of the gangs the same as it's allocated
+	 * In this way, the send-receive pair can be the same across queries in the same session.
+	 * It's useful in some platforms like Azure.
+	 */
+	availableReaderGangsN = list_concat(reuseList,
+										availableReaderGangsN);
+
 	prev_item = NULL;
 	cur_item = list_head(allocatedReaderGangs1);
 	while (cur_item != NULL)
@@ -1575,7 +1627,11 @@ void freeGangsForPortal(char *portal_name)
 		Gang *gp = (Gang *) lfirst(cur_item);
 		ListCell *next_item = lnext(cur_item);
 
-		if (isTargetPortal(gp->portal_name, portal_name))
+		/*
+		 * See the comments above for handling allocatedReaderGangsN.
+		 */
+		if (isTargetPortal(gp->portal_name, portal_name) &&
+			(estate == NULL || estate == gp->estate))
 		{
 			ELOG_DISPATCHER_DEBUG("Returning a reader 1-gang to the available list");
 
@@ -1585,7 +1641,10 @@ void freeGangsForPortal(char *portal_name)
 
 			/* we only return the gang to the available list if it is good */
 			if (cleanupGang(gp))
+			{
+				gp->estate = NULL;
 				availableReaderGangs1 = lappend(availableReaderGangs1, gp);
+			}
 			else
 				DisconnectAndDestroyGang(gp);
 

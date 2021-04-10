@@ -1025,7 +1025,8 @@ static struct config_bool ConfigureNamesBool[] =
 	{
 		{"check_function_bodies", PGC_USERSET, CLIENT_CONN_STATEMENT,
 			gettext_noop("Check function bodies during CREATE FUNCTION."),
-			NULL
+			NULL,
+			GUC_GPDB_ADDOPT
 		},
 		&check_function_bodies,
 		true, NULL, NULL
@@ -1332,7 +1333,7 @@ static struct config_int ConfigureNamesInt[] =
 			NULL
 		},
 		&ReservedBackends,
-		3, 0, INT_MAX / 4, NULL, NULL
+		10, 0, INT_MAX / 4, NULL, NULL
 	},
 
 	{
@@ -1665,7 +1666,7 @@ static struct config_int ConfigureNamesInt[] =
 						 "(FLT_DIG or DBL_DIG as appropriate).")
 		},
 		&extra_float_digits,
-		0, -15, 2, NULL, NULL
+		0, -15, 3, NULL, NULL
 	},
 
 	{
@@ -1853,7 +1854,7 @@ static struct config_int ConfigureNamesInt[] =
 			GUC_UNIT_KB,
 		},
 		&ssl_renegotiation_limit,
-		512 * 1024, 0, MAX_KILOBYTES, NULL, NULL
+		0, 0, MAX_KILOBYTES, NULL, NULL
 	},
 
 	{
@@ -3976,6 +3977,7 @@ AtEOXact_GUC(bool isCommit, int nestLevel)
 				{
 					case GUC_SAVE:
 						Assert(false);	/* can't get here */
+						break;
 
 					case GUC_SET:
 						/* next level always becomes SET */
@@ -5571,6 +5573,13 @@ DispatchSetPGVariable(const char *name, List *args, bool is_local)
 	if (Gp_role != GP_ROLE_DISPATCH || IsBootstrapProcessingMode())
 		return;
 
+	/*
+	 * client_encoding is always kept at SQL_ASCII in QE processes. (See also
+	 * cdbconn_doConnectStart().)
+	 */
+	if (strcmp(name, "client_encoding") == 0)
+		return;
+
 	initStringInfo( &buffer );
 
 	if (args == NIL)
@@ -5585,44 +5594,59 @@ DispatchSetPGVariable(const char *name, List *args, bool is_local)
 
 		appendStringInfo(&buffer, "%s TO ", name);
 
-		foreach(l, args)
+		/*
+		 * GPDB: We handle the timezone GUC specially. This is because the
+		 * timezone GUC can be set with the SET TIME ZONE .. syntax which is an
+		 * alias for SET timezone. Instead of dispatching the SET TIME ZONE ..
+		 * as a special case, we dispatch the already set time zone from the QD
+		 * with the usual SET syntax flavor (SET timezone TO <>).
+		 * Please refer to Issue: #9055 for additional detail.
+		 * #9055 - https://github.com/greenplum-db/gpdb/issues/9055
+		 */
+		if (strcmp(name, "timezone") == 0)
+			appendStringInfo(&buffer, "%s",
+							 quote_literal_internal(GetConfigOption("timezone")));
+		else
 		{
-			A_Const    *arg = (A_Const *) lfirst(l);
-			char	   *val;
-
-			if (l != list_head(args))
-				appendStringInfo(&buffer, ", ");
-
-			if (!IsA(arg, A_Const))
-				elog(ERROR, "unrecognized node type: %d", (int) nodeTag(arg));
-
-			switch (nodeTag(&arg->val))
+			foreach(l, args)
 			{
-				case T_Integer:
-					appendStringInfo(&buffer, "%ld", intVal(&arg->val));
-					break;
-				case T_Float:
-					/* represented as a string, so just copy it */
-					appendStringInfoString(&buffer, strVal(&arg->val));
-					break;
-				case T_String:
-					val = strVal(&arg->val);
+				A_Const    *arg = (A_Const *) lfirst(l);
+				char	   *val;
 
-					/*
-					 * Plain string literal or identifier. Quote it.
-					 */
+				if (l != list_head(args))
+					appendStringInfo(&buffer, ", ");
 
-					if (val[0] != '\'')
-						appendStringInfo(&buffer, "%s", quote_literal_internal(val));
-					else
-						appendStringInfo(&buffer, "%s",val);
+				if (!IsA(arg, A_Const))
+					elog(ERROR, "unrecognized node type: %d", (int) nodeTag(arg));
+
+				switch (nodeTag(&arg->val))
+				{
+					case T_Integer:
+						appendStringInfo(&buffer, "%ld", intVal(&arg->val));
+						break;
+					case T_Float:
+						/* represented as a string, so just copy it */
+						appendStringInfoString(&buffer, strVal(&arg->val));
+						break;
+					case T_String:
+						val = strVal(&arg->val);
+
+						/*
+						 * Plain string literal or identifier. Quote it.
+						 */
+
+						if (val[0] != '\'')
+							appendStringInfo(&buffer, "%s", quote_literal_internal(val));
+						else
+							appendStringInfo(&buffer, "%s",val);
 
 
-					break;
-				default:
-					elog(ERROR, "unrecognized node type: %d",
-						 (int) nodeTag(&arg->val));
-					break;
+						break;
+					default:
+						elog(ERROR, "unrecognized node type: %d",
+							 (int) nodeTag(&arg->val));
+						break;
+				}
 			}
 		}
 	}
@@ -5673,18 +5697,31 @@ set_config_by_name(PG_FUNCTION_ARGS)
 					  is_local ? GUC_ACTION_LOCAL : GUC_ACTION_SET,
 					  true);
 
-    if (Gp_role == GP_ROLE_DISPATCH && !IsBootstrapProcessingMode())
-    {
-			StringInfoData buffer;
-			initStringInfo(&buffer);
-			appendStringInfo(&buffer, "SET ");
-			if (is_local)
-					appendStringInfo(&buffer, "LOCAL ");
-			appendStringInfo(&buffer, "%s TO '%s'", name, value);
-			CdbDispatchSetCommand(buffer.data,
-								   false /* cancelOnError */,
-								   false /* no two phase commit */);
-    }
+	if (Gp_role == GP_ROLE_DISPATCH && !IsBootstrapProcessingMode())
+	{
+		StringInfoData	buffer;
+		const char	   *quoted_name;
+		const char	   *quoted_value = NULL;
+
+		initStringInfo(&buffer);
+
+		quoted_name = quote_literal_internal(name);
+		if (value)
+			quoted_value = quote_literal_internal(value);
+
+		appendStringInfo(&buffer, "SELECT pg_catalog.set_config(%s, %s, %s)",
+						 quoted_name,
+						 quoted_value ? quoted_value : "NULL",
+						 is_local ? "true" : "false");
+
+		if (quoted_value)
+			pfree((char *) quoted_value);
+		pfree((char *) quoted_name);
+
+		CdbDispatchSetCommand(buffer.data,
+		                      false /* cancelOnError */,
+		                      false /* need two phase */);
+	}
 
 	/* get the new current value */
 	new_value = GetConfigOptionByName(name, NULL);

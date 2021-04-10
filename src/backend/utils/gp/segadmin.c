@@ -103,7 +103,23 @@ standby_exists()
 static int16
 get_maxdbid()
 {
-	Relation rel = heap_open(GpSegmentConfigRelationId, AccessExclusiveLock);
+	/*
+	 * We should avoid concurrent modifications of gp_segment_configuration
+	 * table while performing read and write operations. Nevertheless,
+	 * queries dispatch to QE is taking place during the catalog update.
+	 * If a failure or a timeout happens during the process is awaiting
+	 * QE response, the cluster nodes polling by FTS process is activated.
+	 * Here FTS process needs some data about the cluster - it acquires
+	 * AccessShareLock on gp_segment_configuration. However, ExclusiveLock
+	 * allows FTS to get the necessary information about QE from
+	 * gp_segment_configuration even while the catalog is being updated.
+	 *
+	 * FIXME: The deadlock will still occur if any other QE fails during
+	 * FTS request probe initiated by our request. It happens because
+	 * of FTS acquiring RowExclusiveLock on gp_segment_configuration
+	 * to update the status of the failed QE
+	 */
+	Relation rel = heap_open(GpSegmentConfigRelationId, ExclusiveLock);
 	int16 dbid = 0;
 	HeapTuple tuple;
 	SysScanDesc sscan;
@@ -144,7 +160,23 @@ get_availableDbId()
 					   HASH_ELEM | HASH_FUNCTION);
 
 	/* scan GpSegmentConfigRelationId */
-	Relation rel = heap_open(GpSegmentConfigRelationId, AccessExclusiveLock);
+	/*
+	 * We should avoid concurrent modifications of gp_segment_configuration
+	 * table while performing read and write operations. Nevertheless,
+	 * queries dispatch to QE is taking place during the catalog update.
+	 * If a failure or a timeout happens during the process is awaiting
+	 * QE response, the cluster nodes polling by FTS process is activated.
+	 * Here FTS process needs some data about the cluster - it acquires
+	 * AccessShareLock on gp_segment_configuration. However, ExclusiveLock
+	 * allows FTS to get the necessary information about QE from
+	 * gp_segment_configuration even while the catalog is being updated.
+	 *
+	 * FIXME: The deadlock will still occur if any other QE fails during
+	 * FTS request probe initiated by our request. It happens because
+	 * of FTS acquiring RowExclusiveLock on gp_segment_configuration
+	 * to update the status of the failed QE
+	 */
+	Relation rel = heap_open(GpSegmentConfigRelationId, ExclusiveLock);
 	HeapTuple tuple;
 	SysScanDesc sscan;
 
@@ -181,7 +213,23 @@ get_availableDbId()
 static int16
 get_maxcontentid()
 {
-	Relation rel = heap_open(GpSegmentConfigRelationId, AccessExclusiveLock);
+	/*
+	 * We should avoid concurrent modifications of gp_segment_configuration
+	 * table while performing read and write operations. Nevertheless,
+	 * queries dispatch to QE is taking place during the catalog update.
+	 * If a failure or a timeout happens during the process is awaiting
+	 * QE response, the cluster nodes polling by FTS process is activated.
+	 * Here FTS process needs some data about the cluster - it acquires
+	 * AccessShareLock on gp_segment_configuration. However, ExclusiveLock
+	 * allows FTS to get the necessary information about QE from
+	 * gp_segment_configuration even while the catalog is being updated.
+	 *
+	 * FIXME: The deadlock will still occur if any other QE fails during
+	 * FTS request probe initiated by our request. It happens because
+	 * of FTS acquiring RowExclusiveLock on gp_segment_configuration
+	 * to update the status of the failed QE
+	 */
+	Relation rel = heap_open(GpSegmentConfigRelationId, ExclusiveLock);
 	int16 contentid = 0;
 	HeapTuple tuple;
 	SysScanDesc sscan;
@@ -623,7 +671,23 @@ remove_segment_persistent_entries(int16 pridbid, seginfo *i)
 static void
 add_segment_config(seginfo *i)
 {
-	Relation rel = heap_open(GpSegmentConfigRelationId, AccessExclusiveLock);
+	/*
+	 * We should avoid concurrent modifications of gp_segment_configuration
+	 * table while performing read and write operations. Nevertheless,
+	 * queries dispatch to QE is taking place during the catalog update.
+	 * If a failure or a timeout happens during the process is awaiting
+	 * QE response, the cluster nodes polling by FTS process is activated.
+	 * Here FTS process needs some data about the cluster - it acquires
+	 * AccessShareLock on gp_segment_configuration. However, ExclusiveLock
+	 * allows FTS to get the necessary information about QE from
+	 * gp_segment_configuration even while the catalog is being updated.
+	 *
+	 * FIXME: The deadlock will still occur if any other QE fails during
+	 * FTS request probe initiated by our request. It happens because
+	 * of FTS acquiring RowExclusiveLock on gp_segment_configuration
+	 * to update the status of the failed QE
+	 */
+	Relation rel = heap_open(GpSegmentConfigRelationId, ExclusiveLock);
 	Datum values[Natts_gp_segment_configuration];
 	bool nulls[Natts_gp_segment_configuration];
 	HeapTuple tuple;
@@ -749,8 +813,23 @@ gp_add_segment(PG_FUNCTION_ARGS)
 
 	mirroring_sanity_check(MASTER_ONLY | SUPERUSER, "gp_add_segment");
 
-	/* avoid races */
-	rel = heap_open(GpSegmentConfigRelationId, AccessExclusiveLock);
+	/*
+	 * We should avoid concurrent modifications of gp_segment_configuration
+	 * table while performing read and write operations. Nevertheless,
+	 * queries dispatch to QE is taking place during the catalog update.
+	 * If a failure or a timeout happens during the process is awaiting
+	 * QE response, the cluster nodes polling by FTS process is activated.
+	 * Here FTS process needs some data about the cluster - it acquires
+	 * AccessShareLock on gp_segment_configuration. However, ExclusiveLock
+	 * allows FTS to get the necessary information about QE from
+	 * gp_segment_configuration even while the catalog is being updated.
+	 *
+	 * FIXME: The deadlock will still occur if any other QE fails during
+	 * FTS request probe initiated by our request. It happens because
+	 * of FTS acquiring RowExclusiveLock on gp_segment_configuration
+	 * to update the status of the failed QE
+	 */
+	rel = heap_open(GpSegmentConfigRelationId, ExclusiveLock);
 
 	MemSet(&new, 0, sizeof(seginfo));
 
@@ -863,8 +942,19 @@ gp_add_segment_mirror(PG_FUNCTION_ARGS)
 
 	mirroring_sanity_check(MASTER_ONLY | SUPERUSER, "gp_add_segment_mirror");
 
-	/* avoid races */
-	rel = heap_open(GpSegmentConfigRelationId, AccessExclusiveLock);
+	/*
+	 * avoid races - no one else should be allowed to update
+	 * gp_segment_configuration when we read and add entry to this table. Use
+	 * ExclusiveLock to still allow FTS probe to proceed, because we ourselves
+	 * might request a fts probe in case of failure or timeout when QD polls
+	 * results of add_segment_persistent_entries() from QEs. Note that FTS
+	 * acquires an AccessShareLock when it reads from gp_segment_configuration,
+	 * and only acquires another RowExclusiveLock if it decides to modify it.
+	 *
+	 * FIXME: there exists an edge case that if any other segment failed during
+	 * the FTS probe requested by us, deadlock will still happen.
+	 */
+	rel = heap_open(GpSegmentConfigRelationId, ExclusiveLock);
 
 	pridbid = contentid_get_dbid(contentid, SEGMENT_ROLE_PRIMARY, false /* false == current, not preferred, role */);
 	if (!pridbid)
@@ -922,8 +1012,19 @@ gp_remove_segment_mirror(PG_FUNCTION_ARGS)
 
 	mirroring_sanity_check(MASTER_ONLY | SUPERUSER, "gp_remove_segment_mirror");
 
-	/* avoid races */
-	rel = heap_open(GpSegmentConfigRelationId, AccessExclusiveLock);
+	/*
+	 * avoid races - no one else should be allowed to update
+	 * gp_segment_configuration when we read and add entry to this table. Use
+	 * ExclusiveLock to still allow FTS probe to proceed, because we ourselves
+	 * might request a fts probe in case of failure or timeout when QD polls
+	 * results of add_segment_persistent_entries() from QEs. Note that FTS
+	 * acquires an AccessShareLock when it reads from gp_segment_configuration,
+	 * and only acquires another RowExclusiveLock if it decides to modify it.
+	 *
+	 * FIXME: there exists an edge case that if any other segment failed during
+	 * the FTS probe requested by us, deadlock will still happen.
+	 */
+	rel = heap_open(GpSegmentConfigRelationId, ExclusiveLock);
 
 	pridbid = contentid_get_dbid(contentid, SEGMENT_ROLE_PRIMARY, false /* false == current, not preferred, role */);
 
@@ -992,8 +1093,23 @@ gp_add_master_standby(PG_FUNCTION_ARGS)
 	if (standby_exists())
 		elog(ERROR, "only a single master standby may be defined");
 
-	/* Lock exclusively to avoid concurrent changes */
-	gprel = heap_open(GpSegmentConfigRelationId, AccessExclusiveLock);
+	/*
+	 * We should avoid concurrent modifications of gp_segment_configuration
+	 * table while performing read and write operations. Nevertheless,
+	 * queries dispatch to QE is taking place during the catalog update.
+	 * If a failure or a timeout happens during the process is awaiting
+	 * QE response, the cluster nodes polling by FTS process is activated.
+	 * Here FTS process needs some data about the cluster - it acquires
+	 * AccessShareLock on gp_segment_configuration. However, ExclusiveLock
+	 * allows FTS to get the necessary information about QE from
+	 * gp_segment_configuration even while the catalog is being updated.
+	 *
+	 * FIXME: The deadlock will still occur if any other QE fails during
+	 * FTS request probe initiated by our request. It happens because
+	 * of FTS acquiring RowExclusiveLock on gp_segment_configuration
+	 * to update the status of the failed QE
+	 */
+	gprel = heap_open(GpSegmentConfigRelationId, ExclusiveLock);
 
 	maxdbid = get_maxdbid();
 

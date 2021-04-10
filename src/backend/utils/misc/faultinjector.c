@@ -347,8 +347,14 @@ FaultInjectorIdentifierEnumToString[] = {
 		/* inject fault in FinishPreparedTransaction() after recording the commit prepared record */
 	_("gang_created"),
 		/* inject fault to report ERROR just after creating Gang */
+	_("free_gang_initplan"),
+	/* inject fault to skip when test cleanupGang */
 	_("resgroup_assigned_on_master"),
 		/* inject fault to report ERROR just after resource group is assigned on master */
+	_("unassign_resgroup_start_entrydb"),
+		/* inject fault to suspend in the beginning of UnassignResGroup() for the entrydb QE */
+	_("unassign_resgroup_end_qd"),
+		/* inject fault to suspend in the end of UnassignResGroup() for QD */
 	_("before_read_command"),
 		/* inject fault before reading command */
 	_("copy_from_high_processed"),
@@ -362,7 +368,11 @@ FaultInjectorIdentifierEnumToString[] = {
 	_("create_gang_in_progress"),
 		/* inject fault during gang creation, before check for interrupts */
 	_("decrease_toast_max_chunk_size"),
+		/* inject fault inside dynamic index scan after context reset */
+	_("dynamic_index_scan_context_reset"),
 		/* inject fault when creating new TOAST tables, to modify the chunk size */
+	_("abort_after_procarray_end"),
+		/* inject fault in AbortTransaction after ProcArrayEndTransaction */
 	_("not recognized"),
 };
 
@@ -1068,9 +1078,13 @@ FaultInjector_NewHashEntry(
 			case AutoVacWorkerBeforeDoAutovacuum:
 			case CreateResourceGroupFail:
 			case CreateGangInProgress:
+			case GangCreated:
+			case FreeGangInitPlan:
 
 			case DecreaseToastMaxChunkSize:
 			case ProcessStartupPacketFault:
+			case DynamicIndexScanContextReset:
+			case AbortAfterProcarrayEnd:
 
 				break;
 			default:
@@ -1569,6 +1583,7 @@ FaultInjector_IsFaultInjected(
 			
 			retval = TRUE;
 			/* NO break */
+			/* fallthrough */
 		case FaultInjectorStateFailed:
 			
 			isCompleted = TRUE;

@@ -219,19 +219,37 @@ sdw5:sdw5-1:60012:/gpdata/mirror/gp10:14:10:m:63011</codeblock>
             <codeph>-D</codeph> or in the database specified by the <codeph>PGDATABASE</codeph>
           environment variable. For more information, see <xref href="expand-planning.xml#topic9"
             type="topic" format="dita"/>.</p>
+        <p>After segment initialization is complete,  <xref
+            href="expand-redistribute.xml#topic28/expand-redistribute">redistribute the
+            tables</xref> to balance existing data over the new segments.</p>
       </section>
+    </body>
+  </topic>
+  <topic id="topic_wkv_kkd_chb">
+    <title>Monitoring the Cluster Expansion State</title>
+    <body>
+      <p>At any time, you can check the state of cluster expansion by running the
+          <codeph>gpstate</codeph> utility with the <codeph>-x</codeph> flag: </p>
+      <codeblock>$ gpstate -x</codeblock>
+      <p>If the expansion schema exists in the postgres database, <codeph>gpstate -x</codeph>
+        reports on the progress of the expansion. During the first expansion phase,
+          <codeph>gpstate</codeph> reports on the progress of new segment initialization. During the
+        second phase, <codeph>gpstate</codeph> reports on the progress of table redistribution, and
+        whether redistribution is paused or active. </p>
+      <p>You can also query the expansion schema to see expansion status. See <xref
+          href="expand-redistribute.xml#topic31"/> for more information.</p>
     </body>
   </topic>
   <topic id="topic27" xml:lang="en">
     <title>Rolling Back a Failed Expansion Setup</title>
     <body>
-      <p>You can roll back an expansion setup operation only if the operation fails. </p>
+      <p>You can roll back an expansion setup operation (adding segment instances and segment hosts)
+        only if the operation fails.</p>
       <p>If the expansion fails during the initialization step, while the database is down, you must
         first restart the database in master-only mode by running the <codeph>gpstart -m</codeph>
         command. </p>
-      <p>Roll back the failed expansion with the following command, specifying the database that
-        contains the expansion
-        schema:<codeblock>gpexpand --rollback -D <i>database_name</i></codeblock></p>
+      <p>Roll back the failed expansion with the following
+        command:<codeblock>gpexpand --rollback</codeblock></p>
     </body>
   </topic>
 </topic>

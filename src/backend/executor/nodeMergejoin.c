@@ -152,6 +152,7 @@ typedef enum
 #define MarkInnerTuple(innerTupleSlot, mergestate) \
 	ExecCopySlot((mergestate)->mj_MarkedTupleSlot, (innerTupleSlot))
 
+extern bool Test_print_prefetch_joinqual;
 
 /*
  * MJExamineQuals
@@ -669,6 +670,17 @@ ExecMergeJoin(MergeJoinState *node)
 
 		node->mj_squelchInner = false; /* we will never need to Squelch the inner, we've fetched it all */
 		node->prefetch_inner = false;
+	}
+
+	/*
+	 * Prefetch JoinQual to prevent motion hazard.
+	 *
+	 * See ExecPrefetchJoinQual() for details.
+	 */
+	if (node->prefetch_joinqual)
+	{
+		ExecPrefetchJoinQual(&node->js);
+		node->prefetch_joinqual = false;
 	}
 
 	/*
@@ -1586,6 +1598,13 @@ ExecInitMergeJoin(MergeJoin *node, EState *estate, int eflags)
 
 	mergestate->prefetch_inner = node->join.prefetch_inner;
 	mergestate->mj_squelchInner = true;
+	mergestate->prefetch_joinqual = node->join.prefetch_joinqual;
+
+	if (Test_print_prefetch_joinqual && mergestate->prefetch_joinqual)
+		elog(NOTICE,
+			 "prefetch join qual in slice %d of plannode %d",
+			 currentSliceId, ((Plan *) node)->plan_node_id);
+
 	/* Prepare inner operators for rewind after the prefetch */
 	rewindflag = mergestate->prefetch_inner ? EXEC_FLAG_REWIND : 0;
 
@@ -1776,6 +1795,13 @@ ExecReScanMergeJoin(MergeJoinState *node, ExprContext *exprCtxt)
 	node->mj_MatchedInner = false;
 	node->mj_OuterTupleSlot = NULL;
 	node->mj_InnerTupleSlot = NULL;
+
+	/*
+	 * If the parameter is used in the filter of the outer table scan, the outer returns
+	 * NULL doesn't mean we can squelch the inner, because next parameter to the outer
+	 * may return a valid tuple. Same as ExecReScanNestLoop.
+	 */
+	node->mj_squelchInner = false;
 
 	/*
 	 * if chgParam of subnodes is not null then plans will be re-scanned by

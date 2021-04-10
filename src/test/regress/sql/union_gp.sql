@@ -538,6 +538,93 @@ UNION
 (SELECT a FROM t2_setop EXCEPT SELECT a FROM t1_setop ORDER BY a)
 ORDER BY a;
 
+create table t1_ncols(a int, b int, c text, d date) distributed by (a);
+create table t2_ncols(a smallint, b bigint, c varchar(20), d date) distributed by (c, b)
+ partition by range (a) (start (0) end (8) every (4));
+create view v1_ncols(id, a, b, c, d) as select 1,* from t1_ncols union all select 2,* from t2_ncols;
+
+insert into t1_ncols values (1, 11, 'one', '2001-01-01');
+
+insert into t2_ncols values (2, 22, 'two', '2002-02-02');
+insert into t2_ncols values (4, 44, 'four','2004-04-04');
+
+select b from t1_ncols union all select a from t2_ncols;
+select a+100, b, d from t1_ncols union select b, a+200, d from t2_ncols order by 1;
+select c, a from v1_ncols;
+
+with cte1(aa, b, c, d) as (select a*100, b, c, d from t1_ncols union select * from t2_ncols)
+select x.aa/100 aaa, x.c, y.c from cte1 x join cte1 y on x.aa=y.aa;
+
+-- Test that we push quals into UNION sub-selects only when it's safe
+explain
+SELECT * FROM
+  (SELECT 1 AS t, 2 AS x
+   UNION
+   SELECT 2 AS t, 4 AS x) ss
+WHERE x < 4;
+
+ SELECT * FROM
+  (SELECT 1 AS t, 2 AS x
+   UNION
+   SELECT 2 AS t, 4 AS x) ss
+WHERE x < 4;
+
+explain
+SELECT * FROM
+  (SELECT 1 AS t, generate_series(1,10) AS x
+   UNION
+   SELECT 2 AS t, 4 AS x) ss
+WHERE x < 4
+ORDER BY x;
+
+SELECT * FROM
+  (SELECT 1 AS t, generate_series(1,10) AS x
+   UNION
+   SELECT 2 AS t, 4 AS x) ss
+WHERE x < 4
+ORDER BY x;
+
+explain
+SELECT * FROM
+  (SELECT 1 AS t, (random()*3)::int AS x
+   UNION
+   SELECT 2 AS t, 4 AS x) ss
+WHERE x > 3;
+
+SELECT * FROM
+  (SELECT 1 AS t, (random()*3)::int AS x
+   UNION
+   SELECT 2 AS t, 4 AS x) ss
+WHERE x > 3;
+
+CREATE TABLE foo_union (a int, b int);
+CREATE TABLE bar_union (c int, d int);
+INSERT INTO foo_union VALUES (1,1), (5,5);
+INSERT INTO bar_union VALUES (5,5), (2,2);
+EXPLAIN SELECT *
+from
+    (
+    SELECT 1 AS ss
+    UNION
+    SELECT DISTINCT
+        (
+           SELECT bar_union.c FROM bar_union WHERE bar_union.c = foo_union.b 
+        ) AS ss
+        FROM foo_union
+) ABC
+where ABC.ss = 5;
+SELECT *
+from
+    (
+    SELECT 1 AS ss
+    UNION
+    SELECT DISTINCT
+        (
+           SELECT bar_union.c FROM bar_union WHERE bar_union.c = foo_union.b 
+        ) AS ss
+        FROM foo_union
+) ABC
+where ABC.ss = 5;
 --
 -- Clean up
 --
@@ -545,3 +632,8 @@ ORDER BY a;
 DROP TABLE IF EXISTS T_a1 CASCADE;
 DROP TABLE IF EXISTS T_b2 CASCADE;
 DROP TABLE IF EXISTS T_random CASCADE;
+DROP VIEW IF EXISTS v1_ncols CASCADE;
+DROP TABLE IF EXISTS t1_ncols CASCADE;
+DROP TABLE IF EXISTS t2_ncols CASCADE;
+DROP TABLE IF EXISTS foo_union;
+DROP TABLE IF EXISTS bar_union;

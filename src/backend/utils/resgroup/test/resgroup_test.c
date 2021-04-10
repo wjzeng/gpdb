@@ -8,11 +8,18 @@
 #define test_with_setup_and_teardown(test_func) \
 	unit_test_setup_teardown(test_func, setup, teardown)
 
+MemoryContext *OrigMessageContext;
+
 void
 setup(void **state)
 {
 	/* reset the hook function pointer to avoid test pollution. */
 	resgroup_assign_hook = NULL;
+
+	/* initializations for shouldBypassQuery() */
+	gp_resource_group_bypass = false;
+	debug_query_string = NULL;
+	MessageContext = OrigMessageContext;
 }
 
 void
@@ -196,7 +203,7 @@ test_BitsetToCpuset(void **state)
 		bms = bms_union(bms, bms_make_singleton(i));
 	}
 	BitsetToCpuset(bms, cpusetList, 1024);
-	assert_int_equal(strcmp(cpusetList, "0-7"), 0);
+	assert_string_equal(cpusetList, "0-7");
 	//
 	bms = NULL;
 	for (i = 0; i < 10; i += 2)
@@ -204,7 +211,7 @@ test_BitsetToCpuset(void **state)
 		bms = bms_union(bms, bms_make_singleton(i));
 	}
 	BitsetToCpuset(bms, cpusetList, 1024);
-	assert_int_equal(strcmp(cpusetList, "0,2,4,6,8"), 0);
+	assert_string_equal(cpusetList, "0,2,4,6,8");
 	//
 	bms = NULL;
 	for (i = 8; i < 24; ++i)
@@ -212,7 +219,7 @@ test_BitsetToCpuset(void **state)
 		bms = bms_union(bms, bms_make_singleton(i));
 	}
 	BitsetToCpuset(bms, cpusetList, 1024);
-	assert_int_equal(strcmp(cpusetList, "8-23"), 0);
+	assert_string_equal(cpusetList, "8-23");
 	//
 	bms = NULL;
 	for (i = 0; i < 1024; ++i)
@@ -220,7 +227,7 @@ test_BitsetToCpuset(void **state)
 		bms = bms_union(bms, bms_make_singleton(i));
 	}
 	BitsetToCpuset(bms, cpusetList, 1024);
-	assert_int_equal(strcmp(cpusetList, "0-1023"), 0);
+	assert_string_equal(cpusetList, "0-1023");
 	//
 	bms = NULL;
 	for (i = 0; i < 16; ++i)
@@ -228,17 +235,13 @@ test_BitsetToCpuset(void **state)
 		bms = bms_union(bms, bms_make_singleton(i));
 	}
 	BitsetToCpuset(bms, cpusetList, 1024);
-	assert_int_equal(strcmp(cpusetList, "0-15"), 0);
-	//
-	bms = NULL;
-	BitsetToCpuset(bms, cpusetList, 1024);
-	assert_int_equal(strcmp(cpusetList, ""), 0);
+	assert_string_equal(cpusetList, "0-15");
 	//
 	bms = NULL;
 	bms = bms_union(bms, bms_make_singleton(0));
 	bms = bms_union(bms, bms_make_singleton(100));
 	BitsetToCpuset(bms, cpusetList, 4);
-	assert_int_equal(strcmp(cpusetList, "0,"), 0);
+	assert_string_equal(cpusetList, "0,");
 }
 
 void
@@ -248,40 +251,100 @@ test_CpusetOperation(void **state)
 
 	strcpy(cpuset, "0-100");
 	cpusetOperation(cpuset, "1-99", 1024, true);
-	assert_int_equal(strcmp(cpuset, "0,100"), 0);
+	assert_string_equal(cpuset, "0,100");
 
 	strcpy(cpuset, "0,1,2,3");
 	cpusetOperation(cpuset, "0,3", 1024, true);
-	assert_int_equal(strcmp(cpuset, "1-2"), 0);
+	assert_string_equal(cpuset, "1-2");
 
 	strcpy(cpuset, "1-10");
 	cpusetOperation(cpuset, "3-100", 1024, true);
-	assert_int_equal(strcmp(cpuset, "1-2"), 0);
+	assert_string_equal(cpuset, "1-2");
 
 	strcpy(cpuset, "1-10");
 	cpusetOperation(cpuset, "0-100", 1024, false);
-	assert_int_equal(strcmp(cpuset, "0-100"), 0);
+	assert_string_equal(cpuset, "0-100");
 
 	strcpy(cpuset, "1-10");
 	cpusetOperation(cpuset, "100-200", 1024, false);
-	assert_int_equal(strcmp(cpuset, "1-10,100-200"), 0);
+	assert_string_equal(cpuset, "1-10,100-200");
 
 	strcpy(cpuset, "1-10");
 	cpusetOperation(cpuset, "5-15", 1024, false);
-	assert_int_equal(strcmp(cpuset, "1-15"), 0);
+	assert_string_equal(cpuset, "1-15");
 
 	strcpy(cpuset, "1-10");
 	cpusetOperation(cpuset, "", 1024, false);
-	assert_int_equal(strcmp(cpuset, "1-10"), 0);
+	assert_string_equal(cpuset, "1-10");
 
 	strcpy(cpuset, "1-10");
 	cpusetOperation(cpuset, "", 1024, true);
-	assert_int_equal(strcmp(cpuset, "1-10"), 0);
+	assert_string_equal(cpuset, "1-10");
 
 	//ResGroupOps_Probe();
 	//strcpy(cpuset, "1-10");
 	//cpusetOperation(cpuset, "0-100", 1024, true);
-	//assert_int_equal(strcmp(cpuset, "0"), 0);
+	//assert_string_equal(cpuset, "0");
+}
+
+static void
+test__shouldBypassQuery__null_query(void **state)
+{
+	assert_false(shouldBypassQuery(NULL));
+}
+
+static void
+test__shouldBypassQuery__empty_query(void **state)
+{
+	assert_false(shouldBypassQuery(""));
+}
+
+static void
+test__shouldBypassQuery__cmd_select(void **state)
+{
+	assert_false(shouldBypassQuery("select 1"));
+}
+
+static void
+test__shouldBypassQuery__cmd_set(void **state)
+{
+	assert_true(shouldBypassQuery("set enable_sort to off"));
+}
+
+static void
+test__shouldBypassQuery__cmd_reset(void **state)
+{
+	assert_true(shouldBypassQuery("reset enable_sort"));
+}
+
+static void
+test__shouldBypassQuery__cmd_show(void **state)
+{
+	assert_true(shouldBypassQuery("show enable_sort"));
+}
+
+static void
+test__shouldBypassQuery__cmd_mixed(void **state)
+{
+	assert_false(shouldBypassQuery("select 1; show enable_sort;"));
+	assert_false(shouldBypassQuery("show enable_sort; select 1;"));
+	assert_true(shouldBypassQuery("reset enable_sort; show enable_sort;"));
+}
+
+static void
+test__shouldBypassQuery__forced_bypass_mode(void **state)
+{
+	gp_resource_group_bypass = true;
+
+	assert_true(shouldBypassQuery("select 1"));
+}
+
+static void
+test__shouldBypassQuery__message_context_is_null(void **state)
+{
+	MessageContext = NULL;
+
+	assert_false(shouldBypassQuery("select 1"));
 }
 
 int
@@ -298,8 +361,22 @@ main(int argc, char *argv[])
 			unit_test(test__CpusetToBitset_abnormal_case),
 			unit_test(test_BitsetToCpuset),
 			unit_test(test_CpusetOperation),
+			test_with_setup_and_teardown(test__shouldBypassQuery__null_query),
+			test_with_setup_and_teardown(test__shouldBypassQuery__empty_query),
+			test_with_setup_and_teardown(test__shouldBypassQuery__cmd_select),
+			test_with_setup_and_teardown(test__shouldBypassQuery__cmd_set),
+			test_with_setup_and_teardown(test__shouldBypassQuery__cmd_reset),
+			test_with_setup_and_teardown(test__shouldBypassQuery__cmd_show),
+			test_with_setup_and_teardown(test__shouldBypassQuery__cmd_mixed),
+			test_with_setup_and_teardown(test__shouldBypassQuery__forced_bypass_mode),
+			test_with_setup_and_teardown(test__shouldBypassQuery__message_context_is_null),
 	};
 
 	MemoryContextInit();
+	OrigMessageContext = AllocSetContextCreate(TopMemoryContext,
+											   "MessageContext",
+											   ALLOCSET_DEFAULT_MINSIZE,
+											   ALLOCSET_DEFAULT_INITSIZE,
+											   ALLOCSET_DEFAULT_MAXSIZE);
 	run_tests(tests);
 }

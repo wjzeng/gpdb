@@ -27,7 +27,7 @@
  *	http://archives.postgresql.org/pgsql-bugs/2010-02/msg00187.php
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/bin/pg_dump/pg_dump.c,v 1.546 2009/08/04 19:46:51 tgl Exp $
+ *	  $PostgreSQL: pgsql/src/bin/pg_dump/pg_dump.c,v 1.547 2009/09/11 19:17:04 tgl Exp $
  *
  *-------------------------------------------------------------------------
  */
@@ -794,7 +794,10 @@ main(int argc, char **argv)
 	 * If supported, set extra_float_digits so that we can dump float data
 	 * exactly (given correctly implemented float I/O code, anyway)
 	 */
-	do_sql_command(g_conn, "SET extra_float_digits TO 2");
+	if (g_fout->remoteVersion >= 80500)
+		do_sql_command(g_conn, "SET extra_float_digits TO 3");
+	else if (g_fout->remoteVersion >= 70400)
+		do_sql_command(g_conn, "SET extra_float_digits TO 2");
 
 	/*
 	 * If synchronized scanning is supported, disable it, to prevent
@@ -5265,6 +5268,8 @@ dumpTableComment(Archive *fout, TableInfo *tbinfo,
 		if (objsubid == 0)
 		{
 			resetPQExpBuffer(target);
+			if (strcmp(reltypename, "EXTERNAL TABLE") == 0)
+				reltypename = "TABLE";
 			appendPQExpBuffer(target, "%s %s.", reltypename,
 							  fmtId(tbinfo->dobj.namespace->dobj.name));
 			appendPQExpBuffer(target, "%s ", fmtId(tbinfo->dobj.name));
@@ -9514,6 +9519,7 @@ dumpExternal(TableInfo *tbinfo, PQExpBuffer query, PQExpBuffer q, PQExpBuffer de
 		char	   *options;
 		bool		gpdb5OrLater = isGPDB5000OrLater();
 		char	   *on_clause;
+		bool		log_errors_persistently = false;
 
 		/*
 		 * DROP must be fully qualified in case same name appears in
@@ -9782,7 +9788,28 @@ dumpExternal(TableInfo *tbinfo, PQExpBuffer query, PQExpBuffer q, PQExpBuffer de
 
 		if (options && options[0] != '\0')
 		{
-			appendPQExpBuffer(q, "OPTIONS (\n %s\n )\n", options);
+			char *error_log_persistent = "error_log_persistent 'true'";
+			char *pos = strstr(options, error_log_persistent);
+			int error_log_len = strlen(error_log_persistent);
+			if (pos)
+			{
+				log_errors_persistently = true;
+				if (*(pos + error_log_len) == ',')
+						error_log_len += 6;
+				if (strlen(options) - error_log_len != 0)
+				{
+					char *opts = pg_malloc(sizeof(char) * (strlen(options) - error_log_len + 1));
+					int prev_len = pos - options;
+					if (prev_len > 0)
+						strncpy(opts, options, prev_len);
+					StrNCpy(opts + prev_len, pos + error_log_len,
+							strlen(options) - prev_len - error_log_len + 1 /* for \0 */);
+					appendPQExpBuffer(q, "OPTIONS (\n %s\n )\n", opts);
+					free(opts);
+				}
+			}
+			else
+				appendPQExpBuffer(q, "OPTIONS (\n %s\n )\n", options);
 		}
 
 		if (g_fout->remoteVersion >= 80205)
@@ -9802,7 +9829,11 @@ dumpExternal(TableInfo *tbinfo, PQExpBuffer query, PQExpBuffer q, PQExpBuffer de
 				 * attribute so we use the errtblname for emitting LOG ERRORS.
 				 */
 				if (errtblname && strlen(errtblname) > 0)
+				{
 					appendPQExpBufferStr(q, "LOG ERRORS ");
+					if (log_errors_persistently)
+						appendPQExpBufferStr(q, "PERSISTENTLY ");
+				}
 
 				/* reject limit */
 				appendPQExpBuffer(q, "SEGMENT REJECT LIMIT %s", rejlim);

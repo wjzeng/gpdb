@@ -637,3 +637,18 @@ insert into test_gsets values (0, 0), (0, 1), (0,2);
 select i,n,count(*), grouping(i), grouping(n), grouping(i,n) from test_gsets group by grouping sets((), (i,n)) having n is null;
 
 select x, y, count(*), grouping(x,y) from generate_series(1,1) x, generate_series(1,1) y group by grouping sets(x,y) having x is not null;
+
+
+-- test for replacing grouping columns with NULL constants in the given targetlist
+create table replace_col_agg(a int, b int, c text);
+
+insert into replace_col_agg values (1,2,'c1');
+insert into replace_col_agg values (1,3,'c2');
+insert into replace_col_agg values (2,4);
+
+
+select coalesce(c, 'total'), count(distinct b) from replace_col_agg group by grouping sets(c,());
+select a, b, count(distinct b)+a from replace_col_agg group by grouping sets((a), (b));
+select count(distinct a), b + 1 as f, 1 as g from replace_col_agg GROUP BY grouping sets((f,g), (f));
+
+drop table replace_col_agg;

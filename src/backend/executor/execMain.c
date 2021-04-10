@@ -53,6 +53,7 @@
 #include "catalog/pg_attribute_encoding.h"
 #include "catalog/pg_type.h"
 #include "cdb/cdbpartition.h"
+#include "commands/copy.h"
 #include "commands/tablecmds.h" /* XXX: temp for get_parts() */
 #include "commands/tablespace.h"
 #include "commands/trigger.h"
@@ -79,6 +80,7 @@
 #include "utils/typcache.h"
 #include "utils/workfile_mgr.h"
 #include "utils/faultinjector.h"
+#include "utils/resource_manager.h"
 
 #include "catalog/pg_statistic.h"
 #include "catalog/pg_class.h"
@@ -260,8 +262,6 @@ ExecutorStart(QueryDesc *queryDesc, int eflags)
 	Assert(queryDesc->estate == NULL);
 	Assert(queryDesc->plannedstmt != NULL);
 	Assert(queryDesc->memoryAccountId == MEMORY_OWNER_TYPE_Undefined);
-
-	PlannedStmt *plannedStmt = queryDesc->plannedstmt;
 
 	queryDesc->memoryAccountId = MemoryAccounting_CreateExecutorMemoryAccount();
 
@@ -983,6 +983,9 @@ ExecutorEnd(QueryDesc *queryDesc)
 	EState	   *estate;
 	MemoryContext oldcontext;
 
+	/* GPDB: whether this is a SPI inner query for extension usage */
+	bool 		isInnerQuery;
+
 	/* sanity checks */
 	Assert(queryDesc != NULL);
 
@@ -991,6 +994,9 @@ ExecutorEnd(QueryDesc *queryDesc)
 	Assert(estate != NULL);
 
 	Assert(NULL != queryDesc->plannedstmt && MEMORY_OWNER_TYPE_Undefined != queryDesc->memoryAccountId);
+
+	/* GPDB: Save SPI flag first in case the memory context of plannedstmt is cleaned up */
+	isInnerQuery = estate->es_plannedstmt->metricsQueryType > 0;
 
 	START_MEMORY_ACCOUNT(queryDesc->memoryAccountId);
 
@@ -1055,6 +1061,8 @@ ExecutorEnd(QueryDesc *queryDesc)
 		 */
 		FreeExecutorState(estate);
 
+		queryDesc->estate = NULL;
+
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
@@ -1111,7 +1119,7 @@ ExecutorEnd(QueryDesc *queryDesc)
 
 	/* GPDB hook for collecting query info */
 	if (query_info_collect_hook)
-		(*query_info_collect_hook)(METRICS_QUERY_DONE, queryDesc);
+		(*query_info_collect_hook)(isInnerQuery ? METRICS_INNER_QUERY_DONE : METRICS_QUERY_DONE, queryDesc);
 
 	/* Reset queryDesc fields that no longer point to anything */
 	queryDesc->tupDesc = NULL;
@@ -1445,10 +1453,7 @@ InitializeResultRelations(PlannedStmt *plannedstmt, EState *estate, CmdType oper
 			resultRelationOid = getrelid(resultRelationIndex, rangeTable);
 			if (operation == CMD_UPDATE || operation == CMD_DELETE)
 			{
-				resultRelation = CdbOpenRelation(resultRelationOid,
-													 lockmode,
-													 false, /* noWait */
-													 NULL); /* lockUpgraded */
+				resultRelation = CdbOpenRelation(resultRelationOid, lockmode, NULL);
 			}
 			else
 			{
@@ -1496,22 +1501,76 @@ InitializeResultRelations(PlannedStmt *plannedstmt, EState *estate, CmdType oper
 	else
 	{
 		List 	*all_relids = NIL;
-		Oid		 relid = getrelid(linitial_int(plannedstmt->resultRelations), rangeTable);
+		Oid		relid = getrelid(linitial_int(plannedstmt->resultRelations), rangeTable);
+		bool	is_root_table = false;
 
 		if (rel_is_child_partition(relid))
-		{
 			relid = rel_partition_get_master(relid);
-		}
+		else if (rel_is_partitioned(relid))
+			is_root_table = true;
 
 		estate->es_result_partitions = BuildPartitionNodeFromRoot(relid);
 		
 		/*
-		 * list all the relids that may take part in this insert operation
+		 * List all the relids that may take part in this insert operation.
+		 * The logic here is that:
+		 *   - If root partition is in the resultRelations, all_relids
+		 *     contains the root and all its all_inheritors
+		 *   - Otherwise, all_relids is a map of result_partitions to
+		 *     get each element's relation oid.
 		 */
-		all_relids = lappend_oid(all_relids, relid);
-		all_relids = list_concat(all_relids,
-								 all_partition_relids(estate->es_result_partitions));
-		
+		if (is_root_table)
+		{
+			all_relids = lappend_oid(all_relids, relid);
+			all_relids = list_concat(all_relids,
+						 all_partition_relids(estate->es_result_partitions));
+		}
+		else
+		{
+			ListCell *lc;
+			int       idx;
+
+			foreach(lc, resultRelations)
+			{
+				idx = lfirst_int(lc);
+				all_relids = lappend_oid(all_relids,
+							 getrelid(idx, rangeTable));
+			}
+		}
+
+		/*
+		 * For partitioned tables, in case of DELETE/UPDATE or INSERT
+		 * operation on the root table, we must acquire ExclusiveLock or
+		 * RowExclusiveLock respectively on the root and leaf
+		 * partitions, so that any other operation requesting lock
+		 * higher than AccessShareLock and ShareLock must wait on QD.
+		 * For example AO VACUUM should be blocked by the lock on the
+		 * partition table on QD taken by the DML statements, otherwise,
+		 * this leads to inconsistent segfile state between QD and QE,
+		 * and it will fail the next operation on the same segfile.
+		 *
+		 * resultRelations may not have all the entries including the
+		 * root and leaf partition tables, so explicitly acquire locks
+		 * on all the tables.  For example: INSERT / DELETE / UPDATE
+		 * plans on Partitioned tables produced by ORCA only has the
+		 * root table info in resultRelations. Similarly, INSERT plans
+		 * produced by planner only has the root table info as well.
+		 */
+		if (is_root_table && (operation == CMD_UPDATE || operation == CMD_DELETE || operation == CMD_INSERT))
+		{
+			// On QD, the lockmode is RowExclusiveLock
+			Assert(lockmode == RowExclusiveLock);
+			if (operation == CMD_UPDATE || operation == CMD_DELETE)
+			{
+				lockmode = ExclusiveLock;
+			}
+			foreach(l, all_relids)
+			{
+				Oid	relid = lfirst_oid(l);
+				LockRelationOid(relid, lockmode);
+			}
+		}
+
         /* 
          * We also assign a segno for a deletion operation.
          * That segno will later be touched to ensure a correct
@@ -1743,7 +1802,7 @@ InitPlan(QueryDesc *queryDesc, int eflags)
 
         /* CDB: On QD, lock whole table in S or X mode, if distributed. */
 		lockmode = rc->forUpdate ? RowExclusiveLock : RowShareLock;
-		relation = CdbOpenRelation(relid, lockmode, rc->noWait, &lockUpgraded);
+		relation = CdbOpenRelation(relid, lockmode, &lockUpgraded);
 		if (lockUpgraded)
 		{
             heap_close(relation, NoLock);
@@ -2170,6 +2229,11 @@ InitPlan(QueryDesc *queryDesc, int eflags)
 	        (Gp_role != GP_ROLE_EXECUTE || Gp_is_writer) )
 		OpenIntoRel(queryDesc);
 
+	if(queryDesc->plannedstmt->copyIntoClause != NULL)
+	{
+		queryDesc->dest = CreateCopyDestReceiver();
+		((DR_copy*)queryDesc->dest)->queryDesc = queryDesc;
+	}
 
 	if (DEBUG1 >= log_min_messages)
 			{
@@ -2769,6 +2833,13 @@ ExecutePlan(EState *estate,
 	TupleTableSlot *result;
 
 	/*
+	 * For holdable cursor, the plan is executed without rewinding on gpdb. We
+	 * need to quit if the executor has already emitted all tuples.
+	 */
+	if (estate->es_got_eos)
+		return NULL;
+
+	/*
 	 * initialize local variables
 	 */
 	current_tuple_count = 0;
@@ -2949,11 +3020,13 @@ lnext:	;
 
 			/*
 			 * extract the 'ctid' junk attribute.
+			 * extract the 'gp_segment_id' and do tuple locality check.
 			 */
 			if (operation == CMD_UPDATE || operation == CMD_DELETE)
 			{
 				Datum		datum;
 				bool		isNull;
+				AttrNumber      segno;
 
 				datum = ExecGetJunkAttribute(slot, junkfilter->jf_junkAttNo,
 											 &isNull);
@@ -2964,6 +3037,30 @@ lnext:	;
 				tupleid = (ItemPointer) DatumGetPointer(datum);
 				tuple_ctid = *tupleid;	/* make sure we don't free the ctid!! */
 				tupleid = &tuple_ctid;
+
+				segno = ExecFindJunkAttribute(junkfilter, "gp_segment_id");
+				if (AttributeNumberIsValid(segno) && Gp_role != GP_ROLE_UTILITY)
+				{
+					  int32 segid;
+					  datum = ExecGetJunkAttribute(slot, segno, &isNull);
+					  /* shouldn't ever get a null result... */
+					  if (isNull)
+					    elog(ERROR, "gp_segment_id is NULL");
+					  /*
+					   * Sanity check the distribution of the tuple to prevent
+					   * potential data corruption in case users manipulate data
+					   * incorrectly (e.g. insert data on incorrect segment through
+					   * utility mode) or there is bug in code, etc.
+					   */
+					  segid = DatumGetInt32(datum);
+					  if (segid != GpIdentity.segindex)
+					    elog(ERROR,
+						 "distribution key of the tuple (%u, %u) doesn't belong to "
+						 "current segment (actually from seg%d)",
+						 BlockIdGetBlockNumber(&(tupleid->ip_blkid)),
+						 tupleid->ip_posid,
+						 segid);
+				}
 			}
 
 			/*
@@ -3236,7 +3333,7 @@ ExecInsert(TupleTableSlot *slot,
 
 		}
 
-		mtuple = ExecFetchSlotMemTuple(slot, false);
+		mtuple = ExecFetchSlotMemTuple(slot);
 		appendonly_insert(resultRelInfo->ri_aoInsertDesc, mtuple, &newId, (AOTupleId *) &lastTid);
 	}
 	else if (rel_is_aocols)
@@ -3864,7 +3961,7 @@ lreplace:;
 					appendonly_update_init(resultRelationDesc, ActiveSnapshot, resultRelInfo->ri_aosegno);
 			}
 
-			mtuple = ExecFetchSlotMemTuple(slot, false);
+			mtuple = ExecFetchSlotMemTuple(slot);
 
 			result = appendonly_update(resultRelInfo->ri_updateDesc,
 									   mtuple, (AOTupleId *) tupleid, (AOTupleId *) &lastTid);
@@ -4872,9 +4969,7 @@ OpenIntoRel(QueryDesc *queryDesc)
 	estate->es_into_relation_is_bulkload = bufferPoolBulkLoad;
 	estate->es_into_relation_descriptor = intoRelationDesc;
 
-	relFileNode.spcNode = tablespaceId;
-	relFileNode.dbNode = MyDatabaseId;
-	relFileNode.relNode = intoRelationId;
+	relFileNode = intoRelationDesc->rd_node;
 	if (estate->es_into_relation_is_bulkload)
 	{
 		MirroredBufferPool_BeginBulkLoad(

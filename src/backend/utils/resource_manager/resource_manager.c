@@ -19,6 +19,7 @@
 #include "utils/guc.h"
 #include "utils/resource_manager.h"
 #include "utils/resgroup-ops.h"
+#include "utils/session_state.h"
 #include "replication/walsender.h"
 #include "executor/spi.h"
 
@@ -117,4 +118,9 @@ InitResManager(void)
 	{
 		SPI_InitMemoryReservation();
 	}
+
+	if (MySessionState &&
+		!am_walsender &&
+		(Gp_role == GP_ROLE_DISPATCH || Gp_role == GP_ROLE_EXECUTE))
+		GPMemoryProtect_TrackStartupMemory();
 }

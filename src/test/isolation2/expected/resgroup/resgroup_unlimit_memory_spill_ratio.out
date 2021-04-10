@@ -140,8 +140,8 @@ count
 (1 row)
 
 --clean env
-SET ROLE to gpadmin;
-SET
+RESET ROLE;
+RESET
 DROP TABLE test_zero_workmem;
 DROP
 DROP ROLE role_zero_workmem;

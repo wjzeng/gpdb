@@ -145,9 +145,7 @@ rollback;
 -------------------
 -- MPP-7634: bitmap index scan
 --
--- Known_opt_diff: MPP-21346
 select count(*) from direct_test_bitmap where dt='2008-02-05';
--- Known_opt_diff: MPP-21346
 select count(*) from direct_test_bitmap where dt='2008-02-01';
 ----------------------------------------------------------------------------------
 -- MPP-7637: partitioned table
@@ -157,7 +155,6 @@ select * from direct_test_partition where trans_id =1;
 ----------------------------------------------------------------------------------
 -- MPP-7638: range table partition
 --
--- Known_opt_diff: MPP-21346
 select count(*) from direct_test_range_partition where a =1;
 ----------------------------------------------------------------------------------
 -- Prepared statements
@@ -258,6 +255,19 @@ insert into ddtesttab values (1, 1, 5 + nextval('ddtestseq'));
 drop table ddtesttab;
 drop sequence ddtestseq;
 
+
+-- test direct dispatch via gp_segment_id qual
+create table t_test_dd_via_segid(id int);
+insert into t_test_dd_via_segid select * from generate_series(1, 6);
+
+explain select gp_segment_id, id from t_test_dd_via_segid where gp_segment_id=0;
+select gp_segment_id, id from t_test_dd_via_segid where gp_segment_id=0;
+
+explain select gp_segment_id, id from t_test_dd_via_segid where gp_segment_id=1;
+select gp_segment_id, id from t_test_dd_via_segid where gp_segment_id=1;
+
+explain select gp_segment_id, id from t_test_dd_via_segid where gp_segment_id=2;
+select gp_segment_id, id from t_test_dd_via_segid where gp_segment_id=2;
 
 -- cleanup
 set test_print_direct_dispatch_info=off;

@@ -25,23 +25,23 @@
 // fwd decl
 namespace gpos
 {
-	class IMemoryPool;
-	class CBitSet;
-}
+class CMemoryPool;
+class CBitSet;
+}  // namespace gpos
 
 namespace gpdxl
 {
-	class CDXLNode;
+class CDXLNode;
 }
 
 namespace gpopt
 {
-	class CExpression;
-	class CMDAccessor;
-	class CQueryContext;
-	class COptimizerConfig;
-	class ICostModel;
-}
+class CExpression;
+class CMDAccessor;
+class CQueryContext;
+class COptimizerConfig;
+class ICostModel;
+}  // namespace gpopt
 
 struct PlannedStmt;
 struct Query;
@@ -55,16 +55,15 @@ using namespace gpopt;
 // context of optimizer input and output objects
 struct SOptContext
 {
-
 	// mark which pointer member should NOT be released
 	// when calling Free() function
 	enum EPin
 	{
-		epinQueryDXL, // keep m_query_dxl
-		epinQuery, 	 // keep m_query
-		epinPlanDXL, // keep m_plan_dxl
-		epinPlStmt, // keep m_plan_stmt
-		epinErrorMsg // keep m_error_msg
+		epinQueryDXL,  // keep m_query_dxl
+		epinQuery,	   // keep m_query
+		epinPlanDXL,   // keep m_plan_dxl
+		epinPlStmt,	   // keep m_plan_stmt
+		epinErrorMsg   // keep m_error_msg
 	};
 
 	// query object serialized to DXL
@@ -102,218 +101,176 @@ struct SOptContext
 	void Free(EPin input, EPin epinOutput);
 
 	// Clone the error message in given context.
-	CHAR* CloneErrorMsg(struct MemoryContextData *context);
+	CHAR *CloneErrorMsg(struct MemoryContextData *context);
 
 	// casting function
-	static
-	SOptContext *Cast(void *ptr);
+	static SOptContext *Cast(void *ptr);
 
-}; // struct SOptContext
+};	// struct SOptContext
 
 class COptTasks
 {
-	private:
+private:
+	// context of relcache input and output objects
+	struct SContextRelcacheToDXL
+	{
+		// list of object oids to lookup
+		List *m_oid_list;
 
-		// context of relcache input and output objects
-		struct SContextRelcacheToDXL
-		{
-			// list of object oids to lookup
-			List *m_oid_list;
+		// comparison type for tasks retrieving scalar comparisons
+		ULONG m_cmp_type;
 
-			// comparison type for tasks retrieving scalar comparisons
-			ULONG m_cmp_type;
+		// if filename is not null, then output will be written to file
+		const char *m_filename;
 
-			// if filename is not null, then output will be written to file
-			const char *m_filename;
+		// if filename is null, then output will be stored here
+		char *m_dxl;
 
-			// if filename is null, then output will be stored here
-			char *m_dxl;
+		// ctor
+		SContextRelcacheToDXL(List *oid_list, ULONG cmp_type,
+							  const char *filename);
 
-			// ctor
-			SContextRelcacheToDXL(List *oid_list, ULONG cmp_type, const char *filename);
+		// casting function
+		static SContextRelcacheToDXL *RelcacheConvert(void *ptr);
+	};
 
-			// casting function
-			static
-			SContextRelcacheToDXL *RelcacheConvert(void *ptr);
-		};
+	// Structure containing the input and output string for a task that evaluates expressions.
+	struct SEvalExprContext
+	{
+		// Serialized DXL of the expression to be evaluated
+		char *m_dxl;
 
-		// Structure containing the input and output string for a task that evaluates expressions.
-		struct SEvalExprContext
-		{
-			// Serialized DXL of the expression to be evaluated
-			char *m_dxl;
+		// The result of evaluating the expression
+		char *m_dxl_result;
 
-			// The result of evaluating the expression
-			char *m_dxl_result;
+		// casting function
+		static SEvalExprContext *PevalctxtConvert(void *ptr);
+	};
 
-			// casting function
-			static
-			SEvalExprContext *PevalctxtConvert(void *ptr);
-		};
+	// context of minidump load and execution
+	struct SOptimizeMinidumpContext
+	{
+		// the name of the file containing the minidump
+		char *m_szFileName;
 
-		// context of minidump load and execution
-		struct SOptimizeMinidumpContext
-		{
-			// the name of the file containing the minidump
-			char *m_szFileName;
+		// the result of optimizing the minidump
+		char *m_dxl_result;
 
-			// the result of optimizing the minidump
-			char *m_dxl_result;
+		// casting function
+		static SOptimizeMinidumpContext *Cast(void *ptr);
+	};
 
-			// casting function
-			static
-			SOptimizeMinidumpContext *Cast(void *ptr);
-		};
+	// execute a task given the argument
+	static void Execute(void *(*func)(void *), void *func_arg);
 
-		// execute a task given the argument
-		static
-		void Execute ( void *(*func) (void *), void *func_arg);
+	// map GPOS log severity level to GPDB, print error and delete the given error buffer
+	static void LogExceptionMessageAndDelete(
+		CHAR *err_buf, ULONG severity_level = CException::ExsevInvalid);
 
-		// map GPOS log severity level to GPDB, print error and delete the given error buffer
-		static
-		void LogExceptionMessageAndDelete(CHAR* err_buf, ULONG severity_level=CException::ExsevInvalid);
+	// task that does the translation from xml to dxl to planned_stmt
+	static void *ConvertToPlanStmtFromDXLTask(void *ptr);
 
-		// task that does the translation from xml to dxl to planned_stmt
-		static
-		void* ConvertToPlanStmtFromDXLTask(void *ptr);
+	// task that does the translation from query to XML
+	static void *ConvertToDXLFromQueryTask(void *ptr);
 
-		// task that does the translation from query to XML
-		static
-		void* ConvertToDXLFromQueryTask(void *ptr);
+	// dump relcache info for an object into DXL
+	static void *ConvertToDXLFromMDObjsTask(void *ptr);
 
-		// dump relcache info for an object into DXL
-		static
-		void* ConvertToDXLFromMDObjsTask(void *ptr);
+	// dump metadata about cast objects from relcache to a string in DXL format
+	static void *ConvertToDXLFromMDCast(void *ptr);
 
-		// dump metadata about cast objects from relcache to a string in DXL format
-		static
-		void *ConvertToDXLFromMDCast(void *ptr);
-		
-		// dump metadata about scalar comparison objects from relcache to a string in DXL format
-		static
-		void *ConvertToDXLFromMDScalarCmp(void *ptr);
-		
-		// dump relstats info for an object into DXL
-		static
-		void* ConvertToDXLFromRelStatsTask(void *ptr);
+	// dump metadata about scalar comparison objects from relcache to a string in DXL format
+	static void *ConvertToDXLFromMDScalarCmp(void *ptr);
 
-		// evaluates an expression given as a serialized DXL string and returns the serialized DXL result
-		static
-		void* EvalExprFromDXLTask(void *ptr);
+	// dump relstats info for an object into DXL
+	static void *ConvertToDXLFromRelStatsTask(void *ptr);
 
-		// create optimizer configuration object
-		static
-		COptimizerConfig *CreateOptimizerConfig(IMemoryPool *mp, ICostModel *cost_model);
+	// evaluates an expression given as a serialized DXL string and returns the serialized DXL result
+	static void *EvalExprFromDXLTask(void *ptr);
 
-		// optimize a query to a physical DXL
-		static
-		void* OptimizeTask(void *ptr);
+	// create optimizer configuration object
+	static COptimizerConfig *CreateOptimizerConfig(CMemoryPool *mp,
+												   ICostModel *cost_model);
 
-		// optimize the query in a minidump and return resulting plan in DXL format
-		static
-		void* OptimizeMinidumpTask(void *ptr);
+	// optimize a query to a physical DXL
+	static void *OptimizeTask(void *ptr);
 
-		// translate a DXL tree into a planned statement
-		static
-		PlannedStmt *ConvertToPlanStmtFromDXL(IMemoryPool *mp, CMDAccessor *md_accessor, const CDXLNode *dxlnode, bool can_set_tag);
+	// optimize the query in a minidump and return resulting plan in DXL format
+	static void *OptimizeMinidumpTask(void *ptr);
 
-		// load search strategy from given path
-		static
-		CSearchStageArray *LoadSearchStrategy(IMemoryPool *mp, char *path);
+	// translate a DXL tree into a planned statement
+	static PlannedStmt *ConvertToPlanStmtFromDXL(CMemoryPool *mp,
+												 CMDAccessor *md_accessor,
+												 const CDXLNode *dxlnode,
+												 bool can_set_tag);
 
-		// allocate memory for string
-		static
-		CHAR *SzAllocate(IMemoryPool *pmp, ULONG ulSize);
+	// load search strategy from given path
+	static CSearchStageArray *LoadSearchStrategy(CMemoryPool *mp, char *path);
 
-		// helper for converting wide character string to regular string
-		static
-		CHAR *CreateMultiByteCharStringFromWCString(const WCHAR *wcstr);
+	// allocate memory for string
+	static CHAR *SzAllocate(CMemoryPool *pmp, ULONG ulSize);
 
-		// lookup given exception type in the given array
-		static
-		BOOL FoundException(gpos::CException &exc, const ULONG *exceptions, ULONG size);
+	// helper for converting wide character string to regular string
+	static CHAR *CreateMultiByteCharStringFromWCString(const WCHAR *wcstr);
 
-		// check if given exception is an unexpected reason for failing to produce a plan
-		static
-		BOOL IsUnexpectedFailure(gpos::CException &exc);
+	// set cost model parameters
+	static void SetCostModelParams(ICostModel *cost_model);
 
-		// check if given exception should error out
-		static
-		BOOL ShouldErrorOut(gpos::CException &exc);
+	// generate an instance of optimizer cost model
+	static ICostModel *GetCostModel(CMemoryPool *mp, ULONG num_segments);
 
-		// set cost model parameters
-		static
-		void SetCostModelParams(ICostModel *cost_model);
+	// print warning messages for columns with missing statistics
+	static void PrintMissingStatsWarning(CMemoryPool *mp,
+										 CMDAccessor *md_accessor,
+										 IMdIdArray *col_stats,
+										 MdidHashSet *phsmdidRel);
 
-		// generate an instance of optimizer cost model
-		static
-		ICostModel *GetCostModel(IMemoryPool *mp, ULONG num_segments);
+public:
+	// convert Query->DXL->LExpr->Optimize->PExpr->DXL
+	static char *Optimize(Query *query);
 
-		// print warning messages for columns with missing statistics
-		static
-		void PrintMissingStatsWarning(IMemoryPool *mp, CMDAccessor *md_accessor, IMdIdArray *col_stats, MdidHashSet *phsmdidRel);
+	// optimize Query->DXL->LExpr->Optimize->PExpr->DXL->PlannedStmt
+	static PlannedStmt *GPOPTOptimizedPlan(
+		Query *query, SOptContext *gpopt_context,
+		BOOL *
+			had_unexpected_failure	// output : set to true if optimizer unexpectedly failed to produce plan
+	);
 
-	public:
+	// convert query to DXL to xml string.
+	static char *ConvertQueryToDXL(Query *query);
 
-		// convert Query->DXL->LExpr->Optimize->PExpr->DXL
-		static
-		char *Optimize(Query *query);
+	// convert xml string to DXL and to PS
+	static PlannedStmt *ConvertToiPlanStmtFromXML(char *xml_string);
 
-		// optimize Query->DXL->LExpr->Optimize->PExpr->DXL->PlannedStmt
-		static
-		PlannedStmt *GPOPTOptimizedPlan
-			(
-			Query *query,
-			SOptContext* gpopt_context,
-			BOOL *had_unexpected_failure // output : set to true if optimizer unexpectedly failed to produce plan
-			);
+	// dump metadata objects from relcache to file in DXL format
+	static void DumpMDObjs(List *oids, const char *filename);
 
-		// convert query to DXL to xml string.
-		static
-		char *ConvertQueryToDXL(Query *query);
+	// dump metadata objects from relcache to a string in DXL format
+	static char *SzMDObjs(List *oids);
 
-		// convert xml string to DXL and to PS
-		static
-		PlannedStmt *ConvertToiPlanStmtFromXML(char *xml_string);
+	// dump cast function from relcache to a string in DXL format
+	static char *DumpMDCast(List *oids);
 
-		// dump metadata objects from relcache to file in DXL format
-		static
-		void DumpMDObjs(List *oids, const char *filename);
+	// dump scalar comparison from relcache to a string in DXL format
+	static char *DumpMDScalarCmp(List *oids, char *cmp_type);
 
-		// dump metadata objects from relcache to a string in DXL format
-		static
-		char *SzMDObjs(List *oids);
-		
-		// dump cast function from relcache to a string in DXL format
-		static
-		char *DumpMDCast(List *oids);
-		
-		// dump scalar comparison from relcache to a string in DXL format
-		static
-		char *DumpMDScalarCmp(List *oids, char *cmp_type);
+	// dump statistics from relcache to a string in DXL format
+	static char *DumpRelStats(List *oids);
 
-		// dump statistics from relcache to a string in DXL format
-		static
-		char *DumpRelStats(List *oids);
+	// enable/disable a given xforms
+	static bool SetXform(char *xform_str, bool should_disable);
 
-		// enable/disable a given xforms
-		static
-		bool SetXform(char *xform_str, bool should_disable);
-		
-		// return comparison type code
-		static
-		ULONG GetComparisonType(char *cmp_type);
+	// return comparison type code
+	static ULONG GetComparisonType(char *cmp_type);
 
-		// converts XML string to DXL and evaluates the expression
-		static
-		char *EvalExprFromXML(char *xml_string);
+	// converts XML string to DXL and evaluates the expression
+	static char *EvalExprFromXML(char *xml_string);
 
-		// loads a minidump from the given file path, executes it and returns
-		// the serialized representation of the result as DXL
-		static
-		char *OptimizeMinidumpFromFile(char *file_name);
+	// loads a minidump from the given file path, executes it and returns
+	// the serialized representation of the result as DXL
+	static char *OptimizeMinidumpFromFile(char *file_name);
 };
 
-#endif // COptTasks_H
+#endif	// COptTasks_H
 
 // EOF
