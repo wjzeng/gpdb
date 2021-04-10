@@ -19,8 +19,8 @@
  * routines.
  *
  *
- * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -38,9 +38,6 @@
 #include <signal.h>
 #include <time.h>
 
-#include <netinet/in.h>
-#include <arpa/inet.h>
-
 #ifdef WIN32
 #include "win32.h"
 #else
@@ -51,9 +48,6 @@
 #ifdef HAVE_POLL_H
 #include <poll.h>
 #endif
-#ifdef HAVE_SYS_POLL_H
-#include <sys/poll.h>
-#endif
 #ifdef HAVE_SYS_SELECT_H
 #include <sys/select.h>
 #endif
@@ -61,12 +55,13 @@
 #include "libpq-fe.h"
 #include "libpq-int.h"
 #include "mb/pg_wchar.h"
+#include "port/pg_bswap.h"
 #include "pg_config_paths.h"
 
 static int	pqPutMsgBytes(const void *buf, size_t len, PGconn *conn);
 static int	pqSendSome(PGconn *conn, int len);
-static int pqSocketCheck(PGconn *conn, int forRead, int forWrite,
-			  time_t end_time);
+static int	pqSocketCheck(PGconn *conn, int forRead, int forWrite,
+						  time_t end_time);
 static int	pqSocketPoll(int sock, int forRead, int forWrite, time_t end_time);
 
 /*
@@ -285,14 +280,14 @@ pqGetInt(int *result, size_t bytes, PGconn *conn)
 				return EOF;
 			memcpy(&tmp2, conn->inBuffer + conn->inCursor, 2);
 			conn->inCursor += 2;
-			*result = (int) ntohs(tmp2);
+			*result = (int) pg_ntoh16(tmp2);
 			break;
 		case 4:
 			if (conn->inCursor + 4 > conn->inEnd)
 				return EOF;
 			memcpy(&tmp4, conn->inBuffer + conn->inCursor, 4);
 			conn->inCursor += 4;
-			*result = (int) ntohl(tmp4);
+			*result = (int) pg_ntoh32(tmp4);
 			break;
 		default:
 			pqInternalNotice(&conn->noticeHooks,
@@ -357,12 +352,12 @@ pqPutInt(int value, size_t bytes, PGconn *conn)
 	switch (bytes)
 	{
 		case 2:
-			tmp2 = htons((uint16) value);
+			tmp2 = pg_hton16((uint16) value);
 			if (pqPutMsgBytes((const char *) &tmp2, 2, conn))
 				return EOF;
 			break;
 		case 4:
-			tmp4 = htonl((uint32) value);
+			tmp4 = pg_hton32((uint32) value);
 			if (pqPutMsgBytes((const char *) &tmp4, 4, conn))
 				return EOF;
 			break;
@@ -633,7 +628,7 @@ pqPutMsgEndNoAutoFlush(PGconn *conn)
 	{
 		uint32		msgLen = conn->outMsgEnd - conn->outMsgStart;
 
-		msgLen = htonl(msgLen);
+		msgLen = pg_hton32(msgLen);
 		memcpy(conn->outBuffer + conn->outMsgStart, &msgLen, 4);
 	}
 
@@ -793,13 +788,14 @@ retry3:
 	 * the file selected for reading already.
 	 *
 	 * In SSL mode it's even worse: SSL_read() could say WANT_READ and then
-	 * data could arrive before we make the pqReadReady() test.  So we must
-	 * play dumb and assume there is more data, relying on the SSL layer to
-	 * detect true EOF.
+	 * data could arrive before we make the pqReadReady() test, but the second
+	 * SSL_read() could still say WANT_READ because the data received was not
+	 * a complete SSL record.  So we must play dumb and assume there is more
+	 * data, relying on the SSL layer to detect true EOF.
 	 */
 
 #ifdef USE_SSL
-	if (conn->ssl)
+	if (conn->ssl_in_use)
 		return 0;
 #endif
 
@@ -812,12 +808,8 @@ retry3:
 			/* ready for read */
 			break;
 		default:
-			printfPQExpBuffer(&conn->errorMessage,
-							  libpq_gettext(
-								"server closed the connection unexpectedly\n"
-				   "\tThis probably means the server terminated abnormally\n"
-							 "\tbefore or while processing the request.\n"));
-			goto definitelyFailed;
+			/* we override pqReadReady's message with something more useful */
+			goto definitelyEOF;
 	}
 
 	/*
@@ -856,12 +848,20 @@ retry4:
 
 	/*
 	 * OK, we are getting a zero read even though select() says ready. This
-	 * means the connection has been closed.  Cope.  Note that errorMessage
-	 * has been set already.
+	 * means the connection has been closed.  Cope.
 	 */
+definitelyEOF:
+	printfPQExpBuffer(&conn->errorMessage,
+					  libpq_gettext(
+									"server closed the connection unexpectedly\n"
+									"\tThis probably means the server terminated abnormally\n"
+									"\tbefore or while processing the request.\n"));
+
+	/* Come here if lower-level code already set a suitable errorMessage */
 definitelyFailed:
-	pqDropConnection(conn);
-	conn->status = CONNECTION_BAD;		/* No more connection to backend */
+	/* Do *not* drop any already-read data; caller still wants it */
+	pqDropConnection(conn, false);
+	conn->status = CONNECTION_BAD;	/* No more connection to backend */
 	return -1;
 }
 
@@ -873,6 +873,13 @@ definitelyFailed:
  *
  * Return 0 on success, -1 on failure and 1 when not all data could be sent
  * because the socket would block and the connection is non-blocking.
+ *
+ * Upon write failure, conn->write_failed is set and the error message is
+ * saved in conn->write_err_msg, but we clear the output buffer and return
+ * zero anyway; this is because callers should soldier on until it's possible
+ * to read from the server and check for an error message.  write_err_msg
+ * should be reported only when we are unable to obtain a server error first.
+ * (Thus, a -1 result is returned only for an internal *read* failure.)
  */
 static int
 pqSendSome(PGconn *conn, int len)
@@ -881,13 +888,32 @@ pqSendSome(PGconn *conn, int len)
 	int			remaining = conn->outCount;
 	int			result = 0;
 
+	/*
+	 * If we already had a write failure, we will never again try to send data
+	 * on that connection.  Even if the kernel would let us, we've probably
+	 * lost message boundary sync with the server.  conn->write_failed
+	 * therefore persists until the connection is reset, and we just discard
+	 * all data presented to be written.
+	 */
+	if (conn->write_failed)
+	{
+		/* conn->write_err_msg should be set up already */
+		conn->outCount = 0;
+		return 0;
+	}
+
 	if (conn->sock == PGINVALID_SOCKET)
 	{
 		printfPQExpBuffer(&conn->errorMessage,
 						  libpq_gettext("connection not open\n"));
+		conn->write_failed = true;
+		/* Transfer error message to conn->write_err_msg, if possible */
+		/* (strdup failure is OK, we'll cope later) */
+		conn->write_err_msg = strdup(conn->errorMessage.data);
+		resetPQExpBuffer(&conn->errorMessage);
 		/* Discard queued data; no chance it'll ever be sent */
 		conn->outCount = 0;
-		return -1;
+		return 0;
 	}
 
 	/* while there's still data to send */
@@ -925,17 +951,24 @@ pqSendSome(PGconn *conn, int len)
 
 				default:
 					/* pqsecure_write set the error message for us */
+					conn->write_failed = true;
 
 					/*
-					 * We used to close the socket here, but that's a bad idea
-					 * since there might be unread data waiting (typically, a
-					 * NOTICE message from the backend telling us it's
-					 * committing hara-kiri...).  Leave the socket open until
-					 * pqReadData finds no more data can be read.  But abandon
-					 * attempt to send data.
+					 * Transfer error message to conn->write_err_msg, if
+					 * possible (strdup failure is OK, we'll cope later).
+					 *
+					 * Note: this assumes that pqsecure_write and its children
+					 * will overwrite not append to conn->errorMessage.  If
+					 * that's ever changed, we could remember the length of
+					 * conn->errorMessage at entry to this routine, and then
+					 * save and delete just what was appended.
 					 */
+					conn->write_err_msg = strdup(conn->errorMessage.data);
+					resetPQExpBuffer(&conn->errorMessage);
+
+					/* Discard queued data; no chance it'll ever be sent */
 					conn->outCount = 0;
-					return -1;
+					return 0;
 			}
 		}
 		else
@@ -950,16 +983,6 @@ pqSendSome(PGconn *conn, int len)
 			/*
 			 * We didn't send it all, wait till we can send more.
 			 *
-			 * If the connection is in non-blocking mode we don't wait, but
-			 * return 1 to indicate that data is still pending.
-			 */
-			if (pqIsnonblocking(conn))
-			{
-				result = 1;
-				break;
-			}
-
-			/*
 			 * There are scenarios in which we can't send data because the
 			 * communications channel is full, but we cannot expect the server
 			 * to clear the channel eventually because it's blocked trying to
@@ -970,13 +993,33 @@ pqSendSome(PGconn *conn, int len)
 			 * again.  Furthermore, it is possible that such incoming data
 			 * might not arrive until after we've gone to sleep.  Therefore,
 			 * we wait for either read ready or write ready.
+			 *
+			 * In non-blocking mode, we don't wait here directly, but return 1
+			 * to indicate that data is still pending.  The caller should wait
+			 * for both read and write ready conditions, and call
+			 * PQconsumeInput() on read ready, but just in case it doesn't, we
+			 * call pqReadData() ourselves before returning.  That's not
+			 * enough if the data has not arrived yet, but it's the best we
+			 * can do, and works pretty well in practice.  (The documentation
+			 * used to say that you only need to wait for write-ready, so
+			 * there are still plenty of applications like that out there.)
+			 *
+			 * Note that errors here don't result in write_failed becoming
+			 * set.
 			 */
 			if (pqReadData(conn) < 0)
 			{
 				result = -1;	/* error message already set up */
 				break;
 			}
-			if (pqWait(TRUE, TRUE, conn))
+
+			if (pqIsnonblocking(conn))
+			{
+				result = 1;
+				break;
+			}
+
+			if (pqWait(true, true, conn))
 			{
 				result = -1;
 				break;
@@ -1010,6 +1053,7 @@ pqSendSome(PGconn *conn, int len)
  *
  * Return 0 on success, -1 on failure and 1 when not all data could be sent
  * because the socket would block and the connection is non-blocking.
+ * (See pqSendSome comments about how failure should be handled.)
  */
 int
 pqFlush(PGconn *conn)
@@ -1026,7 +1070,7 @@ pqFlush(PGconn *conn)
 /*
  * pqFlushNonBlocking:
  *
- * wrapper for pqFlush, used by FileRep and dispatcher.
+ * wrapper for pqFlush, used by the dispatcher.
  * conn will be temporarily set to non-blocking mode,
  * so that if not all data could be sent on 1st attempt, 
  * pqFlushNonBlocking will return 1 instead of waiting/retrying.
@@ -1036,9 +1080,10 @@ pqFlush(PGconn *conn)
 int
 pqFlushNonBlocking(PGconn *conn)
 {
+	int			ret;
 	bool old = conn->nonblocking;
-	conn->nonblocking = TRUE;
-	int ret = pqFlush(conn);
+	conn->nonblocking = true;
+	ret = pqFlush(conn);
 	conn->nonblocking = old;
 	return ret;
 }
@@ -1062,11 +1107,9 @@ pqWait(int forRead, int forWrite, PGconn *conn)
 /*
  * pqWaitTimed: wait, but not past finish_time.
  *
- * If finish_time is exceeded then we return failure (EOF).  This is like
- * the response for a kernel exception because we don't want the caller
- * to try to read/write in that case.
- *
  * finish_time = ((time_t) -1) disables the wait limit.
+ *
+ * Returns -1 on failure, 0 if the socket is readable/writable, 1 if it timed out.
  */
 int
 pqWaitTimed(int forRead, int forWrite, PGconn *conn, time_t finish_time)
@@ -1076,13 +1119,13 @@ pqWaitTimed(int forRead, int forWrite, PGconn *conn, time_t finish_time)
 	result = pqSocketCheck(conn, forRead, forWrite, finish_time);
 
 	if (result < 0)
-		return EOF;				/* errorMessage is already set */
+		return -1;				/* errorMessage is already set */
 
 	if (result == 0)
 	{
 		printfPQExpBuffer(&conn->errorMessage,
 						  libpq_gettext("timeout expired\n"));
-		return EOF;
+		return 1;
 	}
 
 	return 0;
@@ -1148,13 +1191,13 @@ pqSocketCheck(PGconn *conn, int forRead, int forWrite, time_t end_time)
 	if (conn->sock == PGINVALID_SOCKET)
 	{
 		printfPQExpBuffer(&conn->errorMessage,
-						  libpq_gettext("socket not open\n"));
+						  libpq_gettext("invalid socket\n"));
 		return -1;
 	}
 
 #ifdef USE_SSL
 	/* Check for SSL library buffering read bytes */
-	if (forRead && conn->ssl && SSL_pending(conn->ssl) > 0)
+	if (forRead && conn->ssl_in_use && pgtls_read_pending(conn))
 	{
 		/* short-circuit the select */
 		return 1;
@@ -1168,7 +1211,7 @@ pqSocketCheck(PGconn *conn, int forRead, int forWrite, time_t end_time)
 
 	if (result < 0)
 	{
-		char		sebuf[256];
+		char		sebuf[PG_STRERROR_R_BUFLEN];
 
 		printfPQExpBuffer(&conn->errorMessage,
 						  libpq_gettext("select() failed: %s\n"),
@@ -1260,7 +1303,7 @@ pqSocketPoll(int sock, int forRead, int forWrite, time_t end_time)
 
 	return select(sock + 1, &input_mask, &output_mask,
 				  &except_mask, ptr_timeout);
-#endif   /* HAVE_POLL */
+#endif							/* HAVE_POLL */
 }
 
 
@@ -1270,7 +1313,7 @@ pqSocketPoll(int sock, int forRead, int forWrite, time_t end_time)
  */
 
 /*
- * returns the byte length of the word beginning s, using the
+ * returns the byte length of the character beginning at s, using the
  * specified encoding.
  */
 int
@@ -1280,7 +1323,7 @@ PQmblen(const char *s, int encoding)
 }
 
 /*
- * returns the display length of the word beginning s, using the
+ * returns the display length of the character beginning at s, using the
  * specified encoding.
  */
 int
@@ -1310,14 +1353,14 @@ PQenv2encoding(void)
 
 #ifdef ENABLE_NLS
 
-char *
-libpq_gettext(const char *msgid)
+static void
+libpq_binddomain()
 {
 	static bool already_bound = false;
 
 	if (!already_bound)
 	{
-		/* dgettext() preserves errno, but bindtextdomain() doesn't */
+		/* bindtextdomain() does not preserve errno */
 #ifdef WIN32
 		int			save_errno = GetLastError();
 #else
@@ -1337,8 +1380,20 @@ libpq_gettext(const char *msgid)
 		errno = save_errno;
 #endif
 	}
+}
 
+char *
+libpq_gettext(const char *msgid)
+{
+	libpq_binddomain();
 	return dgettext(PG_TEXTDOMAIN("libpq"), msgid);
 }
 
-#endif   /* ENABLE_NLS */
+char *
+libpq_ngettext(const char *msgid, const char *msgid_plural, unsigned long n)
+{
+	libpq_binddomain();
+	return dngettext(PG_TEXTDOMAIN("libpq"), msgid, msgid_plural, n);
+}
+
+#endif							/* ENABLE_NLS */

@@ -3,7 +3,7 @@
  * cdbappendonlystoragewrite.h
  *
  * Portions Copyright (c) 2007-2008, Greenplum inc
- * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
  *
  *
  * IDENTIFICATION
@@ -43,8 +43,10 @@ typedef struct AppendOnlyStorageWrite
 
 	/*
 	 * The large write length given to the BufferedAppend module.
+	 * The buffer in BufferedAppend will be flushed to disk when
+	 * maxLargeWriteLen is reached.
 	 */
-	int32		largeWriteLen;
+	int32		maxLargeWriteLen;
 
 	/*
 	 * Version number indicating the AO table format version to write in.
@@ -172,6 +174,8 @@ typedef struct AppendOnlyStorageWrite
 	PGFunction *compression_functions;	/* For AO or CO compression.                   */
 	/* The array index corresponds to COMP_FUNC_*  */
 
+	bool needsWAL;
+
 } AppendOnlyStorageWrite;
 
 extern void AppendOnlyStorageWrite_Init(AppendOnlyStorageWrite *storageWrite,
@@ -179,11 +183,11 @@ extern void AppendOnlyStorageWrite_Init(AppendOnlyStorageWrite *storageWrite,
 										int32 maxBufferLen,
 										char *relationName,
 										char *title,
-										AppendOnlyStorageAttributes *storageAttributes);
+										AppendOnlyStorageAttributes *storageAttributes,
+										bool needsWAL);
 extern void AppendOnlyStorageWrite_FinishSession(AppendOnlyStorageWrite *storageWrite);
 
 extern void AppendOnlyStorageWrite_TransactionCreateFile(AppendOnlyStorageWrite *storageWrite,
-											 char *filePathName,
 											 RelFileNodeBackend *relFileNode,
 											 int32 segmentFileNum);
 extern void AppendOnlyStorageWrite_OpenFile(AppendOnlyStorageWrite *storageWrite,

@@ -40,7 +40,7 @@ ALL_PO_FILES = $(addprefix po/, $(addsuffix .po, $(AVAIL_LANGUAGES)))
 MO_FILES = $(addprefix po/, $(addsuffix .mo, $(LANGUAGES)))
 
 ifdef XGETTEXT
-XGETTEXT += -ctranslator --copyright-holder='Greenplum Projec' --msgid-bugs-address=bugs@greenplum.org --no-wrap --sort-by-file --package-name='$(CATALOG_NAME) (Greenplum)' --package-version='$(MAJORVERSION)'
+XGETTEXT += -ctranslator --copyright-holder='Greenplum Project' --msgid-bugs-address=bugs@greenplum.org --no-wrap --sort-by-file --package-name='$(CATALOG_NAME) (Greenplum)' --package-version='$(MAJORVERSION)'
 endif
 
 ifdef MSGMERGE
@@ -67,6 +67,14 @@ BACKEND_COMMON_GETTEXT_FLAGS = \
     errhint:1:c-format \
     errcontext:1:c-format
 
+FRONTEND_COMMON_GETTEXT_FILES = $(top_srcdir)/src/common/logging.c
+
+FRONTEND_COMMON_GETTEXT_TRIGGERS = \
+    pg_log_fatal pg_log_error pg_log_warning pg_log_info pg_log_generic:2 pg_log_generic_v:2
+
+FRONTEND_COMMON_GETTEXT_FLAGS = \
+    pg_log_fatal:1:c-format pg_log_error:1:c-format pg_log_warning:1:c-format pg_log_info:1:c-format pg_log_generic:2:c-format pg_log_generic_v:2:c-format
+
 
 all-po: $(MO_FILES)
 
@@ -76,7 +84,7 @@ all-po: $(MO_FILES)
 ifeq ($(word 1,$(GETTEXT_FILES)),+)
 po/$(CATALOG_NAME).pot: $(word 2, $(GETTEXT_FILES)) $(MAKEFILE_LIST)
 ifdef XGETTEXT
-	$(XGETTEXT) -D $(srcdir) -n $(addprefix -k, $(GETTEXT_TRIGGERS)) $(addprefix --flag=, $(GETTEXT_FLAGS)) -f $<
+	$(XGETTEXT) -D $(srcdir) -D . -n $(addprefix -k, $(GETTEXT_TRIGGERS)) $(addprefix --flag=, $(GETTEXT_FLAGS)) -f $<
 else
 	@echo "You don't have 'xgettext'."; exit 1
 endif
@@ -85,7 +93,7 @@ po/$(CATALOG_NAME).pot: $(GETTEXT_FILES) $(MAKEFILE_LIST)
 # Change to srcdir explicitly, don't rely on $^.  That way we get
 # consistent #: file references in the po files.
 ifdef XGETTEXT
-	$(XGETTEXT) -D $(srcdir) -n $(addprefix -k, $(GETTEXT_TRIGGERS)) $(addprefix --flag=, $(GETTEXT_FLAGS)) $(GETTEXT_FILES)
+	$(XGETTEXT) -D $(srcdir) -D . -n $(addprefix -k, $(GETTEXT_TRIGGERS)) $(addprefix --flag=, $(GETTEXT_FLAGS)) $(GETTEXT_FILES)
 else
 	@echo "You don't have 'xgettext'."; exit 1
 endif

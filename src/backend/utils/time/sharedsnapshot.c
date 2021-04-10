@@ -156,7 +156,6 @@
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "lib/stringinfo.h"
-#include "storage/buffile.h"
 #include "storage/proc.h"
 #include "storage/procarray.h"
 #include "utils/builtins.h"
@@ -173,6 +172,20 @@
 DtxContext DistributedTransactionContext = DTX_CONTEXT_LOCAL_ONLY;
 
 DtxContextInfo QEDtxContextInfo = DtxContextInfo_StaticInit;
+
+#define DUMP_HASH_SZ    1024
+typedef struct DumpEntry
+{
+	uint32  segmate;
+	FullTransactionId localXid;
+	Snapshot snapshot;
+} DumpEntry;
+
+/* local hash table to store cursor snapshot dump*/
+static HTAB *dumpHtab = NULL;
+static bool created_dump = false;
+
+static ResourceOwner DumpResOwner = NULL;	/* shared snapshot dump resources */
 
 /* MPP Shared Snapshot. */
 typedef struct SharedSnapshotStruct
@@ -201,12 +214,6 @@ static Size slotSize = 0;
 static Size slotCount = 0;
 static Size xipEntryCount = 0;
 
-
-/*
- * File references to shared snapshot files open in this transaction.
- */
-static List *shared_snapshot_files = NIL;
-
 /* prototypes for internal functions */
 static SharedSnapshotSlot *SharedSnapshotAdd(int32 slotId);
 static SharedSnapshotSlot *SharedSnapshotLookup(int32 slotId);
@@ -219,6 +226,7 @@ SharedSnapshotShmemSize(void)
 {
 	Size		size;
 
+	/* should be the same as PROCARRAY_MAXPROCS */
 	xipEntryCount = MaxBackends + max_prepared_xacts;
 
 	slotSize = sizeof(SharedSnapshotSlot);
@@ -226,14 +234,22 @@ SharedSnapshotShmemSize(void)
 	slotSize = MAXALIGN(slotSize);
 
 	/*
-	 * We only really need max_prepared_xacts; but for safety we
-	 * multiply that by two (to account for slow de-allocation on
-	 * cleanup, for instance).
+	 * We only really need MaxBackends; but for safety we multiply that by two
+	 * (to account for slow de-allocation on cleanup, for instance).
+	 *
+	 * MaxBackends is only somewhat right.  What we really want here is the
+	 * MaxBackends value from the QD.  But this is at least safe since we know
+	 * we dont need *MORE* than MaxBackends.  But in general MaxBackends on a
+	 * QE is going to be bigger than on a QE by a good bit.  or at least it
+	 * should be.
 	 */
+
 	slotCount = NUM_SHARED_SNAPSHOT_SLOTS;
 
 	size = offsetof(SharedSnapshotStruct, xips);
 	size = add_size(size, mul_size(slotSize, slotCount));
+
+	RequestNamedLWLockTranche("SharedSnapshotLocks", slotCount);
 
 	return MAXALIGN(size);
 }
@@ -261,48 +277,45 @@ CreateSharedSnapshotArray(void)
 		/*
 		 * We're the first - initialize.
 		 */
+		LWLockPadded *lock_base;
+
 		sharedSnapshotArray->numSlots = 0;
 
-		/* TODO:  MaxBackends is only somewhat right.  What we really want here
-		 *        is the MaxBackends value from the QD.  But this is at least
-		 *		  safe since we know we dont need *MORE* than MaxBackends.  But
-		 *        in general MaxBackends on a QE is going to be bigger than on a
-		 *		  QE by a good bit.  or at least it should be.
-		 *
-		 * But really, max_prepared_transactions *is* what we want (it
-		 * corresponds to the number of connections allowed on the
-		 * master).
-		 *
-		 * slotCount is initialized in SharedSnapshotShmemSize().
-		 */
+		/* slotCount is initialized in SharedSnapshotShmemSize(). */
 		sharedSnapshotArray->maxSlots = slotCount;
 		sharedSnapshotArray->nextSlot = 0;
 
+		/*
+		 * Set slots to point to the next byte beyond what was allocated for
+		 * SharedSnapshotStruct. xips is the last element in the struct but is
+		 * not included in SharedSnapshotShmemSize allocation.
+		 */
 		sharedSnapshotArray->slots = (SharedSnapshotSlot *)&sharedSnapshotArray->xips;
 
 		/* xips start just after the last slot structure */
 		xip_base = (TransactionId *)&sharedSnapshotArray->slots[sharedSnapshotArray->maxSlots];
 
+		lock_base = GetNamedLWLockTranche("SharedSnapshotLocks");
 		for (i=0; i < sharedSnapshotArray->maxSlots; i++)
 		{
 			SharedSnapshotSlot *tmpSlot = &sharedSnapshotArray->slots[i];
 
 			tmpSlot->slotid = -1;
 			tmpSlot->slotindex = i;
-			tmpSlot->slotLock = LWLockAssign();
+			tmpSlot->slotLock = &lock_base[i].lock;
 
+			MemSet(tmpSlot->dump, 0, sizeof(SnapshotDump) * SNAPSHOTDUMPARRAYSZ);
+			tmpSlot->cur_dump_id = 0;
 			/*
 			 * Fixup xip array pointer reference space allocated after slot structs:
 			 *
 			 * Note: xipEntryCount is initialized in SharedSnapshotShmemSize().
 			 * So each slot gets (MaxBackends + max_prepared_xacts) transaction-ids.
 			 */
-			tmpSlot->snapshot.xip = &xip_base[xipEntryCount];
+			tmpSlot->snapshot.xip = &xip_base[0];
 			xip_base += xipEntryCount;
 		}
 	}
-
-	shared_snapshot_files = NIL;
 }
 
 /*
@@ -315,12 +328,12 @@ SharedSnapshotDump(void)
 	volatile SharedSnapshotStruct *arrayP = sharedSnapshotArray;
 	int			index;
 
+	Assert(LWLockHeldByMe(SharedSnapshotLock));
+
 	initStringInfo(&str);
 
 	appendStringInfo(&str, "Local SharedSnapshot Slot Dump: currSlots: %d maxSlots: %d ",
 					 arrayP->numSlots, arrayP->maxSlots);
-
-	LWLockAcquire(SharedSnapshotLock, LW_EXCLUSIVE);
 
 	for (index=0; index < arrayP->maxSlots; index++)
 	{
@@ -329,13 +342,12 @@ SharedSnapshotDump(void)
 
 		if (testSlot->slotid != -1)
 		{
-			appendStringInfo(&str, "(SLOT index: %d slotid: %d QDxid: %u QDcid: %u pid: %u)",
-							 testSlot->slotindex, testSlot->slotid, testSlot->QDxid, testSlot->QDcid, (int)testSlot->pid);
+			appendStringInfo(&str, "(SLOT index: %d slotid: %d QDxid: "UINT64_FORMAT" pid: %u)",
+							 testSlot->slotindex, testSlot->slotid, testSlot->distributedXid,
+							 testSlot->writer_proc ? testSlot->writer_proc->pid : 0);
 		}
 
 	}
-
-	LWLockRelease(SharedSnapshotLock);
 
 	return str.data;
 }
@@ -354,8 +366,7 @@ SharedSnapshotAdd(int32 slotId)
 {
 	SharedSnapshotSlot *slot;
 	volatile SharedSnapshotStruct *arrayP = sharedSnapshotArray;
-	int nextSlot = -1;
-	int i;
+	int nextSlot, i;
 	int retryCount = gp_snapshotadd_timeout * 10; /* .1 s per wait */
 
 retry:
@@ -379,11 +390,12 @@ retry:
 
 	if (slot != NULL)
 	{
-		elog(DEBUG1, "SharedSnapshotAdd: found existing entry for our session-id. id %d retry %d pid %u", slotId, retryCount, (int)slot->pid);
-		LWLockRelease(SharedSnapshotLock);
+		elog(DEBUG1, "SharedSnapshotAdd: found existing entry for our session-id. id %d retry %d pid %u", slotId, retryCount,
+				slot->writer_proc ? slot->writer_proc->pid : 0);
 
 		if (retryCount > 0)
 		{
+			LWLockRelease(SharedSnapshotLock);
 			retryCount--;
 
 			pg_usleep(100000); /* 100ms, wait gp_snapshotadd_timeout seconds max. */
@@ -391,7 +403,8 @@ retry:
 		}
 		else
 		{
-			elog(ERROR, "writer segworker group shared snapshot collision on id %d", slotId);
+			elog(ERROR, "writer segworker group shared snapshot collision on id %d. Slot array dump: %s",
+				 slotId, SharedSnapshotDump());
 		}
 	}
 
@@ -417,6 +430,7 @@ retry:
 	/*
 	 * find the next available slot
 	 */
+	nextSlot = -1;
 	for (i=arrayP->nextSlot+1; i < arrayP->maxSlots; i++)
 	{
 		SharedSnapshotSlot *tmpSlot = &arrayP->slots[i];
@@ -428,22 +442,14 @@ retry:
 		}
 	}
 
-	/* mark that there isn't a nextSlot if the above loop didn't find one */
-	if (nextSlot == arrayP->nextSlot)
-		arrayP->nextSlot = -1;
-	else
-		arrayP->nextSlot = nextSlot;
-
-	arrayP->numSlots += 1;
+	arrayP->nextSlot = nextSlot;
+	arrayP->numSlots++;
 
 	/* initialize some things */
 	slot->slotid = slotId;
-	slot->xid = 0;
-	slot->pid = 0;
-	slot->cid = 0;
+	slot->fullXid = InvalidFullTransactionId;
 	slot->startTimestamp = 0;
-	slot->QDxid = 0;
-	slot->QDcid = 0;
+	slot->distributedXid = InvalidDistributedTransactionId;
 	slot->segmateSync = 0;
 	/* Remember the writer proc for IsCurrentTransactionIdForReader */
 	slot->writer_proc = MyProc;
@@ -490,10 +496,7 @@ SharedSnapshotLookup(int32 slotId)
 			testSlot = &arrayP->slots[index];
 
 			if (testSlot->slotindex > arrayP->maxSlots)
-			{
-				LWLockRelease(SharedSnapshotLock);
 				elog(ERROR, "Shared Local Snapshots Array appears corrupted: %s", SharedSnapshotDump());
-			}
 
 			if (testSlot->slotid == slotId)
 			{
@@ -552,12 +555,9 @@ SharedSnapshotRemove(volatile SharedSnapshotSlot *slot, char *creatorDescription
 
 	/* reset the slotid which marks it as being unused. */
 	slot->slotid = -1;
-	slot->xid = 0;
-	slot->pid = 0;
-	slot->cid = 0;
+	slot->fullXid = InvalidFullTransactionId;
 	slot->startTimestamp = 0;
-	slot->QDxid = 0;
-	slot->QDcid = 0;
+	slot->distributedXid = InvalidDistributedTransactionId;
 	slot->segmateSync = 0;
 
 	sharedSnapshotArray->numSlots -= 1;
@@ -571,21 +571,7 @@ SharedSnapshotRemove(volatile SharedSnapshotSlot *slot, char *creatorDescription
 void
 addSharedSnapshot(char *creatorDescription, int id)
 {
-	SharedSnapshotSlot *slot;
-
-	slot = SharedSnapshotAdd(id);
-
-	if (slot==NULL)
-	{
-		ereport(ERROR,
-				(errmsg("%s could not set the Shared Local Snapshot!",
-						creatorDescription),
-				 errdetail("Tried to set the shared local snapshot slot with id: %d "
-						   "and failed. Shared Local Snapshots dump: %s", id,
-						   SharedSnapshotDump())));
-	}
-
-	SharedLocalSnapshotSlot = slot;
+	SharedLocalSnapshotSlot = SharedSnapshotAdd(id);
 
 	elog((Debug_print_full_dtm ? LOG : DEBUG5),"%s added Shared Local Snapshot slot for gp_session_id = %d (address %p)",
 		 creatorDescription, id, SharedLocalSnapshotSlot);
@@ -600,6 +586,7 @@ lookupSharedSnapshot(char *lookerDescription, char *creatorDescription, int id)
 
 	if (slot == NULL)
 	{
+		LWLockAcquire(SharedSnapshotLock, LW_SHARED);
 		ereport(ERROR,
 				(errmsg("%s could not find Shared Local Snapshot!",
 						lookerDescription),
@@ -616,261 +603,152 @@ lookupSharedSnapshot(char *lookerDescription, char *creatorDescription, int id)
 		 lookerDescription, id, creatorDescription, SharedLocalSnapshotSlot);
 }
 
-static char *
-sharedLocalSnapshot_filename(TransactionId xid, CommandId cid, uint32 segmateSync)
-{
-	int pid;
-	static char filename[MAXPGPATH];
-	
-	if (Gp_is_writer)
-	{
-		pid = MyProc->pid;
-	}
-	else
-	{
-		if (lockHolderProcPtr == NULL)
-		{
-			/* get lockholder! */
-			elog(ERROR, "NO LOCK HOLDER POINTER.");
-		}
-		pid = lockHolderProcPtr->pid;
-	}
-
-	snprintf(filename, sizeof(filename), "sess%u_w%u_qdxid%u_qdcid%u_sync%u",
-			 gp_session_id, pid, xid, cid, segmateSync);
-	return filename;
-}
-
 /*
  * Dump the shared local snapshot, so that the readers can pick it up.
  */
 void
 dumpSharedLocalSnapshot_forCursor(void)
 {
-	SharedSnapshotSlot *src = NULL;
-	char* fname = NULL;
-	BufFile *f = NULL;
-	Size count=0;
 	ResourceOwner oldowner;
-	MemoryContext oldcontext;
+	SharedSnapshotSlot *src = NULL;
 
 	Assert(Gp_role == GP_ROLE_DISPATCH || (Gp_role == GP_ROLE_EXECUTE && Gp_is_writer));
 	Assert(SharedLocalSnapshotSlot != NULL);
 
-	LWLockAcquire(SharedLocalSnapshotSlot->slotLock, LW_SHARED);
+	if (DumpResOwner== NULL)
+		DumpResOwner = ResourceOwnerCreate(NULL, "SharedSnapshotDumpResOwner");
+
+	LWLockAcquire(SharedLocalSnapshotSlot->slotLock, LW_EXCLUSIVE);
+
+	created_dump = true;
+	oldowner = CurrentResourceOwner;
+	CurrentResourceOwner = DumpResOwner;
 
 	src = (SharedSnapshotSlot *)SharedLocalSnapshotSlot;
-	fname = sharedLocalSnapshot_filename(src->QDxid, src->QDcid, src->segmateSync);
 
-	/*
-	 * Create our dump-file. Hold the reference to it in
-	 * the transaction's resource owner, so that it lives as long
-	 * as the cursor we're declaring.
-	 */
-	oldowner = CurrentResourceOwner;
-	CurrentResourceOwner = TopTransactionResourceOwner;
-	oldcontext = MemoryContextSwitchTo(TopTransactionContext);
-	f = BufFileCreateNamedTemp(fname,
-							   true, /* delOnClose */
-							   false /* interXact */);
+	Size sz ;
+	dsm_segment *segment;
+	int id = src->cur_dump_id;
+	volatile SnapshotDump *pDump = &src->dump[id];
 
-	/*
-	 * Remember our file, so that we can close it at end of transaction.
-	 * The resource owner mechanism would do it for us as a backstop, but it
-	 * produces warnings at commit if some files haven't been closed.
-	 */
-	shared_snapshot_files = lappend(shared_snapshot_files, f);
-	MemoryContextSwitchTo(oldcontext);
+	if(pDump->segment)
+		dsm_detach(pDump->segment);
+
+	sz = EstimateSnapshotSpace(&src->snapshot);
+	segment = dsm_create(sz, 0);
+
+	char *ptr = dsm_segment_address(segment);
+	SerializeSnapshot(&src->snapshot, ptr);
+
+	pDump->segment = segment;
+	pDump->handle = dsm_segment_handle(segment);
+	pDump->segmateSync = src->segmateSync;
+	pDump->distributedXid = src->distributedXid;
+	pDump->localXid = src->fullXid;
+
+	elog(LOG, "Dump syncmate : %u snapshot to slot %d", src->segmateSync, id);
+
+	src->cur_dump_id =
+		(src->cur_dump_id + 1) % SNAPSHOTDUMPARRAYSZ;
+
 	CurrentResourceOwner = oldowner;
-
-	/* we have our file. */
-
-#define FileWriteOK(file, ptr, size) (BufFileWrite(file, ptr, size) == size)
-
-#define FileWriteFieldWithCount(count, file, field) \
-    if (BufFileWrite((file), &(field), sizeof(field)) != sizeof(field)) break; \
-    count += sizeof(field);
-
-	do
-	{
-		/* Write our length as zero. (we'll fix it later). */
-		count = 0;
-
-		FileWriteFieldWithCount(count, f, count);
-		FileWriteFieldWithCount(count, f, src->pid);
-		FileWriteFieldWithCount(count, f, src->xid);
-		FileWriteFieldWithCount(count, f, src->cid);
-		FileWriteFieldWithCount(count, f, src->startTimestamp);
-
-		FileWriteFieldWithCount(count, f, src->combocidcnt);
-		FileWriteFieldWithCount(count, f, src->combocids);
-		FileWriteFieldWithCount(count, f, src->snapshot.xmin);
-		FileWriteFieldWithCount(count, f, src->snapshot.xmax);
-		FileWriteFieldWithCount(count, f, src->snapshot.xcnt);
-
-		if (!FileWriteOK(f, &src->snapshot.xip, src->snapshot.xcnt * sizeof(TransactionId)))
-			break;
-		count += src->snapshot.xcnt * sizeof(TransactionId);
-
-		FileWriteFieldWithCount(count, f, src->snapshot.curcid);
-
-		/*
-		 * Now update our length field: seek to beginning and overwrite
-		 * our original zero-length.
-		 */
-		if (BufFileSeek(f, 0 /* fileno */, 0 /* offset */, SEEK_SET) != 0)
-			break;
-
-		if (!FileWriteOK(f, &count, sizeof(count)))
-			break;
-
-		/* now flush and close. */
-		BufFileFlush(f);
-		/*
-		 * Temp files get deleted on close!
-		 *
-		 * BufFileClose(f);
-		 */
-
-		LWLockRelease(SharedLocalSnapshotSlot->slotLock);
-		return;
-	}
-	while (0);
-
 	LWLockRelease(SharedLocalSnapshotSlot->slotLock);
-	elog(ERROR, "Failed to write shared snapshot to temp-file");
 }
 
 void
-readSharedLocalSnapshot_forCursor(Snapshot snapshot)
+readSharedLocalSnapshot_forCursor(Snapshot snapshot, DtxContext distributedTransactionContext)
 {
-	BufFile *f;
-	char *fname=NULL;
-	Size count=0, sanity;
-	uint8 *p, *buffer=NULL;
-
-	pid_t writerPid;
-	TransactionId localXid;
-	CommandId localCid;
-	TimestampTz localXactStartTimestamp;
-
-	uint32 combocidcnt;
-	ComboCidKeyData tmp_combocids[MaxComboCids];
+	bool found;
+	SharedSnapshotSlot *src = NULL;
+	FullTransactionId localXid;
 
 	Assert(Gp_role == GP_ROLE_EXECUTE);
 	Assert(!Gp_is_writer);
 	Assert(SharedLocalSnapshotSlot != NULL);
 	Assert(snapshot->xip != NULL);
-	Assert(snapshot->subxip != NULL);
 
-	/*
-	 * Open our dump-file, this will either return a valid file, or
-	 * throw an error.
-	 *
-	 * NOTE: this is always run *after* the dump by the writer is
-	 * guaranteed to have completed.
-	 */
-	fname = sharedLocalSnapshot_filename(QEDtxContextInfo.distributedXid,
-		QEDtxContextInfo.curcid, QEDtxContextInfo.segmateSync);
 
-	f = BufFileOpenNamedTemp(fname,
-							 false, /* delOnClose */
-							 false /* interXact */);
-	/* we have our file. */
-
-#define FileReadOK(file, ptr, size) (BufFileRead(file, ptr, size) == size)
-
-	/* Read the file-length info */
-	if (!FileReadOK(f, &count, sizeof(count)))
-		elog(ERROR, "Cursor snapshot: failed to read size");
-
-	elog(DEBUG1, "Reading in cursor-snapshot %u bytes",
-		     (unsigned int)count);
-
-	buffer = palloc(count);
-
-	/*
-	 * Seek back to the beginning:
-	 * We're going to read this all in one go, the size
-	 * of this buffer should be more than a few hundred bytes.
-	 */
-	if (BufFileSeek(f, 0 /* fileno */, 0 /* offset */, SEEK_SET) != 0)
-		elog(ERROR, "Cursor snapshot: failed to seek.");
-
-	if (!FileReadOK(f, buffer, count))
-		elog(ERROR, "Cursor snapshot: failed to read content");
-
-	/* we've got the entire snapshot read into our buffer. */
-	p = buffer;
-
-	/* sanity check count */
-	memcpy(&sanity, p, sizeof(sanity));
-	if (sanity != count)
-		elog(ERROR, "cursor snapshot failed sanity %u != %u",
-			    (unsigned int)sanity, (unsigned int)count);
-	p += sizeof(sanity);
-
-	/* see dumpSharedLocalSnapshot_forCursor() for the correct order here */
-
-	memcpy(&writerPid, p, sizeof(writerPid));
-	p += sizeof(writerPid);
-
-	memcpy(&localXid, p, sizeof(localXid));
-	p += sizeof(localXid);
-
-	memcpy(&localCid, p, sizeof(localCid));
-	p += sizeof(localCid);
-
-	memcpy(&localXactStartTimestamp, p, sizeof(localXactStartTimestamp));
-	p += sizeof(localXactStartTimestamp);
-
-	memcpy(&combocidcnt, p, sizeof(combocidcnt));
-	p += sizeof(combocidcnt);
-
-	memcpy(tmp_combocids, p, sizeof(tmp_combocids));
-	p += sizeof(tmp_combocids);
-
-	/* handle the combocid stuff (same as in GetSnapshotData()) */
-	if (usedComboCids != combocidcnt)
+	if (dumpHtab == NULL)
 	{
-		if (usedComboCids == 0)
-		{
-			MemoryContext oldCtx =  MemoryContextSwitchTo(TopTransactionContext);
-			comboCids = palloc(combocidcnt * sizeof(ComboCidKeyData));
-			MemoryContextSwitchTo(oldCtx);
-		}
-		else
-			repalloc(comboCids, combocidcnt * sizeof(ComboCidKeyData));
+		HASHCTL     hash_ctl;
+		memset(&hash_ctl, 0, sizeof(hash_ctl));
+		hash_ctl.keysize = sizeof(uint32);
+		hash_ctl.entrysize = sizeof(DumpEntry);
+		hash_ctl.hcxt = TopTransactionContext;
+		dumpHtab = hash_create("snapshot dump",
+		                       DUMP_HASH_SZ  ,
+		                       &hash_ctl,
+		                       HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 	}
-	memcpy(comboCids, tmp_combocids, combocidcnt * sizeof(ComboCidKeyData));
-	usedComboCids = ((combocidcnt < MaxComboCids) ? combocidcnt : MaxComboCids);
 
-	memcpy(&snapshot->xmin, p, sizeof(snapshot->xmin));
-	p += sizeof(snapshot->xmin);
+	/* check segmate in local memory, only sync from shared memory once */
+	DumpEntry *entry = hash_search(dumpHtab, &QEDtxContextInfo.segmateSync, HASH_ENTER, &found);
+	volatile SnapshotDump *pDump = NULL;
 
-	memcpy(&snapshot->xmax, p, sizeof(snapshot->xmax));
-	p += sizeof(snapshot->xmax);
+	if (!found)
+	{
+		src = (SharedSnapshotSlot *)SharedLocalSnapshotSlot;
+		LWLockAcquire(src->slotLock, LW_SHARED);
+		int search_finish_id = src->cur_dump_id;
+		int search_iter = search_finish_id;
 
-	memcpy(&snapshot->xcnt, p, sizeof(snapshot->xcnt));
-	p += sizeof(snapshot->xcnt);
+		do{
+			if (search_iter < 0)
+				search_iter = SNAPSHOTDUMPARRAYSZ - 1;
 
-	memcpy(snapshot->xip, p, snapshot->xcnt * sizeof(TransactionId));
-	p += snapshot->xcnt * sizeof(TransactionId);
+			if (src->dump[search_iter].segmateSync == QEDtxContextInfo.segmateSync &&
+				src->dump[search_iter].distributedXid == QEDtxContextInfo.distributedXid)
+			{
+				pDump = &src->dump[search_iter];
+				found = true;
+				break;
+			}
+
+			search_iter --;
+
+		} while (search_iter != search_finish_id);
+
+		if (!found)
+		{
+			LWLockRelease(SharedLocalSnapshotSlot->slotLock);
+			LWLockAcquire(SharedSnapshotLock, LW_SHARED); /* For SharedSnapshotDump() */
+			ereport(ERROR, (errmsg("could not find Shared Local Snapshot!"),
+				errdetail("Tried to set the shared local snapshot slot with segmate: %u "
+				          "and failed. Shared Local Snapshots dump: %s", QEDtxContextInfo.segmateSync,
+				          SharedSnapshotDump())));
+		}
+
+		Assert(pDump->handle != 0);
+
+		dsm_segment* segment = dsm_attach(pDump->handle);
+		char *ptr = dsm_segment_address(segment);
+
+		entry->snapshot = RestoreSnapshot(ptr);
+		entry->localXid = pDump->localXid;
+
+		dsm_detach(segment);
+
+		LWLockRelease(SharedLocalSnapshotSlot->slotLock);
+	}
+
+	Snapshot dumpsnapshot = entry->snapshot;
+	localXid = entry->localXid;
+	snapshot->xmin = dumpsnapshot->xmin;
+	snapshot->xmax = dumpsnapshot->xmax;
+	snapshot->xcnt = dumpsnapshot->xcnt;
+
+	memcpy(snapshot->xip, dumpsnapshot->xip, snapshot->xcnt * sizeof(TransactionId));
 
 	/* zero out the slack in the xip-array */
 	memset(snapshot->xip + snapshot->xcnt, 0, (xipEntryCount - snapshot->xcnt)*sizeof(TransactionId));
 
-	memcpy(&snapshot->curcid, p, sizeof(snapshot->curcid));
+	snapshot->curcid = dumpsnapshot->curcid;
 
-	/* Now we're done with the buffer */
-	pfree(buffer);
+	SetSharedTransactionId_reader(
+		localXid,
+		snapshot->curcid,
+		distributedTransactionContext);
 
-	/* we're done with file. */
-	BufFileClose(f);
-
-	SetSharedTransactionId_reader(localXid, snapshot->curcid);
-
-	return;
 }
 
 /*
@@ -879,17 +757,24 @@ readSharedLocalSnapshot_forCursor(Snapshot snapshot)
 void
 AtEOXact_SharedSnapshot(void)
 {
-	ListCell *lc;
-	List *oldlist;
+	dumpHtab = NULL;
 
-	oldlist = shared_snapshot_files;
-	shared_snapshot_files = NIL;
-
-	foreach(lc, oldlist)
+	if (created_dump)
 	{
-		BufFileClose((BufFile * ) lfirst(lc));
+		LWLockAcquire(SharedLocalSnapshotSlot->slotLock, LW_EXCLUSIVE);
+
+		/* release dump dsm */
+		ResourceOwnerRelease(DumpResOwner,
+		                     RESOURCE_RELEASE_BEFORE_LOCKS,
+		                     false, /* isCommit */
+		                     true); /* isTopLevel */
+
+		SharedLocalSnapshotSlot->cur_dump_id = 0;
+		MemSet(SharedLocalSnapshotSlot->dump, 0, sizeof(SnapshotDump) * SNAPSHOTDUMPARRAYSZ);
+		created_dump = false;
+		LWLockRelease(SharedLocalSnapshotSlot->slotLock);
+
 	}
-	list_free(oldlist);
 }
 
 /*
@@ -913,8 +798,8 @@ LogDistributedSnapshotInfo(Snapshot snapshot, const char *prefix)
 	DistributedSnapshot *ds = &mapping->ds;
 
 	appendStringInfo(&buf, "%s Distributed snapshot info: "
-			 "xminAllDistributedSnapshots=%d, distribSnapshotId=%d"
-			 ", xmin=%d, xmax=%d, count=%d",
+			 "xminAllDistributedSnapshots="UINT64_FORMAT", distribSnapshotId=%d"
+			 ", xmin="UINT64_FORMAT", xmax="UINT64_FORMAT", count=%d",
 			 prefix,
 			 ds->xminAllDistributedSnapshots,
 			 ds->distribSnapshotId,
@@ -928,12 +813,12 @@ LogDistributedSnapshotInfo(Snapshot snapshot, const char *prefix)
 	{
 		if (no != 0)
 		{
-			appendStringInfo(&buf, ", (dx%d)",
+			appendStringInfo(&buf, ", (dx"UINT64_FORMAT")",
 					 ds->inProgressXidArray[no]);
 		}
 		else
 		{
-			appendStringInfo(&buf, " (dx%d)",
+			appendStringInfo(&buf, " (dx"UINT64_FORMAT")",
 					 ds->inProgressXidArray[no]);
 		}
 	}

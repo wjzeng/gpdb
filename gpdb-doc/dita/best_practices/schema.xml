@@ -244,7 +244,6 @@ FROM (SELECT count(*) c, gp_segment_id FROM facts GROUP BY 2) AS a;</codeblock>
      1 | template1
  10898 | template0
  38817 | pws
- 39682 | gpperfmon
 (6 rows)
 </codeblock></p></li>
           <li>Run a <codeph>gpssh</codeph> command to check file sizes across all of the segment
@@ -319,7 +318,7 @@ gpadmin  15673 27471 28 12:05 ?        00:12:59 postgres: port 40003, sbaskin bd
         172.28.12.250(21813) con699238 seg45 cmd32 slice10 MPPEXEC SELECT
 root     29622 29566  0 12:50 pts/16   00:00:00 grep 15673</codeblock>
           </li>
-          <li>On the master, check the <codeph>pg_log</codeph> log file for the user in the previous
+          <li>On the master, check the <codeph>log</codeph> log file for the user in the previous
             command (<codeph>sbaskin</codeph>), connection (<codeph>con699238</codeph>, and command
               (<codeph>cmd32</codeph>). The line in the log file with these three values
               <i>should</i> be the line that contains the query, but occasionally, the command
@@ -388,9 +387,9 @@ root     29622 29566  0 12:50 pts/16   00:00:00 grep 15673</codeblock>
           the node, the size of the cluster, SQL access, concurrency, workload, and skew. There are
           generally six to eight segments per host, but large clusters should have fewer segments
           per host. When using partitioning and columnar storage it is important to balance the
-          total number of files in the cluster ,but it is <i>more</i> important to consider the
+          total number of files in the cluster, but it is <i>more</i> important to consider the
           number of files per segment and the total number of files on a node. </p>
-        <p>Example DCA V2 64GB Memory per Node</p>
+        <p>Example with 64GB Memory per Node</p>
         <ul id="ul_nyy_tgb_3r">
           <li>Number of nodes: 16</li>
           <li>Number of segments per node: 8</li>

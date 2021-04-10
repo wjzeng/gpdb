@@ -8,7 +8,9 @@
 #include "postgres.h"
 
 #include "access/gist.h"
-#include "access/skey.h"
+#include "access/stratnum.h"
+#include "port/pg_bitutils.h"
+
 #include "crc32.h"
 #include "ltree.h"
 
@@ -22,26 +24,6 @@ PG_FUNCTION_INFO_V1(_ltree_consistent);
 
 #define GETENTRY(vec,pos) ((ltree_gist *) DatumGetPointer((vec)->vector[(pos)].key))
 #define NEXTVAL(x) ( (ltree*)( (char*)(x) + INTALIGN( VARSIZE(x) ) ) )
-
-/* Number of one-bits in an unsigned byte */
-static const uint8 number_of_ones[256] = {
-	0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4,
-	1, 2, 2, 3, 2, 3, 3, 4, 2, 3, 3, 4, 3, 4, 4, 5,
-	1, 2, 2, 3, 2, 3, 3, 4, 2, 3, 3, 4, 3, 4, 4, 5,
-	2, 3, 3, 4, 3, 4, 4, 5, 3, 4, 4, 5, 4, 5, 5, 6,
-	1, 2, 2, 3, 2, 3, 3, 4, 2, 3, 3, 4, 3, 4, 4, 5,
-	2, 3, 3, 4, 3, 4, 4, 5, 3, 4, 4, 5, 4, 5, 5, 6,
-	2, 3, 3, 4, 3, 4, 4, 5, 3, 4, 4, 5, 4, 5, 5, 6,
-	3, 4, 4, 5, 4, 5, 5, 6, 4, 5, 5, 6, 5, 6, 6, 7,
-	1, 2, 2, 3, 2, 3, 3, 4, 2, 3, 3, 4, 3, 4, 4, 5,
-	2, 3, 3, 4, 3, 4, 4, 5, 3, 4, 4, 5, 4, 5, 5, 6,
-	2, 3, 3, 4, 3, 4, 4, 5, 3, 4, 4, 5, 4, 5, 5, 6,
-	3, 4, 4, 5, 4, 5, 5, 6, 4, 5, 5, 6, 5, 6, 6, 7,
-	2, 3, 3, 4, 3, 4, 4, 5, 3, 4, 4, 5, 4, 5, 5, 6,
-	3, 4, 4, 5, 4, 5, 5, 6, 4, 5, 5, 6, 5, 6, 6, 7,
-	3, 4, 4, 5, 4, 5, 5, 6, 4, 5, 5, 6, 5, 6, 6, 7,
-	4, 5, 5, 6, 5, 6, 6, 7, 5, 6, 6, 7, 6, 7, 7, 8
-};
 
 #define WISH_F(a,b,c) (double)( -(double)(((a)-(b))*((a)-(b))*((a)-(b)))*(c) )
 
@@ -85,7 +67,7 @@ _ltree_compress(PG_FUNCTION_ARGS)
 					(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
 					 errmsg("array must not contain nulls")));
 
-		key = (ltree_gist *) palloc(len);
+		key = (ltree_gist *) palloc0(len);
 		SET_VARSIZE(key, len);
 		key->flag = 0;
 
@@ -100,7 +82,7 @@ _ltree_compress(PG_FUNCTION_ARGS)
 		retval = (GISTENTRY *) palloc(sizeof(GISTENTRY));
 		gistentryinit(*retval, PointerGetDatum(key),
 					  entry->rel, entry->page,
-					  entry->offset, FALSE);
+					  entry->offset, false);
 	}
 	else if (!LTG_ISALLTRUE(entry->key))
 	{
@@ -116,14 +98,14 @@ _ltree_compress(PG_FUNCTION_ARGS)
 				PG_RETURN_POINTER(retval);
 		}
 		len = LTG_HDRSIZE;
-		key = (ltree_gist *) palloc(len);
+		key = (ltree_gist *) palloc0(len);
 		SET_VARSIZE(key, len);
 		key->flag = LTG_ALLTRUE;
 
 		retval = (GISTENTRY *) palloc(sizeof(GISTENTRY));
 		gistentryinit(*retval, PointerGetDatum(key),
 					  entry->rel, entry->page,
-					  entry->offset, FALSE);
+					  entry->offset, false);
 	}
 	PG_RETURN_POINTER(retval);
 }
@@ -196,7 +178,7 @@ _ltree_union(PG_FUNCTION_ARGS)
 	}
 
 	len = LTG_HDRSIZE + ((flag & LTG_ALLTRUE) ? 0 : ASIGLEN);
-	result = (ltree_gist *) palloc(len);
+	result = (ltree_gist *) palloc0(len);
 	SET_VARSIZE(result, len);
 	result->flag = flag;
 	if (!LTG_ISALLTRUE(result))
@@ -209,12 +191,7 @@ _ltree_union(PG_FUNCTION_ARGS)
 static int32
 sizebitvec(BITVECP sign)
 {
-	int32		size = 0,
-				i;
-
-	ALOOPBYTE
-		size += number_of_ones[(unsigned char) sign[i]];
-	return size;
+	return pg_popcount((const char *) sign, ASIGLEN);
 }
 
 static int
@@ -227,7 +204,8 @@ hemdistsign(BITVECP a, BITVECP b)
 	ALOOPBYTE
 	{
 		diff = (unsigned char) (a[i] ^ b[i]);
-		dist += number_of_ones[diff];
+		/* Using the popcount functions here isn't likely to win */
+		dist += pg_number_of_ones[diff];
 	}
 	return dist;
 }
@@ -333,26 +311,26 @@ _ltree_picksplit(PG_FUNCTION_ARGS)
 	/* form initial .. */
 	if (LTG_ISALLTRUE(GETENTRY(entryvec, seed_1)))
 	{
-		datum_l = (ltree_gist *) palloc(LTG_HDRSIZE);
+		datum_l = (ltree_gist *) palloc0(LTG_HDRSIZE);
 		SET_VARSIZE(datum_l, LTG_HDRSIZE);
 		datum_l->flag = LTG_ALLTRUE;
 	}
 	else
 	{
-		datum_l = (ltree_gist *) palloc(LTG_HDRSIZE + ASIGLEN);
+		datum_l = (ltree_gist *) palloc0(LTG_HDRSIZE + ASIGLEN);
 		SET_VARSIZE(datum_l, LTG_HDRSIZE + ASIGLEN);
 		datum_l->flag = 0;
 		memcpy((void *) LTG_SIGN(datum_l), (void *) LTG_SIGN(GETENTRY(entryvec, seed_1)), sizeof(ABITVEC));
 	}
 	if (LTG_ISALLTRUE(GETENTRY(entryvec, seed_2)))
 	{
-		datum_r = (ltree_gist *) palloc(LTG_HDRSIZE);
+		datum_r = (ltree_gist *) palloc0(LTG_HDRSIZE);
 		SET_VARSIZE(datum_r, LTG_HDRSIZE);
 		datum_r->flag = LTG_ALLTRUE;
 	}
 	else
 	{
-		datum_r = (ltree_gist *) palloc(LTG_HDRSIZE + ASIGLEN);
+		datum_r = (ltree_gist *) palloc0(LTG_HDRSIZE + ASIGLEN);
 		SET_VARSIZE(datum_r, LTG_HDRSIZE + ASIGLEN);
 		datum_r->flag = 0;
 		memcpy((void *) LTG_SIGN(datum_r), (void *) LTG_SIGN(GETENTRY(entryvec, seed_2)), sizeof(ABITVEC));
@@ -545,7 +523,7 @@ Datum
 _ltree_consistent(PG_FUNCTION_ARGS)
 {
 	GISTENTRY  *entry = (GISTENTRY *) PG_GETARG_POINTER(0);
-	char	   *query = (char *) DatumGetPointer(PG_DETOAST_DATUM(PG_GETARG_DATUM(1)));
+	void	   *query = (void *) PG_DETOAST_DATUM(PG_GETARG_DATUM(1));
 	StrategyNumber strategy = (StrategyNumber) PG_GETARG_UINT16(2);
 
 	/* Oid		subtype = PG_GETARG_OID(3); */

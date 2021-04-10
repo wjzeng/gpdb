@@ -1,15 +1,22 @@
 -- Tests exercising different behaviour of the WITH RECURSIVE implementation in GPDB
 -- GPDB's distributed nature requires thorough testing of many use cases in order to ensure correctness
 
+
 -- Setup
-
-
--- WITH RECURSIVE ref in a sublink in the main query
-
 create schema recursive_cte;
 set search_path=recursive_cte;
 create table recursive_table_1(id int);
 insert into recursive_table_1 values (1), (2), (100);
+
+-- Test the featureblocking GUC for recursive CTE
+set gp_recursive_cte to off;
+with recursive r(i) as (
+   select 1
+   union all
+   select i + 1 from r
+)
+select * from recursive_table_1 where recursive_table_1.id IN (select * from r limit 10);
+set gp_recursive_cte to on;
 
 -- WITH RECURSIVE ref used with IN without correlation
 with recursive r(i) as (
@@ -384,3 +391,44 @@ select * from recursive_table_4 where a > ALL (
 	)
 	select * from r
 );
+
+with recursive x(i) as (
+    select 1
+),
+y(i) as (
+    select sum(i) from x
+    union all
+    select i + 1 from y
+),
+z(i) as (
+    select avg(i) from x
+    union all
+    select i + 1 from z
+)
+(select * from y limit 5)
+union
+(select * from z limit 10);
+
+-- WTIH RECURSIVE and replicated table
+create table t_rep_test_rcte(c int) distributed replicated;
+create table t_rand_test_rcte(c int) distributed by (c);
+insert into t_rep_test_rcte values (1);
+insert into t_rand_test_rcte values (1), (2), (3);
+
+analyze t_rep_test_rcte;
+analyze t_rand_test_rcte;
+
+explain
+with recursive the_cte_here(n) as (
+  select * from t_rep_test_rcte
+  union all
+  select n+1 from the_cte_here join t_rand_test_rcte
+	              on t_rand_test_rcte.c = the_cte_here.n)
+select * from the_cte_here;
+
+with recursive the_cte_here(n) as (
+  select * from t_rep_test_rcte
+  union all
+  select n+1 from the_cte_here join t_rand_test_rcte
+	              on t_rand_test_rcte.c = the_cte_here.n)
+select * from the_cte_here;

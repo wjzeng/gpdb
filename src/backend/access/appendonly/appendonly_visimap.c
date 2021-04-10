@@ -3,7 +3,7 @@
  * AppendOnlyVisimap
  *   maintain a visibility bitmap.
  *
- * Copyright (c) 2013-Present Pivotal Software, Inc.
+ * Copyright (c) 2013-Present VMware, Inc. or its affiliates.
  *
  *
  * IDENTIFICATION
@@ -58,10 +58,11 @@ typedef struct AppendOnlyVisiMapDeleteData
 	AppendOnlyVisiMapDeleteKey key;
 
 	/*
-	 * Offset of the latest dirty version of the visimap bitmap in the spill
-	 * file.
+	 * Location of the latest dirty version of the visimap bitmap in the
+	 * BufFile.
 	 */
-	uint64		workFileOffset;
+	int 		workFileno;
+	off_t		workFileOffset;
 
 	/*
 	 * Tuple id of the visimap entry if the visimap entry existed before.
@@ -338,7 +339,7 @@ AppendOnlyVisimapScan_GetNextInvisible(
 				visiMapScan->isFinished = true;
 				return false;
 			}
-			AOTupleIdInit_Init(tupleId);
+			AOTupleIdSetInvalid(tupleId);
 		}
 
 		if (!AppendOnlyVisimapEntry_GetNextInvisible(
@@ -432,7 +433,7 @@ AppendOnlyVisimapDelete_Init(
 												 &hash_ctl,
 												 HASH_ELEM | HASH_FUNCTION | HASH_COMPARE);
 
-	visiMapDelete->workfile = ExecWorkFile_CreateUnique("visimap_delete", BUFFILE, true, 0);
+	visiMapDelete->workfile = BufFileCreateTemp("visimap_delete", false /* interXact */);
 }
 
 /*
@@ -481,41 +482,50 @@ AppendOnlyVisimapDelete_Unstash(
 
 	elogif(Debug_appendonly_print_visimap, LOG,
 		   "Append-only visi map delete: Unstash dirty visimap entry %d/" INT64_FORMAT
-		   ", offset " INT64_FORMAT,
-		   segno, firstRowNum, deleteData->workFileOffset);
+		   ", (fileno %d, offset " INT64_FORMAT ")",
+		   segno, firstRowNum, deleteData->workFileno, (int64)deleteData->workFileOffset);
 
-	if (ExecWorkFile_Seek(visiMapDelete->workfile, deleteData->workFileOffset, SEEK_SET) != 0)
+	if (BufFileSeek(visiMapDelete->workfile, deleteData->workFileno,
+					deleteData->workFileOffset, SEEK_SET) != 0)
 	{
-		elog(ERROR, "Failed to seek to visimap delete spill location: %d/" INT64_FORMAT
-			 ", offset " INT64_FORMAT,
-			 segno, firstRowNum, deleteData->workFileOffset);
+		ereport(ERROR,
+				(errmsg("failed to seek visimap delete buf file"),
+				 errdetail("location (fileno %d, offset " INT64_FORMAT ") visimap entry: %d/" INT64_FORMAT,
+						   deleteData->workFileno, (int64)deleteData->workFileOffset,
+						   segno, firstRowNum)));
 	}
 
-	len = ExecWorkFile_Read(visiMapDelete->workfile, &key, sizeof(key));
+	len = BufFileRead(visiMapDelete->workfile, &key, sizeof(key));
 	if (len != sizeof(key))
 	{
-		elog(ERROR, "Failed to read visimap delete spill data: %d/" INT64_FORMAT
-			 ", offset " INT64_FORMAT,
-			 segno, firstRowNum, deleteData->workFileOffset);
+		ereport(ERROR,
+				(errmsg("failed to read visimap delete buf file"),
+				 errdetail("location (fileno %d, offset " INT64_FORMAT ") visimap entry: %d/" INT64_FORMAT,
+						   deleteData->workFileno, (int64)deleteData->workFileOffset,
+						   segno, firstRowNum)));
 	}
+
 	Assert(key.segno == segno);
 	Assert(key.firstRowNum == firstRowNum);
 
-	len = ExecWorkFile_Read(visiMapDelete->workfile, visiMap->visimapEntry.data, 4);
+	len = BufFileRead(visiMapDelete->workfile, visiMap->visimapEntry.data, 4);
 	if (len != 4)
 	{
-		elog(ERROR, "Failed to read visimap delete spill data");
+		elog(ERROR, "failed to read visimap delete buf file");
 	}
 	dataLen = VARSIZE(visiMap->visimapEntry.data);
 
 	/* Now read the remaining part of the entry */
-	len = ExecWorkFile_Read(visiMapDelete->workfile,
-							((char *) visiMap->visimapEntry.data) + 4, dataLen - 4);
+	len = BufFileRead(visiMapDelete->workfile,
+					  ((char *) visiMap->visimapEntry.data) + 4, dataLen - 4);
 	if (len != dataLen - 4)
 	{
-		elog(ERROR, "Failed to read visimap delete spill data: %d/" INT64_FORMAT
-			 ", offset " INT64_FORMAT ", len " INT64_FORMAT,
-			 segno, firstRowNum, deleteData->workFileOffset, dataLen);
+		ereport(ERROR,
+				(errmsg("failed to read visimap delete buf file"),
+				 errdetail("location (fileno %d, offset " INT64_FORMAT ") visimap entry: %d/"
+							INT64_FORMAT ", len " INT64_FORMAT,
+							deleteData->workFileno, (int64)deleteData->workFileOffset,
+							segno, firstRowNum, dataLen)));
 	}
 
 	AppendOnlyVisimapDelete_RebuildEntry(&visiMap->visimapEntry,
@@ -607,7 +617,8 @@ AppendOnlyVisimapDelete_Stash(
 	AppendOnlyVisiMapDeleteKey key;
 	MemoryContext oldContext;
 	bool		found;
-	int64		offset;
+	off_t		offset;
+	int 		fileno;
 
 	Assert(visiMapDelete);
 	visiMap = visiMapDelete->visiMap;
@@ -622,6 +633,7 @@ AppendOnlyVisimapDelete_Stash(
 	if (!found)
 	{
 		r->workFileOffset = 0;
+		r->workFileno = -1;
 		memset(&r->tupleTid, 0, sizeof(ItemPointerData));
 	}
 	Assert(r->key.firstRowNum == key.firstRowNum);
@@ -630,34 +642,37 @@ AppendOnlyVisimapDelete_Stash(
 	oldContext = MemoryContextSwitchTo(visiMap->memoryContext);
 	AppendOnlyVisimapEntry_WriteData(&visiMap->visimapEntry);
 
-	offset = ExecWorkFile_GetSize(visiMapDelete->workfile);
+	/*
+	 * If the BufFile was seeked to an internal position for reading a
+	 * previously stashed visimap entry before we were called, we must seek
+	 * till the end of it before writing new visimap entries.
+	 */
+	if (BufFileSeek(visiMapDelete->workfile, 0, 0, SEEK_END) != 0)
+		elog(ERROR, "failed to seek to end of visimap buf file");
+	BufFileTell(visiMapDelete->workfile, &fileno, &offset);
 
 	elogif(Debug_appendonly_print_visimap, LOG,
 		   "Append-only visi map delete: Stash dirty visimap entry %d/" INT64_FORMAT,
 		   visiMap->visimapEntry.segmentFileNum, visiMap->visimapEntry.firstRowNum);
 
-	if (ExecWorkFile_Seek(visiMapDelete->workfile, offset, SEEK_SET) != 0)
-	{
-		elog(ERROR, "Failed to seek to visimap delete spill location: offset " INT64_FORMAT, offset);
-	}
-	if (!ExecWorkFile_Write(visiMapDelete->workfile, &key,
-							sizeof(key)))
+	if (BufFileWrite(visiMapDelete->workfile, &key, sizeof(key)) != sizeof(key))
 	{
 		elog(ERROR, "Failed to write visimap delete spill key information: "
 			 "segno " INT64_FORMAT ", first row " INT64_FORMAT ", offset "
 			 INT64_FORMAT ", length %lu",
-			 key.segno, key.firstRowNum, offset, sizeof(key));
+			 key.segno, key.firstRowNum, (int64)offset, sizeof(key));
 	}
-	if (!ExecWorkFile_Write(visiMapDelete->workfile, visiMap->visimapEntry.data,
-							VARSIZE(visiMap->visimapEntry.data)))
+	int size = VARSIZE(visiMap->visimapEntry.data);
+	if (BufFileWrite(visiMapDelete->workfile, visiMap->visimapEntry.data, size) != size)
 	{
 		elog(ERROR, "Failed to write visimap delete spill key information: "
 			 "segno " INT64_FORMAT ", first row " INT64_FORMAT ", offset "
 			 INT64_FORMAT ", length %d", key.segno, key.firstRowNum,
-			 offset + sizeof(key), VARSIZE(visiMap->visimapEntry.data));
+			 (int64)(offset + sizeof(key)), VARSIZE(visiMap->visimapEntry.data));
 	}
 	memcpy(&r->tupleTid, &visiMap->visimapEntry.tupleTid, sizeof(ItemPointerData));
 	r->workFileOffset = offset;
+	r->workFileno = fileno;
 
 	MemoryContextSwitchTo(oldContext);
 
@@ -678,9 +693,8 @@ AppendOnlyVisimapDelete_Stash(
  * a single tuple is deleted.
  * In all other cases, AppendOnlyVisimapDelete_Hide needs to be used.
  */
-HTSU_Result
-AppendOnlyVisimapDelete_Hide(
-							 AppendOnlyVisimapDelete *visiMapDelete, AOTupleId *aoTupleId)
+TM_Result
+AppendOnlyVisimapDelete_Hide(AppendOnlyVisimapDelete *visiMapDelete, AOTupleId *aoTupleId)
 {
 	AppendOnlyVisimap *visiMap;
 
@@ -715,8 +729,10 @@ AppendOnlyVisimapDelete_WriteBackStashedEntries(AppendOnlyVisimapDelete *visiMap
 {
 	AppendOnlyVisiMapDeleteData *deleteData;
 	int64		len,
-				dataLen,
-				currentOffset = 0;
+				dataLen;
+	off_t		currentOffset;
+	int			currentFileno;
+	
 	AppendOnlyVisimap *visiMap;
 	bool		found;
 	AppendOnlyVisiMapDeleteKey key;
@@ -729,23 +745,23 @@ AppendOnlyVisimapDelete_WriteBackStashedEntries(AppendOnlyVisimapDelete *visiMap
 		return;
 	}
 
-	if (ExecWorkFile_Seek(visiMapDelete->workfile, 0, SEEK_SET) != 0)
+	if (BufFileSeek(visiMapDelete->workfile, 0, 0, SEEK_SET) != 0)
 	{
 		elog(ERROR, "Failed to seek to visimap delete spill beginning");
 	}
 
 	/* Get next entry */
-	currentOffset = 0;
-	len = ExecWorkFile_Read(visiMapDelete->workfile, &key, sizeof(key));
+	BufFileTell(visiMapDelete->workfile, &currentFileno, &currentOffset);
+	len = BufFileRead(visiMapDelete->workfile, &key, sizeof(key));
 	while (len == sizeof(key))
 	{
 		elogif(Debug_appendonly_print_visimap, LOG,
 			   "Append-only visi map delete: Got next dirty visimap: "
 			   INT64_FORMAT "/" INT64_FORMAT ", offset " INT64_FORMAT,
-			   key.segno, key.firstRowNum, currentOffset);
+			   key.segno, key.firstRowNum, (int64)currentOffset);
 
 		/* VARSIZE is only using the first four byte */
-		len = ExecWorkFile_Read(visiMapDelete->workfile, visiMap->visimapEntry.data, 4);
+		len = BufFileRead(visiMapDelete->workfile, visiMap->visimapEntry.data, 4);
 		if (len != 4)
 		{
 			elog(ERROR, "Failed to read visimap delete spill data");
@@ -754,8 +770,8 @@ AppendOnlyVisimapDelete_WriteBackStashedEntries(AppendOnlyVisimapDelete *visiMap
 		Assert(dataLen <= APPENDONLY_VISIMAP_DATA_BUFFER_SIZE);
 
 		/* Now read the remaining part of the entry */
-		len = ExecWorkFile_Read(visiMapDelete->workfile,
-								((char *) visiMap->visimapEntry.data) + 4, dataLen - 4);
+		len = BufFileRead(visiMapDelete->workfile,
+						  ((char *) visiMap->visimapEntry.data) + 4, dataLen - 4);
 		if (len != (dataLen - 4))
 		{
 			elog(ERROR, "Failed to read visimap delete spill data");
@@ -772,17 +788,19 @@ AppendOnlyVisimapDelete_WriteBackStashedEntries(AppendOnlyVisimapDelete *visiMap
 		if (!found)
 		{
 			elog(ERROR, "Found a stashed visimap entry without corresponding meta data: "
-				 "offset " INT64_FORMAT, currentOffset);
+				 "offset " INT64_FORMAT, (int64)currentOffset);
 		}
 		Assert(deleteData);
 		Assert(deleteData->key.firstRowNum == key.firstRowNum);
 		Assert(deleteData->key.segno == key.segno);
-		if (currentOffset != deleteData->workFileOffset)
+		if (currentFileno != deleteData->workFileno ||
+			currentOffset != deleteData->workFileOffset)
 		{
 			elogif(Debug_appendonly_print_visimap, LOG,
 				   "Append-only visi map delete: Found out-dated stashed dirty visimap: "
-				   "current offset " INT64_FORMAT ", expected offset " INT64_FORMAT,
-				   currentOffset, deleteData->workFileOffset);
+				   "current (fileno %d, offset " INT64_FORMAT ") expected (fileno %d, offset " INT64_FORMAT ")",
+				   currentFileno, (int64)currentOffset,
+				   deleteData->workFileno, (int64)deleteData->workFileOffset);
 		}
 		else
 		{
@@ -798,8 +816,8 @@ AppendOnlyVisimapDelete_WriteBackStashedEntries(AppendOnlyVisimapDelete *visiMap
 			AppendOnlyVisimap_Store(visiMapDelete->visiMap);
 		}
 
-		currentOffset += dataLen + sizeof(key);
-		len = ExecWorkFile_Read(visiMapDelete->workfile, &key, sizeof(key));
+		BufFileTell(visiMapDelete->workfile, &currentFileno, &currentOffset);
+		len = BufFileRead(visiMapDelete->workfile, &key, sizeof(key));
 	}
 	if (len != 0)
 	{
@@ -847,6 +865,7 @@ AppendOnlyVisimapDelete_Finish(
 		if (found)
 		{
 			deleteData->workFileOffset = INT64_MAX;
+			deleteData->workFileno = -1;
 			memset(&deleteData->tupleTid, 0, sizeof(ItemPointerData));
 		}
 	}
@@ -854,5 +873,5 @@ AppendOnlyVisimapDelete_Finish(
 	AppendOnlyVisimapDelete_WriteBackStashedEntries(visiMapDelete);
 
 	hash_destroy(visiMapDelete->dirtyEntryCache);
-	ExecWorkFile_Close(visiMapDelete->workfile);
+	BufFileClose(visiMapDelete->workfile);
 }

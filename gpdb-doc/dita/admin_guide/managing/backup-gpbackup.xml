@@ -27,14 +27,19 @@
       commands in parallel. The backup process acquires an <codeph>ACCESS SHARE</codeph> lock on
       each table that is backed up.</p>
     <p>For information about the <codeph>gpbackup</codeph> and <codeph>gprestore</codeph> utility
-      options, see <xref href="../../utility_guide/admin_utilities/gpbackup.xml">gpbackup</xref> and
-        <xref href="../../utility_guide/admin_utilities/gprestore.xml">gprestore</xref>.</p>
+      options, see <xref href="../../utility_guide/ref/gpbackup.xml">gpbackup</xref> and <xref
+        href="../../utility_guide/ref/gprestore.xml">gprestore</xref>.</p>
   </body>
   <topic id="topic_vh5_1hd_tbb">
     <title>Requirements and Limitations</title>
     <body>
-      <p>The <codeph>gpbackup</codeph> and <codeph>gprestore</codeph> utilities are available with
-        Greenplum Database 5.5.0 and later. </p>
+      <p>The <codeph>gpbackup</codeph> and <codeph>gprestore</codeph> utilities are compatible with
+        these Greenplum Database versions:</p>
+      <ul id="ul_jlm_wnd_hjb">
+        <li>Pivotal Greenplum Database 4.3.22 and later</li>
+        <li>Pivotal Greenplum Database 5.5.0 and later</li>
+        <li>Tanzu Greenplum 6.0.0 and later</li>
+      </ul>
       <p><codeph>gpbackup</codeph> and <codeph>gprestore</codeph> have the following limitations:<ul
           id="ul_uqh_hhd_tbb">
           <li>If you create an index on a parent partitioned table, <codeph>gpbackup</codeph> does
@@ -47,6 +52,20 @@
           <li>You can execute multiple instances of <codeph>gpbackup</codeph>, but each execution
             requires a distinct timestamp.</li>
           <li>Database object filtering is currently limited to schemas and tables.</li>
+          <li>When backing up a partitioned table where some or all leaf partitions are in different
+            schemas from the root partition, the leaf partition table definitions, including the
+            schemas, are backed up as metadata. This occurs even if the backup operation specifies
+            that schemas that contain the leaf partitions should be excluded. To control data being
+            backed up for this type of partitioned table in this situation, use the
+              <codeph>--leaf-partition-data</codeph> option.<ul id="ul_bbp_35k_skb">
+              <li>If the <codeph>--leaf-partition-data</codeph> option is not specified, the leaf
+                partition data is also backed up even if the backup operation specifies that the
+                leaf partition schemas should excluded.</li>
+              <li>If the <codeph>--leaf-partition-data</codeph> option is specified, the leaf
+                partition data is not be backed up if the backup operation specifies that the leaf
+                partition schemas should excluded. Only the metadata for leaf partition tables are
+                backed up.</li>
+            </ul></li>
           <li>If you use the <codeph>gpbackup --single-data-file</codeph> option to combine table
             backups into a single file per segment, you cannot perform a parallel restore operation
             with <codeph>gprestore</codeph> (cannot set <codeph>--jobs</codeph> to a value higher
@@ -71,6 +90,10 @@
               be dropped during a backup, you can exclude the tables from a backup with a
                 <codeph>gpbackup</codeph> table filtering option such as
                 <codeph>--exclude-table</codeph> or <codeph>--exclude-schema</codeph>.</p></li>
+          <li>A backup created with <codeph>gpbackup</codeph> can only be restored to a Greenplum
+            Database cluster with the same number of segment instances as the source cluster. If you
+            run <codeph>gpexpand</codeph> to add segments to the cluster, backups you made before
+            starting the expand cannot be restored after the expansion has completed.</li>
         </ul></p>
     </body>
   </topic>
@@ -114,6 +137,7 @@
                     <li dir="ltr">Casts</li>
                     <li dir="ltr">Types</li>
                     <li dir="ltr">Views</li>
+                    <li>Materialized Views (DDL only)</li>
                     <li dir="ltr">Protocols</li>
                     <li dir="ltr">Triggers. (While Greenplum Database does not support triggers, any
                       trigger definitions that are present are backed up and restored.)</li>
@@ -189,7 +213,7 @@ Tables backed up:  3 / 3 [======================================================
 20180105:11:27:55 gpbackup:gpadmin:centos6.localdomain:002182-[INFO]:-Backup completed successfully</codeblock></p>
       <p>The above command creates a file that contains global and database-specific metadata on the
         Greenplum Database master host in the default directory,
-          <codeph>$MASTER_DATA_DIRECTORY/backups/&lt;YYYYMMDD>/&lt;YYYYMMDDHHMMSS>/</codeph>. For
+          <codeph>$COORDINATOR_DATA_DIRECTORY/backups/&lt;YYYYMMDD>/&lt;YYYYMMDDHHMMSS>/</codeph>. For
         example:<codeblock>$ <b>ls /gpmaster/gpsne-1/backups/20180105/20180105112754</b>
 gpbackup_20180105112754_config.yaml   gpbackup_20180105112754_report
 gpbackup_20180105112754_metadata.sql  gpbackup_20180105112754_toc.yaml</codeblock></p>
@@ -219,6 +243,8 @@ $ <b>find /home/gpadmin/backups/ -type f</b>
       <p>When performing a backup operation, you can use the <codeph>--single-data-file</codeph> in
         situations where the additional overhead of multiple files might be prohibitive. For
         example, if you use a third party storage solution such as Data Domain with back ups.</p>
+      <note>Backing up a materialized view does not back up the materialized view data. Only the
+        materialized view definition is backed up.</note>
       <section>
         <title>Restoring from Backup</title>
         <p>To use <codeph>gprestore</codeph> to restore from a backup set, you must use the
@@ -255,7 +281,14 @@ $ <b>gprestore --backup-dir /home/gpadmin/backups/ --timestamp 20171103153156 --
           number for fast data recovery. </p>
         <note>You cannot perform a parallel restore operation with <codeph>gprestore</codeph> if the
           backup combined table backups into a single file per segment with the
-            <codeph>gpbackup</codeph> option <codeph>--single-data-file</codeph>.</note>
+            <codeph>gpbackup</codeph> option <codeph>--single-data-file</codeph>.<p>Restoring a
+            materialized view does not restore materialized view data. Only the materialized view
+            definition is restored. To populate the materialized view with data, use <codeph>REFRESH
+              MATERIALIZED VIEW</codeph>. The tables that are referenced by the materialized view
+            definition must be available when you refresh the materialized view. The
+              <codeph>gprestore</codeph> log file lists the materialized views that were restored
+            and the <codeph>REFRESH MATERIALIZED VIEW</codeph> commands that are used to populate
+            the materialized views with data.</p></note>
       </section>
       <section id="report_files"><title>Report Files</title><p>When performing a backup or restore
           operation, <codeph>gpbackup</codeph> and <codeph>gprestore</codeph> generate a report
@@ -328,16 +361,24 @@ Restore Status: Success</codeblock></section>
       <p><codeph>gpbackup</codeph> backs up all schemas and tables in the specified database, unless
         you exclude or include individual schema or table objects with schema level or table level
         filter options.</p>
-      <p> The schema level options are <codeph>--include-schema</codeph> or
-          <codeph>--exclude-schema</codeph> command-line options to <codeph>gpbackup</codeph>. For
-        example, if the "demo" database includes only two schemas, "wikipedia" and "twitter," both
-        of the following commands back up only the "wikipedia"
+      <p>The schema level options are <codeph>--include-schema</codeph>,
+          <codeph>--include-schema-file</codeph>, or <codeph>--exclude-schema</codeph>,
+          <codeph>--exclude-schema-file</codeph> command-line options to <codeph>gpbackup</codeph>.
+        For example, if the "demo" database includes only two schemas, "wikipedia" and "twitter,"
+        both of the following commands back up only the "wikipedia"
         schema:<codeblock>$ <b>gpbackup --dbname demo --include-schema wikipedia</b>
 $ <b>gpbackup --dbname demo --exclude-schema twitter</b></codeblock></p>
       <p>You can include multiple <codeph>--include-schema</codeph> options in a
           <codeph>gpbackup</codeph>
         <i>or</i> multiple <codeph>--exclude-schema</codeph> options. For
         example:<codeblock>$ <b>gpbackup --dbname demo --include-schema wikipedia --include-schema twitter</b></codeblock></p>
+      <p>If you have a large number of schemas, you can list the schemas in a text file and specify
+        the file with the <codeph>--include-schema-file</codeph> or
+          <codeph>--exclude-schema-file</codeph> options in a <codeph>gpbackup</codeph> command.
+        Each line in the file must define a single schema, and the file cannot contain trailing
+        lines. For example, this command uses a file in the <codeph>gpadmin</codeph> home directory
+        to include a set of
+        schemas.<codeblock><b>gpbackup --dbname demo --include-schema-file /users/home/gpadmin/backup-schemas</b></codeblock></p>
       <p>To filter the individual tables that are included in a backup set, or excluded from a
         backup set, specify individual tables with the <codeph>--include-table</codeph> option or
         the <codeph>--exclude-table</codeph> option. The table must be schema qualified,
@@ -370,9 +411,10 @@ water.tonic</codeblock></p>
           <codeph>--exclude-table</codeph> or <codeph>--include-table</codeph>.</p>
       <p>When you use <codeph>--include-table</codeph> or <codeph>--include-table-file</codeph>
         dependent objects are not automatically backed up or restored, you must explicitly specify
-        the dependent objects that are required. For example, if you back up or restore a view, you
-        must also specify the tables that the view uses. If you backup or restore a table that uses
-        a sequence, you must also specify the sequence.</p>
+        the dependent objects that are required. For example, if you back up or restore a view or
+        materialized view, you must also specify the tables that the view or the materialized view
+        uses. If you backup or restore a table that uses a sequence, you must also specify the
+        sequence. </p>
       <section id="section_ddf_gyn_5bb"><title>Filtering by Leaf Partition</title><p>By default,
             <codeph>gpbackup</codeph> creates one file for each table on a segment. You can specify
           the <codeph>--leaf-partition-data</codeph> option to create one data file per leaf
@@ -464,8 +506,8 @@ public.sales_1_prt_dec17 </codeblock></p><p>Then
         a back up or restore operation completes. </p>
       <p>To have <codeph>gpbackup</codeph> or <codeph>gprestore</codeph> send out status email
         notifications, you must place a file named <codeph>gp_email_contacts.yaml</codeph> in the
-        home directory of the user running <codeph>gpbackup</codeph> or <codeph>gpbackup</codeph> in
-        the same directory as the utilities (<codeph>$GPHOME/bin</codeph>). A utility issues a
+        home directory of the user running <codeph>gpbackup</codeph> or <codeph>gprestore</codeph>
+        in the same directory as the utilities (<codeph>$GPHOME/bin</codeph>). A utility issues a
         message if it cannot locate a <codeph>gp_email_contacts.yaml</codeph> file in either
         location. If both locations contain a <codeph>.yaml</codeph> file, the utility uses the file
         in user <codeph>$HOME</codeph>. </p>
@@ -479,7 +521,9 @@ public.sales_1_prt_dec17 </codeblock></p><p>Then
         number of objects backed up or restored. For information about the contents of a
         notification email, see <xref href="#topic_qgj_b3d_tbb/report_files" format="dita"/>.</p>
       <note>The UNIX mail utility must be running on the Greenplum Database host and must be
-        configured to allow the Greenplum superuser (<codeph>gpadmin</codeph>) to send email.</note>
+        configured to allow the Greenplum superuser (<codeph>gpadmin</codeph>) to send email. Also
+        ensure that the mail program executable is locatable via the <codeph>gpadmin</codeph> user's
+          <codeph>$PATH</codeph>.</note>
     </body>
     <topic id="topic_uq5_v5v_scb">
       <title>gpbackup and gprestore Email File Format </title>
@@ -581,8 +625,8 @@ public.sales_1_prt_dec17 </codeblock></p><p>Then
             different address depending on the success or failure of the backup operation. For a
             restore operation, an email is sent to <codeph>gpadmin@example.com</codeph> only when
             the operation succeeds or completes with
-            errors.<codeblock>contacts
-  backup:
+            errors.<codeblock>contacts:
+  gpbackup:
   - address: gpadmin@example.com
     status:
       success:true
@@ -590,7 +634,7 @@ public.sales_1_prt_dec17 </codeblock></p><p>Then
     status:
       success_with_errors: true
       failure: true
-  restore:
+  gprestore:
   - address: gpadmin@example.com
     status:
       success: true
@@ -610,7 +654,7 @@ public.sales_1_prt_dec17 </codeblock></p><p>Then
         was created.</p>
       <p>By default, metadata and supporting files are stored on the Greenplum Database master host
         in the directory
-          <filepath>$MASTER_DATA_DIRECTORY/backups/YYYYMMDD/YYYYMMDDHHMMSS/</filepath>. If you
+          <filepath>$COORDINATOR_DATA_DIRECTORY/backups/YYYYMMDD/YYYYMMDDHHMMSS/</filepath>. If you
         specify a custom backup directory, this same file path is created as a subdirectory of the
         backup directory. The following table describes the names and contents of the metadata and
         supporting files.<table frame="all" rowsep="1" colsep="1" id="table_nrz_4gj_tbb">
@@ -659,6 +703,8 @@ public.sales_1_prt_dec17 </codeblock></p><p>Then
                     <li>Aggregates</li>
                     <li>Casts</li>
                     <li>Views</li>
+                    <li>Materialized Views <b>Note:</b> Materialized view data is not restored, only
+                      the definition.</li>
                     <li>Constraints</li>
                   </ul>Database-specific objects that must be created <i>after</i> restoring the
                   actual data include:<ul id="ul_br4_wsv_scb">

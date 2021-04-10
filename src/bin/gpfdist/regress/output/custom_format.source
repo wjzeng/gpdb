@@ -10,7 +10,7 @@ execute E'( python @bindir@/lib/gppinggpfdist.py @hostname@:7575 2>&1 || echo) '
 on SEGMENT 0
 FORMAT 'text' (delimiter '|');
 CREATE EXTERNAL WEB TABLE gpfdist_start (x text)
-execute E'((@bindir@/gpfdist -p 7575 -d @abs_srcdir@/data/fixedwidth/  </dev/null >/dev/null 2>&1 &); sleep 1; echo "starting...") '
+execute E'((@bindir@/gpfdist -p 7575 -d @abs_srcdir@/data/fixedwidth/  </dev/null >/dev/null 2>&1 &); for i in `seq 1 30`; do curl 127.0.0.1:7575 >/dev/null 2>&1 && break; sleep 1; done; echo "starting...") '
 on SEGMENT 0
 FORMAT 'text' (delimiter '|');
 CREATE EXTERNAL WEB TABLE gpfdist_stop (x text)
@@ -47,7 +47,7 @@ FORMAT 'text' (delimiter '|');
 -- 19. MPP-14467 import data from file - field names with spaces
 -- 1.  import data into table with string and numeric fields - data OK 
 DROP EXTERNAL TABLE IF EXISTS tbl_ext_fixedwidth;
-NOTICE:  table "tbl_ext_fixedwidth" does not exist, skipping
+NOTICE:  foreign table "tbl_ext_fixedwidth" does not exist, skipping
 CREATE READABLE EXTERNAL TABLE tbl_ext_fixedwidth 
 (s1 char(10), s2 varchar(10), s3 text, dt timestamp, n1 smallint, n2 integer, n3 bigint, n4 decimal, n5 numeric, n6 real, n7 double precision)                                                              
 LOCATION ('gpfdist://@hostname@:7575/fixedwidth_small_correct.tbl')
@@ -74,7 +74,7 @@ CREATE READABLE EXTERNAL TABLE tbl_ext_fixedwidth
 LOCATION ('gpfdist://@hostname@:7575/fixedwidth_small_error_fieldtype.tbl')       
 FORMAT 'CUSTOM' (formatter='fixedwidth_in', s1='10', s2='10', s3='10', dt='20',n1='5', n2='10', n3='10', n4='10', n5='10', n6='10', n7='15');
 SELECT * FROM tbl_ext_fixedwidth ORDER BY s1;
-ERROR:  invalid input syntax for integer: "bbb"  (seg1 slice1 @hostname@:40001 pid=11441)
+ERROR:  invalid input syntax for type integer: "bbb"  (seg1 slice1 @hostname@:40001 pid=11441)
 DETAIL:  External table tbl_ext_fixedwidth
 -- 3.  import data into table with string and numeric fields - too many fields error  -- no reject limit
 DROP EXTERNAL TABLE IF EXISTS tbl_ext_fixedwidth;
@@ -83,8 +83,8 @@ CREATE READABLE EXTERNAL TABLE tbl_ext_fixedwidth
 LOCATION ('gpfdist://@hostname@:7575/fixedwidth_small_error_toomanyfields.tbl')       
 FORMAT 'CUSTOM' (formatter='fixedwidth_in', s1='10', s2='10', s3='10', dt='20',n1='5', n2='10', n3='10', n4='10', n5='10', n6='10', n7='15');
 SELECT * FROM tbl_ext_fixedwidth ORDER BY s1;
-ERROR:  Expected line size from the formatting string: 120, but the actual size is: 125  (seg0 slice1 @hostname@:40000 pid=11440)
-DETAIL:  External table tbl_ext_fixedwidth
+ERROR:  expected line size from the formatting string is 120, actual size is 125
+CONTEXT:  External table tbl_ext_fixedwidth
 -- 4.  import data into table with string and numeric fields - too few fields error  -- no reject limit
 DROP EXTERNAL TABLE IF EXISTS tbl_ext_fixedwidth;
 CREATE READABLE EXTERNAL TABLE tbl_ext_fixedwidth 
@@ -92,8 +92,8 @@ CREATE READABLE EXTERNAL TABLE tbl_ext_fixedwidth
 LOCATION ('gpfdist://@hostname@:7575/fixedwidth_small_error_toofewfields.tbl')       
 FORMAT 'CUSTOM' (formatter='fixedwidth_in', s1='10', s2='10', s3='10', dt='20',n1='5', n2='10', n3='10', n4='10', n5='10', n6='10', n7='15');
 SELECT * FROM tbl_ext_fixedwidth ORDER BY s1;
-ERROR:  Expected line size from the formatting string: 120, but the actual size is: 105  (seg1 slice1 @hostname@:40001 pid=11441)
-DETAIL:  External table tbl_ext_fixedwidth
+ERROR:  expected line size from the formatting string is 120, actual size is 105
+CONTEXT:  External table tbl_ext_fixedwidth
 -- 5.  import data into table with string and numeric fields - field too long error -- no reject limit
 DROP EXTERNAL TABLE IF EXISTS tbl_ext_fixedwidth;
 CREATE READABLE EXTERNAL TABLE tbl_ext_fixedwidth 
@@ -112,7 +112,7 @@ FORMAT 'CUSTOM' (formatter='fixedwidth_in', s1='10', s2='10', s3='10', dt='20',n
 SEGMENT REJECT LIMIT 3 ROWS;
 SELECT * FROM tbl_ext_fixedwidth ORDER BY s1;
 ERROR:  segment reject limit reached, aborting operation
-DETAIL:  Last error was: invalid input syntax for integer: "y32"  (seg1 slice1 @hostname@:40001 pid=11441)
+DETAIL:  Last error was: invalid input syntax for type integer: "y32"  (seg1 slice1 @hostname@:40001 pid=11441)
 CONTEXT:  External table tbl_ext_fixedwidth
 -- 7.  import data into table with string and numeric fields - field type error  -- reject limit not crossed
 DROP EXTERNAL TABLE IF EXISTS tbl_ext_fixedwidth;
@@ -122,7 +122,7 @@ LOCATION ('gpfdist://@hostname@:7575/fixedwidth_small_error_rejectlimitnotcrosse
 FORMAT 'CUSTOM' (formatter='fixedwidth_in', s1='10', s2='10', s3='10', dt='20',n1='5', n2='10', n3='10', n4='10', n5='10', n6='10', n7='15')
 SEGMENT REJECT LIMIT 5 ROWS;
 SELECT * FROM tbl_ext_fixedwidth ORDER BY s1;
-NOTICE:  Found 4 data formatting errors (4 or more input rows). Rejected related input data.
+NOTICE:  found 4 data formatting errors (4 or more input rows), rejected related input data
      s1     |  s2  |   s3   |            dt            | n1 | n2  |   n3   |  n4   |   n5    |   n6    |     n7     
 ------------+------+--------+--------------------------+----+-----+--------+-------+---------+---------+------------
  aaa        | twoa | shpits | Wed Jun 01 12:30:30 2011 | 23 | 732 | 834567 | 45.67 | 789.123 | 7.12345 | 123.456789
@@ -141,7 +141,7 @@ LOCATION ('gpfdist://@hostname@:7575/fixedwidth_small_error_rejectlimitnotcrosse
 FORMAT 'CUSTOM' (formatter='fixedwidth_in', s1='10', s2='10', s3='10', dt='20',n1='5', n2='10', n3='10', n4='10', n5='10', n6='10', n7='15')
 LOG ERRORS SEGMENT REJECT LIMIT 5 ROWS;
 SELECT * FROM tbl_ext_fixedwidth ORDER BY s1;
-NOTICE:  Found 4 data formatting errors (4 or more input rows). Rejected related input data.
+NOTICE:  found 4 data formatting errors (4 or more input rows), rejected related input data
      s1     |  s2  |   s3   |            dt            | n1 | n2  |   n3   |  n4   |   n5    |   n6    |     n7     
 ------------+------+--------+--------------------------+----+-----+--------+-------+---------+---------+------------
  aaa        | twoa | shpits | Wed Jun 01 12:30:30 2011 | 23 | 732 | 834567 | 45.67 | 789.123 | 7.12345 | 123.456789
@@ -153,18 +153,18 @@ NOTICE:  Found 4 data formatting errors (4 or more input rows). Rejected related
 (6 rows)
 
 SELECT relname,linenum,errmsg FROM gp_read_error_log('tbl_ext_fixedwidth') ORDER BY linenum;
-      relname       | linenum |                 errmsg                  
---------------------+---------+-----------------------------------------
- tbl_ext_fixedwidth |       3 | invalid input syntax for integer: "s32"
- tbl_ext_fixedwidth |       4 | invalid input syntax for integer: "7v2"
- tbl_ext_fixedwidth |       5 | invalid input syntax for integer: "y32"
- tbl_ext_fixedwidth |       6 | invalid input syntax for integer: "7d2"
+      relname       | linenum |                    errmsg                    
+--------------------+---------+----------------------------------------------
+ tbl_ext_fixedwidth |       3 | invalid input syntax for type integer: "s32"
+ tbl_ext_fixedwidth |       4 | invalid input syntax for type integer: "7v2"
+ tbl_ext_fixedwidth |       5 | invalid input syntax for type integer: "y32"
+ tbl_ext_fixedwidth |       6 | invalid input syntax for type integer: "7d2"
 (4 rows)
 
 DROP EXTERNAL TABLE tbl_ext_fixedwidth;
 -- 9.  import data into table with string and numeric fields - FORMAT string syntax error  -- field definition error
 DROP EXTERNAL TABLE IF EXISTS tbl_ext_fixedwidth;
-NOTICE:  table "tbl_ext_fixedwidth" does not exist, skipping
+NOTICE:  foreign table "tbl_ext_fixedwidth" does not exist, skipping
 CREATE READABLE EXTERNAL TABLE tbl_ext_fixedwidth 
 (s1 char(10), s2 varchar(10), s3 text, dt timestamp, n1 smallint, n2 integer, n3 bigint, n4 decimal, n5 numeric, n6 real, n7 double precision)                                                              
 LOCATION ('gpfdist://@hostname@:7575/fixedwidth_small_correct.tbl')       
@@ -179,14 +179,14 @@ LINE 1: SELECT * FROM tbl_ext_fixedwidth ORDER BY s1;
 -- 10. import data into table with string and numeric fields - FORMAT string syntax error  -- fields order does not corespond to file order
 --     canno't be caught when testing string syntax, will appear as a type error and only if the swap was between fields of different type
 DROP EXTERNAL TABLE IF EXISTS tbl_ext_fixedwidth;
-NOTICE:  table "tbl_ext_fixedwidth" does not exist, skipping
+NOTICE:  foreign table "tbl_ext_fixedwidth" does not exist, skipping
 CREATE READABLE EXTERNAL TABLE tbl_ext_fixedwidth 
 (s1 char(10), s2 varchar(10), s3 text, dt timestamp, n1 smallint, n2 integer, n3 bigint, n4 decimal, n5 numeric, n6 real, n7 double precision)                                                              
 LOCATION ('gpfdist://@hostname@:7575/fixedwidth_small_correct.tbl')       
 FORMAT 'CUSTOM' (formatter='fixedwidth_in', s1='10', n1='5', s2='10', s3='10', dt='20', n2='10', n3='10', n4='10', n5='10', n6='10', n7='15');
 SELECT * FROM tbl_ext_fixedwidth ORDER BY s1;
-ERROR:  invalid input syntax for integer: "twoa"  (seg1 slice1 @hostname@:40001 pid=11441)
-DETAIL:  External table tbl_ext_fixedwidth
+ERROR:  invalid input syntax for type smallint: "twoa"  (seg1 slice1 @hostname@:40001 pid=11441)
+CONTEXT:  External table tbl_ext_fixedwidth
 -- 11. import data into table with string and numeric fields - FORMAT string syntax error  -- fields names do not corespond fields in table
 DROP EXTERNAL TABLE IF EXISTS tbl_ext_fixedwidth;
 CREATE READABLE EXTERNAL TABLE tbl_ext_fixedwidth 
@@ -194,8 +194,8 @@ CREATE READABLE EXTERNAL TABLE tbl_ext_fixedwidth
 LOCATION ('gpfdist://@hostname@:7575/fixedwidth_small_correct.tbl')       
 FORMAT 'CUSTOM' (formatter='fixedwidth_in', s1='10', n1='5', s2='10', s3='10', dt='20', n2='10', n3='10', n4='10', n5='10', n6='10', n7='15');
 SELECT * FROM tbl_ext_fixedwidth ORDER BY s1;
-ERROR:  the fixed width formatter requires a length specification for each one of the external table columns being used (missing field <s3>  (seg1 slice1 @hostname@:40001 pid=11441)
-DETAIL:  External table tbl_ext_fixedwidth
+ERROR:  missing column definition in length specification
+CONTEXT:  External table tbl_ext_fixedwidth
 -- 12. import data into table with string and numeric fields -- NULL value loaded when NULL value defined
 DROP EXTERNAL TABLE IF EXISTS tbl_ext_fixedwidth;
 CREATE READABLE EXTERNAL TABLE tbl_ext_fixedwidth 
@@ -270,8 +270,8 @@ CREATE READABLE EXTERNAL TABLE tbl_ext_fixedwidth
 LOCATION ('gpfdist://@hostname@:7575/fixedwidth_small_blankfields.tbl')       
 FORMAT 'CUSTOM' (formatter='fixedwidth_in', s1='10', s2='10', s3='10', dt='20', n1='5', n2='10', n3='10', n4='10', n5='10', n6='10', n7='15', preserve_blanks='on');
 SELECT * FROM tbl_ext_fixedwidth ORDER BY s1;
-ERROR:  A null_value was not defined. When preserve_blanks is on, a null_value 								 must be defined in the formatter arguments string  (seg0 slice1 @hostname@:40000 pid=11440)
-DETAIL:  External table tbl_ext_fixedwidth
+ERROR:  null_value was not defined
+CONTEXT:  External table tbl_ext_fixedwidth
 -- 15. import data into table with string and numeric fields - FORMAT string syntax error  -- preserve_blanks with NULL defined
 --     trailing blanks are loaded, blank fields are loaded as  strings, only fields with the null value are loaded as NULL
 DROP EXTERNAL TABLE IF EXISTS tbl_ext_fixedwidth;
@@ -10367,7 +10367,7 @@ SELECT * FROM tbl_ext_fixedwidth ORDER BY "s 1";
 -- --------------------------------------
 -- Helper to remove the output file
 DROP EXTERNAL WEB TABLE IF EXISTS clean_out_file;
-NOTICE:  table "clean_out_file" does not exist, skipping
+NOTICE:  foreign table "clean_out_file" does not exist, skipping
 CREATE EXTERNAL WEB TABLE clean_out_file (x text)
 EXECUTE E'( rm -f @abs_srcdir@/data/fixedwidth/fixedwidth_out.tbl)'
 on SEGMENT 0

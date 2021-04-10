@@ -125,7 +125,7 @@ int main()
 
     ECPGdebug(1, stderr);
 
-    { ECPGconnect(__LINE__, 0, "regress1" , NULL, NULL , NULL, 0); 
+    { ECPGconnect(__LINE__, 0, "ecpg1_regression" , NULL, NULL , NULL, 0); 
 #line 54 "pointer_to_struct.pgc"
 
 if (sqlca.sqlwarn[0] == 'W') sqlprint();
@@ -289,5 +289,5 @@ if (sqlca.sqlcode < 0) sqlprint();}
 
 
 	/* All the memory will anyway be freed at the end */
-    return( 0 );
+    return 0;
 }

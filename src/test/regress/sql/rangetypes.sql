@@ -73,9 +73,13 @@ SELECT * FROM numrange_test WHERE 1.9 <@ nr;
 select * from numrange_test where nr = 'empty';
 select * from numrange_test where nr = '(1.1, 2.2)';
 select * from numrange_test where nr = '[1.1, 2.2)';
+select * from numrange_test where nr < 'empty';
 select * from numrange_test where nr < numrange(-1000.0, -1000.0,'[]');
 select * from numrange_test where nr < numrange(0.0, 1.0,'[]');
 select * from numrange_test where nr < numrange(1000.0, 1001.0,'[]');
+select * from numrange_test where nr <= 'empty';
+select * from numrange_test where nr >= 'empty';
+select * from numrange_test where nr > 'empty';
 select * from numrange_test where nr > numrange(-1001.0, -1000.0,'[]');
 select * from numrange_test where nr > numrange(0.0, 1.0,'[]');
 select * from numrange_test where nr > numrange(1000.0, 1000.0,'[]');
@@ -110,7 +114,11 @@ select numrange(1.1, 2.2) < numrange(1.1, 1.2);
 
 select numrange(1.0, 2.0) + numrange(2.0, 3.0);
 select numrange(1.0, 2.0) + numrange(1.5, 3.0);
-select numrange(1.0, 2.0) + numrange(2.5, 3.0);
+select numrange(1.0, 2.0) + numrange(2.5, 3.0); -- should fail
+
+select range_merge(numrange(1.0, 2.0), numrange(2.0, 3.0));
+select range_merge(numrange(1.0, 2.0), numrange(1.5, 3.0));
+select range_merge(numrange(1.0, 2.0), numrange(2.5, 3.0)); -- shouldn't fail
 
 select numrange(1.0, 2.0) * numrange(2.0, 3.0);
 select numrange(1.0, 2.0) * numrange(1.5, 3.0);
@@ -288,6 +296,11 @@ select count(*) from test_range_spgist where ir &< int4range(100,500);
 select count(*) from test_range_spgist where ir &> int4range(100,500);
 select count(*) from test_range_spgist where ir -|- int4range(100,500);
 
+-- test index-only scans
+explain (costs off)
+select ir from test_range_spgist where ir -|- int4range(10,20) order by ir;
+select ir from test_range_spgist where ir -|- int4range(10,20) order by ir;
+
 RESET enable_seqscan;
 RESET enable_indexscan;
 RESET enable_bitmapscan;
@@ -314,7 +327,7 @@ create table test_range_excl(
   during tsrange,
   exclude using gist (room with =, during with &&),
   exclude using gist (speaker with =, during with &&)
-) DISTRIBUTED BY (id);
+) DISTRIBUTED REPLICATED;
 
 insert into test_range_excl
   values(1, int4range(123, 123, '[]'), int4range(1, 1, '[]'), '[2010-01-02 10:00, 2010-01-02 11:00)');
@@ -440,6 +453,37 @@ select arrayrange(ARRAY[2,1], ARRAY[1,2]);  -- fail
 
 select array[1,1] <@ arrayrange(array[1,2], array[2,1]);
 select array[1,3] <@ arrayrange(array[1,2], array[2,1]);
+
+-- start_ignore
+-- GPDB_94_MERGE_FIXME: orca can not run the test green.
+
+--
+-- Check behavior when subtype lacks a hash function
+--
+
+create type cashrange as range (subtype = money);
+
+set enable_sort = off;  -- try to make it pick a hash setop implementation
+
+select '(2,5)'::cashrange except select '(5,6)'::cashrange;
+
+reset enable_sort;
+
+-- end_ignore
+
+--
+-- Ranges of composites
+--
+
+create type two_ints as (a int, b int);
+create type two_ints_range as range (subtype = two_ints);
+
+-- with force_parallel_mode on, this exercises tqueue.c's range remapping
+select *, row_to_json(upper(t)) as u from
+  (values (two_ints_range(row(1,2), row(3,4))),
+          (two_ints_range(row(5,6), row(7,8)))) v(t);
+
+drop type two_ints cascade;
 
 --
 -- OUT/INOUT/TABLE functions

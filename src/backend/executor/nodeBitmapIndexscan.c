@@ -4,8 +4,8 @@
  *	  Routines to support bitmapped index scans of relations
  *
  * Portions Copyright (c) 2007-2008, Greenplum inc
- * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -24,8 +24,6 @@
 #include "postgres.h"
 
 #include "access/genam.h"
-#include "cdb/cdbvars.h"
-#include "cdb/cdbpartition.h"
 #include "executor/execdebug.h"
 #include "executor/nodeBitmapIndexscan.h"
 #include "executor/nodeIndexscan.h"
@@ -34,6 +32,21 @@
 #include "utils/lsyscache.h"
 #include "nodes/tidbitmap.h"
 
+#include "cdb/cdbvars.h"
+
+
+/* ----------------------------------------------------------------
+ *		ExecBitmapIndexScan
+ *
+ *		stub for pro forma compliance
+ * ----------------------------------------------------------------
+ */
+static TupleTableSlot *
+ExecBitmapIndexScan(PlanState *pstate)
+{
+	elog(ERROR, "BitmapIndexScan node does not support ExecProcNode call convention");
+	return NULL;
+}
 
 /* ----------------------------------------------------------------
  *		MultiExecBitmapIndexScan(node)
@@ -57,6 +70,7 @@ MultiExecBitmapIndexScan(BitmapIndexScanState *node)
 {
 	Node	   *bitmap = NULL;
 	IndexScanDesc scandesc;
+	double		nTuples = 0;
 	bool		doscan;
 
 	/* Make sure we are not leaking a previous bitmap */
@@ -89,7 +103,7 @@ MultiExecBitmapIndexScan(BitmapIndexScanState *node)
 	/* Get bitmap from index */
 	while (doscan)
 	{
-		bitmap = index_getbitmap(scandesc, node->biss_result);
+		nTuples += (double) index_getbitmap(scandesc, &bitmap);
 
 		if ((NULL != bitmap) &&
 			!(IsA(bitmap, TIDBitmap) || IsA(bitmap, StreamBitmap)))
@@ -106,9 +120,6 @@ MultiExecBitmapIndexScan(BitmapIndexScanState *node)
 		if (node->ss.ps.instrument && (node->ss.ps.instrument)->need_cdb)
 			tbm_generic_set_instrument(bitmap, node->ss.ps.instrument);
 
-		if (node->biss_result == NULL)
-			node->biss_result = (Node *) bitmap;
-
 		doscan = ExecIndexAdvanceArrayKeys(node->biss_ArrayKeys,
 										   node->biss_NumArrayKeys);
 		if (doscan)				/* reset index scan */
@@ -118,9 +129,8 @@ MultiExecBitmapIndexScan(BitmapIndexScanState *node)
 	}
 
 	/* must provide our own instrumentation support */
-	/* GPDB: Report "1 tuple", actually meaning "1 bitmap" */
 	if (node->ss.ps.instrument)
-		InstrStopNode(node->ss.ps.instrument, 1 /* nTuples */);
+		InstrStopNode(node->ss.ps.instrument, nTuples);
 
 	return (Node *) bitmap;
 }
@@ -170,21 +180,6 @@ ExecReScanBitmapIndexScan(BitmapIndexScanState *node)
 		index_rescan(node->biss_ScanDesc,
 					 node->biss_ScanKeys, node->biss_NumScanKeys,
 					 NULL, 0);
-
-	/* Sanity check */
-	if (node->biss_result &&
-		(!IsA(node->biss_result, TIDBitmap) && !IsA(node->biss_result, StreamBitmap)))
-	{
-		ereport(ERROR,
-				(errcode(ERRCODE_INTERNAL_ERROR),
-				 errmsg("the returning bitmap in nodeBitmapIndexScan is invalid.")));
-	}
-
-	if (NULL != node->biss_result)
-	{
-		tbm_generic_free(node->biss_result);
-		node->biss_result = NULL;
-	}
 }
 
 /* ----------------------------------------------------------------
@@ -218,11 +213,6 @@ ExecEndBitmapIndexScan(BitmapIndexScanState *node)
 		index_endscan(indexScanDesc);
 	if (indexRelationDesc)
 		index_close(indexRelationDesc, NoLock);
-
-	tbm_generic_free(node->biss_result);
-	node->biss_result = NULL;
-
-	EndPlanStateGpmonPkt(&node->ss.ps);
 }
 
 /* ----------------------------------------------------------------
@@ -235,7 +225,7 @@ BitmapIndexScanState *
 ExecInitBitmapIndexScan(BitmapIndexScan *node, EState *estate, int eflags)
 {
 	BitmapIndexScanState *indexstate;
-	bool		relistarget;
+	LOCKMODE	lockmode;
 
 	/* check for unsupported flags */
 	Assert(!(eflags & (EXEC_FLAG_BACKWARD | EXEC_FLAG_MARK)));
@@ -246,9 +236,19 @@ ExecInitBitmapIndexScan(BitmapIndexScan *node, EState *estate, int eflags)
 	indexstate = makeNode(BitmapIndexScanState);
 	indexstate->ss.ps.plan = (Plan *) node;
 	indexstate->ss.ps.state = estate;
+	indexstate->ss.ps.ExecProcNode = ExecBitmapIndexScan;
 
 	/* normally we don't make the result bitmap till runtime */
 	indexstate->biss_result = NULL;
+
+	/*
+	 * We do not open or lock the base relation here.  We assume that an
+	 * ancestor BitmapHeapScan node is holding AccessShareLock (or better) on
+	 * the heap relation throughout the execution of the plan tree.
+	 */
+
+	indexstate->ss.ss_currentRelation = NULL;
+	indexstate->ss.ss_currentScanDesc = NULL;
 
 	/*
 	 * Miscellaneous initialization
@@ -267,15 +267,6 @@ ExecInitBitmapIndexScan(BitmapIndexScan *node, EState *estate, int eflags)
 	 */
 
 	/*
-	 * We do not open or lock the base relation here.  We assume that an
-	 * ancestor BitmapHeapScan node is holding AccessShareLock (or better) on
-	 * the heap relation throughout the execution of the plan tree.
-	 */
-
-	indexstate->ss.ss_currentRelation = NULL;
-	//indexstate->ss.ss_currentScanDesc = NULL;
-
-	/*
 	 * If we are just doing EXPLAIN (ie, aren't going to run the plan), stop
 	 * here.  This allows an index-advisor plugin to EXPLAIN a plan containing
 	 * references to nonexistent indexes.
@@ -283,16 +274,9 @@ ExecInitBitmapIndexScan(BitmapIndexScan *node, EState *estate, int eflags)
 	if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
 		return indexstate;
 
-	/*
-	 * Open the index relation.
-	 *
-	 * If the parent table is one of the target relations of the query, then
-	 * InitPlan already opened and write-locked the index, so we can avoid
-	 * taking another lock here.  Otherwise we need a normal reader's lock.
-	 */
-	relistarget = ExecRelationIsTargetRelation(estate, node->scan.scanrelid);
-	indexstate->biss_RelationDesc = index_open(node->indexid,
-									 relistarget ? NoLock : AccessShareLock);
+	/* Open the index relation. */
+	lockmode = exec_rt_fetch(node->scan.scanrelid, estate)->rellockmode;
+	indexstate->biss_RelationDesc = index_open(node->indexid, lockmode);
 
 	/*
 	 * Initialize index-specific scan state

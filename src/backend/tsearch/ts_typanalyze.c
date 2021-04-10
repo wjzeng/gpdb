@@ -3,7 +3,7 @@
  * ts_typanalyze.c
  *	  functions for gathering statistics from tsvector columns
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
@@ -13,11 +13,12 @@
  */
 #include "postgres.h"
 
-#include "access/hash.h"
+#include "catalog/pg_collation.h"
 #include "catalog/pg_operator.h"
 #include "commands/vacuum.h"
 #include "tsearch/ts_type.h"
 #include "utils/builtins.h"
+#include "utils/hashutils.h"
 
 
 /* A hash key for lexemes */
@@ -36,9 +37,9 @@ typedef struct
 } TrackItem;
 
 static void compute_tsvector_stats(VacAttrStats *stats,
-					   AnalyzeAttrFetchFunc fetchfunc,
-					   int samplerows,
-					   double totalrows);
+								   AnalyzeAttrFetchFunc fetchfunc,
+								   int samplerows,
+								   double totalrows);
 static void prune_lexemes_hashtable(HTAB *lexemes_tab, int b_current);
 static uint32 lexeme_hash(const void *key, Size keysize);
 static int	lexeme_match(const void *key1, const void *key2, Size keysize);
@@ -188,7 +189,7 @@ compute_tsvector_stats(VacAttrStats *stats,
 	lexemes_tab = hash_create("Analyzed lexemes table",
 							  num_mcelem,
 							  &hash_ctl,
-					HASH_ELEM | HASH_FUNCTION | HASH_COMPARE | HASH_CONTEXT);
+							  HASH_ELEM | HASH_FUNCTION | HASH_COMPARE | HASH_CONTEXT);
 
 	/* Initialize counters. */
 	b_current = 1;
@@ -232,9 +233,7 @@ compute_tsvector_stats(VacAttrStats *stats,
 
 		/*
 		 * We loop through the lexemes in the tsvector and add them to our
-		 * tracking hashtable.  Note: the hashtable entries will point into
-		 * the (detoasted) tsvector value, therefore we cannot free that
-		 * storage until we're done.
+		 * tracking hashtable.
 		 */
 		lexemesptr = STRPTR(vector);
 		curentryptr = ARRPTR(vector);
@@ -242,7 +241,12 @@ compute_tsvector_stats(VacAttrStats *stats,
 		{
 			bool		found;
 
-			/* Construct a hash key */
+			/*
+			 * Construct a hash key.  The key points into the (detoasted)
+			 * tsvector value at this point, but if a new entry is created, we
+			 * make a copy of it.  This way we can free the tsvector value
+			 * once we've processed all its lexemes.
+			 */
 			hash_key.lexeme = lexemesptr + curentryptr->pos;
 			hash_key.length = curentryptr->len;
 
@@ -261,6 +265,9 @@ compute_tsvector_stats(VacAttrStats *stats,
 				/* Initialize new tracking list element */
 				item->frequency = 1;
 				item->delta = b_current - 1;
+
+				item->key.lexeme = palloc(hash_key.length);
+				memcpy(item->key.lexeme, hash_key.lexeme, hash_key.length);
 			}
 
 			/* lexeme_no is the number of elements processed (ie N) */
@@ -276,6 +283,10 @@ compute_tsvector_stats(VacAttrStats *stats,
 			/* Advance to the next WordEntry in the tsvector */
 			curentryptr++;
 		}
+
+		/* If the vector was toasted, free the detoasted copy. */
+		if (TSVectorGetDatum(vector) != value)
+			pfree(vector);
 	}
 
 	/* We can only compute real stats if we found some non-null values. */
@@ -295,7 +306,7 @@ compute_tsvector_stats(VacAttrStats *stats,
 		stats->stawidth = total_width / (double) nonnull_cnt;
 
 		/* Assume it's a unique column (see notes above) */
-		stats->stadistinct = -1.0;
+		stats->stadistinct = -1.0 * (1.0 - stats->stanullfrac);
 
 		/*
 		 * Construct an array of the interesting hashtable items, that is,
@@ -396,7 +407,7 @@ compute_tsvector_stats(VacAttrStats *stats,
 
 				mcelem_values[i] =
 					PointerGetDatum(cstring_to_text_with_len(item->key.lexeme,
-														  item->key.length));
+															 item->key.length));
 				mcelem_freqs[i] = (double) item->frequency / (double) nonnull_cnt;
 			}
 			mcelem_freqs[i++] = (double) minfreq / (double) nonnull_cnt;
@@ -405,6 +416,7 @@ compute_tsvector_stats(VacAttrStats *stats,
 
 			stats->stakind[0] = STATISTIC_KIND_MCELEM;
 			stats->staop[0] = TextEqualOperator;
+			stats->stacoll[0] = DEFAULT_COLLATION_OID;
 			stats->stanumbers[0] = mcelem_freqs;
 			/* See above comment about two extra frequency fields */
 			stats->numnumbers[0] = num_mcelem + 2;
@@ -423,7 +435,7 @@ compute_tsvector_stats(VacAttrStats *stats,
 		stats->stats_valid = true;
 		stats->stanullfrac = 1.0;
 		stats->stawidth = 0;	/* "unknown" */
-		stats->stadistinct = 0.0;		/* "unknown" */
+		stats->stadistinct = 0.0;	/* "unknown" */
 	}
 
 	/*
@@ -447,9 +459,12 @@ prune_lexemes_hashtable(HTAB *lexemes_tab, int b_current)
 	{
 		if (item->frequency + item->delta <= b_current)
 		{
+			char	   *lexeme = item->key.lexeme;
+
 			if (hash_search(lexemes_tab, (const void *) &item->key,
 							HASH_REMOVE, NULL) == NULL)
 				elog(ERROR, "hash table corrupted");
+			pfree(lexeme);
 		}
 	}
 }
@@ -501,8 +516,8 @@ lexeme_compare(const void *key1, const void *key2)
 static int
 trackitem_compare_frequencies_desc(const void *e1, const void *e2)
 {
-	const TrackItem *const * t1 = (const TrackItem *const *) e1;
-	const TrackItem *const * t2 = (const TrackItem *const *) e2;
+	const TrackItem *const *t1 = (const TrackItem *const *) e1;
+	const TrackItem *const *t2 = (const TrackItem *const *) e2;
 
 	return (*t2)->frequency - (*t1)->frequency;
 }
@@ -513,8 +528,8 @@ trackitem_compare_frequencies_desc(const void *e1, const void *e2)
 static int
 trackitem_compare_lexemes(const void *e1, const void *e2)
 {
-	const TrackItem *const * t1 = (const TrackItem *const *) e1;
-	const TrackItem *const * t2 = (const TrackItem *const *) e2;
+	const TrackItem *const *t1 = (const TrackItem *const *) e1;
+	const TrackItem *const *t2 = (const TrackItem *const *) e2;
 
 	return lexeme_compare(&(*t1)->key, &(*t2)->key);
 }

@@ -2,9 +2,10 @@
 
 #include "postgres_fe.h"
 #include <ctype.h>
+#include <float.h>
 #include <limits.h>
 
-#include "extern.h"
+#include "pgtypeslib_extern.h"
 #include "pgtypes_error.h"
 
 #define Max(x, y)				((x) > (y) ? (x) : (y))
@@ -39,7 +40,7 @@ apply_typmod(numeric *var, long typmod)
 
 	/* Do nothing if we have a default typmod (-1) */
 	if (typmod < (long) (VARHDRSZ))
-		return (0);
+		return 0;
 
 	typmod -= VARHDRSZ;
 	precision = (typmod >> 16) & 0xffff;
@@ -99,7 +100,7 @@ apply_typmod(numeric *var, long typmod)
 
 	var->rscale = scale;
 	var->dscale = scale;
-	return (0);
+	return 0;
 }
 #endif
 
@@ -161,7 +162,7 @@ PGTYPESdecimal_new(void)
 static int
 set_var_from_str(char *str, char **ptr, numeric *dest)
 {
-	bool		have_dp = FALSE;
+	bool		have_dp = false;
 	int			i = 0;
 
 	errno = 0;
@@ -213,7 +214,7 @@ set_var_from_str(char *str, char **ptr, numeric *dest)
 
 	if (*(*ptr) == '.')
 	{
-		have_dp = TRUE;
+		have_dp = true;
 		(*ptr)++;
 	}
 
@@ -240,7 +241,7 @@ set_var_from_str(char *str, char **ptr, numeric *dest)
 				errno = PGTYPES_NUM_BAD_NUMERIC;
 				return -1;
 			}
-			have_dp = TRUE;
+			have_dp = true;
 			(*ptr)++;
 		}
 		else
@@ -262,8 +263,7 @@ set_var_from_str(char *str, char **ptr, numeric *dest)
 			return -1;
 		}
 		(*ptr) = endptr;
-		if (exponent > NUMERIC_MAX_PRECISION ||
-			exponent < -NUMERIC_MAX_PRECISION)
+		if (exponent >= INT_MAX / 2 || exponent <= -(INT_MAX / 2))
 		{
 			errno = PGTYPES_NUM_BAD_NUMERIC;
 			return -1;
@@ -296,7 +296,7 @@ set_var_from_str(char *str, char **ptr, numeric *dest)
 		dest->weight = 0;
 
 	dest->rscale = dest->dscale;
-	return (0);
+	return 0;
 }
 
 
@@ -412,16 +412,16 @@ PGTYPESnumeric_from_asc(char *str, char **endptr)
 	char	  **ptr = (endptr != NULL) ? endptr : &realptr;
 
 	if (!value)
-		return (NULL);
+		return NULL;
 
 	ret = set_var_from_str(str, ptr, value);
 	if (ret)
 	{
 		PGTYPESnumeric_free(value);
-		return (NULL);
+		return NULL;
 	}
 
-	return (value);
+	return value;
 }
 
 char *
@@ -445,7 +445,7 @@ PGTYPESnumeric_to_asc(numeric *num, int dscale)
 	/* get_str_from_var may change its argument */
 	s = get_str_from_var(numcopy, dscale);
 	PGTYPESnumeric_free(numcopy);
-	return (s);
+	return s;
 }
 
 /* ----------
@@ -1368,15 +1368,15 @@ PGTYPESnumeric_cmp(numeric *var1, numeric *var2)
 {
 	/* use cmp_abs function to calculate the result */
 
-	/* both are positive: normal comparation with cmp_abs */
+	/* both are positive: normal comparison with cmp_abs */
 	if (var1->sign == NUMERIC_POS && var2->sign == NUMERIC_POS)
 		return cmp_abs(var1, var2);
 
-	/* both are negative: return the inverse of the normal comparation */
+	/* both are negative: return the inverse of the normal comparison */
 	if (var1->sign == NUMERIC_NEG && var2->sign == NUMERIC_NEG)
 	{
 		/*
-		 * instead of inverting the result, we invert the paramter ordering
+		 * instead of inverting the result, we invert the parameter ordering
 		 */
 		return cmp_abs(var2, var1);
 	}
@@ -1497,11 +1497,11 @@ PGTYPESnumeric_copy(numeric *src, numeric *dst)
 int
 PGTYPESnumeric_from_double(double d, numeric *dst)
 {
-	char		buffer[100];
+	char		buffer[DBL_DIG + 100];
 	numeric    *tmp;
 	int			i;
 
-	if (sprintf(buffer, "%f", d) == 0)
+	if (sprintf(buffer, "%.*g", DBL_DIG, d) <= 0)
 		return -1;
 
 	if ((tmp = PGTYPESnumeric_from_asc(buffer, NULL)) == NULL)

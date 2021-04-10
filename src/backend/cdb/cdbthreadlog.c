@@ -5,7 +5,7 @@
  *
  *
  * Portions Copyright (c) 2005-2008, Greenplum inc
- * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
  *
  *
  * IDENTIFICATION
@@ -134,13 +134,6 @@ write_log(const char *fmt,...)
 									0,
 									0,
 									true,
-
-		/*
-		 * This is a real hack... We want to send alerts on these errors, but
-		 * we aren't using ereport()
-		 */
-									strstr(errbuf, "Master unable to connect") != NULL ||
-									strstr(errbuf, "Found a fault with a segment") != NULL,
 									NULL,
 									false);
 

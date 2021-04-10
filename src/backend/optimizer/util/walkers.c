@@ -8,10 +8,10 @@
 #include "postgres.h"
 
 #include "catalog/pg_collation.h"
+#include "catalog/pg_type.h"
 #include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/walkers.h"
-#include "optimizer/var.h"
 
 /**
  * Plan node walker related methods.
@@ -143,7 +143,8 @@ walk_join_node_fields(Join *join,
 bool
 plan_tree_walker(Node *node,
 				 bool (*walker) (),
-				 void *context)
+				 void *context,
+				 bool recurse_into_subplans)
 {
 	/*
 	 * The walker has already visited the current node, and so we need
@@ -176,20 +177,12 @@ plan_tree_walker(Node *node,
 				return true;
 			break;
 
-		case T_PartitionSelector:
+		case T_ProjectSet:
 			if (walk_plan_node_fields((Plan *) node, walker, context))
-				return true;
-			if (walker((Node *) ((PartitionSelector *) node)->levelEqExpressions, context))
-				return true;
-			if (walker((Node *) ((PartitionSelector *) node)->levelExpressions, context))
-				return true;
-			if (walker(((PartitionSelector *) node)->residualPredicate, context))
-				return true;
-			if (walker(((PartitionSelector *) node)->propagationExpression, context))
 				return true;
 			break;
 
-		case T_Repeat:
+		case T_PartitionSelector:
 			if (walk_plan_node_fields((Plan *) node, walker, context))
 				return true;
 			break;
@@ -238,14 +231,31 @@ plan_tree_walker(Node *node,
 			return walk_scan_node_fields((Scan *) node, walker, context);
 
 		case T_SeqScan:
-		case T_ExternalScan:
-		case T_DynamicTableScan:
+		case T_SampleScan:
 		case T_BitmapHeapScan:
-		case T_BitmapAppendOnlyScan:
-		case T_BitmapTableScan:
 		case T_WorkTableScan:
+		case T_NamedTuplestoreScan:
+			if (walk_scan_node_fields((Scan *) node, walker, context))
+				return true;
+			break;
+
 		case T_ForeignScan:
 			if (walk_scan_node_fields((Scan *) node, walker, context))
+				return true;
+			if (walker(((ForeignScan *) node)->fdw_exprs, context))
+				return true;
+			break;
+
+		case T_CustomScan:
+			if (walk_scan_node_fields((Scan *) node, walker, context))
+				return true;
+			if (walker(((CustomScan *) node)->custom_plans, context))
+				return true;
+			if (walker(((CustomScan *) node)->custom_exprs, context))
+				return true;
+			if (walker(((CustomScan *) node)->custom_private, context))
+				return true;
+			if (walker(((CustomScan *) node)->custom_scan_tlist, context))
 				return true;
 			break;
 
@@ -256,6 +266,13 @@ plan_tree_walker(Node *node,
 				return true;
 			break;
 
+		case T_TableFuncScan:
+			if (walker((Node *) ((TableFuncScan *) node)->tablefunc, context))
+				return true;
+			if (walk_scan_node_fields((Scan *) node, walker, context))
+				return true;
+			break;
+			
 		case T_TableFunctionScan:
 			if (walker((Node *) ((TableFunctionScan *) node)->function, context))
 				return true;
@@ -266,12 +283,13 @@ plan_tree_walker(Node *node,
 		case T_FunctionScan:
 			if (walker((Node *) ((FunctionScan *) node)->functions, context))
 				return true;
+			if (walker((Node *) ((FunctionScan *) node)->param, context))
+				return true;
 			if (walk_scan_node_fields((Scan *) node, walker, context))
 				return true;
 			break;
 
 		case T_IndexScan:
-		case T_DynamicIndexScan:
 			if (walk_scan_node_fields((Scan *) node, walker, context))
 				return true;
 			if (walker((Node *) ((IndexScan *) node)->indexqual, context))
@@ -287,11 +305,11 @@ plan_tree_walker(Node *node,
 			break;
 
 		case T_BitmapIndexScan:
-		case T_DynamicBitmapIndexScan:
 			if (walk_scan_node_fields((Scan *) node, walker, context))
 				return true;
 			if (walker((Node *) ((BitmapIndexScan *) node)->indexqual, context))
 				return true;
+
 			/* Other fields are lists of basic items, nothing to walk. */
 			break;
 
@@ -351,6 +369,20 @@ plan_tree_walker(Node *node,
 			/* Other fields are simple items and lists of simple items. */
 			break;
 
+		case T_TupleSplit:
+			if (walk_plan_node_fields((Plan *) node, walker, context))
+				return true;
+			if (expression_tree_walker((Node *)((TupleSplit *)node)->dqa_expr_lst, walker, context))
+				return true;
+			/* Other fields are simple items and lists of simple items. */
+			break;
+
+		case T_DQAExpr:
+			if (walker(((DQAExpr *)node)->agg_filter, context))
+				return true;
+			/* Other fields are simple items and lists of simple items. */
+			break;
+
 		case T_WindowAgg:
 			if (walk_plan_node_fields((Plan *) node, walker, context))
 				return true;
@@ -364,6 +396,12 @@ plan_tree_walker(Node *node,
 			if (walk_plan_node_fields((Plan *) node, walker, context))
 				return true;
 			/* Other fields are simple items and lists of simple items. */
+			break;
+
+		case T_Gather:
+			if (walk_plan_node_fields((Plan *) node, walker, context))
+				return true;
+			/* Other fields are simple items. */
 			break;
 
 		case T_Hash:
@@ -398,10 +436,7 @@ plan_tree_walker(Node *node,
 			if (walk_plan_node_fields((Plan *) node, walker, context))
 				return true;
 
-			if (walker((Node *) ((Motion *)node)->hashExpr, context))
-				return true;
-
-			if (walker((Node *) ((Motion *)node)->hashDataTypes, context))
+			if (walker((Node *) ((Motion *)node)->hashExprs, context))
 				return true;
 
 			break;
@@ -441,8 +476,8 @@ plan_tree_walker(Node *node,
 										   walker, context))
 					return true;
 
-				/* recur into the subplan's plan, a kind of Plan node */
-				if (walker((Node *) subplan_plan, context))
+				/* recurse into the subplan's plan, a kind of Plan node */
+				if (recurse_into_subplans && walker((Node *) subplan_plan, context))
 					return true;
 
 				/* also examine args list */
@@ -468,6 +503,13 @@ plan_tree_walker(Node *node,
 				return true;
 			if (walker((Node *) ((ModifyTable *) node)->withCheckOptionLists, context))
 				return true;
+			if (walker((Node *) ((ModifyTable *) node)->onConflictSet, context))
+				return true;
+			if (walker((Node *) ((ModifyTable *) node)->onConflictWhere, context))
+				return true;
+			if (walker((Node *) ((ModifyTable *) node)->returningLists, context))
+				return true;
+
 			break;
 
 		case T_LockRows:
@@ -475,10 +517,7 @@ plan_tree_walker(Node *node,
 				return true;
 			break;
 
-		case T_DML:
 		case T_SplitUpdate:
-		case T_Reshuffle:
-		case T_RowTrigger:
 		case T_AssertOp:
 			if (walk_plan_node_fields((Plan *) node, walker, context))
 				return true;
@@ -510,7 +549,7 @@ plan_tree_walker(Node *node,
 		case T_CurrentOfExpr:
 		case T_RangeTblRef:
 		case T_Aggref:
-		case T_ArrayRef:
+		case T_SubscriptingRef:
 		case T_FuncExpr:
 		case T_OpExpr:
 		case T_DistinctExpr:
@@ -535,13 +574,6 @@ plan_tree_walker(Node *node,
 		case T_SetOperationStmt:
 		case T_SpecialJoinInfo:
 		case T_TableValueExpr:
-		case T_PartSelectedExpr:
-		case T_PartDefaultExpr:
-		case T_PartBoundExpr:
-		case T_PartBoundInclusionExpr:
-		case T_PartBoundOpenExpr:
-		case T_PartListRuleExpr:
-		case T_PartListNullTestExpr:
 
 		default:
 			return expression_tree_walker(node, walker, context);
@@ -566,7 +598,7 @@ Plan *plan_tree_base_subplan_get_plan(plan_tree_base_prefix *base, SubPlan *subp
 		rootdata.glob = (PlannerGlobal*)base->node;
 		return planner_subplan_get_plan(&rootdata, subplan);
 	}
-	Insist(false);
+	Assert(false);
 	return NULL;
 }
 
@@ -648,27 +680,24 @@ extract_nodes_walker(Node *node, extract_context *context)
 		SubPlan	   *subplan = (SubPlan *) node;
 
 		/*
-		 * SubPlan has both of expressions and subquery.
-		 * In case the caller wants non-subquery version,
-		 * still we need to walk through its expressions.
+		 * SubPlan has both of expressions and subquery.  In case the caller wants
+		 * non-subquery version, still we need to walk through its expressions.
+		 * NB: Since we're not going to descend into SUBPLANs anyway (see below),
+		 * look at the SUBPLAN node here, even if descendIntoSubqueries is false
+		 * lest we miss some nodes there.
 		 */
-		if (!context->descendIntoSubqueries)
-		{
-			if (extract_nodes_walker((Node *) subplan->testexpr,
-									 context))
-				return true;
-			if (expression_tree_walker((Node *) subplan->args,
-									   extract_nodes_walker, context))
-				return true;
+		if (extract_nodes_walker((Node *) subplan->testexpr,
+								 context))
+			return true;
+		if (expression_tree_walker((Node *) subplan->args,
+								   extract_nodes_walker, context))
+			return true;
 
-			/* Do not descend into subplans */
-			return false;
-		}
 		/*
-		 * Although the flag indicates the caller wants to
-		 * descend into subqueries, SubPlan seems special;
-		 * Some partitioning code assumes this should return
-		 * immediately without descending.  See MPP-17168.
+		 * Do not descend into subplans.
+		 * Even if descendIntoSubqueries indicates the caller wants to descend into
+		 * subqueries, SubPlan seems special; Some partitioning code assumes this
+		 * should return immediately without descending.  See MPP-17168.
 		 */
 		return false;
 	}
@@ -686,7 +715,8 @@ extract_nodes_walker(Node *node, extract_context *context)
 	}
 
 	return plan_tree_walker(node, extract_nodes_walker,
-								  (void *) context);
+							(void *) context,
+							true);
 }
 
 /**
@@ -838,7 +868,7 @@ check_collation_in_list(List *colllist, check_collation_context *context)
 static bool
 check_collation_walker(Node *node, check_collation_context *context)
 {
-	Oid collation, inputCollation;
+	Oid collation, inputCollation, type;
 
 	if (NULL == node)
 	{
@@ -854,6 +884,18 @@ check_collation_walker(Node *node, check_collation_context *context)
 	switch (nodeTag(node))
 	{
 		case T_Var:
+			type = (castNode(Var, node))->vartype;
+			collation = exprCollation(node);
+			if (type == NAMEOID)
+			{
+				if (collation != C_COLLATION_OID)
+					context->foundNonDefaultCollation = 1;
+			}
+			else if (InvalidOid != collation && DEFAULT_COLLATION_OID != collation)
+			{
+				context->foundNonDefaultCollation = 1;
+			}
+			break;
 		case T_Const:
 		case T_OpExpr:
 		case T_ScalarArrayOpExpr:
@@ -875,12 +917,11 @@ check_collation_walker(Node *node, check_collation_context *context)
 		case T_ArrayCoerceExpr:
 		case T_SubLink:
 		case T_ArrayExpr:
-		case T_ArrayRef:
+		case T_SubscriptingRef:
 		case T_RowExpr:
 		case T_RowCompareExpr:
 		case T_FieldSelect:
 		case T_FieldStore:
-		case T_GroupId:
 		case T_CoerceToDomainValue:
 		case T_CurrentOfExpr:
 		case T_NamedArgExpr:
@@ -894,9 +935,7 @@ check_collation_walker(Node *node, check_collation_context *context)
 		case T_SubPlan:
 		case T_AlternativeSubPlan:
 		case T_GroupingFunc:
-		case T_Grouping:
 		case T_DMLActionExpr:
-		case T_PartBoundExpr:
 			collation = exprCollation(node);
 			inputCollation = exprInputCollation(node);
 			if ((InvalidOid != collation && DEFAULT_COLLATION_OID != collation) ||
@@ -909,22 +948,8 @@ check_collation_walker(Node *node, check_collation_context *context)
 			/* unsupported */
 			context->foundNonDefaultCollation = 1;
 			break;
-		case T_ColumnDef:
-			collation = ((ColumnDef *) node)->collOid;
-			if (InvalidOid != collation && DEFAULT_COLLATION_OID != collation)
-			{
-				context->foundNonDefaultCollation = 1;
-			}
-			break;
-		case T_IndexElem:
-			if (NIL != ((IndexElem *) node)->collation)
-			{
-				context->foundNonDefaultCollation = 1;
-			}
-			break;
 		case T_RangeTblEntry:
-			check_collation_in_list(((RangeTblEntry *) node)->values_collations, context);
-			check_collation_in_list(((RangeTblEntry *) node)->ctecolcollations, context);
+			check_collation_in_list(((RangeTblEntry *) node)->colcollations, context);
 			break;
 		case T_RangeTblFunction:
 			check_collation_in_list(((RangeTblFunction *) node)->funccolcollations, context);

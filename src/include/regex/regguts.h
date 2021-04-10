@@ -78,9 +78,6 @@
 #endif
 
 /* want size of a char in bits, and max value in bounded quantifiers */
-#ifndef CHAR_BIT
-#include <limits.h>
-#endif
 #ifndef _POSIX2_RE_DUP_MAX
 #define _POSIX2_RE_DUP_MAX	255 /* normally from <limits.h> */
 #endif
@@ -92,13 +89,19 @@
  */
 
 #define NOTREACHED	0
-#define xxx		1
 
 #define DUPMAX	_POSIX2_RE_DUP_MAX
-#define INFINITY	(DUPMAX+1)
+#define DUPINF	(DUPMAX+1)
 
 #define REMAGIC 0xfed7			/* magic number for main struct */
 
+/* Type codes for lookaround constraints */
+#define LATYPE_AHEAD_POS	03	/* positive lookahead */
+#define LATYPE_AHEAD_NEG	02	/* negative lookahead */
+#define LATYPE_BEHIND_POS	01	/* positive lookbehind */
+#define LATYPE_BEHIND_NEG	00	/* negative lookbehind */
+#define LATYPE_IS_POS(la)	((la) & 01)
+#define LATYPE_IS_AHEAD(la) ((la) & 02)
 
 
 /*
@@ -124,63 +127,17 @@
 #define ISBSET(uv, sn)	((uv)[(sn)/UBITS] & ((unsigned)1 << ((sn)%UBITS)))
 
 
-
-/*
- * We dissect a chr into byts for colormap table indexing.  Here we define
- * a byt, which will be the same as a byte on most machines...  The exact
- * size of a byt is not critical, but about 8 bits is good, and extraction
- * of 8-bit chunks is sometimes especially fast.
- */
-#ifndef BYTBITS
-#define BYTBITS 8				/* bits in a byt */
-#endif
-#define BYTTAB	(1<<BYTBITS)	/* size of table with one entry per byt value */
-#define BYTMASK (BYTTAB-1)		/* bit mask for byt */
-#define NBYTS	((CHRBITS+BYTBITS-1)/BYTBITS)
-/* the definition of GETCOLOR(), below, assumes NBYTS <= 4 */
-
-
-
 /*
  * As soon as possible, we map chrs into equivalence classes -- "colors" --
  * which are of much more manageable number.
  */
 typedef short color;			/* colors of characters */
-typedef int pcolor;				/* what color promotes to */
 
 #define MAX_COLOR	32767		/* max color (must fit in 'color' datatype) */
 #define COLORLESS	(-1)		/* impossible color */
 #define WHITE		0			/* default color, parent of all others */
+/* Note: various places in the code know that WHITE is zero */
 
-
-
-/*
- * A colormap is a tree -- more precisely, a DAG -- indexed at each level
- * by a byt of the chr, to map the chr to a color efficiently.  Because
- * lower sections of the tree can be shared, it can exploit the usual
- * sparseness of such a mapping table.  The tree is always NBYTS levels
- * deep (in the past it was shallower during construction but was "filled"
- * to full depth at the end of that); areas that are unaltered as yet point
- * to "fill blocks" which are entirely WHITE in color.
- */
-
-/* the tree itself */
-struct colors
-{
-	color		ccolor[BYTTAB];
-};
-struct ptrs
-{
-	union tree *pptr[BYTTAB];
-};
-union tree
-{
-	struct colors colors;
-	struct ptrs ptrs;
-};
-
-#define tcolor	colors.ccolor
-#define tptr	ptrs.pptr
 
 /*
  * Per-color data structure for the compile-time color machinery
@@ -196,26 +153,56 @@ union tree
  */
 struct colordesc
 {
-	uchr		nchrs;			/* number of chars of this color */
+	int			nschrs;			/* number of simple chars of this color */
+	int			nuchrs;			/* number of upper map entries of this color */
 	color		sub;			/* open subcolor, if any; or free-chain ptr */
 #define  NOSUB	 COLORLESS		/* value of "sub" when no open subcolor */
 	struct arc *arcs;			/* chain of all arcs of this color */
-	chr			firstchr;		/* char first assigned to this color */
+	chr			firstchr;		/* simple char first assigned to this color */
 	int			flags;			/* bit values defined next */
 #define  FREECOL 01				/* currently free */
 #define  PSEUDO  02				/* pseudocolor, no real chars */
 #define  UNUSEDCOLOR(cd) ((cd)->flags & FREECOL)
-	union tree *block;			/* block of solid color, if any */
 };
 
 /*
  * The color map itself
  *
- * Much of the data in the colormap struct is only used at compile time.
- * However, the bulk of the space usage is in the "tree" structure, so it's
- * not clear that there's much point in converting the rest to a more compact
- * form when compilation is finished.
+ * This struct holds both data used only at compile time, and the chr to
+ * color mapping information, used at both compile and run time.  The latter
+ * is the bulk of the space, so it's not really worth separating out the
+ * compile-only portion.
+ *
+ * Ideally, the mapping data would just be an array of colors indexed by
+ * chr codes; but for large character sets that's impractical.  Fortunately,
+ * common characters have smaller codes, so we can use a simple array for chr
+ * codes up to MAX_SIMPLE_CHR, and do something more complex for codes above
+ * that, without much loss of performance.  The "something more complex" is a
+ * 2-D array of color entries, where row indexes correspond to individual chrs
+ * or chr ranges that have been mentioned in the regex (with row zero
+ * representing all other chrs), and column indexes correspond to different
+ * sets of locale-dependent character classes such as "isalpha".  The
+ * classbits[k] entry is zero if we do not care about the k'th character class
+ * in this regex, and otherwise it is the bit to be OR'd into the column index
+ * if the character in question is a member of that class.  We find the color
+ * of a high-valued chr by identifying which colormaprange it is in to get
+ * the row index (use row zero if it's in none of them), identifying which of
+ * the interesting cclasses it's in to get the column index, and then indexing
+ * into the 2-D hicolormap array.
+ *
+ * The colormapranges are required to be nonempty, nonoverlapping, and to
+ * appear in increasing chr-value order.
  */
+
+#define NUM_CCLASSES 13			/* must match data in regc_locale.c */
+
+typedef struct colormaprange
+{
+	chr			cmin;			/* range represents cmin..cmax inclusive */
+	chr			cmax;
+	int			rownum;			/* row index in hicolormap array (>= 1) */
+} colormaprange;
+
 struct colormap
 {
 	int			magic;
@@ -226,27 +213,27 @@ struct colormap
 	color		free;			/* beginning of free chain (if non-0) */
 	struct colordesc *cd;		/* pointer to array of colordescs */
 #define  CDEND(cm)	 (&(cm)->cd[(cm)->max + 1])
+
+	/* mapping data for chrs <= MAX_SIMPLE_CHR: */
+	color	   *locolormap;		/* simple array indexed by chr code */
+
+	/* mapping data for chrs > MAX_SIMPLE_CHR: */
+	int			classbits[NUM_CCLASSES];	/* see comment above */
+	int			numcmranges;	/* number of colormapranges */
+	colormaprange *cmranges;	/* ranges of high chrs */
+	color	   *hicolormap;		/* 2-D array of color entries */
+	int			maxarrayrows;	/* number of array rows allocated */
+	int			hiarrayrows;	/* number of array rows in use */
+	int			hiarraycols;	/* number of array columns (2^N) */
+
 	/* If we need up to NINLINECDS, we store them here to save a malloc */
-#define  NINLINECDS  ((size_t)10)
+#define  NINLINECDS  ((size_t) 10)
 	struct colordesc cdspace[NINLINECDS];
-	union tree	tree[NBYTS];	/* tree top, plus lower-level fill blocks */
 };
 
-/* optimization magic to do fast chr->color mapping */
-#define B0(c)	((c) & BYTMASK)
-#define B1(c)	(((c)>>BYTBITS) & BYTMASK)
-#define B2(c)	(((c)>>(2*BYTBITS)) & BYTMASK)
-#define B3(c)	(((c)>>(3*BYTBITS)) & BYTMASK)
-#if NBYTS == 1
-#define GETCOLOR(cm, c) ((cm)->tree->tcolor[B0(c)])
-#endif
-/* beware, for NBYTS>1, GETCOLOR() is unsafe -- 2nd arg used repeatedly */
-#if NBYTS == 2
-#define GETCOLOR(cm, c) ((cm)->tree->tptr[B1(c)]->tcolor[B0(c)])
-#endif
-#if NBYTS == 4
-#define GETCOLOR(cm, c) ((cm)->tree->tptr[B3(c)]->tptr[B2(c)]->tptr[B1(c)]->tcolor[B0(c)])
-#endif
+/* fetch color for chr; beware of multiple evaluation of c argument */
+#define GETCOLOR(cm, c) \
+	((c) <= MAX_SIMPLE_CHR ? (cm)->locolormap[(c) - CHR_MIN] : pg_reg_getcolor(cm, c))
 
 
 /*
@@ -256,6 +243,11 @@ struct colormap
 /*
  * Representation of a set of characters.  chrs[] represents individual
  * code points, ranges[] represents ranges in the form min..max inclusive.
+ *
+ * If the cvec represents a locale-specific character class, eg [[:alpha:]],
+ * then the chrs[] and ranges[] arrays contain only members of that class
+ * up to MAX_SIMPLE_CHR (inclusive).  cclasscode is set to regc_locale.c's
+ * code for the class, rather than being -1 as it is in an ordinary cvec.
  *
  * Note that in cvecs gotten from newcvec() and intended to be freed by
  * freecvec(), both arrays of chrs are after the end of the struct, not
@@ -269,6 +261,7 @@ struct cvec
 	int			nranges;		/* number of ranges (chr pairs) */
 	int			rangespace;		/* number of ranges allocated in ranges[] */
 	chr		   *ranges;			/* pointer to vector of chr pairs */
+	int			cclasscode;		/* value of "enum classes", or -1 */
 };
 
 
@@ -287,8 +280,10 @@ struct arc
 	struct state *from;			/* where it's from (and contained within) */
 	struct state *to;			/* where it's to */
 	struct arc *outchain;		/* link in *from's outs chain or free chain */
-#define  freechain	 outchain
+	struct arc *outchainRev;	/* back-link in *from's outs chain */
+#define  freechain	outchain	/* we do not maintain "freechainRev" */
 	struct arc *inchain;		/* link in *to's ins chain */
+	struct arc *inchainRev;		/* back-link in *to's ins chain */
 	struct arc *colorchain;		/* link in color's arc chain */
 	struct arc *colorchainRev;	/* back-link in color's arc chain */
 };
@@ -330,9 +325,6 @@ struct nfa
 	struct colormap *cm;		/* the color map */
 	color		bos[2];			/* colors, if any, assigned to BOS and BOL */
 	color		eos[2];			/* colors, if any, assigned to EOS and EOL */
-	size_t		size;			/* Current NFA size; differs from nstates as
-								 * it also counts the number of states in
-								 * children of this NFA. */
 	struct vars *v;				/* simplifies compile error reporting */
 	struct nfa *parent;			/* parent NFA, if any */
 };
@@ -350,7 +342,7 @@ struct nfa
  *
  * The non-dummy carc structs are of two types: plain arcs and LACON arcs.
  * Plain arcs just store the transition color number as "co".  LACON arcs
- * store the lookahead constraint number plus cnfa.ncolors as "co".  LACON
+ * store the lookaround constraint number plus cnfa.ncolors as "co".  LACON
  * arcs can be distinguished from plain by testing for co >= cnfa.ncolors.
  */
 struct carc
@@ -364,7 +356,7 @@ struct cnfa
 	int			nstates;		/* number of states */
 	int			ncolors;		/* number of colors (max color in use + 1) */
 	int			flags;
-#define  HASLACONS	01			/* uses lookahead constraints */
+#define  HASLACONS	01			/* uses lookaround constraints */
 	int			pre;			/* setup state number */
 	int			post;			/* teardown state number */
 	color		bos[2];			/* colors, if any, assigned to BOS and BOL */
@@ -380,10 +372,16 @@ struct cnfa
 #define NULLCNFA(cnfa)	((cnfa).nstates == 0)
 
 /*
- * Used to limit the maximum NFA size to something sane. [Tcl Bug 1810264]
+ * This symbol limits the transient heap space used by the regex compiler,
+ * and thereby also the maximum complexity of NFAs that we'll deal with.
+ * Currently we only count NFA states and arcs against this; the other
+ * transient data is generally not large enough to notice compared to those.
+ * Note that we do not charge anything for the final output data structures
+ * (the compacted NFA and the colormap).
  */
-#ifndef REG_MAX_STATES
-#define REG_MAX_STATES	100000
+#ifndef REG_MAX_COMPILE_SPACE
+#define REG_MAX_COMPILE_SPACE  \
+	(100000 * sizeof(struct state) + 100000 * sizeof(struct arcbatch))
 #endif
 
 /*
@@ -414,19 +412,20 @@ struct subre
 #define  LONGER  01				/* prefers longer match */
 #define  SHORTER 02				/* prefers shorter match */
 #define  MIXED	 04				/* mixed preference below */
-#define  CAP 010				/* capturing parens below */
+#define  CAP	 010			/* capturing parens below */
 #define  BACKR	 020			/* back reference below */
 #define  INUSE	 0100			/* in use in final tree */
-#define  LOCAL	 03				/* bits which may not propagate up */
+#define  NOPROP  03				/* bits which may not propagate up */
 #define  LMIX(f) ((f)<<2)		/* LONGER -> MIXED */
 #define  SMIX(f) ((f)<<1)		/* SHORTER -> MIXED */
-#define  UP(f)	 (((f)&~LOCAL) | (LMIX(f) & SMIX(f) & MIXED))
+#define  UP(f)	 (((f)&~NOPROP) | (LMIX(f) & SMIX(f) & MIXED))
 #define  MESSY(f)	 ((f)&(MIXED|CAP|BACKR))
-#define  PREF(f) ((f)&LOCAL)
+#define  PREF(f) ((f)&NOPROP)
 #define  PREF2(f1, f2)	 ((PREF(f1) != 0) ? PREF(f1) : PREF(f2))
 #define  COMBINE(f1, f2) (UP((f1)|(f2)) | PREF2(f1, f2))
 	short		id;				/* ID of subre (1..ntree-1) */
-	int			subno;			/* subexpression number (for 'b' and '(') */
+	int			subno;			/* subexpression number for 'b' and '(', or
+								 * LATYPE code for lookaround constraint */
 	short		min;			/* min repetitions for iteration or backref */
 	short		max;			/* max repetitions for iteration or backref */
 	struct subre *left;			/* left child, if any (also freelist chain) */
@@ -447,10 +446,14 @@ struct fns
 {
 	void		FUNCPTR(free, (regex_t *));
 	int			FUNCPTR(cancel_requested, (void));
+	int			FUNCPTR(stack_too_deep, (void));
 };
 
 #define CANCEL_REQUESTED(re)  \
 	((*((struct fns *) (re)->re_fns)->cancel_requested) ())
+
+#define STACK_TOO_DEEP(re)	\
+	((*((struct fns *) (re)->re_fns)->stack_too_deep) ())
 
 
 /*
@@ -465,9 +468,15 @@ struct guts
 	size_t		nsub;			/* copy of re_nsub */
 	struct subre *tree;
 	struct cnfa search;			/* for fast preliminary search */
-	int			ntree;			/* number of subre's, less one */
+	int			ntree;			/* number of subre's, plus one */
 	struct colormap cmap;
 	int			FUNCPTR(compare, (const chr *, const chr *, size_t));
-	struct subre *lacons;		/* lookahead-constraint vector */
-	int			nlacons;		/* size of lacons */
+	struct subre *lacons;		/* lookaround-constraint vector */
+	int			nlacons;		/* size of lacons[]; note that only slots
+								 * numbered 1 .. nlacons-1 are used */
 };
+
+
+/* prototypes for functions that are exported from regcomp.c to regexec.c */
+extern void pg_set_regex_collation(Oid collation);
+extern color pg_reg_getcolor(struct colormap *cm, chr c);

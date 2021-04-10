@@ -4,7 +4,7 @@
  *	  Functions to support administrative tasks with GPDB segments.
  *
  * Portions Copyright (c) 2010 Greenplum
- * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
  *
  *
  * IDENTIFICATION
@@ -13,12 +13,14 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
-#include "miscadmin.h"
 
 #include "libpq-fe.h"
+#include "miscadmin.h"
 #include "pqexpbuffer.h"
 
-#include "catalog/gp_segment_config.h"
+#include "access/genam.h"
+#include "access/table.h"
+#include "catalog/gp_segment_configuration.h"
 #include "catalog/pg_proc.h"
 #include "catalog/indexing.h"
 #include "cdb/cdbdisp_query.h"
@@ -28,6 +30,7 @@
 #include "postmaster/startup.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
+#include "utils/rel.h"
 
 #define MASTER_ONLY 0x1
 #define UTILITY_MODE 0x2
@@ -37,22 +40,11 @@
 #define STANDBY_ONLY 0x20
 #define SINGLE_USER_MODE 0x40
 
-/* Encapsulation of information about a given segment. */
-typedef struct seginfo
-{
-	CdbComponentDatabaseInfo db;
-} seginfo;
-
 /* look up a particular segment */
-static seginfo *
-get_seginfo(int16 dbid)
+static GpSegConfigEntry *
+get_segconfig(int16 dbid)
 {
-	seginfo    *i = palloc(sizeof(seginfo));
-	CdbComponentDatabaseInfo *c = dbid_get_dbinfo(dbid);
-
-	memcpy(&(i->db), c, sizeof(CdbComponentDatabaseInfo));
-
-	return i;
+	return dbid_get_dbinfo(dbid);
 }
 
 /* Convenience routine to look up the mirror for a given segment index */
@@ -99,7 +91,7 @@ standby_exists()
 static int16
 get_maxdbid()
 {
-	Relation	rel = heap_open(GpSegmentConfigRelationId, AccessExclusiveLock);
+	Relation	rel = table_open(GpSegmentConfigRelationId, AccessExclusiveLock);
 	int16		dbid = 0;
 	HeapTuple	tuple;
 	SysScanDesc sscan;
@@ -111,7 +103,7 @@ get_maxdbid()
 				   ((Form_gp_segment_configuration) GETSTRUCT(tuple))->dbid);
 	}
 	systable_endscan(sscan);
-	heap_close(rel, NoLock);
+	table_close(rel, NoLock);
 
 	return dbid;
 }
@@ -252,47 +244,46 @@ mirroring_sanity_check(int flags, const char *func)
  * Add a new row to gp_segment_configuration.
  */
 static void
-add_segment_config(seginfo *i)
+add_segment_config(GpSegConfigEntry *i)
 {
-	Relation	rel = heap_open(GpSegmentConfigRelationId, AccessExclusiveLock);
+	Relation	rel = table_open(GpSegmentConfigRelationId, AccessExclusiveLock);
 	Datum		values[Natts_gp_segment_configuration];
 	bool		nulls[Natts_gp_segment_configuration];
 	HeapTuple	tuple;
 
 	MemSet(nulls, false, sizeof(nulls));
 
-	values[Anum_gp_segment_configuration_dbid - 1] = Int16GetDatum(i->db.dbid);
-	values[Anum_gp_segment_configuration_content - 1] = Int16GetDatum(i->db.segindex);
-	values[Anum_gp_segment_configuration_role - 1] = CharGetDatum(i->db.role);
+	values[Anum_gp_segment_configuration_dbid - 1] = Int16GetDatum(i->dbid);
+	values[Anum_gp_segment_configuration_content - 1] = Int16GetDatum(i->segindex);
+	values[Anum_gp_segment_configuration_role - 1] = CharGetDatum(i->role);
 	values[Anum_gp_segment_configuration_preferred_role - 1] =
-		CharGetDatum(i->db.preferred_role);
+		CharGetDatum(i->preferred_role);
 	values[Anum_gp_segment_configuration_mode - 1] =
-		CharGetDatum(i->db.mode);
+		CharGetDatum(i->mode);
 	values[Anum_gp_segment_configuration_status - 1] =
-		CharGetDatum(i->db.status);
+		CharGetDatum(i->status);
 	values[Anum_gp_segment_configuration_port - 1] =
-		Int32GetDatum(i->db.port);
+		Int32GetDatum(i->port);
 	values[Anum_gp_segment_configuration_hostname - 1] =
-		CStringGetTextDatum(i->db.hostname);
+		CStringGetTextDatum(i->hostname);
 	values[Anum_gp_segment_configuration_address - 1] =
-		CStringGetTextDatum(i->db.address);
+		CStringGetTextDatum(i->address);
 	values[Anum_gp_segment_configuration_datadir - 1] =
-		CStringGetTextDatum(i->db.datadir);
+		CStringGetTextDatum(i->datadir);
 
 	tuple = heap_form_tuple(RelationGetDescr(rel), values, nulls);
 
 	/* insert a new tuple */
-	simple_heap_insert(rel, tuple);
-	CatalogUpdateIndexes(rel, tuple);
+	CatalogTupleInsert(rel, tuple);
 
-	heap_close(rel, NoLock);
+	table_close(rel, NoLock);
 }
 
 /*
  * Master function for adding a new segment
  */
 static void
-add_segment_config_entry(int16 pridbid, seginfo *i)
+add_segment_config_entry(GpSegConfigEntry *i)
 {
 	/* Add gp_segment_configuration entry */
 	add_segment_config(i);
@@ -310,7 +301,7 @@ remove_segment_config(int16 dbid)
 	HeapTuple	tuple;
 	Relation	rel;
 
-	rel = heap_open(GpSegmentConfigRelationId, RowExclusiveLock);
+	rel = table_open(GpSegmentConfigRelationId, RowExclusiveLock);
 
 	ScanKeyInit(&scankey,
 				Anum_gp_segment_configuration_dbid,
@@ -321,33 +312,33 @@ remove_segment_config(int16 dbid)
 							   NULL, 1, &scankey);
 	while ((tuple = systable_getnext(sscan)) != NULL)
 	{
-		simple_heap_delete(rel, &tuple->t_self);
+		CatalogTupleDelete(rel, &tuple->t_self);
 		numDel++;
 	}
 	systable_endscan(sscan);
 
 	Assert(numDel > 0);
 
-	heap_close(rel, NoLock);
+	table_close(rel, NoLock);
 }
 
 static void
-add_segment(seginfo new_segment_information)
+add_segment(GpSegConfigEntry *new_segment_information)
 {
-	int16		primary_dbid = new_segment_information.db.dbid;
+	int16		primary_dbid = new_segment_information->dbid;
 
-	if (new_segment_information.db.role == GP_SEGMENT_CONFIGURATION_ROLE_MIRROR)
+	if (new_segment_information->role == GP_SEGMENT_CONFIGURATION_ROLE_MIRROR)
 	{
-		primary_dbid = contentid_get_dbid(new_segment_information.db.segindex, GP_SEGMENT_CONFIGURATION_ROLE_PRIMARY, false	/* false == current, not
+		primary_dbid = contentid_get_dbid(new_segment_information->segindex, GP_SEGMENT_CONFIGURATION_ROLE_PRIMARY, false	/* false == current, not
 										    * preferred, role */ );
 		if (!primary_dbid)
 			elog(ERROR, "contentid %i does not point to an existing segment",
-				 new_segment_information.db.segindex);
+				 new_segment_information->segindex);
 
 		/*
 		 * no mirrors should be defined
 		 */
-		if (segment_has_mirror(new_segment_information.db.segindex))
+		if (segment_has_mirror(new_segment_information->segindex))
 			elog(ERROR, "segment already has a mirror defined");
 
 		/*
@@ -355,17 +346,16 @@ add_segment(seginfo new_segment_information)
 		 * or mirror (no preferred primary -- make this one the preferred
 		 * primary)
 		 */
-		int			preferredPrimaryDbId = contentid_get_dbid(new_segment_information.db.segindex, GP_SEGMENT_CONFIGURATION_ROLE_PRIMARY, true /* preferred role */ );
+		int			preferredPrimaryDbId = contentid_get_dbid(new_segment_information->segindex, GP_SEGMENT_CONFIGURATION_ROLE_PRIMARY, true /* preferred role */ );
 
-		if (preferredPrimaryDbId == 0 && new_segment_information.db.preferred_role == GP_SEGMENT_CONFIGURATION_ROLE_MIRROR)
+		if (preferredPrimaryDbId == 0 && new_segment_information->preferred_role == GP_SEGMENT_CONFIGURATION_ROLE_MIRROR)
 		{
 			elog(NOTICE, "override preferred_role of this mirror as primary to support rebalance operation.");
-			new_segment_information.db.preferred_role = GP_SEGMENT_CONFIGURATION_ROLE_PRIMARY;
+			new_segment_information->preferred_role = GP_SEGMENT_CONFIGURATION_ROLE_PRIMARY;
 		}
 	}
 
-	add_segment_config_entry(primary_dbid,
-							 &new_segment_information);
+	add_segment_config_entry(new_segment_information);
 }
 
 /*
@@ -384,38 +374,38 @@ add_segment(seginfo new_segment_information)
 Datum
 gp_add_segment_primary(PG_FUNCTION_ARGS)
 {
-	seginfo		new;
+	GpSegConfigEntry	new;
 
-	MemSet(&new, 0, sizeof(seginfo));
+	MemSet(&new, 0, sizeof(GpSegConfigEntry));
 
 	if (PG_ARGISNULL(0))
 		elog(ERROR, "hostname cannot be NULL");
-	new.db.hostname = TextDatumGetCString(PG_GETARG_DATUM(0));
+	new.hostname = TextDatumGetCString(PG_GETARG_DATUM(0));
 
 	if (PG_ARGISNULL(1))
 		elog(ERROR, "address cannot be NULL");
-	new.db.address = TextDatumGetCString(PG_GETARG_DATUM(1));
+	new.address = TextDatumGetCString(PG_GETARG_DATUM(1));
 
 	if (PG_ARGISNULL(2))
 		elog(ERROR, "port cannot be NULL");
-	new.db.port = PG_GETARG_INT32(2);
+	new.port = PG_GETARG_INT32(2);
 
 	if (PG_ARGISNULL(3))
 		elog(ERROR, "datadir cannot be NULL");
-	new.db.datadir = TextDatumGetCString(PG_GETARG_DATUM(3));
+	new.datadir = TextDatumGetCString(PG_GETARG_DATUM(3));
 
 	mirroring_sanity_check(MASTER_ONLY | SUPERUSER, "gp_add_segment_primary");
 
-	new.db.segindex = get_maxcontentid() + 1;
-	new.db.dbid = get_availableDbId();
-	new.db.role = GP_SEGMENT_CONFIGURATION_ROLE_PRIMARY;
-	new.db.preferred_role = GP_SEGMENT_CONFIGURATION_ROLE_PRIMARY;
-	new.db.mode = GP_SEGMENT_CONFIGURATION_MODE_NOTINSYNC;
-	new.db.status = GP_SEGMENT_CONFIGURATION_STATUS_UP;
+	new.segindex = get_maxcontentid() + 1;
+	new.dbid = get_availableDbId();
+	new.role = GP_SEGMENT_CONFIGURATION_ROLE_PRIMARY;
+	new.preferred_role = GP_SEGMENT_CONFIGURATION_ROLE_PRIMARY;
+	new.mode = GP_SEGMENT_CONFIGURATION_MODE_NOTINSYNC;
+	new.status = GP_SEGMENT_CONFIGURATION_STATUS_UP;
 
-	add_segment(new);
+	add_segment(&new);
 
-	PG_RETURN_INT16(new.db.dbid);
+	PG_RETURN_INT16(new.dbid);
 }
 
 /*
@@ -428,58 +418,58 @@ gp_add_segment_primary(PG_FUNCTION_ARGS)
 Datum
 gp_add_segment(PG_FUNCTION_ARGS)
 {
-	seginfo		new;
+	GpSegConfigEntry new;
 
-	MemSet(&new, 0, sizeof(seginfo));
+	MemSet(&new, 0, sizeof(GpSegConfigEntry));
 
 	if (PG_ARGISNULL(0))
 		elog(ERROR, "dbid cannot be NULL");
-	new.db.dbid = PG_GETARG_INT16(0);
+	new.dbid = PG_GETARG_INT16(0);
 
 	if (PG_ARGISNULL(1))
 		elog(ERROR, "content cannot be NULL");
-	new.db.segindex = PG_GETARG_INT16(1);
+	new.segindex = PG_GETARG_INT16(1);
 
 	if (PG_ARGISNULL(2))
 		elog(ERROR, "role cannot be NULL");
-	new.db.role = PG_GETARG_CHAR(2);
+	new.role = PG_GETARG_CHAR(2);
 
 	if (PG_ARGISNULL(3))
 		elog(ERROR, "preferred_role cannot be NULL");
-	new.db.preferred_role = PG_GETARG_CHAR(3);
+	new.preferred_role = PG_GETARG_CHAR(3);
 
 	if (PG_ARGISNULL(4))
 		elog(ERROR, "mode cannot be NULL");
-	new.db.mode = PG_GETARG_CHAR(4);
+	new.mode = PG_GETARG_CHAR(4);
 
 	if (PG_ARGISNULL(5))
 		elog(ERROR, "status cannot be NULL");
-	new.db.status = PG_GETARG_CHAR(5);
+	new.status = PG_GETARG_CHAR(5);
 
 	if (PG_ARGISNULL(6))
 		elog(ERROR, "port cannot be NULL");
-	new.db.port = PG_GETARG_INT32(6);
+	new.port = PG_GETARG_INT32(6);
 
 	if (PG_ARGISNULL(7))
 		elog(ERROR, "hostname cannot be NULL");
-	new.db.hostname = TextDatumGetCString(PG_GETARG_DATUM(7));
+	new.hostname = TextDatumGetCString(PG_GETARG_DATUM(7));
 
 	if (PG_ARGISNULL(8))
 		elog(ERROR, "address cannot be NULL");
-	new.db.address = TextDatumGetCString(PG_GETARG_DATUM(8));
+	new.address = TextDatumGetCString(PG_GETARG_DATUM(8));
 
 	if (PG_ARGISNULL(9))
 		elog(ERROR, "datadir cannot be NULL");
-	new.db.datadir = TextDatumGetCString(PG_GETARG_DATUM(9));
+	new.datadir = TextDatumGetCString(PG_GETARG_DATUM(9));
 
 	mirroring_sanity_check(MASTER_ONLY | SUPERUSER, "gp_add_segment");
 
-	new.db.mode = GP_SEGMENT_CONFIGURATION_MODE_NOTINSYNC;
+	new.mode = GP_SEGMENT_CONFIGURATION_MODE_NOTINSYNC;
 	elog(NOTICE, "mode is changed to GP_SEGMENT_CONFIGURATION_MODE_NOTINSYNC under walrep.");
 
-	add_segment(new);
+	add_segment(&new);
 
-	PG_RETURN_INT16(new.db.dbid);
+	PG_RETURN_INT16(new.dbid);
 }
 
 /*
@@ -488,10 +478,8 @@ gp_add_segment(PG_FUNCTION_ARGS)
 static void
 remove_segment(int16 pridbid, int16 mirdbid)
 {
-	seginfo    *i;
-
 	/* Check that we're removing a mirror, not a primary */
-	i = get_seginfo(mirdbid);
+	get_segconfig(mirdbid);
 
 	remove_segment_config(mirdbid);
 }
@@ -532,39 +520,39 @@ gp_remove_segment(PG_FUNCTION_ARGS)
 Datum
 gp_add_segment_mirror(PG_FUNCTION_ARGS)
 {
-	seginfo		new;
+	GpSegConfigEntry new;
 
 	if (PG_ARGISNULL(0))
 		elog(ERROR, "contentid cannot be NULL");
-	new.db.segindex = PG_GETARG_INT16(0);
+	new.segindex = PG_GETARG_INT16(0);
 
 	if (PG_ARGISNULL(1))
 		elog(ERROR, "hostname cannot be NULL");
-	new.db.hostname = TextDatumGetCString(PG_GETARG_DATUM(1));
+	new.hostname = TextDatumGetCString(PG_GETARG_DATUM(1));
 
 	if (PG_ARGISNULL(2))
 		elog(ERROR, "address cannot be NULL");
-	new.db.address = TextDatumGetCString(PG_GETARG_DATUM(2));
+	new.address = TextDatumGetCString(PG_GETARG_DATUM(2));
 
 	if (PG_ARGISNULL(3))
 		elog(ERROR, "port cannot be NULL");
-	new.db.port = PG_GETARG_INT32(3);
+	new.port = PG_GETARG_INT32(3);
 
 	if (PG_ARGISNULL(4))
 		elog(ERROR, "datadir cannot be NULL");
-	new.db.datadir = TextDatumGetCString(PG_GETARG_DATUM(4));
+	new.datadir = TextDatumGetCString(PG_GETARG_DATUM(4));
 	
 	mirroring_sanity_check(MASTER_ONLY | SUPERUSER, "gp_add_segment_mirror");
 
-	new.db.dbid = get_availableDbId();
-	new.db.mode = GP_SEGMENT_CONFIGURATION_MODE_NOTINSYNC;
-	new.db.status = GP_SEGMENT_CONFIGURATION_STATUS_DOWN;
-	new.db.role = GP_SEGMENT_CONFIGURATION_ROLE_MIRROR;
-	new.db.preferred_role = GP_SEGMENT_CONFIGURATION_ROLE_MIRROR;
+	new.dbid = get_availableDbId();
+	new.mode = GP_SEGMENT_CONFIGURATION_MODE_NOTINSYNC;
+	new.status = GP_SEGMENT_CONFIGURATION_STATUS_DOWN;
+	new.role = GP_SEGMENT_CONFIGURATION_ROLE_MIRROR;
+	new.preferred_role = GP_SEGMENT_CONFIGURATION_ROLE_MIRROR;
 
-	add_segment(new);
+	add_segment(&new);
 
-	PG_RETURN_INT16(new.db.dbid);
+	PG_RETURN_INT16(new.dbid);
 }
 
 /*
@@ -638,11 +626,10 @@ gp_add_master_standby_port(PG_FUNCTION_ARGS)
 Datum
 gp_add_master_standby(PG_FUNCTION_ARGS)
 {
-	seginfo    *i;
-	seginfo		new;
 	int			maxdbid;
 	int16		master_dbid;
 	Relation	gprel;
+	GpSegConfigEntry	*config;
 
 	if (PG_ARGISNULL(0))
 		elog(ERROR, "host name cannot be NULL");
@@ -671,30 +658,29 @@ gp_add_master_standby(PG_FUNCTION_ARGS)
 	 */
 	master_dbid = contentid_get_dbid(MASTER_CONTENT_ID,
 									 GP_SEGMENT_CONFIGURATION_ROLE_PRIMARY, false);
-	i = get_seginfo(master_dbid);
-	memcpy(&new, i, sizeof(seginfo));
+	config = get_segconfig(master_dbid);
 
-	new.db.dbid = maxdbid + 1;
-	new.db.role = GP_SEGMENT_CONFIGURATION_ROLE_MIRROR;
-	new.db.preferred_role = GP_SEGMENT_CONFIGURATION_ROLE_MIRROR;
-	new.db.mode = GP_SEGMENT_CONFIGURATION_MODE_INSYNC;
-	new.db.status = GP_SEGMENT_CONFIGURATION_STATUS_UP;
+	config->dbid = maxdbid + 1;
+	config->role = GP_SEGMENT_CONFIGURATION_ROLE_MIRROR;
+	config->preferred_role = GP_SEGMENT_CONFIGURATION_ROLE_MIRROR;
+	config->mode = GP_SEGMENT_CONFIGURATION_MODE_INSYNC;
+	config->status = GP_SEGMENT_CONFIGURATION_STATUS_UP;
 
-	new.db.hostname = TextDatumGetCString(PG_GETARG_TEXT_P(0));
+	config->hostname = TextDatumGetCString(PG_GETARG_TEXT_P(0));
 
-	new.db.address = TextDatumGetCString(PG_GETARG_TEXT_P(1));
+	config->address = TextDatumGetCString(PG_GETARG_TEXT_P(1));
 
-	new.db.datadir = TextDatumGetCString(PG_GETARG_TEXT_P(2));
+	config->datadir = TextDatumGetCString(PG_GETARG_TEXT_P(2));
 	
 	/* Use the new port number if specified */
 	if (PG_NARGS() > 3 && !PG_ARGISNULL(3))
-		new.db.port = PG_GETARG_INT32(3);
+		config->port = PG_GETARG_INT32(3);
 
-	add_segment_config_entry(GpIdentity.dbid, &new);
+	add_segment_config_entry(config);
 	
 	heap_close(gprel, NoLock);
 
-	PG_RETURN_INT16(new.db.dbid);
+	PG_RETURN_INT16(config->dbid);
 }
 
 /*
@@ -722,10 +708,10 @@ gp_remove_master_standby(PG_FUNCTION_ARGS)
 }
 
 static void
-segment_config_activate_standby(int16 standbydbid, int16 newdbid)
+segment_config_activate_standby(int16 standby_dbid, int16 master_dbid)
 {
 	/* we use AccessExclusiveLock to prevent races */
-	Relation	rel = heap_open(GpSegmentConfigRelationId, AccessExclusiveLock);
+	Relation	rel = table_open(GpSegmentConfigRelationId, AccessExclusiveLock);
 	HeapTuple	tuple;
 	ScanKeyData scankey;
 	SysScanDesc sscan;
@@ -735,68 +721,55 @@ segment_config_activate_standby(int16 standbydbid, int16 newdbid)
 	ScanKeyInit(&scankey,
 				Anum_gp_segment_configuration_dbid,
 				BTEqualStrategyNumber, F_INT2EQ,
-				Int16GetDatum(newdbid));
+				Int16GetDatum(master_dbid));
 	sscan = systable_beginscan(rel, GpSegmentConfigDbidIndexId, true,
 							   NULL, 1, &scankey);
 	while ((tuple = systable_getnext(sscan)) != NULL)
 	{
-		simple_heap_delete(rel, &tuple->t_self);
+		CatalogTupleDelete(rel, &tuple->t_self);
 		numDel++;
 	}
 	systable_endscan(sscan);
 
 	if (0 == numDel)
-		elog(ERROR, "cannot find old master, dbid %i", newdbid);
+		elog(ERROR, "cannot find old master, dbid %i", master_dbid);
 
-	/* now, set out old dbid to the new dbid */
+	/* now, set out rows for old standby. */
 	ScanKeyInit(&scankey,
 				Anum_gp_segment_configuration_dbid,
 				BTEqualStrategyNumber, F_INT2EQ,
-				Int16GetDatum(standbydbid));
+				Int16GetDatum(standby_dbid));
 	sscan = systable_beginscan(rel, GpSegmentConfigDbidIndexId, true,
 							   NULL, 1, &scankey);
 
 	tuple = systable_getnext(sscan);
 
 	if (!HeapTupleIsValid(tuple))
-		elog(ERROR, "cannot find standby, dbid %i", standbydbid);
+		elog(ERROR, "cannot find standby, dbid %i", standby_dbid);
 
 	tuple = heap_copytuple(tuple);
+	/* old standby keeps its previous dbid. */
 	((Form_gp_segment_configuration) GETSTRUCT(tuple))->role = GP_SEGMENT_CONFIGURATION_ROLE_PRIMARY;
 	((Form_gp_segment_configuration) GETSTRUCT(tuple))->preferred_role = GP_SEGMENT_CONFIGURATION_ROLE_PRIMARY;
 
-	simple_heap_update(rel, &tuple->t_self, tuple);
-	CatalogUpdateIndexes(rel, tuple);
+	CatalogTupleUpdate(rel, &tuple->t_self, tuple);
 
 	systable_endscan(sscan);
 
-	heap_close(rel, NoLock);
+	table_close(rel, NoLock);
 }
 
 /*
  * Update gp_segment_configuration to activate a standby.
- * This means deleting references to the old standby.
  */
 static void
-catalog_activate_standby(int16 standbydbid, int16 olddbid)
+catalog_activate_standby(int16 standby_dbid, int16 master_dbid)
 {
-	segment_config_activate_standby(standbydbid, olddbid);
+	segment_config_activate_standby(standby_dbid, master_dbid);
 }
 
 /*
- * Activate a standby. To do this, we need to change
- *
- * 1. Check that we're actually the standby
- *    dbid 1)
- * 2. Remove references to the old master
- * 3. Update the persistence tables to remove references to the master,
- *    switching our old dbid for the new one
- *
- * Things are actually a little hairy here. The reason is that in order to
- * read/write the filesystem, we need to lookup the gp_persistent_filespace_node
- * table.
- *
- * gp_activate_standby()
+ * Activate a standby. To do this, we need to update gp_segment_configuration.
  *
  * Returns:
  *  true upon success, otherwise throws error.
@@ -804,10 +777,10 @@ catalog_activate_standby(int16 standbydbid, int16 olddbid)
 bool
 gp_activate_standby(void)
 {
-	int16		olddbid = GpIdentity.dbid;
-	int16		newdbid;
+	int16		standby_dbid = GpIdentity.dbid;
+	int16		master_dbid;
 
-	newdbid = contentid_get_dbid(MASTER_CONTENT_ID, GP_SEGMENT_CONFIGURATION_ROLE_PRIMARY, true);
+	master_dbid = contentid_get_dbid(MASTER_CONTENT_ID, GP_SEGMENT_CONFIGURATION_ROLE_PRIMARY, true);
 
 	/*
 	 * This call comes from Startup process post checking state in pg_control
@@ -817,7 +790,7 @@ gp_activate_standby(void)
 	 * for StartUp Process, to cover for case of crash after updating the
 	 * catalogs during promote.
 	 */
-	if (am_startup && (newdbid == olddbid))
+	if (am_startup && (master_dbid == standby_dbid))
 	{
 		/*
 		 * Job is already done, nothing needs to be done. We mostly crashed
@@ -829,7 +802,7 @@ gp_activate_standby(void)
 	mirroring_sanity_check(SUPERUSER | UTILITY_MODE | STANDBY_ONLY,
 						   PG_FUNCNAME_MACRO);
 
-	catalog_activate_standby(olddbid, newdbid);
+	catalog_activate_standby(standby_dbid, master_dbid);
 
 	/* done */
 	return true;
@@ -840,7 +813,8 @@ gp_request_fts_probe_scan(PG_FUNCTION_ARGS)
 {
 	if (Gp_role != GP_ROLE_DISPATCH)
 	{
-		ereport(ERROR, (errmsg("This function can only be called by master (without utility mode).")));
+		ereport(ERROR,
+				(errmsg("this function can only be called by master (without utility mode)")));
 		PG_RETURN_BOOL(false);
 	}
 

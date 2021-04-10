@@ -4,7 +4,7 @@
  *	  Query Executor Factory for gangs of QEs
  *
  * Portions Copyright (c) 2005-2008, Greenplum inc
- * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
  *
  *
  * IDENTIFICATION
@@ -14,23 +14,18 @@
  */
 #include "postgres.h"
 
-#include <unistd.h>				/* getpid() */
-#include <limits.h>
-
-#include "libpq-fe.h"
-#include "miscadmin.h"			/* MyDatabaseId */
+#include "miscadmin.h"			/* MyProcPid */
 #include "pgstat.h"			/* pgstat_report_sessionid() */
-#include "storage/proc.h"		/* MyProc */
 #include "utils/memutils.h"
 
 #include "access/xact.h"
 #include "catalog/namespace.h"
 #include "commands/variable.h"
+#include "common/ip.h"
 #include "nodes/execnodes.h"	/* CdbProcess, Slice, SliceTable */
 #include "postmaster/postmaster.h"
 #include "tcop/tcopprot.h"
 #include "utils/int8.h"
-#include "utils/portal.h"
 #include "utils/sharedsnapshot.h"
 #include "tcop/pquery.h"
 
@@ -42,13 +37,10 @@
 #include "cdb/cdbdisp_query.h"
 #include "cdb/cdbgang.h"		/* me */
 #include "cdb/cdbgang_async.h"
-#include "cdb/cdbtm.h"			/* discardDtxTransaction() */
 #include "cdb/cdbutil.h"		/* CdbComponentDatabaseInfo */
 #include "cdb/cdbvars.h"		/* Gp_role, etc. */
-#include "cdb/cdbconn.h"		/* Gp_role, etc. */
-#include "storage/bfz.h"
+#include "cdb/cdbconn.h"		/* cdbconn_* */
 #include "libpq/libpq-be.h"
-#include "libpq/ip.h"
 
 #include "utils/guc_tables.h"
 
@@ -67,6 +59,12 @@ int			qe_identifier = 0;
  * number of primary segments on this host
  */
 int			host_segments = 0;
+
+/*
+ * size of hash table of interconnect connections
+ * equals to 2 * (the number of total segments)
+ */
+int			ic_htab_size = 0;
 
 Gang      *CurrentGangCreating = NULL;
 
@@ -131,6 +129,11 @@ AllocateGang(CdbDispatcherState *ds, GangType type, List *segments)
 	newGang->allocated = true;
 	newGang->type = type;
 
+	/*
+	 * Push to the head of the allocated list, later in
+	 * cdbdisp_destroyDispatcherState() we should recycle them from the head to
+	 * restore the original order of the idle gangs.
+	 */
 	ds->allocatedGangs = lcons(newGang, ds->allocatedGangs);
 	ds->largestGangSize = Max(ds->largestGangSize, newGang->size);
 
@@ -192,6 +195,29 @@ segment_failure_due_to_recovery(const char *error_message)
 	return false;
 }
 
+/* Check if the segment failure is due to missing writer process on QE node. */
+bool
+segment_failure_due_to_missing_writer(const char *error_message)
+{
+	char	   *fatal = NULL,
+			   *ptr = NULL;
+	int			fatal_len = 0;
+
+	if (error_message == NULL)
+		return false;
+
+	fatal = _("FATAL");
+	fatal_len = strlen(fatal);
+
+	ptr = strstr(error_message, fatal);
+	if ((ptr != NULL) && ptr[fatal_len] == ':' &&
+		strstr(error_message, _(WRITER_IS_MISSING_MSG)))
+		return true;
+
+	return false;
+}
+
+
 /*
  * Reads the GP catalog tables and build a CdbComponentDatabases structure.
  * It then converts this to a Gang structure and initializes all the non-connection related fields.
@@ -204,7 +230,7 @@ buildGangDefinition(List *segments, SegmentType segmentType)
 {
 	Gang *newGangDefinition = NULL;
 	ListCell *lc;
-	int	i = 0;
+	volatile int i = 0;
 	int	size;
 	int contentId;
 
@@ -219,7 +245,6 @@ buildGangDefinition(List *segments, SegmentType segmentType)
 	newGangDefinition->type = GANGTYPE_UNALLOCATED;
 	newGangDefinition->size = size;
 	newGangDefinition->allocated = false;
-	newGangDefinition->portal_name = NULL;
 	newGangDefinition->db_descriptors =
 		(SegmentDatabaseDescriptor **) palloc0(size * sizeof(SegmentDatabaseDescriptor*));
 
@@ -235,6 +260,7 @@ buildGangDefinition(List *segments, SegmentType segmentType)
 	}
 	PG_CATCH();
 	{
+		newGangDefinition->size = i;
 		RecycleGang(newGangDefinition, true /* destroy */);
 		PG_RE_THROW();
 	}
@@ -250,7 +276,7 @@ buildGangDefinition(List *segments, SegmentType segmentType)
 static void
 addOneOption(StringInfo string, struct config_generic *guc)
 {
-	Assert(guc && (guc->flags & GUC_GPDB_ADDOPT));
+	Assert(guc && (guc->flags & GUC_GPDB_NEED_SYNC));
 	switch (guc->vartype)
 	{
 		case PGC_BOOL:
@@ -318,8 +344,6 @@ addOneOption(StringInfo string, struct config_generic *guc)
 				}
 				break;
 			}
-		default:
-			Insist(false);
 	}
 }
 
@@ -340,15 +364,17 @@ makeOptions(void)
 	Assert(Gp_role == GP_ROLE_DISPATCH);
 
 	qdinfo = cdbcomponent_getComponentInfo(MASTER_CONTENT_ID); 
-	appendStringInfo(&string, " -c gp_qd_hostname=%s", qdinfo->hostip);
-	appendStringInfo(&string, " -c gp_qd_port=%d", qdinfo->port);
+	appendStringInfo(&string, " -c gp_qd_hostname=%s", qdinfo->config->hostip);
+	appendStringInfo(&string, " -c gp_qd_port=%d", qdinfo->config->port);
 
 	for (i = 0; i < ngucs; ++i)
 	{
 		struct config_generic *guc = gucs[i];
 
-		if ((guc->flags & GUC_GPDB_ADDOPT) &&
-			(guc->context == PGC_USERSET || IsAuthenticatedUserSuperUser()))
+		if ((guc->flags & GUC_GPDB_NEED_SYNC) &&
+			(guc->context == PGC_USERSET ||
+			 guc->context == PGC_BACKEND ||
+			 IsAuthenticatedUserSuperUser()))
 			addOneOption(&string, guc);
 	}
 
@@ -364,7 +390,7 @@ makeOptions(void)
  */
 bool
 build_gpqeid_param(char *buf, int bufsz,
-				   bool is_writer, int identifier, int hostSegs)
+				   bool is_writer, int identifier, int hostSegs, int icHtabSize)
 {
 	int		len;
 #ifdef HAVE_INT64_TIMESTAMP
@@ -377,9 +403,9 @@ build_gpqeid_param(char *buf, int bufsz,
 #endif
 #endif
 
-	len = snprintf(buf, bufsz, "%d;" TIMESTAMP_FORMAT ";%s;%d;%d",
+	len = snprintf(buf, bufsz, "%d;" TIMESTAMP_FORMAT ";%s;%d;%d;%d",
 				   gp_session_id, PgStartTime,
-				   (is_writer ? "true" : "false"), identifier, hostSegs);
+				   (is_writer ? "true" : "false"), identifier, hostSegs, icHtabSize);
 
 	return (len > 0 && len < bufsz);
 }
@@ -411,15 +437,12 @@ gpqeid_next_param(char **cpp, char **npp)
  * inherited from the postmaster; etc; so don't try to do too much in here.
  */
 void
-cdbgang_parse_gpqeid_params(struct Port *port __attribute__((unused)),
+cdbgang_parse_gpqeid_params(struct Port *port pg_attribute_unused(),
 							const char *gpqeid_value)
 {
 	char	   *gpqeid = pstrdup(gpqeid_value);
 	char	   *cp;
 	char	   *np = gpqeid;
-
-	/* The presence of an gpqeid string means this backend is a qExec. */
-	SetConfigOption("gp_session_role", "execute", PGC_POSTMASTER, PGC_S_OVERRIDE);
 
 	/* gp_session_id */
 	if (gpqeid_next_param(&cp, &np))
@@ -451,11 +474,16 @@ cdbgang_parse_gpqeid_params(struct Port *port __attribute__((unused)),
 		host_segments = (int) strtol(cp, NULL, 10);
 	}
 
+	if (gpqeid_next_param(&cp, &np))
+	{
+		ic_htab_size = (int) strtol(cp, NULL, 10);
+	}
+
 	/* Too few items, or too many? */
 	if (!cp || np)
 		goto bad;
 
-	if (gp_session_id <= 0 || PgStartTime <= 0 || qe_identifier < 0 || host_segments <= 0)
+	if (gp_session_id <= 0 || PgStartTime <= 0 || qe_identifier < 0 || host_segments <= 0 || ic_htab_size <= 0)
 		goto bad;
 
 	pfree(gpqeid);
@@ -492,20 +520,22 @@ makeCdbProcess(SegmentDatabaseDescriptor *segdbDesc)
 	{
 		elog(ERROR, "required segment is unavailable");
 	}
-	else if (qeinfo->hostip == NULL)
+	else if (qeinfo->config->hostip == NULL)
 	{
 		elog(ERROR, "required segment IP is unavailable");
 	}
 
-	process->listenerAddr = pstrdup(qeinfo->hostip);
+	process->listenerAddr = pstrdup(qeinfo->config->hostip);
 
 	if (Gp_interconnect_type == INTERCONNECT_TYPE_UDPIFC)
 		process->listenerPort = (segdbDesc->motionListener >> 16) & 0x0ffff;
-	else if (Gp_interconnect_type == INTERCONNECT_TYPE_TCP)
+	else if (Gp_interconnect_type == INTERCONNECT_TYPE_TCP ||
+			 Gp_interconnect_type == INTERCONNECT_TYPE_PROXY)
 		process->listenerPort = (segdbDesc->motionListener & 0x0ffff);
 
 	process->pid = segdbDesc->backendPid;
 	process->contentid = segdbDesc->segindex;
+	process->dbid = qeinfo->config->dbid;
 	return process;
 }
 
@@ -519,7 +549,7 @@ makeCdbProcess(SegmentDatabaseDescriptor *segdbDesc)
  * @directDispatch: might be null
  */
 void
-setupCdbProcessList(Slice *slice)
+setupCdbProcessList(ExecSlice *slice)
 {
 	int			i = 0;
 	Gang		*gang = slice->primaryGang;
@@ -544,9 +574,10 @@ setupCdbProcessList(Slice *slice)
 		slice->primaryProcesses = lappend(slice->primaryProcesses, process);
 		slice->processesMap = bms_add_member(slice->processesMap, segdbDesc->identifier);
 
-		ELOG_DISPATCHER_DEBUG("Gang assignment (gang_id %d): slice%d seg%d %s:%d pid=%d",
-							  gang->gang_id, slice->sliceIndex, process->contentid,
-							  process->listenerAddr, process->listenerPort, process->pid);
+		ELOG_DISPATCHER_DEBUG("Gang assignment: slice%d seg%d %s:%d pid=%d",
+							  slice->sliceIndex, process->contentid,
+							  process->listenerAddr, process->listenerPort,
+							  process->pid);
 	}
 }
 
@@ -573,25 +604,33 @@ getCdbProcessesForQD(int isPrimary)
 
 	qdinfo = cdbcomponent_getComponentInfo(MASTER_CONTENT_ID);
 
-	Assert(qdinfo->segindex == -1);
+	Assert(qdinfo->config->segindex == -1);
 	Assert(SEGMENT_IS_ACTIVE_PRIMARY(qdinfo));
-	Assert(qdinfo->hostip != NULL);
+	Assert(qdinfo->config->hostip != NULL);
 
 	proc = makeNode(CdbProcess);
 
 	/*
-	 * Set QD listener address to NULL. This will be filled during starting up
-	 * outgoing interconnect connection.
+	 * Set QD listener address to the ADDRESS of the master, so the motions that connect to
+	 * the master knows what the interconnect address of the peer is. `adjustMasterRouting()`
+	 * is not necessary, and it could be wrong if the QD/QE on the master binds a single IP
+	 * address for interconnection instead of the wildcard address. Binding the wildcard address
+	 * for interconnection has some flaws:
+	 * 1. All the QD/QE in the same node share the same port space(for a same AF_INET/AF_INET6),
+	 *    which contributes to run out of port.
+	 * 2. When the segments have their own ADDRESS, the connection address could be confusing.
 	 */
-	proc->listenerAddr = NULL;
+	proc->listenerAddr = pstrdup(qdinfo->config->hostip);
 
 	if (Gp_interconnect_type == INTERCONNECT_TYPE_UDPIFC)
 		proc->listenerPort = (Gp_listener_port >> 16) & 0x0ffff;
-	else if (Gp_interconnect_type == INTERCONNECT_TYPE_TCP)
+	else if (Gp_interconnect_type == INTERCONNECT_TYPE_TCP ||
+			 Gp_interconnect_type == INTERCONNECT_TYPE_PROXY)
 		proc->listenerPort = (Gp_listener_port & 0x0ffff);
 
 	proc->pid = MyProcPid;
 	proc->contentid = -1;
+	proc->dbid = qdinfo->config->dbid;
 
 	list = lappend(list, proc);
 	return list;
@@ -805,31 +844,6 @@ gangTypeToString(GangType type)
 	return ret;
 }
 
-bool
-GangOK(Gang *gp)
-{
-	int			i;
-
-	if (gp == NULL)
-		return false;
-
-	/*
-	 * Gang is direct-connect (no agents).
-	 */
-
-	for (i = 0; i < gp->size; i++)
-	{
-		SegmentDatabaseDescriptor *segdbDesc = gp->db_descriptors[i];
-
-		if (cdbconn_isBadConnection(segdbDesc))
-			return false;
-		if (FtsIsSegmentDown(segdbDesc->segment_database_info))
-			return false;
-	}
-
-	return true;
-}
-
 void
 RecycleGang(Gang *gp, bool forceDestroy)
 {
@@ -851,4 +865,11 @@ RecycleGang(Gang *gp, bool forceDestroy)
 
 		cdbcomponent_recycleIdleQE(segdbDesc, forceDestroy);
 	}
+}
+
+void
+ResetAllGangs(void)
+{
+	DisconnectAndDestroyAllGangs(true);
+	CheckForResetSession();
 }

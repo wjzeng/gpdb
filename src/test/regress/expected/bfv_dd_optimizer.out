@@ -16,13 +16,8 @@ INFO:  Distributed transaction command 'Distributed Prepare' to ALL contents: 0 
 INFO:  Distributed transaction command 'Distributed Commit Prepared' to ALL contents: 0 1 2
 insert into dd_singlecol_1 values(null, null);
 INFO:  (slice 0) Dispatch command to SINGLE content
-INFO:  Distributed transaction command 'Distributed Prepare' to SINGLE content
-INFO:  Distributed transaction command 'Distributed Commit Prepared' to SINGLE content
+INFO:  Distributed transaction command 'Distributed Commit (one-phase)' to SINGLE content
 analyze dd_singlecol_1;
-INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
-CONTEXT:  SQL statement "select pg_catalog.sum(pg_catalog.gp_statistics_estimate_reltuples_relpages_oid(c.oid))::pg_catalog.float4[] from gp_dist_random('pg_catalog.pg_class') c where c.oid=139468"
-INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
-CONTEXT:  SQL statement "select Ta.a , Ta.b  from public.dd_singlecol_1 as Ta  limit 30000 "
 -- ctas tests
 create table dd_ctas_1 as select * from dd_singlecol_1 where a=1 distributed by (a);
 INFO:  (slice 0) Dispatch command to ALL contents: 0 1 2
@@ -91,22 +86,22 @@ INFO:  (slice 1) Dispatch command to SINGLE content
 (1 row)
 
 -- single column distr key
-select * from dd_singlecol_1 where a in (1,3,5);
+select * from dd_singlecol_1 where a in (10,11,12);
 INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
- a | b 
----+---
- 5 | 5
- 1 | 1
- 3 | 3
+ a  | b  
+----+----
+ 10 | 10
+ 11 | 11
+ 12 | 12
 (3 rows)
 
-select * from dd_singlecol_1 where a=1 or a=3 or a=5;
+select * from dd_singlecol_1 where a=10 or a=11 or a=12;
 INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
- a | b 
----+---
- 1 | 1
- 3 | 3
- 5 | 5
+ a  | b  
+----+----
+ 10 | 10
+ 11 | 11
+ 12 | 12
 (3 rows)
 
 select * from dd_singlecol_1 where a is null or a=1;
@@ -126,21 +121,21 @@ INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
  2
 (2 rows)
 
--- negative cases: single column distr key, values don't hash to the same segment
-select * from dd_singlecol_1 where a=1 or a=3;
+-- single column distr key, values hash to the same segment
+select * from dd_singlecol_1 where a=10 or a=11;
 INFO:  (slice 1) Dispatch command to SINGLE content
- a | b 
----+---
- 1 | 1
- 3 | 3
+ a  | b  
+----+----
+ 10 | 10
+ 11 | 11
 (2 rows)
 
-select * from dd_singlecol_1 where a in (1, 3);
+select * from dd_singlecol_1 where a in (10, 11);
 INFO:  (slice 1) Dispatch command to SINGLE content
- a | b 
----+---
- 1 | 1
- 3 | 3
+ a  | b  
+----+----
+ 10 | 10
+ 11 | 11
 (2 rows)
 
 select * from dd_singlecol_1 where a is null or a=2;
@@ -151,56 +146,50 @@ INFO:  (slice 1) Dispatch command to SINGLE content
    |  
 (2 rows)
 
-select * from dd_singlecol_1 where (a,b) in ((1,2),(2,3)); 
+select * from dd_singlecol_1 where (a,b) in ((10,2),(11,3));
 INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
  a | b 
 ---+---
 (0 rows)
 
-select * from dd_singlecol_1 where a between 1 and 2;
+select * from dd_singlecol_1 where a between 10 and 11;
 INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
- a | b 
----+---
- 2 | 2
- 1 | 1
+ a  | b  
+----+----
+ 10 | 10
+ 11 | 11
 (2 rows)
 
 -- partitioned tables
 create table dd_part_singlecol(a int, b int, c int) distributed by (a) partition by range (b) 
 (start(1) end(100) every (20), default partition extra);
-NOTICE:  CREATE TABLE will create partition "dd_part_singlecol_1_prt_extra" for table "dd_part_singlecol"
-NOTICE:  CREATE TABLE will create partition "dd_part_singlecol_1_prt_2" for table "dd_part_singlecol"
-NOTICE:  CREATE TABLE will create partition "dd_part_singlecol_1_prt_3" for table "dd_part_singlecol"
-NOTICE:  CREATE TABLE will create partition "dd_part_singlecol_1_prt_4" for table "dd_part_singlecol"
-NOTICE:  CREATE TABLE will create partition "dd_part_singlecol_1_prt_5" for table "dd_part_singlecol"
-NOTICE:  CREATE TABLE will create partition "dd_part_singlecol_1_prt_6" for table "dd_part_singlecol"
 INFO:  Distributed transaction command 'Distributed Prepare' to ALL contents: 0 1 2
 INFO:  Distributed transaction command 'Distributed Commit Prepared' to ALL contents: 0 1 2
 insert into dd_part_singlecol select g, g*2, g*3 from generate_series(1,49) g;
 INFO:  (slice 0) Dispatch command to ALL contents: 0 1 2
+INFO:  (slice 1) Dispatch command to SINGLE content
 INFO:  Distributed transaction command 'Distributed Prepare' to ALL contents: 0 1 2
 INFO:  Distributed transaction command 'Distributed Commit Prepared' to ALL contents: 0 1 2
 insert into dd_part_singlecol values (NULL, NULL);
 INFO:  (slice 0) Dispatch command to SINGLE content
-INFO:  Distributed transaction command 'Distributed Prepare' to SINGLE content
-INFO:  Distributed transaction command 'Distributed Commit Prepared' to SINGLE content
+INFO:  Distributed transaction command 'Distributed Commit (one-phase)' to SINGLE content
 -- disjunction with partitioned tables
-select * from dd_part_singlecol where a in (1,3,5);
+select * from dd_part_singlecol where a in (10,11,12);
 INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
- a | b  | c  
----+----+----
- 5 | 10 | 15
- 1 |  2 |  3
- 3 |  6 |  9
+ a  | b  | c  
+----+----+----
+ 10 | 20 | 30
+ 11 | 22 | 33
+ 12 | 24 | 36
 (3 rows)
 
-select * from dd_part_singlecol where a=1 or a=3 or a=5;
+select * from dd_part_singlecol where a=10 or a=11 or a=12;
 INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
- a | b  | c  
----+----+----
- 5 | 10 | 15
- 1 |  2 |  3
- 3 |  6 |  9
+ a  | b  | c  
+----+----+----
+ 10 | 20 | 30
+ 11 | 22 | 33
+ 12 | 24 | 36
 (3 rows)
 
 select * from dd_part_singlecol where a is null or a=1;
@@ -309,8 +298,7 @@ INFO:  Distributed transaction command 'Distributed Prepare' to ALL contents: 0 
 INFO:  Distributed transaction command 'Distributed Commit Prepared' to ALL contents: 0 1 2
 insert into dd_singlecol_idx values(null, null);
 INFO:  (slice 0) Dispatch command to SINGLE content
-INFO:  Distributed transaction command 'Distributed Prepare' to SINGLE content
-INFO:  Distributed transaction command 'Distributed Commit Prepared' to SINGLE content
+INFO:  Distributed transaction command 'Distributed Commit (one-phase)' to SINGLE content
 create table dd_singlecol_idx2(a int, b int, c int) distributed by (a);
 INFO:  Distributed transaction command 'Distributed Prepare' to ALL contents: 0 1 2
 INFO:  Distributed transaction command 'Distributed Commit Prepared' to ALL contents: 0 1 2
@@ -323,24 +311,9 @@ INFO:  Distributed transaction command 'Distributed Prepare' to ALL contents: 0 
 INFO:  Distributed transaction command 'Distributed Commit Prepared' to ALL contents: 0 1 2
 insert into dd_singlecol_idx2 values(null, null);
 INFO:  (slice 0) Dispatch command to SINGLE content
-INFO:  Distributed transaction command 'Distributed Prepare' to SINGLE content
-INFO:  Distributed transaction command 'Distributed Commit Prepared' to SINGLE content
+INFO:  Distributed transaction command 'Distributed Commit (one-phase)' to SINGLE content
 analyze dd_singlecol_idx;
-INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
-CONTEXT:  SQL statement "select pg_catalog.sum(pg_catalog.gp_statistics_estimate_reltuples_relpages_oid(c.oid))::pg_catalog.float4[] from gp_dist_random('pg_catalog.pg_class') c where c.oid=139504"
-INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
-CONTEXT:  SQL statement "select Ta.a , Ta.b , Ta.c  from public.dd_singlecol_idx as Ta  limit 30000 "
-INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
-CONTEXT:  SQL statement "select pg_catalog.sum(pg_catalog.gp_statistics_estimate_reltuples_relpages_oid(c.oid))::pg_catalog.float4[] from gp_dist_random('pg_catalog.pg_class') c where c.oid=139507"
-INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
-CONTEXT:  SQL statement "select pg_catalog.sum(pg_catalog.gp_statistics_estimate_reltuples_relpages_oid(c.oid))::pg_catalog.float4[] from gp_dist_random('pg_catalog.pg_class') c where c.oid=139508"
 analyze dd_singlecol_idx2;
-INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
-CONTEXT:  SQL statement "select pg_catalog.sum(pg_catalog.gp_statistics_estimate_reltuples_relpages_oid(c.oid))::pg_catalog.float4[] from gp_dist_random('pg_catalog.pg_class') c where c.oid=139509"
-INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
-CONTEXT:  SQL statement "select Ta.a , Ta.b , Ta.c  from public.dd_singlecol_idx2 as Ta  limit 30000 "
-INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
-CONTEXT:  SQL statement "select pg_catalog.sum(pg_catalog.gp_statistics_estimate_reltuples_relpages_oid(c.oid))::pg_catalog.float4[] from gp_dist_random('pg_catalog.pg_class') c where c.oid=139512"
 -- disjunction with index scans
 select * from dd_singlecol_idx where (a=1 or a=2) and b<2;
 INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
@@ -386,17 +359,8 @@ INFO:  Distributed transaction command 'Distributed Prepare' to ALL contents: 0 
 INFO:  Distributed transaction command 'Distributed Commit Prepared' to ALL contents: 0 1 2
 insert into dd_singlecol_bitmap_idx values(null, null);
 INFO:  (slice 0) Dispatch command to SINGLE content
-INFO:  Distributed transaction command 'Distributed Prepare' to SINGLE content
-INFO:  Distributed transaction command 'Distributed Commit Prepared' to SINGLE content
+INFO:  Distributed transaction command 'Distributed Commit (one-phase)' to SINGLE content
 analyze dd_singlecol_bitmap_idx;
-INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
-CONTEXT:  SQL statement "select pg_catalog.sum(pg_catalog.gp_statistics_estimate_reltuples_relpages_oid(c.oid))::pg_catalog.float4[] from gp_dist_random('pg_catalog.pg_class') c where c.oid=139513"
-INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
-CONTEXT:  SQL statement "select Ta.a , Ta.b , Ta.c  from public.dd_singlecol_bitmap_idx as Ta  limit 30000 "
-INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
-CONTEXT:  SQL statement "select pg_catalog.sum(pg_catalog.gp_statistics_estimate_reltuples_relpages_oid(c.oid))::pg_catalog.float4[] from gp_dist_random('pg_catalog.pg_class') c where c.oid=139516"
-INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
-CONTEXT:  SQL statement "select pg_catalog.sum(pg_catalog.gp_statistics_estimate_reltuples_relpages_oid(c.oid))::pg_catalog.float4[] from gp_dist_random('pg_catalog.pg_class') c where c.oid=139520"
 -- disjunction with bitmap index scans
 select * from dd_singlecol_bitmap_idx where (a=1 or a=2) and b<2;
 INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
@@ -459,64 +423,20 @@ create table dd_singlecol_part_bitmap_idx(a int, b int, c int)
 distributed by (a)
 partition by range (b) 
 (start(1) end(100) every (20), default partition extra);;
-NOTICE:  CREATE TABLE will create partition "dd_singlecol_part_bitmap_idx_1_prt_extra" for table "dd_singlecol_part_bitmap_idx"
-NOTICE:  CREATE TABLE will create partition "dd_singlecol_part_bitmap_idx_1_prt_2" for table "dd_singlecol_part_bitmap_idx"
-NOTICE:  CREATE TABLE will create partition "dd_singlecol_part_bitmap_idx_1_prt_3" for table "dd_singlecol_part_bitmap_idx"
-NOTICE:  CREATE TABLE will create partition "dd_singlecol_part_bitmap_idx_1_prt_4" for table "dd_singlecol_part_bitmap_idx"
-NOTICE:  CREATE TABLE will create partition "dd_singlecol_part_bitmap_idx_1_prt_5" for table "dd_singlecol_part_bitmap_idx"
-NOTICE:  CREATE TABLE will create partition "dd_singlecol_part_bitmap_idx_1_prt_6" for table "dd_singlecol_part_bitmap_idx"
 INFO:  Distributed transaction command 'Distributed Prepare' to ALL contents: 0 1 2
 INFO:  Distributed transaction command 'Distributed Commit Prepared' to ALL contents: 0 1 2
 create index sc_part_bitmap_idx_b on dd_singlecol_part_bitmap_idx using bitmap(b);
-NOTICE:  building index for child partition "dd_singlecol_part_bitmap_idx_1_prt_extra"
-NOTICE:  building index for child partition "dd_singlecol_part_bitmap_idx_1_prt_2"
-NOTICE:  building index for child partition "dd_singlecol_part_bitmap_idx_1_prt_3"
-NOTICE:  building index for child partition "dd_singlecol_part_bitmap_idx_1_prt_4"
-NOTICE:  building index for child partition "dd_singlecol_part_bitmap_idx_1_prt_5"
-NOTICE:  building index for child partition "dd_singlecol_part_bitmap_idx_1_prt_6"
 INFO:  Distributed transaction command 'Distributed Prepare' to ALL contents: 0 1 2
 INFO:  Distributed transaction command 'Distributed Commit Prepared' to ALL contents: 0 1 2
 insert into dd_singlecol_part_bitmap_idx select g, g%5,g%5 from generate_series(1,100) g;
 INFO:  (slice 0) Dispatch command to ALL contents: 0 1 2
+INFO:  (slice 1) Dispatch command to SINGLE content
 INFO:  Distributed transaction command 'Distributed Prepare' to ALL contents: 0 1 2
 INFO:  Distributed transaction command 'Distributed Commit Prepared' to ALL contents: 0 1 2
 insert into dd_singlecol_part_bitmap_idx values(null, null);
 INFO:  (slice 0) Dispatch command to SINGLE content
-INFO:  Distributed transaction command 'Distributed Prepare' to SINGLE content
-INFO:  Distributed transaction command 'Distributed Commit Prepared' to SINGLE content
+INFO:  Distributed transaction command 'Distributed Commit (one-phase)' to SINGLE content
 analyze dd_singlecol_part_bitmap_idx;
-INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
-CONTEXT:  SQL statement "select pg_catalog.sum(pg_catalog.gp_statistics_estimate_reltuples_relpages_oid(c.oid))::pg_catalog.float4[] from gp_dist_random('pg_catalog.pg_class') c where c.oid=139531"
-INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
-CONTEXT:  SQL statement "select Ta.a , Ta.b , Ta.c  from public.dd_singlecol_part_bitmap_idx_1_prt_2 as Ta  limit 30000 "
-INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
-CONTEXT:  SQL statement "select pg_catalog.sum(pg_catalog.gp_statistics_estimate_reltuples_relpages_oid(c.oid))::pg_catalog.float4[] from gp_dist_random('pg_catalog.pg_class') c where c.oid=139559"
-INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
-CONTEXT:  SQL statement "select pg_catalog.sum(pg_catalog.gp_statistics_estimate_reltuples_relpages_oid(c.oid))::pg_catalog.float4[] from gp_dist_random('pg_catalog.pg_class') c where c.oid=139535"
-INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
-CONTEXT:  SQL statement "select pg_catalog.sum(pg_catalog.gp_statistics_estimate_reltuples_relpages_oid(c.oid))::pg_catalog.float4[] from gp_dist_random('pg_catalog.pg_class') c where c.oid=139539"
-INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
-CONTEXT:  SQL statement "select pg_catalog.sum(pg_catalog.gp_statistics_estimate_reltuples_relpages_oid(c.oid))::pg_catalog.float4[] from gp_dist_random('pg_catalog.pg_class') c where c.oid=139543"
-INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
-CONTEXT:  SQL statement "select pg_catalog.sum(pg_catalog.gp_statistics_estimate_reltuples_relpages_oid(c.oid))::pg_catalog.float4[] from gp_dist_random('pg_catalog.pg_class') c where c.oid=139547"
-INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
-CONTEXT:  SQL statement "select pg_catalog.sum(pg_catalog.gp_statistics_estimate_reltuples_relpages_oid(c.oid))::pg_catalog.float4[] from gp_dist_random('pg_catalog.pg_class') c where c.oid=139527"
-INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
-CONTEXT:  SQL statement "select Ta.a , Ta.b , Ta.c  from public.dd_singlecol_part_bitmap_idx_1_prt_extra as Ta  limit 30000 "
-INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
-CONTEXT:  SQL statement "select pg_catalog.sum(pg_catalog.gp_statistics_estimate_reltuples_relpages_oid(c.oid))::pg_catalog.float4[] from gp_dist_random('pg_catalog.pg_class') c where c.oid=139555"
-INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
-CONTEXT:  SQL statement "select pg_catalog.sum(pg_catalog.gp_statistics_estimate_reltuples_relpages_oid(c.oid))::pg_catalog.float4[] from gp_dist_random('pg_catalog.pg_class') c where c.oid=139531"
-INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
-CONTEXT:  SQL statement "select pg_catalog.sum(pg_catalog.gp_statistics_estimate_reltuples_relpages_oid(c.oid))::pg_catalog.float4[] from gp_dist_random('pg_catalog.pg_class') c where c.oid=139535"
-INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
-CONTEXT:  SQL statement "select pg_catalog.sum(pg_catalog.gp_statistics_estimate_reltuples_relpages_oid(c.oid))::pg_catalog.float4[] from gp_dist_random('pg_catalog.pg_class') c where c.oid=139539"
-INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
-CONTEXT:  SQL statement "select pg_catalog.sum(pg_catalog.gp_statistics_estimate_reltuples_relpages_oid(c.oid))::pg_catalog.float4[] from gp_dist_random('pg_catalog.pg_class') c where c.oid=139543"
-INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
-CONTEXT:  SQL statement "select pg_catalog.sum(pg_catalog.gp_statistics_estimate_reltuples_relpages_oid(c.oid))::pg_catalog.float4[] from gp_dist_random('pg_catalog.pg_class') c where c.oid=139547"
-INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
-CONTEXT:  SQL statement "select pg_catalog.sum(pg_catalog.gp_statistics_estimate_reltuples_relpages_oid(c.oid))::pg_catalog.float4[] from gp_dist_random('pg_catalog.pg_class') c where c.oid=139527"
 -- bitmap indexes on partitioned tables
 select * from dd_singlecol_part_bitmap_idx where a=1 and b=0;
 INFO:  (slice 1) Dispatch command to SINGLE content
@@ -562,12 +482,6 @@ INFO:  (slice 0) Dispatch command to ALL contents: 0 1 2
 INFO:  Distributed transaction command 'Distributed Prepare' to ALL contents: 0 1 2
 INFO:  Distributed transaction command 'Distributed Commit Prepared' to ALL contents: 0 1 2
 analyze dd_multicol_idx;
-INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
-CONTEXT:  SQL statement "select pg_catalog.sum(pg_catalog.gp_statistics_estimate_reltuples_relpages_oid(c.oid))::pg_catalog.float4[] from gp_dist_random('pg_catalog.pg_class') c where c.oid=139579"
-INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
-CONTEXT:  SQL statement "select Ta.a , Ta.b , Ta.c  from public.dd_multicol_idx as Ta  limit 30000 "
-INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
-CONTEXT:  SQL statement "select pg_catalog.sum(pg_catalog.gp_statistics_estimate_reltuples_relpages_oid(c.oid))::pg_catalog.float4[] from gp_dist_random('pg_catalog.pg_class') c where c.oid=139582"
 select count(*) from dd_multicol_idx;
 INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
  count 
@@ -648,11 +562,11 @@ INFO:  (slice 1) Dispatch command to SINGLE content
  1 | 1 | 1
 (1 row)
 
-select * from dd_multicol_idx where (a=1 or a=2) and (b=1 or b=5) and c=1;
+select * from dd_multicol_idx where (a=10 or a=11) and (b=1 or b=5) and c=1;
 INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
- a | b | c 
----+---+---
- 1 | 1 | 1
+ a  | b | c 
+----+---+---
+ 11 | 1 | 1
 (1 row)
 
 -- indexes on partitioned tables 
@@ -660,126 +574,38 @@ create table dd_singlecol_part_idx(a int, b int, c int)
 distributed by (a)
 partition by range (b) 
 (start(1) end(100) every (20), default partition extra);;
-NOTICE:  CREATE TABLE will create partition "dd_singlecol_part_idx_1_prt_extra" for table "dd_singlecol_part_idx"
-NOTICE:  CREATE TABLE will create partition "dd_singlecol_part_idx_1_prt_2" for table "dd_singlecol_part_idx"
-NOTICE:  CREATE TABLE will create partition "dd_singlecol_part_idx_1_prt_3" for table "dd_singlecol_part_idx"
-NOTICE:  CREATE TABLE will create partition "dd_singlecol_part_idx_1_prt_4" for table "dd_singlecol_part_idx"
-NOTICE:  CREATE TABLE will create partition "dd_singlecol_part_idx_1_prt_5" for table "dd_singlecol_part_idx"
-NOTICE:  CREATE TABLE will create partition "dd_singlecol_part_idx_1_prt_6" for table "dd_singlecol_part_idx"
 INFO:  Distributed transaction command 'Distributed Prepare' to ALL contents: 0 1 2
 INFO:  Distributed transaction command 'Distributed Commit Prepared' to ALL contents: 0 1 2
 create index sc_part_idx_b on dd_singlecol_part_idx(b);
-NOTICE:  building index for child partition "dd_singlecol_part_idx_1_prt_extra"
-NOTICE:  building index for child partition "dd_singlecol_part_idx_1_prt_2"
-NOTICE:  building index for child partition "dd_singlecol_part_idx_1_prt_3"
-NOTICE:  building index for child partition "dd_singlecol_part_idx_1_prt_4"
-NOTICE:  building index for child partition "dd_singlecol_part_idx_1_prt_5"
-NOTICE:  building index for child partition "dd_singlecol_part_idx_1_prt_6"
 INFO:  Distributed transaction command 'Distributed Prepare' to ALL contents: 0 1 2
 INFO:  Distributed transaction command 'Distributed Commit Prepared' to ALL contents: 0 1 2
 insert into dd_singlecol_part_idx select g, g%5,g%5 from generate_series(1,100) g;
 INFO:  (slice 0) Dispatch command to ALL contents: 0 1 2
+INFO:  (slice 1) Dispatch command to SINGLE content
 INFO:  Distributed transaction command 'Distributed Prepare' to ALL contents: 0 1 2
 INFO:  Distributed transaction command 'Distributed Commit Prepared' to ALL contents: 0 1 2
 insert into dd_singlecol_part_idx values(null, null);
 INFO:  (slice 0) Dispatch command to SINGLE content
-INFO:  Distributed transaction command 'Distributed Prepare' to SINGLE content
-INFO:  Distributed transaction command 'Distributed Commit Prepared' to SINGLE content
+INFO:  Distributed transaction command 'Distributed Commit (one-phase)' to SINGLE content
 create table dd_singlecol_part_idx2(a int, b int, c int) 
 distributed by (a)
 partition by range (b) 
 (start(1) end(100) every (20), default partition extra);;
-NOTICE:  CREATE TABLE will create partition "dd_singlecol_part_idx2_1_prt_extra" for table "dd_singlecol_part_idx2"
-NOTICE:  CREATE TABLE will create partition "dd_singlecol_part_idx2_1_prt_2" for table "dd_singlecol_part_idx2"
-NOTICE:  CREATE TABLE will create partition "dd_singlecol_part_idx2_1_prt_3" for table "dd_singlecol_part_idx2"
-NOTICE:  CREATE TABLE will create partition "dd_singlecol_part_idx2_1_prt_4" for table "dd_singlecol_part_idx2"
-NOTICE:  CREATE TABLE will create partition "dd_singlecol_part_idx2_1_prt_5" for table "dd_singlecol_part_idx2"
-NOTICE:  CREATE TABLE will create partition "dd_singlecol_part_idx2_1_prt_6" for table "dd_singlecol_part_idx2"
 INFO:  Distributed transaction command 'Distributed Prepare' to ALL contents: 0 1 2
 INFO:  Distributed transaction command 'Distributed Commit Prepared' to ALL contents: 0 1 2
 create index sc_part_idx_a on dd_singlecol_part_idx2(a);
-NOTICE:  building index for child partition "dd_singlecol_part_idx2_1_prt_extra"
-NOTICE:  building index for child partition "dd_singlecol_part_idx2_1_prt_2"
-NOTICE:  building index for child partition "dd_singlecol_part_idx2_1_prt_3"
-NOTICE:  building index for child partition "dd_singlecol_part_idx2_1_prt_4"
-NOTICE:  building index for child partition "dd_singlecol_part_idx2_1_prt_5"
-NOTICE:  building index for child partition "dd_singlecol_part_idx2_1_prt_6"
 INFO:  Distributed transaction command 'Distributed Prepare' to ALL contents: 0 1 2
 INFO:  Distributed transaction command 'Distributed Commit Prepared' to ALL contents: 0 1 2
 insert into dd_singlecol_part_idx2 select g, g%5,g%5 from generate_series(1,100) g;
 INFO:  (slice 0) Dispatch command to ALL contents: 0 1 2
+INFO:  (slice 1) Dispatch command to SINGLE content
 INFO:  Distributed transaction command 'Distributed Prepare' to ALL contents: 0 1 2
 INFO:  Distributed transaction command 'Distributed Commit Prepared' to ALL contents: 0 1 2
 insert into dd_singlecol_part_idx2 values(null, null);
 INFO:  (slice 0) Dispatch command to SINGLE content
-INFO:  Distributed transaction command 'Distributed Prepare' to SINGLE content
-INFO:  Distributed transaction command 'Distributed Commit Prepared' to SINGLE content
+INFO:  Distributed transaction command 'Distributed Commit (one-phase)' to SINGLE content
 analyze dd_singlecol_part_idx;
-INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
-CONTEXT:  SQL statement "select pg_catalog.sum(pg_catalog.gp_statistics_estimate_reltuples_relpages_oid(c.oid))::pg_catalog.float4[] from gp_dist_random('pg_catalog.pg_class') c where c.oid=139590"
-INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
-CONTEXT:  SQL statement "select Ta.a , Ta.b , Ta.c  from public.dd_singlecol_part_idx_1_prt_2 as Ta  limit 30000 "
-INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
-CONTEXT:  SQL statement "select pg_catalog.sum(pg_catalog.gp_statistics_estimate_reltuples_relpages_oid(c.oid))::pg_catalog.float4[] from gp_dist_random('pg_catalog.pg_class') c where c.oid=139612"
-INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
-CONTEXT:  SQL statement "select pg_catalog.sum(pg_catalog.gp_statistics_estimate_reltuples_relpages_oid(c.oid))::pg_catalog.float4[] from gp_dist_random('pg_catalog.pg_class') c where c.oid=139594"
-INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
-CONTEXT:  SQL statement "select pg_catalog.sum(pg_catalog.gp_statistics_estimate_reltuples_relpages_oid(c.oid))::pg_catalog.float4[] from gp_dist_random('pg_catalog.pg_class') c where c.oid=139598"
-INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
-CONTEXT:  SQL statement "select pg_catalog.sum(pg_catalog.gp_statistics_estimate_reltuples_relpages_oid(c.oid))::pg_catalog.float4[] from gp_dist_random('pg_catalog.pg_class') c where c.oid=139602"
-INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
-CONTEXT:  SQL statement "select pg_catalog.sum(pg_catalog.gp_statistics_estimate_reltuples_relpages_oid(c.oid))::pg_catalog.float4[] from gp_dist_random('pg_catalog.pg_class') c where c.oid=139606"
-INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
-CONTEXT:  SQL statement "select pg_catalog.sum(pg_catalog.gp_statistics_estimate_reltuples_relpages_oid(c.oid))::pg_catalog.float4[] from gp_dist_random('pg_catalog.pg_class') c where c.oid=139586"
-INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
-CONTEXT:  SQL statement "select Ta.a , Ta.b , Ta.c  from public.dd_singlecol_part_idx_1_prt_extra as Ta  limit 30000 "
-INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
-CONTEXT:  SQL statement "select pg_catalog.sum(pg_catalog.gp_statistics_estimate_reltuples_relpages_oid(c.oid))::pg_catalog.float4[] from gp_dist_random('pg_catalog.pg_class') c where c.oid=139611"
-INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
-CONTEXT:  SQL statement "select pg_catalog.sum(pg_catalog.gp_statistics_estimate_reltuples_relpages_oid(c.oid))::pg_catalog.float4[] from gp_dist_random('pg_catalog.pg_class') c where c.oid=139590"
-INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
-CONTEXT:  SQL statement "select pg_catalog.sum(pg_catalog.gp_statistics_estimate_reltuples_relpages_oid(c.oid))::pg_catalog.float4[] from gp_dist_random('pg_catalog.pg_class') c where c.oid=139594"
-INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
-CONTEXT:  SQL statement "select pg_catalog.sum(pg_catalog.gp_statistics_estimate_reltuples_relpages_oid(c.oid))::pg_catalog.float4[] from gp_dist_random('pg_catalog.pg_class') c where c.oid=139598"
-INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
-CONTEXT:  SQL statement "select pg_catalog.sum(pg_catalog.gp_statistics_estimate_reltuples_relpages_oid(c.oid))::pg_catalog.float4[] from gp_dist_random('pg_catalog.pg_class') c where c.oid=139602"
-INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
-CONTEXT:  SQL statement "select pg_catalog.sum(pg_catalog.gp_statistics_estimate_reltuples_relpages_oid(c.oid))::pg_catalog.float4[] from gp_dist_random('pg_catalog.pg_class') c where c.oid=139606"
-INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
-CONTEXT:  SQL statement "select pg_catalog.sum(pg_catalog.gp_statistics_estimate_reltuples_relpages_oid(c.oid))::pg_catalog.float4[] from gp_dist_random('pg_catalog.pg_class') c where c.oid=139586"
 analyze dd_singlecol_part_idx2;
-INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
-CONTEXT:  SQL statement "select pg_catalog.sum(pg_catalog.gp_statistics_estimate_reltuples_relpages_oid(c.oid))::pg_catalog.float4[] from gp_dist_random('pg_catalog.pg_class') c where c.oid=139624"
-INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
-CONTEXT:  SQL statement "select Ta.a , Ta.b , Ta.c  from public.dd_singlecol_part_idx2_1_prt_2 as Ta  limit 30000 "
-INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
-CONTEXT:  SQL statement "select pg_catalog.sum(pg_catalog.gp_statistics_estimate_reltuples_relpages_oid(c.oid))::pg_catalog.float4[] from gp_dist_random('pg_catalog.pg_class') c where c.oid=139646"
-INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
-CONTEXT:  SQL statement "select pg_catalog.sum(pg_catalog.gp_statistics_estimate_reltuples_relpages_oid(c.oid))::pg_catalog.float4[] from gp_dist_random('pg_catalog.pg_class') c where c.oid=139628"
-INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
-CONTEXT:  SQL statement "select pg_catalog.sum(pg_catalog.gp_statistics_estimate_reltuples_relpages_oid(c.oid))::pg_catalog.float4[] from gp_dist_random('pg_catalog.pg_class') c where c.oid=139632"
-INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
-CONTEXT:  SQL statement "select pg_catalog.sum(pg_catalog.gp_statistics_estimate_reltuples_relpages_oid(c.oid))::pg_catalog.float4[] from gp_dist_random('pg_catalog.pg_class') c where c.oid=139636"
-INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
-CONTEXT:  SQL statement "select pg_catalog.sum(pg_catalog.gp_statistics_estimate_reltuples_relpages_oid(c.oid))::pg_catalog.float4[] from gp_dist_random('pg_catalog.pg_class') c where c.oid=139640"
-INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
-CONTEXT:  SQL statement "select pg_catalog.sum(pg_catalog.gp_statistics_estimate_reltuples_relpages_oid(c.oid))::pg_catalog.float4[] from gp_dist_random('pg_catalog.pg_class') c where c.oid=139620"
-INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
-CONTEXT:  SQL statement "select Ta.a , Ta.b , Ta.c  from public.dd_singlecol_part_idx2_1_prt_extra as Ta  limit 30000 "
-INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
-CONTEXT:  SQL statement "select pg_catalog.sum(pg_catalog.gp_statistics_estimate_reltuples_relpages_oid(c.oid))::pg_catalog.float4[] from gp_dist_random('pg_catalog.pg_class') c where c.oid=139645"
-INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
-CONTEXT:  SQL statement "select pg_catalog.sum(pg_catalog.gp_statistics_estimate_reltuples_relpages_oid(c.oid))::pg_catalog.float4[] from gp_dist_random('pg_catalog.pg_class') c where c.oid=139624"
-INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
-CONTEXT:  SQL statement "select pg_catalog.sum(pg_catalog.gp_statistics_estimate_reltuples_relpages_oid(c.oid))::pg_catalog.float4[] from gp_dist_random('pg_catalog.pg_class') c where c.oid=139628"
-INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
-CONTEXT:  SQL statement "select pg_catalog.sum(pg_catalog.gp_statistics_estimate_reltuples_relpages_oid(c.oid))::pg_catalog.float4[] from gp_dist_random('pg_catalog.pg_class') c where c.oid=139632"
-INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
-CONTEXT:  SQL statement "select pg_catalog.sum(pg_catalog.gp_statistics_estimate_reltuples_relpages_oid(c.oid))::pg_catalog.float4[] from gp_dist_random('pg_catalog.pg_class') c where c.oid=139636"
-INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
-CONTEXT:  SQL statement "select pg_catalog.sum(pg_catalog.gp_statistics_estimate_reltuples_relpages_oid(c.oid))::pg_catalog.float4[] from gp_dist_random('pg_catalog.pg_class') c where c.oid=139640"
-INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
-CONTEXT:  SQL statement "select pg_catalog.sum(pg_catalog.gp_statistics_estimate_reltuples_relpages_oid(c.oid))::pg_catalog.float4[] from gp_dist_random('pg_catalog.pg_class') c where c.oid=139620"
 -- indexes on partitioned tables
 select * from dd_singlecol_part_idx where a=1 and b>0;
 INFO:  (slice 1) Dispatch command to SINGLE content
@@ -941,8 +767,8 @@ INFO:  (slice 1) Dispatch command to SINGLE content
 
 -- inner joins
 select * from dd_singlecol_1 t1, dd_singlecol_2 t2 where t1.a=t2.a and t1.a=1;
-INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
 INFO:  (slice 2) Dispatch command to ALL contents: 0 1 2
+INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
  a | b | a | b 
 ---+---+---+---
  1 | 1 | 1 | 1
@@ -965,16 +791,16 @@ INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
 (10 rows)
 
 select * from dd_singlecol_1 t1, dd_singlecol_2 t2 where t1.b>t2.a and t1.a=1;
-INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
 INFO:  (slice 2) Dispatch command to ALL contents: 0 1 2
+INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
  a | b | a | b 
 ---+---+---+---
 (0 rows)
 
 -- outer joins
 select * from dd_singlecol_1 t1 left outer join dd_singlecol_2 t2 on (t1.a=t2.a) where t1.a=1;
-INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
 INFO:  (slice 2) Dispatch command to ALL contents: 0 1 2
+INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
  a | b | a | b 
 ---+---+---+---
  1 | 1 | 1 | 1
@@ -1032,23 +858,23 @@ INFO:  (slice 2) Dispatch command to ALL contents: 0 1 2
 
 -- subqueries
 select * from dd_singlecol_1 t1 where a=1 and b < (select count(*) from dd_singlecol_2 t2 where t2.a=t1.a);
-INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
 INFO:  (slice 2) Dispatch command to ALL contents: 0 1 2
+INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
  a | b 
 ---+---
 (0 rows)
 
 select * from dd_singlecol_1 t1 where a=1 and b in (select count(*) from dd_singlecol_2 t2 where t2.a<=t1.a);
-INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
 INFO:  (slice 2) Dispatch command to ALL contents: 0 1 2
+INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
  a | b 
 ---+---
  1 | 1
 (1 row)
 
 select t1.a, t1.b, (select sum(t2.a+t2.b) from dd_singlecol_2 t2 where t2.b=1) from dd_singlecol_1 t1  where t1.a=1; 
-INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
 INFO:  (slice 3) Dispatch command to ALL contents: 0 1 2
+INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
 INFO:  (slice 2) Dispatch command to SINGLE content
  a | b | sum 
 ---+---+-----
@@ -1090,16 +916,16 @@ INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
 
 -- group by and sort
 select b, count(*) from dd_singlecol_1 where a=1 group by b;
-INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
 INFO:  (slice 2) Dispatch command to ALL contents: 0 1 2
+INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
  b | count 
 ---+-------
  1 |     1
 (1 row)
 
 select b, count(*) from dd_singlecol_1 where a=1 group by b order by b;
-INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
 INFO:  (slice 2) Dispatch command to ALL contents: 0 1 2
+INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
  b | count 
 ---+-------
  1 |     1

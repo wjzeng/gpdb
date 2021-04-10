@@ -3,11 +3,12 @@
  * stringinfo.h
  *	  Declarations/definitions for "StringInfo" functions.
  *
- * StringInfo provides an indefinitely-extensible string data type.
- * It can be used to buffer either ordinary C strings (null-terminated text)
- * or arbitrary binary data.  All storage is allocated with palloc().
+ * StringInfo provides an extensible string data type (currently limited to a
+ * length of 1GB).  It can be used to buffer either ordinary C strings
+ * (null-terminated text) or arbitrary binary data.  All storage is allocated
+ * with palloc() (falling back to malloc in frontend code).
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/lib/stringinfo.h
@@ -94,10 +95,7 @@ extern void resetStringInfo(StringInfo str);
  * to str if necessary.  This is sort of like a combination of sprintf and
  * strcat.
  */
-extern void
-appendStringInfo(StringInfo str, const char *fmt,...)
-/* This extension allows gcc to check the format string */
-__attribute__((format(PG_PRINTF_ATTRIBUTE, 2, 3)));
+extern void appendStringInfo(StringInfo str, const char *fmt,...) pg_attribute_printf(2, 3);
 
 /*------------------------
  * appendStringInfoVA
@@ -108,9 +106,7 @@ __attribute__((format(PG_PRINTF_ATTRIBUTE, 2, 3)));
  * pass the return value to enlargeStringInfo() before trying again; see
  * appendStringInfo for standard usage pattern.
  */
-extern int
-appendStringInfoVA(StringInfo str, const char *fmt, va_list args)
-__attribute__((format(PG_PRINTF_ATTRIBUTE, 2, 0)));
+extern int	appendStringInfoVA(StringInfo str, const char *fmt, va_list args) pg_attribute_printf(2, 0);
 
 /*------------------------
  * appendStringInfoString
@@ -148,7 +144,7 @@ extern void appendStringInfoSpaces(StringInfo str, int count);
  * if necessary.
  */
 extern void appendBinaryStringInfo(StringInfo str,
-					   const void *data, int datalen);
+								   const char *data, int datalen);
 
 /*------------------------
  * appendStringInfoLiteral
@@ -161,16 +157,18 @@ extern void appendBinaryStringInfo(StringInfo str,
 #define appendStringInfoLiteral(str, lit) (appendBinaryStringInfo(str, (lit), sizeof((lit)) - 1))
 
 /*------------------------
+ * appendBinaryStringInfoNT
+ * Append arbitrary binary data to a StringInfo, allocating more space
+ * if necessary. Does not ensure a trailing null-byte exists.
+ */
+extern void appendBinaryStringInfoNT(StringInfo str,
+									 const char *data, int datalen);
+
+/*------------------------
  * enlargeStringInfo
  * Make sure a StringInfo's buffer can hold at least 'needed' more bytes.
  */
 extern void enlargeStringInfo(StringInfo str, int needed);
-
-/*------------------------
- * truncateStringInfo
- * Make sure a StringInfo's string is no longer than 'nchars' characters.
- */
-extern void truncateStringInfo(StringInfo str, int nchars);
 
 /*------------------------
  * replaceStringInfoString
@@ -179,4 +177,4 @@ extern void truncateStringInfo(StringInfo str, int nchars);
 
 extern void replaceStringInfoString(StringInfo str, char *replace, char *replacement);
 
-#endif   /* STRINGINFO_H */
+#endif							/* STRINGINFO_H */

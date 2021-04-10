@@ -7,11 +7,8 @@ top_builddir = ../../..
 include $(top_builddir)/src/Makefile.global
 
 NAME = isolation2_regress
-OBJS = isolation2_regress.o
+OBJS = isolation2_regress.o workfile_mgr_test.o
 include $(top_srcdir)/src/Makefile.shlib
-
-# where to find psql for testing an existing installation
-PSQLDIR = $(bindir)
 
 ifeq ($(PORTNAME), win32)
 LDLIBS += -lws2_32
@@ -20,7 +17,10 @@ endif
 override CPPFLAGS := -I$(srcdir) -I$(libpq_srcdir) -I$(srcdir)/../regress $(CPPFLAGS)
 override LDLIBS := $(libpq_pgport) $(LDLIBS)
 
-all: pg_isolation2_regress$(X) all-lib
+all: pg_isolation2_regress$(X) all-lib data extended_protocol_test
+
+extended_protocol_test: extended_protocol_test.c
+	$(CC) $(CPPFLAGS) -I$(top_builddir)/src/interfaces/libpq -L$(GPHOME)/lib -L$(top_builddir)/src/interfaces/libpq  -o $@ $< -lpq
 
 pg_regress.o:
 	$(MAKE) -C $(top_builddir)/src/test/regress pg_regress.o
@@ -41,6 +41,9 @@ atmsort.pm:
 explain.pm:
 	rm -f $@ && $(LN_S) $(top_builddir)/src/test/regress/explain.pm
 
+data:
+	rm -f $@ && $(LN_S) $(top_builddir)/src/test/regress/data
+
 pg_isolation2_regress$(X): isolation2_main.o pg_regress.o submake-libpq submake-libpgport
 	$(CC) $(CFLAGS) $(filter %.o,$^) $(libpq_pgport) $(LDFLAGS) $(LDFLAGS_EX) $(LIBS) -o $@
 
@@ -48,12 +51,13 @@ clean distclean:
 	rm -f pg_isolation2_regress$(X) $(OBJS) isolation2_main.o
 	rm -f pg_regress.o
 	rm -f gpstringsubs.pl gpdiff.pl atmsort.pm explain.pm
+	rm -f data
 	rm -rf $(pg_regress_clean_files)
 
 install: all gpdiff.pl gpstringsubs.pl
 
 installcheck: install
-	./pg_isolation2_regress --init-file=$(top_builddir)/src/test/regress/init_file --init-file=./init_file_isolation2 --psqldir='$(PSQLDIR)' --inputdir=$(srcdir) --ao-dir=uao --schedule=$(srcdir)/isolation2_schedule --exclude-tests=$(EXCLUDE_TESTS)
+	$(pg_isolation2_regress_installcheck) --init-file=$(top_builddir)/src/test/regress/init_file --init-file=./init_file_isolation2 --schedule=$(srcdir)/isolation2_schedule
 
 installcheck-resgroup: install
-	./pg_isolation2_regress --init-file=$(top_builddir)/src/test/regress/init_file --init-file=./init_file_resgroup --psqldir='$(PSQLDIR)' --inputdir=$(srcdir) --resgroup-dir=resgroup --dbname=isolation2resgrouptest --schedule=$(srcdir)/isolation2_resgroup_schedule
+	$(pg_isolation2_regress_installcheck) --init-file=$(top_builddir)/src/test/regress/init_file --init-file=./init_file_resgroup --dbname=isolation2resgrouptest --schedule=$(srcdir)/isolation2_resgroup_schedule

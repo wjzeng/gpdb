@@ -6,7 +6,7 @@
  * See src/backend/optimizer/README for discussion of EquivalenceClasses.
  *
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -16,51 +16,54 @@
  */
 #include "postgres.h"
 
-#include "access/skey.h"
+#include <limits.h>
+
+#include "access/stratnum.h"
 #include "catalog/pg_type.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
+#include "optimizer/appendinfo.h"
 #include "optimizer/clauses.h"
+#include "optimizer/optimizer.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
 #include "optimizer/planmain.h"
-#include "optimizer/prep.h"
-#include "optimizer/var.h"
+#include "optimizer/restrictinfo.h"
 #include "utils/lsyscache.h"
 
 
 static EquivalenceMember *add_eq_member(EquivalenceClass *ec,
-			  Expr *expr, Relids relids, Relids nullable_relids,
-			  bool is_child, Oid datatype);
+										Expr *expr, Relids relids, Relids nullable_relids,
+										bool is_child, Oid datatype);
 static void generate_base_implied_equalities_const(PlannerInfo *root,
-									   EquivalenceClass *ec);
+												   EquivalenceClass *ec);
 static void generate_base_implied_equalities_no_const(PlannerInfo *root,
-										  EquivalenceClass *ec);
+													  EquivalenceClass *ec);
 static void generate_base_implied_equalities_broken(PlannerInfo *root,
-										EquivalenceClass *ec);
+													EquivalenceClass *ec);
 static List *generate_join_implied_equalities_normal(PlannerInfo *root,
-										EquivalenceClass *ec,
-										Relids join_relids,
-										Relids outer_relids,
-										Relids inner_relids);
+													 EquivalenceClass *ec,
+													 Relids join_relids,
+													 Relids outer_relids,
+													 Relids inner_relids);
 static List *generate_join_implied_equalities_broken(PlannerInfo *root,
-										EquivalenceClass *ec,
-										Relids nominal_join_relids,
-										Relids outer_relids,
-										Relids nominal_inner_relids,
-										AppendRelInfo *inner_appinfo);
-static Oid select_equality_operator(EquivalenceClass *ec,
-						 Oid lefttype, Oid righttype);
+													 EquivalenceClass *ec,
+													 Relids nominal_join_relids,
+													 Relids outer_relids,
+													 Relids nominal_inner_relids,
+													 RelOptInfo *inner_rel);
+static Oid	select_equality_operator(EquivalenceClass *ec,
+									 Oid lefttype, Oid righttype);
 static RestrictInfo *create_join_clause(PlannerInfo *root,
-				   EquivalenceClass *ec, Oid opno,
-				   EquivalenceMember *leftem,
-				   EquivalenceMember *rightem,
-				   EquivalenceClass *parent_ec);
+										EquivalenceClass *ec, Oid opno,
+										EquivalenceMember *leftem,
+										EquivalenceMember *rightem,
+										EquivalenceClass *parent_ec);
 static bool reconsider_outer_join_clause(PlannerInfo *root,
-							 RestrictInfo *rinfo,
-							 bool outer_on_left);
+										 RestrictInfo *rinfo,
+										 bool outer_on_left);
 static bool reconsider_full_join_clause(PlannerInfo *root,
-							RestrictInfo *rinfo);
+										RestrictInfo *rinfo);
 
 
 /*
@@ -69,8 +72,14 @@ static bool reconsider_full_join_clause(PlannerInfo *root,
  *	  any delay by an outer join, so its two sides can be considered equal
  *	  anywhere they are both computable; moreover that equality can be
  *	  extended transitively.  Record this knowledge in the EquivalenceClass
- *	  data structure.  Returns TRUE if successful, FALSE if not (in which
- *	  case caller should treat the clause as ordinary, not an equivalence).
+ *	  data structure, if applicable.  Returns true if successful, false if not
+ *	  (in which case caller should treat the clause as ordinary, not an
+ *	  equivalence).
+ *
+ * In some cases, although we cannot convert a clause into EquivalenceClass
+ * knowledge, we can still modify it to a more useful form than the original.
+ * Then, *p_restrictinfo will be replaced by a new RestrictInfo, which is what
+ * the caller should use for further processing.
  *
  * If below_outer_join is true, then the clause was found below the nullable
  * side of an outer join, so its sides might validly be both NULL rather than
@@ -78,8 +87,15 @@ static bool reconsider_full_join_clause(PlannerInfo *root,
  * care to mark an EquivalenceClass if it came from any such clauses.  Also,
  * we have to check that both sides are either pseudo-constants or strict
  * functions of Vars, else they might not both go to NULL above the outer
- * join.  (This is the reason why we need a failure return.  It's more
+ * join.  (This is the main reason why we need a failure return.  It's more
  * convenient to check this case here than at the call sites...)
+ *
+ * We also reject proposed equivalence clauses if they contain leaky functions
+ * and have security_level above zero.  The EC evaluation rules require us to
+ * apply certain tests at certain joining levels, and we can't tolerate
+ * delaying any test on security_level grounds.  By rejecting candidate clauses
+ * that might require security delays, we ensure it's safe to apply an EC
+ * clause as soon as it's supposed to be applied.
  *
  * On success return, we have also initialized the clause's left_ec/right_ec
  * fields to point to the EquivalenceClass representing it.  This saves lookup
@@ -95,9 +111,11 @@ static bool reconsider_full_join_clause(PlannerInfo *root,
  * memory context.
  */
 bool
-process_equivalence(PlannerInfo *root, RestrictInfo *restrictinfo,
+process_equivalence(PlannerInfo *root,
+					RestrictInfo **p_restrictinfo,
 					bool below_outer_join)
 {
+	RestrictInfo *restrictinfo = *p_restrictinfo;
 	Expr	   *clause = restrictinfo->clause;
 	Oid			opno,
 				collation,
@@ -120,6 +138,10 @@ process_equivalence(PlannerInfo *root, RestrictInfo *restrictinfo,
 	Assert(restrictinfo->left_ec == NULL);
 	Assert(restrictinfo->right_ec == NULL);
 
+	/* Reject if it is potentially postponable by security considerations */
+	if (restrictinfo->security_level > 0 && !restrictinfo->leakproof)
+		return false;
+
 	/* Extract info from given clause */
 	Assert(is_opclause(clause));
 	opno = ((OpExpr *) clause)->opno;
@@ -141,16 +163,45 @@ process_equivalence(PlannerInfo *root, RestrictInfo *restrictinfo,
 									   collation);
 
 	/*
-	 * Reject clauses of the form X=X.  These are not as redundant as they
-	 * might seem at first glance: assuming the operator is strict, this is
-	 * really an expensive way to write X IS NOT NULL.  So we must not risk
-	 * just losing the clause, which would be possible if there is already a
-	 * single-element EquivalenceClass containing X.  The case is not common
-	 * enough to be worth contorting the EC machinery for, so just reject the
-	 * clause and let it be processed as a normal restriction clause.
+	 * Clauses of the form X=X cannot be translated into EquivalenceClasses.
+	 * We'd either end up with a single-entry EC, losing the knowledge that
+	 * the clause was present at all, or else make an EC with duplicate
+	 * entries, causing other issues.
 	 */
 	if (equal(item1, item2))
-		return false;			/* X=X is not a useful equivalence */
+	{
+		/*
+		 * If the operator is strict, then the clause can be treated as just
+		 * "X IS NOT NULL".  (Since we know we are considering a top-level
+		 * qual, we can ignore the difference between FALSE and NULL results.)
+		 * It's worth making the conversion because we'll typically get a much
+		 * better selectivity estimate than we would for X=X.
+		 *
+		 * If the operator is not strict, we can't be sure what it will do
+		 * with NULLs, so don't attempt to optimize it.
+		 */
+		set_opfuncid((OpExpr *) clause);
+		if (func_strict(((OpExpr *) clause)->opfuncid))
+		{
+			NullTest   *ntest = makeNode(NullTest);
+
+			ntest->arg = item1;
+			ntest->nulltesttype = IS_NOT_NULL;
+			ntest->argisrow = false;	/* correct even if composite arg */
+			ntest->location = -1;
+
+			*p_restrictinfo =
+				make_restrictinfo((Expr *) ntest,
+								  restrictinfo->is_pushed_down,
+								  restrictinfo->outerjoin_delayed,
+								  restrictinfo->pseudoconstant,
+								  restrictinfo->security_level,
+								  NULL,
+								  restrictinfo->outer_relids,
+								  restrictinfo->nullable_relids);
+		}
+		return false;
+	}
 
 	/*
 	 * If below outer join, check for strictness, else reject.
@@ -231,7 +282,7 @@ process_equivalence(PlannerInfo *root, RestrictInfo *restrictinfo,
 		{
 			EquivalenceMember *cur_em = (EquivalenceMember *) lfirst(lc2);
 
-			Assert(!cur_em->em_is_child);		/* no children yet */
+			Assert(!cur_em->em_is_child);	/* no children yet */
 
 			/*
 			 * If below an outer join, don't match constants: they're not as
@@ -275,6 +326,10 @@ process_equivalence(PlannerInfo *root, RestrictInfo *restrictinfo,
 		{
 			ec1->ec_sources = lappend(ec1->ec_sources, restrictinfo);
 			ec1->ec_below_outer_join |= below_outer_join;
+			ec1->ec_min_security = Min(ec1->ec_min_security,
+									   restrictinfo->security_level);
+			ec1->ec_max_security = Max(ec1->ec_max_security,
+									   restrictinfo->security_level);
 			/* mark the RI as associated with this eclass */
 			restrictinfo->left_ec = ec1;
 			restrictinfo->right_ec = ec1;
@@ -306,6 +361,10 @@ process_equivalence(PlannerInfo *root, RestrictInfo *restrictinfo,
 		ec1->ec_has_const |= ec2->ec_has_const;
 		/* can't need to set has_volatile */
 		ec1->ec_below_outer_join |= ec2->ec_below_outer_join;
+		ec1->ec_min_security = Min(ec1->ec_min_security,
+								   ec2->ec_min_security);
+		ec1->ec_max_security = Max(ec1->ec_max_security,
+								   ec2->ec_max_security);
 		ec2->ec_merged = ec1;
 		root->eq_classes = list_delete_ptr(root->eq_classes, ec2);
 		/* just to avoid debugging confusion w/ dangling pointers: */
@@ -315,6 +374,10 @@ process_equivalence(PlannerInfo *root, RestrictInfo *restrictinfo,
 		ec2->ec_relids = NULL;
 		ec1->ec_sources = lappend(ec1->ec_sources, restrictinfo);
 		ec1->ec_below_outer_join |= below_outer_join;
+		ec1->ec_min_security = Min(ec1->ec_min_security,
+								   restrictinfo->security_level);
+		ec1->ec_max_security = Max(ec1->ec_max_security,
+								   restrictinfo->security_level);
 		/* mark the RI as associated with this eclass */
 		restrictinfo->left_ec = ec1;
 		restrictinfo->right_ec = ec1;
@@ -329,6 +392,10 @@ process_equivalence(PlannerInfo *root, RestrictInfo *restrictinfo,
 							false, item2_type);
 		ec1->ec_sources = lappend(ec1->ec_sources, restrictinfo);
 		ec1->ec_below_outer_join |= below_outer_join;
+		ec1->ec_min_security = Min(ec1->ec_min_security,
+								   restrictinfo->security_level);
+		ec1->ec_max_security = Max(ec1->ec_max_security,
+								   restrictinfo->security_level);
 		/* mark the RI as associated with this eclass */
 		restrictinfo->left_ec = ec1;
 		restrictinfo->right_ec = ec1;
@@ -343,6 +410,10 @@ process_equivalence(PlannerInfo *root, RestrictInfo *restrictinfo,
 							false, item1_type);
 		ec2->ec_sources = lappend(ec2->ec_sources, restrictinfo);
 		ec2->ec_below_outer_join |= below_outer_join;
+		ec2->ec_min_security = Min(ec2->ec_min_security,
+								   restrictinfo->security_level);
+		ec2->ec_max_security = Max(ec2->ec_max_security,
+								   restrictinfo->security_level);
 		/* mark the RI as associated with this eclass */
 		restrictinfo->left_ec = ec2;
 		restrictinfo->right_ec = ec2;
@@ -366,6 +437,8 @@ process_equivalence(PlannerInfo *root, RestrictInfo *restrictinfo,
 		ec->ec_below_outer_join = below_outer_join;
 		ec->ec_broken = false;
 		ec->ec_sortref = 0;
+		ec->ec_min_security = restrictinfo->security_level;
+		ec->ec_max_security = restrictinfo->security_level;
 		ec->ec_merged = NULL;
 		em1 = add_eq_member(ec, item1, item1_relids, item1_nullable_relids,
 							false, item1_type);
@@ -424,8 +497,9 @@ canonicalize_ec_expression(Expr *expr, Oid req_type, Oid req_collation)
 
 	/*
 	 * For a polymorphic-input-type opclass, just keep the same exposed type.
+	 * RECORD opclasses work like polymorphic-type ones for this purpose.
 	 */
-	if (IsPolymorphicType(req_type))
+	if (IsPolymorphicType(req_type) || req_type == RECORDOID)
 		req_type = expr_type;
 
 	/*
@@ -529,8 +603,8 @@ add_eq_member(EquivalenceClass *ec, Expr *expr, Relids relids,
  * so for now we live with just reporting the first match.  See also
  * generate_implied_equalities_for_column and match_pathkeys_to_index.)
  *
- * If create_it is TRUE, we'll build a new EquivalenceClass when there is no
- * match.  If create_it is FALSE, we just return NULL when no match.
+ * If create_it is true, we'll build a new EquivalenceClass when there is no
+ * match.  If create_it is false, we just return NULL when no match.
  *
  * This can be used safely both before and after EquivalenceClass merging;
  * since it never causes merging it does not invalidate any existing ECs
@@ -639,6 +713,8 @@ get_eclass_for_sort_expr(PlannerInfo *root,
 	newec->ec_below_outer_join = false;
 	newec->ec_broken = false;
 	newec->ec_sortref = sortref;
+	newec->ec_min_security = UINT_MAX;
+	newec->ec_max_security = 0;
 	newec->ec_merged = NULL;
 
 	if (newec->ec_has_volatile && sortref == 0) /* should not happen */
@@ -834,6 +910,7 @@ generate_base_implied_equalities_const(PlannerInfo *root,
 								 bms_copy(ec->ec_relids),
 								 bms_union(cur_em->em_nullable_relids,
 										   const_em->em_nullable_relids),
+								 ec->ec_min_security,
 								 ec->ec_below_outer_join,
 								 cur_em->em_is_const);
 	}
@@ -852,11 +929,10 @@ generate_base_implied_equalities_no_const(PlannerInfo *root,
 	/*
 	 * We scan the EC members once and track the last-seen member for each
 	 * base relation.  When we see another member of the same base relation,
-	 * we generate "prev_mem = cur_mem".  This results in the minimum number
-	 * of derived clauses, but it's possible that it will fail when a
-	 * different ordering would succeed.  XXX FIXME: use a UNION-FIND
-	 * algorithm similar to the way we build merged ECs.  (Use a list-of-lists
-	 * for each rel.)
+	 * we generate "prev_em = cur_em".  This results in the minimum number of
+	 * derived clauses, but it's possible that it will fail when a different
+	 * ordering would succeed.  XXX FIXME: use a UNION-FIND algorithm similar
+	 * to the way we build merged ECs.  (Use a list-of-lists for each rel.)
 	 */
 	prev_ems = (EquivalenceMember **)
 		palloc0(root->simple_rel_array_size * sizeof(EquivalenceMember *));
@@ -867,9 +943,8 @@ generate_base_implied_equalities_no_const(PlannerInfo *root,
 		int			relid;
 
 		Assert(!cur_em->em_is_child);	/* no children yet */
-		if (bms_membership(cur_em->em_relids) != BMS_SINGLETON)
+		if (!bms_get_singleton_member(cur_em->em_relids, &relid))
 			continue;
-		relid = bms_singleton_member(cur_em->em_relids);
 		Assert(relid < root->simple_rel_array_size);
 
 		if (prev_ems[relid] != NULL)
@@ -891,6 +966,7 @@ generate_base_implied_equalities_no_const(PlannerInfo *root,
 									 bms_copy(ec->ec_relids),
 									 bms_union(prev_em->em_nullable_relids,
 											   cur_em->em_nullable_relids),
+									 ec->ec_min_security,
 									 ec->ec_below_outer_join,
 									 false);
 		}
@@ -911,7 +987,8 @@ generate_base_implied_equalities_no_const(PlannerInfo *root,
 	{
 		EquivalenceMember *cur_em = (EquivalenceMember *) lfirst(lc);
 		List	   *vars = pull_var_clause((Node *) cur_em->em_expr,
-										   PVC_RECURSE_AGGREGATES,
+										   PVC_RECURSE_AGGREGATES |
+										   PVC_RECURSE_WINDOWFUNCS |
 										   PVC_INCLUDE_PLACEHOLDERS);
 
 		add_vars_to_targetlist(root, vars, ec->ec_relids, false);
@@ -988,7 +1065,7 @@ generate_base_implied_equalities_broken(PlannerInfo *root,
  *
  * join_relids should always equal bms_union(outer_relids, inner_rel->relids).
  * We could simplify this function's API by computing it internally, but in
- * all current uses, the caller has the value at hand anyway.
+ * most current uses, the caller has the value at hand anyway.
  */
 List *
 generate_join_implied_equalities(PlannerInfo *root,
@@ -996,31 +1073,47 @@ generate_join_implied_equalities(PlannerInfo *root,
 								 Relids outer_relids,
 								 RelOptInfo *inner_rel)
 {
+	return generate_join_implied_equalities_for_ecs(root,
+													root->eq_classes,
+													join_relids,
+													outer_relids,
+													inner_rel);
+}
+
+/*
+ * generate_join_implied_equalities_for_ecs
+ *	  As above, but consider only the listed ECs.
+ */
+List *
+generate_join_implied_equalities_for_ecs(PlannerInfo *root,
+										 List *eclasses,
+										 Relids join_relids,
+										 Relids outer_relids,
+										 RelOptInfo *inner_rel)
+{
 	List	   *result = NIL;
 	Relids		inner_relids = inner_rel->relids;
 	Relids		nominal_inner_relids;
 	Relids		nominal_join_relids;
-	AppendRelInfo *inner_appinfo;
 	ListCell   *lc;
 
 	/* If inner rel is a child, extra setup work is needed */
-	if (inner_rel->reloptkind == RELOPT_OTHER_MEMBER_REL)
+	if (IS_OTHER_REL(inner_rel))
 	{
-		/* Lookup parent->child translation data */
-		inner_appinfo = find_childrel_appendrelinfo(root, inner_rel);
-		/* Construct relids for the parent rel */
-		nominal_inner_relids = bms_make_singleton(inner_appinfo->parent_relid);
+		Assert(!bms_is_empty(inner_rel->top_parent_relids));
+
+		/* Fetch relid set for the topmost parent rel */
+		nominal_inner_relids = inner_rel->top_parent_relids;
 		/* ECs will be marked with the parent's relid, not the child's */
 		nominal_join_relids = bms_union(outer_relids, nominal_inner_relids);
 	}
 	else
 	{
-		inner_appinfo = NULL;
 		nominal_inner_relids = inner_relids;
 		nominal_join_relids = join_relids;
 	}
 
-	foreach(lc, root->eq_classes)
+	foreach(lc, eclasses)
 	{
 		EquivalenceClass *ec = (EquivalenceClass *) lfirst(lc);
 		List	   *sublist = NIL;
@@ -1048,10 +1141,10 @@ generate_join_implied_equalities(PlannerInfo *root,
 		if (ec->ec_broken)
 			sublist = generate_join_implied_equalities_broken(root,
 															  ec,
-														 nominal_join_relids,
+															  nominal_join_relids,
 															  outer_relids,
-														nominal_inner_relids,
-															  inner_appinfo);
+															  nominal_inner_relids,
+															  inner_rel);
 
 		result = list_concat(result, sublist);
 	}
@@ -1244,7 +1337,7 @@ generate_join_implied_equalities_broken(PlannerInfo *root,
 										Relids nominal_join_relids,
 										Relids outer_relids,
 										Relids nominal_inner_relids,
-										AppendRelInfo *inner_appinfo)
+										RelOptInfo *inner_rel)
 {
 	List	   *result = NIL;
 	ListCell   *lc;
@@ -1266,10 +1359,16 @@ generate_join_implied_equalities_broken(PlannerInfo *root,
 	 * RestrictInfos that are not listed in ec_derives, but there shouldn't be
 	 * any duplication, and it's a sufficiently narrow corner case that we
 	 * shouldn't sweat too much over it anyway.
+	 *
+	 * Since inner_rel might be an indirect descendant of the baserel
+	 * mentioned in the ec_sources clauses, we have to be prepared to apply
+	 * multiple levels of Var translation.
 	 */
-	if (inner_appinfo)
-		result = (List *) adjust_appendrel_attrs(root, (Node *) result,
-												 inner_appinfo);
+	if (IS_OTHER_REL(inner_rel) && result != NIL)
+		result = (List *) adjust_appendrel_attrs_multilevel(root,
+															(Node *) result,
+															inner_rel->relids,
+															inner_rel->top_parent_relids);
 
 	return result;
 }
@@ -1293,7 +1392,13 @@ select_equality_operator(EquivalenceClass *ec, Oid lefttype, Oid righttype)
 
 		opno = get_opfamily_member(opfamily, lefttype, righttype,
 								   BTEqualStrategyNumber);
-		if (OidIsValid(opno))
+		if (!OidIsValid(opno))
+			continue;
+		/* If no barrier quals in query, don't worry about leaky operators */
+		if (ec->ec_max_security == 0)
+			return opno;
+		/* Otherwise, insist that selected operators be leakproof */
+		if (get_func_leakproof(get_opcode(opno)))
 			return opno;
 	}
 	return InvalidOid;
@@ -1360,7 +1465,8 @@ create_join_clause(PlannerInfo *root,
 										bms_union(leftem->em_relids,
 												  rightem->em_relids),
 										bms_union(leftem->em_nullable_relids,
-											   rightem->em_nullable_relids));
+												  rightem->em_nullable_relids),
+										ec->ec_min_security);
 
 	/* Mark the clause as redundant, or not */
 	rinfo->parent_ec = parent_ec;
@@ -1569,7 +1675,7 @@ reconsider_outer_join_clauses(PlannerInfo *root)
 /*
  * reconsider_outer_join_clauses for a single LEFT/RIGHT JOIN clause
  *
- * Returns TRUE if we were able to propagate a constant through the clause.
+ * Returns true if we were able to propagate a constant through the clause.
  */
 static bool
 reconsider_outer_join_clause(PlannerInfo *root, RestrictInfo *rinfo,
@@ -1637,7 +1743,7 @@ reconsider_outer_join_clause(PlannerInfo *root, RestrictInfo *rinfo,
 		{
 			EquivalenceMember *cur_em = (EquivalenceMember *) lfirst(lc2);
 
-			Assert(!cur_em->em_is_child);		/* no children yet */
+			Assert(!cur_em->em_is_child);	/* no children yet */
 			if (equal(outervar, cur_em->em_expr))
 			{
 				match = true;
@@ -1671,8 +1777,9 @@ reconsider_outer_join_clause(PlannerInfo *root, RestrictInfo *rinfo,
 												   innervar,
 												   cur_em->em_expr,
 												   bms_copy(inner_relids),
-											bms_copy(inner_nullable_relids));
-			if (process_equivalence(root, newrinfo, true))
+												   bms_copy(inner_nullable_relids),
+												   cur_ec->ec_min_security);
+			if (process_equivalence(root, &newrinfo, true))
 				match = true;
 		}
 
@@ -1693,7 +1800,7 @@ reconsider_outer_join_clause(PlannerInfo *root, RestrictInfo *rinfo,
 /*
  * reconsider_outer_join_clauses for a single FULL JOIN clause
  *
- * Returns TRUE if we were able to propagate a constant through the clause.
+ * Returns true if we were able to propagate a constant through the clause.
  */
 static bool
 reconsider_full_join_clause(PlannerInfo *root, RestrictInfo *rinfo)
@@ -1766,7 +1873,7 @@ reconsider_full_join_clause(PlannerInfo *root, RestrictInfo *rinfo)
 		foreach(lc2, cur_ec->ec_members)
 		{
 			coal_em = (EquivalenceMember *) lfirst(lc2);
-			Assert(!coal_em->em_is_child);		/* no children yet */
+			Assert(!coal_em->em_is_child);	/* no children yet */
 			if (IsA(coal_em->em_expr, CoalesceExpr))
 			{
 				CoalesceExpr *cexpr = (CoalesceExpr *) coal_em->em_expr;
@@ -1813,8 +1920,9 @@ reconsider_full_join_clause(PlannerInfo *root, RestrictInfo *rinfo)
 													   leftvar,
 													   cur_em->em_expr,
 													   bms_copy(left_relids),
-											 bms_copy(left_nullable_relids));
-				if (process_equivalence(root, newrinfo, true))
+													   bms_copy(left_nullable_relids),
+													   cur_ec->ec_min_security);
+				if (process_equivalence(root, &newrinfo, true))
 					matchleft = true;
 			}
 			eq_op = select_equality_operator(cur_ec,
@@ -1827,8 +1935,9 @@ reconsider_full_join_clause(PlannerInfo *root, RestrictInfo *rinfo)
 													   rightvar,
 													   cur_em->em_expr,
 													   bms_copy(right_relids),
-											bms_copy(right_nullable_relids));
-				if (process_equivalence(root, newrinfo, true))
+													   bms_copy(right_nullable_relids),
+													   cur_ec->ec_min_security);
+				if (process_equivalence(root, &newrinfo, true))
 					matchright = true;
 			}
 		}
@@ -1906,6 +2015,93 @@ exprs_known_equal(PlannerInfo *root, Node *item1, Node *item2)
 
 
 /*
+ * match_eclasses_to_foreign_key_col
+ *	  See whether a foreign key column match is proven by any eclass.
+ *
+ * If the referenced and referencing Vars of the fkey's colno'th column are
+ * known equal due to any eclass, return that eclass; otherwise return NULL.
+ * (In principle there might be more than one matching eclass if multiple
+ * collations are involved, but since collation doesn't matter for equality,
+ * we ignore that fine point here.)  This is much like exprs_known_equal,
+ * except that we insist on the comparison operator matching the eclass, so
+ * that the result is definite not approximate.
+ */
+EquivalenceClass *
+match_eclasses_to_foreign_key_col(PlannerInfo *root,
+								  ForeignKeyOptInfo *fkinfo,
+								  int colno)
+{
+	Index		var1varno = fkinfo->con_relid;
+	AttrNumber	var1attno = fkinfo->conkey[colno];
+	Index		var2varno = fkinfo->ref_relid;
+	AttrNumber	var2attno = fkinfo->confkey[colno];
+	Oid			eqop = fkinfo->conpfeqop[colno];
+	List	   *opfamilies = NIL;	/* compute only if needed */
+	ListCell   *lc1;
+
+	foreach(lc1, root->eq_classes)
+	{
+		EquivalenceClass *ec = (EquivalenceClass *) lfirst(lc1);
+		bool		item1member = false;
+		bool		item2member = false;
+		ListCell   *lc2;
+
+		/* Never match to a volatile EC */
+		if (ec->ec_has_volatile)
+			continue;
+		/* Note: it seems okay to match to "broken" eclasses here */
+
+		/*
+		 * If eclass visibly doesn't have members for both rels, there's no
+		 * need to grovel through the members.
+		 */
+		if (!bms_is_member(var1varno, ec->ec_relids) ||
+			!bms_is_member(var2varno, ec->ec_relids))
+			continue;
+
+		foreach(lc2, ec->ec_members)
+		{
+			EquivalenceMember *em = (EquivalenceMember *) lfirst(lc2);
+			Var		   *var;
+
+			if (em->em_is_child)
+				continue;		/* ignore children here */
+
+			/* EM must be a Var, possibly with RelabelType */
+			var = (Var *) em->em_expr;
+			while (var && IsA(var, RelabelType))
+				var = (Var *) ((RelabelType *) var)->arg;
+			if (!(var && IsA(var, Var)))
+				continue;
+
+			/* Match? */
+			if (var->varno == var1varno && var->varattno == var1attno)
+				item1member = true;
+			else if (var->varno == var2varno && var->varattno == var2attno)
+				item2member = true;
+
+			/* Have we found both PK and FK column in this EC? */
+			if (item1member && item2member)
+			{
+				/*
+				 * Succeed if eqop matches EC's opfamilies.  We could test
+				 * this before scanning the members, but it's probably cheaper
+				 * to test for member matches first.
+				 */
+				if (opfamilies == NIL)	/* compute if we didn't already */
+					opfamilies = get_mergejoin_opfamilies(eqop);
+				if (equal(opfamilies, ec->ec_opfamilies))
+					return ec;
+				/* Otherwise, done with this EC, move on to the next */
+				break;
+			}
+		}
+	}
+	return NULL;
+}
+
+
+/*
  * add_child_rel_equivalences
  *	  Search for EC members that reference the parent_rel, and
  *	  add transformed members referencing the child_rel.
@@ -1938,11 +2134,10 @@ add_child_rel_equivalences(PlannerInfo *root,
 			continue;
 
 		/*
-		 * No point in searching if parent rel not mentioned in eclass; but we
-		 * can't tell that for sure if parent rel is itself a child.
+		 * No point in searching if child's topmost parent rel is not
+		 * mentioned in eclass.
 		 */
-		if (parent_rel->reloptkind == RELOPT_BASEREL &&
-			!bms_is_subset(parent_rel->relids, cur_ec->ec_relids))
+		if (!bms_is_subset(child_rel->top_parent_relids, cur_ec->ec_relids))
 			continue;
 
 		foreach(lc2, cur_ec->ec_members)
@@ -1952,17 +2147,41 @@ add_child_rel_equivalences(PlannerInfo *root,
 			if (cur_em->em_is_const)
 				continue;		/* ignore consts here */
 
-			/* Does it reference parent_rel? */
-			if (bms_overlap(cur_em->em_relids, parent_rel->relids))
+			/*
+			 * We consider only original EC members here, not
+			 * already-transformed child members.  Otherwise, if some original
+			 * member expression references more than one appendrel, we'd get
+			 * an O(N^2) explosion of useless derived expressions for
+			 * combinations of children.
+			 */
+			if (cur_em->em_is_child)
+				continue;		/* ignore children here */
+
+			/* Does this member reference child's topmost parent rel? */
+			if (bms_overlap(cur_em->em_relids, child_rel->top_parent_relids))
 			{
 				/* Yes, generate transformed child version */
 				Expr	   *child_expr;
 				Relids		new_relids;
 				Relids		new_nullable_relids;
 
-				child_expr = (Expr *)
-					adjust_appendrel_attrs(root, (Node *) cur_em->em_expr,
-										   appinfo);
+				if (parent_rel->reloptkind == RELOPT_BASEREL)
+				{
+					/* Simple single-level transformation */
+					child_expr = (Expr *)
+						adjust_appendrel_attrs(root,
+											   (Node *) cur_em->em_expr,
+											   1, &appinfo);
+				}
+				else
+				{
+					/* Must do multi-level transformation */
+					child_expr = (Expr *)
+						adjust_appendrel_attrs_multilevel(root,
+														  (Node *) cur_em->em_expr,
+														  child_rel->relids,
+														  child_rel->top_parent_relids);
+				}
 
 				/*
 				 * Transform em_relids to match.  Note we do *not* do
@@ -1971,7 +2190,7 @@ add_child_rel_equivalences(PlannerInfo *root,
 				 * don't want the child member to be marked as constant.
 				 */
 				new_relids = bms_difference(cur_em->em_relids,
-											parent_rel->relids);
+											child_rel->top_parent_relids);
 				new_relids = bms_add_members(new_relids, child_rel->relids);
 
 				/*
@@ -1979,10 +2198,11 @@ add_child_rel_equivalences(PlannerInfo *root,
 				 * parent and child relids are singletons.
 				 */
 				new_nullable_relids = cur_em->em_nullable_relids;
-				if (bms_overlap(new_nullable_relids, parent_rel->relids))
+				if (bms_overlap(new_nullable_relids,
+								child_rel->top_parent_relids))
 				{
 					new_nullable_relids = bms_difference(new_nullable_relids,
-														 parent_rel->relids);
+														 child_rel->top_parent_relids);
 					new_nullable_relids = bms_add_members(new_nullable_relids,
 														  child_rel->relids);
 				}
@@ -1991,48 +2211,6 @@ add_child_rel_equivalences(PlannerInfo *root,
 									 new_relids, new_nullable_relids,
 									 true, cur_em->em_datatype);
 			}
-		}
-	}
-}
-
-
-/*
- * mutate_eclass_expressions
- *	  Apply an expression tree mutator to all expressions stored in
- *	  equivalence classes (but ignore child exprs unless include_child_exprs).
- *
- * This is a bit of a hack ... it's currently needed only by planagg.c,
- * which needs to do a global search-and-replace of MIN/MAX Aggrefs
- * after eclasses are already set up.  Without changing the eclasses too,
- * subsequent matching of ORDER BY and DISTINCT clauses would fail.
- *
- * Note that we assume the mutation won't affect relation membership or any
- * other properties we keep track of (which is a bit bogus, but by the time
- * planagg.c runs, it no longer matters).  Also we must be called in the
- * main planner memory context.
- */
-void
-mutate_eclass_expressions(PlannerInfo *root,
-						  Node *(*mutator) (),
-						  void *context,
-						  bool include_child_exprs)
-{
-	ListCell   *lc1;
-
-	foreach(lc1, root->eq_classes)
-	{
-		EquivalenceClass *cur_ec = (EquivalenceClass *) lfirst(lc1);
-		ListCell   *lc2;
-
-		foreach(lc2, cur_ec->ec_members)
-		{
-			EquivalenceMember *cur_em = (EquivalenceMember *) lfirst(lc2);
-
-			if (cur_em->em_is_child && !include_child_exprs)
-				continue;		/* ignore children unless requested */
-
-			cur_em->em_expr = (Expr *)
-				mutator((Node *) cur_em->em_expr, context);
 		}
 	}
 }
@@ -2070,14 +2248,17 @@ generate_implied_equalities_for_column(PlannerInfo *root,
 {
 	List	   *result = NIL;
 	bool		is_child_rel = (rel->reloptkind == RELOPT_OTHER_MEMBER_REL);
-	Index		parent_relid;
+	Relids		parent_relids;
 	ListCell   *lc1;
 
-	/* If it's a child rel, we'll need to know what its parent is */
+	/* Indexes are available only on base or "other" member relations. */
+	Assert(IS_SIMPLE_REL(rel));
+
+	/* If it's a child rel, we'll need to know what its parent(s) are */
 	if (is_child_rel)
-		parent_relid = find_childrel_appendrelinfo(root, rel)->parent_relid;
+		parent_relids = find_childrel_parents(root, rel);
 	else
-		parent_relid = 0;		/* not used, but keep compiler quiet */
+		parent_relids = NULL;	/* not used, but keep compiler quiet */
 
 	foreach(lc1, root->eq_classes)
 	{
@@ -2147,10 +2328,10 @@ generate_implied_equalities_for_column(PlannerInfo *root,
 
 			/*
 			 * Also, if this is a child rel, avoid generating a useless join
-			 * to its parent rel.
+			 * to its parent rel(s).
 			 */
 			if (is_child_rel &&
-				bms_is_member(parent_relid, other_em->em_relids))
+				bms_overlap(parent_relids, other_em->em_relids))
 				continue;
 
 			eq_op = select_equality_operator(cur_ec,
@@ -2283,9 +2464,11 @@ has_relevant_eclass_joinclause(PlannerInfo *root, RelOptInfo *rel1)
  * from actually being generated.
  */
 bool
-eclass_useful_for_merging(EquivalenceClass *eclass,
+eclass_useful_for_merging(PlannerInfo *root,
+						  EquivalenceClass *eclass,
 						  RelOptInfo *rel)
 {
+	Relids		relids;
 	ListCell   *lc;
 
 	Assert(!eclass->ec_merged);
@@ -2303,8 +2486,17 @@ eclass_useful_for_merging(EquivalenceClass *eclass,
 	 * possibly-overoptimistic heuristic.
 	 */
 
+	/* If specified rel is a child, we must consider the topmost parent rel */
+	if (IS_OTHER_REL(rel))
+	{
+		Assert(!bms_is_empty(rel->top_parent_relids));
+		relids = rel->top_parent_relids;
+	}
+	else
+		relids = rel->relids;
+
 	/* If rel already includes all members of eclass, no point in searching */
-	if (bms_is_subset(eclass->ec_relids, rel->relids))
+	if (bms_is_subset(eclass->ec_relids, relids))
 		return false;
 
 	/* To join, we need a member not in the given rel */
@@ -2315,7 +2507,7 @@ eclass_useful_for_merging(EquivalenceClass *eclass,
 		if (cur_em->em_is_child)
 			continue;			/* ignore children here */
 
-		if (!bms_overlap(cur_em->em_relids, rel->relids))
+		if (!bms_overlap(cur_em->em_relids, relids))
 			return true;
 	}
 
@@ -2345,6 +2537,43 @@ is_redundant_derived_clause(RestrictInfo *rinfo, List *clauselist)
 
 		if (otherrinfo->parent_ec == parent_ec)
 			return true;
+	}
+
+	return false;
+}
+
+/*
+ * is_redundant_with_indexclauses
+ *		Test whether rinfo is redundant with any clause in the IndexClause
+ *		list.  Here, for convenience, we test both simple identity and
+ *		whether it is derived from the same EC as any member of the list.
+ */
+bool
+is_redundant_with_indexclauses(RestrictInfo *rinfo, List *indexclauses)
+{
+	EquivalenceClass *parent_ec = rinfo->parent_ec;
+	ListCell   *lc;
+
+	foreach(lc, indexclauses)
+	{
+		IndexClause *iclause = lfirst_node(IndexClause, lc);
+		RestrictInfo *otherrinfo = iclause->rinfo;
+
+		/* If indexclause is lossy, it won't enforce the condition exactly */
+		if (iclause->lossy)
+			continue;
+
+		/* Match if it's same clause (pointer equality should be enough) */
+		if (rinfo == otherrinfo)
+			return true;
+		/* Match if derived from same EC */
+		if (parent_ec && otherrinfo->parent_ec == parent_ec)
+			return true;
+
+		/*
+		 * No need to look at the derived clauses in iclause->indexquals; they
+		 * couldn't match if the parent clause didn't.
+		 */
 	}
 
 	return false;

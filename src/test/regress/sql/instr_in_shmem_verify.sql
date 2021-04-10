@@ -1,4 +1,3 @@
--- start_ignore
 -- This test checks for leaks of instrumentation slots in shmem.
 -- gp_instrument_shmem_detail is a function can retrieve
 -- instrumentation slots contents on every segment.
@@ -6,7 +5,9 @@
 -- then it calls the function to detect if any left over
 -- instrumentation slots exists.
 
+-- start_ignore
 DROP SCHEMA IF EXISTS QUERY_METRICS CASCADE; 
+-- end_ignore
 CREATE SCHEMA QUERY_METRICS;
 SET SEARCH_PATH=QUERY_METRICS;
 CREATE EXTERNAL WEB TABLE __gp_localid
@@ -19,7 +20,7 @@ CREATE EXTERNAL WEB TABLE __gp_masterid
 (
     masterid    int
 )
-EXECUTE E'echo $GP_SEGMENT_ID' ON MASTER FORMAT 'TEXT';
+EXECUTE E'echo $GP_SEGMENT_ID' ON COORDINATOR FORMAT 'TEXT';
 GRANT SELECT ON TABLE __gp_masterid TO public;
 
 CREATE FUNCTION gp_instrument_shmem_detail_f()
@@ -47,14 +48,11 @@ ORDER BY segid;
 GRANT SELECT ON gp_instrument_shmem_detail TO public;
 
 SET OPTIMIZER=OFF;
--- end_ignore
 
-SELECT count(*) FROM pg_stat_activity;
+SELECT count(*) FROM pg_stat_activity where backend_type = 'client backend';
 
 -- Expected result is 1 row, means only current query in instrument slots,
 -- If more than one row returned, means previous test has leaked slots.
 SELECT count(*) FROM (SELECT 1 FROM gp_instrument_shmem_detail GROUP BY ssid, ccnt) t;
 
--- start_ignore
-DROP SCHEMA IF EXISTS QUERY_METRICS CASCADE; 
--- end_ignore
+DROP SCHEMA QUERY_METRICS CASCADE;

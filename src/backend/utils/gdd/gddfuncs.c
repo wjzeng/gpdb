@@ -4,7 +4,7 @@
  *	  Global DeadLock Detector - Helper Functions
  *
  *
- * Copyright (c) 2018-Present Pivotal Software, Inc.
+ * Copyright (c) 2018-Present VMware, Inc. or its affiliates.
  *
  *
  *-------------------------------------------------------------------------
@@ -18,6 +18,7 @@
 #include "cdb/cdbvars.h"
 #include "funcapi.h"
 #include "libpq-fe.h"
+#include "storage/lock.h"
 #include "storage/proc.h"
 #include "utils/builtins.h"
 
@@ -71,16 +72,17 @@ lockIsHoldTillEndXact(LockInstanceData *lock)
 }
 
 /*
- * pg_dist_wait_status - produce a view with one row per waiting relation
+ * gp_dist_wait_status - produce a view with one row per waiting relation
  */
 Datum
-pg_dist_wait_status(PG_FUNCTION_ARGS)
+gp_dist_wait_status(PG_FUNCTION_ARGS)
 {
 	FuncCallContext *funcctx;
 	HeapTuple	tuple;
 	Datum		result;
-	Datum		values[4];
-	bool		nulls[4];
+	Datum		values[10];
+	bool		nulls[10];
+	char        tnbuf[32];
 	GddWaitStatusCtx *ctx;
 
 	MemSet(values, 0, sizeof(values));
@@ -100,7 +102,7 @@ pg_dist_wait_status(PG_FUNCTION_ARGS)
 		oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
 
 		/* build tupdesc for result tuples */
-		tupdesc = CreateTemplateTupleDesc(4, false);
+		tupdesc = CreateTemplateTupleDesc(10);
 		TupleDescInitEntry(tupdesc, (AttrNumber) 1, "segid",
 						   INT4OID, -1, 0);
 		TupleDescInitEntry(tupdesc, (AttrNumber) 2, "waiter_dxid",
@@ -109,6 +111,18 @@ pg_dist_wait_status(PG_FUNCTION_ARGS)
 						   XIDOID, -1, 0);
 		TupleDescInitEntry(tupdesc, (AttrNumber) 4, "holdTillEndXact",
 						   BOOLOID, -1, 0);
+		TupleDescInitEntry(tupdesc, (AttrNumber) 5, "waiter_lpid",
+						   INT4OID, -1, 0);
+		TupleDescInitEntry(tupdesc, (AttrNumber) 6, "holder_lpid",
+						   INT4OID, -1, 0);
+		TupleDescInitEntry(tupdesc, (AttrNumber) 7, "waiter_lockmode",
+						   TEXTOID, -1, 0);
+		TupleDescInitEntry(tupdesc, (AttrNumber) 8, "waiter_locktype",
+						   TEXTOID, -1, 0);
+		TupleDescInitEntry(tupdesc, (AttrNumber) 9, "waiter_sessiondid",
+						   INT4OID, -1, 0);
+		TupleDescInitEntry(tupdesc, (AttrNumber) 10, "holder_sessionid",
+						   INT4OID, -1, 0);
 
 		funcctx->tuple_desc = BlessTupleDesc(tupdesc);
 
@@ -131,15 +145,11 @@ pg_dist_wait_status(PG_FUNCTION_ARGS)
 		{
 			int			i;
 
-			/*
-			 * GPDB_84_MERGE_FIXME: Should we rewrite this in a different way now that we have
-			 * ON SEGMENT/ ON MASTER attributes on functions?
-			 */
-			CdbDispatchCommand("SELECT * FROM pg_catalog.pg_dist_wait_status()",
-							   DF_WITH_SNAPSHOT, &ctx->cdb_pgresults);
+			CdbDispatchCommand("SELECT * FROM pg_catalog.gp_dist_wait_status()",
+							   DF_NONE, &ctx->cdb_pgresults);
 
 			if (ctx->cdb_pgresults.numResults == 0)
-				elog(ERROR, "pg_dist_wait_status() didn't get back any data from the segDBs");
+				elog(ERROR, "gp_dist_wait_status() didn't get back any data from the segDBs");
 
 			for (i = 0; i < ctx->cdb_pgresults.numResults; i++)
 			{
@@ -151,7 +161,7 @@ pg_dist_wait_status(PG_FUNCTION_ARGS)
 				if (PQresultStatus(ctx->cdb_pgresults.pg_results[i]) != PGRES_TUPLES_OK)
 				{
 					cdbdisp_clearCdbPgResults(&ctx->cdb_pgresults);
-					elog(ERROR,"pg_dist_wait_status(): resultStatus not tuples_Ok");
+					elog(ERROR,"gp_dist_wait_status(): resultStatus not tuples_Ok");
 				}
 
 				/*
@@ -191,6 +201,7 @@ pg_dist_wait_status(PG_FUNCTION_ARGS)
 	 * A relation is that:
 	 * (waiter.granted == false &&
 	 *  holder.granted == true &&
+	 *  waiter.waitLockMode conflict with holder.holdMask &&
 	 *  waiter.pid != holder.pid &&
 	 *  waiter.locktype == holder.locktype &&
 	 *  waiter.locktags == holder.locktags)
@@ -227,6 +238,7 @@ pg_dist_wait_status(PG_FUNCTION_ARGS)
 		{
 			TransactionId w_dxid;
 			TransactionId h_dxid;
+			const char   *locktypename;
 			int			holder = ctx->holder++;
 			LockInstanceData	   *h_lock = &ctx->lockData->locks[holder];
 
@@ -236,6 +248,13 @@ pg_dist_wait_status(PG_FUNCTION_ARGS)
 			if (!isGranted(h_lock))
 				continue;
 			if (w_lock->pid == h_lock->pid)
+				continue;
+			/* If waiter and holder have different lock methods, they must not be conflict */
+			if (w_lock->locktag.locktag_lockmethodid != h_lock->locktag.locktag_lockmethodid)
+				continue;
+			/* If waiter and holder are not conflict, should skip this edge */
+			if (!CheckWaitLockModeConflictHoldMask(w_lock->locktag,
+					w_lock->waitLockMode, h_lock->holdMask))
 				continue;
 			if (!lockEqual(w_lock, h_lock))
 				continue;
@@ -250,6 +269,21 @@ pg_dist_wait_status(PG_FUNCTION_ARGS)
 			values[1] = TransactionIdGetDatum(w_dxid);
 			values[2] = TransactionIdGetDatum(h_dxid);
 			values[3] = BoolGetDatum(lockIsHoldTillEndXact(w_lock));
+			values[4] = Int32GetDatum(w_lock->pid);
+			values[5] = Int32GetDatum(h_lock->pid);
+			values[6] = CStringGetTextDatum(GetLockmodeName(w_lock->locktag.locktag_lockmethodid, w_lock->waitLockMode));
+
+			if (w_lock->locktag.locktag_type <= LOCKTAG_LAST_TYPE)
+				locktypename = LockTagTypeNames[w_lock->locktag.locktag_type];
+			else
+			{
+				snprintf(tnbuf, sizeof(tnbuf), "unknown %d",
+						 (int) w_lock->locktag.locktag_type);
+				locktypename = tnbuf;
+			}
+			values[7] = CStringGetTextDatum(locktypename);
+			values[8] = Int32GetDatum(w_lock->mppSessionId);
+			values[9] = Int32GetDatum(h_lock->mppSessionId);
 
 			tuple = heap_form_tuple(funcctx->tuple_desc, values, nulls);
 			result = HeapTupleGetDatum(tuple);
@@ -276,6 +310,12 @@ pg_dist_wait_status(PG_FUNCTION_ARGS)
 				values[1] = TransactionIdGetDatum(atoi(PQgetvalue(pg_result, row, 1)));
 				values[2] = TransactionIdGetDatum(atoi(PQgetvalue(pg_result, row, 2)));
 				values[3] = BoolGetDatum(strncmp(PQgetvalue(pg_result, row, 3), "t", 1) == 0);
+				values[4] = Int32GetDatum(atoi(PQgetvalue(pg_result, row, 4)));
+				values[5] = Int32GetDatum(atoi(PQgetvalue(pg_result, row, 5)));
+				values[6] = CStringGetTextDatum(PQgetvalue(pg_result, row, 6));
+				values[7] = CStringGetTextDatum(PQgetvalue(pg_result, row, 7));
+				values[8] = Int32GetDatum(atoi(PQgetvalue(pg_result, row, 8)));
+				values[9] = Int32GetDatum(atoi(PQgetvalue(pg_result, row, 9)));
 
 				tuple = heap_form_tuple(funcctx->tuple_desc, values, nulls);
 				result = HeapTupleGetDatum(tuple);

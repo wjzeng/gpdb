@@ -23,7 +23,6 @@
 #include <libxml/xmlerror.h>
 #include <libxml/parserInternals.h>
 
-
 PG_MODULE_MAGIC;
 
 /* exported for use by xslt_proc.c */
@@ -42,16 +41,16 @@ typedef struct
 /* local declarations */
 
 static xmlChar *pgxmlNodeSetToText(xmlNodeSetPtr nodeset,
-				   xmlChar *toptagname, xmlChar *septagname,
-				   xmlChar *plainsep);
+								   xmlChar *toptagname, xmlChar *septagname,
+								   xmlChar *plainsep);
 
 static text *pgxml_result_to_text(xmlXPathObjectPtr res, xmlChar *toptag,
-					 xmlChar *septag, xmlChar *plainsep);
+								  xmlChar *septag, xmlChar *plainsep);
 
 static xmlChar *pgxml_texttoxmlchar(text *textstring);
 
 static xmlXPathObjectPtr pgxml_xpath(text *document, xmlChar *xpath,
-			xpath_workspace *workspace);
+									 xpath_workspace *workspace);
 
 static void cleanup_workspace(xpath_workspace *workspace);
 
@@ -96,9 +95,9 @@ PG_FUNCTION_INFO_V1(xml_is_well_formed);
 Datum
 xml_is_well_formed(PG_FUNCTION_ARGS)
 {
-	text	   *t = PG_GETARG_TEXT_P(0);		/* document buffer */
+	text	   *t = PG_GETARG_TEXT_PP(0);	/* document buffer */
 	bool		result = false;
-	int32		docsize = VARSIZE(t) - VARHDRSZ;
+	int32		docsize = VARSIZE_ANY_EXHDR(t);
 	xmlDocPtr	doctree;
 	PgXmlErrorContext *xmlerrcxt;
 
@@ -106,7 +105,7 @@ xml_is_well_formed(PG_FUNCTION_ARGS)
 
 	PG_TRY();
 	{
-		doctree = xmlParseMemory((char *) VARDATA(t), docsize);
+		doctree = xmlParseMemory((char *) VARDATA_ANY(t), docsize);
 
 		result = (doctree != NULL);
 
@@ -134,7 +133,7 @@ PG_FUNCTION_INFO_V1(xml_encode_special_chars);
 Datum
 xml_encode_special_chars(PG_FUNCTION_ARGS)
 {
-	text	   *tin = PG_GETARG_TEXT_P(0);
+	text	   *tin = PG_GETARG_TEXT_PP(0);
 	text	   *tout;
 	xmlChar    *ts,
 			   *tt;
@@ -188,7 +187,7 @@ pgxmlNodeSetToText(xmlNodeSetPtr nodeset,
 			if (plainsep != NULL)
 			{
 				xmlBufferWriteCHAR(buf,
-							  xmlXPathCastNodeToString(nodeset->nodeTab[i]));
+								   xmlXPathCastNodeToString(nodeset->nodeTab[i]));
 
 				/* If this isn't the last entry, write the plain sep. */
 				if (i < (nodeset->nodeNr) - 1)
@@ -249,10 +248,10 @@ PG_FUNCTION_INFO_V1(xpath_nodeset);
 Datum
 xpath_nodeset(PG_FUNCTION_ARGS)
 {
-	text	   *document = PG_GETARG_TEXT_P(0);
-	text	   *xpathsupp = PG_GETARG_TEXT_P(1);		/* XPath expression */
-	xmlChar    *toptag = pgxml_texttoxmlchar(PG_GETARG_TEXT_P(2));
-	xmlChar    *septag = pgxml_texttoxmlchar(PG_GETARG_TEXT_P(3));
+	text	   *document = PG_GETARG_TEXT_PP(0);
+	text	   *xpathsupp = PG_GETARG_TEXT_PP(1);	/* XPath expression */
+	xmlChar    *toptag = pgxml_texttoxmlchar(PG_GETARG_TEXT_PP(2));
+	xmlChar    *septag = pgxml_texttoxmlchar(PG_GETARG_TEXT_PP(3));
 	xmlChar    *xpath;
 	text	   *xpres;
 	xmlXPathObjectPtr res;
@@ -282,9 +281,9 @@ PG_FUNCTION_INFO_V1(xpath_list);
 Datum
 xpath_list(PG_FUNCTION_ARGS)
 {
-	text	   *document = PG_GETARG_TEXT_P(0);
-	text	   *xpathsupp = PG_GETARG_TEXT_P(1);		/* XPath expression */
-	xmlChar    *plainsep = pgxml_texttoxmlchar(PG_GETARG_TEXT_P(2));
+	text	   *document = PG_GETARG_TEXT_PP(0);
+	text	   *xpathsupp = PG_GETARG_TEXT_PP(1);	/* XPath expression */
+	xmlChar    *plainsep = pgxml_texttoxmlchar(PG_GETARG_TEXT_PP(2));
 	xmlChar    *xpath;
 	text	   *xpres;
 	xmlXPathObjectPtr res;
@@ -311,15 +310,15 @@ PG_FUNCTION_INFO_V1(xpath_string);
 Datum
 xpath_string(PG_FUNCTION_ARGS)
 {
-	text	   *document = PG_GETARG_TEXT_P(0);
-	text	   *xpathsupp = PG_GETARG_TEXT_P(1);		/* XPath expression */
+	text	   *document = PG_GETARG_TEXT_PP(0);
+	text	   *xpathsupp = PG_GETARG_TEXT_PP(1);	/* XPath expression */
 	xmlChar    *xpath;
 	int32		pathsize;
 	text	   *xpres;
 	xmlXPathObjectPtr res;
 	xpath_workspace workspace;
 
-	pathsize = VARSIZE(xpathsupp) - VARHDRSZ;
+	pathsize = VARSIZE_ANY_EXHDR(xpathsupp);
 
 	/*
 	 * We encapsulate the supplied path with "string()" = 8 chars + 1 for NUL
@@ -328,8 +327,8 @@ xpath_string(PG_FUNCTION_ARGS)
 	/* We could try casting to string using the libxml function? */
 
 	xpath = (xmlChar *) palloc(pathsize + 9);
-	strncpy((char *) xpath, "string(", 7);
-	memcpy((char *) (xpath + 7), VARDATA(xpathsupp), pathsize);
+	memcpy((char *) xpath, "string(", 7);
+	memcpy((char *) (xpath + 7), VARDATA_ANY(xpathsupp), pathsize);
 	xpath[pathsize + 7] = ')';
 	xpath[pathsize + 8] = '\0';
 
@@ -352,8 +351,8 @@ PG_FUNCTION_INFO_V1(xpath_number);
 Datum
 xpath_number(PG_FUNCTION_ARGS)
 {
-	text	   *document = PG_GETARG_TEXT_P(0);
-	text	   *xpathsupp = PG_GETARG_TEXT_P(1);		/* XPath expression */
+	text	   *document = PG_GETARG_TEXT_PP(0);
+	text	   *xpathsupp = PG_GETARG_TEXT_PP(1);	/* XPath expression */
 	xmlChar    *xpath;
 	float4		fRes;
 	xmlXPathObjectPtr res;
@@ -384,8 +383,8 @@ PG_FUNCTION_INFO_V1(xpath_bool);
 Datum
 xpath_bool(PG_FUNCTION_ARGS)
 {
-	text	   *document = PG_GETARG_TEXT_P(0);
-	text	   *xpathsupp = PG_GETARG_TEXT_P(1);		/* XPath expression */
+	text	   *document = PG_GETARG_TEXT_PP(0);
+	text	   *xpathsupp = PG_GETARG_TEXT_PP(1);	/* XPath expression */
 	xmlChar    *xpath;
 	int			bRes;
 	xmlXPathObjectPtr res;
@@ -414,7 +413,7 @@ xpath_bool(PG_FUNCTION_ARGS)
 static xmlXPathObjectPtr
 pgxml_xpath(text *document, xmlChar *xpath, xpath_workspace *workspace)
 {
-	int32		docsize = VARSIZE(document) - VARHDRSZ;
+	int32		docsize = VARSIZE_ANY_EXHDR(document);
 	PgXmlErrorContext *xmlerrcxt;
 	xmlXPathCompExprPtr comppath;
 
@@ -426,7 +425,7 @@ pgxml_xpath(text *document, xmlChar *xpath, xpath_workspace *workspace)
 
 	PG_TRY();
 	{
-		workspace->doctree = xmlParseMemory((char *) VARDATA(document),
+		workspace->doctree = xmlParseMemory((char *) VARDATA_ANY(document),
 											docsize);
 		if (workspace->doctree != NULL)
 		{
@@ -554,8 +553,7 @@ xpath_table(PG_FUNCTION_ARGS)
 
 	int			numpaths;
 	int			ret;
-	int			proc;
-	int			i;
+	uint64		proc;
 	int			j;
 	int			rownr;			/* For issuing multiple rows from one original
 								 * document */
@@ -581,8 +579,8 @@ xpath_table(PG_FUNCTION_ARGS)
 	if (!(rsinfo->allowedModes & SFRM_Materialize))
 		ereport(ERROR,
 				(errcode(ERRCODE_SYNTAX_ERROR),
-			   errmsg("xpath_table requires Materialize mode, but it is not "
-					  "allowed in this context")));
+				 errmsg("xpath_table requires Materialize mode, but it is not "
+						"allowed in this context")));
 
 	/*
 	 * The tuplestore must exist in a higher context than this function call
@@ -612,7 +610,7 @@ xpath_table(PG_FUNCTION_ARGS)
 
 	/*
 	 * At the moment we assume that the returned attributes make sense for the
-	 * XPath specififed (i.e. we trust the caller). It's not fatal if they get
+	 * XPath specified (i.e. we trust the caller). It's not fatal if they get
 	 * it wrong - the input function for the column type will raise an error
 	 * if the path result can't be converted into the correct binary
 	 * representation.
@@ -665,7 +663,6 @@ xpath_table(PG_FUNCTION_ARGS)
 			 query_buf.data);
 
 	proc = SPI_processed;
-	/* elog(DEBUG1,"xpath_table: SPI returned %d rows",proc); */
 	tuptable = SPI_tuptable;
 	spi_tupdesc = tuptable->tupdesc;
 
@@ -693,6 +690,8 @@ xpath_table(PG_FUNCTION_ARGS)
 	PG_TRY();
 	{
 		/* For each row i.e. document returned from SPI */
+		uint64		i;
+
 		for (i = 0; i < proc; i++)
 		{
 			char	   *pkey;
@@ -721,7 +720,7 @@ xpath_table(PG_FUNCTION_ARGS)
 			/* Parse the document */
 			if (xmldoc)
 				doctree = xmlParseMemory(xmldoc, strlen(xmldoc));
-			else	/* treat NULL as not well-formed */
+			else				/* treat NULL as not well-formed */
 				doctree = NULL;
 
 			if (doctree == NULL)

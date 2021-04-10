@@ -31,15 +31,14 @@
         <plentry>
           <pt>DATABASE</pt>
           <pd>Recreate all indexes within the current database. Indexes on shared system catalogs
-            are skipped. This form of <codeph>REINDEX</codeph> cannot be executed inside a
+            are also processed. This form of <codeph>REINDEX</codeph> cannot be executed inside a
             transaction block.</pd>
         </plentry>
         <plentry>
           <pt>SYSTEM</pt>
-          <pd>Recreate all indexes on system catalogs within the current database. Indexes on user
-            tables are not processed. Also, indexes on shared (global) system catalogs are skipped.
-            This form of <codeph>REINDEX</codeph> cannot be executed inside a transaction
-            block.</pd>
+          <pd>Recreate all indexes on system catalogs within the current database. Indexes on shared
+            system catalogs are included. Indexes on user tables are not processed. This form of
+              <codeph>REINDEX</codeph> cannot be executed inside a transaction block.</pd>
         </plentry>
         <plentry>
           <pt><varname>name</varname></pt>
@@ -51,12 +50,15 @@
       </parml></section>
     <section id="section5">
       <title>Notes</title>
+      <p><codeph>REINDEX</codeph> causes locking of system catalog tables, which could
+        affect currently running queries. To avoid disrupting ongoing business operations, schedule
+        the <codeph>REINDEX</codeph> operation during a period of low activity.</p>
       <p><codeph>REINDEX</codeph> is similar to a drop and recreate of the index in that the index
         contents are rebuilt from scratch. However, the locking considerations are rather different.
           <codeph>REINDEX</codeph> locks out writes but not reads of the index's parent table. It
         also takes an exclusive lock on the specific index being processed, which will block reads
         that attempt to use that index. In contrast, <codeph>DROP INDEX</codeph> momentarily takes
-        exclusive lock on the parent table, blocking both writes and reads. The subsequent
+        an exclusive lock on the parent table, blocking both writes and reads. The subsequent
           <codeph>CREATE INDEX</codeph> locks out writes but not reads; since the index is not
         there, no read will attempt to use it, meaning that there will be no blocking but reads may
         be forced into expensive sequential scans. </p>

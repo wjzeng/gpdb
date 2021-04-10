@@ -52,8 +52,9 @@ EXIT_STATUS=0
 PORT_TXT="#port"
 LOG_STATEMENT_TXT="#log_statement ="
 LISTEN_ADR_TXT="listen_addresses"
-CHKPOINT_SEG_TXT="checkpoint_segments"
-TMP_PG_HBA=/tmp/pg_hba_conf_master.$$
+CONTENT_ID_TXT="gp_contentid"
+DBID_TXT="gp_dbid"
+TMP_PG_HBA=/tmp/pg_hba_conf_coordinator.$$
 
 #******************************************************************************
 # Functions
@@ -82,16 +83,17 @@ SET_VAR () {
 	    S=":"
             ;;
     esac
-    GP_HOSTADDRESS=`$ECHO $I|$CUT -d$S -f1`
-    GP_PORT=`$ECHO $I|$CUT -d$S -f2`
-    GP_DIR=`$ECHO $I|$CUT -d$S -f3`
-    GP_DBID=`$ECHO $I|$CUT -d$S -f4`
-    GP_CONTENT=`$ECHO $I|$CUT -d$S -f5`
+    GP_HOSTNAME=`$ECHO $I|$CUT -d$S -f1`
+    GP_HOSTADDRESS=`$ECHO $I|$CUT -d$S -f2`
+    GP_PORT=`$ECHO $I|$CUT -d$S -f3`
+    GP_DIR=`$ECHO $I|$CUT -d$S -f4`
+    GP_DBID=`$ECHO $I|$CUT -d$S -f5`
+    GP_CONTENT=`$ECHO $I|$CUT -d$S -f6`
 }
 
 PARA_EXIT () {
 	if [ $1 -ne 0 ];then
-		$ECHO "FAILED:$SEGMENT_LINE" >> $PARALLEL_STATUS_FILE
+		$ECHO "FAILED:$SEGMENT_TO_CREATE" >> $PARALLEL_STATUS_FILE
 		LOG_MSG "[FATAL][$INST_COUNT]:-Failed $2"
 		exit 2
 	else
@@ -99,168 +101,163 @@ PARA_EXIT () {
 	fi
 }
 
-PROCESS_QE () {
+ADD_PG_HBA_ENTRIES() {
+    local ADDR
+    local CIDR_ADDR
 
-    LOG_MSG "[INFO][$INST_COUNT]:-Start Function $FUNCNAME"
-    LOG_MSG "[INFO][$INST_COUNT]:-Processing segment $GP_HOSTADDRESS"
-
-    # do primary stuff
-    if [ x"" = x"$COPY_FROM_PRIMARY_HOSTADDRESS" ]; then
-	# build initdb command, capturing output in ${GP_DIR}.initdb
-	cmd="$EXPORT_LIB_PATH;$INITDB"
-	cmd="$cmd -E $ENCODING"
-	cmd="$cmd -D $GP_DIR"
-	cmd="$cmd --locale=$LOCALE_SETTING"
-	cmd="$cmd $LC_ALL_SETTINGS"
-	cmd="$cmd --max_connections=$QE_MAX_CONNECT"
-	cmd="$cmd --shared_buffers=$QE_SHARED_BUFFERS"
-	if [ x"$HEAP_CHECKSUM" == x"on" ]; then
-            cmd="$cmd --data-checksums"
-	fi
-	cmd="$cmd --backend_output=$GP_DIR.initdb"
-
-	$TRUSTED_SHELL ${GP_HOSTADDRESS} $cmd >> $LOG_FILE 2>&1
-	RETVAL=$?
-
-	# if there was an error, copy ${GP_DIR}.initdb to the log before cleaning it up
-	if [ $RETVAL -ne 0 ]; then
-	    $TRUSTED_SHELL ${GP_HOSTADDRESS} "cat $GP_DIR.initdb" >> $LOG_FILE 2>&1
-	fi
-	$TRUSTED_SHELL ${GP_HOSTADDRESS} "rm -f $GP_DIR.initdb" >> $LOG_FILE 2>&1
-	BACKOUT_COMMAND "$TRUSTED_SHELL ${GP_HOSTADDRESS} \"$RM -rf $GP_DIR > /dev/null 2>&1\""
-	BACKOUT_COMMAND "$ECHO \"removing directory $GP_DIR on $GP_HOSTADDRESS\""
-	PARA_EXIT $RETVAL "to start segment instance database $GP_HOSTADDRESS $GP_DIR"
-    fi
-
-    # on mirror, copy data from primary
-    if [ x"" != x"$COPY_FROM_PRIMARY_HOSTADDRESS" ]; then
-        LOG_MSG "[INFO]:-Running pg_basebackup to init mirror on ${GP_HOSTADDRESS} using primary on ${COPY_FROM_PRIMARY_HOSTADDRESS} ..." 1
-        RUN_COMMAND_REMOTE ${COPY_FROM_PRIMARY_HOSTADDRESS} "${EXPORT_GPHOME}; . ${GPHOME}/greenplum_path.sh; echo 'host  replication ${GP_USER} samenet trust' >> ${COPY_FROM_PRIMARY_DIR}/pg_hba.conf; pg_ctl -D ${COPY_FROM_PRIMARY_DIR} reload"
-        RUN_COMMAND_REMOTE ${GP_HOSTADDRESS} "${EXPORT_GPHOME}; . ${GPHOME}/greenplum_path.sh; rm -rf ${GP_DIR}; ${GPHOME}/bin/pg_basebackup -x -R -c fast -E ./db_dumps -E ./gpperfmon/data -E ./gpperfmon/logs -D ${GP_DIR} -h ${COPY_FROM_PRIMARY_HOSTADDRESS} -p ${COPY_FROM_PRIMARY_PORT};"
-        REGISTER_MIRROR
-        START_QE "-w"
-        RETVAL=$?
-        PARA_EXIT $RETVAL "pg_basebackup of segment data directory from ${COPY_FROM_PRIMARY_HOSTADDRESS} to ${GP_HOSTADDRESS}"
-    fi
-
-    # do primary stuff
-    if [ x"" = x"$COPY_FROM_PRIMARY_HOSTADDRESS" ]; then
-        # Configure postgresql.conf
-        LOG_MSG "[INFO][$INST_COUNT]:-Configuring segment $PG_CONF"
-        $TRUSTED_SHELL ${GP_HOSTADDRESS} "$ECHO \"#MPP Specific parameters\" >> ${GP_DIR}/$PG_CONF"
-        RETVAL=$?
-        PARA_EXIT $RETVAL "Update ${GP_DIR}/$PG_CONF file"
-        $TRUSTED_SHELL ${GP_HOSTADDRESS} "$ECHO \"#----------------------\" >> ${GP_DIR}/$PG_CONF"
-        RETVAL=$?
-        PARA_EXIT $RETVAL "Update ${GP_DIR}/$PG_CONF file"
-        SED_PG_CONF ${GP_DIR}/$PG_CONF "$PORT_TXT" port=$GP_PORT 0 $GP_HOSTADDRESS
-        PARA_EXIT $RETVAL "Update port number to $GP_PORT"
-        SED_PG_CONF ${GP_DIR}/$PG_CONF "$LISTEN_ADR_TXT" listen_addresses=\'*\' 0 $GP_HOSTADDRESS
-        PARA_EXIT $RETVAL "Update listen address"
-        SED_PG_CONF ${GP_DIR}/$PG_CONF "$CHKPOINT_SEG_TXT" checkpoint_segments=$CHECK_POINT_SEGMENTS 0 $GP_HOSTADDRESS
-        PARA_EXIT $RETVAL "Update checkpoint segments"
-
-        if [ x"" != x"$PG_CONF_ADD_FILE" ]; then
-	        LOG_MSG "[INFO][$INST_COUNT]:-Processing additional configuration parameters"
-	        for NEW_PARAM in `$CAT $PG_CONF_ADD_FILE|$TR -s ' '|$TR -d ' '|$GREP -v "^#"`
-	        do
-	            LOG_MSG "[INFO][$INST_COUNT]:-Adding config $NEW_PARAM to segment"
-	            SEARCH_TXT=`$ECHO $NEW_PARAM |$CUT -d"=" -f1`
-	            SED_PG_CONF ${GP_DIR}/$PG_CONF $SEARCH_TXT $NEW_PARAM 0 $GP_HOSTADDRESS
-	            PARA_EXIT $RETVAL "Update $PG_CONF $SEARCH_TXT $NEW_PARAM"
-	        done
-        fi
-    fi
-    # Configuring PG_HBA  -- on mirror, only need to add local addresses (skip the other addresses)
-    LOG_MSG "[INFO][$INST_COUNT]:-Configuring segment $PG_HBA"
-    if [ $HBA_HOSTNAMES -eq 0 ]; then
-        if [ x"" = x"$COPY_FROM_PRIMARY_HOSTADDRESS" ]; then
-        for MASTER_IP in "${MASTER_IP_ADDRESS[@]}"
-        do
-            # MPP-15889
-            CIDR_MASTER_IP=$(GET_CIDRADDR $MASTER_IP)
-            $TRUSTED_SHELL ${GP_HOSTADDRESS} "$ECHO host	all	all	${CIDR_MASTER_IP}	trust >> ${GP_DIR}/$PG_HBA"
-            PARA_EXIT $? "Update $PG_HBA for master IP address ${CIDR_MASTER_IP}"
-        done
-        if [ x"" != x"$STANDBY_HOSTNAME" ];then
-            LOG_MSG "[INFO][$INST_COUNT]:-Processing Standby master IP address for segment instances"
-            for STANDBY_IP in "${STANDBY_IP_ADDRESS[@]}"
-            do
-                # MPP-15889
-                CIDR_STANDBY_IP=$(GET_CIDRADDR $STANDBY_IP)
-            $TRUSTED_SHELL ${GP_HOSTADDRESS} "$ECHO host	all	all	${CIDR_STANDBY_IP}	trust >> ${GP_DIR}/$PG_HBA"
-            PARA_EXIT $? "Update $PG_HBA for master standby address ${CIDR_STANDBY_IP}"
-            done
-        fi
-        fi
-
-        # Add all local IPV4 addresses
-        SEGMENT_IPV4_LOCAL_ADDRESS_ALL=(`$TRUSTED_SHELL $GP_HOSTADDRESS "$IPV4_ADDR_LIST_CMD | $GREP inet | $GREP -v \"127.0.0\" | $AWK '{print \\$2}' | $CUT -d'/' -f1"`)
-        for ADDR in "${SEGMENT_IPV4_LOCAL_ADDRESS_ALL[@]}"
-        do
-        # MPP-15889
-        CIDR_ADDR=$(GET_CIDRADDR $ADDR)
-            $TRUSTED_SHELL ${GP_HOSTADDRESS} "$ECHO host     all          $USER_NAME         $CIDR_ADDR      trust >> ${GP_DIR}/$PG_HBA"
-        done
-
-        # Add all local IPV6 addresses
-        SEGMENT_IPV6_LOCAL_ADDRESS_ALL=(`$TRUSTED_SHELL $GP_HOSTADDRESS "$IPV6_ADDR_LIST_CMD | $GREP inet6 | $AWK '{print \\$2}' | $CUT -d'/' -f1"`)
-        for ADDR in "${SEGMENT_IPV6_LOCAL_ADDRESS_ALL[@]}"
-        do
+    for ADDR in "$@"; do
         # MPP-15889
         CIDR_ADDR=$(GET_CIDRADDR $ADDR)
         $TRUSTED_SHELL ${GP_HOSTADDRESS} "$ECHO host     all          $USER_NAME         $CIDR_ADDR      trust >> ${GP_DIR}/$PG_HBA"
-        done
-    else
-        # clean up localhost CIDR in pg_hba.conf if exists
-        if [ -f ${GP_DIR}/$PG_HBA ]; then
-            $GREP "^#" ${GP_DIR}/$PG_HBA > $TMP_PG_HBA
-            $MV $TMP_PG_HBA ${GP_DIR}/$PG_HBA
-        fi
+    done
+}
 
+CREATE_QES_PRIMARY () {
+    LOG_MSG "[INFO][$INST_COUNT]:-Start Function $FUNCNAME"
+    LOG_MSG "[INFO][$INST_COUNT]:-Processing segment $GP_HOSTADDRESS"
+    # build initdb command
+    cmd="$EXPORT_LIB_PATH;$INITDB"
+    cmd="$cmd -E $ENCODING"
+    cmd="$cmd -D $GP_DIR"
+    cmd="$cmd --locale=$LOCALE_SETTING"
+    cmd="$cmd $LC_ALL_SETTINGS"
+    cmd="$cmd --max_connections=$QE_MAX_CONNECT"
+    cmd="$cmd --shared_buffers=$QE_SHARED_BUFFERS"
+    if [ x"$HEAP_CHECKSUM" == x"on" ]; then
+        cmd="$cmd --data-checksums"
+    fi
+    
+    $TRUSTED_SHELL ${GP_HOSTADDRESS} $cmd >> $LOG_FILE 2>&1
+    RETVAL=$?
+    
+    BACKOUT_COMMAND "$TRUSTED_SHELL ${GP_HOSTADDRESS} \"$RM -rf $GP_DIR > /dev/null 2>&1\""
+    BACKOUT_COMMAND "$ECHO \"removing directory $GP_DIR on $GP_HOSTADDRESS\""
+    PARA_EXIT $RETVAL "to start segment instance database $GP_HOSTADDRESS $GP_DIR"
+    
+    # Configure postgresql.conf
+    LOG_MSG "[INFO][$INST_COUNT]:-Configuring segment $PG_CONF"
+    $TRUSTED_SHELL ${GP_HOSTADDRESS} "$ECHO \"#MPP Specific parameters\" >> ${GP_DIR}/$PG_CONF"
+    RETVAL=$?
+    PARA_EXIT $RETVAL "Update ${GP_DIR}/$PG_CONF file"
+    $TRUSTED_SHELL ${GP_HOSTADDRESS} "$ECHO \"#----------------------\" >> ${GP_DIR}/$PG_CONF"
+    RETVAL=$?
+    PARA_EXIT $RETVAL "Update ${GP_DIR}/$PG_CONF file"
+    SED_PG_CONF ${GP_DIR}/$PG_CONF "$PORT_TXT" port=$GP_PORT 0 $GP_HOSTADDRESS
+    PARA_EXIT $RETVAL "Update port number to $GP_PORT"
+    SED_PG_CONF ${GP_DIR}/$PG_CONF "$LISTEN_ADR_TXT" listen_addresses=\'*\' 0 $GP_HOSTADDRESS
+    PARA_EXIT $RETVAL "Update listen address"
+    SED_PG_CONF ${GP_DIR}/$PG_CONF "$CONTENT_ID_TXT" "gp_contentid=${GP_CONTENT}" 0 $GP_HOSTADDRESS
+    PARA_EXIT $RETVAL "Update gp_contentid"
+    SED_PG_CONF ${GP_DIR}/$PG_INTERNAL_CONF "$DBID_TXT" "gp_dbid=${GP_DBID}" 0 $GP_HOSTADDRESS
+    PARA_EXIT $RETVAL "Update gp_dbid"
+    
+    if [ x"" != x"$PG_CONF_ADD_FILE" ]; then
+        LOG_MSG "[INFO][$INST_COUNT]:-Processing additional configuration parameters"
+        for NEW_PARAM in `$CAT $PG_CONF_ADD_FILE|$TR -s ' '|$TR -d ' '|$GREP -v "^#"`
+        do
+            LOG_MSG "[INFO][$INST_COUNT]:-Adding config $NEW_PARAM to segment"
+            SEARCH_TXT=`$ECHO $NEW_PARAM |$CUT -d"=" -f1`
+            SED_PG_CONF ${GP_DIR}/$PG_CONF $SEARCH_TXT $NEW_PARAM 0 $GP_HOSTADDRESS
+            PARA_EXIT $RETVAL "Update $PG_CONF $SEARCH_TXT $NEW_PARAM"
+        done
+    fi
+    # Configuring PG_HBA
+    LOG_MSG "[INFO][$INST_COUNT]:-Configuring segment $PG_HBA"
+    if [ $HBA_HOSTNAMES -eq 0 ]; then
+        for COORDINATOR_IP in "${COORDINATOR_IP_ADDRESS[@]}"
+        do
+            # MPP-15889
+            CIDR_COORDINATOR_IP=$(GET_CIDRADDR $COORDINATOR_IP)
+            $TRUSTED_SHELL ${GP_HOSTADDRESS} "$ECHO host	all	all	${CIDR_COORDINATOR_IP}	trust >> ${GP_DIR}/$PG_HBA"
+            PARA_EXIT $? "Update $PG_HBA for coordinator IP address ${CIDR_COORDINATOR_IP}"
+          done
+        if [ x"" != x"$STANDBY_HOSTNAME" ];then
+          LOG_MSG "[INFO][$INST_COUNT]:-Processing Standby coordinator IP address for segment instances"
+          for STANDBY_IP in "${STANDBY_IP_ADDRESS[@]}"
+          do
+          # MPP-15889
+              CIDR_STANDBY_IP=$(GET_CIDRADDR $STANDBY_IP)
+              $TRUSTED_SHELL ${GP_HOSTADDRESS} "$ECHO host	all	all	${CIDR_STANDBY_IP}	trust >> ${GP_DIR}/$PG_HBA"
+              PARA_EXIT $? "Update $PG_HBA for coordinator standby address ${CIDR_STANDBY_IP}"
+          done
+        fi
+    
+        # Add all local IPV4 addresses
+        SEGMENT_IPV4_LOCAL_ADDRESS_ALL=(`$TRUSTED_SHELL $GP_HOSTADDRESS "$IPV4_ADDR_LIST_CMD | $GREP inet | $GREP -v \"127.0.0\" | $AWK '{print \\$2}' | $CUT -d'/' -f1"`)
+        ADD_PG_HBA_ENTRIES "${SEGMENT_IPV4_LOCAL_ADDRESS_ALL[@]}"
+    
+        if [ x"" != x"$MIRROR_HOSTADDRESS" ]; then
+          # Add all mirror segments local IPV4 addresses
+          MIRROR_SEGMENT_IPV4_LOCAL_ADDRESS_ALL=(`$TRUSTED_SHELL $MIRROR_HOSTADDRESS "$IPV4_ADDR_LIST_CMD | $GREP inet | $GREP -v \"127.0.0\" | $AWK '{print \\$2}' | $CUT -d'/' -f1"`)
+          ADD_PG_HBA_ENTRIES "${MIRROR_SEGMENT_IPV4_LOCAL_ADDRESS_ALL[@]}"
+        fi
+    
+        # Add all local IPV6 addresses
+        SEGMENT_IPV6_LOCAL_ADDRESS_ALL=(`$TRUSTED_SHELL $GP_HOSTADDRESS "$IPV6_ADDR_LIST_CMD | $GREP inet6 | $AWK '{print \\$2}' | $CUT -d'/' -f1"`)
+        ADD_PG_HBA_ENTRIES "${SEGMENT_IPV6_LOCAL_ADDRESS_ALL[@]}"
+    
+        if [ x"" != x"$MIRROR_HOSTADDRESS" ]; then
+          # Add all mirror segments local IPV6 addresses
+          MIRROR_SEGMENT_IPV6_LOCAL_ADDRESS_ALL=(`$TRUSTED_SHELL $MIRROR_HOSTADDRESS "$IPV6_ADDR_LIST_CMD | $GREP inet6 | $AWK '{print \\$2}' | $CUT -d'/' -f1"`)
+          ADD_PG_HBA_ENTRIES "${MIRROR_SEGMENT_IPV6_LOCAL_ADDRESS_ALL[@]}"
+        fi
+    else # use hostnames in pg_hba.conf
         # add localhost
         $TRUSTED_SHELL ${GP_HOSTADDRESS} "$ECHO host     all          all         localhost      trust >> ${GP_DIR}/$PG_HBA"
-
-        if [ x"" = x"$COPY_FROM_PRIMARY_HOSTADDRESS" ]; then
-            $TRUSTED_SHELL ${GP_HOSTADDRESS} "$ECHO host	all	all	${MASTER_HOSTNAME}	trust >> ${GP_DIR}/$PG_HBA"
-            PARA_EXIT $? "Update $PG_HBA for master IP address ${MASTER_HOSTNAME}"
-            if [ x"" != x"$STANDBY_HOSTNAME" ];then
-                LOG_MSG "[INFO][$INST_COUNT]:-Processing Standby master IP address for segment instances"
-                $TRUSTED_SHELL ${GP_HOSTADDRESS} "$ECHO host	all	all	${STANDBY_HOSTNAME}	trust >> ${GP_DIR}/$PG_HBA"
-                PARA_EXIT $? "Update $PG_HBA for master standby address ${STANDBY_HOSTNAME}"
-            fi
+        $TRUSTED_SHELL ${GP_HOSTADDRESS} "$ECHO host	all	all	${COORDINATOR_HOSTNAME}	trust >> ${GP_DIR}/$PG_HBA"
+        if [ x"" != x"$MIRROR_HOSTADDRESS" ]; then
+          $TRUSTED_SHELL ${GP_HOSTADDRESS} "$ECHO host     all          $USER_NAME         $MIRROR_HOSTADDRESS      trust >> ${GP_DIR}/$PG_HBA"
         fi
-
+        PARA_EXIT $? "Update $PG_HBA for coordinator IP address ${COORDINATOR_HOSTNAME}"
+        if [ x"" != x"$STANDBY_HOSTNAME" ];then
+            LOG_MSG "[INFO][$INST_COUNT]:-Processing Standby coordinator IP address for segment instances"
+            $TRUSTED_SHELL ${GP_HOSTADDRESS} "$ECHO host	all	all	${STANDBY_HOSTNAME}	trust >> ${GP_DIR}/$PG_HBA"
+            PARA_EXIT $? "Update $PG_HBA for coordinator standby address ${STANDBY_HOSTNAME}"
+        fi
         $TRUSTED_SHELL ${GP_HOSTADDRESS} "$ECHO host     all          $USER_NAME         $GP_HOSTADDRESS      trust >> ${GP_DIR}/$PG_HBA"
     fi
-
     LOG_MSG "[INFO][$INST_COUNT]:-End Function $FUNCNAME"
 }
 
-REGISTER_MIRROR() {
-    LOG_MSG "[INFO]:-Start Function $FUNCNAME"
-    env PGOPTIONS="-c gp_session_role=utility" $PSQL "${DEFAULTDB}" -c "select pg_catalog.gp_add_segment_mirror(${GP_CONTENT}::int2, '${GP_HOSTADDRESS}', '${GP_HOSTADDRESS}', ${GP_PORT}, '${GP_DIR}')" >> $LOG_FILE 2>&1
-    LOG_MSG "[INFO]:-End Function $FUNCNAME"
-}
-
-STOP_QE() {
-    # we don't add backout commands here.  We could get double-stop calls since the same QE is sometimes started, stopped, and restarted.  But hopefully that's okay
-
-    LOG_MSG "[INFO]:-Start Function $FUNCNAME" 1
-    LOG_MSG "[INFO]:-Stopping instance on segment ${GP_HOSTADDRESS}:${GP_PORT}" 1
-    $TRUSTED_SHELL ${GP_HOSTADDRESS} "$EXPORT_LIB_PATH;export PGPORT=${GP_PORT}; $PG_CTL -w -l $GP_DIR/pg_log/startup.log -D $GP_DIR -o \"-i -p ${GP_PORT}\" stop" >> $LOG_FILE 2>&1
-    LOG_MSG "[INFO]:-End Function $FUNCNAME"
+CREATE_QES_MIRROR () {
+    LOG_MSG "[INFO][$INST_COUNT]:-Start Function $FUNCNAME"
+    LOG_MSG "[INFO][$INST_COUNT]:-Processing segment $GP_HOSTADDRESS"
+    # on mirror, just copy data from primary as the primary has all the relevant pg_hba.conf content
+    # only the entry for replication is added on the primary if mirror hosts are there
+    LOG_MSG "[INFO]:-Running pg_basebackup to init mirror on ${GP_HOSTADDRESS} using primary on ${PRIMARY_HOSTADDRESS} ..." 1
+    # Add the samehost replication entry to support single-host development
+    local PG_HBA_ENTRIES="${PG_HBA_ENTRIES}"$'\n'"host  replication ${GP_USER} samehost trust"
+    if [ $HBA_HOSTNAMES -eq 0 ];then
+        local MIRROR_ADDRESSES=($($TRUSTED_SHELL ${GP_HOSTADDRESS} "${GPHOME}"/libexec/ifaddrs --no-loopback))
+        local PRIMARY_ADDRESSES=($($TRUSTED_SHELL ${PRIMARY_HOSTADDRESS} "${GPHOME}"/libexec/ifaddrs --no-loopback))
+        for ADDR in "${MIRROR_ADDRESSES[@]}" "${PRIMARY_ADDRESSES[@]}"
+        do
+            CIDR_ADDR=$(GET_CIDRADDR $ADDR)
+            PG_HBA_ENTRIES="${PG_HBA_ENTRIES}"$'\n'"host  replication ${GP_USER} ${CIDR_ADDR} trust"
+        done
+    else
+        PG_HBA_ENTRIES="${PG_HBA_ENTRIES}"$'\n'"host  replication ${GP_USER} ${GP_HOSTADDRESS} trust"
+        if [ "${GP_HOSTADDRESS}" != "${PRIMARY_HOSTADDRESS}" ]; then
+            PG_HBA_ENTRIES="${PG_HBA_ENTRIES}"$'\n'"host  replication ${GP_USER} ${PRIMARY_HOSTADDRESS} trust"
+        fi
+    fi
+    RUN_COMMAND_REMOTE ${PRIMARY_HOSTADDRESS} "${EXPORT_GPHOME}; . ${GPHOME}/greenplum_path.sh; cat - >> ${PRIMARY_DIR}/pg_hba.conf; pg_ctl -D ${PRIMARY_DIR} reload" <<< "${PG_HBA_ENTRIES}"
+    RUN_COMMAND_REMOTE ${GP_HOSTADDRESS} "${EXPORT_GPHOME}; . ${GPHOME}/greenplum_path.sh; rm -rf ${GP_DIR}; ${GPHOME}/bin/pg_basebackup --wal-method=stream --create-slot --slot='internal_wal_replication_slot' -R -c fast -E ./db_dumps -D ${GP_DIR} -h ${PRIMARY_HOSTADDRESS} -p ${PRIMARY_PORT} --target-gp-dbid ${GP_DBID};"
+    START_QE "-w"
+    RETVAL=$?
+    PARA_EXIT $RETVAL "pg_basebackup of segment data directory from ${PRIMARY_HOSTADDRESS} to ${GP_HOSTADDRESS}"
+    LOG_MSG "[INFO][$INST_COUNT]:-End Function $FUNCNAME"
 }
 
 START_QE() {
 	LOG_MSG "[INFO][$INST_COUNT]:-Starting Functioning instance on segment ${GP_HOSTADDRESS}"
 	PG_CTL_WAIT=$1
-	$TRUSTED_SHELL ${GP_HOSTADDRESS} "$EXPORT_LIB_PATH;export PGPORT=${GP_PORT}; $PG_CTL $PG_CTL_WAIT -l $GP_DIR/pg_log/startup.log -D $GP_DIR -o \"-i -p ${GP_PORT} --gp_dbid=${GP_DBID} --gp_contentid=${GP_CONTENT} --gp_num_contents_in_cluster=${TOTAL_SEG}\" start" >> $LOG_FILE 2>&1
+	$TRUSTED_SHELL ${GP_HOSTADDRESS} "$EXPORT_LIB_PATH;export PGPORT=${GP_PORT}; $PG_CTL $PG_CTL_WAIT -l $GP_DIR/log/startup.log -D $GP_DIR -o \"-p ${GP_PORT} -c gp_role=execute\" start" >> $LOG_FILE 2>&1
 	RETVAL=$?
 	if [ $RETVAL -ne 0 ]; then
 		BACKOUT_COMMAND "$TRUSTED_SHELL $GP_HOSTADDRESS \"${EXPORT_LIB_PATH};export PGPORT=${GP_PORT}; $PG_CTL -w -D $GP_DIR -o \"-i -p ${GP_PORT}\" -m immediate  stop\""
 		BACKOUT_COMMAND "$ECHO \"Stopping segment instance on $GP_HOSTADDRESS\""
-		$TRUSTED_SHELL ${GP_HOSTADDRESS} "$CAT ${GP_DIR}/pg_log/startup.log "|$TEE -a $LOG_FILE
+		$TRUSTED_SHELL ${GP_HOSTADDRESS} "$CAT ${GP_DIR}/log/startup.log "|$TEE -a $LOG_FILE
 		PARA_EXIT $RETVAL "Start segment instance database"
 	fi	
 	BACKOUT_COMMAND "$TRUSTED_SHELL $GP_HOSTADDRESS \"${EXPORT_LIB_PATH};export PGPORT=${GP_PORT}; $PG_CTL -w -D $GP_DIR -o \"-i -p ${GP_PORT}\" -m immediate  stop\""
@@ -271,7 +268,7 @@ START_QE() {
 #******************************************************************************
 # Main Section
 #******************************************************************************
-trap '$ECHO "KILLED:$SEGMENT_LINE" >> $PARALLEL_STATUS_FILE;ERROR_EXIT "[FATAL]:-[$INST_COUNT]-Recieved INT or TERM signal" 2' INT TERM
+trap '$ECHO "KILLED:$SEGMENT_TO_CREATE" >> $PARALLEL_STATUS_FILE;ERROR_EXIT "[FATAL]:-[$INST_COUNT]-Recieved INT or TERM signal"' INT TERM
 while getopts ":qp:" opt
 do
 	case $opt in
@@ -284,44 +281,65 @@ do
 	esac
 done
 
-#Now process supplied call parameters
-PARENT_PID=$1;shift		#PID of calling gpinitsystem program
+# gpcreateseg.sh is called for creating primary and mirror segments.
+# Below is an example for invocation to create a primary
+# COORDINATOR_HOSTNAME=bhuvi.local HBA_HOSTNAMES=0 /usr/local/gpdb/bin/lib/gpcreateseg.sh -p clusterConfigPostgresAddonsFile 65324 1
+# IS_PRIMARY host1.local~45432~/tmp/demoDataDir0~2~0 host2.local~45433~/tmp/demoDataDir0~3~0 0
+# /tmp/gpAdminLogs/gpinitsystem_20190903.log on  10.64.249.254~192.168.1.72~::1~fe80::1%lo0 10.64.249.252~192.168.1.73~::1~fe81::1%lo1 &
+# PARALLEL_COUNT 1 4
+# Now process supplied call parameters
+PARENT_PID=$1;shift		# PID of calling gpinitsystem program ex: 31578
 CHK_CALL
 
-TYPE=$1;shift
-case $TYPE in
-	1 )
-		SEGMENT_LINE=$1;shift		#String used to build segment instance
-        COPY_FROM_PRIMARY_SEGMENT_LINE=$1;shift # String used to build primary segment instance from which to copy data
-		if [ x"IS_PRIMARY" != x"$COPY_FROM_PRIMARY_SEGMENT_LINE" ]; then
-			SET_VAR $COPY_FROM_PRIMARY_SEGMENT_LINE
-			COPY_FROM_PRIMARY_HOSTADDRESS=$GP_HOSTADDRESS
-			COPY_FROM_PRIMARY_DIR=$GP_DIR
-			COPY_FROM_PRIMARY_PORT=$GP_PORT
-            COPY_FROM_PRIMARY_CONTENT=$GP_CONTENT
-		fi
-		SET_VAR $SEGMENT_LINE
+# for primary: it's IS_PRIMARY
+# for mirror: it's IS_MIRROR
+PRIMARY_OR_MIRROR_IDENTIFIER=$1;shift
 
-        if [ x"IS_PRIMARY" != x"$COPY_FROM_PRIMARY_SEGMENT_LINE" ]; then
-            if [ x"$GP_CONTENT" != x"$COPY_FROM_PRIMARY_CONTENT" ]; then
-                $ECHO "[FATAL]:-mismatch between content id and primary content id" 
-		        exit 2
-            fi
-        fi
-		INST_COUNT=$1;shift		#Unique number for this parallel script, starts at 0
-		BACKOUT_FILE=/tmp/gpsegcreate.sh_backout.$$
-		LOG_FILE=$1;shift		#Central logging file
-		LOG_MSG "[INFO][$INST_COUNT]:-Start Main"
-		LOG_MSG "[INFO][$INST_COUNT]:-Command line options passed to utility = $*"
-		HEAP_CHECKSUM=$1;shift
-		TMP_MASTER_IP_ADDRESS=$1;shift	#List of IP addresses for the master instance
-		MASTER_IP_ADDRESS=(`$ECHO $TMP_MASTER_IP_ADDRESS|$TR '~' ' '`)
-		TMP_STANDBY_IP_ADDRESS=$1;shift #List of IP addresses for standby master
-		STANDBY_IP_ADDRESS=(`$ECHO $TMP_STANDBY_IP_ADDRESS|$TR '~' ' '`)
-		PROCESS_QE
-		$ECHO "COMPLETED:$SEGMENT_LINE" >> $PARALLEL_STATUS_FILE
-		;;
-esac
+# string containing details of segment to create, format: hostname~port~datadir~dbid~content
+SEGMENT_TO_CREATE=$1;shift
+
+# string containing details of the corresponding pair (if mirroring enabled else empty)
+CORRESPONDING_PAIR_INFO=$1;shift
+
+# SET_VAR populates, GP_HOSTADDRESS, GP_DIR, GP_PORT, GP_CONTENT
+SET_VAR $CORRESPONDING_PAIR_INFO
+if [ x"IS_MIRROR" == x"$PRIMARY_OR_MIRROR_IDENTIFIER" ]; then
+   # store the corresponding primary info
+   PRIMARY_HOSTADDRESS=$GP_HOSTADDRESS
+   PRIMARY_DIR=$GP_DIR
+   PRIMARY_PORT=$GP_PORT
+   PRIMARY_CONTENT=$GP_CONTENT
+else
+   # store the corresponding mirror hostname
+   MIRROR_HOSTADDRESS=$GP_HOSTADDRESS
+fi
+
+# update GP_HOSTADDRESS, GP_DIR, GP_PORT, GP_CONTENT with the segment to create
+SET_VAR $SEGMENT_TO_CREATE
+
+if [ x"IS_MIRROR" == x"$PRIMARY_OR_MIRROR_IDENTIFIER" ]; then
+    if [ x"$GP_CONTENT" != x"$PRIMARY_CONTENT" ]; then
+        $ECHO "[FATAL]:-mismatch between content id and primary content id"
+        exit 2
+    fi
+fi
+
+INST_COUNT=$1;shift		#Unique number for this parallel script, starts at 0
+BACKOUT_FILE=/tmp/gpsegcreate.sh_backout.$$
+LOG_FILE=$1;shift		#Central logging file
+LOG_MSG "[INFO][$INST_COUNT]:-Start Main"
+LOG_MSG "[INFO][$INST_COUNT]:-Command line options passed to utility = $*"
+HEAP_CHECKSUM=$1;shift
+TMP_COORDINATOR_IP_ADDRESS=$1;shift	#List of IP addresses for the coordinator instance
+COORDINATOR_IP_ADDRESS=(`$ECHO $TMP_COORDINATOR_IP_ADDRESS|$TR '~' ' '`)
+TMP_STANDBY_IP_ADDRESS=$1;shift #List of IP addresses for standby coordinator
+STANDBY_IP_ADDRESS=(`$ECHO $TMP_STANDBY_IP_ADDRESS|$TR '~' ' '`)
+if [ x"IS_PRIMARY" == x"$PRIMARY_OR_MIRROR_IDENTIFIER" ]; then
+    CREATE_QES_PRIMARY
+else
+    CREATE_QES_MIRROR
+fi
+$ECHO "COMPLETED:$SEGMENT_TO_CREATE" >> $PARALLEL_STATUS_FILE
 
 LOG_MSG "[INFO][$INST_COUNT]:-End Main"
 exit $EXIT_STATUS

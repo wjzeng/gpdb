@@ -4,8 +4,8 @@
  *	  Target list manipulation routines
  *
  * Portions Copyright (c) 2007-2008, Greenplum inc
- * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -18,7 +18,8 @@
 
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
-#include "optimizer/planmain.h"
+#include "optimizer/cost.h"
+#include "optimizer/optimizer.h"
 #include "optimizer/tlist.h"
 #include "utils/lsyscache.h" /* get_typavgwidth() */
 
@@ -31,6 +32,45 @@ typedef struct maxSortGroupRef_context
 static
 bool maxSortGroupRef_walker(Node *node, maxSortGroupRef_context *cxt);
 
+/* Test if an expression node represents a SRF call.  Beware multiple eval! */
+#define IS_SRF_CALL(node) \
+	((IsA(node, FuncExpr) && ((FuncExpr *) (node))->funcretset) || \
+	 (IsA(node, OpExpr) && ((OpExpr *) (node))->opretset))
+
+/*
+ * Data structures for split_pathtarget_at_srfs().  To preserve the identity
+ * of sortgroupref items even if they are textually equal(), what we track is
+ * not just bare expressions but expressions plus their sortgroupref indexes.
+ */
+typedef struct
+{
+	Node	   *expr;			/* some subexpression of a PathTarget */
+	Index		sortgroupref;	/* its sortgroupref, or 0 if none */
+} split_pathtarget_item;
+
+typedef struct
+{
+	/* This is a List of bare expressions: */
+	List	   *input_target_exprs; /* exprs available from input */
+	/* These are Lists of Lists of split_pathtarget_items: */
+	List	   *level_srfs;		/* SRF exprs to evaluate at each level */
+	List	   *level_input_vars;	/* input vars needed at each level */
+	List	   *level_input_srfs;	/* input SRFs needed at each level */
+	/* These are Lists of split_pathtarget_items: */
+	List	   *current_input_vars; /* vars needed in current subexpr */
+	List	   *current_input_srfs; /* SRFs needed in current subexpr */
+	/* Auxiliary data for current split_pathtarget_walker traversal: */
+	int			current_depth;	/* max SRF depth in current subexpr */
+	Index		current_sgref;	/* current subexpr's sortgroupref, or 0 */
+} split_pathtarget_context;
+
+static bool split_pathtarget_walker(Node *node,
+									split_pathtarget_context *context);
+static void add_sp_item_to_pathtarget(PathTarget *target,
+									  split_pathtarget_item *item);
+static void add_sp_items_to_pathtarget(PathTarget *target, List *items);
+
+
 /*****************************************************************************
  *		Target list creation and searching utilities
  *****************************************************************************/
@@ -41,7 +81,7 @@ bool maxSortGroupRef_walker(Node *node, maxSortGroupRef_context *cxt);
  *	  equal() to the given expression.  Result is NULL if no such member.
  */
 TargetEntry *
-tlist_member(Node *node, List *targetlist)
+tlist_member(Expr *node, List *targetlist)
 {
 	ListCell   *temp;
 
@@ -93,12 +133,12 @@ tlist_members(Node *node, List *targetlist)
  *	  involving binary-compatible sort operations.
  */
 TargetEntry *
-tlist_member_ignore_relabel(Node *node, List *targetlist)
+tlist_member_ignore_relabel(Expr *node, List *targetlist)
 {
 	ListCell   *temp;
 
 	while (node && IsA(node, RelabelType))
-		node = (Node *) ((RelabelType *) node)->arg;
+		node = ((RelabelType *) node)->arg;
 
 	foreach(temp, targetlist)
 	{
@@ -117,13 +157,12 @@ tlist_member_ignore_relabel(Node *node, List *targetlist)
 /*
  * tlist_member_match_var
  *	  Same as above, except that we match the provided Var on the basis
- *	  of varno/varattno/varlevelsup only, rather than using full equal().
+ *	  of varno/varattno/varlevelsup/vartype only, rather than full equal().
  *
  * This is needed in some cases where we can't be sure of an exact typmod
- * match.  It's probably a good idea to check the vartype anyway, but
- * we leave it to the caller to apply any suitable sanity checks.
+ * match.  For safety, though, we insist on vartype match.
  */
-TargetEntry *
+static TargetEntry *
 tlist_member_match_var(Var *var, List *targetlist)
 {
 	ListCell   *temp;
@@ -137,38 +176,11 @@ tlist_member_match_var(Var *var, List *targetlist)
 			continue;
 		if (var->varno == tlvar->varno &&
 			var->varattno == tlvar->varattno &&
-			var->varlevelsup == tlvar->varlevelsup)
+			var->varlevelsup == tlvar->varlevelsup &&
+			var->vartype == tlvar->vartype)
 			return tlentry;
 	}
 	return NULL;
-}
-
-/*
- * flatten_tlist
- *	  Create a target list that only contains unique variables.
- *
- * Aggrefs and PlaceHolderVars in the input are treated according to
- * aggbehavior and phbehavior, for which see pull_var_clause().
- *
- * 'tlist' is the current target list
- *
- * Returns the "flattened" new target list.
- *
- * The result is entirely new structure sharing no nodes with the original.
- * Copying the Var nodes is probably overkill, but be safe for now.
- */
-List *
-flatten_tlist(List *tlist, PVCAggregateBehavior aggbehavior,
-			  PVCPlaceHolderBehavior phbehavior)
-{
-	List	   *vlist = pull_var_clause((Node *) tlist,
-										aggbehavior,
-										phbehavior);
-	List	   *new_tlist;
-
-	new_tlist = add_to_flat_tlist(NIL, vlist);
-	list_free(vlist);
-	return new_tlist;
 }
 
 /*
@@ -183,27 +195,21 @@ flatten_tlist(List *tlist, PVCAggregateBehavior aggbehavior,
 List *
 add_to_flat_tlist(List *tlist, List *exprs)
 {
-	return add_to_flat_tlist_junk(tlist, exprs, false);
-}
-
-List *
-add_to_flat_tlist_junk(List *tlist, List *exprs, bool resjunk)
-{
 	int			next_resno = list_length(tlist) + 1;
 	ListCell   *lc;
 
 	foreach(lc, exprs)
 	{
-		Node	   *expr = (Node *) lfirst(lc);
+		Expr	   *expr = (Expr *) lfirst(lc);
 
 		if (!tlist_member_ignore_relabel(expr, tlist))
 		{
 			TargetEntry *tle;
 
-			tle = makeTargetEntry(copyObject(expr),		/* copy needed?? */
+			tle = makeTargetEntry(copyObject(expr), /* copy needed?? */
 								  next_resno++,
 								  NULL,
-								  resjunk);
+								  false);
 			tlist = lappend(tlist, tle);
 		}
 	}
@@ -233,6 +239,27 @@ get_tlist_exprs(List *tlist, bool includeJunk)
 		result = lappend(result, tle->expr);
 	}
 	return result;
+}
+
+
+/*
+ * count_nonjunk_tlist_entries
+ *		What it says ...
+ */
+int
+count_nonjunk_tlist_entries(List *tlist)
+{
+	int			len = 0;
+	ListCell   *l;
+
+	foreach(l, tlist)
+	{
+		TargetEntry *tle = (TargetEntry *) lfirst(l);
+
+		if (!tle->resjunk)
+			len++;
+	}
+	return len;
 }
 
 
@@ -344,6 +371,34 @@ tlist_same_collations(List *tlist, List *colCollations, bool junkOK)
 	return true;
 }
 
+/*
+ * apply_tlist_labeling
+ *		Apply the TargetEntry labeling attributes of src_tlist to dest_tlist
+ *
+ * This is useful for reattaching column names etc to a plan's final output
+ * targetlist.
+ */
+void
+apply_tlist_labeling(List *dest_tlist, List *src_tlist)
+{
+	ListCell   *ld,
+			   *ls;
+
+	Assert(list_length(dest_tlist) == list_length(src_tlist));
+	forboth(ld, dest_tlist, ls, src_tlist)
+	{
+		TargetEntry *dest_tle = (TargetEntry *) lfirst(ld);
+		TargetEntry *src_tle = (TargetEntry *) lfirst(ls);
+
+		Assert(dest_tle->resno == src_tle->resno);
+		dest_tle->resname = src_tle->resname;
+		dest_tle->ressortgroupref = src_tle->ressortgroupref;
+		dest_tle->resorigtbl = src_tle->resorigtbl;
+		dest_tle->resorigcol = src_tle->resorigcol;
+		dest_tle->resjunk = src_tle->resjunk;
+	}
+}
+
 
 /*
  * get_sortgroupref_tle
@@ -363,13 +418,7 @@ get_sortgroupref_tle(Index sortref, List *targetList)
 			return tle;
 	}
 
-	/*
-	 * XXX: we probably should catch this earlier, but we have a
-	 * few queries in the regression suite that hit this.
-	 */
-	ereport(ERROR,
-			(errcode(ERRCODE_SYNTAX_ERROR),
-			 errmsg("ORDER/GROUP BY expression not found in targetlist")));
+	elog(ERROR, "ORDER/GROUP BY expression not found in targetlist");
 	return NULL;				/* keep compiler quiet */
 }
 
@@ -434,15 +483,6 @@ get_sortgroupclauses_tles_recurse(List *clauses, List *targetList,
 		{
 			get_sortgroupclauses_tles_recurse((List *) node, targetList,
 											  tles, sortops, eqops);
-		}
-		else if (IsA(node, GroupingClause))
-		{
-			/* GroupingClauses are collected into separate list */
-			get_sortgroupclauses_tles_recurse(((GroupingClause *) node)->groupsets,
-											  targetList,
-											  &sub_grouping_tles,
-											  &sub_grouping_sortops,
-											  &sub_grouping_eqops);
 		}
 		else
 			elog(ERROR, "unrecognized node type in list of sort/group clauses: %d",
@@ -513,113 +553,46 @@ get_sortgrouplist_exprs(List *sgClauses, List *targetList)
 }
 
 /*
- * get_grouplist_colidx
- *		Given a list of GroupClauses, build an array of the referenced
- *		targetlist resnos and their sort operators.  If numCols is not NULL,
- *		it is filled by the length of returned array.  Results are allocated
- *		by palloc.
+ * get_sortgroupref_clause
+ *		Find the SortGroupClause matching the given SortGroupRef index,
+ *		and return it.
  */
-void
-get_grouplist_colidx(List *groupClauses, List *targetList, int *numCols,
-					 AttrNumber **colIdx, Oid **grpOperators)
+SortGroupClause *
+get_sortgroupref_clause(Index sortref, List *clauses)
 {
-	List	   *tles;
-	List	   *sortops;
-	List	   *eqops;
-	ListCell   *lc_tle;
-	ListCell   *lc_eqop;
-	int			i,
-				len;
+	ListCell   *l;
 
-	len = num_distcols_in_grouplist(groupClauses);
-	if (numCols)
-		*numCols = len;
-
-	if (len == 0)
+	foreach(l, clauses)
 	{
-		*colIdx = NULL;
-		*grpOperators = NULL;
-		return;
+		SortGroupClause *cl = (SortGroupClause *) lfirst(l);
+
+		if (cl->tleSortGroupRef == sortref)
+			return cl;
 	}
 
-	get_sortgroupclauses_tles(groupClauses, targetList, &tles, &sortops, &eqops);
-
-	*colIdx = (AttrNumber *) palloc(sizeof(AttrNumber) * len);
-	*grpOperators = (Oid *) palloc(sizeof(Oid) * len);
-
-	i = 0;
-	forboth(lc_tle, tles, lc_eqop, eqops)
-	{
-		TargetEntry	*tle = lfirst(lc_tle);
-		Oid			eqop = lfirst_oid(lc_eqop);
-
-		Assert (i < len);
-
-		(*colIdx)[i] = tle->resno;
-		(*grpOperators)[i] = eqop;
-		if (!OidIsValid((*grpOperators)[i]))		/* shouldn't happen */
-			elog(ERROR, "could not find equality operator for ordering operator %u",
-				 (*grpOperators)[i]);
-		i++;
-	}
+	elog(ERROR, "ORDER/GROUP BY expression not found in list");
+	return NULL;				/* keep compiler quiet */
 }
 
 /*
- * get_grouplist_exprs
- *     Find a list of unique referenced targetlist expressions used in a given
- *     list of GroupClauses or a GroupingClauses.
- *
- * All expressions will appear in the same order as they appear in the
- * given list of GroupClauses or a GroupingClauses.
- *
- * Note that the top-level empty sets will be removed here.
+ * get_sortgroupref_clause_noerr
+ *		As above, but return NULL rather than throwing an error if not found.
  */
-List *
-get_grouplist_exprs(List *groupClauses, List *targetList)
+SortGroupClause *
+get_sortgroupref_clause_noerr(Index sortref, List *clauses)
 {
-	List *result = NIL;
-	ListCell *l;
+	ListCell   *l;
 
-	foreach (l, groupClauses)
+	foreach(l, clauses)
 	{
-		Node *groupClause = lfirst(l);
+		SortGroupClause *cl = (SortGroupClause *) lfirst(l);
 
-		if (groupClause == NULL)
-			continue;
-
-		Assert(IsA(groupClause, SortGroupClause) ||
-			   IsA(groupClause, GroupingClause) ||
-			   IsA(groupClause, List));
-
-		if (IsA(groupClause, SortGroupClause))
-		{
-			Node *expr = get_sortgroupclause_expr((SortGroupClause *) groupClause,
-												  targetList);
-
-			if (!list_member(result, expr))
-				result = lappend(result, expr);
-		}
-
-		else if (IsA(groupClause, List))
-			result = list_concat_unique(result,
-								 get_grouplist_exprs((List *)groupClause, targetList));
-
-		else
-			result = list_concat_unique(result,
-								 get_grouplist_exprs(((GroupingClause*)groupClause)->groupsets,
-													 targetList));
+		if (cl->tleSortGroupRef == sortref)
+			return cl;
 	}
 
-	return result;
+	return NULL;
 }
-
-
-/*****************************************************************************
- *		Functions to extract data from a list of SortGroupClauses
- *
- * These don't really belong in tlist.c, but they are sort of related to the
- * functions just above, and they don't seem to deserve their own file.
- *****************************************************************************/
 
 /*
  * extract_grouping_ops - make an array of the equality operator OIDs
@@ -645,6 +618,31 @@ extract_grouping_ops(List *groupClause)
 	}
 
 	return groupOperators;
+}
+
+/*
+ * extract_grouping_collations - make an array of the grouping column collations
+ *		for a SortGroupClause list
+ */
+Oid *
+extract_grouping_collations(List *groupClause, List *tlist)
+{
+	int			numCols = list_length(groupClause);
+	int			colno = 0;
+	Oid		   *grpCollations;
+	ListCell   *glitem;
+
+	grpCollations = (Oid *) palloc(sizeof(Oid) * numCols);
+
+	foreach(glitem, groupClause)
+	{
+		SortGroupClause *groupcl = (SortGroupClause *) lfirst(glitem);
+		TargetEntry *tle = get_sortgroupclause_tle(groupcl, tlist);
+
+		grpCollations[colno++] = exprCollation((Node *) tle->expr);
+	}
+
+	return grpCollations;
 }
 
 /*
@@ -684,31 +682,10 @@ grouping_is_sortable(List *groupClause)
 
 	foreach(glitem, groupClause)
 	{
-		Node	   *node = lfirst(glitem);
+		SortGroupClause *groupcl = (SortGroupClause *) lfirst(glitem);
 
-		if (node == NULL)
-			continue;
-
-		if (IsA(node, List))
-		{
-			if (!grouping_is_sortable((List *) node))
-				return false;
-		}
-		else if (IsA(node, GroupingClause))
-		{
-			if (!grouping_is_sortable(((GroupingClause *) node)->groupsets))
-				return false;
-		}
-		else
-		{
-			SortGroupClause *groupcl;
-
-			Assert(IsA(node, SortGroupClause));
-
-			groupcl = (SortGroupClause *) node;
-			if (!OidIsValid(groupcl->sortop))
-				return false;
-		}
+		if (!OidIsValid(groupcl->sortop))
+			return false;
 	}
 	return true;
 }
@@ -725,32 +702,13 @@ grouping_is_hashable(List *groupClause)
 
 	foreach(glitem, groupClause)
 	{
-		Node	   *node = lfirst(glitem);
+		SortGroupClause *groupcl = (SortGroupClause *) lfirst(glitem);
 
-		if (node == NULL)
-			continue;
-
-		if (IsA(node, List))
-		{
-			if (!grouping_is_hashable((List *) node))
-				return false;
-		}
-		else if (IsA(node, GroupingClause))
-		{
-			if (!grouping_is_hashable(((GroupingClause *) node)->groupsets))
-				return false;
-		}
-		else
-		{
-			SortGroupClause *groupcl = (SortGroupClause *) node;
-
-			if (!groupcl->hashable)
-				return false;
-		}
+		if (!groupcl->hashable)
+			return false;
 	}
 	return true;
 }
-
 
 /*
  * Return the largest sortgroupref value in use in the given
@@ -849,4 +807,671 @@ int get_row_width(List *tlist)
 	}
 
     return width;
+}
+
+/*****************************************************************************
+ *		PathTarget manipulation functions
+ *
+ * PathTarget is a somewhat stripped-down version of a full targetlist; it
+ * omits all the TargetEntry decoration except (optionally) sortgroupref data,
+ * and it adds evaluation cost and output data width info.
+ *****************************************************************************/
+
+/*
+ * make_pathtarget_from_tlist
+ *	  Construct a PathTarget equivalent to the given targetlist.
+ *
+ * This leaves the cost and width fields as zeroes.  Most callers will want
+ * to use create_pathtarget(), so as to get those set.
+ */
+PathTarget *
+make_pathtarget_from_tlist(List *tlist)
+{
+	PathTarget *target = makeNode(PathTarget);
+	int			i;
+	ListCell   *lc;
+
+	target->sortgrouprefs = (Index *) palloc(list_length(tlist) * sizeof(Index));
+
+	i = 0;
+	foreach(lc, tlist)
+	{
+		TargetEntry *tle = (TargetEntry *) lfirst(lc);
+
+		target->exprs = lappend(target->exprs, tle->expr);
+		target->sortgrouprefs[i] = tle->ressortgroupref;
+		i++;
+	}
+
+	return target;
+}
+
+/*
+ * make_tlist_from_pathtarget
+ *	  Construct a targetlist from a PathTarget.
+ */
+List *
+make_tlist_from_pathtarget(PathTarget *target)
+{
+	List	   *tlist = NIL;
+	int			i;
+	ListCell   *lc;
+
+	i = 0;
+	foreach(lc, target->exprs)
+	{
+		Expr	   *expr = (Expr *) lfirst(lc);
+		TargetEntry *tle;
+
+		tle = makeTargetEntry(expr,
+							  i + 1,
+							  NULL,
+							  false);
+		if (target->sortgrouprefs)
+			tle->ressortgroupref = target->sortgrouprefs[i];
+		tlist = lappend(tlist, tle);
+		i++;
+	}
+
+	return tlist;
+}
+
+/*
+ * copy_pathtarget
+ *	  Copy a PathTarget.
+ *
+ * The new PathTarget has its own List cells, but shares the underlying
+ * target expression trees with the old one.  We duplicate the List cells
+ * so that items can be added to one target without damaging the other.
+ */
+PathTarget *
+copy_pathtarget(PathTarget *src)
+{
+	PathTarget *dst = makeNode(PathTarget);
+
+	/* Copy scalar fields */
+	memcpy(dst, src, sizeof(PathTarget));
+	/* Shallow-copy the expression list */
+	dst->exprs = list_copy(src->exprs);
+	/* Duplicate sortgrouprefs if any (if not, the memcpy handled this) */
+	if (src->sortgrouprefs)
+	{
+		Size		nbytes = list_length(src->exprs) * sizeof(Index);
+
+		dst->sortgrouprefs = (Index *) palloc(nbytes);
+		memcpy(dst->sortgrouprefs, src->sortgrouprefs, nbytes);
+	}
+	return dst;
+}
+
+/*
+ * create_empty_pathtarget
+ *	  Create an empty (zero columns, zero cost) PathTarget.
+ */
+PathTarget *
+create_empty_pathtarget(void)
+{
+	/* This is easy, but we don't want callers to hard-wire this ... */
+	return makeNode(PathTarget);
+}
+
+/*
+ * add_column_to_pathtarget
+ *		Append a target column to the PathTarget.
+ *
+ * As with make_pathtarget_from_tlist, we leave it to the caller to update
+ * the cost and width fields.
+ */
+void
+add_column_to_pathtarget(PathTarget *target, Expr *expr, Index sortgroupref)
+{
+	/* Updating the exprs list is easy ... */
+	target->exprs = lappend(target->exprs, expr);
+	/* ... the sortgroupref data, a bit less so */
+	if (target->sortgrouprefs)
+	{
+		int			nexprs = list_length(target->exprs);
+
+		/* This might look inefficient, but actually it's usually cheap */
+		target->sortgrouprefs = (Index *)
+			repalloc(target->sortgrouprefs, nexprs * sizeof(Index));
+		target->sortgrouprefs[nexprs - 1] = sortgroupref;
+	}
+	else if (sortgroupref)
+	{
+		/* Adding sortgroupref labeling to a previously unlabeled target */
+		int			nexprs = list_length(target->exprs);
+
+		target->sortgrouprefs = (Index *) palloc0(nexprs * sizeof(Index));
+		target->sortgrouprefs[nexprs - 1] = sortgroupref;
+	}
+}
+
+/*
+ * add_new_column_to_pathtarget
+ *		Append a target column to the PathTarget, but only if it's not
+ *		equal() to any pre-existing target expression.
+ *
+ * The caller cannot specify a sortgroupref, since it would be unclear how
+ * to merge that with a pre-existing column.
+ *
+ * As with make_pathtarget_from_tlist, we leave it to the caller to update
+ * the cost and width fields.
+ */
+void
+add_new_column_to_pathtarget(PathTarget *target, Expr *expr)
+{
+	if (!list_member(target->exprs, expr))
+		add_column_to_pathtarget(target, expr, 0);
+}
+
+/*
+ * add_new_columns_to_pathtarget
+ *		Apply add_new_column_to_pathtarget() for each element of the list.
+ */
+void
+add_new_columns_to_pathtarget(PathTarget *target, List *exprs)
+{
+	ListCell   *lc;
+
+	foreach(lc, exprs)
+	{
+		Expr	   *expr = (Expr *) lfirst(lc);
+
+		add_new_column_to_pathtarget(target, expr);
+	}
+}
+
+/*
+ * apply_pathtarget_labeling_to_tlist
+ *		Apply any sortgrouprefs in the PathTarget to matching tlist entries
+ *
+ * Here, we do not assume that the tlist entries are one-for-one with the
+ * PathTarget.  The intended use of this function is to deal with cases
+ * where createplan.c has decided to use some other tlist and we have
+ * to identify what matches exist.
+ */
+void
+apply_pathtarget_labeling_to_tlist(List *tlist, PathTarget *target)
+{
+	int			i;
+	ListCell   *lc;
+
+	/* Nothing to do if PathTarget has no sortgrouprefs data */
+	if (target->sortgrouprefs == NULL)
+		return;
+
+	i = 0;
+	foreach(lc, target->exprs)
+	{
+		Expr	   *expr = (Expr *) lfirst(lc);
+		TargetEntry *tle;
+
+		if (target->sortgrouprefs[i])
+		{
+			/*
+			 * For Vars, use tlist_member_match_var's weakened matching rule;
+			 * this allows us to deal with some cases where a set-returning
+			 * function has been inlined, so that we now have more knowledge
+			 * about what it returns than we did when the original Var was
+			 * created.  Otherwise, use regular equal() to find the matching
+			 * TLE.  (In current usage, only the Var case is actually needed;
+			 * but it seems best to have sane behavior here for non-Vars too.)
+			 */
+			if (expr && IsA(expr, Var))
+				tle = tlist_member_match_var((Var *) expr, tlist);
+			else
+				tle = tlist_member(expr, tlist);
+
+			/*
+			 * Complain if noplace for the sortgrouprefs label, or if we'd
+			 * have to label a column twice.  (The case where it already has
+			 * the desired label probably can't happen, but we may as well
+			 * allow for it.)
+			 */
+			if (!tle)
+				elog(ERROR, "ORDER/GROUP BY expression not found in targetlist");
+			if (tle->ressortgroupref != 0 &&
+				tle->ressortgroupref != target->sortgrouprefs[i])
+				elog(ERROR, "targetlist item has multiple sortgroupref labels");
+
+			tle->ressortgroupref = target->sortgrouprefs[i];
+		}
+		i++;
+	}
+}
+
+/*
+ * split_pathtarget_at_srfs
+ *		Split given PathTarget into multiple levels to position SRFs safely
+ *
+ * The executor can only handle set-returning functions that appear at the
+ * top level of the targetlist of a ProjectSet plan node.  If we have any SRFs
+ * that are not at top level, we need to split up the evaluation into multiple
+ * plan levels in which each level satisfies this constraint.  This function
+ * creates appropriate PathTarget(s) for each level.
+ *
+ * As an example, consider the tlist expression
+ *		x + srf1(srf2(y + z))
+ * This expression should appear as-is in the top PathTarget, but below that
+ * we must have a PathTarget containing
+ *		x, srf1(srf2(y + z))
+ * and below that, another PathTarget containing
+ *		x, srf2(y + z)
+ * and below that, another PathTarget containing
+ *		x, y, z
+ * When these tlists are processed by setrefs.c, subexpressions that match
+ * output expressions of the next lower tlist will be replaced by Vars,
+ * so that what the executor gets are tlists looking like
+ *		Var1 + Var2
+ *		Var1, srf1(Var2)
+ *		Var1, srf2(Var2 + Var3)
+ *		x, y, z
+ * which satisfy the desired property.
+ *
+ * Another example is
+ *		srf1(x), srf2(srf3(y))
+ * That must appear as-is in the top PathTarget, but below that we need
+ *		srf1(x), srf3(y)
+ * That is, each SRF must be computed at a level corresponding to the nesting
+ * depth of SRFs within its arguments.
+ *
+ * In some cases, a SRF has already been evaluated in some previous plan level
+ * and we shouldn't expand it again (that is, what we see in the target is
+ * already meant as a reference to a lower subexpression).  So, don't expand
+ * any tlist expressions that appear in input_target, if that's not NULL.
+ *
+ * It's also important that we preserve any sortgroupref annotation appearing
+ * in the given target, especially on expressions matching input_target items.
+ *
+ * The outputs of this function are two parallel lists, one a list of
+ * PathTargets and the other an integer list of bool flags indicating
+ * whether the corresponding PathTarget contains any evaluatable SRFs.
+ * The lists are given in the order they'd need to be evaluated in, with
+ * the "lowest" PathTarget first.  So the last list entry is always the
+ * originally given PathTarget, and any entries before it indicate evaluation
+ * levels that must be inserted below it.  The first list entry must not
+ * contain any SRFs (other than ones duplicating input_target entries), since
+ * it will typically be attached to a plan node that cannot evaluate SRFs.
+ *
+ * Note: using a list for the flags may seem like overkill, since there
+ * are only a few possible patterns for which levels contain SRFs.
+ * But this representation decouples callers from that knowledge.
+ */
+void
+split_pathtarget_at_srfs(PlannerInfo *root,
+						 PathTarget *target, PathTarget *input_target,
+						 List **targets, List **targets_contain_srfs)
+{
+	split_pathtarget_context context;
+	int			max_depth;
+	bool		need_extra_projection;
+	List	   *prev_level_tlist;
+	int			lci;
+	ListCell   *lc,
+			   *lc1,
+			   *lc2,
+			   *lc3;
+
+	/*
+	 * It's not unusual for planner.c to pass us two physically identical
+	 * targets, in which case we can conclude without further ado that all
+	 * expressions are available from the input.  (The logic below would
+	 * arrive at the same conclusion, but much more tediously.)
+	 */
+	if (target == input_target)
+	{
+		*targets = list_make1(target);
+		*targets_contain_srfs = list_make1_int(false);
+		return;
+	}
+
+	/* Pass any input_target exprs down to split_pathtarget_walker() */
+	context.input_target_exprs = input_target ? input_target->exprs : NIL;
+
+	/*
+	 * Initialize with empty level-zero lists, and no levels after that.
+	 * (Note: we could dispense with representing level zero explicitly, since
+	 * it will never receive any SRFs, but then we'd have to special-case that
+	 * level when we get to building result PathTargets.  Level zero describes
+	 * the SRF-free PathTarget that will be given to the input plan node.)
+	 */
+	context.level_srfs = list_make1(NIL);
+	context.level_input_vars = list_make1(NIL);
+	context.level_input_srfs = list_make1(NIL);
+
+	/* Initialize data we'll accumulate across all the target expressions */
+	context.current_input_vars = NIL;
+	context.current_input_srfs = NIL;
+	max_depth = 0;
+	need_extra_projection = false;
+
+	/* Scan each expression in the PathTarget looking for SRFs */
+	lci = 0;
+	foreach(lc, target->exprs)
+	{
+		Node	   *node = (Node *) lfirst(lc);
+
+		/* Tell split_pathtarget_walker about this expr's sortgroupref */
+		context.current_sgref = get_pathtarget_sortgroupref(target, lci);
+		lci++;
+
+		/*
+		 * Find all SRFs and Vars (and Var-like nodes) in this expression, and
+		 * enter them into appropriate lists within the context struct.
+		 */
+		context.current_depth = 0;
+		split_pathtarget_walker(node, &context);
+
+		/* An expression containing no SRFs is of no further interest */
+		if (context.current_depth == 0)
+			continue;
+
+		/*
+		 * Track max SRF nesting depth over the whole PathTarget.  Also, if
+		 * this expression establishes a new max depth, we no longer care
+		 * whether previous expressions contained nested SRFs; we can handle
+		 * any required projection for them in the final ProjectSet node.
+		 */
+		if (max_depth < context.current_depth)
+		{
+			max_depth = context.current_depth;
+			need_extra_projection = false;
+		}
+
+		/*
+		 * If any maximum-depth SRF is not at the top level of its expression,
+		 * we'll need an extra Result node to compute the top-level scalar
+		 * expression.
+		 */
+		if (max_depth == context.current_depth && !IS_SRF_CALL(node))
+			need_extra_projection = true;
+	}
+
+	/*
+	 * If we found no SRFs needing evaluation (maybe they were all present in
+	 * input_target, or maybe they were all removed by const-simplification),
+	 * then no ProjectSet is needed; fall out.
+	 */
+	if (max_depth == 0)
+	{
+		*targets = list_make1(target);
+		*targets_contain_srfs = list_make1_int(false);
+		return;
+	}
+
+	/*
+	 * The Vars and SRF outputs needed at top level can be added to the last
+	 * level_input lists if we don't need an extra projection step.  If we do
+	 * need one, add a SRF-free level to the lists.
+	 */
+	if (need_extra_projection)
+	{
+		context.level_srfs = lappend(context.level_srfs, NIL);
+		context.level_input_vars = lappend(context.level_input_vars,
+										   context.current_input_vars);
+		context.level_input_srfs = lappend(context.level_input_srfs,
+										   context.current_input_srfs);
+	}
+	else
+	{
+		lc = list_nth_cell(context.level_input_vars, max_depth);
+		lfirst(lc) = list_concat(lfirst(lc), context.current_input_vars);
+		lc = list_nth_cell(context.level_input_srfs, max_depth);
+		lfirst(lc) = list_concat(lfirst(lc), context.current_input_srfs);
+	}
+
+	/*
+	 * Now construct the output PathTargets.  The original target can be used
+	 * as-is for the last one, but we need to construct a new SRF-free target
+	 * representing what the preceding plan node has to emit, as well as a
+	 * target for each intermediate ProjectSet node.
+	 */
+	*targets = *targets_contain_srfs = NIL;
+	prev_level_tlist = NIL;
+
+	forthree(lc1, context.level_srfs,
+			 lc2, context.level_input_vars,
+			 lc3, context.level_input_srfs)
+	{
+		List	   *level_srfs = (List *) lfirst(lc1);
+		PathTarget *ntarget;
+
+		if (lnext(lc1) == NULL)
+		{
+			ntarget = target;
+		}
+		else
+		{
+			ntarget = create_empty_pathtarget();
+
+			/*
+			 * This target should actually evaluate any SRFs of the current
+			 * level, and it needs to propagate forward any Vars needed by
+			 * later levels, as well as SRFs computed earlier and needed by
+			 * later levels.
+			 */
+			add_sp_items_to_pathtarget(ntarget, level_srfs);
+			for_each_cell(lc, lnext(lc2))
+			{
+				List	   *input_vars = (List *) lfirst(lc);
+
+				add_sp_items_to_pathtarget(ntarget, input_vars);
+			}
+			for_each_cell(lc, lnext(lc3))
+			{
+				List	   *input_srfs = (List *) lfirst(lc);
+				ListCell   *lcx;
+
+				foreach(lcx, input_srfs)
+				{
+					split_pathtarget_item *item = lfirst(lcx);
+
+					if (list_member(prev_level_tlist, item->expr))
+						add_sp_item_to_pathtarget(ntarget, item);
+				}
+			}
+			set_pathtarget_cost_width(root, ntarget);
+		}
+
+		/*
+		 * Add current target and does-it-compute-SRFs flag to output lists.
+		 */
+		*targets = lappend(*targets, ntarget);
+		*targets_contain_srfs = lappend_int(*targets_contain_srfs,
+											(level_srfs != NIL));
+
+		/* Remember this level's output for next pass */
+		prev_level_tlist = ntarget->exprs;
+	}
+}
+
+/*
+ * Recursively examine expressions for split_pathtarget_at_srfs.
+ *
+ * Note we make no effort here to prevent duplicate entries in the output
+ * lists.  Duplicates will be gotten rid of later.
+ */
+static bool
+split_pathtarget_walker(Node *node, split_pathtarget_context *context)
+{
+	if (node == NULL)
+		return false;
+
+	/*
+	 * A subexpression that matches an expression already computed in
+	 * input_target can be treated like a Var (which indeed it will be after
+	 * setrefs.c gets done with it), even if it's actually a SRF.  Record it
+	 * as being needed for the current expression, and ignore any
+	 * substructure.  (Note in particular that this preserves the identity of
+	 * any expressions that appear as sortgrouprefs in input_target.)
+	 */
+	if (list_member(context->input_target_exprs, node))
+	{
+		split_pathtarget_item *item = palloc(sizeof(split_pathtarget_item));
+
+		item->expr = node;
+		item->sortgroupref = context->current_sgref;
+		context->current_input_vars = lappend(context->current_input_vars,
+											  item);
+		return false;
+	}
+
+	/*
+	 * Vars and Var-like constructs are expected to be gotten from the input,
+	 * too.  We assume that these constructs cannot contain any SRFs (if one
+	 * does, there will be an executor failure from a misplaced SRF).
+	 */
+	if (IsA(node, Var) ||
+		IsA(node, PlaceHolderVar) ||
+		IsA(node, Aggref) ||
+		IsA(node, GroupingFunc) ||
+		IsA(node, WindowFunc))
+	{
+		split_pathtarget_item *item = palloc(sizeof(split_pathtarget_item));
+
+		item->expr = node;
+		item->sortgroupref = context->current_sgref;
+		context->current_input_vars = lappend(context->current_input_vars,
+											  item);
+		return false;
+	}
+
+	/*
+	 * If it's a SRF, recursively examine its inputs, determine its level, and
+	 * make appropriate entries in the output lists.
+	 */
+	if (IS_SRF_CALL(node))
+	{
+		split_pathtarget_item *item = palloc(sizeof(split_pathtarget_item));
+		List	   *save_input_vars = context->current_input_vars;
+		List	   *save_input_srfs = context->current_input_srfs;
+		int			save_current_depth = context->current_depth;
+		int			srf_depth;
+		ListCell   *lc;
+
+		item->expr = node;
+		item->sortgroupref = context->current_sgref;
+
+		context->current_input_vars = NIL;
+		context->current_input_srfs = NIL;
+		context->current_depth = 0;
+		context->current_sgref = 0; /* subexpressions are not sortgroup items */
+
+		(void) expression_tree_walker(node, split_pathtarget_walker,
+									  (void *) context);
+
+		/* Depth is one more than any SRF below it */
+		srf_depth = context->current_depth + 1;
+
+		/* If new record depth, initialize another level of output lists */
+		if (srf_depth >= list_length(context->level_srfs))
+		{
+			context->level_srfs = lappend(context->level_srfs, NIL);
+			context->level_input_vars = lappend(context->level_input_vars, NIL);
+			context->level_input_srfs = lappend(context->level_input_srfs, NIL);
+		}
+
+		/* Record this SRF as needing to be evaluated at appropriate level */
+		lc = list_nth_cell(context->level_srfs, srf_depth);
+		lfirst(lc) = lappend(lfirst(lc), item);
+
+		/* Record its inputs as being needed at the same level */
+		lc = list_nth_cell(context->level_input_vars, srf_depth);
+		lfirst(lc) = list_concat(lfirst(lc), context->current_input_vars);
+		lc = list_nth_cell(context->level_input_srfs, srf_depth);
+		lfirst(lc) = list_concat(lfirst(lc), context->current_input_srfs);
+
+		/*
+		 * Restore caller-level state and update it for presence of this SRF.
+		 * Notice we report the SRF itself as being needed for evaluation of
+		 * surrounding expression.
+		 */
+		context->current_input_vars = save_input_vars;
+		context->current_input_srfs = lappend(save_input_srfs, item);
+		context->current_depth = Max(save_current_depth, srf_depth);
+
+		/* We're done here */
+		return false;
+	}
+
+	/*
+	 * Otherwise, the node is a scalar (non-set) expression, so recurse to
+	 * examine its inputs.
+	 */
+	context->current_sgref = 0; /* subexpressions are not sortgroup items */
+	return expression_tree_walker(node, split_pathtarget_walker,
+								  (void *) context);
+}
+
+/*
+ * Add a split_pathtarget_item to the PathTarget, unless a matching item is
+ * already present.  This is like add_new_column_to_pathtarget, but allows
+ * for sortgrouprefs to be handled.  An item having zero sortgroupref can
+ * be merged with one that has a sortgroupref, acquiring the latter's
+ * sortgroupref.
+ *
+ * Note that we don't worry about possibly adding duplicate sortgrouprefs
+ * to the PathTarget.  That would be bad, but it should be impossible unless
+ * the target passed to split_pathtarget_at_srfs already had duplicates.
+ * As long as it didn't, we can have at most one split_pathtarget_item with
+ * any particular nonzero sortgroupref.
+ */
+static void
+add_sp_item_to_pathtarget(PathTarget *target, split_pathtarget_item *item)
+{
+	int			lci;
+	ListCell   *lc;
+
+	/*
+	 * Look for a pre-existing entry that is equal() and does not have a
+	 * conflicting sortgroupref already.
+	 */
+	lci = 0;
+	foreach(lc, target->exprs)
+	{
+		Node	   *node = (Node *) lfirst(lc);
+		Index		sgref = get_pathtarget_sortgroupref(target, lci);
+
+		if ((item->sortgroupref == sgref ||
+			 item->sortgroupref == 0 ||
+			 sgref == 0) &&
+			equal(item->expr, node))
+		{
+			/* Found a match.  Assign item's sortgroupref if it has one. */
+			if (item->sortgroupref)
+			{
+				if (target->sortgrouprefs == NULL)
+				{
+					target->sortgrouprefs = (Index *)
+						palloc0(list_length(target->exprs) * sizeof(Index));
+				}
+				target->sortgrouprefs[lci] = item->sortgroupref;
+			}
+			return;
+		}
+		lci++;
+	}
+
+	/*
+	 * No match, so add item to PathTarget.  Copy the expr for safety.
+	 */
+	add_column_to_pathtarget(target, (Expr *) copyObject(item->expr),
+							 item->sortgroupref);
+}
+
+/*
+ * Apply add_sp_item_to_pathtarget to each element of list.
+ */
+static void
+add_sp_items_to_pathtarget(PathTarget *target, List *items)
+{
+	ListCell   *lc;
+
+	foreach(lc, items)
+	{
+		split_pathtarget_item *item = lfirst(lc);
+
+		add_sp_item_to_pathtarget(target, item);
+	}
 }

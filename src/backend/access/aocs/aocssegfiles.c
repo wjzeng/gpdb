@@ -4,7 +4,7 @@
  *	  AOCS Segment files.
  *
  * Portions Copyright (c) 2009, Greenplum Inc.
- * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
  *
  *
  * IDENTIFICATION
@@ -14,6 +14,8 @@
  */
 
 #include "postgres.h"
+
+#include <math.h>
 
 #include "cdb/cdbappendonlystorage.h"
 #include "access/aomd.h"
@@ -27,7 +29,6 @@
 #include "access/xact.h"
 #include "catalog/catalog.h"
 #include "catalog/pg_appendonly.h"
-#include "catalog/pg_appendonly_fn.h"
 #include "catalog/namespace.h"
 #include "catalog/indexing.h"
 #include "catalog/gp_fastsequence.h"
@@ -52,12 +53,12 @@
 #include "cdb/cdbaocsam.h"
 #include "executor/executor.h"
 #include "storage/lmgr.h"
+#include "storage/procarray.h"
 
 #include "funcapi.h"
 #include "access/heapam.h"
 #include "catalog/pg_type.h"
 #include "utils/builtins.h"
-#include "utils/visibility_summary.h"
 
 
 static AOCSFileSegInfo **GetAllAOCSFileSegInfo_pg_aocsseg_rel(
@@ -67,38 +68,27 @@ static AOCSFileSegInfo **GetAllAOCSFileSegInfo_pg_aocsseg_rel(
 									 Snapshot appendOnlyMetaDataSnapshot,
 									 int32 *totalseg);
 
-AOCSFileSegInfo *
-NewAOCSFileSegInfo(int32 segno, int32 nvp)
-{
-	AOCSFileSegInfo *seginfo;
-
-	seginfo = (AOCSFileSegInfo *) palloc0(aocsfileseginfo_size(nvp));
-	seginfo   ->segno = segno;
-	seginfo   ->vpinfo.nEntry = nvp;
-	seginfo   ->state = AOSEG_STATE_DEFAULT;
-
-	/* New segments are always created in the latest format */
-	seginfo   ->formatversion = AORelationVersion_GetLatest();
-
-	return seginfo;
-}
-
 void
-InsertInitialAOCSFileSegInfo(Relation prel, int32 segno, int32 nvp)
+InsertInitialAOCSFileSegInfo(Relation prel, int32 segno, int32 nvp, Oid segrelid)
 {
 	bool	   *nulls = palloc0(sizeof(bool) * Natts_pg_aocsseg);
 	Datum	   *values = palloc0(sizeof(Datum) * Natts_pg_aocsseg);
 	AOCSVPInfo *vpinfo = create_aocs_vpinfo(nvp);
 	HeapTuple	segtup;
 	Relation	segrel;
+	Buffer		buf = InvalidBuffer;
+	TM_Result	result;
+	TM_FailureData hufd;
 	int16		formatVersion;
+
+	ValidateAppendonlySegmentDataBeforeStorage(segno);
 
 	/* New segments are always created in the latest format */
 	formatVersion = AORelationVersion_GetLatest();
 
-	segrel = heap_open(prel->rd_appendonly->segrelid, RowExclusiveLock);
+	segrel = heap_open(segrelid, RowExclusiveLock);
 
-	InsertFastSequenceEntry(prel->rd_appendonly->segrelid,
+	InsertFastSequenceEntry(segrelid,
 							(int64) segno,
 							0);
 
@@ -111,8 +101,25 @@ InsertInitialAOCSFileSegInfo(Relation prel, int32 segno, int32 nvp)
 
 	segtup = heap_form_tuple(RelationGetDescr(segrel), values, nulls);
 
-	frozen_heap_insert(segrel, segtup);
-	CatalogUpdateIndexes(segrel, segtup);
+	CatalogTupleInsertFrozen(segrel, segtup);
+
+	/*
+	 * Lock the tuple so that a concurrent insert transaction will not
+	 * consider this segfile for insertion. This should succeed since
+	 * we just inserted the row, and the caller is holding a lock that
+	 * prevents concurrent lockers.
+	 */
+	result = heap_lock_tuple(segrel, segtup,
+							 GetCurrentCommandId(true),
+							 LockTupleExclusive,
+							 LockWaitSkip,
+							 false, /* follow_updates */
+							 &buf,
+							 &hufd);
+	if (result != TM_Ok)
+		elog(ERROR, "could not lock newly-inserted gp_fastsequence tuple");
+	if (BufferIsValid(buf))
+		ReleaseBuffer(buf);
 
 	heap_freetuple(segtup);
 	heap_close(segrel, RowExclusiveLock);
@@ -129,22 +136,23 @@ InsertInitialAOCSFileSegInfo(Relation prel, int32 segno, int32 nvp)
  * pg_aocsseg_* relation that belongs to the currently used
  * AppendOnly table.
  *
- * If a caller intends to append to this (logical) file segment entry they must
- * already hold a relation Append-Only segment file (transaction-scope) lock (tag
- * LOCKTAG_RELATION_APPENDONLY_SEGMENT_FILE) in order to guarantee
- * stability of the pg_aoseg information on this segment file and exclusive right
- * to append data to the segment file.
+ * If a caller intends to append to this (logical) file segment entry they
+ * must have already locked the pg_aoseg tuple earlier, in order to guarantee
+ * stability of the pg_aoseg information on this segment file and exclusive
+ * right to append data to the segment file. In that case, 'locked' should be
+ * passed as true.
  */
 AOCSFileSegInfo *
 GetAOCSFileSegInfo(Relation prel,
 				   Snapshot appendOnlyMetaDataSnapshot,
-				   int32 segno)
+				   int32 segno,
+				   bool locked)
 {
 	int32		nvp = RelationGetNumberOfAttributes(prel);
 
 	Relation	segrel;
 	TupleDesc	tupdesc;
-	HeapScanDesc scan;
+	SysScanDesc scan;
 	HeapTuple	segtup = NULL;
 	HeapTuple	fssegtup = NULL;
 	int			tuple_segno = InvalidFileSegNumber;
@@ -153,12 +161,18 @@ GetAOCSFileSegInfo(Relation prel,
 	bool	   *null;
 	bool		isNull;
 
-	segrel = heap_open(prel->rd_appendonly->segrelid, AccessShareLock);
+    Oid         segrelid;
+    GetAppendOnlyEntryAuxOids(prel->rd_id,
+                              appendOnlyMetaDataSnapshot,
+                              &segrelid, NULL, NULL,
+                              NULL, NULL);
+
+	segrel = heap_open(segrelid, AccessShareLock);
 	tupdesc = RelationGetDescr(segrel);
 
 	/* Scan aoseg relation for tuple. */
-	scan = heap_beginscan(segrel, appendOnlyMetaDataSnapshot, 0, NULL);
-	while ((segtup = heap_getnext(scan, ForwardScanDirection)) != NULL)
+	scan = systable_beginscan(segrel, InvalidOid, false, appendOnlyMetaDataSnapshot, 0, NULL);
+	while ((segtup = systable_getnext(scan)) != NULL)
 	{
 		tuple_segno = DatumGetInt32(fastgetattr(segtup, Anum_pg_aocs_segno, tupdesc, &isNull));
 		if (isNull)
@@ -186,10 +200,22 @@ GetAOCSFileSegInfo(Relation prel,
 	if (!HeapTupleIsValid(fssegtup))
 	{
 		/* This segment file does not have an entry. */
-		heap_endscan(scan);
+		systable_endscan(scan);
 		heap_close(segrel, AccessShareLock);
+
+		if (locked)
+			ereport(ERROR,
+					(errcode(ERRCODE_INTERNAL_ERROR),
+					 errmsg("could not find segno %d for relation %s",
+							segno, RelationGetRelationName(prel))));
 		return NULL;
 	}
+
+	if (locked && !pg_aoseg_tuple_is_locked_by_me(fssegtup))
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("segno %d for relation %s is not locked for us",
+						segno, RelationGetRelationName(prel))));
 
 	seginfo = (AOCSFileSegInfo *) palloc0(aocsfileseginfo_size(nvp));
 
@@ -232,7 +258,7 @@ GetAOCSFileSegInfo(Relation prel,
 	pfree(null);
 
 	heap_freetuple(fssegtup);
-	heap_endscan(scan);
+	systable_endscan(scan);
 	heap_close(segrel, AccessShareLock);
 
 	return seginfo;
@@ -245,10 +271,20 @@ GetAllAOCSFileSegInfo(Relation prel,
 {
 	Relation	pg_aocsseg_rel;
 	AOCSFileSegInfo **results;
+	Oid         segrelid;
 
 	Assert(RelationIsAoCols(prel));
 
-	pg_aocsseg_rel = relation_open(prel->rd_appendonly->segrelid, AccessShareLock);
+	GetAppendOnlyEntryAuxOids(prel->rd_id,
+							  appendOnlyMetaDataSnapshot,
+							  &segrelid, NULL, NULL,
+							  NULL, NULL);
+
+	if (segrelid == InvalidOid)
+		elog(ERROR, "could not find pg_aoseg aux table for AOCO table \"%s\"",
+			 RelationGetRelationName(prel));
+
+	pg_aocsseg_rel = relation_open(segrelid, AccessShareLock);
 
 	results = GetAllAOCSFileSegInfo_pg_aocsseg_rel(
 												   RelationGetNumberOfAttributes(prel),
@@ -291,7 +327,7 @@ GetAllAOCSFileSegInfo_pg_aocsseg_rel(int numOfColumns,
 
 	int32		nvp = numOfColumns;
 
-	HeapScanDesc scan;
+	SysScanDesc scan;
 	HeapTuple	tup;
 
 	AOCSFileSegInfo **allseg;
@@ -312,8 +348,8 @@ GetAllAOCSFileSegInfo_pg_aocsseg_rel(int numOfColumns,
 
 	cur_seg = 0;
 
-	scan = heap_beginscan(pg_aocsseg_rel, snapshot, 0, NULL);
-	while ((tup = heap_getnext(scan, ForwardScanDirection)) != NULL)
+	scan = systable_beginscan(pg_aocsseg_rel, InvalidOid, false, snapshot, 0, NULL);
+	while ((tup = systable_getnext(scan)) != NULL)
 	{
 		/* dynamically expand space for AOCSFileSegInfo* array */
 		if (cur_seg >= seginfo_slot_no)
@@ -325,10 +361,6 @@ GetAllAOCSFileSegInfo_pg_aocsseg_rel(int numOfColumns,
 		aocs_seginfo = (AOCSFileSegInfo *) palloc0(aocsfileseginfo_size(nvp));
 
 		allseg[cur_seg] = aocs_seginfo;
-
-		GetTupleVisibilitySummary(
-								  tup,
-								  &aocs_seginfo->tupleVisibilitySummary);
 
 		heap_deform_tuple(tup, RelationGetDescr(pg_aocsseg_rel), d, null);
 
@@ -379,7 +411,7 @@ GetAllAOCSFileSegInfo_pg_aocsseg_rel(int numOfColumns,
 	pfree(d);
 	pfree(null);
 
-	heap_endscan(scan);
+	systable_endscan(scan);
 
 	*totalseg = cur_seg;
 
@@ -417,7 +449,6 @@ GetAOCSSSegFilesTotals(Relation parentrel, Snapshot appendOnlyMetaDataSnapshot)
 	totals = (FileSegTotals *) palloc0(sizeof(FileSegTotals));
 	memset(totals, 0, sizeof(FileSegTotals));
 
-
 	allseg = GetAllAOCSFileSegInfo(parentrel, appendOnlyMetaDataSnapshot, &totalseg);
 	for (s = 0; s < totalseg; s++)
 	{
@@ -430,7 +461,7 @@ GetAOCSSSegFilesTotals(Relation parentrel, Snapshot appendOnlyMetaDataSnapshot)
 		for (e = 0; e < nEntry; e++)
 		{
 			totals->totalbytes += vpinfo->entry[e].eof;
-			totals->totalbytesuncompressed = vpinfo->entry[e].eof_uncompressed;
+			totals->totalbytesuncompressed += vpinfo->entry[e].eof_uncompressed;
 		}
 		if (allseg[s]->state != AOSEG_STATE_AWAITING_DROP)
 		{
@@ -450,53 +481,13 @@ GetAOCSSSegFilesTotals(Relation parentrel, Snapshot appendOnlyMetaDataSnapshot)
 }
 
 /*
- * GetAOCSTotalBytes
- *
- * Get the total bytes for a specific AOCS table from the pg_aocsseg table on
- * this local segdb.
+ * Change an pg_aoseg row from DEFAULT to AWAITING_DROP to DEFAULT.
  */
-int64
-GetAOCSTotalBytes(Relation parentrel, Snapshot appendOnlyMetaDataSnapshot,
-				  bool compressed)
-{
-	AOCSFileSegInfo	  **allseg;
-	int64				result;
-	int					totalseg;
-	int					s;
-	int					e;
-
-	result = 0;
-	allseg = GetAllAOCSFileSegInfo(parentrel, appendOnlyMetaDataSnapshot, &totalseg);
-	for (s = 0; s < totalseg; s++)
-	{
-		for (e = 0; e < RelationGetNumberOfAttributes(parentrel); e++)
-		{
-			AOCSVPInfoEntry		*entry = getAOCSVPEntry(allseg[s], e);
-
-			if (compressed)
-				result += entry->eof;
-			else
-				result += entry->eof_uncompressed;
-		}
-	}
-
-	if (allseg)
-	{
-		FreeAllAOCSSegFileInfo(allseg, totalseg);
-		pfree(allseg);
-	}
-
-	return result;
-}
-
 void
-SetAOCSFileSegInfoState(Relation prel,
-						int segno,
-						FileSegInfoState newState)
+MarkAOCSFileSegInfoAwaitingDrop(Relation prel, int segno)
 {
-	LockAcquireResult acquireResult;
 	Relation	segrel;
-	HeapScanDesc scan;
+	SysScanDesc scan;
 	HeapTuple	oldtup = NULL;
 	HeapTuple	newtup;
 	int			tuple_segno = InvalidFileSegNumber;
@@ -505,39 +496,37 @@ SetAOCSFileSegInfoState(Relation prel,
 	bool		null[Natts_pg_aocsseg] = {0,};
 	bool		repl[Natts_pg_aocsseg] = {0,};
 	TupleDesc	tupdesc;
+	Snapshot	appendOnlyMetaDataSnapshot;
+	Oid			segrelid;
 
-	elogif(Debug_appendonly_print_compaction, LOG,
-		   "Set segfile info state: segno %d, table '%s', new state %d",
-		   segno,
-		   RelationGetRelationName(prel),
-		   newState);
+	if (Debug_appendonly_print_compaction)
+		elog(LOG,
+			 "changing state of segfile %d of table '%s' to AWAITING_DROP",
+			 segno, RelationGetRelationName(prel));
 
 	Assert(RelationIsAoCols(prel));
-	Assert(newState > AOSEG_STATE_USECURRENT && newState <= AOSEG_STATE_AWAITING_DROP);
 
-	/*
-	 * Verify we already have the write-lock!
-	 */
-	acquireResult = LockRelationAppendOnlySegmentFile(
-													  &prel->rd_node,
-													  segno,
-													  AccessExclusiveLock,
-													   /* dontWait */ false);
-	if (acquireResult != LOCKACQUIRE_ALREADY_HELD)
-	{
-		elog(ERROR, "Should already have the (transaction-scope) write-lock on Append-Only segment file #%d, "
-			 "relation %s", segno, RelationGetRelationName(prel));
-	}
+	appendOnlyMetaDataSnapshot = RegisterSnapshot(GetCatalogSnapshot(InvalidOid));
+	GetAppendOnlyEntryAuxOids(prel->rd_id,
+							  appendOnlyMetaDataSnapshot,
+							  &segrelid, NULL, NULL,
+							  NULL, NULL);
+	UnregisterSnapshot(appendOnlyMetaDataSnapshot);
 
-	segrel = heap_open(prel->rd_appendonly->segrelid, RowExclusiveLock);
+	segrel = heap_open(segrelid, RowExclusiveLock);
 	tupdesc = RelationGetDescr(segrel);
 
 	/*
+	 * GPDB_12_MERGE_FIXME: we are using systable_beginscan API in this file
+	 * but the API used by aosegfiles.c is table_beginscan_catalog.  Let's
+	 * have parity between the two because they do have parity on master
+	 * branch.
+	 * 
 	 * Since we have the segment-file entry under lock (with
 	 * LockRelationAppendOnlySegmentFile) we can use SnapshotNow.
 	 */
-	scan = heap_beginscan_catalog(segrel, 0, NULL);
-	while (segno != tuple_segno && (oldtup = heap_getnext(scan, ForwardScanDirection)) != NULL)
+	scan = systable_beginscan(segrel, InvalidOid, false, NULL, 0, NULL);
+	while (segno != tuple_segno && (oldtup = systable_getnext(scan)) != NULL)
 	{
 		tuple_segno = DatumGetInt32(fastgetattr(oldtup, Anum_pg_aocs_segno, tupdesc, &isNull));
 		if (isNull)
@@ -553,13 +542,20 @@ SetAOCSFileSegInfoState(Relation prel,
 							   RelationGetRelationName(prel), segno)
 						));
 
-#ifdef USE_ASSERT_CHECKING
-	d[Anum_pg_aocs_segno - 1] = fastgetattr(oldtup, Anum_pg_aocs_segno, tupdesc, &null[Anum_pg_aocs_segno - 1]);
-	Assert(!null[Anum_pg_aocs_segno - 1]);
-	Assert(DatumGetInt32(d[Anum_pg_aocs_segno - 1]) == segno);
-#endif
+	/*
+	 * Verify that the caller locked the segment earlier. In principle, if
+	 * the caller is holding an AccessExclusiveLock on the table, locking
+	 * individual tuples would not be necessary, but all current callers
+	 * diligently lock the tuples anyway, so we can perform this sanity check
+	 * here.
+	 */
+	if (!pg_aoseg_tuple_is_locked_by_me(oldtup))
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("cannot update pg_aocs entry for segno %d for relation %s, it is not locked for us",
+						segno, RelationGetRelationName(prel))));
 
-	d[Anum_pg_aocs_state - 1] = Int16GetDatum(newState);
+	d[Anum_pg_aocs_state - 1] = Int16GetDatum(AOSEG_STATE_AWAITING_DROP);
 	repl[Anum_pg_aocs_state - 1] = true;
 
 	newtup = heap_modify_tuple(oldtup, tupdesc, d, null, repl);
@@ -568,16 +564,29 @@ SetAOCSFileSegInfoState(Relation prel,
 
 	pfree(newtup);
 
-	heap_endscan(scan);
+	systable_endscan(scan);
 	heap_close(segrel, RowExclusiveLock);
 }
 
+/*
+ * Reset state of an  pg_aocs row from AWAITING_DROP to DEFAULT state.
+ *
+ * Also clears tupcount, varblockcount, and EOFs, and sets formatversion to
+ * the latest version. 'modcount' is not changed.
+ *
+ * The caller should have checked that the segfile is no longer needed by
+ * any running transaction. It is not necessary to hold a lock on the segfile
+ * row, though.
+ *
+ * GPDB_12_MERGE_FIXME: this and ClearFileSegInfo should look similar, which
+ * is not currently the case.  On master branch, they do look similar.  Let's
+ * make it so before we merge.
+ */
 void
-ClearAOCSFileSegInfo(Relation prel, int segno, FileSegInfoState newState)
+ClearAOCSFileSegInfo(Relation prel, int segno)
 {
-	LockAcquireResult acquireResult;
 	Relation	segrel;
-	HeapScanDesc scan;
+    SysScanDesc scan;
 	HeapTuple	oldtup = NULL;
 	HeapTuple	newtup;
 	int			tuple_segno = InvalidFileSegNumber;
@@ -589,38 +598,32 @@ ClearAOCSFileSegInfo(Relation prel, int segno, FileSegInfoState newState)
 	int			nvp = RelationGetNumberOfAttributes(prel);
 	int			i;
 	AOCSVPInfo *vpinfo = create_aocs_vpinfo(nvp);
+	Oid			segrelid;
+	Snapshot	appendOnlyMetaDataSnapshot;
 
 	Assert(RelationIsAoCols(prel));
-	Assert(newState >= AOSEG_STATE_USECURRENT && newState <= AOSEG_STATE_AWAITING_DROP);
 
 	elogif(Debug_appendonly_print_compaction, LOG,
 		   "Clear seg file info: segno %d table '%s'",
 		   segno,
 		   RelationGetRelationName(prel));
 
-	/*
-	 * Verify we already have the write-lock!
-	 */
-	acquireResult = LockRelationAppendOnlySegmentFile(
-													  &prel->rd_node,
-													  segno,
-													  AccessExclusiveLock,
-													   /* dontWait */ false);
-	if (acquireResult != LOCKACQUIRE_ALREADY_HELD)
-	{
-		elog(ERROR, "Should already have the (transaction-scope) write-lock on Append-Only segment file #%d, "
-			 "relation %s", segno, RelationGetRelationName(prel));
-	}
+	appendOnlyMetaDataSnapshot = RegisterSnapshot(GetCatalogSnapshot(InvalidOid));	
+	GetAppendOnlyEntryAuxOids(prel->rd_id,
+							  appendOnlyMetaDataSnapshot,
+							  &segrelid, NULL, NULL,
+							  NULL, NULL);
+	UnregisterSnapshot(appendOnlyMetaDataSnapshot);
 
-	segrel = heap_open(prel->rd_appendonly->segrelid, RowExclusiveLock);
+	segrel = heap_open(segrelid, RowExclusiveLock);
 	tupdesc = RelationGetDescr(segrel);
 
 	/*
 	 * Since we have the segment-file entry under lock (with
 	 * LockRelationAppendOnlySegmentFile) we can use SnapshotNow.
 	 */
-	scan = heap_beginscan_catalog(segrel, 0, NULL);
-	while (segno != tuple_segno && (oldtup = heap_getnext(scan, ForwardScanDirection)) != NULL)
+	scan = systable_beginscan(segrel, InvalidOid, false, NULL, 0, NULL);
+	while (segno != tuple_segno && (oldtup = systable_getnext(scan)) != NULL)
 	{
 		tuple_segno = DatumGetInt32(fastgetattr(oldtup, Anum_pg_aocs_segno, tupdesc, &isNull));
 		if (isNull)
@@ -648,7 +651,6 @@ ClearAOCSFileSegInfo(Relation prel, int segno, FileSegInfoState newState)
 	d[Anum_pg_aocs_tupcount - 1] = 0;
 	repl[Anum_pg_aocs_tupcount - 1] = true;
 
-
 	d[Anum_pg_aocs_varblockcount - 1] = fastgetattr(oldtup, Anum_pg_aocs_varblockcount, tupdesc, &null[Anum_pg_aocs_varblockcount - 1]);
 	Assert(!null[Anum_pg_aocs_varblockcount - 1]);
 	d[Anum_pg_aocs_varblockcount - 1] = 0;
@@ -669,11 +671,8 @@ ClearAOCSFileSegInfo(Relation prel, int segno, FileSegInfoState newState)
 	null[Anum_pg_aocs_vpinfo - 1] = false;
 	repl[Anum_pg_aocs_vpinfo - 1] = true;
 
-	if (newState > 0)
-	{
-		d[Anum_pg_aocs_state - 1] = Int16GetDatum(newState);
-		repl[Anum_pg_aocs_state - 1] = true;
-	}
+	d[Anum_pg_aocs_state - 1] = Int16GetDatum(AOSEG_STATE_DEFAULT);
+	repl[Anum_pg_aocs_state - 1] = true;
 
 	newtup = heap_modify_tuple(oldtup, tupdesc, d, null, repl);
 
@@ -682,18 +681,17 @@ ClearAOCSFileSegInfo(Relation prel, int segno, FileSegInfoState newState)
 	pfree(newtup);
 	pfree(vpinfo);
 
-	heap_endscan(scan);
+	systable_endscan(scan);
 	heap_close(segrel, RowExclusiveLock);
 }
 
 void
 UpdateAOCSFileSegInfo(AOCSInsertDesc idesc)
 {
-	LockAcquireResult acquireResult;
 
 	Relation	prel = idesc->aoi_rel;
 	Relation	segrel;
-	HeapScanDesc scan;
+	SysScanDesc scan;
 
 	HeapTuple	oldtup = NULL;
 	HeapTuple	newtup;
@@ -708,29 +706,15 @@ UpdateAOCSFileSegInfo(AOCSInsertDesc idesc)
 	int			i;
 	AOCSVPInfo *vpinfo = create_aocs_vpinfo(nvp);
 
-	/*
-	 * Verify we already have the write-lock!
-	 */
-	acquireResult = LockRelationAppendOnlySegmentFile(
-													  &prel->rd_node,
-													  idesc->cur_segno,
-													  AccessExclusiveLock,
-													   /* dontWait */ false);
-	if (acquireResult != LOCKACQUIRE_ALREADY_HELD)
-	{
-		elog(ERROR, "Should already have the (transaction-scope) write-lock on Append-Only segment file #%d, "
-			 "relation %s", idesc->cur_segno, RelationGetRelationName(prel));
-	}
-
-	segrel = heap_open(prel->rd_appendonly->segrelid, RowExclusiveLock);
+	segrel = heap_open(idesc->segrelid, RowExclusiveLock);
 	tupdesc = RelationGetDescr(segrel);
 
 	/*
 	 * Since we have the segment-file entry under lock (with
 	 * LockRelationAppendOnlySegmentFile) we can use SnapshotNow.
 	 */
-	scan = heap_beginscan_catalog(segrel, 0, NULL);
-	while (idesc->cur_segno != tuple_segno && (oldtup = heap_getnext(scan, ForwardScanDirection)) != NULL)
+	scan = systable_beginscan(segrel, InvalidOid, false, idesc->appendOnlyMetaDataSnapshot, 0, NULL);
+	while (idesc->cur_segno != tuple_segno && (oldtup = systable_getnext(scan)) != NULL)
 	{
 		tuple_segno = DatumGetInt32(fastgetattr(oldtup, Anum_pg_aocs_segno, tupdesc, &isNull));
 		if (isNull)
@@ -745,6 +729,19 @@ UpdateAOCSFileSegInfo(AOCSInsertDesc idesc)
 						errmsg("AOCS table \"%s\" file segment \"%d\" does not exist",
 							   RelationGetRelationName(prel), idesc->cur_segno)
 						));
+
+	/*
+	 * Verify that the caller locked the segment earlier. In principle, if
+	 * the caller is holding an AccessExclusiveLock on the table, locking
+	 * individual tuples would not be necessary, but all current callers
+	 * diligently lock the tuples anyway, so we can perform this sanity check
+	 * here.
+	 */
+	if (!pg_aoseg_tuple_is_locked_by_me(oldtup))
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("cannot update pg_aocs entry for segno %d for relation %s, it is not locked for us",
+						idesc->cur_segno, RelationGetRelationName(prel))));
 
 #ifdef USE_ASSERT_CHECKING
 	d[Anum_pg_aocs_segno - 1] = fastgetattr(oldtup, Anum_pg_aocs_segno, tupdesc, &null[Anum_pg_aocs_segno - 1]);
@@ -764,10 +761,13 @@ UpdateAOCSFileSegInfo(AOCSInsertDesc idesc)
 	d[Anum_pg_aocs_varblockcount - 1] += idesc->varblockCount;
 	repl[Anum_pg_aocs_varblockcount - 1] = true;
 
-	d[Anum_pg_aocs_modcount - 1] = fastgetattr(oldtup, Anum_pg_aocs_modcount, tupdesc, &null[Anum_pg_aocs_modcount - 1]);
-	Assert(!null[Anum_pg_aocs_modcount - 1]);
-	d[Anum_pg_aocs_modcount - 1] += 1;
-	repl[Anum_pg_aocs_modcount - 1] = true;
+	if (!idesc->skipModCountIncrement)
+	{
+		d[Anum_pg_aocs_modcount - 1] = fastgetattr(oldtup, Anum_pg_aocs_modcount, tupdesc, &null[Anum_pg_aocs_modcount - 1]);
+		Assert(!null[Anum_pg_aocs_modcount - 1]);
+		d[Anum_pg_aocs_modcount - 1] += 1;
+		repl[Anum_pg_aocs_modcount - 1] = true;
+	}
 
 	/*
 	 * Lets fetch the vpinfo structure from the existing tuple in pg_aocsseg.
@@ -844,7 +844,7 @@ UpdateAOCSFileSegInfo(AOCSInsertDesc idesc)
 	pfree(newtup);
 	pfree(vpinfo);
 
-	heap_endscan(scan);
+	systable_endscan(scan);
 	heap_close(segrel, RowExclusiveLock);
 }
 
@@ -861,7 +861,7 @@ AOCSFileSegInfoAddVpe(Relation prel, int32 segno,
 	LockAcquireResult acquireResult;
 
 	Relation	segrel;
-	HeapScanDesc scan;
+	SysScanDesc scan;
 
 	AOCSVPInfo *oldvpinfo;
 	AOCSVPInfo *newvpinfo;
@@ -892,22 +892,27 @@ AOCSFileSegInfoAddVpe(Relation prel, int32 segno,
 	}
 
 	acquireResult = LockRelationNoWait(prel, AccessExclusiveLock);
-	if (acquireResult != LOCKACQUIRE_ALREADY_HELD)
+	if (acquireResult != LOCKACQUIRE_ALREADY_HELD && acquireResult != LOCKACQUIRE_ALREADY_CLEAR)
 	{
 		elog(ERROR, "should already have (transaction-scope) AccessExclusive"
 			 " lock on relation %s, oid %d",
 			 RelationGetRelationName(prel), RelationGetRelid(prel));
 	}
 
-	segrel = heap_open(prel->rd_appendonly->segrelid, RowExclusiveLock);
+    Oid         segrelid;
+    GetAppendOnlyEntryAuxOids(prel->rd_id,
+                              NULL,
+                              &segrelid, NULL, NULL,
+                              NULL, NULL);
+	segrel = heap_open(segrelid, RowExclusiveLock);
 	tupdesc = RelationGetDescr(segrel);
 
 	/*
 	 * Since we have the segment-file entry under lock (with
 	 * LockRelationAppendOnlySegmentFile) we can use SnapshotNow.
 	 */
-	scan = heap_beginscan_catalog(segrel, 0, NULL);
-	while (segno != tuple_segno && (oldtup = heap_getnext(scan, ForwardScanDirection)) != NULL)
+	scan = systable_beginscan(segrel, InvalidOid, false, NULL, 0, NULL);
+	while (segno != tuple_segno && (oldtup = systable_getnext(scan)) != NULL)
 	{
 		tuple_segno = DatumGetInt32(fastgetattr(oldtup, Anum_pg_aocs_segno, tupdesc, &isNull));
 		if (isNull)
@@ -992,7 +997,7 @@ AOCSFileSegInfoAddVpe(Relation prel, int32 segno,
 	 * transaction commits/aborts.  Additionally, we are already holding
 	 * AccessExclusive lock on the AOCS relation OID.
 	 */
-	heap_endscan(scan);
+	systable_endscan(scan);
 	heap_close(segrel, NoLock);
 }
 
@@ -1000,10 +1005,8 @@ void
 AOCSFileSegInfoAddCount(Relation prel, int32 segno,
 						int64 tupadded, int64 varblockadded, int64 modcount_added)
 {
-	LockAcquireResult acquireResult;
-
 	Relation	segrel;
-	HeapScanDesc scan;
+	SysScanDesc scan;
 
 	HeapTuple	oldtup = NULL;
 	HeapTuple	newtup;
@@ -1015,29 +1018,21 @@ AOCSFileSegInfoAddCount(Relation prel, int32 segno,
 
 	TupleDesc	tupdesc;
 
-	/*
-	 * Verify we already have the write-lock!
-	 */
-	acquireResult = LockRelationAppendOnlySegmentFile(
-													  &prel->rd_node,
-													  segno,
-													  AccessExclusiveLock,
-													   /* dontWait */ false);
-	if (acquireResult != LOCKACQUIRE_ALREADY_HELD)
-	{
-		elog(ERROR, "Should already have the (transaction-scope) write-lock on Append-Only segment file #%d, "
-			 "relation %s", segno, RelationGetRelationName(prel));
-	}
+    Oid         segrelid;
+    GetAppendOnlyEntryAuxOids(prel->rd_id,
+                              NULL,
+                              &segrelid, NULL, NULL,
+                              NULL, NULL);
 
-	segrel = heap_open(prel->rd_appendonly->segrelid, RowExclusiveLock);
+	segrel = heap_open(segrelid, RowExclusiveLock);
 	tupdesc = RelationGetDescr(segrel);
 
 	/*
 	 * Since we have the segment-file entry under lock (with
 	 * LockRelationAppendOnlySegmentFile) we can use SnapshotNow.
 	 */
-	scan = heap_beginscan_catalog(segrel, 0, NULL);
-	while (segno != tuple_segno && (oldtup = heap_getnext(scan, ForwardScanDirection)) != NULL)
+	scan = systable_beginscan(segrel, InvalidOid, false, NULL, 0, NULL);
+	while (segno != tuple_segno && (oldtup = systable_getnext(scan)) != NULL)
 	{
 		tuple_segno = DatumGetInt32(fastgetattr(oldtup, Anum_pg_aocs_segno, tupdesc, &isNull));
 		if (isNull)
@@ -1052,6 +1047,19 @@ AOCSFileSegInfoAddCount(Relation prel, int32 segno,
 						errmsg("AOCS table \"%s\" file segment \"%d\" does not exist",
 							   RelationGetRelationName(prel), segno)
 						));
+
+	/*
+	 * Verify that the caller locked the segment earlier. In principle, if
+	 * the caller is holding an AccessExclusiveLock on the table, locking
+	 * individual tuples would not be necessary, but all current callers
+	 * diligently lock the tuples anyway, so we can perform this sanity check
+	 * here.
+	 */
+	if (!pg_aoseg_tuple_is_locked_by_me(oldtup))
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("cannot update pg_aocs entry for segno %d for relation %s, it is not locked for us",
+						segno, RelationGetRelationName(prel))));
 
 #ifdef USE_ASSERT_CHECKING
 	d[Anum_pg_aocs_segno - 1] = fastgetattr(oldtup, Anum_pg_aocs_segno, tupdesc, &null[Anum_pg_aocs_segno - 1]);
@@ -1081,7 +1089,7 @@ AOCSFileSegInfoAddCount(Relation prel, int32 segno,
 
 	heap_freetuple(newtup);
 
-	heap_endscan(scan);
+	systable_endscan(scan);
 	heap_close(segrel, RowExclusiveLock);
 }
 
@@ -1155,9 +1163,9 @@ gp_aocsseg_internal(PG_FUNCTION_ARGS, Oid aocsRelOid)
 		oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
 
 		/* build tupdesc for result tuples */
-		tupdesc = CreateTemplateTupleDesc(10, false);
-		TupleDescInitEntry(tupdesc, (AttrNumber) 1, "gp_tid",
-						   TIDOID, -1, 0);
+		tupdesc = CreateTemplateTupleDesc(10);
+		TupleDescInitEntry(tupdesc, (AttrNumber) 1, "segment_id",
+						   INT4OID, -1, 0);
 		TupleDescInitEntry(tupdesc, (AttrNumber) 2, "segno",
 						   INT4OID, -1, 0);
 		TupleDescInitEntry(tupdesc, (AttrNumber) 3, "column_num",
@@ -1188,7 +1196,7 @@ gp_aocsseg_internal(PG_FUNCTION_ARGS, Oid aocsRelOid)
 
 		context->aocsRelOid = aocsRelOid;
 
-		aocsRel = heap_open(aocsRelOid, NoLock);
+		aocsRel = heap_open(aocsRelOid, AccessShareLock);
 		if (!RelationIsAoCols(aocsRel))
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
@@ -1198,7 +1206,12 @@ gp_aocsseg_internal(PG_FUNCTION_ARGS, Oid aocsRelOid)
 		/* Remember the number of columns. */
 		context->relnatts = aocsRel->rd_rel->relnatts;
 
-		pg_aocsseg_rel = heap_open(aocsRel->rd_appendonly->segrelid, NoLock);
+        Oid         segrelid;
+        GetAppendOnlyEntryAuxOids(aocsRel->rd_id,
+                                  appendOnlyMetaDataSnapshot,
+                                  &segrelid, NULL, NULL,
+                                  NULL, NULL);
+		pg_aocsseg_rel = heap_open(segrelid, AccessShareLock);
 
 		context->aocsSegfileArray = GetAllAOCSFileSegInfo_pg_aocsseg_rel(
 																		 aocsRel->rd_rel->relnatts,
@@ -1207,8 +1220,8 @@ gp_aocsseg_internal(PG_FUNCTION_ARGS, Oid aocsRelOid)
 																		 appendOnlyMetaDataSnapshot,
 																		 &context->totalAocsSegFiles);
 
-		heap_close(pg_aocsseg_rel, NoLock);
-		heap_close(aocsRel, NoLock);
+		heap_close(pg_aocsseg_rel, AccessShareLock);
+		heap_close(aocsRel, AccessShareLock);
 
 		/* Iteration positions. */
 		context->segfileArrayIndex = 0;
@@ -1232,10 +1245,9 @@ gp_aocsseg_internal(PG_FUNCTION_ARGS, Oid aocsRelOid)
 		bool		nulls[10];
 		HeapTuple	tuple;
 		Datum		result;
-
 		struct AOCSFileSegInfo *aocsSegfile;
-
-		AOCSVPInfoEntry *entry;
+		int64		eof;
+		int64		eof_uncompressed;
 
 		if (context->segfileArrayIndex >= context->totalAocsSegFiles)
 		{
@@ -1264,15 +1276,31 @@ gp_aocsseg_internal(PG_FUNCTION_ARGS, Oid aocsRelOid)
 
 		aocsSegfile = context->aocsSegfileArray[context->segfileArrayIndex];
 
-		entry = getAOCSVPEntry(aocsSegfile, context->columnNum);
+		if (context->columnNum >= aocsSegfile->vpinfo.nEntry)
+		{
+			/*
+			 * AWAITING_DROP segments might be missing information for some
+			 * (newly-added) columns.
+			 */
+			eof = -1;
+			eof_uncompressed = -1;
+		}
+		else
+		{
+			AOCSVPInfoEntry *entry;
 
-		values[0] = ItemPointerGetDatum(&aocsSegfile->tupleVisibilitySummary.tid);
+			entry = getAOCSVPEntry(aocsSegfile, context->columnNum);
+			eof = entry->eof;
+			eof_uncompressed = entry->eof_uncompressed;
+		}
+
+		values[0] = Int32GetDatum(GpIdentity.segindex);
 		values[1] = Int32GetDatum(aocsSegfile->segno);
 		values[2] = Int16GetDatum(context->columnNum);
 		values[3] = Int32GetDatum(context->columnNum * AOTupleId_MultiplierSegmentFileNum + aocsSegfile->segno);
 		values[4] = Int64GetDatum(aocsSegfile->total_tupcount);
-		values[5] = Int64GetDatum(entry->eof);
-		values[6] = Int64GetDatum(entry->eof_uncompressed);
+		values[5] = Int64GetDatum(eof);
+		values[6] = Int64GetDatum(eof_uncompressed);
 		values[7] = Int64GetDatum(aocsSegfile->modcount);
 		values[8] = Int16GetDatum(aocsSegfile->formatversion);
 		values[9] = Int16GetDatum(aocsSegfile->state);
@@ -1345,46 +1373,26 @@ gp_aocsseg_history(PG_FUNCTION_ARGS)
 		oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
 
 		/* build tupdesc for result tuples */
-		tupdesc = CreateTemplateTupleDesc(20, false);
-		TupleDescInitEntry(tupdesc, (AttrNumber) 1, "gp_tid",
-						   TIDOID, -1, 0);
-		TupleDescInitEntry(tupdesc, (AttrNumber) 2, "gp_xmin",
+		tupdesc = CreateTemplateTupleDesc(10);
+		TupleDescInitEntry(tupdesc, (AttrNumber) 1, "segment_id",
 						   INT4OID, -1, 0);
-		TupleDescInitEntry(tupdesc, (AttrNumber) 3, "gp_xmin_status",
-						   TEXTOID, -1, 0);
-		TupleDescInitEntry(tupdesc, (AttrNumber) 4, "gp_xmin_distrib_id",
-						   TEXTOID, -1, 0);
-		TupleDescInitEntry(tupdesc, (AttrNumber) 5, "gp_xmax",
+		TupleDescInitEntry(tupdesc, (AttrNumber) 2, "segno",
 						   INT4OID, -1, 0);
-		TupleDescInitEntry(tupdesc, (AttrNumber) 6, "gp_xmax_status",
-						   TEXTOID, -1, 0);
-		TupleDescInitEntry(tupdesc, (AttrNumber) 7, "gp_xmax_distrib_id",
-						   TEXTOID, -1, 0);
-		TupleDescInitEntry(tupdesc, (AttrNumber) 8, "gp_command_id",
-						   INT4OID, -1, 0);
-		TupleDescInitEntry(tupdesc, (AttrNumber) 9, "gp_infomask",
-						   TEXTOID, -1, 0);
-		TupleDescInitEntry(tupdesc, (AttrNumber) 10, "gp_update_tid",
-						   TIDOID, -1, 0);
-		TupleDescInitEntry(tupdesc, (AttrNumber) 11, "gp_visibility",
-						   TEXTOID, -1, 0);
-		TupleDescInitEntry(tupdesc, (AttrNumber) 12, "segno",
-						   INT4OID, -1, 0);
-		TupleDescInitEntry(tupdesc, (AttrNumber) 13, "column_num",
+		TupleDescInitEntry(tupdesc, (AttrNumber) 3, "column_num",
 						   INT2OID, -1, 0);
-		TupleDescInitEntry(tupdesc, (AttrNumber) 14, "physical_segno",
+		TupleDescInitEntry(tupdesc, (AttrNumber) 4, "physical_segno",
 						   INT4OID, -1, 0);
-		TupleDescInitEntry(tupdesc, (AttrNumber) 15, "tupcount",
+		TupleDescInitEntry(tupdesc, (AttrNumber) 5, "tupcount",
 						   INT8OID, -1, 0);
-		TupleDescInitEntry(tupdesc, (AttrNumber) 16, "eof",
+		TupleDescInitEntry(tupdesc, (AttrNumber) 6, "eof",
 						   INT8OID, -1, 0);
-		TupleDescInitEntry(tupdesc, (AttrNumber) 17, "eof_uncompressed",
+		TupleDescInitEntry(tupdesc, (AttrNumber) 7, "eof_uncompressed",
 						   INT8OID, -1, 0);
-		TupleDescInitEntry(tupdesc, (AttrNumber) 18, "modcount",
+		TupleDescInitEntry(tupdesc, (AttrNumber) 8, "modcount",
 						   INT8OID, -1, 0);
-		TupleDescInitEntry(tupdesc, (AttrNumber) 19, "formatversion",
+		TupleDescInitEntry(tupdesc, (AttrNumber) 9, "formatversion",
 						   INT2OID, -1, 0);
-		TupleDescInitEntry(tupdesc, (AttrNumber) 20, "state",
+		TupleDescInitEntry(tupdesc, (AttrNumber) 10, "state",
 						   INT2OID, -1, 0);
 
 		funcctx->tuple_desc = BlessTupleDesc(tupdesc);
@@ -1398,17 +1406,26 @@ gp_aocsseg_history(PG_FUNCTION_ARGS)
 
 		context->aocsRelOid = aocsRelOid;
 
-		aocsRel = heap_open(aocsRelOid, NoLock);
+		aocsRel = heap_open(aocsRelOid, AccessShareLock);
 		if (!RelationIsAoCols(aocsRel))
+		{
+			heap_close(aocsRel, AccessShareLock);
 			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("'%s' is not an append-only columnar relation",
-							RelationGetRelationName(aocsRel))));
+			        (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				        errmsg("'%s' is not an append-only columnar relation",
+				               RelationGetRelationName(aocsRel))));
+		}
 
 		/* Remember the number of columns. */
 		context->relnatts = aocsRel->rd_rel->relnatts;
 
-		pg_aocsseg_rel = heap_open(aocsRel->rd_appendonly->segrelid, NoLock);
+        Oid         segrelid;
+        GetAppendOnlyEntryAuxOids(aocsRel->rd_id,
+                                  NULL,
+                                  &segrelid, NULL, NULL,
+                                  NULL, NULL);
+
+		pg_aocsseg_rel = heap_open(segrelid, AccessShareLock);
 
 		context->aocsSegfileArray = GetAllAOCSFileSegInfo_pg_aocsseg_rel(
 																		 RelationGetNumberOfAttributes(aocsRel),
@@ -1417,8 +1434,8 @@ gp_aocsseg_history(PG_FUNCTION_ARGS)
 																		 SnapshotAny, //Get ALL tuples from pg_aocsseg_ % including aborted and in - progress ones.
 																		 & context->totalAocsSegFiles);
 
-		heap_close(pg_aocsseg_rel, NoLock);
-		heap_close(aocsRel, NoLock);
+		heap_close(pg_aocsseg_rel, AccessShareLock);
+		heap_close(aocsRel, AccessShareLock);
 
 		/* Iteration positions. */
 		context->segfileArrayIndex = 0;
@@ -1437,14 +1454,13 @@ gp_aocsseg_history(PG_FUNCTION_ARGS)
 	 */
 	while (true)
 	{
-		Datum		values[20];
-		bool		nulls[20];
+		Datum		values[10];
+		bool		nulls[10];
 		HeapTuple	tuple;
 		Datum		result;
-
 		struct AOCSFileSegInfo *aocsSegfile;
-
-		AOCSVPInfoEntry *entry;
+		int64		eof;
+		int64		eof_uncompressed;
 
 		if (context->segfileArrayIndex >= context->totalAocsSegFiles)
 		{
@@ -1473,22 +1489,34 @@ gp_aocsseg_history(PG_FUNCTION_ARGS)
 
 		aocsSegfile = context->aocsSegfileArray[context->segfileArrayIndex];
 
-		entry = getAOCSVPEntry(aocsSegfile, context->columnNum);
+		if (context->columnNum >= aocsSegfile->vpinfo.nEntry)
+		{
+			/*
+			 * AWAITING_DROP segments might be missing information for some
+			 * (newly-added) columns
+			 */
+			eof = -1;
+			eof_uncompressed = -1;
+		}
+		else
+		{
+			AOCSVPInfoEntry *entry;
 
-		GetTupleVisibilitySummaryDatums(
-										&values[0],
-										&nulls[0],
-										&aocsSegfile->tupleVisibilitySummary);
+			entry = getAOCSVPEntry(aocsSegfile, context->columnNum);
+			eof = entry->eof;
+			eof_uncompressed = entry->eof_uncompressed;
+		}
 
-		values[11] = Int32GetDatum(aocsSegfile->segno);
-		values[12] = Int16GetDatum(context->columnNum);
-		values[13] = Int32GetDatum(context->columnNum * AOTupleId_MultiplierSegmentFileNum + aocsSegfile->segno);
-		values[14] = Int64GetDatum(aocsSegfile->total_tupcount);
-		values[15] = Int64GetDatum(entry->eof);
-		values[16] = Int64GetDatum(entry->eof_uncompressed);
-		values[17] = Int64GetDatum(aocsSegfile->modcount);
-		values[18] = Int16GetDatum(aocsSegfile->formatversion);
-		values[19] = Int16GetDatum(aocsSegfile->state);
+		values[0] = Int32GetDatum(GpIdentity.segindex);
+		values[1] = Int32GetDatum(aocsSegfile->segno);
+		values[2] = Int16GetDatum(context->columnNum);
+		values[3] = Int32GetDatum(context->columnNum * AOTupleId_MultiplierSegmentFileNum + aocsSegfile->segno);
+		values[4] = Int64GetDatum(aocsSegfile->total_tupcount);
+		values[5] = Int64GetDatum(eof);
+		values[6] = Int64GetDatum(eof_uncompressed);
+		values[7] = Int64GetDatum(aocsSegfile->modcount);
+		values[8] = Int16GetDatum(aocsSegfile->formatversion);
+		values[9] = Int16GetDatum(aocsSegfile->state);
 
 		tuple = heap_form_tuple(funcctx->tuple_desc, values, nulls);
 		result = HeapTupleGetDatum(tuple);
@@ -1500,191 +1528,6 @@ gp_aocsseg_history(PG_FUNCTION_ARGS)
 	}
 
 	SRF_RETURN_DONE(funcctx);
-}
-
-int64
-gp_update_aocol_master_stats_internal(Relation parentrel, Snapshot appendOnlyMetaDataSnapshot)
-{
-	StringInfoData sqlstmt;
-	Relation	aosegrel;
-	bool		connected = false;
-	int			proc;	/* 32 bit, only holds number of segments */
-	int			ret;
-	int64		total_count = 0;
-	MemoryContext oldcontext = CurrentMemoryContext;
-	int32		nvp = RelationGetNumberOfAttributes(parentrel);
-
-	/*
-	 * assemble our query string
-	 */
-	aosegrel = heap_open(parentrel->rd_appendonly->segrelid, AccessShareLock);
-	initStringInfo(&sqlstmt);
-	appendStringInfo(&sqlstmt, "select segno,sum(tupcount) "
-					 "from gp_dist_random('%s.%s') "
-					 "group by (segno)",
-					 get_namespace_name(RelationGetNamespace(aosegrel)),
-					 RelationGetRelationName(aosegrel));
-	heap_close(aosegrel, AccessShareLock);
-
-	PG_TRY();
-	{
-
-		if (SPI_OK_CONNECT != SPI_connect())
-		{
-			ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
-							errmsg("Unable to obtain AO relation information from segment databases."),
-							errdetail("SPI_connect failed in gp_update_ao_master_stats")));
-		}
-		connected = true;
-
-		/* Do the query. */
-		ret = SPI_execute(sqlstmt.data, false, 0);
-		proc = (int) SPI_processed;
-
-
-		if (ret > 0 && SPI_tuptable != NULL)
-		{
-			TupleDesc	tupdesc = SPI_tuptable->tupdesc;
-			SPITupleTable *tuptable = SPI_tuptable;
-			int			i;
-
-			/*
-			 * Iterate through each result tuple
-			 */
-			for (i = 0; i < proc; i++)
-			{
-				HeapTuple	tuple = tuptable->vals[i];
-				AOCSFileSegInfo *aocsfsinfo = NULL;
-				int			qe_segno;
-				int64		qe_tupcount;
-				char	   *val_segno;
-				char	   *val_tupcount;
-				MemoryContext cxt_save;
-
-				/*
-				 * Get totals from QE's for a specific segment
-				 */
-				val_segno = SPI_getvalue(tuple, tupdesc, 1);
-				val_tupcount = SPI_getvalue(tuple, tupdesc, 2);
-
-				/* use our own context so that SPI won't free our stuff later */
-				cxt_save = MemoryContextSwitchTo(oldcontext);
-
-				/*
-				 * Convert to desired data type
-				 */
-				qe_segno = pg_atoi(val_segno, sizeof(int32), 0);
-				qe_tupcount = DatumGetInt64(DirectFunctionCall1(int8in,
-																CStringGetDatum(val_tupcount)));
-
-				total_count += qe_tupcount;
-
-				/*
-				 * Get the numbers on the QD for this segment
-				 */
-
-
-				/*
-				 * CONSIDER: For integrity, we should lock ALL segment files
-				 * first before
-				 */
-
-				/*
-				 * executing the query.  And, the query of the segments (the
-				 * SPI_execute)
-				 */
-
-				/*
-				 * and the update (UpdateFileSegInfo) should be in the same
-				 * transaction.
-				 */
-				/* */
-
-				/*
-				 * If there are concurrent Append-Only inserts, we can end up
-				 * with
-				 */
-				/* the wrong answer... */
-				/* */
-
-				/*
-				 * NOTE: This is a transaction scope lock that must be held
-				 * until commit / abort.
-				 */
-				/* */
-				LockRelationAppendOnlySegmentFile(
-												  &parentrel->rd_node,
-												  qe_segno,
-												  AccessExclusiveLock,
-												   /* dontWait */ false);
-
-				aocsfsinfo = GetAOCSFileSegInfo(parentrel, appendOnlyMetaDataSnapshot, qe_segno);
-				if (aocsfsinfo == NULL)
-				{
-					InsertInitialAOCSFileSegInfo(parentrel, qe_segno, nvp);
-
-					aocsfsinfo = NewAOCSFileSegInfo(qe_segno, nvp);
-				}
-
-				/*
-				 * check if numbers match. NOTE: proper way is to use int8eq()
-				 * but since we don't expect any NAN's in here better do it
-				 * directly
-				 */
-				if (aocsfsinfo->total_tupcount != qe_tupcount)
-				{
-					int64		diff = qe_tupcount - aocsfsinfo->total_tupcount;
-
-					elog(DEBUG3, "gp_update_ao_master_stats: updating "
-						 "segno %d with tupcount %d", qe_segno,
-						 (int) qe_tupcount);
-
-					/*
-					 * QD tup count !=  QE tup count. update QD count by
-					 * passing in the diff (may be negative sometimes).
-					 */
-					AOCSFileSegInfoAddCount(parentrel, qe_segno, diff, 0, 1);
-				}
-				else
-					elog(DEBUG3, "gp_update_ao_master_stats: no need to "
-						 "update segno %d. it is synced", qe_segno);
-
-				pfree(aocsfsinfo);
-
-				MemoryContextSwitchTo(cxt_save);
-
-				/*
-				 * TODO: if an entry exists for this rel in the AO hash table
-				 * need to also update that entry in shared memory. Need to
-				 * figure out how to do this safely when concurrent operations
-				 * are in progress. note that if no entry exists we are ok.
-				 *
-				 * At this point this doesn't seem too urgent as we generally
-				 * only expect this function to update segno 0 only and the QD
-				 * never cares about segment 0 anyway.
-				 */
-			}
-		}
-
-		connected = false;
-
-		SPI_finish();
-	}
-
-	/* Clean up in case of error. */
-	PG_CATCH();
-	{
-		if (connected)
-			SPI_finish();
-
-		/* Carry on with error handling. */
-		PG_RE_THROW();
-	}
-	PG_END_TRY();
-
-	pfree(sqlstmt.data);
-
-	return total_count;
 }
 
 float8
@@ -1736,9 +1579,10 @@ aocol_compression_ratio_internal(Relation parentrel)
 
 		if (SPI_OK_CONNECT != SPI_connect())
 		{
-			ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
-							errmsg("Unable to obtain AO relation information from segment databases."),
-							errdetail("SPI_connect failed in get_ao_compression_ratio")));
+			ereport(ERROR,
+					(errcode(ERRCODE_INTERNAL_ERROR),
+					 errmsg("unable to obtain AO relation information from segment databases"),
+					 errdetail("SPI_connect failed in get_ao_compression_ratio")));
 		}
 		connected = true;
 

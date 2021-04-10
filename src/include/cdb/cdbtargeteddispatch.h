@@ -11,7 +11,7 @@
  * See MPP-6939 for more information.
  *
  * Portions Copyright (c) 2009, Greenplum inc
- * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
  *
  *
  * IDENTIFICATION
@@ -22,14 +22,14 @@
 #ifndef CDBTARGETEDDISPATCH_H
 #define CDBTARGETEDDISPATCH_H
 
+#include "nodes/pathnodes.h"
 #include "nodes/plannodes.h"
-#include "nodes/parsenodes.h"
-#include "nodes/relation.h"
 
-/**
- * @param query the query that produced the given plan
- * @param plan the plan to augment with directDispatch info (in its directDispatch field)
- */
-extern void AssignContentIdsToPlanData(Query *query, Plan *plan, PlannerInfo *root);
+extern void FinalizeDirectDispatchDataForSlice(PlanSlice *slice);
+extern void DirectDispatchUpdateContentIdsFromPlan(PlannerInfo *root, Plan *plan);
+extern void DirectDispatchUpdateContentIdsForInsert(PlannerInfo *root, Plan *plan,
+													GpPolicy *targetPolicy, Oid *hashfuncs);
+
+extern void MergeDirectDispatchCalculationInfo(DirectDispatchInfo *to, DirectDispatchInfo *from);
 
 #endif   /* CDBTARGETEDDISPATCH_H */

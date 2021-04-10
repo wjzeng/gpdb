@@ -1,4 +1,3 @@
-set enable_partition_rules = false;
 
 drop table if exists d;
 drop table if exists c;
@@ -55,14 +54,27 @@ partition bb start (date '2008-01-01') end (date '2009-01-01')
 
 drop table ggg cascade;
 
--- don't allow nonconstant expressions, even simple ones...
+-- Expressions are allowed
 create table ggg (a char(1), b numeric, d numeric)
 distributed by (a)
-partition by range (b,d)
+partition by range (b)
 (
-partition aa start (2007,1) end (2008,2+2),
-partition bb start (2008,2) end (2009,3)
+partition aa start (2007) end (2007+1),
+partition bb start (2008) end (2009)
 );
+
+drop table ggg cascade;
+
+-- Even volatile expressions are OK. They are evaluted immediately.
+create table ggg (a char(1), b numeric, d numeric)
+distributed by (a)
+partition by range (b)
+(
+partition aa start (2007) end (2008+(random()*9)::integer),
+partition bb start (2018) end (2019)
+);
+
+drop table ggg cascade;
 
 -- too many columns for RANGE partition
 create table ggg (a char(1), b numeric, d numeric)
@@ -73,8 +85,24 @@ partition aa start (2007,1) end (2008,2),
 partition bb start (2008,2) end (2009,3)
 );
 
-
 drop table ggg cascade;
+
+-- Mismatch between number of columns in PARTITION BY and in the START/END clauses
+create table pby_mismatch (a char(1), b numeric, d numeric)
+distributed by (a)
+partition by range (b)
+(
+  partition aa start (2007,1) end (2008),
+  partition bb start (2008,2) end (2009)
+);
+
+create table pby_mismatch (a char(1), b numeric, d numeric)
+distributed by (a)
+partition by range (b)
+(
+  partition aa start (2007) end (2008,1),
+  partition bb start (2008) end (2009,1)
+);
 
 -- basic list partition
 create table ggg (a char(1), b char(2), d char(3))
@@ -188,16 +216,17 @@ partition by list (gender)
 );
 
 -- duplicate values
-CREATE TABLE rank (id int, rank int, year date, gender
-char(1)) DISTRIBUTED BY (id, gender, year)
-partition by list (rank,gender)
+CREATE TYPE rank_partkey AS (rank int, gender char(1));
+CREATE TABLE rank (id int, rankgender rank_partkey, year date)
+DISTRIBUTED BY (id, year)
+partition by list (rankgender)
 (
- values ((1, 'M')),
- values ((2, 'M')),
- values ((3, 'M')),
- values ((1, 'F')),
- partition ff values ((4, 'M')),
- partition bb values ((1, 'M'))
+ values (CAST ('(1,M)' AS rank_partkey)),
+ values (CAST ('(2,M)' AS rank_partkey)),
+ values (CAST ('(3,M)' AS rank_partkey)),
+ values (CAST ('(1,F)' AS rank_partkey)),
+ partition ff values (CAST ('(4,M)' AS rank_partkey)),
+ partition bb values (CAST ('(1,M)' AS rank_partkey))
 );
 
 
@@ -371,6 +400,34 @@ select * from ggg_1_prt_4 order by 1, 2;
 
 drop table ggg cascade;
 
+-- EVERY works by invoking the + operator. We haven't explictly documented
+-- that user can create his own, but better still test it.
+create domain funnytext as text;
+create function funnytext_plus (funnytext, integer) returns funnytext
+as $$ select (chr(ascii($1) + $2))::funnytext $$ language sql;
+
+create operator pg_catalog.+ (function=funnytext_plus, leftarg=funnytext, rightarg=integer);
+
+create table ggg (a char(1), t funnytext)
+distributed by (a)
+partition by range (t)
+(
+  start ('aaa') end ('foobar') every (1)
+);
+\d+ ggg
+
+drop table ggg cascade;
+
+-- What if the + operator returns NULL?
+create or replace function funnytext_plus (funnytext, integer) returns funnytext
+as $$ select NULL::funnytext $$ language sql;
+create table ggg (a char(1), t funnytext)
+distributed by (a)
+partition by range (t)
+(
+  start ('aaa') end ('foobar') every (1)
+);
+
 create table fff (a char(1), b char(2), d char(3)) distributed by (a)
 partition by list (b) (partition aa values ('2'));
 
@@ -504,7 +561,7 @@ partition bb start (date '2008-01-01') end (date '2009-01-01')
 );
 
 -- already exists
-alter table hhh add partition aa;
+alter table hhh add partition aa start ('2010-01-01') end ('2011-01-01');
 
 -- no partition spec
 alter table hhh add partition cc;
@@ -554,10 +611,7 @@ alter table no_start1 add partition baz end (4);
 -- ok (because starts after baz end)
 alter table no_start1 add partition baz2 start (5);
 
-select tablename, partitionlevel, parentpartitiontablename,
-partitionname, partitionrank, partitionboundary from pg_partitions
-where tablename = 'no_start1' or tablename = 'no_end1'
-order by tablename, partitionrank;
+select relname, pg_get_expr(relpartbound, oid) from pg_class where relname like 'no_start%' or relname like 'no_end%';
 
 drop table no_end1;
 drop table no_start1;
@@ -570,7 +624,7 @@ partition j2 end (date '2009-01-01'));
 
 -- must have a name
 alter table jjj add default partition;
-alter table jjj add default partition for (rank(1));
+alter table jjj add default partition for ('2008-01-01');
 -- cannot have boundary spec
 alter table jjj add default partition j3 end (date '2010-01-01');
 
@@ -586,7 +640,6 @@ default partition j3);
 alter table jjj add default partition j3 ;
 alter table jjj add default partition j4 ;
 
--- cannot add if have default, must split
 alter table jjj add partition j5 end (date '2010-01-01');
 
 drop table jjj cascade;
@@ -604,8 +657,6 @@ alter table hhh drop partition cc restrict;
 alter table hhh drop partition if exists cc;
 
 -- fail (mpp-3265)
-alter table hhh drop partition for (rank(0));
-alter table hhh drop partition for (rank(-55));
 alter table hhh drop partition for ('2001-01-01');
 
 
@@ -626,18 +677,19 @@ partition bb values ('2008-01-01'),
 partition cc values ('2009-01-01')
 );
 
--- must have name or value for list partition
+-- must have name or value for partition
 alter table hhh_l1 drop partition;
 alter table hhh_l1 drop partition aa;
 alter table hhh_l1 drop partition for ('2008-01-01');
 
--- if not specified, drop first range partition...
+-- same with range partitioning
+alter table hhh_r1 drop partition;
 alter table hhh_r1 drop partition for ('2007-04-01');
-alter table hhh_r1 drop partition;
-alter table hhh_r1 drop partition;
-alter table hhh_r1 drop partition;
-alter table hhh_r1 drop partition;
-alter table hhh_r1 drop partition;
+alter table hhh_r1 drop partition for ('2007-01-01');
+alter table hhh_r1 drop partition aa_2;
+alter table hhh_r1 drop partition aa_3;
+alter table hhh_r1 drop partition aa_5;
+alter table hhh_r1 drop partition aa_6;
 
 -- more add partition tests
 
@@ -725,13 +777,8 @@ alter table rank truncate partition for ('F');
 
 drop table rank cascade;
 
-alter table hhh exchange partition cc with table nosuchtable with validation;
-
-alter table hhh exchange partition cc with table nosuchtable without validation;
-
-alter table hhh exchange partition aa with table nosuchtable with validation;
-
-alter table hhh exchange partition aa with table nosuchtable without validation;
+alter table hhh exchange partition cc with table nosuchtable;
+alter table hhh exchange partition aa with table nosuchtable;
 
 alter table hhh rename partition cc to aa;
 alter table hhh rename partition bb to aa;
@@ -865,6 +912,7 @@ insert into d values(1, 10);
 insert into d values(1, 11);
 insert into d values(1, 55);
 insert into d values(1, 70);
+\d+ d
 select * from d;
 select * from d_1_prt_1;
 select * from d_1_prt_2;
@@ -901,21 +949,24 @@ insert into d values (1, 1);
 insert into d values (1, 2);
 insert into d values (1, NULL);
 select * from d_1_prt_abc;
+alter table d split default partition start (21,1) end (30) into (partition c, default partition);
+alter table d split default partition start (21) end (30,1) into (partition c, default partition);
 drop table  d cascade;
 
 -- multicolumn list support
-create table d (a int, b int, c int) distributed by (a)
-partition by list(b, c)
-(partition a values(('1', '2'), ('3', '4')),
- partition b values(('100', '20')),
- partition c values(('1000', '1001'), ('1001', '1002'), ('1003', '1004')));
-
-insert into d values(1, 1, 2);
-insert into d values(1, 3, 4);
-insert into d values(1, 100, 20);
-insert into d values(1, 100, 2000);
-insert into d values(1, '1000', '1001'), (1, '1001', '1002'), (1, '1003', '1004');
-insert into d values(1, 100, NULL);
+create type d_partkey as (b int, c int);
+create table d (a int, k d_partkey) distributed by (a)
+partition by list(k)
+(partition a values(CAST('(1,2)' as d_partkey), CAST('(3,4)' as d_partkey)),
+ partition b values(CAST('(100,20)' as d_partkey)),
+ partition c values(CAST('(1000,1001)' as d_partkey), CAST('(1001,1002)' as d_partkey), CAST('(1003,1004)' as d_partkey)));
+\d+ d
+insert into d values(1, (1, 2));
+insert into d values(1, (3, 4));
+insert into d values(1, (100, 20));
+insert into d values(1, (100, 2000));
+insert into d values(1, ('1000', '1001')), (1, ('1001', '1002')), (1, ('1003', '1004'));
+insert into d values(1, (100, NULL));
 select * from d_1_prt_a;
 select * from d_1_prt_b;
 select * from d_1_prt_c;
@@ -986,7 +1037,7 @@ drop table b;
 -- different levels -- so this is legal again...
 drop table if exists a;
 
--- TEST: make sure GPOPT (aka pivotal query optimizer) fall back to legacy query optimizer
+-- TEST: make sure GPOPT (aka pivotal query optimizer) fall back to Postgres query optimizer
 --       for queries with partition elimination over FULL OUTER JOIN
 --       between partitioned tables.
 
@@ -1012,7 +1063,7 @@ partition by list (p2)
 -- end_ignore
 
 -- VERIFY
--- expect GPOPT fall back to legacy query optimizer
+-- expect GPOPT fall back to Postgres query optimizer
 -- since GPOPT don't support partition elimination through full outer joins
 select * from s1 full outer join s2 on s1.d1 = s2.d2 and s1.p1 = s2.p2 where s1.p1 = 1;
 
@@ -1022,6 +1073,36 @@ drop table if exists s1;
 drop table if exists s2;
 -- end_ignore
 
+-- the following case is to test when we have a template
+-- we can correct add new subpartition with relation options.
+create table test_part_relops_tmpl (id int,  p1 text, p2 text, count int)
+distributed by (id)
+partition by list (p1)
+subpartition by list (p2)
+(
+  partition m1 values ('m1')
+  (subpartition l1 values ('l1'),
+   subpartition l2 values ('l2')),
+  partition m2 values ('m2')
+  (subpartition l1 values ('l1'),
+   subpartition l2 values ('l2'))
+);
+
+alter table test_part_relops_tmpl
+set subpartition template
+(
+   subpartition l1 values('l1')
+);
+
+-- previously, we do wrong in the function of `add_partition_rule`
+-- which invokes `transformRelOptions`, and transformRelOptions
+-- may return NULL in some cases. For example, the invokation of
+-- transformRelOptions in add_partition_rule set ignoreOids = true,
+-- so the following statement creates such senario by passing oids options,
+-- then transformRelOptions return NULL and we should correctly handle
+-- null pointers.
+alter table test_part_relops_tmpl alter partition for ('m1') add partition l3 values ('l3')
+with (oids=false);
 
 create table mpp_2914A(id int,  buyDate date, kind char(1))
 DISTRIBUTED BY (id)
@@ -1111,15 +1192,6 @@ create table dcl_messaging_test
         message_create_date     timestamp(3) not null,
         trace_socket            varchar(1024) null,
         trace_count             varchar(1024) null,
-        variable_01             varchar(1024) null,
-        variable_02             varchar(1024) null,
-        variable_03             varchar(1024) null,
-        variable_04             varchar(1024) null,
-        variable_05             varchar(1024) null,
-        variable_06             varchar(1024) null,
-        variable_07             varchar(1024) null,
-        variable_08             varchar(1024) null,
-        variable_09             varchar(1024) null,
         variable_10             varchar(1024) null,
         variable_11             varchar(1024) null,
         variable_12             varchar(1024) null,
@@ -1130,52 +1202,12 @@ create table dcl_messaging_test
         variable_17             varchar(1024) null,
         variable_18             varchar(1024) null,
         variable_19             varchar(1024) null,
-        variable_20             varchar(1024) null,
-        variable_21             varchar(1024) null,
-        variable_22             varchar(1024) null,
-        variable_23             varchar(1024) null,
-        variable_24             varchar(1024) null,
-        variable_25             varchar(1024) null,
-        variable_26             varchar(1024) null,
-        variable_27             varchar(1024) null,
-        variable_28             varchar(1024) null,
-        variable_29             varchar(1024) null,
-        variable_30             varchar(1024) null,
-        variable_31             varchar(1024) null,
-        variable_32             varchar(1024) null,
-        variable_33             varchar(1024) null,
-        variable_34             varchar(1024) null,
-        variable_35             varchar(1024) null,
-        variable_36             varchar(1024) null,
-        variable_37             varchar(1024) null,
-        variable_38             varchar(1024) null,
-        variable_39             varchar(1024) null,
-        variable_40             varchar(1024) null,
-        variable_41             varchar(1024) null,
-        variable_42             varchar(1024) null,
-        variable_43             varchar(1024) null,
-        variable_44             varchar(1024) null,
-        variable_45             varchar(1024) null,
-        variable_46             varchar(1024) null,
-        variable_47             varchar(1024) null,
-        variable_48             varchar(1024) null,
-        variable_49             varchar(1024) null,
-        variable_50             varchar(1024) null,
-        variable_51             varchar(1024) null,
-        variable_52             varchar(1024) null,
-        variable_53             varchar(1024) null,
-        variable_54             varchar(1024) null,
-        variable_55             varchar(1024) null,
-        variable_56             varchar(1024) null,
-        variable_57             varchar(1024) null,
-        variable_58             varchar(1024) null,
-        variable_59             varchar(1024) null,
-        variable_60             varchar(1024) null
+        variable_20             varchar(1024) null
 )
 distributed by (message_create_date)
 partition by range (message_create_date)
 (
-    START (timestamp '2011-09-01') END (timestamp '2011-09-15') EVERY (interval '1 day'),
+    START (timestamp '2011-09-01') END (timestamp '2011-09-10') EVERY (interval '1 day'),
     DEFAULT PARTITION outlying_dates
 );
 -- partial index
@@ -1185,10 +1217,10 @@ create index dcl_messaging_test_index16 on dcl_messaging_test(upper(variable_16)
 alter table dcl_messaging_test drop default partition;
 
 -- ADD case
-alter table dcl_messaging_test add partition start (timestamp '2011-09-15') inclusive end (timestamp '2011-09-16') exclusive;
+alter table dcl_messaging_test add partition start (timestamp '2011-09-10') inclusive end (timestamp '2011-09-11') exclusive;
 
 -- EXCHANGE case
-create table dcl_candidate(like dcl_messaging_test) with (appendonly=true);
+create table dcl_candidate(like dcl_messaging_test including indexes) with (appendonly=true);
 insert into dcl_candidate(message_create_date) values (timestamp '2011-09-06');
 alter table dcl_messaging_test exchange partition for ('2011-09-06') with table dcl_candidate;
 
@@ -1207,18 +1239,18 @@ PARTITION BY RANGE (date)
 
 -- Add unbound partition right before the start succeeds
 alter table mpp13806 add partition test end (date '2008-01-01') exclusive;
-select partitiontablename, partitionrangestart, partitionstartinclusive, partitionrangeend, partitionendinclusive from pg_partitions where tablename like 'mpp13806%' order by partitionrank;
+select relname, pg_get_expr(relpartbound, oid) from pg_class where relname like 'mpp13806%';
 
 -- Drop the partition
 alter TABLE mpp13806 drop partition test;
 
 -- Add unbound partition with a gap succeeds
 alter table mpp13806 add partition test end (date '2007-12-31') exclusive;
-select partitiontablename, partitionrangestart, partitionstartinclusive, partitionrangeend, partitionendinclusive from pg_partitions where tablename like 'mpp13806%' order by partitionrank;
+select relname, pg_get_expr(relpartbound, oid) from pg_class where relname like 'mpp13806%';
 
 -- Fill the gap succeeds/adding immediately before the first partition succeeds
 alter table mpp13806 add partition test1 start (date '2007-12-31') inclusive end (date '2008-01-01') exclusive;
-select partitiontablename, partitionrangestart, partitionstartinclusive, partitionrangeend, partitionendinclusive from pg_partitions where tablename like 'mpp13806%' order by partitionrank;
+select relname, pg_get_expr(relpartbound, oid) from pg_class where relname like 'mpp13806%';
 
 
 --
@@ -1261,12 +1293,9 @@ create table mpp14613_range(
      start(1) end(5) every(1)
  );
 
--- Check the partition and subpartition details
-select tablename,partitiontablename, partitionname from pg_partitions where tablename in ('mpp14613_list','mpp14613_range');
-
 -- SPLIT partition
-alter table mpp14613_list alter partition others split partition subothers at (10) into (partition b1, partition b2);
-alter table mpp14613_range alter partition others split partition subothers at (10) into (partition b1, partition b2);
+alter table mpp14613_list alter partition others split partition subothers at (10) into (partition b1, partition subothers);
+alter table mpp14613_range alter partition others split partition subothers at (10) into (partition b1, partition subothers);
 
 -- ALTER TABLE ... ALTER PARTITION ... SPLIT DEFAULT PARTITION
 create table foo(
@@ -1287,17 +1316,13 @@ create table foo(
     start(1) end(5) every(1)
  );
 
-alter table foo alter partition others split partition subothers at (10) into (partition b1, default partition);
 alter table foo alter partition others split partition subothers at (10) into (partition b1, partition subothers);
+alter table foo alter partition others split partition subothers at (10) into (partition b1, default partition);
 alter table foo alter partition others split default partition at (10) into (partition b1, default partition);
 drop table foo;
 
--- Drop table as gpcheckcat will complaint of not having constraint for newly
--- created tables due to split.
-drop table mpp14613_list;
-
 --
--- Drop index on a partitioned table. The indexes on the partitions remain.
+-- Drop index on a partitioned table. The indexes on the partitions are removed.
 --
 create table pt_indx_tab (c1 integer, c2 int, c3 text) partition by range (c1) (partition A start (integer '0') end (integer '5') every (integer '1'));
 
@@ -1311,76 +1336,18 @@ drop index pt_indx_drop;
 select count(*) from pg_index where indrelid='pt_indx_tab'::regclass;
 select count(*) from pg_index where indrelid='pt_indx_tab_1_prt_a_1'::regclass;
 
-
---
--- MPP-18162 CLONE (4.2.3) - List partitioning for multiple columns gives duplicate values error
---
-create table mpp18162a
-( i1 int, i2 int)
-distributed by (i1)
-partition by list (i1, i2) (
-  partition pi0 values ( (1,1) ),
-  partition pi1 values ( (1,2) ),
-  partition pi2 values ( (2,1) )
-);
-
-create table mpp18162b
-( i1 int, i2 int)
-distributed by (i1)
-partition by list (i1, i2) (
-  partition pi1 values ( (3,1), (1,3) ),
-  partition pi2 values ( (4,1), (1,4) )
-);
-
-create table mpp18162c
-( i1 text, i2 varchar(10))
-distributed by (i1)
-partition by list (i1, i2) (
-  partition pi0 values ( ('1','1') ),
-  partition pi1 values ( ('1','2') ),
-  partition pi2 values ( ('2','1') )
-);
-
-create table mpp18162d
-( i1 text, i2 varchar(10))
-distributed by (i1)
-partition by list (i1, i2) (
-  partition pi1 values ( ('3','1'), ('1','3') ),
-  partition pi2 values ( ('4','1'), ('1','4') )
-);
-
-create table mpp18162e
-( i1 date, i2 date)
-distributed by (i1)
-partition by list (i1, i2) (
-  partition pi1 values ( (date '2008-01-01',date '2008-02-01') ),
-  partition pi2 values ( (date '2008-02-01',date '2008-01-01') ),
-  partition pi3 values ( (date '2008-03-01',date '2008-04-01') ),
-  partition pi4 values ( (date '2008-04-01',date '2008-03-01') )
-);
-
-create table mpp18162f
-( i1 text, i2 varchar(10))
-distributed by (i1)
-partition by list (i1, i2) (
-  partition pi1 values ( (date '2008-01-01',date '2008-02-01'), (date '2008-02-01',date '2008-01-01') ),
-  partition pi2 values ( (date '2008-03-01',date '2008-04-01'), (date '2008-04-01',date '2008-03-01') )
-);
-
-
 --
 -- Test changing the datatype of a column in a partitioning key column.
 -- (Not supported, throws an error).
 --
 create table mpp18179 (a int, b int, i int)
 distributed by (a)
-partition by list (a,b)
-   ( PARTITION ab1 VALUES ((1,1)),
-     PARTITION ab2 values ((1,2)),
+partition by list (b)
+   ( PARTITION ab1 VALUES (1),
+     PARTITION ab2 values (2),
      default partition other
    );
 
-alter table mpp18179 alter column a type varchar(20);
 alter table mpp18179 alter column b type varchar(20);
 
 
@@ -1397,14 +1364,11 @@ INSERT INTO mpp7635_aoi_table2(id) VALUES (0);
 CREATE INDEX mpp7635_ix3 ON mpp7635_aoi_table2 USING BITMAP (id);
 select * from pg_indexes where tablename like 'mpp7635%';
 
--- Drop it. This only drops it from the root table, not the partitions.
+-- Drop it
 DROP INDEX mpp7635_ix3;
 select * from pg_indexes where tablename like 'mpp7635%';
 
--- Create it again. This creates the index on the partitions, too, so you
--- end up with duplicate indexes on the partitions. It's a bit silly, but
--- should still work, and not throw a "relation already exists" error, for
--- example.
+-- Create it again.
 CREATE INDEX mpp7635_ix3 ON mpp7635_aoi_table2 (id);
 select * from pg_indexes where tablename like 'mpp7635%';
 
@@ -1440,33 +1404,353 @@ select count(*) from mpp7863_1_prt_extra;
 select dat, count(*) from mpp7863 group by 1 order by 2,1;
 
 
--- Test that pg_get_expr() can be used on the pg_partition_rule columns that
--- store expressions, even by non-superusers. pg_get_expr() is restricted
--- to specific system catalogs, for security reasons.
-create role part_expr_role;
+--
+-- Test handling of dropped columns in SPLIT PARTITION. (PR #9386)
+--
+DROP TABLE IF EXISTS users_test;
 
-CREATE TABLE part_expr_test_range (id int) DISTRIBUTED BY (id)
-PARTITION BY RANGE(id) (START (1::int) END (10::int) EVERY (5));
-CREATE TABLE part_expr_test_list (id int) DISTRIBUTED BY (id)
-PARTITION BY list(id) (partition p1 values(1, 2, 3));
+CREATE TABLE users_test
+(
+  id          INT,
+  dd          TEXT,
+  user_name   VARCHAR(40),
+  user_email  VARCHAR(60),
+  born_time   TIMESTAMP,
+  create_time TIMESTAMP
+)
+DISTRIBUTED BY (id)
+PARTITION BY RANGE (create_time)
+(
+  PARTITION p2019 START ('2019-01-01'::TIMESTAMP) END ('2020-01-01'::TIMESTAMP),
+  DEFAULT PARTITION extra
+);
 
-set session authorization part_expr_role;
+-- Drop useless column dd for some reason
+ALTER TABLE users_test DROP COLUMN dd;
 
--- This should throw a "not allowed" error.
-select pg_get_expr('bogus', 'pg_class'::regclass);
+-- Assume we forgot/failed to split out new partitions beforehand
+INSERT INTO users_test VALUES(1, 'A', 'A@abc.com', '1970-01-01', '2019-01-01 12:00:00');
+INSERT INTO users_test VALUES(2, 'B', 'B@abc.com', '1980-01-01', '2020-01-01 12:00:00');
+INSERT INTO users_test VALUES(3, 'C', 'C@abc.com', '1990-01-01', '2021-01-01 12:00:00');
 
--- But this should
-select p.parrelid::regclass, pr.parchildrelid::regclass,
-       pg_get_expr(parrangestart, pr.parchildrelid),
-       pg_get_expr(parrangeend, pr.parchildrelid),
-       pg_get_expr(parrangeevery, pr.parchildrelid),
-       pg_get_expr(parlistvalues, pr.parchildrelid)
-from pg_partition_rule pr, pg_partition p
-where pr.paroid = p.oid
-and p.parrelid in ('part_expr_test_range'::regclass, 'part_expr_test_list'::regclass);
+-- New partition arrives late
+ALTER TABLE users_test SPLIT DEFAULT PARTITION START ('2020-01-01'::TIMESTAMP) END ('2021-01-01'::TIMESTAMP)
+ INTO (PARTITION p2020, DEFAULT PARTITION);
 
-reset session authorization;
+-- Expect A
+SELECT user_name FROM users_test_1_prt_p2019;
+-- Expect B
+SELECT user_name FROM users_test_1_prt_p2020;
+-- Expect C
+SELECT user_name FROM users_test_1_prt_extra;
 
-DROP TABLE part_expr_test_range;
-DROP TABLE part_expr_test_list;
-DROP ROLE part_expr_role;
+-- Github issue: https://github.com/greenplum-db/gpdb/issues/9460
+-- When creating unique or primary key index on Partition table,
+-- the cols in index must contain all partition keys.
+CREATE TABLE t_idx_col_contain_partkey(a int, b int) DISTRIBUTED BY (a)
+PARTITION BY list (b)
+(PARTITION t1 values (1),
+ PARTITION t2 values (2));
+
+-- the following statement should fail because index cols does not contain part key
+CREATE UNIQUE INDEX uidx_t_idx_col_contain_partkey on t_idx_col_contain_partkey(a);
+-- the following statement should work
+CREATE UNIQUE INDEX uidx_t_idx_col_contain_partkey on t_idx_col_contain_partkey(a, b);
+DROP INDEX uidx_t_idx_col_contain_partkey;
+DROP TABLE t_idx_col_contain_partkey;
+
+-- test unique index for multi level partition table
+CREATE TABLE t_idx_col_contain_partkey
+(
+        r_regionkey integer not null,
+        r_name char(25),
+        r_comment varchar(152)
+)
+DISTRIBUTED BY (r_regionkey)
+PARTITION BY RANGE (r_regionkey)
+SUBPARTITION BY LIST (r_name) SUBPARTITION TEMPLATE
+(
+        SUBPARTITION africa VALUES ('AFRICA'),
+        SUBPARTITION america VALUES ('AMERICA'),
+        SUBPARTITION asia VALUES ('ASIA'),
+        SUBPARTITION europe VALUES ('EUROPE'),
+        SUBPARTITION mideast VALUES ('MIDDLE EAST'),
+        SUBPARTITION australia VALUES ('AUSTRALIA'),
+        SUBPARTITION antarctica VALUES ('ANTARCTICA')
+)
+(
+        PARTITION region1 start (0),
+        PARTITION region2 start (3),
+        PARTITION region3 start (5) end (8)
+);
+
+-- should fail, must contain all the partition keys of all levels
+CREATE UNIQUE INDEX uidx_t_idx_col_contain_partkey on t_idx_col_contain_partkey(r_regionkey);
+-- should work
+CREATE UNIQUE INDEX uidx_t_idx_col_contain_partkey on t_idx_col_contain_partkey(r_regionkey, r_name);
+DROP INDEX uidx_t_idx_col_contain_partkey;
+DROP TABLE t_idx_col_contain_partkey;
+
+--
+-- Test EXCHANGE PARTITION, when the new table has different CHECK constraints
+--
+CREATE TABLE constraint_mismatch_tbl (
+    id int,
+    date date,
+    amt decimal(10,2)
+    CONSTRAINT amt_check CHECK (amt > 0)
+) DISTRIBUTED BY (id)
+PARTITION BY RANGE (date)
+   (PARTITION Jan08 START (date '2008-01-01'),
+    PARTITION Feb08 START (date '2008-02-01'),
+    PARTITION Mar08 START (date '2008-03-01') END (date '2008-04-01'));
+
+-- fail: new table doesn't have 'amt_check' constraint
+CREATE TABLE mismatch_exchange_tbl (
+    id int,
+    date date,
+    amt decimal(10,2)
+) DISTRIBUTED BY (id);
+INSERT INTO mismatch_exchange_tbl SELECT i, '2008-03-02', i FROM generate_series(11,15)i;
+
+ALTER TABLE constraint_mismatch_tbl EXCHANGE PARTITION mar08 WITH TABLE mismatch_exchange_tbl;
+
+-- fail: new table has a constraint called 'amt_check', but it's different from the parent's
+DROP TABLE mismatch_exchange_tbl;
+CREATE TABLE mismatch_exchange_tbl (
+    id int,
+    date date,
+    amt decimal(10,2)
+    CONSTRAINT amt_check CHECK (amt <> 0)
+) DISTRIBUTED BY (id);
+INSERT INTO mismatch_exchange_tbl SELECT i, '2008-03-02', i FROM generate_series(11,15)i;
+
+ALTER TABLE constraint_mismatch_tbl EXCHANGE PARTITION mar08 WITH TABLE mismatch_exchange_tbl;
+
+-- success: new table has compatible 'amt_check' constraint
+DROP TABLE mismatch_exchange_tbl;
+CREATE TABLE mismatch_exchange_tbl (
+    id int,
+    date date,
+    amt decimal(10,2)
+    CONSTRAINT amt_check CHECK (amt > 0)
+) DISTRIBUTED BY (id);
+INSERT INTO mismatch_exchange_tbl SELECT i, '2008-03-02', i FROM generate_series(11,15)i;
+
+ALTER TABLE constraint_mismatch_tbl EXCHANGE PARTITION mar08 WITH TABLE mismatch_exchange_tbl;
+
+
+--
+-- END INCLUSIVE should work for CREATE, ADD PARTITION, and SPLIT PARTITION for
+-- the following data types. The INCLUSIVE END value will be converted to an
+-- EXCLUSIVE upper bound during transformation. If the INCLUSIVE END value is
+-- smaller than the maximum value of the data type, the exclusive upper bound
+-- will be the END INCLUSIVE value + '1', where '1' is the resolution of the
+-- data type. Otherwise, MAXVALUE will be stored as the upper bound.
+--
+-- END INCLUSIVE should work for bigint
+CREATE TABLE end_inclusive_bigint (a int, b bigint)
+    DISTRIBUTED BY (a)
+    PARTITION BY RANGE (b)
+        (
+        PARTITION pmax_create START (9223372036854775805) END (9223372036854775807) INCLUSIVE EVERY (1),
+        PARTITION p1 START (1) END (3) INCLUSIVE,
+        PARTITION p20 START (20),
+        DEFAULT PARTITION other
+        );
+ALTER TABLE end_inclusive_bigint SPLIT DEFAULT PARTITION START (7) END (10) INCLUSIVE INTO (PARTITION p7, DEFAULT PARTITION);
+\d+ end_inclusive_bigint
+
+ALTER TABLE end_inclusive_bigint DROP PARTITION pmax_create_1;
+ALTER TABLE end_inclusive_bigint DROP PARTITION pmax_create_2;
+ALTER TABLE end_inclusive_bigint ADD PARTITION pmax_add START (9223372036854775805) END (9223372036854775807) INCLUSIVE;
+\d+ end_inclusive_bigint
+
+ALTER TABLE end_inclusive_bigint DROP PARTITION pmax_add;
+ALTER TABLE end_inclusive_bigint SPLIT DEFAULT PARTITION START (9223372036854775805) END (9223372036854775807) INCLUSIVE INTO (PARTITION pmax_split, DEFAULT PARTITION);
+\d+ end_inclusive_bigint
+
+-- END INCLUSIVE should work for int
+CREATE TABLE end_inclusive_int (a int, b int)
+    DISTRIBUTED BY (a)
+    PARTITION BY RANGE (b)
+        (
+        PARTITION p1 END (3) INCLUSIVE,
+        PARTITION pmax END (2147483647) INCLUSIVE
+        );
+\d+ end_inclusive_int
+
+-- END INCLUSIVE should work for smallint
+CREATE TABLE end_inclusive_smallint (a int, b smallint)
+    DISTRIBUTED BY (a)
+    PARTITION BY RANGE (b)
+        (
+        PARTITION p1 START (1) END (3) INCLUSIVE,
+        PARTITION pmax START (4) END (32767) INCLUSIVE
+        );
+\d+ end_inclusive_smallint
+
+-- END INCLUSIVE should work for date
+CREATE TABLE end_inclusive_date (a int, b date)
+    DISTRIBUTED BY (a)
+    PARTITION BY RANGE (b)
+        (
+        PARTITION p1 START ('2020-06-16') END ('2020-06-17') INCLUSIVE,
+        PARTITION pmax START ('2020-06-18') END ('infinity') INCLUSIVE
+        );
+\d+ end_inclusive_date
+
+-- END INCLUSIVE should work for time without time zone
+CREATE TABLE end_inclusive_time (a int, b time)
+    DISTRIBUTED BY (a)
+    PARTITION BY RANGE (b)
+        (
+        PARTITION p1 START ('00:00:00.000001') END ('01:00:00') INCLUSIVE,
+        PARTITION pmax START ('23:00:00') END ('24:00:00') INCLUSIVE
+        );
+\d+ end_inclusive_time
+
+-- END INCLUSIVE should work for time with time zone
+CREATE TABLE end_inclusive_timetz (a int, b time with time zone)
+    DISTRIBUTED BY (a)
+    PARTITION BY RANGE (b)
+        (
+        PARTITION p1 START ('00:00:00 EST') END ('01:00:00 PST') INCLUSIVE,
+        PARTITION pmax START ('23:00:00 EST') END ('24:00:00 PST') INCLUSIVE
+        );
+\d+ end_inclusive_timetz
+
+-- END INCLUSIVE should work for timestamp without time zone
+CREATE TABLE end_inclusive_timestamp (a int, b timestamp)
+    DISTRIBUTED BY (a)
+    PARTITION BY RANGE (b)
+        (
+        PARTITION p1 START ('2020-06-16 00:00:00') END ('2020-06-16 01:00:00') INCLUSIVE,
+        PARTITION pmax START ('2020-06-16 23:00:00') END ('infinity') INCLUSIVE
+        );
+\d+ end_inclusive_timestamp
+
+-- END INCLUSIVE should work for timestamp with time zone
+CREATE TABLE end_inclusive_timestamptz (a int, b timestamp with time zone)
+    DISTRIBUTED BY (a)
+    PARTITION BY RANGE (b)
+        (
+        PARTITION p1 START ('2020-06-16 00:00:00 PST') END ('2020-06-16 01:00:00 PST') INCLUSIVE,
+        PARTITION pmax START ('2020-06-16 23:00:00 EST') END ('infinity') INCLUSIVE
+        );
+\d+ end_inclusive_timestamptz
+
+-- END INCLUSIVE should work for interval
+CREATE TABLE end_inclusive_interval (a int, b interval)
+    DISTRIBUTED BY (a)
+    PARTITION BY RANGE (b)
+        (
+        PARTITION p1 START ('1 year') END ('2 years') INCLUSIVE
+        );
+\d+ end_inclusive_interval
+
+-- END INCLUSIVE with MAXVALUE should work with implicit START/END
+DROP TABLE end_inclusive_int;
+CREATE TABLE end_inclusive_int (a int, b int)
+    DISTRIBUTED BY (a)
+    PARTITION BY RANGE (b)
+        (
+        PARTITION p1 START (1),
+        PARTITION pmax END (2147483647) INCLUSIVE,
+        PARTITION p2 START (2) END (5) INCLUSIVE
+        );
+\d+ end_inclusive_int
+
+DROP TABLE end_inclusive_int;
+CREATE TABLE end_inclusive_int (a int, b int)
+    DISTRIBUTED BY (a)
+    PARTITION BY RANGE (b)
+        (
+        PARTITION pmax END (2147483647) INCLUSIVE,
+        PARTITION p1 START (1),
+        PARTITION p2 START (2) END (5) INCLUSIVE
+        );
+\d+ end_inclusive_int
+
+-- END INCLUSIVE should fail when precision is specified
+CREATE TABLE end_inclusive_time_with_precision (a int, b time(5))
+    DISTRIBUTED BY (a)
+    PARTITION BY RANGE (b)
+        (
+        PARTITION p1 START ('00:00:00') END ('01:00:00') INCLUSIVE
+        );
+
+-- END INCLUSIVE should fail for unsupported data types
+CREATE TABLE end_inclusive_numeric (a int, b numeric)
+    DISTRIBUTED BY (a)
+    PARTITION BY RANGE (b)
+        (
+        PARTITION p1 START (1) END (3) INCLUSIVE
+        );
+
+-- Also check START EXCLUSIVE
+CREATE TABLE start_exclusive_smallint (a int, b smallint)
+    DISTRIBUTED BY (a)
+    PARTITION BY RANGE (b)
+        (
+        PARTITION p1 START (0) EXCLUSIVE END (3) INCLUSIVE,
+        PARTITION pmax START (4) EXCLUSIVE
+        );
+\d+ start_exclusive_smallint
+
+-- If the START EXCLUSIVE value + 1 would overflow, you get an error
+CREATE TABLE start_exclusive_smallint_overflow (a int, b smallint)
+    DISTRIBUTED BY (a)
+    PARTITION BY RANGE (b)
+        (
+        PARTITION p1 START (0) EXCLUSIVE END (3) INCLUSIVE,
+        PARTITION pmax START (32767) EXCLUSIVE
+        );
+
+-- Test for ALTER TABLE WITH/WITHOUT VALIDATION.
+-- It doesn't do anything anymore, but check that the syntax is accepted.
+CREATE TABLE validation_syntax_tbl (a int)
+    DISTRIBUTED BY (a)
+    PARTITION BY RANGE (a)
+        (
+        PARTITION p1 START (1) END (3)
+        );
+CREATE TABLE exchange_tbl (a int4);
+INSERT INTO exchange_tbl VALUES (100);
+ALTER TABLE validation_syntax_tbl EXCHANGE PARTITION p1 WITH TABLE exchange_tbl WITH VALIDATION;
+ALTER TABLE validation_syntax_tbl EXCHANGE PARTITION p1 WITH TABLE exchange_tbl WITHOUT VALIDATION;
+DROP TABLE exchange_tbl;
+DROP TABLE validation_syntax_tbl;
+
+
+--
+-- Test a case where the automatically created partition name clashes with
+-- another table or partition.
+-- Before GPDB 7, the automatic table name generation used check if the name is
+-- in use, and pick another name to avoid the clash. It's not as smart anymore.
+-- It's more tricky now, because e.g. the ALTER TABLE ALTER/DROP/ADD PARTITION
+-- commands rely on the deterministic naming of the partitions. If a user runs
+-- into this, the work around is to use different table/partition names, or
+-- use the upstream syntax and name each partition explicitly.
+--
+CREATE TABLE partitioned_table_with_very_long_name_123456789x
+(
+    col1 int4,
+    col2 int4
+)
+DISTRIBUTED by (col1)
+PARTITION BY RANGE(col2)
+  (partition partone start(1) end(100000001),
+   partition parttwo start(100000001) end(200000001),
+   partition partthree start(200000001) end(300000001));
+
+CREATE TABLE partitioned_table_with_very_long_name_123456789y
+(
+    col1 int4,
+    col2 int4
+)
+DISTRIBUTED by (col1)
+PARTITION BY RANGE(col2)
+  (partition partone start(1) end(100000001),
+   partition parttwo start(100000001) end(200000001),
+   partition partthree start(200000001) end(300000001));

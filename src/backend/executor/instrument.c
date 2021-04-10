@@ -5,8 +5,8 @@
  *
  *
  * Portions Copyright (c) 2006-2009, Greenplum inc
- * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
- * Copyright (c) 2001-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
+ * Copyright (c) 2001-2019, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/executor/instrument.c
@@ -21,20 +21,25 @@
 #include "storage/spin.h"
 #include "executor/instrument.h"
 #include "utils/memutils.h"
-#include "gpmon/gpmon.h"
+#include "utils/timestamp.h"
 #include "miscadmin.h"
 #include "storage/shmem.h"
+#include "cdb/cdbdtxcontextinfo.h"
+#include "cdb/cdbtm.h"
 
 BufferUsage pgBufferUsage;
+static BufferUsage save_pgBufferUsage;
 
+static void BufferUsageAdd(BufferUsage *dst, const BufferUsage *add);
 static void BufferUsageAccumDiff(BufferUsage *dst,
-					 const BufferUsage *add, const BufferUsage *sub);
+								 const BufferUsage *add, const BufferUsage *sub);
 
 /* GPDB specific */
 static bool shouldPickInstrInShmem(NodeTag tag);
 static Instrumentation *pickInstrFromShmem(const Plan *plan, int instrument_options);
 static void instrShmemRecycleCallback(ResourceReleasePhase phase, bool isCommit,
 						  bool isTopLevel, void *arg);
+static void gp_gettmid(int32* tmid);
 
 InstrumentationHeader *InstrumentGlobal = NULL;
 static int  scanNodeCounter = 0;
@@ -68,17 +73,22 @@ InstrAlloc(int n, int instrument_options)
 	return instr;
 }
 
+/* Initialize a pre-allocated instrumentation structure. */
+void
+InstrInit(Instrumentation *instr, int instrument_options)
+{
+	memset(instr, 0, sizeof(Instrumentation));
+	instr->need_bufusage = (instrument_options & INSTRUMENT_BUFFERS) != 0;
+	instr->need_timer = (instrument_options & INSTRUMENT_TIMER) != 0;
+}
+
 /* Entry to a plan node */
 void
 InstrStartNode(Instrumentation *instr)
 {
-	if (instr->need_timer)
-	{
-		if (INSTR_TIME_IS_ZERO(instr->starttime))
-			INSTR_TIME_SET_CURRENT(instr->starttime);
-		else
-			elog(ERROR, "InstrStartNode called twice in a row");
-	}
+	if (instr->need_timer &&
+		!INSTR_TIME_SET_CURRENT_LAZY(instr->starttime))
+		elog(ERROR, "InstrStartNode called twice in a row");
 
 	/* save buffer usage totals at node entry, if needed */
 	if (instr->need_bufusage)
@@ -156,6 +166,74 @@ InstrEndLoop(Instrumentation *instr)
 	instr->tuplecount = 0;
 }
 
+/* aggregate instrumentation information */
+void
+InstrAggNode(Instrumentation *dst, Instrumentation *add)
+{
+	if (!dst->running && add->running)
+	{
+		dst->running = true;
+		dst->firsttuple = add->firsttuple;
+	}
+	else if (dst->running && add->running && dst->firsttuple > add->firsttuple)
+		dst->firsttuple = add->firsttuple;
+
+	INSTR_TIME_ADD(dst->counter, add->counter);
+
+	dst->tuplecount += add->tuplecount;
+	dst->startup += add->startup;
+	dst->total += add->total;
+	dst->ntuples += add->ntuples;
+	dst->ntuples2 += add->ntuples2;
+	dst->nloops += add->nloops;
+	dst->nfiltered1 += add->nfiltered1;
+	dst->nfiltered2 += add->nfiltered2;
+
+	/* Add delta of buffer usage since entry to node's totals */
+	if (dst->need_bufusage)
+		BufferUsageAdd(&dst->bufusage, &add->bufusage);
+}
+
+/* note current values during parallel executor startup */
+void
+InstrStartParallelQuery(void)
+{
+	save_pgBufferUsage = pgBufferUsage;
+}
+
+/* report usage after parallel executor shutdown */
+void
+InstrEndParallelQuery(BufferUsage *result)
+{
+	memset(result, 0, sizeof(BufferUsage));
+	BufferUsageAccumDiff(result, &pgBufferUsage, &save_pgBufferUsage);
+}
+
+/* accumulate work done by workers in leader's stats */
+void
+InstrAccumParallelQuery(BufferUsage *result)
+{
+	BufferUsageAdd(&pgBufferUsage, result);
+}
+
+/* dst += add */
+static void
+BufferUsageAdd(BufferUsage *dst, const BufferUsage *add)
+{
+	dst->shared_blks_hit += add->shared_blks_hit;
+	dst->shared_blks_read += add->shared_blks_read;
+	dst->shared_blks_dirtied += add->shared_blks_dirtied;
+	dst->shared_blks_written += add->shared_blks_written;
+	dst->local_blks_hit += add->local_blks_hit;
+	dst->local_blks_read += add->local_blks_read;
+	dst->local_blks_dirtied += add->local_blks_dirtied;
+	dst->local_blks_written += add->local_blks_written;
+	dst->temp_blks_read += add->temp_blks_read;
+	dst->temp_blks_written += add->temp_blks_written;
+	INSTR_TIME_ADD(dst->blk_read_time, add->blk_read_time);
+	INSTR_TIME_ADD(dst->blk_write_time, add->blk_write_time);
+}
+
 /* dst += add - sub */
 static void
 BufferUsageAccumDiff(BufferUsage *dst,
@@ -197,7 +275,7 @@ InstrShmemSize(void)
 	Size		number_slots;
 
 	/* If start in utility mode, disallow Instrumentation on Shmem */
-	if (Gp_session_role == GP_ROLE_UTILITY)
+	if (Gp_role == GP_ROLE_UTILITY)
 		return size;
 
 	/* If GUCs not enabled, bypass Instrumentation on Shmem */
@@ -289,7 +367,7 @@ static bool
 shouldPickInstrInShmem(NodeTag tag)
 {
 	/* For utility mode, don't alloc in shmem */
-	if (Gp_session_role == GP_ROLE_UTILITY)
+	if (Gp_role == GP_ROLE_UTILITY)
 		return false;
 
 	if (!gp_enable_query_metrics || NULL == InstrumentGlobal)
@@ -300,7 +378,7 @@ shouldPickInstrInShmem(NodeTag tag)
 		case T_SeqScan:
 
 			/*
-			 * If table has many partitions, legacy planner will generate a
+			 * If table has many partitions, Postgres planner will generate a
 			 * plan with many SCAN nodes under a APPEND node. If the number of
 			 * partitions are too many, this plan will occupy too many slots.
 			 * Here is a limitation on number of shmem slots used by scan
@@ -353,7 +431,7 @@ pickInstrFromShmem(const Plan *plan, int instrument_options)
 		instr = &(slot->data);
 		slot->segid = (int16) GpIdentity.segindex;
 		slot->pid = MyProcPid;
-		gpmon_gettmid(&(slot->tmid));
+		gp_gettmid(&(slot->tmid));
 		slot->ssid = gp_session_id;
 		slot->ccnt = gp_command_count;
 		slot->nid = (int16) plan->plan_node_id;
@@ -419,4 +497,9 @@ instrShmemRecycleCallback(ResourceReleasePhase phase, bool isCommit, bool isTopL
 		pfree(curr);
 	}
 	SpinLockRelease(&InstrumentGlobal->lock);
+}
+
+static void gp_gettmid(int32* tmid)
+{
+	*tmid = (int32) PgStartTime;
 }

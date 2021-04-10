@@ -10,13 +10,9 @@
  *
  *-------------------------------------------------------------------------
  */
+#include "postgres_fe.h"
 
-
-#include <windows.h>
 #include <olectl.h>
-#include <string.h>
-#include <stdio.h>
-#include <stdlib.h>
 
 /* Global variables */
 HANDLE		g_module = NULL;	/* hModule of DLL */
@@ -26,13 +22,13 @@ HANDLE		g_module = NULL;	/* hModule of DLL */
  * The maximum length of a registry key is 255 characters.
  * http://msdn.microsoft.com/en-us/library/ms724872(v=vs.85).aspx
  */
-char		event_source[256] = "PostgreSQL";
+char		event_source[256] = DEFAULT_EVENT_SOURCE;
 
 /* Prototypes */
 HRESULT		DllInstall(BOOL bInstall, LPCWSTR pszCmdLine);
 STDAPI		DllRegisterServer(void);
 STDAPI		DllUnregisterServer(void);
-BOOL WINAPI DllMain(HANDLE hModule, DWORD ul_reason_for_call, LPVOID lpReserved);
+BOOL		WINAPI DllMain(HANDLE hModule, DWORD ul_reason_for_call, LPVOID lpReserved);
 
 /*
  * DllInstall --- Passes the command line argument to DLL
@@ -85,7 +81,7 @@ DllRegisterServer(void)
 	 * EventLog registry key.
 	 */
 	_snprintf(key_name, sizeof(key_name),
-			"SYSTEM\\CurrentControlSet\\Services\\EventLog\\Application\\%s",
+			  "SYSTEM\\CurrentControlSet\\Services\\EventLog\\Application\\%s",
 			  event_source);
 	if (RegCreateKey(HKEY_LOCAL_MACHINE, key_name, &key))
 	{
@@ -138,7 +134,7 @@ DllUnregisterServer(void)
 	 */
 
 	_snprintf(key_name, sizeof(key_name),
-			"SYSTEM\\CurrentControlSet\\Services\\EventLog\\Application\\%s",
+			  "SYSTEM\\CurrentControlSet\\Services\\EventLog\\Application\\%s",
 			  event_source);
 	if (RegDeleteKey(HKEY_LOCAL_MACHINE, key_name))
 	{

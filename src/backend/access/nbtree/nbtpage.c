@@ -4,7 +4,7 @@
  *	  BTree-specific page management code for the Postgres btree access
  *	  method.
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -22,23 +22,27 @@
  */
 #include "postgres.h"
 
-#include "access/heapam.h"	/* For RelationFetchGpRelationNodeForXLog. */
 #include "access/nbtree.h"
+#include "access/nbtxlog.h"
 #include "access/transam.h"
+#include "access/xlog.h"
+#include "access/xloginsert.h"
 #include "miscadmin.h"
 #include "storage/indexfsm.h"
 #include "storage/lmgr.h"
 #include "storage/predicate.h"
 #include "utils/snapmgr.h"
 
+static void _bt_cachemetadata(Relation rel, BTMetaPageData *input);
+static BTMetaPageData *_bt_getmeta(Relation rel, Buffer metabuf);
 static bool _bt_mark_page_halfdead(Relation rel, Buffer buf, BTStack stack);
 static bool _bt_unlink_halfdead_page(Relation rel, Buffer leafbuf,
-						 bool *rightsib_empty);
+									 bool *rightsib_empty);
 static bool _bt_lock_branch_parent(Relation rel, BlockNumber child,
-					   BTStack stack, Buffer *topparent, OffsetNumber *topoff,
-					   BlockNumber *target, BlockNumber *rightsib);
+								   BTStack stack, Buffer *topparent, OffsetNumber *topoff,
+								   BlockNumber *target, BlockNumber *rightsib);
 static void _bt_log_reuse_page(Relation rel, BlockNumber blkno,
-				   TransactionId latestRemovedXid);
+							   TransactionId latestRemovedXid);
 
 /*
  *	_bt_initmetapage() -- Fill a page buffer with a correct metapage image
@@ -58,16 +62,203 @@ _bt_initmetapage(Page page, BlockNumber rootbknum, uint32 level)
 	metad->btm_level = level;
 	metad->btm_fastroot = rootbknum;
 	metad->btm_fastlevel = level;
+	metad->btm_oldest_btpo_xact = InvalidTransactionId;
+	metad->btm_last_cleanup_num_heap_tuples = -1.0;
 
 	metaopaque = (BTPageOpaque) PageGetSpecialPointer(page);
 	metaopaque->btpo_flags = BTP_META;
 
 	/*
-	 * Set pd_lower just past the end of the metadata.  This is not essential
-	 * but it makes the page look compressible to xlog.c.
+	 * Set pd_lower just past the end of the metadata.  This is essential,
+	 * because without doing so, metadata will be lost if xlog.c compresses
+	 * the page.
 	 */
 	((PageHeader) page)->pd_lower =
 		((char *) metad + sizeof(BTMetaPageData)) - (char *) page;
+}
+
+/*
+ *	_bt_upgrademetapage() -- Upgrade a meta-page from an old format to version
+ *		3, the last version that can be updated without broadly affecting
+ *		on-disk compatibility.  (A REINDEX is required to upgrade to v4.)
+ *
+ *		This routine does purely in-memory image upgrade.  Caller is
+ *		responsible for locking, WAL-logging etc.
+ */
+void
+_bt_upgrademetapage(Page page)
+{
+	BTMetaPageData *metad;
+	BTPageOpaque metaopaque PG_USED_FOR_ASSERTS_ONLY;
+
+	metad = BTPageGetMeta(page);
+	metaopaque = (BTPageOpaque) PageGetSpecialPointer(page);
+
+	/* It must be really a meta page of upgradable version */
+	Assert(metaopaque->btpo_flags & BTP_META);
+	Assert(metad->btm_version < BTREE_NOVAC_VERSION);
+	Assert(metad->btm_version >= BTREE_MIN_VERSION);
+
+	/* Set version number and fill extra fields added into version 3 */
+	metad->btm_version = BTREE_NOVAC_VERSION;
+	metad->btm_oldest_btpo_xact = InvalidTransactionId;
+	metad->btm_last_cleanup_num_heap_tuples = -1.0;
+
+	/* Adjust pd_lower (see _bt_initmetapage() for details) */
+	((PageHeader) page)->pd_lower =
+		((char *) metad + sizeof(BTMetaPageData)) - (char *) page;
+}
+
+/*
+ * Cache metadata from input meta page to rel->rd_amcache.
+ */
+static void
+_bt_cachemetadata(Relation rel, BTMetaPageData *input)
+{
+	BTMetaPageData *cached_metad;
+
+	/* We assume rel->rd_amcache was already freed by caller */
+	Assert(rel->rd_amcache == NULL);
+	rel->rd_amcache = MemoryContextAlloc(rel->rd_indexcxt,
+										 sizeof(BTMetaPageData));
+
+	/* Meta page should be of supported version */
+	Assert(input->btm_version >= BTREE_MIN_VERSION &&
+		   input->btm_version <= BTREE_VERSION);
+
+	cached_metad = (BTMetaPageData *) rel->rd_amcache;
+	if (input->btm_version >= BTREE_NOVAC_VERSION)
+	{
+		/* Version with compatible meta-data, no need to upgrade */
+		memcpy(cached_metad, input, sizeof(BTMetaPageData));
+	}
+	else
+	{
+		/*
+		 * Upgrade meta-data: copy available information from meta-page and
+		 * fill new fields with default values.
+		 *
+		 * Note that we cannot upgrade to version 4+ without a REINDEX, since
+		 * extensive on-disk changes are required.
+		 */
+		memcpy(cached_metad, input, offsetof(BTMetaPageData, btm_oldest_btpo_xact));
+		cached_metad->btm_version = BTREE_NOVAC_VERSION;
+		cached_metad->btm_oldest_btpo_xact = InvalidTransactionId;
+		cached_metad->btm_last_cleanup_num_heap_tuples = -1.0;
+	}
+}
+
+/*
+ * Get metadata from share-locked buffer containing metapage, while performing
+ * standard sanity checks.  Sanity checks here must match _bt_getroot().
+ */
+static BTMetaPageData *
+_bt_getmeta(Relation rel, Buffer metabuf)
+{
+	Page		metapg;
+	BTPageOpaque metaopaque;
+	BTMetaPageData *metad;
+
+	metapg = BufferGetPage(metabuf);
+	metaopaque = (BTPageOpaque) PageGetSpecialPointer(metapg);
+	metad = BTPageGetMeta(metapg);
+
+	/* sanity-check the metapage */
+	if (!P_ISMETA(metaopaque) ||
+		metad->btm_magic != BTREE_MAGIC)
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("index \"%s\" is not a btree",
+						RelationGetRelationName(rel))));
+
+	if (metad->btm_version < BTREE_MIN_VERSION ||
+		metad->btm_version > BTREE_VERSION)
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("version mismatch in index \"%s\": file version %d, "
+						"current version %d, minimal supported version %d",
+						RelationGetRelationName(rel),
+						metad->btm_version, BTREE_VERSION, BTREE_MIN_VERSION)));
+
+	return metad;
+}
+
+/*
+ *	_bt_update_meta_cleanup_info() -- Update cleanup-related information in
+ *									  the metapage.
+ *
+ *		This routine checks if provided cleanup-related information is matching
+ *		to those written in the metapage.  On mismatch, metapage is overwritten.
+ */
+void
+_bt_update_meta_cleanup_info(Relation rel, TransactionId oldestBtpoXact,
+							 float8 numHeapTuples)
+{
+	Buffer		metabuf;
+	Page		metapg;
+	BTMetaPageData *metad;
+	bool		needsRewrite = false;
+	XLogRecPtr	recptr;
+
+	/* read the metapage and check if it needs rewrite */
+	metabuf = _bt_getbuf(rel, BTREE_METAPAGE, BT_READ);
+	metapg = BufferGetPage(metabuf);
+	metad = BTPageGetMeta(metapg);
+
+	/* outdated version of metapage always needs rewrite */
+	if (metad->btm_version < BTREE_NOVAC_VERSION)
+		needsRewrite = true;
+	else if (metad->btm_oldest_btpo_xact != oldestBtpoXact ||
+			 metad->btm_last_cleanup_num_heap_tuples != numHeapTuples)
+		needsRewrite = true;
+
+	if (!needsRewrite)
+	{
+		_bt_relbuf(rel, metabuf);
+		return;
+	}
+
+	/* trade in our read lock for a write lock */
+	LockBuffer(metabuf, BUFFER_LOCK_UNLOCK);
+	LockBuffer(metabuf, BT_WRITE);
+
+	START_CRIT_SECTION();
+
+	/* upgrade meta-page if needed */
+	if (metad->btm_version < BTREE_NOVAC_VERSION)
+		_bt_upgrademetapage(metapg);
+
+	/* update cleanup-related information */
+	metad->btm_oldest_btpo_xact = oldestBtpoXact;
+	metad->btm_last_cleanup_num_heap_tuples = numHeapTuples;
+	MarkBufferDirty(metabuf);
+
+	/* write wal record if needed */
+	if (RelationNeedsWAL(rel))
+	{
+		xl_btree_metadata md;
+
+		XLogBeginInsert();
+		XLogRegisterBuffer(0, metabuf, REGBUF_WILL_INIT | REGBUF_STANDARD);
+
+		Assert(metad->btm_version >= BTREE_NOVAC_VERSION);
+		md.version = metad->btm_version;
+		md.root = metad->btm_root;
+		md.level = metad->btm_level;
+		md.fastroot = metad->btm_fastroot;
+		md.fastlevel = metad->btm_fastlevel;
+		md.oldest_btpo_xact = oldestBtpoXact;
+		md.last_cleanup_num_heap_tuples = numHeapTuples;
+
+		XLogRegisterBufData(0, (char *) &md, sizeof(xl_btree_metadata));
+
+		recptr = XLogInsert(RM_BTREE_ID, XLOG_BTREE_META_CLEANUP);
+
+		PageSetLSN(metapg, recptr);
+	}
+
+	END_CRIT_SECTION();
+	_bt_relbuf(rel, metabuf);
 }
 
 /*
@@ -77,7 +268,7 @@ _bt_initmetapage(Page page, BlockNumber rootbknum, uint32 level)
  *		its location from the metadata page, and then read the root page
  *		itself.  If no root page exists yet, we have to create one.  The
  *		standard class of race conditions exists here; I think I covered
- *		them all in the Hopi Indian rain dance of lock requests below.
+ *		them all in the intricate dance of lock requests below.
  *
  *		The access type parameter (BT_READ or BT_WRITE) controls whether
  *		a new root page will be created or not.  If access = BT_READ,
@@ -121,7 +312,8 @@ _bt_getroot(Relation rel, int access)
 		metad = (BTMetaPageData *) rel->rd_amcache;
 		/* We shouldn't have cached it if any of these fail */
 		Assert(metad->btm_magic == BTREE_MAGIC);
-		Assert(metad->btm_version == BTREE_VERSION);
+		Assert(metad->btm_version >= BTREE_MIN_VERSION);
+		Assert(metad->btm_version <= BTREE_VERSION);
 		Assert(metad->btm_root != P_NONE);
 
 		rootblkno = metad->btm_fastroot;
@@ -160,19 +352,21 @@ _bt_getroot(Relation rel, int access)
 	metad = BTPageGetMeta(metapg);
 
 	/* sanity-check the metapage */
-	if (!(metaopaque->btpo_flags & BTP_META) ||
+	if (!P_ISMETA(metaopaque) ||
 		metad->btm_magic != BTREE_MAGIC)
 		ereport(ERROR,
 				(errcode(ERRCODE_INDEX_CORRUPTED),
 				 errmsg("index \"%s\" is not a btree",
 						RelationGetRelationName(rel))));
 
-	if (metad->btm_version != BTREE_VERSION)
+	if (metad->btm_version < BTREE_MIN_VERSION ||
+		metad->btm_version > BTREE_VERSION)
 		ereport(ERROR,
 				(errcode(ERRCODE_INDEX_CORRUPTED),
-				 errmsg("version mismatch in index \"%s\": file version %d, code version %d",
+				 errmsg("version mismatch in index \"%s\": file version %d, "
+						"current version %d, minimal supported version %d",
 						RelationGetRelationName(rel),
-						metad->btm_version, BTREE_VERSION)));
+						metad->btm_version, BTREE_VERSION, BTREE_MIN_VERSION)));
 
 	/* if no root page initialized yet, do it */
 	if (metad->btm_root == P_NONE)
@@ -222,10 +416,16 @@ _bt_getroot(Relation rel, int access)
 		/* NO ELOG(ERROR) till meta is updated */
 		START_CRIT_SECTION();
 
+		/* upgrade metapage if needed */
+		if (metad->btm_version < BTREE_NOVAC_VERSION)
+			_bt_upgrademetapage(metapg);
+
 		metad->btm_root = rootblkno;
 		metad->btm_level = 0;
 		metad->btm_fastroot = rootblkno;
 		metad->btm_fastlevel = 0;
+		metad->btm_oldest_btpo_xact = InvalidTransactionId;
+		metad->btm_last_cleanup_num_heap_tuples = -1.0;
 
 		MarkBufferDirty(rootbuf);
 		MarkBufferDirty(metabuf);
@@ -235,18 +435,29 @@ _bt_getroot(Relation rel, int access)
 		{
 			xl_btree_newroot xlrec;
 			XLogRecPtr	recptr;
-			XLogRecData rdata;
+			xl_btree_metadata md;
 
-			xlrec.node = rel->rd_node;
+			XLogBeginInsert();
+			XLogRegisterBuffer(0, rootbuf, REGBUF_WILL_INIT);
+			XLogRegisterBuffer(2, metabuf, REGBUF_WILL_INIT | REGBUF_STANDARD);
+
+			Assert(metad->btm_version >= BTREE_NOVAC_VERSION);
+			md.version = metad->btm_version;
+			md.root = rootblkno;
+			md.level = 0;
+			md.fastroot = rootblkno;
+			md.fastlevel = 0;
+			md.oldest_btpo_xact = InvalidTransactionId;
+			md.last_cleanup_num_heap_tuples = -1.0;
+
+			XLogRegisterBufData(2, (char *) &md, sizeof(xl_btree_metadata));
+
 			xlrec.rootblk = rootblkno;
 			xlrec.level = 0;
 
-			rdata.data = (char *) &xlrec;
-			rdata.len = SizeOfBtreeNewroot;
-			rdata.buffer = InvalidBuffer;
-			rdata.next = NULL;
+			XLogRegisterData((char *) &xlrec, SizeOfBtreeNewroot);
 
-			recptr = XLogInsert(RM_BTREE_ID, XLOG_BTREE_NEWROOT, &rdata);
+			recptr = XLogInsert(RM_BTREE_ID, XLOG_BTREE_NEWROOT);
 
 			PageSetLSN(rootpage, recptr);
 			PageSetLSN(metapg, recptr);
@@ -274,9 +485,7 @@ _bt_getroot(Relation rel, int access)
 		/*
 		 * Cache the metapage data for next time
 		 */
-		rel->rd_amcache = MemoryContextAlloc(rel->rd_indexcxt,
-											 sizeof(BTMetaPageData));
-		memcpy(rel->rd_amcache, metad, sizeof(BTMetaPageData));
+		_bt_cachemetadata(rel, metad);
 
 		/*
 		 * We are done with the metapage; arrange to release it via first
@@ -356,19 +565,21 @@ _bt_gettrueroot(Relation rel)
 	metaopaque = (BTPageOpaque) PageGetSpecialPointer(metapg);
 	metad = BTPageGetMeta(metapg);
 
-	if (!(metaopaque->btpo_flags & BTP_META) ||
+	if (!P_ISMETA(metaopaque) ||
 		metad->btm_magic != BTREE_MAGIC)
 		ereport(ERROR,
 				(errcode(ERRCODE_INDEX_CORRUPTED),
 				 errmsg("index \"%s\" is not a btree",
 						RelationGetRelationName(rel))));
 
-	if (metad->btm_version != BTREE_VERSION)
+	if (metad->btm_version < BTREE_MIN_VERSION ||
+		metad->btm_version > BTREE_VERSION)
 		ereport(ERROR,
 				(errcode(ERRCODE_INDEX_CORRUPTED),
-				 errmsg("version mismatch in index \"%s\": file version %d, code version %d",
+				 errmsg("version mismatch in index \"%s\": file version %d, "
+						"current version %d, minimal supported version %d",
 						RelationGetRelationName(rel),
-						metad->btm_version, BTREE_VERSION)));
+						metad->btm_version, BTREE_VERSION, BTREE_MIN_VERSION)));
 
 	/* if no root page initialized yet, fail */
 	if (metad->btm_root == P_NONE)
@@ -427,35 +638,12 @@ _bt_getrootheight(Relation rel)
 {
 	BTMetaPageData *metad;
 
-	/*
-	 * We can get what we need from the cached metapage data.  If it's not
-	 * cached yet, load it.  Sanity checks here must match _bt_getroot().
-	 */
 	if (rel->rd_amcache == NULL)
 	{
 		Buffer		metabuf;
-		Page		metapg;
-		BTPageOpaque metaopaque;
 
 		metabuf = _bt_getbuf(rel, BTREE_METAPAGE, BT_READ);
-		metapg = BufferGetPage(metabuf);
-		metaopaque = (BTPageOpaque) PageGetSpecialPointer(metapg);
-		metad = BTPageGetMeta(metapg);
-
-		/* sanity-check the metapage */
-		if (!(metaopaque->btpo_flags & BTP_META) ||
-			metad->btm_magic != BTREE_MAGIC)
-			ereport(ERROR,
-					(errcode(ERRCODE_INDEX_CORRUPTED),
-					 errmsg("index \"%s\" is not a btree",
-							RelationGetRelationName(rel))));
-
-		if (metad->btm_version != BTREE_VERSION)
-			ereport(ERROR,
-					(errcode(ERRCODE_INDEX_CORRUPTED),
-					 errmsg("version mismatch in index \"%s\": file version %d, code version %d",
-							RelationGetRelationName(rel),
-							metad->btm_version, BTREE_VERSION)));
+		metad = _bt_getmeta(rel, metabuf);
 
 		/*
 		 * If there's no root page yet, _bt_getroot() doesn't expect a cache
@@ -471,20 +659,69 @@ _bt_getrootheight(Relation rel)
 		/*
 		 * Cache the metapage data for next time
 		 */
-		rel->rd_amcache = MemoryContextAlloc(rel->rd_indexcxt,
-											 sizeof(BTMetaPageData));
-		memcpy(rel->rd_amcache, metad, sizeof(BTMetaPageData));
-
+		_bt_cachemetadata(rel, metad);
+		/* We shouldn't have cached it if any of these fail */
+		Assert(metad->btm_magic == BTREE_MAGIC);
+		Assert(metad->btm_version >= BTREE_NOVAC_VERSION);
+		Assert(metad->btm_fastroot != P_NONE);
 		_bt_relbuf(rel, metabuf);
 	}
 
+	/* Get cached page */
 	metad = (BTMetaPageData *) rel->rd_amcache;
-	/* We shouldn't have cached it if any of these fail */
-	Assert(metad->btm_magic == BTREE_MAGIC);
-	Assert(metad->btm_version == BTREE_VERSION);
-	Assert(metad->btm_fastroot != P_NONE);
 
 	return metad->btm_fastlevel;
+}
+
+/*
+ *	_bt_heapkeyspace() -- is heap TID being treated as a key?
+ *
+ *		This is used to determine the rules that must be used to descend a
+ *		btree.  Version 4 indexes treat heap TID as a tiebreaker attribute.
+ *		pg_upgrade'd version 3 indexes need extra steps to preserve reasonable
+ *		performance when inserting a new BTScanInsert-wise duplicate tuple
+ *		among many leaf pages already full of such duplicates.
+ */
+bool
+_bt_heapkeyspace(Relation rel)
+{
+	BTMetaPageData *metad;
+
+	if (rel->rd_amcache == NULL)
+	{
+		Buffer		metabuf;
+
+		metabuf = _bt_getbuf(rel, BTREE_METAPAGE, BT_READ);
+		metad = _bt_getmeta(rel, metabuf);
+
+		/*
+		 * If there's no root page yet, _bt_getroot() doesn't expect a cache
+		 * to be made, so just stop here.  (XXX perhaps _bt_getroot() should
+		 * be changed to allow this case.)
+		 */
+		if (metad->btm_root == P_NONE)
+		{
+			uint32		btm_version = metad->btm_version;
+
+			_bt_relbuf(rel, metabuf);
+			return btm_version > BTREE_NOVAC_VERSION;
+		}
+
+		/*
+		 * Cache the metapage data for next time
+		 */
+		_bt_cachemetadata(rel, metad);
+		/* We shouldn't have cached it if any of these fail */
+		Assert(metad->btm_magic == BTREE_MAGIC);
+		Assert(metad->btm_version >= BTREE_NOVAC_VERSION);
+		Assert(metad->btm_fastroot != P_NONE);
+		_bt_relbuf(rel, metabuf);
+	}
+
+	/* Get cached page */
+	metad = (BTMetaPageData *) rel->rd_amcache;
+
+	return metad->btm_version > BTREE_NOVAC_VERSION;
 }
 
 /*
@@ -504,9 +741,9 @@ _bt_checkpage(Relation rel, Buffer buf)
 	if (PageIsNew(page))
 		ereport(ERROR,
 				(errcode(ERRCODE_INDEX_CORRUPTED),
-			 errmsg("index \"%s\" contains unexpected zero page at block %u",
-					RelationGetRelationName(rel),
-					BufferGetBlockNumber(buf)),
+				 errmsg("index \"%s\" contains unexpected zero page at block %u",
+						RelationGetRelationName(rel),
+						BufferGetBlockNumber(buf)),
 				 errhint("Please REINDEX it.")));
 
 	/*
@@ -518,8 +755,7 @@ _bt_checkpage(Relation rel, Buffer buf)
 				 errmsg("index \"%s\" contains corrupted page at block %u",
 						RelationGetRelationName(rel),
 						BufferGetBlockNumber(buf)),
-				 errhint("Please REINDEX it."),
-				 errSendAlert(true)));
+				 errhint("Please REINDEX it.")));
 }
 
 /*
@@ -528,39 +764,23 @@ _bt_checkpage(Relation rel, Buffer buf)
 static void
 _bt_log_reuse_page(Relation rel, BlockNumber blkno, TransactionId latestRemovedXid)
 {
-	if (!RelationNeedsWAL(rel))
-		return;
-
-	/* No ereport(ERROR) until changes are logged */
-	START_CRIT_SECTION();
+	xl_btree_reuse_page xlrec_reuse;
 
 	/*
-	 * We don't do MarkBufferDirty here because we're about to initialise the
-	 * page, and nobody else can see it yet.
+	 * Note that we don't register the buffer with the record, because this
+	 * operation doesn't modify the page. This record only exists to provide a
+	 * conflict point for Hot Standby.
 	 */
 
 	/* XLOG stuff */
-	{
-		XLogRecData rdata[1];
-		xl_btree_reuse_page xlrec_reuse;
+	xlrec_reuse.node = rel->rd_node;
+	xlrec_reuse.block = blkno;
+	xlrec_reuse.latestRemovedXid = latestRemovedXid;
 
-		xlrec_reuse.node = rel->rd_node;
-		xlrec_reuse.block = blkno;
-		xlrec_reuse.latestRemovedXid = latestRemovedXid;
-		rdata[0].data = (char *) &xlrec_reuse;
-		rdata[0].len = SizeOfBtreeReusePage;
-		rdata[0].buffer = InvalidBuffer;
-		rdata[0].next = NULL;
+	XLogBeginInsert();
+	XLogRegisterData((char *) &xlrec_reuse, SizeOfBtreeReusePage);
 
-		XLogInsert(RM_BTREE_ID, XLOG_BTREE_REUSE_PAGE, rdata);
-
-		/*
-		 * We don't do PageSetLSN here because we're about to initialise the
-		 * page, so no need.
-		 */
-	}
-
-	END_CRIT_SECTION();
+	XLogInsert(RM_BTREE_ID, XLOG_BTREE_REUSE_PAGE);
 }
 
 /*
@@ -631,9 +851,14 @@ _bt_getbuf(Relation rel, BlockNumber blkno, int access)
 					/*
 					 * If we are generating WAL for Hot Standby then create a
 					 * WAL record that will allow us to conflict with queries
-					 * running on standby.
+					 * running on standby, in case they have snapshots older
+					 * than btpo.xact.  This can only apply if the page does
+					 * have a valid btpo.xact value, ie not if it's new.  (We
+					 * must check that because an all-zero page has no special
+					 * space.)
 					 */
-					if (XLogStandbyInfoActive())
+					if (XLogStandbyInfoActive() && RelationNeedsWAL(rel) &&
+						!PageIsNew(page))
 					{
 						BTPageOpaque opaque = (BTPageOpaque) PageGetSpecialPointer(page);
 
@@ -725,7 +950,7 @@ _bt_relandgetbuf(Relation rel, Buffer obuf, BlockNumber blkno, int access)
  * Lock and pin (refcount) are both dropped.
  */
 void
-_bt_relbuf(Relation rel __attribute__((unused)), Buffer buf)
+_bt_relbuf(Relation rel, Buffer buf)
 {
 	UnlockReleaseBuffer(buf);
 }
@@ -746,7 +971,10 @@ _bt_pageinit(Page page, Size size)
  *	_bt_page_recyclable() -- Is an existing page recyclable?
  *
  * This exists to make sure _bt_getbuf and btvacuumscan have the same
- * policy about whether a page is safe to re-use.
+ * policy about whether a page is safe to re-use.  But note that _bt_getbuf
+ * knows enough to distinguish the PageIsNew condition from the other one.
+ * At some point it might be appropriate to redesign this to have a three-way
+ * result value.
  */
 bool
 _bt_page_recyclable(Page page)
@@ -798,10 +1026,8 @@ _bt_delitems_vacuum(Relation rel, Buffer buf,
 					OffsetNumber *itemnos, int nitems,
 					BlockNumber lastBlockVacuumed)
 {
-	Page		page;
+	Page		page = BufferGetPage(buf);
 	BTPageOpaque opaque;
-
-	page = BufferGetPage(buf);
 
 	/* No ereport(ERROR) until changes are logged */
 	START_CRIT_SECTION();
@@ -811,8 +1037,8 @@ _bt_delitems_vacuum(Relation rel, Buffer buf,
 		PageIndexMultiDelete(page, itemnos, nitems);
 
 	/*
-	 * If this is within VACUUM, we can clear the vacuum cycle ID since this
-	 * page has certainly been processed by the current vacuum scan.
+	 * We can clear the vacuum cycle ID since this page has certainly been
+	 * processed by the current vacuum scan.
 	 */
 	opaque = (BTPageOpaque) PageGetSpecialPointer(page);
 	opaque->btpo_cycleid = 0;
@@ -832,17 +1058,13 @@ _bt_delitems_vacuum(Relation rel, Buffer buf,
 	if (RelationNeedsWAL(rel))
 	{
 		XLogRecPtr	recptr;
-		XLogRecData rdata[2];
 		xl_btree_vacuum xlrec_vacuum;
 
-		xlrec_vacuum.node = rel->rd_node;
-		xlrec_vacuum.block = BufferGetBlockNumber(buf);
-
 		xlrec_vacuum.lastBlockVacuumed = lastBlockVacuumed;
-		rdata[0].data = (char *) &xlrec_vacuum;
-		rdata[0].len = SizeOfBtreeVacuum;
-		rdata[0].buffer = InvalidBuffer;
-		rdata[0].next = &(rdata[1]);
+
+		XLogBeginInsert();
+		XLogRegisterBuffer(0, buf, REGBUF_STANDARD);
+		XLogRegisterData((char *) &xlrec_vacuum, SizeOfBtreeVacuum);
 
 		/*
 		 * The target-offsets array is not in the buffer, but pretend that it
@@ -850,20 +1072,9 @@ _bt_delitems_vacuum(Relation rel, Buffer buf,
 		 * need not be stored too.
 		 */
 		if (nitems > 0)
-		{
-			rdata[1].data = (char *) itemnos;
-			rdata[1].len = nitems * sizeof(OffsetNumber);
-		}
-		else
-		{
-			rdata[1].data = NULL;
-			rdata[1].len = 0;
-		}
-		rdata[1].buffer = buf;
-		rdata[1].buffer_std = true;
-		rdata[1].next = NULL;
+			XLogRegisterBufData(0, (char *) itemnos, nitems * sizeof(OffsetNumber));
 
-		recptr = XLogInsert(RM_BTREE_ID, XLOG_BTREE_VACUUM, rdata);
+		recptr = XLogInsert(RM_BTREE_ID, XLOG_BTREE_VACUUM);
 
 		PageSetLSN(page, recptr);
 	}
@@ -890,9 +1101,15 @@ _bt_delitems_delete(Relation rel, Buffer buf,
 {
 	Page		page = BufferGetPage(buf);
 	BTPageOpaque opaque;
+	TransactionId latestRemovedXid = InvalidTransactionId;
 
 	/* Shouldn't be called unless there's something to do */
 	Assert(nitems > 0);
+
+	if (XLogStandbyInfoActive() && RelationNeedsWAL(rel))
+		latestRemovedXid =
+			index_compute_xid_horizon_for_tuples(rel, heapRel, buf,
+												 itemnos, nitems);
 
 	/* No ereport(ERROR) until changes are logged */
 	START_CRIT_SECTION();
@@ -921,36 +1138,23 @@ _bt_delitems_delete(Relation rel, Buffer buf,
 	if (RelationNeedsWAL(rel))
 	{
 		XLogRecPtr	recptr;
-		XLogRecData rdata[3];
 		xl_btree_delete xlrec_delete;
 
-		xlrec_delete.node = rel->rd_node;
-		xlrec_delete.hnode = heapRel->rd_node;
-		xlrec_delete.block = BufferGetBlockNumber(buf);
+		xlrec_delete.latestRemovedXid = latestRemovedXid;
 		xlrec_delete.nitems = nitems;
 
-		rdata[0].data = (char *) &xlrec_delete;
-		rdata[0].len = SizeOfBtreeDelete;
-		rdata[0].buffer = InvalidBuffer;
-		rdata[0].next = &(rdata[1]);
+		XLogBeginInsert();
+		XLogRegisterBuffer(0, buf, REGBUF_STANDARD);
+		XLogRegisterData((char *) &xlrec_delete, SizeOfBtreeDelete);
 
 		/*
 		 * We need the target-offsets array whether or not we store the whole
 		 * buffer, to allow us to find the latestRemovedXid on a standby
 		 * server.
 		 */
-		rdata[1].data = (char *) itemnos;
-		rdata[1].len = nitems * sizeof(OffsetNumber);
-		rdata[1].buffer = InvalidBuffer;
-		rdata[1].next = &(rdata[2]);
+		XLogRegisterData((char *) itemnos, nitems * sizeof(OffsetNumber));
 
-		rdata[2].data = NULL;
-		rdata[2].len = 0;
-		rdata[2].buffer = buf;
-		rdata[2].buffer_std = true;
-		rdata[2].next = NULL;
-
-		recptr = XLogInsert(RM_BTREE_ID, XLOG_BTREE_DELETE, rdata);
+		recptr = XLogInsert(RM_BTREE_ID, XLOG_BTREE_DELETE);
 
 		PageSetLSN(page, recptr);
 	}
@@ -994,9 +1198,11 @@ _bt_is_page_halfdead(Relation rel, BlockNumber blk)
  * right sibling.
  *
  * "child" is the leaf page we wish to delete, and "stack" is a search stack
- * leading to it (approximately).  Note that we will update the stack
- * entry(s) to reflect current downlink positions --- this is harmless and
- * indeed saves later search effort in _bt_pagedel.  The caller should
+ * leading to it (it actually leads to the leftmost leaf page with a high key
+ * matching that of the page to be deleted in !heapkeyspace indexes).  Note
+ * that we will update the stack entry(s) to reflect current downlink
+ * positions --- this is essentially the same as the corresponding step of
+ * splitting, and is not expected to affect caller.  The caller should
  * initialize *target and *rightsib to the leaf page and its right sibling.
  *
  * Note: it's OK to release page locks on any internal pages between the leaf
@@ -1019,11 +1225,13 @@ _bt_lock_branch_parent(Relation rel, BlockNumber child, BTStack stack,
 	BlockNumber leftsib;
 
 	/*
-	 * Locate the downlink of "child" in the parent (updating the stack entry
-	 * if needed)
+	 * Locate the downlink of "child" in the parent, updating the stack entry
+	 * if needed.  This is how !heapkeyspace indexes deal with having
+	 * non-unique high keys in leaf level pages.  Even heapkeyspace indexes
+	 * can have a stale stack due to insertions into the parent.
 	 */
-	ItemPointerSet(&(stack->bts_btentry.t_tid), child, P_HIKEY);
-	pbuf = _bt_getstackbuf(rel, stack, BT_WRITE);
+	stack->bts_btentry = child;
+	pbuf = _bt_getstackbuf(rel, stack);
 	if (pbuf == InvalidBuffer)
 		elog(ERROR, "failed to re-find parent key in index \"%s\" for deletion target page %u",
 			 RelationGetRelationName(rel), child);
@@ -1093,19 +1301,8 @@ _bt_lock_branch_parent(Relation rel, BlockNumber child, BTStack stack,
 				_bt_relbuf(rel, lbuf);
 			}
 
-			/*
-			 * Perform the same check on this internal level that
-			 * _bt_mark_page_halfdead performed on the leaf level.
-			 */
-			if (_bt_is_page_halfdead(rel, *rightsib))
-			{
-				elog(DEBUG1, "could not delete page %u because its right sibling %u is half-dead",
-					 parent, *rightsib);
-				return false;
-			}
-
 			return _bt_lock_branch_parent(rel, parent, stack->bts_parent,
-										topparent, topoff, target, rightsib);
+										  topparent, topoff, target, rightsib);
 		}
 		else
 		{
@@ -1188,9 +1385,9 @@ _bt_pagedel(Relation rel, Buffer buf)
 			if (P_ISHALFDEAD(opaque))
 				ereport(LOG,
 						(errcode(ERRCODE_INDEX_CORRUPTED),
-					errmsg("index \"%s\" contains a half-dead internal page",
-						   RelationGetRelationName(rel)),
-						 errhint("This can be caused by an interrupt VACUUM in version 9.3 or older, before upgrade. Please REINDEX it.")));
+						 errmsg("index \"%s\" contains a half-dead internal page",
+								RelationGetRelationName(rel)),
+						 errhint("This can be caused by an interrupted VACUUM in version 9.3 or older, before upgrade. Please REINDEX it.")));
 			_bt_relbuf(rel, buf);
 			return ndeleted;
 		}
@@ -1232,16 +1429,17 @@ _bt_pagedel(Relation rel, Buffer buf)
 		{
 			/*
 			 * We need an approximate pointer to the page's parent page.  We
-			 * use the standard search mechanism to search for the page's high
-			 * key; this will give us a link to either the current parent or
-			 * someplace to its left (if there are multiple equal high keys).
+			 * use a variant of the standard search mechanism to search for
+			 * the page's high key; this will give us a link to either the
+			 * current parent or someplace to its left (if there are multiple
+			 * equal high keys, which is possible with !heapkeyspace indexes).
 			 *
 			 * Also check if this is the right-half of an incomplete split
 			 * (see comment above).
 			 */
 			if (!stack)
 			{
-				ScanKey		itup_scankey;
+				BTScanInsert itup_key;
 				ItemId		itemid;
 				IndexTuple	targetkey;
 				Buffer		lbuf;
@@ -1272,6 +1470,7 @@ _bt_pagedel(Relation rel, Buffer buf)
 					lbuf = _bt_getbuf(rel, leftsib, BT_READ);
 					lpage = BufferGetPage(lbuf);
 					lopaque = (BTPageOpaque) PageGetSpecialPointer(lpage);
+
 					/*
 					 * If the left sibling is split again by another backend,
 					 * after we released the lock, we know that the first
@@ -1290,11 +1489,11 @@ _bt_pagedel(Relation rel, Buffer buf)
 				}
 
 				/* we need an insertion scan key for the search, so build one */
-				itup_scankey = _bt_mkscankey(rel, targetkey);
-				/* find the leftmost leaf page containing this key */
-				stack = _bt_search(rel, rel->rd_rel->relnatts, itup_scankey,
-								   false, &lbuf, BT_READ);
-				/* don't need a pin on the page */
+				itup_key = _bt_mkscankey(rel, targetkey);
+				/* find the leftmost leaf page with matching pivot/high key */
+				itup_key->pivotsearch = true;
+				stack = _bt_search(rel, itup_key, &lbuf, BT_READ, NULL);
+				/* don't need a lock or second pin on the page */
 				_bt_relbuf(rel, lbuf);
 
 				/*
@@ -1320,9 +1519,10 @@ _bt_pagedel(Relation rel, Buffer buf)
 		rightsib_empty = false;
 		while (P_ISHALFDEAD(opaque))
 		{
+			/* will check for interrupts, once lock is released */
 			if (!_bt_unlink_halfdead_page(rel, buf, &rightsib_empty))
 			{
-				_bt_relbuf(rel, buf);
+				/* _bt_unlink_halfdead_page already released buffer */
 				return ndeleted;
 			}
 			ndeleted++;
@@ -1331,6 +1531,12 @@ _bt_pagedel(Relation rel, Buffer buf)
 		rightsib = opaque->btpo_next;
 
 		_bt_relbuf(rel, buf);
+
+		/*
+		 * Check here, as calling loops will have locks held, preventing
+		 * interrupts from being processed.
+		 */
+		CHECK_FOR_INTERRUPTS();
 
 		/*
 		 * The page has now been deleted. If its right sibling is completely
@@ -1384,11 +1590,11 @@ _bt_mark_page_halfdead(Relation rel, Buffer leafbuf, BTStack stack)
 	leafrightsib = opaque->btpo_next;
 
 	/*
-	 * Before attempting to lock the parent page, check that the right
-	 * sibling is not in half-dead state.  A half-dead right sibling would
-	 * have no downlink in the parent, which would be highly confusing later
-	 * when we delete the downlink that follows the current page's downlink.
-	 * (I believe the deletion would work correctly, but it would fail the
+	 * Before attempting to lock the parent page, check that the right sibling
+	 * is not in half-dead state.  A half-dead right sibling would have no
+	 * downlink in the parent, which would be highly confusing later when we
+	 * delete the downlink that follows the current page's downlink. (I
+	 * believe the deletion would work correctly, but it would fail the
 	 * cross-check we make that the following downlink points to the right
 	 * sibling of the delete page.)
 	 */
@@ -1404,7 +1610,17 @@ _bt_mark_page_halfdead(Relation rel, Buffer leafbuf, BTStack stack)
 	 * parent, unless it is the only child --- in which case the parent has to
 	 * be deleted too, and the same condition applies recursively to it. We
 	 * have to check this condition all the way up before trying to delete,
-	 * and lock the final parent of the to-be-deleted branch.
+	 * and lock the final parent of the to-be-deleted subtree.
+	 *
+	 * However, we won't need to repeat the above _bt_is_page_halfdead() check
+	 * for parent/ancestor pages because of the rightmost restriction. The
+	 * leaf check will apply to a right "cousin" leaf page rather than a
+	 * simple right sibling leaf page in cases where we actually go on to
+	 * perform internal page deletion. The right cousin leaf page is
+	 * representative of the left edge of the subtree to the right of the
+	 * to-be-deleted subtree as a whole.  (Besides, internal pages are never
+	 * marked half-dead, so it isn't even possible to directly assess if an
+	 * internal page is part of some other to-be-deleted subtree.)
 	 */
 	rightsib = leafrightsib;
 	target = leafblkno;
@@ -1429,15 +1645,15 @@ _bt_mark_page_halfdead(Relation rel, Buffer leafbuf, BTStack stack)
 #ifdef USE_ASSERT_CHECKING
 	itemid = PageGetItemId(page, topoff);
 	itup = (IndexTuple) PageGetItem(page, itemid);
-	Assert(ItemPointerGetBlockNumber(&(itup->t_tid)) == target);
+	Assert(BTreeInnerTupleGetDownLink(itup) == target);
 #endif
 
 	nextoffset = OffsetNumberNext(topoff);
 	itemid = PageGetItemId(page, nextoffset);
 	itup = (IndexTuple) PageGetItem(page, itemid);
-	if (ItemPointerGetBlockNumber(&(itup->t_tid)) != rightsib)
+	if (BTreeInnerTupleGetDownLink(itup) != rightsib)
 		elog(ERROR, "right sibling %u of block %u is not next child %u of block %u in index \"%s\"",
-			 rightsib, target, ItemPointerGetBlockNumber(&(itup->t_tid)),
+			 rightsib, target, BTreeInnerTupleGetDownLink(itup),
 			 BufferGetBlockNumber(topparent), RelationGetRelationName(rel));
 
 	/*
@@ -1460,7 +1676,7 @@ _bt_mark_page_halfdead(Relation rel, Buffer leafbuf, BTStack stack)
 
 	itemid = PageGetItemId(page, topoff);
 	itup = (IndexTuple) PageGetItem(page, itemid);
-	ItemPointerSet(&(itup->t_tid), rightsib, P_HIKEY);
+	BTreeInnerTupleSetDownLink(itup, rightsib);
 
 	nextoffset = OffsetNumberNext(topoff);
 	PageIndexTupleDelete(page, nextoffset);
@@ -1479,9 +1695,10 @@ _bt_mark_page_halfdead(Relation rel, Buffer leafbuf, BTStack stack)
 	MemSet(&trunctuple, 0, sizeof(IndexTupleData));
 	trunctuple.t_info = sizeof(IndexTupleData);
 	if (target != leafblkno)
-		ItemPointerSet(&trunctuple.t_tid, target, P_HIKEY);
+		BTreeTupleSetTopParent(&trunctuple, target);
 	else
-		ItemPointerSetInvalid(&trunctuple.t_tid);
+		BTreeTupleSetTopParent(&trunctuple, InvalidBlockNumber);
+
 	if (PageAddItem(page, (Item) &trunctuple, sizeof(IndexTupleData), P_HIKEY,
 					false, false) == InvalidOffsetNumber)
 		elog(ERROR, "could not add dummy high key to half-dead page");
@@ -1495,33 +1712,26 @@ _bt_mark_page_halfdead(Relation rel, Buffer leafbuf, BTStack stack)
 	{
 		xl_btree_mark_page_halfdead xlrec;
 		XLogRecPtr	recptr;
-		XLogRecData rdata[2];
 
-		xlrec.target.node = rel->rd_node;
-		ItemPointerSet(&(xlrec.target.tid), BufferGetBlockNumber(topparent), topoff);
+		xlrec.poffset = topoff;
 		xlrec.leafblk = leafblkno;
 		if (target != leafblkno)
 			xlrec.topparent = target;
 		else
 			xlrec.topparent = InvalidBlockNumber;
 
+		XLogBeginInsert();
+		XLogRegisterBuffer(0, leafbuf, REGBUF_WILL_INIT);
+		XLogRegisterBuffer(1, topparent, REGBUF_STANDARD);
+
 		page = BufferGetPage(leafbuf);
 		opaque = (BTPageOpaque) PageGetSpecialPointer(page);
 		xlrec.leftblk = opaque->btpo_prev;
 		xlrec.rightblk = opaque->btpo_next;
 
-		rdata[0].data = (char *) &xlrec;
-		rdata[0].len = SizeOfBtreeMarkPageHalfDead;
-		rdata[0].buffer = InvalidBuffer;
-		rdata[0].next = &(rdata[1]);
+		XLogRegisterData((char *) &xlrec, SizeOfBtreeMarkPageHalfDead);
 
-		rdata[1].data = NULL;
-		rdata[1].len = 0;
-		rdata[1].buffer = topparent;
-		rdata[1].buffer_std = true;
-		rdata[1].next = NULL;
-
-		recptr = XLogInsert(RM_BTREE_ID, XLOG_BTREE_MARK_PAGE_HALFDEAD, rdata);
+		recptr = XLogInsert(RM_BTREE_ID, XLOG_BTREE_MARK_PAGE_HALFDEAD);
 
 		page = BufferGetPage(topparent);
 		PageSetLSN(page, recptr);
@@ -1546,6 +1756,11 @@ _bt_mark_page_halfdead(Relation rel, Buffer leafbuf, BTStack stack)
  * Returns 'false' if the page could not be unlinked (shouldn't happen).
  * If the (new) right sibling of the page is empty, *rightsib_empty is set
  * to true.
+ *
+ * Must hold pin and lock on leafbuf at entry (read or write doesn't matter).
+ * On success exit, we'll be holding pin and write lock.  On failure exit,
+ * we'll release both pin and lock before returning (we define it that way
+ * to avoid having to reacquire a lock we already released).
  */
 static bool
 _bt_unlink_halfdead_page(Relation rel, Buffer leafbuf, bool *rightsib_empty)
@@ -1567,9 +1782,8 @@ _bt_unlink_halfdead_page(Relation rel, Buffer leafbuf, bool *rightsib_empty)
 	BTPageOpaque opaque;
 	bool		rightsib_is_rightmost;
 	int			targetlevel;
-	ItemPointer leafhikey;
+	IndexTuple	leafhikey;
 	BlockNumber nextchild;
-	BlockNumber topblkno;
 
 	page = BufferGetPage(leafbuf);
 	opaque = (BTPageOpaque) PageGetSpecialPointer(page);
@@ -1580,24 +1794,32 @@ _bt_unlink_halfdead_page(Relation rel, Buffer leafbuf, bool *rightsib_empty)
 	 * Remember some information about the leaf page.
 	 */
 	itemid = PageGetItemId(page, P_HIKEY);
-	leafhikey = &((IndexTuple) PageGetItem(page, itemid))->t_tid;
+	leafhikey = (IndexTuple) PageGetItem(page, itemid);
 	leafleftsib = opaque->btpo_prev;
 	leafrightsib = opaque->btpo_next;
 
 	LockBuffer(leafbuf, BUFFER_LOCK_UNLOCK);
 
 	/*
+	 * Check here, as calling loops will have locks held, preventing
+	 * interrupts from being processed.
+	 */
+	CHECK_FOR_INTERRUPTS();
+
+	/*
 	 * If the leaf page still has a parent pointing to it (or a chain of
 	 * parents), we don't unlink the leaf page yet, but the topmost remaining
-	 * parent in the branch.
+	 * parent in the branch.  Set 'target' and 'buf' to reference the page
+	 * actually being unlinked.
 	 */
-	if (ItemPointerIsValid(leafhikey))
+	target = BTreeTupleGetTopParent(leafhikey);
+
+	if (target != InvalidBlockNumber)
 	{
-		topblkno = ItemPointerGetBlockNumber(leafhikey);
-		target = topblkno;
+		Assert(target != leafblkno);
 
 		/* fetch the block number of the topmost parent's left sibling */
-		buf = _bt_getbuf(rel, topblkno, BT_READ);
+		buf = _bt_getbuf(rel, target, BT_READ);
 		page = BufferGetPage(buf);
 		opaque = (BTPageOpaque) PageGetSpecialPointer(page);
 		leftsib = opaque->btpo_prev;
@@ -1611,11 +1833,10 @@ _bt_unlink_halfdead_page(Relation rel, Buffer leafbuf, bool *rightsib_empty)
 	}
 	else
 	{
-		topblkno = InvalidBlockNumber;
 		target = leafblkno;
 
 		buf = leafbuf;
-		leftsib = opaque->btpo_prev;
+		leftsib = leafleftsib;
 		targetlevel = 0;
 	}
 
@@ -1644,10 +1865,30 @@ _bt_unlink_halfdead_page(Relation rel, Buffer leafbuf, bool *rightsib_empty)
 			/* step right one page */
 			leftsib = opaque->btpo_next;
 			_bt_relbuf(rel, lbuf);
+
+			/*
+			 * It'd be good to check for interrupts here, but it's not easy to
+			 * do so because a lock is always held. This block isn't
+			 * frequently reached, so hopefully the consequences of not
+			 * checking interrupts aren't too bad.
+			 */
+
 			if (leftsib == P_NONE)
 			{
-				elog(LOG, "no left sibling (concurrent deletion?) in \"%s\"",
+				elog(LOG, "no left sibling (concurrent deletion?) of block %u in \"%s\"",
+					 target,
 					 RelationGetRelationName(rel));
+				if (target != leafblkno)
+				{
+					/* we have only a pin on target, but pin+lock on leafbuf */
+					ReleaseBuffer(buf);
+					_bt_relbuf(rel, leafbuf);
+				}
+				else
+				{
+					/* we have only a pin on leafbuf */
+					ReleaseBuffer(leafbuf);
+				}
 				return false;
 			}
 			lbuf = _bt_getbuf(rel, leftsib, BT_WRITE);
@@ -1696,9 +1937,11 @@ _bt_unlink_halfdead_page(Relation rel, Buffer leafbuf, bool *rightsib_empty)
 			elog(ERROR, "half-dead page changed status unexpectedly in block %u of index \"%s\"",
 				 target, RelationGetRelationName(rel));
 
-		/* remember the next child down in the branch. */
+		/* remember the next non-leaf child down in the branch. */
 		itemid = PageGetItemId(page, P_FIRSTDATAKEY(opaque));
-		nextchild = ItemPointerGetBlockNumber(&((IndexTuple) PageGetItem(page, itemid))->t_tid);
+		nextchild = BTreeInnerTupleGetDownLink((IndexTuple) PageGetItem(page, itemid));
+		if (nextchild == leafblkno)
+			nextchild = InvalidBlockNumber;
 	}
 
 	/*
@@ -1783,12 +2026,7 @@ _bt_unlink_halfdead_page(Relation rel, Buffer leafbuf, bool *rightsib_empty)
 	 * branch.
 	 */
 	if (target != leafblkno)
-	{
-		if (nextchild == leafblkno)
-			ItemPointerSetInvalid(leafhikey);
-		else
-			ItemPointerSet(leafhikey, nextchild, P_HIKEY);
-	}
+		BTreeTupleSetTopParent(leafhikey, nextchild);
 
 	/*
 	 * Mark the page itself deleted.  It can be recycled when all current
@@ -1809,6 +2047,9 @@ _bt_unlink_halfdead_page(Relation rel, Buffer leafbuf, bool *rightsib_empty)
 	/* And update the metapage, if needed */
 	if (BufferIsValid(metabuf))
 	{
+		/* upgrade metapage if needed */
+		if (metad->btm_version < BTREE_NOVAC_VERSION)
+			_bt_upgrademetapage(metapg);
 		metad->btm_fastroot = rightsib;
 		metad->btm_fastlevel = targetlevel;
 		MarkBufferDirty(metabuf);
@@ -1829,63 +2070,48 @@ _bt_unlink_halfdead_page(Relation rel, Buffer leafbuf, bool *rightsib_empty)
 		xl_btree_metadata xlmeta;
 		uint8		xlinfo;
 		XLogRecPtr	recptr;
-		XLogRecData rdata[4];
-		XLogRecData *nextrdata;
 
-		xlrec.node = rel->rd_node;
+		XLogBeginInsert();
+
+		XLogRegisterBuffer(0, buf, REGBUF_WILL_INIT);
+		if (BufferIsValid(lbuf))
+			XLogRegisterBuffer(1, lbuf, REGBUF_STANDARD);
+		XLogRegisterBuffer(2, rbuf, REGBUF_STANDARD);
+		if (target != leafblkno)
+			XLogRegisterBuffer(3, leafbuf, REGBUF_WILL_INIT);
 
 		/* information on the unlinked block */
-		xlrec.deadblk = target;
 		xlrec.leftsib = leftsib;
 		xlrec.rightsib = rightsib;
 		xlrec.btpo_xact = opaque->btpo.xact;
 
 		/* information needed to recreate the leaf block (if not the target) */
-		xlrec.leafblk = leafblkno;
 		xlrec.leafleftsib = leafleftsib;
 		xlrec.leafrightsib = leafrightsib;
 		xlrec.topparent = nextchild;
 
-		rdata[0].data = (char *) &xlrec;
-		rdata[0].len = SizeOfBtreeUnlinkPage;
-		rdata[0].buffer = InvalidBuffer;
-		rdata[0].next = nextrdata = &(rdata[1]);
+		XLogRegisterData((char *) &xlrec, SizeOfBtreeUnlinkPage);
 
 		if (BufferIsValid(metabuf))
 		{
+			XLogRegisterBuffer(4, metabuf, REGBUF_WILL_INIT | REGBUF_STANDARD);
+
+			Assert(metad->btm_version >= BTREE_NOVAC_VERSION);
+			xlmeta.version = metad->btm_version;
 			xlmeta.root = metad->btm_root;
 			xlmeta.level = metad->btm_level;
 			xlmeta.fastroot = metad->btm_fastroot;
 			xlmeta.fastlevel = metad->btm_fastlevel;
+			xlmeta.oldest_btpo_xact = metad->btm_oldest_btpo_xact;
+			xlmeta.last_cleanup_num_heap_tuples = metad->btm_last_cleanup_num_heap_tuples;
 
-			nextrdata->data = (char *) &xlmeta;
-			nextrdata->len = sizeof(xl_btree_metadata);
-			nextrdata->buffer = InvalidBuffer;
-			nextrdata->next = nextrdata + 1;
-			nextrdata++;
+			XLogRegisterBufData(4, (char *) &xlmeta, sizeof(xl_btree_metadata));
 			xlinfo = XLOG_BTREE_UNLINK_PAGE_META;
 		}
 		else
 			xlinfo = XLOG_BTREE_UNLINK_PAGE;
 
-		nextrdata->data = NULL;
-		nextrdata->len = 0;
-		nextrdata->buffer = rbuf;
-		nextrdata->buffer_std = true;
-		nextrdata->next = NULL;
-
-		if (BufferIsValid(lbuf))
-		{
-			nextrdata->next = nextrdata + 1;
-			nextrdata++;
-			nextrdata->data = NULL;
-			nextrdata->len = 0;
-			nextrdata->buffer = lbuf;
-			nextrdata->buffer_std = true;
-			nextrdata->next = NULL;
-		}
-
-		recptr = XLogInsert(RM_BTREE_ID, xlinfo, rdata);
+		recptr = XLogInsert(RM_BTREE_ID, xlinfo);
 
 		if (BufferIsValid(metabuf))
 		{

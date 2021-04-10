@@ -7,7 +7,7 @@
  *    externalized.
  *
  * Portions Copyright (c) 2005-2008, Greenplum inc
- * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
  * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
@@ -23,14 +23,12 @@
 #include "optimizer/planmain.h"
 
 #include "cdb/cdbhash.h"
-#include "cdb/cdbllize.h"
 #include "cdb/cdbmutate.h"
+#include "cdb/cdbpath.h"
 #include "cdb/cdbsetop.h"
 #include "cdb/cdbutil.h"
 #include "cdb/cdbvars.h"
-#include "cdb/cdbpullup.h"
 
-static Flow *copyFlow(Flow *model_flow, bool withExprs, bool withSort);
 
 /*
  * Function: choose_setop_type
@@ -41,55 +39,56 @@ static Flow *copyFlow(Flow *model_flow, bool withExprs, bool withSort);
  * See the comments in cdbsetop.h for discussion of types of setop plan.
  */
 GpSetOpType
-choose_setop_type(List *planlist)
+choose_setop_type(List *pathlist)
 {
 	ListCell   *cell;
-	Plan	   *subplan = NULL;
-	bool		ok_general = TRUE;
-	bool		ok_partitioned = TRUE;
-	bool		ok_replicated = TRUE;
-	bool		ok_single_qe = TRUE;
-	bool		has_partitioned = FALSE;
+	bool		ok_general = true;
+	bool		ok_partitioned = true;
+	bool		ok_single_qe = true;
+	bool		has_partitioned = false;
 
 	Assert(Gp_role == GP_ROLE_DISPATCH || Gp_role == GP_ROLE_UTILITY);
 
-	foreach(cell, planlist)
+	foreach(cell, pathlist)
 	{
-		Flow	   *subplanflow;
+		Path	   *subpath = (Path *) lfirst(cell);
 
-		subplan = (Plan *) lfirst(cell);
-		subplanflow = subplan->flow;
-
-		Assert(is_plan_node((Node *) subplan));
-		Assert(subplanflow != NULL);
-		switch (subplanflow->locustype)
+		switch (subpath->locus.locustype)
 		{
 			case CdbLocusType_Hashed:
 			case CdbLocusType_HashedOJ:
 			case CdbLocusType_Strewn:
-				ok_general = ok_replicated = FALSE;
-				has_partitioned = TRUE;
+				ok_general = false;
+				has_partitioned = true;
 				break;
 
 			case CdbLocusType_Entry:
-				ok_general = ok_partitioned = ok_replicated = ok_single_qe = FALSE;
+				ok_general = ok_partitioned = ok_single_qe = false;
 				break;
 
+			case CdbLocusType_OuterQuery:
+				return PSETOP_SEQUENTIAL_OUTERQUERY;
+
 			case CdbLocusType_SingleQE:
-				ok_general = ok_replicated = FALSE;
+				ok_general = false;
 				break;
 
 			case CdbLocusType_SegmentGeneral:
-				ok_general = ok_replicated = FALSE;
+				ok_general = false;
 				break;
 
 			case CdbLocusType_General:
 				break;
 
-			case CdbLocusType_Null:
 			case CdbLocusType_Replicated:
+				break;
+
+			case CdbLocusType_Null:
+				elog(ERROR, "unexpected Null locus in set operation branch");
+				break;
 			default:
-				return PSETOP_NONE;
+				elog(ERROR, "unexpected locus type in set operation branch");
+				break;
 		}
 	}
 
@@ -105,23 +104,19 @@ choose_setop_type(List *planlist)
 
 
 void
-adjust_setop_arguments(PlannerInfo *root, List *planlist, GpSetOpType setop_type)
+adjust_setop_arguments(PlannerInfo *root, List *pathlist, List *tlist_list, GpSetOpType setop_type)
 {
-	ListCell   *cell;
-	Plan	   *subplan;
-	Plan	   *adjusted_plan;
+	ListCell   *pathcell;
+	ListCell   *tlistcell;
+	Path	   *adjusted_path;
+	CdbPathLocus locus;
 
-	foreach(cell, planlist)
+	forboth(pathcell, pathlist, tlistcell, tlist_list)
 	{
-		Flow	   *subplanflow;
+		Path	   *subpath = (Path *) lfirst(pathcell);
+		List	   *subtlist = (List *) lfirst(tlistcell);
 
-		subplan = (Plan *) lfirst(cell);
-		subplanflow = subplan->flow;
-
-		Assert(is_plan_node((Node *) subplan));
-		Assert(subplanflow != NULL);
-
-		adjusted_plan = subplan;
+		adjusted_path = subpath;
 		switch (setop_type)
 		{
 			case PSETOP_GENERAL:
@@ -129,297 +124,173 @@ adjust_setop_arguments(PlannerInfo *root, List *planlist, GpSetOpType setop_type
 				break;
 
 			case PSETOP_PARALLEL_PARTITIONED:
-				switch (subplanflow->locustype)
+				switch (subpath->locus.locustype)
 				{
 					case CdbLocusType_Hashed:
 					case CdbLocusType_HashedOJ:
 					case CdbLocusType_Strewn:
-						Assert(subplanflow->flotype == FLOW_PARTITIONED);
 						break;
 					case CdbLocusType_SingleQE:
 					case CdbLocusType_General:
 					case CdbLocusType_SegmentGeneral:
-						Assert(subplanflow->flotype == FLOW_SINGLETON && subplanflow->segindex > -1);
-
 						/*
 						 * The setop itself will run on an N-gang, so we need
 						 * to arrange for the singleton input to be separately
 						 * dispatched to a 1-gang and collect its result on
 						 * one of our N QEs. Hence ...
 						 */
-						adjusted_plan = (Plan *) make_motion_hash_all_targets(NULL, subplan);
+						adjusted_path = make_motion_hash_all_targets(root, subpath, subtlist);
 						break;
 					case CdbLocusType_Null:
 					case CdbLocusType_Entry:
 					case CdbLocusType_Replicated:
 					default:
-						ereport(ERROR, (
-										errcode(ERRCODE_INTERNAL_ERROR),
+						ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
 										errmsg("unexpected argument locus to set operation")));
 						break;
 				}
 				break;
 
 			case PSETOP_SEQUENTIAL_QD:
-				switch (subplanflow->locustype)
+				switch (subpath->locus.locustype)
 				{
 					case CdbLocusType_Hashed:
 					case CdbLocusType_HashedOJ:
 					case CdbLocusType_Strewn:
-						Assert(subplanflow->flotype == FLOW_PARTITIONED);
-						adjusted_plan = (Plan *) make_motion_gather_to_QD(root, subplan, NULL);
+						CdbPathLocus_MakeEntry(&locus);
+						adjusted_path = cdbpath_create_motion_path(root, subpath, NULL, false,
+																   locus);
 						break;
 
 					case CdbLocusType_SingleQE:
-						Assert(subplanflow->flotype == FLOW_SINGLETON);
-
 						/*
 						 * The input was focused on a single QE, but we need it in the QD.
 						 * It's bit silly to add a Motion to just move the whole result from
 						 * single QE to QD, it would be better to produce the result in the
 						 * QD in the first place, and avoid the Motion. But it's too late
-						 * to modify the subplan.
+						 * to modify the subpath.
 						 */
-						adjusted_plan = (Plan *) make_motion_gather_to_QD(root, subplan, NULL);
+						CdbPathLocus_MakeEntry(&locus);
+						adjusted_path = cdbpath_create_motion_path(root, subpath, NULL, false,
+																   locus);
 						break;
 
 					case CdbLocusType_Entry:
 					case CdbLocusType_General:
+					case CdbLocusType_OuterQuery:
 						break;
 
 					case CdbLocusType_Null:
 					case CdbLocusType_Replicated:
 					default:
-						ereport(ERROR, (
-										errcode(ERRCODE_INTERNAL_ERROR),
+						ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
 										errmsg("unexpected argument locus to set operation")));
 						break;
 				}
 				break;
 
 			case PSETOP_SEQUENTIAL_QE:
-				switch (subplanflow->locustype)
+			case PSETOP_SEQUENTIAL_OUTERQUERY:
+				switch (subpath->locus.locustype)
 				{
 					case CdbLocusType_Hashed:
 					case CdbLocusType_HashedOJ:
 					case CdbLocusType_Strewn:
-						Assert(subplanflow->flotype == FLOW_PARTITIONED);
 						/* Gather to QE.  No need to keep ordering. */
-						adjusted_plan = (Plan *) make_motion_gather_to_QE(root, subplan, NULL);
+						CdbPathLocus_MakeSingleQE(&locus, getgpsegmentCount());
+						adjusted_path = cdbpath_create_motion_path(root, subpath, NULL, false,
+																   locus);
 						break;
 
 					case CdbLocusType_SingleQE:
-						Assert(subplanflow->flotype == FLOW_SINGLETON && subplanflow->segindex != -1);
 						break;
 
+					case CdbLocusType_OuterQuery:
 					case CdbLocusType_General:
 						break;
 
 					case CdbLocusType_SegmentGeneral:
 						/* Gather to QE.  No need to keep ordering. */
-						adjusted_plan = (Plan *) make_motion_gather_to_QE(root, subplan, NULL);
+						CdbPathLocus_MakeSingleQE(&locus, getgpsegmentCount());
+						adjusted_path = cdbpath_create_motion_path(root, subpath, NULL, false,
+																   locus);
 						break;
 
 					case CdbLocusType_Entry:
 					case CdbLocusType_Null:
 					case CdbLocusType_Replicated:
 					default:
-						ereport(ERROR, (
-										errcode(ERRCODE_INTERNAL_ERROR),
+						ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
 										errmsg("unexpected argument locus to set operation")));
 						break;
 				}
 				break;
 
-			case PSETOP_PARALLEL_REPLICATED:
-				/* Only when all args are replicated. */
-				ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
-								errmsg("unexpected replicated intermediate result"),
-								errdetail("argument to set operation may not be replicated")));
-				break;
-
 			default:
 				/* Can't happen! */
-				ereport(ERROR, (
-								errcode(ERRCODE_INTERNAL_ERROR),
+				ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
 								errmsg("unexpected arguments to set operation")));
 				break;
 		}
 
 		/* If we made changes, inject them into the argument list. */
-		if (subplan != adjusted_plan)
+		if (subpath != adjusted_path)
 		{
-			subplan = adjusted_plan;
-			cell->data.ptr_value = subplan;
+			subpath = adjusted_path;
+			pathcell->data.ptr_value = subpath;
 		}
 	}
 
 	return;
 }
 
-
-/*
- * Copy a Flow node.  Only the declarative part is preserved.  Not, e.g.,
- * any required movement or transformation.  Hash information is preserved
- * only if withExprs is true. Sort specifications are preserved only
- * if withSort is true.
- *
- * A NULL result indicates either a NULL argument or a problem.
- */
-static Flow *
-copyFlow(Flow *model_flow, bool withExprs, bool withSort)
-{
-	Flow	   *new_flow = NULL;
-
-	if (model_flow == NULL)
-		return NULL;
-
-	new_flow = makeFlow(model_flow->flotype, model_flow->numsegments);
-	new_flow->locustype = model_flow->locustype;
-
-	if (model_flow->flotype == FLOW_PARTITIONED)
-	{
-		/* Copy hash attribute definitions, if wanted and available. */
-		if (withExprs && model_flow->hashExpr != NULL)
-		{
-			new_flow->hashExpr = copyObject(model_flow->hashExpr);
-		}
-	}
-	else if (model_flow->flotype == FLOW_SINGLETON)
-	{
-		/* Propagate segment definition. */
-		new_flow->segindex = model_flow->segindex;
-	}
-	else if (model_flow->flotype != FLOW_REPLICATED)
-	{
-		/* Clean up and give up. This isn't one of our blessed types. */
-		pfree(new_flow);
-		return NULL;
-	}
-
-	return new_flow;
-}
-
-
-/*
- * make_motion_gather_to_QD
- *		Add a Motion node atop the given subplan to gather the tuples
- *      from an input gang to the QD. This motion should only be applied to
- *      a non-replicated, non-root subplan.
- */
-Motion *
-make_motion_gather_to_QD(PlannerInfo *root, Plan *subplan, List *sortPathKeys)
-{
-	return make_motion_gather(root, subplan, sortPathKeys);
-}
-
-/*
- * make_motion_gather_to_QE
- *		Add a Motion node atop the given subplan to gather tuples to
- *      a single QE. This motion should only be applied to a partitioned
- *      subplan.
- */
-Motion *
-make_motion_gather_to_QE(PlannerInfo *root, Plan *subplan, List *sortPathKeys)
-{
-	return make_motion_gather(root, subplan, sortPathKeys);
-}
-
-/*
- * make_motion_gather
- *		Add a Motion node atop the given subplan to gather tuples to
- *      a single process. This motion should only be applied to a partitioned
- *      subplan.
- */
-Motion *
-make_motion_gather(PlannerInfo *root, Plan *subplan, List *sortPathKeys)
-{
-	Motion	   *motion;
-
-	Assert(subplan->flow != NULL);
-	Assert(subplan->flow->flotype == FLOW_PARTITIONED ||
-		   subplan->flow->flotype == FLOW_SINGLETON);
-
-	if (sortPathKeys)
-	{
-		Sort	   *sort;
-
-		/*
-		 * The input is pre-sorted, so we don't need to do any real sorting
-		 * here. But make_sort_for_pathkeys() is a convenient way to construct
-		 * the 'sortColIdx', 'sortOperators', etc. fields that we need in the
-		 * Motion node. They represent the input order that the Motion node
-		 * will preserve, when it receives and merges the inputs.
-		 */
-		sort = make_sort_from_pathkeys(root,
-									   subplan,
-									   sortPathKeys,
-									   -1.0,
-									   false /* useExecutorVarFormat */ );
-
-		/* FIXME: numsegments */
-
-		motion = make_sorted_union_motion(root,
-										  subplan,
-										  sort->numCols,
-										  sort->sortColIdx,
-										  sort->sortOperators,
-										  sort->collations,sort->nullsFirst,
-										  false,
-										  subplan->flow->numsegments);
-
-		/* throw away the Sort */
-		pfree(sort);
-	}
-	else
-	{
-		/* FIXME: numsegments */
-
-		motion = make_union_motion(subplan, false, subplan->flow->numsegments);
-	}
-
-	return motion;
-}
-
 /*
  * make_motion_hash_all_targets
- *		Add a Motion node atop the given subplan to hash collocate
+ *		Add a Motion node atop the given subplath to hash collocate
  *      tuples non-distinct on the non-junk attributes.  This motion
- *      should only be applied to a non-replicated, non-root subplan.
+ *      should only be applied to a non-replicated, non-root subpath.
  *
  * This will align with the sort attributes used as input to a SetOp
- * or Unique operator. This is used in plans for UNION and other
+ * or Unique operator. This is used in path for UNION and other
  * set-operations that implicitly do a DISTINCT on the whole target
  * list.
  */
-Motion *
-make_motion_hash_all_targets(PlannerInfo *root, Plan *subplan)
+Path *
+make_motion_hash_all_targets(PlannerInfo *root, Path *subpath, List *tlist)
 {
 	ListCell   *cell;
 	List	   *hashexprs = NIL;
+	List	   *hashopfamilies = NIL;
+	List	   *hashsortrefs = NIL;
+	CdbPathLocus locus;
 
-	foreach(cell, subplan->targetlist)
+	foreach(cell, tlist)
 	{
 		TargetEntry *tle = (TargetEntry *) lfirst(cell);
+		Oid			opfamily;
 
 		if (tle->resjunk)
 			continue;
 
-		if (!isGreenplumDbHashable(exprType((Node *) tle->expr)))
-			continue;
+		opfamily = cdb_default_distribution_opfamily_for_type(exprType((Node *) tle->expr));
+		if (!opfamily)
+			continue;		/* not hashable */
 
 		hashexprs = lappend(hashexprs, copyObject(tle->expr));
+		hashopfamilies = lappend_oid(hashopfamilies, opfamily);
+		hashsortrefs = lappend_int(hashsortrefs, tle->ressortgroupref);
 	}
 
 	if (hashexprs)
-		/*
-		 * FIXME: ALL as numsegments is correct,
-		 *        but can we decide a better value?
-		 */
-		return make_hashed_motion(subplan,
-								  hashexprs,
-								  false /* useExecutorVarFormat */,
-								  GP_POLICY_ALL_NUMSEGMENTS);
+	{
+		/* Distribute to ALL to maximize parallelism */
+		locus = cdbpathlocus_from_exprs(root,
+										subpath->parent,
+										hashexprs,
+										hashopfamilies,
+										hashsortrefs,
+										getgpsegmentCount());
+	}
 	else
 	{
 		/*
@@ -429,32 +300,11 @@ make_motion_hash_all_targets(PlannerInfo *root, Plan *subplan)
 		 * produce a different plan, with Sorts in the segments, and an
 		 * order-preserving gather on the top.)
 		 */
-		return make_motion_gather(root, subplan, NIL);
+		CdbPathLocus_MakeSingleQE(&locus, getgpsegmentCount());
 	}
-}
 
-/*
- * make_motion_hash
- *		Add a Motion node atop the given subplan to hash collocate
- *      tuples non-distinct on the values of the hash expressions.  This
- *      motion should only be applied to a non-replicated, non-root subplan.
- */
-Motion *
-make_motion_hash(PlannerInfo *root __attribute__((unused)), Plan *subplan, List *hashexprs)
-{
-	Motion	   *motion;
-
-	Assert(subplan->flow != NULL);
-
-	/* FIXME: numsegments */
-
-	motion = make_hashed_motion(
-								subplan,
-								hashexprs,
-								false /* useExecutorVarFormat */,
-								subplan->flow->numsegments);
-
-	return motion;
+	return cdbpath_create_motion_path(root, subpath, subpath->pathkeys,
+									  false, locus);
 }
 
 /*
@@ -462,138 +312,26 @@ make_motion_hash(PlannerInfo *root __attribute__((unused)), Plan *subplan, List 
  *     type determined during examination of the arguments.
  */
 void
-mark_append_locus(Plan *plan, GpSetOpType optype)
+mark_append_locus(Path *path, GpSetOpType optype)
 {
-	/*
-	 * FIXME: for append we forcely collect data on all segments
-	 */
-	int			numsegments = GP_POLICY_ALL_NUMSEGMENTS;
-
 	switch (optype)
 	{
 		case PSETOP_GENERAL:
-			mark_plan_general(plan, numsegments);
+			CdbPathLocus_MakeGeneral(&path->locus);
 			break;
 		case PSETOP_PARALLEL_PARTITIONED:
-			mark_plan_strewn(plan, numsegments);
-			break;
-		case PSETOP_PARALLEL_REPLICATED:
-			mark_plan_replicated(plan, numsegments);
+			CdbPathLocus_MakeStrewn(&path->locus, getgpsegmentCount());
 			break;
 		case PSETOP_SEQUENTIAL_QD:
-			mark_plan_entry(plan);
+			CdbPathLocus_MakeEntry(&path->locus);
 			break;
 		case PSETOP_SEQUENTIAL_QE:
-			mark_plan_singleQE(plan, numsegments);
+			CdbPathLocus_MakeSingleQE(&path->locus, getgpsegmentCount());
+			break;
+		case PSETOP_SEQUENTIAL_OUTERQUERY:
+			CdbPathLocus_MakeOuterQuery(&path->locus);
+			break;
 		case PSETOP_NONE:
 			break;
 	}
-}
-
-void
-mark_passthru_locus(Plan *plan, bool with_hash, bool with_sort)
-{
-	Flow	   *flow;
-	Plan	   *subplan = NULL;
-	bool		is_subquery = IsA(plan, SubqueryScan);
-
-	Assert(is_plan_node((Node *) plan) && plan->flow == NULL);
-
-	if (is_subquery)
-	{
-		subplan = ((SubqueryScan *) plan)->subplan;
-	}
-	else
-	{
-		subplan = plan->lefttree;
-	}
-
-	Assert(subplan != NULL && subplan->flow != NULL);
-
-	flow = copyFlow(subplan->flow, with_hash && !is_subquery, with_sort);
-
-	if (is_subquery && with_hash && flow->flotype == FLOW_PARTITIONED)
-	{
-		ListCell   *c;
-		List	   *hash = NIL;
-		Index		varno = ((Scan *) plan)->scanrelid;
-
-		Flow	   *subplanflow = subplan->flow;
-
-		/*
-		 * Make sure all the expressions the flow thinks we're hashed on occur
-		 * in the subplan targetlist.
-		 */
-		foreach(c, subplanflow->hashExpr)
-		{
-			Node	   *x = (Node *) lfirst(c);
-
-			Expr	   *exprNew = cdbpullup_expr((Expr *) x, subplan->targetlist, NULL, varno);
-
-			hash = lappend(hash, exprNew);
-		}
-
-		flow->hashExpr = hash;
-	}
-
-	plan->flow = flow;
-}
-
-
-void
-mark_sort_locus(Plan *plan)
-{
-	plan->flow = pull_up_Flow(plan, plan->lefttree);
-}
-
-void
-mark_plan_general(Plan *plan, int numsegments)
-{
-	Assert(is_plan_node((Node *) plan) && plan->flow == NULL);
-	plan->flow = makeFlow(FLOW_SINGLETON, numsegments);
-	plan->flow->segindex = 0;
-	plan->flow->locustype = CdbLocusType_General;
-}
-
-void
-mark_plan_strewn(Plan *plan, int numsegments)
-{
-	Assert(is_plan_node((Node *) plan) && plan->flow == NULL);
-	plan->flow = makeFlow(FLOW_PARTITIONED, numsegments);
-	plan->flow->locustype = CdbLocusType_Strewn;
-}
-
-void
-mark_plan_replicated(Plan *plan, int numsegments)
-{
-	Assert(is_plan_node((Node *) plan) && plan->flow == NULL);
-	plan->flow = makeFlow(FLOW_REPLICATED, numsegments);
-	plan->flow->locustype = CdbLocusType_Replicated;
-}
-
-void
-mark_plan_entry(Plan *plan)
-{
-	Assert(is_plan_node((Node *) plan) && plan->flow == NULL);
-	plan->flow = makeFlow(FLOW_SINGLETON, GP_POLICY_ENTRY_NUMSEGMENTS);
-	plan->flow->segindex = -1;
-	plan->flow->locustype = CdbLocusType_Entry;
-}
-
-void
-mark_plan_singleQE(Plan *plan, int numsegments)
-{
-	Assert(is_plan_node((Node *) plan) && plan->flow == NULL);
-	plan->flow = makeFlow(FLOW_SINGLETON, numsegments);
-	plan->flow->segindex = 0;
-	plan->flow->locustype = CdbLocusType_SingleQE;
-}
-
-void
-mark_plan_segment_general(Plan *plan, int numsegments)
-{
-	Assert(is_plan_node((Node *) plan) && plan->flow == NULL);
-	plan->flow = makeFlow(FLOW_SINGLETON, numsegments);
-	plan->flow->segindex = 0;
-	plan->flow->locustype = CdbLocusType_SegmentGeneral;
 }

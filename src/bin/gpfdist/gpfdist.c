@@ -13,12 +13,15 @@
 #include <apr_pools.h>
 #include <apr_strings.h>
 #include <apr_time.h>
+#include <apr_general.h>
 #include <event.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
+#ifndef WIN32
 #include <strings.h>
+#endif
 #ifdef GPFXDIST
 #include <regex.h>
 #include <gpfxdist.h>
@@ -45,13 +48,13 @@
 #include <io.h>
 #define SHUT_WR SD_SEND
 #define socklen_t int
-#ifndef ECONNRESET
+#undef ECONNRESET
 #define ECONNRESET   WSAECONNRESET
 #endif
 
-#endif
-
+#include <postgres.h>
 #include <pg_config.h>
+#include <pg_config_manual.h>
 #include "gpfdist_helper.h"
 #ifdef USE_SSL
 #include <openssl/ssl.h>
@@ -104,8 +107,9 @@ static void flush_ssl_buffer(int fd, short event, void* arg);
  ================
  When a gpdb segment connects to gpfdist, it provides the following parameters:
  X-GP-XID   - transaction ID
- X-GP-CID   - command ID
- X-GP-SN    - session ID
+ X-GP-CID   - command ID to distinguish different queries.
+ X-GP-SN    - scan number to distinguish scans on the same external tables
+              within the same query.
  X-GP-PROTO - protocol number, report error if not provided:
 
  X-GP-PROTO = 0
@@ -312,17 +316,17 @@ static void log_gpfdist_status();
 static void log_request_header(const request_t *r);
 
 static void gprint(const request_t *r, const char* fmt, ...)
-__attribute__((format(PG_PRINTF_ATTRIBUTE, 2, 3)));
+pg_attribute_printf(2, 3);
 static void gprintln(const request_t *r, const char* fmt, ...)
-__attribute__((format(PG_PRINTF_ATTRIBUTE, 2, 3)));
+pg_attribute_printf(2, 3);
 static void gprintlnif(const request_t *r, const char* fmt, ...)
-__attribute__((format(PG_PRINTF_ATTRIBUTE, 2, 3)));
+pg_attribute_printf(2, 3);
 static void gfatal(const request_t *r, const char* fmt, ...)
-__attribute__((format(PG_PRINTF_ATTRIBUTE, 2, 3)));
+pg_attribute_printf(2, 3);
 static void gwarning(const request_t *r, const char* fmt, ...)
-__attribute__((format(PG_PRINTF_ATTRIBUTE, 2, 3)));
+pg_attribute_printf(2, 3);
 static void gdebug(const request_t *r, const char* fmt, ...)
-__attribute__((format(PG_PRINTF_ATTRIBUTE, 2, 3)));
+pg_attribute_printf(2, 3);
 
 /* send gp-proto==1 ctl info */
 static void gp1_send_eof(request_t* r);
@@ -344,6 +348,7 @@ static void session_active_segs_dump(session_t* session);
 static int session_active_segs_isempty(session_t* session);
 static int request_validate(request_t *r);
 static int request_set_path(request_t *r, const char* d, char* p, char* pp, char* path);
+static int request_path_validate(request_t *r, const char* path);
 static int request_parse_gp_headers(request_t *r, int opt_g);
 static void free_session_cb(int fd, short event, void* arg);
 #ifdef GPFXDIST
@@ -369,9 +374,9 @@ static int local_send(request_t *r, const char* buf, int buflen);
 static int get_unsent_bytes(request_t* r);
 
 static void * palloc_safe(request_t *r, apr_pool_t *pool, apr_size_t size, const char *fmt, ...)
-__attribute__((format(PG_PRINTF_ATTRIBUTE, 4, 5)));
+pg_attribute_printf(4, 5);
 static void * pcalloc_safe(request_t *r, apr_pool_t *pool, apr_size_t size, const char *fmt, ...)
-__attribute__((format(PG_PRINTF_ATTRIBUTE, 4, 5)));
+pg_attribute_printf(4, 5);
 
 static void process_term_signal(int sig,short event,void* arg);
 int gpfdist_init(int argc, const char* const argv[]);
@@ -1176,7 +1181,11 @@ static int local_send(request_t *r, const char* buf, int buflen)
 			if (r->session)
 				session_end(r->session, 0);
 		} else {
-			gdebug(r, "gpfdist_send failed - due to (%d: %s)", e, strerror(e));
+			if (!ok) {
+				gwarning(r, "gpfdist_send failed - due to (%d: %s)", e, strerror(e));
+			} else {
+				gdebug(r, "gpfdist_send failed - due to (%d: %s), should try again", e, strerror(e));
+			}
 		}
 		return ok ? 0 : -1;
 	}
@@ -1293,7 +1302,7 @@ session_get_block(const request_t* r, block_t* retblock, char* line_delim_str, i
 {
 	int 		size;
 	const int 	whole_rows = 1; /* gpfdist must not read data with partial rows */
-	struct fstream_filename_and_offset fos = {};
+	struct fstream_filename_and_offset fos;
 
 	session_t *session = r->session;
 
@@ -1342,13 +1351,14 @@ session_get_block(const request_t* r, block_t* retblock, char* line_delim_str, i
 /* finish the session - close the file */
 static void session_end(session_t* session, int error)
 {
-	gprintln(NULL, "session end.");
+	gprintln(NULL, "session end. id = %ld, is_error = %d, error = %d", session->id, session->is_error, error);
 
 	if (error)
 		session->is_error = error;
 
 	if (session->fstream)
 	{
+		gprintln(NULL, "close fstream");
 		fstream_close(session->fstream);
 		session->fstream = 0;
 	}
@@ -1547,11 +1557,27 @@ static int session_attach(request_t* r)
 			int quote = 0;
 			int escape = 0;
 			int eol_type = 0;
-			sscanf(r->csvopt, "m%dx%dq%dn%dh%d", &fstream_options.is_csv, &escape,
-					&quote, &eol_type, &fstream_options.header);
-			fstream_options.quote = quote;
-			fstream_options.escape = escape;
-			fstream_options.eol_type = eol_type;
+			/* csvopt is different in gp4 and later version */
+			/* for gp4, csv opt is like "mxqnh"; for later version of gpdb, csv opt is like "mxqhn" */
+			/* we check the number of successful match here to make sure eol_type and header is right */
+			if ( strcmp(r->csvopt, "") != 0 ){  //writable external table doesn't have csvopt
+				int n = sscanf(r->csvopt, "m%dx%dq%dn%dh%d", &fstream_options.is_csv, &escape,
+						&quote, &eol_type, &fstream_options.header);
+				if (n!=5){
+					n = sscanf(r->csvopt, "m%dx%dq%dh%dn%d", &fstream_options.is_csv, &escape,
+						&quote, &fstream_options.header, &eol_type);
+				}
+				if (n==5){
+					fstream_options.quote = quote;
+					fstream_options.escape = escape;
+					fstream_options.eol_type = eol_type;
+				}
+				else{
+					http_error(r, FDIST_BAD_REQUEST, "bad request, csvopt doesn't match the format");
+					request_end(r, 1, 0);
+					return -1;
+				}
+			}
 		}
 
 		/* set fstream for read (GET) or write (PUT) */
@@ -1618,6 +1644,7 @@ static int session_attach(request_t* r)
 		session->active_segids[r->segid] = 1; /* mark this segid as active */
 		session->maxsegs = r->totalsegs;
 		session->requests = apr_hash_make(pool);
+		event_set(&session->ev, 0, 0, 0, 0);
 
 		if (session->tid == 0 || session->path == 0 || session->key == 0)
 			gfatal(r, "out of memory in session_attach");
@@ -1630,14 +1657,6 @@ static int session_attach(request_t* r)
 
 	/* found a session in hashtable*/
 
-	/* if error, send an error and close */
-	if (session->is_error)
-	{
-		http_error(r, FDIST_INTERNAL_ERROR, "session error");
-		request_end(r, 1, 0);
-		return -1;
-	}
-
 	/* session already ended. send an empty response, and close. */
 	if (NULL == session->fstream)
 	{
@@ -1645,6 +1664,14 @@ static int session_attach(request_t* r)
 
 		http_empty(r);
 		request_end(r, 0, 0);
+		return -1;
+	}
+
+	/* if error, send an error and close */
+	if (session->is_error)
+	{
+		http_error(r, FDIST_INTERNAL_ERROR, "session error");
+		request_end(r, 1, 0);
 		return -1;
 	}
 
@@ -1722,7 +1749,7 @@ static int session_active_segs_isempty(session_t* session)
  * Callback when the socket is ready to be written
  */
 void gfile_printf_then_putc_newline(const char *format, ...)
-__attribute__((format(PG_PRINTF_ATTRIBUTE, 1, 2)));
+pg_attribute_printf(1, 2);
 
 static void do_write(int fd, short event, void* arg)
 {
@@ -1769,6 +1796,10 @@ static void do_write(int fd, short event, void* arg)
 				n = local_send(r, datablock->hdr.hbyte + datablock->hdr.hbot, n);
 				if (n < 0)
 				{
+					/*
+					 * TODO: It is not safe to check errno here, should check and
+					 * return special value in local_send()
+					 */
 					if (errno == EPIPE || errno == ECONNRESET)
 						r->outblock.bot = r->outblock.top;
 					request_end(r, 1, "gpfdist send block header failure");
@@ -1977,6 +2008,12 @@ static void do_read_request(int fd, short event, void* arg)
 	/* decode %xx to char */
 	percent_encoding_to_char(p, pp, path);
 
+	/* legit check for the path */
+	if (request_path_validate(r, path) != 0)
+	{
+		return;
+	}
+
 	/*
 	 * This is a debug hook. We'll get here By creating an external table with
 	 * name(a text) location('gpfdist://<host>:<port>/gpfdist/status').
@@ -2140,6 +2177,8 @@ static void do_accept(int fd, short event, void* arg)
 	r->id = ++REQUEST_SEQ;
 	r->pool = pool;
 	r->sock = sock;
+
+	event_set(&r->ev, 0, 0, 0, 0);
 
 	/* use the block size specified by -m option */
 	r->outblock.data = palloc_safe(r, pool, opt.m, "out of memory when allocating buffer: %d bytes", opt.m);
@@ -2335,6 +2374,17 @@ signal_register()
 
 }
 
+static void clear_listen_sock(void)
+{
+	SOCKET sock = -1;
+	while(gcb.listen_sock_count > 0)
+	{
+		sock = gcb.listen_socks[gcb.listen_sock_count-1];
+		closesocket(sock);
+		gcb.listen_socks[gcb.listen_sock_count-1] = -1;
+		gcb.listen_sock_count--;
+	}
+}
 /* Create HTTP port and start to receive request */
 static void
 http_setup(void)
@@ -2349,6 +2399,8 @@ http_setup(void)
 
 	char service[32];
 	const char *hostaddr = NULL;
+	int ipv6only_val = 1;
+	bool create_failed = false;
 
 #ifdef USE_SSL
 	if (opt.ssl)
@@ -2468,6 +2520,15 @@ http_setup(void)
 				gwarning(NULL, "Setting SO_LINGER on socket failed");
 				continue;
 			}
+			if(rp->ai_family == AF_INET6)
+			{
+				if (setsockopt(f, IPPROTO_IPV6, IPV6_V6ONLY, (void*) &ipv6only_val, sizeof(ipv6only_val)) == -1)
+				{
+					gwarning(NULL, "Setting IPV6_V6ONLY on socket failed");
+					closesocket(f);
+					continue;
+				}
+			}
 
 			if (bind(f, rp->ai_addr, rp->ai_addrlen) != 0)
 			{
@@ -2487,9 +2548,12 @@ http_setup(void)
 						gwarning(NULL, "%s (errno = %d), port: %d",
 					               		strerror(errno), errno, opt.p);
 					}
+					closesocket(f);
+					create_failed = true;
+					break;
 				}
 				else
-			    {
+				{
 					gwarning(NULL, "%s (errno=%d), port: %d",strerror(errno), errno, opt.p);
 				}
 
@@ -2522,6 +2586,11 @@ http_setup(void)
 		{
 			/* don't need this any more */
 			freeaddrinfo(addrs);
+		}
+		if(create_failed)
+		{
+			clear_listen_sock();
+			create_failed = false;
 		}
 
 		if (gcb.listen_sock_count > 0)
@@ -2721,7 +2790,7 @@ static int ggetpid()
 }
 
 static void _gprint(const request_t *r, const char *level, const char *fmt, va_list args)
-__attribute__((format(PG_PRINTF_ATTRIBUTE, 3, 0)));
+pg_attribute_printf(3, 0);
 
 static void _gprint(const request_t *r, const char *level, const char *fmt, va_list args)
 {
@@ -2818,7 +2887,10 @@ void gfile_printf_then_putc_newline(const char *format, ...)
 
 void *gfile_malloc(size_t size)
 {
-	return malloc(size);
+	void *p = malloc(size);
+	if (!p)
+		gfatal(NULL, "Out of memory");
+	return p;
 }
 
 void gfile_free(void *a)
@@ -3121,24 +3193,6 @@ done_processing_request:
 
 static int request_set_path(request_t *r, const char* d, char* p, char* pp, char* path)
 {
-
-	/*
-	 * disallow using a relative path in the request
-	 */
-	if (strstr(path, ".."))
-	{
-		gwarning(r, "reject invalid request from %s [%s %s] - request "
-						"is using a relative path",
-						r->peer,
-						r->in.req->argv[0],
-						r->in.req->argv[1]);
-
-		http_error(r, FDIST_BAD_REQUEST, "invalid request due to relative path");
-		request_end(r, 1, 0);
-
-		return -1;
-	}
-
 	r->path = 0;
 
 	/*
@@ -3174,6 +3228,51 @@ static int request_set_path(request_t *r, const char* d, char* p, char* pp, char
 	if (!r->path)
 	{
 		http_error(r, FDIST_BAD_REQUEST, "invalid request (unable to set path)");
+		request_end(r, 1, 0);
+		return -1;
+	}
+
+	return 0;
+}
+
+static int request_path_validate(request_t *r, const char* path)
+{
+	const char* warn_msg = NULL;
+	const char* http_err_msg = NULL;
+
+#ifdef WIN32
+	if (strstr(path, ".."))
+#else
+	if (strstr(path, "\\"))
+	{
+		/*
+		 * '\' is the path separator under windows.
+		 * For *nix, escape char may cause some unexpected result with
+		 * the file API. e.g.: 'ls \.\.' equals to 'ls ..'.
+		 */
+		warn_msg = "contains escape character backslash '\\'";
+		http_err_msg = "invalid request, "
+			"escape character backslash '\\' is not allowed.";
+	}
+	else if (strstr(path, ".."))
+#endif
+	{
+		/*
+		 * disallow using a relative path in the request. CWE23
+		 */
+		warn_msg = "is using a relative path";
+		http_err_msg = "invalid request due to relative path";
+	}
+
+	if (warn_msg)
+	{
+		gwarning(r, "reject invalid request from %s [%s %s] - request %s",
+						r->peer,
+						r->in.req->argv[0],
+						r->in.req->argv[1],
+						warn_msg);
+
+		http_error(r, FDIST_BAD_REQUEST, http_err_msg);
 		request_end(r, 1, 0);
 		return -1;
 	}
@@ -3257,23 +3356,23 @@ static int request_parse_gp_headers(request_t *r, int opt_g)
 
 	for (i = 0; i < r->in.req->hc; i++)
 	{
-		if (0 == strcmp("X-GP-XID", r->in.req->hname[i]))
+		if (0 == strcasecmp("X-GP-XID", r->in.req->hname[i]))
 			xid = r->in.req->hvalue[i];
-		else if (0 == strcmp("X-GP-CID", r->in.req->hname[i]))
+		else if (0 == strcasecmp("X-GP-CID", r->in.req->hname[i]))
 			cid = r->in.req->hvalue[i];
-		else if (0 == strcmp("X-GP-SN", r->in.req->hname[i]))
+		else if (0 == strcasecmp("X-GP-SN", r->in.req->hname[i]))
 			sn = r->in.req->hvalue[i];
-		else if (0 == strcmp("X-GP-CSVOPT", r->in.req->hname[i]))
+		else if (0 == strcasecmp("X-GP-CSVOPT", r->in.req->hname[i]))
 			r->csvopt = r->in.req->hvalue[i];
-		else if (0 == strcmp("X-GP-PROTO", r->in.req->hname[i]))
+		else if (0 == strcasecmp("X-GP-PROTO", r->in.req->hname[i]))
 			gp_proto = r->in.req->hvalue[i];
-		else if (0 == strcmp("X-GP-DONE", r->in.req->hname[i]))
+		else if (0 == strcasecmp("X-GP-DONE", r->in.req->hname[i]))
 			r->is_final = 1;
-		else if (0 == strcmp("X-GP-SEGMENT-COUNT", r->in.req->hname[i]))
+		else if (0 == strcasecmp("X-GP-SEGMENT-COUNT", r->in.req->hname[i]))
 			r->totalsegs = atoi(r->in.req->hvalue[i]);
-		else if (0 == strcmp("X-GP-SEGMENT-ID", r->in.req->hname[i]))
+		else if (0 == strcasecmp("X-GP-SEGMENT-ID", r->in.req->hname[i]))
 			r->segid = atoi(r->in.req->hvalue[i]);
-		else if (0 == strcmp("X-GP-LINE-DELIM-STR", r->in.req->hname[i]))
+		else if (0 == strcasecmp("X-GP-LINE-DELIM-STR", r->in.req->hname[i]))
 		{
 			if (NULL == r->in.req->hvalue[i] ||  ((int)strlen(r->in.req->hvalue[i])) % 2 == 1 || !base16_decode(r->in.req->hvalue[i]))
 			{
@@ -3284,13 +3383,13 @@ static int request_parse_gp_headers(request_t *r, int opt_g)
 			}
 			r->line_delim_str = r->in.req->hvalue[i];
 		}
-		else if (0 == strcmp("X-GP-LINE-DELIM-LENGTH", r->in.req->hname[i]))
+		else if (0 == strcasecmp("X-GP-LINE-DELIM-LENGTH", r->in.req->hname[i]))
 			r->line_delim_length = atoi(r->in.req->hvalue[i]);
 #ifdef GPFXDIST
-		else if (0 == strcmp("X-GP-TRANSFORM", r->in.req->hname[i]))
+		else if (0 == strcasecmp("X-GP-TRANSFORM", r->in.req->hname[i]))
 			r->trans.name = r->in.req->hvalue[i];
 #endif
-		else if (0 == strcmp("X-GP-SEQ", r->in.req->hname[i]))
+		else if (0 == strcasecmp("X-GP-SEQ", r->in.req->hname[i]))
 		{
 			r->seq = atol(r->in.req->hvalue[i]);
 			/* sequence number starting from 1 */
@@ -3593,6 +3692,7 @@ int gpfdist_init(int argc, const char* const argv[])
 
 	if (wd != NULL)
 	{
+		errno = 0;
 		val = strtol(wd, &endptr, 10);
 
 		if (errno || endptr == wd || val > INT_MAX)
@@ -3683,20 +3783,22 @@ void report_event(LPCTSTR _error_msg)
 int verify_buf_size(char** pBuf, const char* _in_val)
 {
 	int val_len, new_len;
+	char *p;
 
 	val_len = (int)strlen(_in_val);
 	if (val_len >= CMD_LINE_ARG_SIZE)
 	{
 		new_len = ((val_len+1) >= CMD_LINE_ARG_MAX_SIZE) ? CMD_LINE_ARG_MAX_SIZE : (val_len+1);
-		free(*pBuf);
-		*pBuf = (char*)malloc(new_len);
+		p = realloc(*pBuf, new_len);
+		if (p == NULL)
+			return 0;
+		*pBuf = p;
 		memset(*pBuf, 0, new_len);
 	}
 	else
 	{
 		new_len = val_len;
 	}
-
 
 	return new_len;
 }
@@ -3708,6 +3810,8 @@ void init_cmd_buffer(int argc, const char* const argv[])
 	for (i = 0; i < CMD_LINE_ARG_NUM; i++)
 	{
 		cmd_line_buffer[i] = (char*)malloc(CMD_LINE_ARG_SIZE);
+		if (cmd_line_buffer[i] == NULL)
+			gfatal(NULL, "Out of memory");
 		memset(cmd_line_buffer[i], 0, CMD_LINE_ARG_SIZE);
 	}
 
@@ -3729,6 +3833,8 @@ void init_cmd_buffer(int argc, const char* const argv[])
 	{
 		int len;
 		len = verify_buf_size(&cmd_line_buffer[i], argv[i]);
+		if (!len)
+			gfatal(NULL, "Out of memory");
 		memcpy(cmd_line_buffer[i], argv[i], len);
 	}
 }
@@ -3925,22 +4031,23 @@ static SSL_CTX *initialize_ctx(void)
 	}
 
 	/* Create our context*/
-	ctx = SSL_CTX_new( TLSv1_server_method() );
+	ctx = SSL_CTX_new(SSLv23_server_method());
 
 	/* Generate random seed */
 	if ( RAND_poll() == 0 )
 		gfatal(NULL,"Can't generate random seed for SSL");
 
-	/* The size of the string will consist of the path and the filename (the longest one) */
-	// +1 for the '/' character (/filename)
-	// +1 for the \0,
-	stringSize = find_max( strlen(CertificateFilename), find_max(strlen(PrivateKeyFilename),strlen(TrustedCaFilename)) ) + strlen(opt.ssl) + 2;
+	/*
+	 * The size of the string will consist of the path and the filename (the
+	 * longest one)
+	 * +1 for the '/' character (/filename)
+	 * +1 for the \0
+	 */
+	stringSize = find_max(strlen(CertificateFilename), find_max(strlen(PrivateKeyFilename), strlen(TrustedCaFilename))) + strlen(opt.ssl) + 2;
 	/* Allocate the memory for the file name */
-	fileName = (char *) calloc( (stringSize), sizeof(char) );
-	if ( fileName == NULL )
-	{
+	fileName = (char *) calloc((stringSize), sizeof(char));
+	if (fileName == NULL)
 		gfatal (NULL,"Unable to allocate memory for SSL initialization");
-	}
 
 #ifdef WIN32
 	slash = '\\';
@@ -4080,6 +4187,23 @@ static int gpfdist_socket_receive(const request_t *r, void *buf, const size_t bu
 	return ( recv(r->sock, buf, buflen, 0) );
 }
 
+/*
+ * request_shutdown_sock
+ *
+ * Shutdown request socket transmission.
+ */
+static void request_shutdown_sock(const request_t* r)
+{
+	int ret = shutdown(r->sock, SHUT_WR);
+	if (ret == 0)
+	{
+		gprintlnif(r, "successfully shutdown socket");
+	}
+	else
+	{
+		gprintln(r, "failed to shutdown socket, errno: %d, msg: %s", errno, strerror(errno));
+	}
+}
 
 #ifdef USE_SSL
 /*
@@ -4093,7 +4217,6 @@ static int gpfdist_SSL_receive(const request_t *r, void *buf, const size_t bufle
 	/* todo: add error checks here */
 }
 
-
 /*
  * free_SSL_resources
  *
@@ -4101,12 +4224,15 @@ static int gpfdist_SSL_receive(const request_t *r, void *buf, const size_t bufle
  */
 static void free_SSL_resources(const request_t *r)
 {
-	BIO_ssl_shutdown(r->sbio);
-	BIO_vfree(r->io);
+	//send close_notify to client
+	SSL_shutdown(r->ssl);  //or BIO_ssl_shutdown(r->ssl_bio);
+
+	request_shutdown_sock(r);
+
+	BIO_vfree(r->io);  //ssl_bio is pushed to r->io list, so ssl_bio is freed too.
 	BIO_vfree(r->sbio);
 	//BIO_vfree(r->ssl_bio);
 	SSL_free(r->ssl);
-
 }
 
 
@@ -4123,7 +4249,7 @@ static void handle_ssl_error(SOCKET sock, BIO *sbio, SSL *ssl)
 		ERR_print_errors(gcb.bio_err);
 	}
 
-	BIO_ssl_shutdown(sbio);
+	SSL_shutdown(ssl);
 	SSL_free(ssl);
 }
 
@@ -4205,7 +4331,7 @@ static void do_close(int fd, short event, void *arg)
 		gwarning(r, "gpfdist shutdown the connection, while have not received response from segment");
 	}
 
-	int ret = read(r->sock, buffer, sizeof(buffer) - 1);
+	int ret = recv(r->sock, buffer, sizeof(buffer) - 1, 0);
 	if (ret < 0)
 	{
 		gwarning(r, "gpfdist read error after shutdown. errno: %d, msg: %s", errno, strerror(errno));
@@ -4251,7 +4377,6 @@ static void do_close(int fd, short event, void *arg)
 	fflush(stdout);
 }
 
-
 /*
  * request_cleanup
  *
@@ -4259,16 +4384,7 @@ static void do_close(int fd, short event, void *arg)
  */
 static void request_cleanup(request_t *r)
 {
-	int ret = shutdown(r->sock, SHUT_WR);
-	if (ret == 0)
-	{
-		gprintlnif(r, "successfully shutdown socket");
-	}
-	else
-	{
-		gprintln(r, "failed to shutdown socket, errno: %d, msg: %s", errno, strerror(errno));
-	}
-
+	request_shutdown_sock(r);
 	setup_do_close(r);
 }
 
@@ -4296,9 +4412,9 @@ static void request_cleanup_and_free_SSL_resources(request_t *r)
 	gprintln(r, "SSL cleanup and free");
 
 	/* Clean up request resources */
-	request_cleanup(r);
+	setup_do_close(r);
 
-	/* Release SSL related memory */
+	/* Shutdown SSL gracefully and Release SSL related memory */
 	free_SSL_resources(r);
 }
 #endif

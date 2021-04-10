@@ -10,8 +10,8 @@
  * and so on.  (Those are the things planner.c deals with.)
  *
  * Portions Copyright (c) 2005-2008, Greenplum inc
- * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -22,6 +22,10 @@
  */
 #include "postgres.h"
 
+#include "optimizer/appendinfo.h"
+#include "optimizer/clauses.h"
+#include "optimizer/inherit.h"
+#include "optimizer/optimizer.h"
 #include "optimizer/orclauses.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
@@ -34,7 +38,6 @@
 #include "cdb/cdbvars.h"
 #include "optimizer/cost.h"
 
-static Bitmapset *distcols_in_groupclause(List *gc, Bitmapset *bms);
 
 /*
  * query_planner
@@ -44,13 +47,9 @@ static Bitmapset *distcols_in_groupclause(List *gc, Bitmapset *bms);
  * Since query_planner does not handle the toplevel processing (grouping,
  * sorting, etc) it cannot select the best path by itself.  Instead, it
  * returns the RelOptInfo for the top level of joining, and the caller
- * (grouping_planner) can choose one of the surviving paths for the rel.
- * Normally it would choose either the rel's cheapest path, or the cheapest
- * path for the desired sort order.
+ * (grouping_planner) can choose among the surviving paths for the rel.
  *
  * root describes the query to plan
- * tlist is the target list the query should produce
- *		(this is NOT necessarily root->parse->targetList!)
  * qp_callback is a function to compute query_pathkeys once it's safe to do so
  * qp_extra is optional extra data to pass to qp_callback
  *
@@ -61,60 +60,18 @@ static Bitmapset *distcols_in_groupclause(List *gc, Bitmapset *bms);
  * (We cannot construct canonical pathkeys until that's done.)
  */
 RelOptInfo *
-query_planner(PlannerInfo *root, List *tlist,
+query_planner(PlannerInfo *root,
 			  query_pathkeys_callback qp_callback, void *qp_extra)
 {
 	Query	   *parse = root->parse;
 	List	   *joinlist;
 	RelOptInfo *final_rel;
-	Index		rti;
-	double		total_pages;
-
-	/*
-	 * If the query has an empty join tree, then it's something easy like
-	 * "SELECT 2+2;" or "INSERT ... VALUES()".  Fall through quickly.
-	 */
-	if (parse->jointree->fromlist == NIL)
-	{
-		Path	   *result_path;
-
-		/* We need a dummy joinrel to describe the empty set of baserels */
-		final_rel = build_empty_join_rel(root);
-
-		/* The only path for it is a trivial Result path */
-		result_path = (Path *) create_result_path((List *) parse->jointree->quals);
-		add_path(final_rel, result_path);
-
-		/* Select cheapest path (pretty easy in this case...) */
-		set_cheapest(final_rel);
-
-		/*
-		 * We still are required to call qp_callback, in case it's something
-		 * like "SELECT 2+2 ORDER BY 1".
-		 */
-		root->canon_pathkeys = NIL;
-		(*qp_callback) (root, qp_extra);
-
-		{
-			char		exec_location;
-
-			exec_location = check_execute_on_functions((Node *) parse->targetList);
-
-			if (exec_location == PROEXECLOCATION_MASTER)
-				CdbPathLocus_MakeEntry(&result_path->locus);
-			else if (exec_location == PROEXECLOCATION_ALL_SEGMENTS)
-				CdbPathLocus_MakeStrewn(&result_path->locus,
-										GP_POLICY_ALL_NUMSEGMENTS);
-		}
-
-		return final_rel;
-	}
 
 	/*
 	 * Init planner lists to empty.
 	 *
 	 * NOTE: append_rel_list was set up by subquery_planner, so do not touch
-	 * here; eq_classes and minmax_aggs may contain data already, too.
+	 * here.
 	 */
 	root->join_rel_list = NIL;
 	root->join_rel_hash = NULL;
@@ -125,8 +82,8 @@ query_planner(PlannerInfo *root, List *tlist,
 	root->right_join_clauses = NIL;
 	root->full_join_clauses = NIL;
 	root->join_info_list = NIL;
-	root->lateral_info_list = NIL;
 	root->placeholder_list = NIL;
+	root->fkey_list = NIL;
 	root->initial_rels = NIL;
 
 	/*
@@ -137,15 +94,100 @@ query_planner(PlannerInfo *root, List *tlist,
 	setup_simple_rel_arrays(root);
 
 	/*
-	 * Construct RelOptInfo nodes for all base relations in query, and
-	 * indirectly for all appendrel member relations ("other rels").  This
-	 * will give us a RelOptInfo for every "simple" (non-join) rel involved in
-	 * the query.
+	 * In the trivial case where the jointree is a single RTE_RESULT relation,
+	 * bypass all the rest of this function and just make a RelOptInfo and its
+	 * one access path.  This is worth optimizing because it applies for
+	 * common cases like "SELECT expression" and "INSERT ... VALUES()".
+	 */
+	Assert(parse->jointree->fromlist != NIL);
+	if (list_length(parse->jointree->fromlist) == 1)
+	{
+		Node	   *jtnode = (Node *) linitial(parse->jointree->fromlist);
+
+		if (IsA(jtnode, RangeTblRef))
+		{
+			int			varno = ((RangeTblRef *) jtnode)->rtindex;
+			RangeTblEntry *rte = root->simple_rte_array[varno];
+
+			Assert(rte != NULL);
+			if (rte->rtekind == RTE_RESULT)
+			{
+				/* Make the RelOptInfo for it directly */
+				final_rel = build_simple_rel(root, varno, NULL);
+
+				/*
+				 * If query allows parallelism in general, check whether the
+				 * quals are parallel-restricted.  (We need not check
+				 * final_rel->reltarget because it's empty at this point.
+				 * Anything parallel-restricted in the query tlist will be
+				 * dealt with later.)  This is normally pretty silly, because
+				 * a Result-only plan would never be interesting to
+				 * parallelize.  However, if force_parallel_mode is on, then
+				 * we want to execute the Result in a parallel worker if
+				 * possible, so we must do this.
+				 */
+				if (root->glob->parallelModeOK &&
+					force_parallel_mode != FORCE_PARALLEL_OFF)
+					final_rel->consider_parallel =
+						is_parallel_safe(root, parse->jointree->quals);
+
+				/*
+				 * The only path for it is a trivial Result path.  We cheat a
+				 * bit here by using a GroupResultPath, because that way we
+				 * can just jam the quals into it without preprocessing them.
+				 * (But, if you hold your head at the right angle, a FROM-less
+				 * SELECT is a kind of degenerate-grouping case, so it's not
+				 * that much of a cheat.)
+				 */
+				Path *result_path = (Path *)
+						 create_group_result_path(root, final_rel,
+												  final_rel->reltarget,
+												  (List *) parse->jointree->quals);
+				add_path(final_rel, result_path);
+
+				/* Select cheapest path (pretty easy in this case...) */
+				set_cheapest(final_rel);
+
+				/*
+				 * We still are required to call qp_callback, in case it's
+				 * something like "SELECT 2+2 ORDER BY 1".
+				 */
+				(*qp_callback) (root, qp_extra);
+
+				if (Gp_role == GP_ROLE_DISPATCH)
+				{
+					char		exec_location;
+
+					exec_location = check_execute_on_functions((Node *) parse->targetList);
+
+					if (exec_location == PROEXECLOCATION_COORDINATOR || exec_location == PROEXECLOCATION_INITPLAN)
+						CdbPathLocus_MakeEntry(&result_path->locus);
+					else if (exec_location == PROEXECLOCATION_ALL_SEGMENTS)
+						CdbPathLocus_MakeStrewn(&result_path->locus,
+												getgpsegmentCount());
+				}
+				else
+					CdbPathLocus_MakeEntry(&result_path->locus);
+
+				return final_rel;
+			}
+		}
+	}
+
+	/*
+	 * Populate append_rel_array with each AppendRelInfo to allow direct
+	 * lookups by child relid.
+	 */
+	setup_append_rel_array(root);
+
+	/*
+	 * Construct RelOptInfo nodes for all base relations used in the query.
+	 * Appendrel member relations ("other rels") will be added later.
 	 *
-	 * Note: the reason we find the rels by searching the jointree and
-	 * appendrel list, rather than just scanning the rangetable, is that the
-	 * rangetable may contain RTEs for rels not actively part of the query,
-	 * for example views.  We don't want to make RelOptInfos for them.
+	 * Note: the reason we find the baserels by searching the jointree, rather
+	 * than scanning the rangetable, is that the rangetable may contain RTEs
+	 * for rels not actively part of the query, for example views.  We don't
+	 * want to make RelOptInfos for them.
 	 */
 	add_base_rels_to_query(root, (Node *) parse->jointree);
 
@@ -159,7 +201,9 @@ query_planner(PlannerInfo *root, List *tlist,
 	 * restrictions.  Finally, we form a target joinlist for make_one_rel() to
 	 * work from.
 	 */
-	build_base_rel_tlists(root, tlist);
+	build_base_rel_tlists(root, root->processed_tlist);
+
+	make_placeholders_for_subplans(root);
 
 	find_placeholders_in_jointree(root);
 
@@ -211,18 +255,31 @@ query_planner(PlannerInfo *root, List *tlist,
 	joinlist = remove_useless_joins(root, joinlist);
 
 	/*
+	 * Also, reduce any semijoins with unique inner rels to plain inner joins.
+	 * Likewise, this can't be done until now for lack of needed info.
+	 */
+	reduce_unique_semijoins(root);
+
+	/*
 	 * Now distribute "placeholders" to base rels as needed.  This has to be
 	 * done after join removal because removal could change whether a
-	 * placeholder is evaluatable at a base rel.
+	 * placeholder is evaluable at a base rel.
 	 */
 	add_placeholders_to_base_rels(root);
 
 	/*
-	 * Create the LateralJoinInfo list now that we have finalized
-	 * PlaceHolderVar eval levels and made any necessary additions to the
-	 * lateral_vars lists for lateral references within PlaceHolderVars.
+	 * Construct the lateral reference sets now that we have finalized
+	 * PlaceHolderVar eval levels.
 	 */
 	create_lateral_join_info(root);
+
+	/*
+	 * Match foreign keys to equivalence classes and join quals.  This must be
+	 * done after finalizing equivalence classes, and it's useful to wait till
+	 * after join removal so that we can skip processing foreign keys
+	 * involving removed relations.
+	 */
+	match_foreign_keys_to_quals(root);
 
 	/*
 	 * Look for join OR clauses that we can extract single-relation
@@ -231,33 +288,14 @@ query_planner(PlannerInfo *root, List *tlist,
 	extract_restriction_or_clauses(root);
 
 	/*
-	 * We should now have size estimates for every actual table involved in
-	 * the query, and we also know which if any have been deleted from the
-	 * query by join removal; so we can compute total_table_pages.
-	 *
-	 * Note that appendrels are not double-counted here, even though we don't
-	 * bother to distinguish RelOptInfos for appendrel parents, because the
-	 * parents will still have size zero.
-	 *
-	 * XXX if a table is self-joined, we will count it once per appearance,
-	 * which perhaps is the wrong thing ... but that's not completely clear,
-	 * and detecting self-joins here is difficult, so ignore it for now.
+	 * Now expand appendrels by adding "otherrels" for their children.  We
+	 * delay this to the end so that we have as much information as possible
+	 * available for each baserel, including all restriction clauses.  That
+	 * let us prune away partitions that don't satisfy a restriction clause.
+	 * Also note that some information such as lateral_relids is propagated
+	 * from baserels to otherrels here, so we must have computed it already.
 	 */
-	total_pages = 0;
-	for (rti = 1; rti < root->simple_rel_array_size; rti++)
-	{
-		RelOptInfo *brel = root->simple_rel_array[rti];
-
-		if (brel == NULL)
-			continue;
-
-		Assert(brel->relid == rti);		/* sanity check on array */
-
-		if (brel->reloptkind == RELOPT_BASEREL ||
-			brel->reloptkind == RELOPT_OTHER_MEMBER_REL)
-			total_pages += (double) brel->pages;
-	}
-	root->total_table_pages = total_pages;
+	add_other_rels_to_query(root);
 
 	/*
 	 * Ready to do the primary planning.
@@ -268,71 +306,9 @@ query_planner(PlannerInfo *root, List *tlist,
 	if (!final_rel || !final_rel->cheapest_total_path ||
 		final_rel->cheapest_total_path->param_info != NULL)
 		elog(ERROR, "failed to construct the join relation");
-	Insist(final_rel->cheapest_startup_path);
+	Assert(final_rel->cheapest_startup_path);
 
 	return final_rel;
-}
-
-/*
- * distcols_in_groupclause -
- *     Return all distinct tleSortGroupRef values in a GROUP BY clause.
- *
- * If this is a GROUPING_SET, this function is called recursively to
- * find the tleSortGroupRef values for underlying grouping columns.
- */
-static Bitmapset *
-distcols_in_groupclause(List *gc, Bitmapset *bms)
-{
-	ListCell *l;
-
-	foreach(l, gc)
-	{
-		Node *node = lfirst(l);
-
-		if (node == NULL)
-			continue;
-
-		Assert(IsA(node, SortGroupClause) ||
-			   IsA(node, List) ||
-			   IsA(node, GroupingClause));
-
-		if (IsA(node, SortGroupClause))
-		{
-			bms = bms_add_member(bms, ((SortGroupClause *) node)->tleSortGroupRef);
-		}
-
-		else if (IsA(node, List))
-		{
-			bms = distcols_in_groupclause((List *)node, bms);
-		}
-
-		else if (IsA(node, GroupingClause))
-		{
-			List *groupsets = ((GroupingClause *)node)->groupsets;
-			bms = distcols_in_groupclause(groupsets, bms);
-		}
-	}
-
-	return bms;
-}
-
-/*
- * num_distcols_in_grouplist -
- *      Return number of distinct columns/expressions that appeared in
- *      a list of GroupClauses or GroupingClauses.
- */
-int
-num_distcols_in_grouplist(List *gc)
-{
-	Bitmapset *bms = NULL;
-	int num_cols;
-
-	bms = distcols_in_groupclause(gc, bms);
-
-	num_cols = bms_num_members(bms);
-	bms_free(bms);
-
-	return num_cols;
 }
 
 /**
@@ -345,42 +321,20 @@ num_distcols_in_grouplist(List *gc)
 PlannerConfig *DefaultPlannerConfig(void)
 {
 	PlannerConfig *c1 = (PlannerConfig *) palloc(sizeof(PlannerConfig));
-	c1->cdbpath_segments = planner_segment_count(NULL);
-	c1->enable_seqscan = enable_seqscan;
-	c1->enable_indexscan = enable_indexscan;
-	c1->enable_bitmapscan = enable_bitmapscan;
-	c1->enable_tidscan = enable_tidscan;
-	c1->enable_sort = enable_sort;
-	c1->enable_hashagg = enable_hashagg;
-	c1->enable_groupagg = enable_groupagg;
-	c1->enable_nestloop = enable_nestloop;
-	c1->enable_mergejoin = enable_mergejoin;
-	c1->enable_hashjoin = enable_hashjoin;
-	c1->gp_enable_hashjoin_size_heuristic = gp_enable_hashjoin_size_heuristic;
-	c1->gp_enable_predicate_propagation = gp_enable_predicate_propagation;
-	c1->constraint_exclusion = constraint_exclusion;
 
 	c1->gp_enable_minmax_optimization = gp_enable_minmax_optimization;
 	c1->gp_enable_multiphase_agg = gp_enable_multiphase_agg;
-	c1->gp_enable_preunique = gp_enable_preunique;
-	c1->gp_eager_preunique = gp_eager_preunique;
-	c1->gp_hashagg_streambottom = gp_hashagg_streambottom;
-	c1->gp_enable_agg_distinct = gp_enable_agg_distinct;
-	c1->gp_enable_dqa_pruning = gp_enable_dqa_pruning;
-	c1->gp_eager_dqa_pruning = gp_eager_dqa_pruning;
-	c1->gp_eager_one_phase_agg = gp_eager_one_phase_agg;
-	c1->gp_eager_two_phase_agg = gp_eager_two_phase_agg;
-	c1->gp_enable_groupext_distinct_pruning = gp_enable_groupext_distinct_pruning;
-	c1->gp_enable_groupext_distinct_gather = gp_enable_groupext_distinct_gather;
-	c1->gp_enable_sort_limit = gp_enable_sort_limit;
-	c1->gp_enable_sort_distinct = gp_enable_sort_distinct;
-
 	c1->gp_enable_direct_dispatch = gp_enable_direct_dispatch;
-	c1->gp_dynamic_partition_pruning = gp_dynamic_partition_pruning;
 
 	c1->gp_cte_sharing = gp_cte_sharing;
 
 	c1->honor_order_by = true;
+
+	c1->is_under_subplan = false;
+
+	c1->force_singleQE = false;
+
+	c1->may_rescan = false;
 
 	return c1;
 }

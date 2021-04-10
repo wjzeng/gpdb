@@ -1,7 +1,6 @@
 -- Check if retry logic handles errors correctly.  The retry logic had
 -- a bug where error state wasn't cleaned up correctly during retries,
 -- leading to PANIC due to ERRORDATA_STACK_SIZE exeeded.
-set dtx_phase2_retry_count = 11;
 -- Set a fault on one of the QEs such that an error is raised exactly
 -- 10 times at the beginning of 2nd phase of 2PC.
 -- ERRORDATA_STACK_SIZE is defined as 10.  By erroring out 10 times,
@@ -11,13 +10,11 @@ set dtx_phase2_retry_count = 11;
 --
 -- COMMIT_PREPARED
 --
-create extension if not exists gp_inject_fault;
 select gp_inject_fault('finish_prepared_start_of_function', 'error', '', '', '', 1, 10, 0, dbid)
 from gp_segment_configuration where role = 'p' and status = 'u' and content = 1;
-NOTICE:  Success:
  gp_inject_fault 
 -----------------
- t
+ Success:
 (1 row)
 
 begin;
@@ -25,39 +22,48 @@ create table dtm_retry_table (a int) distributed by (a);
 -- Expected behavior is QD makes 11 attempts to commit and the last
 -- one succeeds.
 end;
-WARNING:  the distributed transaction 'Commit Prepared' broadcast failed to one or more segments for gid DUMMY
+WARNING:  the distributed transaction 'Commit Prepared' broadcast failed to one or more segments. Retrying ... try 1
+DETAIL:  gid=66803951, state=Retry Commit Prepared
 NOTICE:  Releasing segworker group to retry broadcast.
-WARNING:  the distributed transaction 'Commit Prepared' broadcast failed to one or more segments for gid DUMMY
+WARNING:  the distributed transaction 'Commit Prepared' broadcast failed to one or more segments. Retrying ... try 2
+DETAIL:  gid=66803951, state=Retry Commit Prepared
 NOTICE:  Releasing segworker group to retry broadcast.
-WARNING:  the distributed transaction 'Commit Prepared' broadcast failed to one or more segments for gid DUMMY
+WARNING:  the distributed transaction 'Commit Prepared' broadcast failed to one or more segments. Retrying ... try 3
+DETAIL:  gid=66803951, state=Retry Commit Prepared
 NOTICE:  Releasing segworker group to retry broadcast.
-WARNING:  the distributed transaction 'Commit Prepared' broadcast failed to one or more segments for gid DUMMY
+WARNING:  the distributed transaction 'Commit Prepared' broadcast failed to one or more segments. Retrying ... try 4
+DETAIL:  gid=66803951, state=Retry Commit Prepared
 NOTICE:  Releasing segworker group to retry broadcast.
-WARNING:  the distributed transaction 'Commit Prepared' broadcast failed to one or more segments for gid DUMMY
+WARNING:  the distributed transaction 'Commit Prepared' broadcast failed to one or more segments. Retrying ... try 5
+DETAIL:  gid=66803951, state=Retry Commit Prepared
 NOTICE:  Releasing segworker group to retry broadcast.
-WARNING:  the distributed transaction 'Commit Prepared' broadcast failed to one or more segments for gid DUMMY
+WARNING:  the distributed transaction 'Commit Prepared' broadcast failed to one or more segments. Retrying ... try 6
+DETAIL:  gid=66803951, state=Retry Commit Prepared
 NOTICE:  Releasing segworker group to retry broadcast.
-WARNING:  the distributed transaction 'Commit Prepared' broadcast failed to one or more segments for gid DUMMY
+WARNING:  the distributed transaction 'Commit Prepared' broadcast failed to one or more segments. Retrying ... try 7
+DETAIL:  gid=66803951, state=Retry Commit Prepared
 NOTICE:  Releasing segworker group to retry broadcast.
-WARNING:  the distributed transaction 'Commit Prepared' broadcast failed to one or more segments for gid DUMMY
+WARNING:  the distributed transaction 'Commit Prepared' broadcast failed to one or more segments. Retrying ... try 8
+DETAIL:  gid=66803951, state=Retry Commit Prepared
 NOTICE:  Releasing segworker group to retry broadcast.
-WARNING:  the distributed transaction 'Commit Prepared' broadcast failed to one or more segments for gid DUMMY
+WARNING:  the distributed transaction 'Commit Prepared' broadcast failed to one or more segments. Retrying ... try 9
+DETAIL:  gid=66803951, state=Retry Commit Prepared
 NOTICE:  Releasing segworker group to retry broadcast.
-WARNING:  the distributed transaction 'Commit Prepared' broadcast failed to one or more segments for gid DUMMY
+WARNING:  the distributed transaction 'Commit Prepared' broadcast failed to one or more segments. Retrying ... try 10
+DETAIL:  gid=66803951, state=Retry Commit Prepared
 NOTICE:  Releasing segworker group to retry broadcast.
 -- Reset all faults.
 select gp_inject_fault_infinite('all', 'reset', dbid) from gp_segment_configuration;
-NOTICE:  Success:
  gp_inject_fault_infinite 
 --------------------------
- t
- t
- t
- t
- t
- t
- t
- t
+ Success:
+ Success:
+ Success:
+ Success:
+ Success:
+ Success:
+ Success:
+ Success:
 (8 rows)
 
 -- Verify that the table got created properly on all segments.
@@ -69,10 +75,9 @@ insert into dtm_retry_table select * from generate_series(1,12);
 -- abort_some_prepared broadcast in 2nd phase.
 select gp_inject_fault('start_prepare', 'error', dbid)
 from gp_segment_configuration where role = 'p' and status = 'u' and content = 0;
-NOTICE:  Success:
  gp_inject_fault 
 -----------------
- t
+ Success:
 (1 row)
 
 -- Let content 1 primary, which had successfully prepared the
@@ -80,10 +85,9 @@ NOTICE:  Success:
 -- abort_some_prepared request.
 select gp_inject_fault('finish_prepared_start_of_function', 'error', '', '', '', 1, 10, 0, dbid)
 from gp_segment_configuration where role = 'p' and status = 'u' and content = 1;
-NOTICE:  Success:
  gp_inject_fault 
 -----------------
- t
+ Success:
 (1 row)
 
 begin;
@@ -91,7 +95,8 @@ truncate table dtm_retry_table;
 -- Expected behavior: QD's 11th attempt to broadcast
 -- abort_some_prepared message succeeds.
 end;
-WARNING:  the distributed transaction 'Abort [Prepared]' broadcast failed to one or more segments for gid = 1532027571-0000000036.  Retrying ... try 0
+WARNING:  the distributed transaction broadcast failed to one or more segments
+DETAIL:  gid=66803953, state=Notifying Abort (Some Prepared)
 NOTICE:  Releasing segworker groups to retry broadcast.
 NOTICE:  Releasing segworker groups to retry broadcast.
 NOTICE:  Releasing segworker groups to retry broadcast.
@@ -112,17 +117,16 @@ select count(*) = 12 from dtm_retry_table;
 
 -- Reset all faults.
 select gp_inject_fault_infinite('all', 'reset', dbid) from gp_segment_configuration;
-NOTICE:  Success:
  gp_inject_fault_infinite 
 --------------------------
- t
- t
- t
- t
- t
- t
- t
- t
+ Success:
+ Success:
+ Success:
+ Success:
+ Success:
+ Success:
+ Success:
+ Success:
 (8 rows)
 
 --
@@ -132,19 +136,17 @@ NOTICE:  Success:
 -- abort_prepared broadcast in 2nd phase.
 select gp_inject_fault('dtm_broadcast_prepare', 'error', dbid)
 from gp_segment_configuration where role = 'p' and content = -1;
-NOTICE:  Success:
  gp_inject_fault 
 -----------------
- t
+ Success:
 (1 row)
 
 -- Let content 0 primary error out 10 times during second phase.
 select gp_inject_fault('finish_prepared_start_of_function', 'error', '', '', '', 1, 10, 0, dbid)
 from gp_segment_configuration where role = 'p' and status = 'u' and content = 0;
-NOTICE:  Success:
  gp_inject_fault 
 -----------------
- t
+ Success:
 (1 row)
 
 begin;
@@ -152,7 +154,8 @@ truncate table dtm_retry_table;
 -- Expected behavior: QD's 11th attempt to broadcast
 -- abort_prepared message succeeds.
 end;
-WARNING:  the distributed transaction 'Abort Prepared' broadcast failed to one or more segments for gid DUMMY
+WARNING:  the distributed transaction broadcast failed to one or more segments
+DETAIL:  gid=66803954, state=Notifying Abort Prepared
 NOTICE:  Releasing segworker groups to retry broadcast.
 NOTICE:  Releasing segworker groups to retry broadcast.
 NOTICE:  Releasing segworker groups to retry broadcast.
@@ -173,16 +176,15 @@ select count(*) = 12 from dtm_retry_table;
 
 -- Reset all faults.
 select gp_inject_fault_infinite('all', 'reset', dbid) from gp_segment_configuration;
-NOTICE:  Success:
  gp_inject_fault_infinite 
 --------------------------
- t
- t
- t
- t
- t
- t
- t
- t
+ Success:
+ Success:
+ Success:
+ Success:
+ Success:
+ Success:
+ Success:
+ Success:
 (8 rows)
 

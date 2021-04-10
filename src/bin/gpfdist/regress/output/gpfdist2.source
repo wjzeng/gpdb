@@ -9,7 +9,7 @@ CREATE TABLE REG_REGION (R_REGIONKEY INT, R_NAME CHAR(25), R_COMMENT VARCHAR(152
 -- 'gpfdist' protocol
 -- --------------------------------------
 CREATE EXTERNAL WEB TABLE gpfdist2_start (x text)
-execute E'((@bindir@/gpfdist -p 7070 -d @abs_srcdir@/data  </dev/null >/dev/null 2>&1 &); sleep 1; echo "starting...") '
+execute E'((@bindir@/gpfdist -p 7070 -d @abs_srcdir@/data  </dev/null >/dev/null 2>&1 &); for i in `seq 1 30`; do curl 127.0.0.1:7070 >/dev/null 2>&1 && break; sleep 1; done; echo "starting...") '
 on SEGMENT 0
 FORMAT 'text' (delimiter '|');
 CREATE EXTERNAL WEB TABLE gpfdist2_stop (x text)
@@ -34,7 +34,9 @@ select * from gpfdist2_start;
 drop table if exists lineitem;
 NOTICE:  table "lineitem" does not exist, skipping
 drop external table if exists ext_lineitem;
-NOTICE:  table "ext_lineitem" does not exist, skipping
+NOTICE:  foreign table "ext_lineitem" does not exist, skipping
+drop external table if exists ext_simple;
+NOTICE:  foreign table "ext_simple" does not exist, skipping
 -- end_ignore
 -- test 1 using a .gz file
 CREATE EXTERNAL TABLE ext_lineitem (
@@ -341,8 +343,9 @@ FORMAT 'csv'
         HEADER
 )
 ;
-NOTICE:  HEADER means that each one of the data files has a header row.
+NOTICE:  HEADER means that each one of the data files has a header row
 SELECT count(*) FROM ext_lineitem;
+NOTICE:  HEADER means that each one of the data files has a header row
  count 
 -------
    255
@@ -479,8 +482,8 @@ FORMAT 'text'
 )
 ;
 SELECT count(*) FROM ext_lineitem;
-ERROR:  invalid input syntax for integer: "HEADER"  (seg0 slice1 127.0.0.1:25435 pid=67886)
-DETAIL:  External table ext_lineitem, line 1 of gpfdist://@hostname@:7070/gpfdist2/lineitem.tbl.*, column l_orderkey
+ERROR:  invalid input syntax for type bigint: "HEADER"  (seg0 slice1 127.0.0.1:25435 pid=67886)
+CONTEXT:  External table ext_lineitem, line 1 of gpfdist://@hostname@:7070/gpfdist2/lineitem.tbl.*, column l_orderkey
 DROP EXTERNAL TABLE ext_lineitem;
 -- test 14
 CREATE EXTERNAL TABLE ext_lineitem (
@@ -512,7 +515,7 @@ FORMAT 'text'
 LOG ERRORS SEGMENT REJECT LIMIT 200
 ;
 SELECT count(*) FROM ext_lineitem;
-NOTICE:  Found 4 data formatting errors (4 or more input rows). Rejected related input data.
+NOTICE:  found 4 data formatting errors (4 or more input rows), rejected related input data
  count 
 -------
     28
@@ -580,15 +583,15 @@ FORMAT 'text'
 )
 ;
 CREATE INDEX index ON ext_lineitem (L_ORDERKEY);
-ERROR:  cannot create indexes on external tables.
+ERROR:  cannot create index on foreign table "ext_lineitem"
 TRUNCATE ext_lineitem;
-ERROR:  "ext_lineitem" is an external relation and can't be truncated
+ERROR:  "ext_lineitem" is not a table
 DELETE FROM ext_lineitem where L_ORDERKEY > 10;
-ERROR:  cannot update or delete from external relation "ext_lineitem"
+ERROR:  cannot delete from foreign table "ext_lineitem"
 UPDATE ext_lineitem SET L_ORDERKEY = 10 where L_ORDERKEY > 10;
-ERROR:  cannot update or delete from external relation "ext_lineitem"
-INSERT INTO ext_lineitem VALUES (1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1);
-ERROR:  cannot change a readable external table "ext_lineitem"
+ERROR:  cannot update foreign table "ext_lineitem"
+INSERT INTO ext_lineitem VALUES (1,1,1,1,1,1,1,1,1,1,null,null,null,1,1,1);
+ERROR:  foreign table "ext_lineitem" does not allow inserts
 DROP EXTERNAL TABLE ext_lineitem;
 -- test 17 different delimiter
 CREATE EXTERNAL TABLE ext_lineitem (
@@ -714,8 +717,9 @@ FORMAT 'csv'
         HEADER
 )
 ;
-NOTICE:  HEADER means that each one of the data files has a header row.
+NOTICE:  HEADER means that each one of the data files has a header row
 SELECT count(*) FROM ext_lineitem;
+NOTICE:  HEADER means that each one of the data files has a header row
    255
 
 DROP EXTERNAL TABLE ext_lineitem;
@@ -749,8 +753,8 @@ FORMAT 'csv'
 )
 ;
 SELECT count(*) FROM ext_lineitem;
-ERROR:  invalid input syntax for integer: "HEADER"  (seg1 slice1 127.0.0.1:25433 pid=67887)
-DETAIL:  External table ext_lineitem, line 1 of gpfdist://@hostname@:7070/gpfdist2/lineitem.tbl.csv.header, column l_orderkey
+ERROR:  invalid input syntax for type bigint: "HEADER"  (seg1 slice1 127.0.0.1:25433 pid=67887)
+CONTEXT:  External table ext_lineitem, line 1 of gpfdist://@hostname@:7070/gpfdist2/lineitem.tbl.csv.header, column l_orderkey
 DROP EXTERNAL TABLE ext_lineitem;
 -- test 20 without header row and header is not defined in format clause
 CREATE EXTERNAL TABLE ext_lineitem (
@@ -891,13 +895,13 @@ FORMAT 'text'
         FORCE NOT NULL L_COMMENT
 )
 ;
-ERROR:  force not null available only in CSV mode
+ERROR:  COPY force not null available only in CSV mode
 SELECT count(*) FROM ext_lineitem;
 ERROR:  relation "ext_lineitem" does not exist
 LINE 1: SELECT count(*) FROM ext_lineitem;
                              ^
 DROP EXTERNAL TABLE ext_lineitem;
-ERROR:  table "ext_lineitem" does not exist
+ERROR:  foreign table "ext_lineitem" does not exist
 -- test 24 inherit external table
 CREATE EXTERNAL TABLE ext_lineitem (
                 L_ORDERKEY INT8,
@@ -1021,7 +1025,170 @@ SELECT count(*) FROM ext_crlf_with_lf_column;
  10367
 
 DROP EXTERNAL TABLE ext_crlf_with_lf_column;
+-- test 26 correct combination of command-id, transaction-id and scan-number defines a gpfdist-session
+CREATE EXTERNAL TABLE ext_simple(id INTEGER)
+LOCATION
+(
+        'gpfdist://@hostname@:7070/gpfdist2/simple.tbl'
+)
+FORMAT 'text'
+(
+        DELIMITER AS '|'
+        ESCAPE 'OFF'
+);
+-- command-id is incremented for select statements
+SELECT count(*) FROM ext_simple;
+     4
+
+set optimizer=off;
+BEGIN;
+SELECT count(*) FROM ext_simple;
+     4
+
+SELECT count(*) FROM ext_simple;
+     4
+
+ROLLBACK;
+set optimizer=on;
+BEGIN;
+SELECT count(*) FROM ext_simple;
+     4
+
+SELECT count(*) FROM ext_simple;
+     4
+
+ROLLBACK;
+-- command-id is incremented when executing same prepared statement multiple times.
+-- See plancache.c: if (plansource->num_custom_plans < 5)
+set optimizer=off;
+PREPARE ext_simple_foo(int) AS SELECT count(*) from ext_simple;
+BEGIN;
+EXECUTE ext_simple_foo(1);
+     4
+
+EXECUTE ext_simple_foo(1);
+     4
+
+EXECUTE ext_simple_foo(1);
+     4
+
+EXECUTE ext_simple_foo(1);
+     4
+
+EXECUTE ext_simple_foo(1);
+     4
+
+EXECUTE ext_simple_foo(1);
+     4
+
+EXECUTE ext_simple_foo(1);
+     4
+
+EXECUTE ext_simple_foo(1);
+     4
+
+ROLLBACK;
+DEALLOCATE ext_simple_foo;
+set optimizer=on;
+PREPARE ext_simple_foo(int) AS SELECT count(*) from ext_simple;
+BEGIN;
+EXECUTE ext_simple_foo(1);
+     4
+
+EXECUTE ext_simple_foo(1);
+     4
+
+EXECUTE ext_simple_foo(1);
+     4
+
+EXECUTE ext_simple_foo(1);
+     4
+
+EXECUTE ext_simple_foo(1);
+     4
+
+EXECUTE ext_simple_foo(1);
+     4
+
+EXECUTE ext_simple_foo(1);
+     4
+
+EXECUTE ext_simple_foo(1);
+     4
+
+ROLLBACK;
+DEALLOCATE ext_simple_foo;
+-- Two scans on the same external table within the same query.
+set optimizer=off;
+SELECT count(*) FROM ext_simple AS e1, ext_simple AS e2 WHERE e1.id = e2.id;
+     4
+
+set optimizer=on;
+SELECT count(*) FROM ext_simple AS e1, ext_simple AS e2 WHERE e1.id = e2.id;
+     4
+
+-- PREPARE & EXECUTE two scans on the same external table within the same query.
+set optimizer=off;
+PREPARE ext_simple_bar(int) AS SELECT count(*) FROM ext_simple AS e1, ext_simple AS e2 WHERE e1.id = e2.id;
+BEGIN;
+EXECUTE ext_simple_bar(1);
+     4
+
+EXECUTE ext_simple_bar(1);
+     4
+
+EXECUTE ext_simple_bar(1);
+     4
+
+EXECUTE ext_simple_bar(1);
+     4
+
+EXECUTE ext_simple_bar(1);
+     4
+
+EXECUTE ext_simple_bar(1);
+     4
+
+EXECUTE ext_simple_bar(1);
+     4
+
+EXECUTE ext_simple_bar(1);
+     4
+
+ROLLBACK;
+DEALLOCATE ext_simple_bar;
+set optimizer=on;
+PREPARE ext_simple_bar(int) AS SELECT count(*) FROM ext_simple AS e1, ext_simple AS e2 WHERE e1.id = e2.id;
+BEGIN;
+EXECUTE ext_simple_bar(1);
+     4
+
+EXECUTE ext_simple_bar(1);
+     4
+
+EXECUTE ext_simple_bar(1);
+     4
+
+EXECUTE ext_simple_bar(1);
+     4
+
+EXECUTE ext_simple_bar(1);
+     4
+
+EXECUTE ext_simple_bar(1);
+     4
+
+EXECUTE ext_simple_bar(1);
+     4
+
+EXECUTE ext_simple_bar(1);
+     4
+
+ROLLBACK;
+DEALLOCATE ext_simple_bar;
+DROP EXTERNAL TABLE ext_simple;
 -- start_ignore
 select * from gpfdist2_stop;
  stopping...
+
 -- end_ignore

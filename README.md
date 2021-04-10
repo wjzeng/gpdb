@@ -1,12 +1,13 @@
 **Concourse Pipeline** [![Concourse Build Status](https://prod.ci.gpdb.pivotal.io/api/v1/teams/main/pipelines/gpdb_master/badge)](https://prod.ci.gpdb.pivotal.io/teams/main/pipelines/gpdb_master) |
-**Travis Build** [![Travis Build Status](https://travis-ci.org/greenplum-db/gpdb.svg?branch=master)](https://travis-ci.org/greenplum-db/gpdb)
+**Travis Build** [![Travis Build Status](https://travis-ci.org/greenplum-db/gpdb.svg?branch=master)](https://travis-ci.org/greenplum-db/gpdb) |
+**Zuul Regression Test On Arm** [![Zuul Regression Test Status](http://openlabtesting.org:15000/badge?project=greenplum-db%2Fgpdb)](https://status.openlabtesting.org/builds/builds?project=greenplum-db%2Fgpdb&job_name=gpdb-installcheck-world-tests-on-arm64)
 
 ----------------------------------------------------------------------
 
-![Greenplum](/gpAux/releng/images/logo-greenplum.png)
+![Greenplum](logo-greenplum.png)
 
-The Greenplum Database (GPDB) is an advanced, fully featured, open
-source data warehouse. It provides powerful and rapid analytics on
+Greenplum Database (GPDB) is an advanced, fully featured, open
+source data warehouse, based on PostgreSQL. It provides powerful and rapid analytics on
 petabyte scale data volumes. Uniquely geared toward big data
 analytics, Greenplum Database is powered by the world’s most advanced
 cost-based query optimizer delivering high analytical query
@@ -14,47 +15,33 @@ performance on large data volumes.
 
 The Greenplum project is released under the [Apache 2
 license](http://www.apache.org/licenses/LICENSE-2.0). We want to thank
-all our current community contributors and are really interested in
+all our past and present community contributors and are really interested in
 all new potential contributions. For the Greenplum Database community
 no contribution is too small, we encourage all types of contributions.
 
 ## Overview
 
-A Greenplum cluster consists of a __master__ server, and multiple
-__segment__ servers. All user data resides in the segments, the master
-contains only metadata. The master server, and all the segments, share
+A Greenplum cluster consists of a __coordinator__ server, and multiple
+__segment__ servers. All user data resides in the segments, the coordinator
+contains only metadata. The coordinator server, and all the segments, share
 the same schema.
 
-Users always connect to the master server, which divides up the query
-into fragments that are executed in the segments, sends the fragments
-to the segments, and collects the results.
+Users always connect to the coordinator server, which divides up the query
+into fragments that are executed in the segments, and collects the results.
+
+More information can be found on the [project website](https://greenplum.org/).
 
 ## Building Greenplum Database with GPORCA
+GPORCA is a cost-based optimizer which is used by Greenplum Database in
+conjunction with the PostgreSQL planner.  It is also known as just ORCA, and
+Pivotal Optimizer. The code for GPORCA resides src/backend/gporca. It is built
+automatically by default.
 
 ### Installing dependencies (for macOS developers)
 Follow [these macOS steps](README.macOS.md) for getting your system ready for GPDB
 
 ### Installing dependencies (for Linux developers)
-Follow [appropriate linux steps](README.linux.md) for getting your system ready for GPDB
-
-<a name="buildOrca"></a>
-### Build the optimizer
-#### Automatically with Conan dependency manager
-
-```bash
-cd depends
-./configure
-make
-make install_local
-cd ..
-```
-
-#### Manually
-Follow the directions in the [ORCA README](https://github.com/greenplum-db/gporca).
-
-**Note**: Get the latest ORCA `git pull --ff-only` if you see an error message like below:
-
-    checking Checking ORCA version... configure: error: Your ORCA version is expected to be 2.33.XXX
+Follow [appropriate linux steps](README.Linux.md) for getting your system ready for GPDB
 
 ### Build the database
 
@@ -79,22 +66,16 @@ The directory and the TCP ports for the demo cluster can be changed on the fly.
 Instead of `make cluster`, consider:
 
 ```
-DATADIRS=/tmp/gpdb-cluster MASTER_PORT=15432 PORT_BASE=25432 make cluster
+DATADIRS=/tmp/gpdb-cluster PORT_BASE=5555 make cluster
 ```
 
 The TCP port for the regression test can be changed on the fly:
 
 ```
-PGPORT=15432 make installcheck-world
+PGPORT=5555 make installcheck-world
 ```
 
-Once build and started, run `psql` and check the GPOPT (e.g. GPORCA) version:
-
-```
-select gp_opt_version();
-```
-
-To turn ORCA off and use legacy planner for query optimization:
+To turn GPORCA off and use Postgres planner for query optimization:
 ```
 set optimizer=off;
 ```
@@ -133,32 +114,12 @@ make installcheck-world
   upstream. We try to keep the upstream tests identical to the upstream
   versions, to make merging with newer PostgreSQL releases easier.
 
-### Running TINC tests
-
-* create TINC test cluster
-
-It's different from the `create-demo-cluster` to pass the ICW tests. It has
-less number of primaries and also support more connections.
-
-```
-# assuming repo cloned under ~/workspace/gpdb
-cd ~/workspace/gpdb
-source /usr/local/gpdb/greenplum_path.sh
-make create-tinc-test-cluster
-source gpAux/gpdemo/gpdemo-env.sh
-make -C src/test/tinc walrep_2 # to run walrep_2 tinc tests
-```
-
-To understand more about TINC, please refer to `src/test/tinc/README`.
-
 ## Alternative Configurations
 
 ### Building GPDB without GPORCA
 
-Currently, GPDB is built with ORCA by default so latest ORCA libraries and headers need
-to be available in the environment. [Build and Install](#buildOrca) the latest ORCA.
-
-If you want to build GPDB without ORCA, configure requires `--disable-orca` flag to be set.
+Currently, GPDB is built with GPORCA by default. If you want to build GPDB
+without GPORCA, configure requires `--disable-orca` flag to be set.
 ```
 # Clean environment
 make distclean
@@ -170,21 +131,11 @@ make distclean
 ### Building GPDB with PXF
 
 PXF is an extension framework for GPDB to enable fast access to external hadoop datasets.
-Refer to [PXF extension](gpAux/extensions/pxf/README.md) for more information.
+Refer to [PXF extension](gpcontrib/pxf/README.md) for more information.
 
 Currently, GPDB is built with PXF by default (--enable-pxf is on).
 In order to build GPDB without pxf, simply invoke `./configure` with additional option `--disable-pxf`.
 PXF requires curl, so `--enable-pxf` is not compatible with the `--without-libcurl` option.
-
-### Building GPDB with gpperfmon enabled
-
-gpperfmon tracks a variety of queries, statistics, system properties, and metrics.
-To build with it enabled, change your `configure` to have an additional option
-`--enable-gpperfmon`
-
-See [more information about gpperfmon here](gpAux/gpperfmon/README.md)
-
-gpperfmon is dependent on several libraries like apr, apu, and libsigar
 
 ### Building GPDB with Python3 enabled
 
@@ -192,9 +143,14 @@ GPDB supports Python3 with plpython3u UDF
 
 See [how to enable Python3](src/pl/plpython/README.md) for details.
 
+
+### Building GPDB client tools on Windows
+
+See [Building GPDB client tools on Windows](README.Windows.md) for details.
+
 ## Development with Docker
 
-See [README.docker.md](README.docker.md).
+See [README.Docker.md](README.Docker.md).
 
 We provide a docker image with all dependencies required to compile and test
 GPDB [(See Usage)](src/tools/docker/README.md). You can view the dependency dockerfile at `./src/tools/docker/centos6-admin/Dockerfile`.
@@ -220,9 +176,14 @@ throughout the codebase, but a few larger additions worth noting:
 
 * __gpAux/__
 
-  Contains Greenplum-specific extensions such as gpfdist and
-  gpmapreduce.  Some additional directories are submodules and will be
+  Contains Greenplum-specific release management scripts, and vendored
+  dependencies. Some additional directories are submodules and will be
   made available over time.
+
+* __gpcontrib/__
+
+  Much like the PostgreSQL contrib/ directory, this directory contains
+  extensions such as gpfdist, PXF and gpmapreduce which are Greenplum-specific.
 
 * __doc/__
 
@@ -251,15 +212,20 @@ throughout the codebase, but a few larger additions worth noting:
 
 * __src/backend/gpopt/__
 
-  Contains the so-called __translator__ library, for using the ORCA
+  Contains the so-called __translator__ library, for using the GPORCA
   optimizer with Greenplum. The translator library is written in C++
   code, and contains glue code for translating plans and queries
-  between the DXL format used by ORCA, and the PostgreSQL internal
+  between the DXL format used by GPORCA, and the PostgreSQL internal
   representation.
 
+* __src/backend/gporca/__
+
+  Contains the GPORCA optimizer code and tests. This is written in C++. See
+  [README.md](src/backend/gporca/README.md) for more information and how to
+  unit-test GPORCA.
 * __src/backend/fts/__
 
-  FTS is a process that runs in the master node, and periodically
+  FTS is a process that runs in the coordinator node, and periodically
   polls the segments to maintain the status of each segment.
 
 ## Contributing
@@ -276,7 +242,7 @@ future releases.
 Greenplum is developed on GitHub, and anybody wishing to contribute to it will
 have to [have a GitHub account](https://github.com/signup/free) and be familiar
 with [Git tools and workflow](https://wiki.postgresql.org/wiki/Working_with_Git).
-It is also recommend that you follow the [developer's mailing list](http://greenplum.org/#contribute)
+It is also recommend that you follow the [developer's mailing list](https://greenplum.org/community/)
 since some of the contributions may generate more detailed discussions there.
 
 Once you have your GitHub account, [fork](https://github.com/greenplum-db/gpdb/fork)
@@ -303,7 +269,7 @@ verbatim or your contribution being upstreamed as part of the larger changeset).
 If the contribution you're submitting is NOT original work you have to indicate the name
 of the license and also make sure that it is similar in terms to the Apache License 2.0.
 Apache Software Foundation maintains a list of these licenses under [Category A](https://www.apache.org/legal/resolved.html#category-a). In addition to that, you may be required to make proper attribution in the
-[NOTICE file](https://github.com/greenplum-db/gpdb/blob/master/NOTICE) file similar to [these examples](https://github.com/greenplum-db/gpdb/blob/master/NOTICE#L278).
+[NOTICE file](https://github.com/greenplum-db/gpdb/blob/master/NOTICE) similar to [these examples](https://github.com/greenplum-db/gpdb/blob/master/NOTICE#L278).
 
 Finally, keep in mind that it is NEVER a good idea to remove licensing headers from
 the work that is not your original one. Even if you are using parts of the file that
@@ -322,7 +288,7 @@ doing the actual work as a series of small, self-contained commits. This makes
 the reviewer's job much easier and increases the timeliness of feedback.
 
 When it comes to C and C++ parts of Greenplum, we try to follow
-[PostgreSQL Coding Conventions](https://www.postgresql.org/docs/devel/static/source.html).
+[PostgreSQL Coding Conventions](https://www.postgresql.org/docs/devel/source.html).
 In addition to that we require that:
    * All Python code passes [Pylint](https://www.pylint.org/)
    * All Go code is formatted according to [gofmt](https://golang.org/cmd/gofmt/)
@@ -359,12 +325,18 @@ Feel free to ask on the mailing list to learn more about the Greenplum release p
 
 Once you are ready to share your work with the Greenplum core team and the rest of
 the Greenplum community, you should push all the commits to a branch in your own
-repository forked from the official Greenplum and [send us a pull request](https://help.github.com/articles/about-pull-requests/).
+repository forked from the official Greenplum and
+[send us a pull request](https://help.github.com/articles/about-pull-requests/).
 
-For now, we require all pull requests to be submitted against the main master
-branch, but over time, once there are many supported open source releases of Greenplum
-in the wild, you may decide to submit your pull requests against an active
-release branch if the change is only applicable to a given release.
+We welcome submissions which are work in-progress in order to get feedback early
+in the development process.  When opening the pull request, select "Draft" in
+the dropdown menu when creating the PR to clearly mark the intent of the pull
+request. Prefixing the title with "WIP:" is also good practice.
+
+All new features should be submitted against the main master branch. Bugfixes
+should too be submitted against master unless they only exist in a supported
+back-branch. If the bug exists in both master and back-branches, explain this
+in the PR description.
 
 ### Validation checks and CI
 
@@ -428,7 +400,7 @@ just commit to the repository directly.
 ## Documentation
 
 For Greenplum Database documentation, please check the
-[online documentation](http://greenplum.org/docs/).
+[online documentation](http://docs.greenplum.org/).
 
 For further information beyond the scope of this README, please see
 [our wiki](https://github.com/greenplum-db/gpdb/wiki)

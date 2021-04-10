@@ -3,7 +3,7 @@
  *  cdbsetop.h
  *
  * Portions Copyright (c) 2005-2008, Greenplum inc
- * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
  *
  *
  * IDENTIFICATION
@@ -15,8 +15,8 @@
 #define CDBSETOP_H
 
 #include "nodes/pg_list.h"
+#include "nodes/pathnodes.h"
 #include "nodes/plannodes.h"
-#include "nodes/relation.h"
 
 /*
  * GpSetOpType represents a strategy by which to construct a parallel
@@ -39,10 +39,10 @@
  *    unordered.  The set operation is performed on the QE as if it were 
  *    sequential.
  *
- * PSETOP_PARALLEL_REPLICATED
- *    The plans input to the Append node are replicated loci.  The result of 
- *    the Append is, therefore, replicated.  The set operation is performed 
- *    in parallel (and redundantly) on the QEs as if it were sequential.
+ * PSETOP_SEQUENTIAL_QE
+ *    Similar to SEQUENTIAL_QD/QE, but the output must be made available
+ *    to the outer query's locus. We don't know the outer query's locus yet,
+ *    but we treat it sequential.
  *
  * PSETOP_GENERAL
  *    The plans input to the Append node are all general loci.  The result
@@ -54,57 +54,20 @@ typedef enum GpSetOpType
 	PSETOP_PARALLEL_PARTITIONED,
 	PSETOP_SEQUENTIAL_QD,
 	PSETOP_SEQUENTIAL_QE,
-	PSETOP_PARALLEL_REPLICATED,
+	PSETOP_SEQUENTIAL_OUTERQUERY,
 	PSETOP_GENERAL
 } GpSetOpType;
 
 extern 
-GpSetOpType choose_setop_type(List *planlist); 
+GpSetOpType choose_setop_type(List *pathlist);
 
 extern
-void adjust_setop_arguments(PlannerInfo *root, List *planlist, GpSetOpType setop_type);
+void adjust_setop_arguments(PlannerInfo *root, List *pathlist, List *tlist_list, GpSetOpType setop_type);
 
 
-extern
-Motion* make_motion_hash_all_targets(PlannerInfo *root, Plan *subplan);
-
-extern
-Motion* make_motion_hash(PlannerInfo *root, Plan *subplan, List *hashexprs);
+extern Path *make_motion_hash_all_targets(PlannerInfo *root, Path *subpath, List *tlist);
 
 extern
-Motion* make_motion_gather_to_QD(PlannerInfo *root, Plan *subplan, List *sortPathKeys);
-
-extern
-Motion* make_motion_gather_to_QE(PlannerInfo *root, Plan *subplan, List *sortPathKeys);
-
-extern
-Motion *make_motion_gather(PlannerInfo *root, Plan *subplan, List *sortPathKeys);
-
-extern
-void mark_append_locus(Plan *plan, GpSetOpType optype);
-
-extern
-void mark_passthru_locus(Plan *plan, bool with_hash, bool with_sort);
-
-extern
-void mark_sort_locus(Plan *plan);
-
-extern
-void mark_plan_general(Plan* plan, int numsegments);
-
-extern
-void mark_plan_strewn(Plan* plan, int numsegments);
-
-extern
-void mark_plan_replicated(Plan* plan, int numsegments);
-
-extern
-void mark_plan_entry(Plan* plan);
-
-extern
-void mark_plan_singleQE(Plan* plan, int numsegments);
-
-extern
-void mark_plan_segment_general(Plan* plan, int numsegments);
+void mark_append_locus(Path *path, GpSetOpType optype);
 
 #endif   /* CDBSETOP_H */

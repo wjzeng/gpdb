@@ -4,6 +4,7 @@
 #include "cmockery.h"
 
 #include "postgres.h"
+#include "access/htup_details.h"
 #include "utils/memutils.h"
 #include "access/appendonlywriter.h"
 #include "catalog/pg_tablespace.h"
@@ -31,11 +32,12 @@ setup_test_structures()
 #undef unlink
 #define unlink mock_unlink
 
-int mock_unlink(const char * path)
+static int
+mock_unlink(const char *path)
 {
 	int ec = 0;
 	u_int segfile = 0; /* parse the path */
-	char *tmp_path = path + strlen(PATH_TO_DATA_FILE) + 1;
+	const char *tmp_path = path + strlen(PATH_TO_DATA_FILE) + 1;
 	if (strcmp(tmp_path, "") != 0)
 	{
 		segfile = atoi(tmp_path);
@@ -63,7 +65,7 @@ int mock_unlink(const char * path)
 
 #include "../aomd.c"
 
-void
+static void
 test__AOSegmentFilePathNameLen(void **state)
 {
 	RelationData reldata;
@@ -79,7 +81,7 @@ test__AOSegmentFilePathNameLen(void **state)
 	assert_in_range(r, strlen(basepath) + 3, strlen(basepath) + 10);
 }
 
-void
+static void
 test__FormatAOSegmentFileName(void **state)
 {
 	char	   *basepath = "base/21381/123";
@@ -112,11 +114,9 @@ test__FormatAOSegmentFileName(void **state)
 	assert_int_equal(fileSegNo, 256);
 }
 
-
-void
+static void
 test__MakeAOSegmentFileName(void **state)
 {
-	char	   *basepath = "base/21381/123";
 	int32		fileSegNo;
 	char		filepathname[256];
 	RelationData reldata;
@@ -152,12 +152,12 @@ test__MakeAOSegmentFileName(void **state)
 	assert_int_equal(fileSegNo, 256);
 }
 
-void
+static void
 test_mdunlink_co_no_file_exists(void **state)
 {
 	setup_test_structures();
 
-	mdunlink_ao(PATH_TO_DATA_FILE);
+	mdunlink_ao(PATH_TO_DATA_FILE, MAIN_FORKNUM);
 
 	// called 1 time checking column
 	assert_true(num_unlink_called == 0);
@@ -165,7 +165,7 @@ test_mdunlink_co_no_file_exists(void **state)
 }
 
 /* concurrency = 1 max_column = 4 */
-void
+static void
 test_mdunlink_co_4_columns_1_concurrency(void **state)
 {
 	setup_test_structures();
@@ -178,7 +178,7 @@ test_mdunlink_co_4_columns_1_concurrency(void **state)
 	file_present[(2*AOTupleId_MultiplierSegmentFileNum) + 1] = true;
 	file_present[(3*AOTupleId_MultiplierSegmentFileNum) + 1] = true;
 
-	mdunlink_ao(PATH_TO_DATA_FILE);
+	mdunlink_ao(PATH_TO_DATA_FILE, MAIN_FORKNUM);
 
 	assert_true(num_unlink_called == 4);
 	assert_true(unlink_passing);
@@ -186,7 +186,7 @@ test_mdunlink_co_4_columns_1_concurrency(void **state)
 }
 
 /* concurrency = 1,5 max_column = 3 */
-void
+static void
 test_mdunlink_co_3_columns_2_concurrency(void **state)
 {
 	setup_test_structures();
@@ -203,20 +203,20 @@ test_mdunlink_co_3_columns_2_concurrency(void **state)
 	file_present[(1*AOTupleId_MultiplierSegmentFileNum) + 5] = true;
 	file_present[(2*AOTupleId_MultiplierSegmentFileNum) + 5] = true;
 
-	mdunlink_ao(PATH_TO_DATA_FILE);
+	mdunlink_ao(PATH_TO_DATA_FILE, MAIN_FORKNUM);
 	assert_true(num_unlink_called == 6);
 	assert_true(unlink_passing);
 	return;
 }
 
-void
+static void
 test_mdunlink_co_all_columns_full_concurrency(void **state)
 {
 	setup_test_structures();
 
 	memset(file_present, true, sizeof(file_present));
 
-	mdunlink_ao(PATH_TO_DATA_FILE);
+	mdunlink_ao(PATH_TO_DATA_FILE, MAIN_FORKNUM);
 
 	/*
 	 * Note num_unlink_called is one less than total files because .0 is NOT unlinked
@@ -227,20 +227,33 @@ test_mdunlink_co_all_columns_full_concurrency(void **state)
 	return;
 }
 
-void
+static void
 test_mdunlink_co_one_columns_one_concurrency(void **state)
 {
 	setup_test_structures();
 
 	file_present[1] = true;
 
-	mdunlink_ao(PATH_TO_DATA_FILE);
+	mdunlink_ao(PATH_TO_DATA_FILE, MAIN_FORKNUM);
 	assert_true(num_unlink_called == 1);
 	assert_true(unlink_passing);
 	return;
 }
 
-void
+static void
+test_mdunlink_does_not_unlink_for_init_fork(void **state)
+{
+	setup_test_structures();
+
+	file_present[1] = true;
+
+	mdunlink_ao(PATH_TO_DATA_FILE, INIT_FORKNUM);
+	assert_true(num_unlink_called == 0);
+	assert_true(unlink_passing);
+	return;
+}
+
+static void
 test_mdunlink_co_one_columns_full_concurrency(void **state)
 {
 	setup_test_structures();
@@ -249,7 +262,7 @@ test_mdunlink_co_one_columns_full_concurrency(void **state)
 	for (int filenum=1; filenum < MAX_AOREL_CONCURRENCY; filenum++)
 		file_present[filenum] = true;
 
-	mdunlink_ao(PATH_TO_DATA_FILE);
+	mdunlink_ao(PATH_TO_DATA_FILE, MAIN_FORKNUM);
 	assert_true(num_unlink_called == (MAX_AOREL_CONCURRENCY - 1));
 	assert_true(unlink_passing);
 	return;
@@ -269,6 +282,7 @@ main(int argc, char *argv[])
 		unit_test(test_mdunlink_co_all_columns_full_concurrency),
 		unit_test(test_mdunlink_co_3_columns_2_concurrency),
 		unit_test(test_mdunlink_co_4_columns_1_concurrency),
+		unit_test(test_mdunlink_does_not_unlink_for_init_fork),
 		unit_test(test_mdunlink_co_no_file_exists)
 	};
 

@@ -3,7 +3,7 @@
  * pg_prewarm.c
  *		  prewarming utilities
  *
- * Copyright (c) 2010-2014, PostgreSQL Global Development Group
+ * Copyright (c) 2010-2019, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		  contrib/pg_prewarm/pg_prewarm.c
@@ -15,8 +15,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include "access/heapam.h"
-#include "catalog/catalog.h"
+#include "access/relation.h"
 #include "fmgr.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
@@ -37,7 +36,7 @@ typedef enum
 	PREWARM_BUFFER
 } PrewarmType;
 
-static char blockbuffer[BLCKSZ];
+static PGAlignedBlock blockbuffer;
 
 /*
  * pg_prewarm(regclass, mode text, fork text,
@@ -79,7 +78,7 @@ pg_prewarm(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 (errmsg("prewarm type cannot be null"))));
-	type = PG_GETARG_TEXT_P(1);
+	type = PG_GETARG_TEXT_PP(1);
 	ttype = text_to_cstring(type);
 	if (strcmp(ttype, "prefetch") == 0)
 		ptype = PREWARM_PREFETCH;
@@ -99,7 +98,7 @@ pg_prewarm(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 (errmsg("relation fork cannot be null"))));
-	forkName = PG_GETARG_TEXT_P(2);
+	forkName = PG_GETARG_TEXT_PP(2);
 	forkString = text_to_cstring(forkName);
 	forkNumber = forkname_to_number(forkString);
 
@@ -107,7 +106,7 @@ pg_prewarm(PG_FUNCTION_ARGS)
 	rel = relation_open(relOid, AccessShareLock);
 	aclresult = pg_class_aclcheck(relOid, GetUserId(), ACL_SELECT);
 	if (aclresult != ACLCHECK_OK)
-		aclcheck_error(aclresult, ACL_KIND_CLASS, get_rel_name(relOid));
+		aclcheck_error(aclresult, get_relkind_objtype(rel->rd_rel->relkind), get_rel_name(relOid));
 
 	/* Check that the fork exists. */
 	RelationOpenSmgr(rel);
@@ -138,8 +137,8 @@ pg_prewarm(PG_FUNCTION_ARGS)
 		if (last_block < 0 || last_block >= nblocks)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-			errmsg("ending block number must be between 0 and " INT64_FORMAT,
-				   nblocks - 1)));
+					 errmsg("ending block number must be between 0 and " INT64_FORMAT,
+							nblocks - 1)));
 	}
 
 	/* Now we're ready to do the real work. */
@@ -159,6 +158,7 @@ pg_prewarm(PG_FUNCTION_ARGS)
 		 */
 		for (block = first_block; block <= last_block; ++block)
 		{
+			CHECK_FOR_INTERRUPTS();
 			PrefetchBuffer(rel, forkNumber, block);
 			++blocks_done;
 		}
@@ -177,7 +177,8 @@ pg_prewarm(PG_FUNCTION_ARGS)
 		 */
 		for (block = first_block; block <= last_block; ++block)
 		{
-			smgrread(rel->rd_smgr, forkNumber, block, blockbuffer);
+			CHECK_FOR_INTERRUPTS();
+			smgrread(rel->rd_smgr, forkNumber, block, blockbuffer.data);
 			++blocks_done;
 		}
 	}
@@ -190,6 +191,7 @@ pg_prewarm(PG_FUNCTION_ARGS)
 		{
 			Buffer		buf;
 
+			CHECK_FOR_INTERRUPTS();
 			buf = ReadBufferExtended(rel, forkNumber, block, RBM_NORMAL, NULL);
 			ReleaseBuffer(buf);
 			++blocks_done;

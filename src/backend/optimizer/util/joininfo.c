@@ -3,7 +3,7 @@
  * joininfo.c
  *	  joininfo list manipulation routines
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -24,7 +24,7 @@
  *		Detect whether there is a joinclause that involves
  *		the two given relations.
  *
- * Note: the joinclause does not have to be evaluatable with only these two
+ * Note: the joinclause does not have to be evaluable with only these two
  * relations.  This is intentional.  For example consider
  *		SELECT * FROM a, b, c WHERE a.x = (b.y + c.z)
  * If a is much larger than the other tables, it may be worthwhile to
@@ -96,17 +96,15 @@ add_join_clause_to_rels(PlannerInfo *root,
 						RestrictInfo *restrictinfo,
 						Relids join_relids)
 {
-	Relids		tmprelids;
 	int			cur_relid;
 
-	tmprelids = bms_copy(join_relids);
-	while ((cur_relid = bms_first_member(tmprelids)) >= 0)
+	cur_relid = -1;
+	while ((cur_relid = bms_next_member(join_relids, cur_relid)) >= 0)
 	{
 		RelOptInfo *rel = find_base_rel(root, cur_relid);
 
 		rel->joininfo = lappend(rel->joininfo, restrictinfo);
 	}
-	bms_free(tmprelids);
 }
 
 /*
@@ -125,11 +123,10 @@ remove_join_clause_from_rels(PlannerInfo *root,
 							 RestrictInfo *restrictinfo,
 							 Relids join_relids)
 {
-	Relids		tmprelids;
 	int			cur_relid;
 
-	tmprelids = bms_copy(join_relids);
-	while ((cur_relid = bms_first_member(tmprelids)) >= 0)
+	cur_relid = -1;
+	while ((cur_relid = bms_next_member(join_relids, cur_relid)) >= 0)
 	{
 		RelOptInfo *rel = find_base_rel(root, cur_relid);
 
@@ -140,5 +137,4 @@ remove_join_clause_from_rels(PlannerInfo *root,
 		Assert(list_member_ptr(rel->joininfo, restrictinfo));
 		rel->joininfo = list_delete_ptr(rel->joininfo, restrictinfo);
 	}
-	bms_free(tmprelids);
 }

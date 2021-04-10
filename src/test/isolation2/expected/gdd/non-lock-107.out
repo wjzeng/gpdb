@@ -2,8 +2,8 @@ DROP TABLE IF EXISTS t107;
 DROP
 CREATE TABLE t107 (id int, val int);
 CREATE
-INSERT INTO t107 (id, val) SELECT i, i FROM generate_series(1, 20) i;
-INSERT 20
+INSERT INTO t107 (id, val) SELECT i, i FROM generate_series(1, 100) i;
+INSERT 100
 
 10: BEGIN;
 BEGIN
@@ -27,9 +27,9 @@ UPDATE 1
 20&: UPDATE t107 SET val=20 WHERE val=segid(0,2) OR id=segid(1,1);  <waiting ...>
 
 SELECT barrier();
-barrier
--------
-       
+ barrier 
+---------
+         
 (1 row)
 
 -- seg 1: con10 ~~> con20, tuple lock
@@ -40,9 +40,9 @@ barrier
 
 -- so far there is no deadlock yet as con30 is idle in transaction
 SELECT pg_sleep(20);
-pg_sleep
---------
-        
+ pg_sleep 
+----------
+          
 (1 row)
 
 -- when con30 quits the edge from con10 to con20 on seg 1 will change:

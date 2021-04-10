@@ -19,29 +19,30 @@
 
 #include "gpopt/base/CColRef.h"
 #include "gpopt/search/CSearchStage.h"
+#include "gpopt/translate/CTranslatorUtils.h"
 
 
 
 // fwd decl
 namespace gpos
 {
-	class IMemoryPool;
-	class CBitSet;
-}
+class CMemoryPool;
+class CBitSet;
+}  // namespace gpos
 
 namespace gpdxl
 {
-	class CDXLNode;
+class CDXLNode;
 }
 
 namespace gpopt
 {
-	class CExpression;
-	class CMDAccessor;
-	class CQueryContext;
-	class COptimizerConfig;
-	class ICostModel;
-}
+class CExpression;
+class CMDAccessor;
+class CQueryContext;
+class COptimizerConfig;
+class ICostModel;
+}  // namespace gpopt
 
 struct PlannedStmt;
 struct Query;
@@ -55,45 +56,44 @@ using namespace gpopt;
 // context of optimizer input and output objects
 struct SOptContext
 {
-
 	// mark which pointer member should NOT be released
 	// when calling Free() function
 	enum EPin
 	{
-		epinQueryDXL, // keep m_query_dxl
-		epinQuery, 	 // keep m_query
-		epinPlanDXL, // keep m_plan_dxl
-		epinPlStmt, // keep m_plan_stmt
-		epinErrorMsg // keep m_error_msg
+		epinQueryDXL,  // keep m_query_dxl
+		epinQuery,	   // keep m_query
+		epinPlanDXL,   // keep m_plan_dxl
+		epinPlStmt,	   // keep m_plan_stmt
+		epinErrorMsg   // keep m_error_msg
 	};
 
 	// query object serialized to DXL
-	CHAR *m_query_dxl;
+	CHAR *m_query_dxl{nullptr};
 
 	// query object
-	Query *m_query;
+	Query *m_query{nullptr};
 
 	// plan object serialized to DXL
-	CHAR *m_plan_dxl;
+	CHAR *m_plan_dxl{nullptr};
 
 	// plan object
-	PlannedStmt *m_plan_stmt;
+	PlannedStmt *m_plan_stmt{nullptr};
 
 	// is generating a plan object required ?
-	BOOL m_should_generate_plan_stmt;
+	BOOL m_should_generate_plan_stmt{false};
 
 	// is serializing a plan to DXL required ?
-	BOOL m_should_serialize_plan_dxl;
+	BOOL m_should_serialize_plan_dxl{false};
 
 	// did the optimizer fail unexpectedly?
-	BOOL m_is_unexpected_failure;
+	BOOL m_is_unexpected_failure{false};
 
 	// should the error be propagated to user, instead of falling back to the
 	// Postres planner?
-	BOOL m_should_error_out;
+	BOOL m_should_error_out{false};
 
 	// buffer for optimizer error messages
-	CHAR *m_error_msg;
+	CHAR *m_error_msg{nullptr};
 
 	// ctor
 	SOptContext();
@@ -103,92 +103,69 @@ struct SOptContext
 	void HandleError(BOOL *had_unexpected_failure);
 
 	// free all members except input and output pointers
-	void Free(EPin input, EPin epinOutput);
+	void Free(EPin input, EPin epinOutput) const;
 
 	// Clone the error message in given context.
-	CHAR* CloneErrorMsg(struct MemoryContextData *context);
+	CHAR *CloneErrorMsg(struct MemoryContextData *context) const;
 
 	// casting function
-	static
-	SOptContext *Cast(void *ptr);
+	static SOptContext *Cast(void *ptr);
 
-}; // struct SOptContext
+};	// struct SOptContext
 
 class COptTasks
 {
-	private:
+private:
+	// execute a task given the argument
+	static void Execute(void *(*func)(void *), void *func_arg);
 
-		// execute a task given the argument
-		static
-		void Execute ( void *(*func) (void *), void *func_arg);
+	// map GPOS log severity level to GPDB, print error and delete the given error buffer
+	static void LogExceptionMessageAndDelete(
+		CHAR *err_buf, ULONG severity_level = CException::ExsevInvalid);
 
-		// map GPOS log severity level to GPDB, print error and delete the given error buffer
-		static
-		void LogExceptionMessageAndDelete(CHAR* err_buf, ULONG severity_level=CException::ExsevInvalid);
+	// create optimizer configuration object
+	static COptimizerConfig *CreateOptimizerConfig(CMemoryPool *mp,
+												   ICostModel *cost_model);
 
-		// create optimizer configuration object
-		static
-		COptimizerConfig *CreateOptimizerConfig(IMemoryPool *mp, ICostModel *cost_model);
+	// optimize a query to a physical DXL
+	static void *OptimizeTask(void *ptr);
 
-		// optimize a query to a physical DXL
-		static
-		void* OptimizeTask(void *ptr);
+	// translate a DXL tree into a planned statement
+	static PlannedStmt *ConvertToPlanStmtFromDXL(
+		CMemoryPool *mp, CMDAccessor *md_accessor, const Query *orig_query,
+		const CDXLNode *dxlnode, bool can_set_tag,
+		DistributionHashOpsKind distribution_hashops);
 
-		// translate a DXL tree into a planned statement
-		static
-		PlannedStmt *ConvertToPlanStmtFromDXL(IMemoryPool *mp, CMDAccessor *md_accessor, const CDXLNode *dxlnode, bool can_set_tag);
+	// load search strategy from given path
+	static CSearchStageArray *LoadSearchStrategy(CMemoryPool *mp, char *path);
 
-		// load search strategy from given path
-		static
-		CSearchStageArray *LoadSearchStrategy(IMemoryPool *mp, char *path);
+	// helper for converting wide character string to regular string
+	static CHAR *CreateMultiByteCharStringFromWCString(const WCHAR *wcstr);
 
-		// helper for converting wide character string to regular string
-		static
-		CHAR *CreateMultiByteCharStringFromWCString(const WCHAR *wcstr);
+	// set cost model parameters
+	static void SetCostModelParams(ICostModel *cost_model);
 
-		// lookup given exception type in the given array
-		static
-		BOOL FoundException(gpos::CException &exc, const ULONG *exceptions, ULONG size);
+	// generate an instance of optimizer cost model
+	static ICostModel *GetCostModel(CMemoryPool *mp, ULONG num_segments);
 
-		// check if given exception is an unexpected reason for failing to produce a plan
-		static
-		BOOL IsUnexpectedFailure(gpos::CException &exc);
+	// print warning messages for columns with missing statistics
+	static void PrintMissingStatsWarning(CMemoryPool *mp,
+										 CMDAccessor *md_accessor,
+										 IMdIdArray *col_stats,
+										 MdidHashSet *phsmdidRel);
 
-		// check if given exception should error out
-		static
-		BOOL ShouldErrorOut(gpos::CException &exc);
+public:
+	// convert Query->DXL->LExpr->Optimize->PExpr->DXL
+	static char *Optimize(Query *query);
 
-		// set cost model parameters
-		static
-		void SetCostModelParams(ICostModel *cost_model);
+	// optimize Query->DXL->LExpr->Optimize->PExpr->DXL->PlannedStmt
+	static PlannedStmt *GPOPTOptimizedPlan(Query *query,
+										   SOptContext *gpopt_context);
 
-		// generate an instance of optimizer cost model
-		static
-		ICostModel *GetCostModel(IMemoryPool *mp, ULONG num_segments);
-
-		// print warning messages for columns with missing statistics
-		static
-		void PrintMissingStatsWarning(IMemoryPool *mp, CMDAccessor *md_accessor, IMdIdArray *col_stats, MdidHashSet *phsmdidRel);
-
-	public:
-
-		// convert Query->DXL->LExpr->Optimize->PExpr->DXL
-		static
-		char *Optimize(Query *query);
-
-		// optimize Query->DXL->LExpr->Optimize->PExpr->DXL->PlannedStmt
-		static
-		PlannedStmt *GPOPTOptimizedPlan
-			(
-			Query *query,
-			SOptContext* gpopt_context
-			);
-		
-		// enable/disable a given xforms
-		static
-		bool SetXform(char *xform_str, bool should_disable);
+	// enable/disable a given xforms
+	static bool SetXform(char *xform_str, bool should_disable);
 };
 
-#endif // COptTasks_H
+#endif	// COptTasks_H
 
 // EOF

@@ -4,7 +4,7 @@
  *	  This file contains declarations for an allocator that works with
  *	  vmem quota.
  *
- * Copyright (c) 2016-Present Pivotal Software, Inc.
+ * Copyright (c) 2016-Present VMware, Inc. or its affiliates.
  *
  *
  * IDENTIFICATION
@@ -158,13 +158,6 @@ static inline size_t
 UserPtr_GetVmemPtrSize(void *ptr)
 {
 	return UserPtrSize_GetVmemPtrSize(VmemPtr_GetUserPtrSize(UserPtr_GetVmemPtr(ptr)));
-}
-
-/* The end address of a user pointer */
-static inline void*
-UserPtr_GetEndPtr(void *ptr)
-{
-	return (((char *)ptr) + UserPtr_GetUserPtrSize(ptr));
 }
 
 /* Initialize header/footer of a Vmem pointer */

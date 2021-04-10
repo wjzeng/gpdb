@@ -3,7 +3,7 @@
  * datumstream.c
  *
  * Portions Copyright (c) 2009, Greenplum Inc.
- * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
  *
  *
  * IDENTIFICATION
@@ -178,6 +178,7 @@ datumstreamread_getlarge(DatumStreamRead * acc, Datum *datum, bool *null)
 			acc->largeObjectState = DatumStreamLargeObjectState_Consumed;
 
 			/* Fall below to ~_Consumed. */
+			/* fallthrough */
 
 		case DatumStreamLargeObjectState_Consumed:
 			{
@@ -370,7 +371,8 @@ init_datumstream_info(
 	/*
 	 * Adjust maxsz for Append-Only Storage.
 	 */
-	Assert(maxsz <= MAX_APPENDONLY_BLOCK_SIZE);
+	if (maxsz <= 0 || maxsz > MAX_APPENDONLY_BLOCK_SIZE)
+		elog(ERROR, "invalid AO block size %d", maxsz);
 	*maxAoBlockSize = maxsz;
 
 	/*
@@ -493,7 +495,8 @@ create_datumstreamwrite(
 						int32 maxsz,
 						Form_pg_attribute attr,
 						char *relname,
-						char *title)
+						char *title,
+						bool needsWAL)
 {
 	DatumStreamWrite *acc = palloc0(sizeof(DatumStreamWrite));
 
@@ -530,7 +533,7 @@ create_datumstreamwrite(
 		compressionFunctions = get_funcs_for_compression(acc->ao_attr.compressType);
 		if (compressionFunctions != NULL)
 		{
-			TupleDesc	td = CreateTupleDesc(1, false, &attr);
+			TupleDesc	td = CreateTupleDesc(1, &attr);
 			StorageAttributes sa;
 
 			sa.comptype = acc->ao_attr.compressType;
@@ -561,7 +564,8 @@ create_datumstreamwrite(
 								acc->maxAoBlockSize,
 								relname,
 								title,
-								&acc->ao_attr);
+								&acc->ao_attr,
+								needsWAL);
 
 	acc->ao_write.compression_functions = compressionFunctions;
 	acc->ao_write.compressionState = compressionState;
@@ -803,7 +807,6 @@ datumstreamwrite_open_file(DatumStreamWrite *ds, char *fn, int64 eof, int64 eofU
 	if (segmentFileNum > 0 && eof == 0)
 	{
 		AppendOnlyStorageWrite_TransactionCreateFile(&ds->ao_write,
-													 fn,
 													 relFileNode,
 													 segmentFileNum);
 	}
@@ -1192,7 +1195,7 @@ datumstreamread_block_content(DatumStreamRead * acc)
 					pfree(acc->large_object_buffer);
 					acc->large_object_buffer = NULL;
 
-					SIMPLE_FAULT_INJECTOR(MallocFailure);
+					SIMPLE_FAULT_INJECTOR("malloc_failure");
 				}
 
 				acc->large_object_buffer_size = acc->getBlockInfo.contentLen;

@@ -75,7 +75,7 @@
           <p>Master parameter settings in the master <codeph>postgresql.conf </codeph>file are the
             system-wide default. To set a master parameter:</p>
           <ol>
-            <li id="kh160766">Edit the <codeph>$MASTER_DATA_DIRECTORY/postgresql.conf</codeph>
+            <li id="kh160766">Edit the <codeph>$COORDINATOR_DATA_DIRECTORY/postgresql.conf</codeph>
               file.</li>
             <li id="kh160741">Find the parameter to set, uncomment it (remove the preceding
                 <codeph>#</codeph> character), and type the desired value.</li>
@@ -85,7 +85,9 @@
                 <codeblock>$ gpstop -u</codeblock>
               </p></li>
             <li id="kh160789">For parameter changes that require a server restart, restart Greenplum
-              Database as follows:<p><codeblock>$ gpstop -r</codeblock></p></li>
+              Database as follows:<p>
+                <codeblock>$ gpstop -r</codeblock>
+              </p></li>
           </ol>
           <p>For details about the server configuration parameters, see the <cite>Greenplum Database
               Reference Guide</cite>.</p>
@@ -362,7 +364,7 @@
       <topic id="topic19" xml:lang="en">
         <title>Cost-Based Vacuum Delay Parameters</title>
         <body>
-          <note type="warning">Pivotal does not recommend cost-based vacuum delay because it runs
+          <note type="warning">VMware does not recommend cost-based vacuum delay because it runs
             asynchronously among the segment instances. The vacuum cost limit and delay is invoked
             at the segment level without taking into account the state of the entire Greenplum
             array.</note>
@@ -453,9 +455,6 @@
                   <codeph>enable_tidscan</codeph>
                 </p>
                 <p>
-                  <codeph>gp_enable_adaptive_nestloop</codeph>
-                </p>
-                <p>
                   <codeph>gp_enable_agg_distinct</codeph>
                 </p>
               </stentry>
@@ -470,22 +469,19 @@
                   <codeph>gp_enable_fast_sri</codeph>
                 </p>
                 <p>
-                  <codeph>gp_enable_groupext_distinct_ gather</codeph>
+                  <codeph>gp_enable_groupext_distinct_gather</codeph>
                 </p>
                 <p>
-                  <codeph>gp_enable_groupext_distinct_ pruning</codeph>
+                  <codeph>gp_enable_groupext_distinct_pruning</codeph>
                 </p>
                 <p>
                   <codeph>gp_enable_multiphase_agg</codeph>
                 </p>
                 <p>
-                  <codeph>gp_enable_predicate_ propagation</codeph>
+                  <codeph>gp_enable_predicate_propagation</codeph>
                 </p>
                 <p>
                   <codeph>gp_enable_preunique</codeph>
-                </p>
-                <p>
-                  <codeph>gp_enable_sequential_window_ plans</codeph>
                 </p>
                 <p>
                   <codeph>gp_enable_sort_distinct</codeph>
@@ -552,9 +548,6 @@
             <li id="kh158362">
               <codeph>default_statistics_target </codeph>
             </li>
-            <li id="kh158369">
-              <codeph>gp_analyze_relative_error</codeph>
-            </li>
           </ul>
         </body>
       </topic>
@@ -592,13 +585,13 @@
               </stentry>
               <stentry>
                 <p>
-                  <codeph>gp_enable_groupext_distinct_ gather</codeph>
+                  <codeph>gp_enable_groupext_distinct_gather</codeph>
                 </p>
                 <p>
-                  <codeph>gp_enable_groupext_distinct_ pruning</codeph>
+                  <codeph>gp_enable_groupext_distinct_pruning</codeph>
                 </p>
                 <p>
-                  <codeph>gp_workfile_compress_algorithm</codeph>
+                  <codeph>gp_workfile_compression</codeph>
                 </p>
               </stentry>
             </strow>
@@ -623,10 +616,7 @@
               </stentry>
               <stentry>
                 <p>
-                  <codeph>gp_statistics_use_fkeys</codeph>
-                </p>
-                <p>
-                  <codeph>gp_workfile_compress_algorithm</codeph>
+                  <codeph>gp_workfile_compression</codeph>
                 </p>
               </stentry>
             </strow>
@@ -648,6 +638,9 @@
             </li>
             <li id="kh167484">
               <codeph>gp_statistics_pullup_from_child_partition</codeph>
+            </li>
+            <li>
+              <codeph>gp_statistics_use_fkeys</codeph>
             </li>
           </ul>
         </body>
@@ -782,108 +775,20 @@
         </body>
       </topic>
     </topic>
-    <topic id="topic33" xml:lang="en">
-      <title id="kh171299">System Monitoring Parameters</title>
-      <topic id="topic34" xml:lang="en">
-        <title>SNMP Alerts</title>
-        <body>
-          <p>The following parameters send SNMP notifications when events occur.</p>
-          <simpletable id="kh178188">
-            <strow>
-              <stentry>
-                <p>
-                  <codeph>gp_snmp_community</codeph>
-                </p>
-                <p>
-                  <codeph>gp_snmp_monitor_address</codeph>
-                </p>
-              </stentry>
-              <stentry>
-                <p>
-                  <codeph>gp_snmp_use_inform_or_trap</codeph>
-                </p>
-              </stentry>
-            </strow>
-          </simpletable>
-        </body>
-      </topic>
-      <topic id="topic35" xml:lang="en">
-        <title>Email Alerts</title>
-        <body>
-          <p>The following parameters configure the system to send email alerts for fatal error
-            events, such as a segment going down or a server crash and reset.</p>
-          <simpletable id="kh171646">
-            <strow>
-              <stentry>
-                <p>
-                  <codeph>gp_email_from</codeph>
-                </p>
-                <p>
-                  <codeph>gp_email_smtp_password</codeph>
-                </p>
-                <p>
-                  <codeph>gp_email_smtp_server</codeph>
-                </p>
-              </stentry>
-              <stentry>
-                <p>
-                  <codeph>gp_email_smtp_userid</codeph>
-                </p>
-                <p>
-                  <codeph>gp_email_to</codeph>
-                </p>
-              </stentry>
-            </strow>
-          </simpletable>
-        </body>
-      </topic>
-      <topic id="topic36" xml:lang="en">
-        <title>Greenplum Performance Monitoring Data Collection Agents</title>
-        <body>
-          <p>The following parameters configure the data collection agents for the (<codeph>gpperfmon</codeph>) database.</p>
-          <simpletable id="kh171891">
-            <strow>
-              <stentry>
-                <p>
-                  <codeph>gp_enable_gpperfmon</codeph>
-                </p>
-                <p>
-                  <codeph>gp_gpperfmon_send_interval</codeph>
-                </p>
-              </stentry>
-              <stentry>
-                <p>
-                  <codeph>gpperfmon_log_alert_level</codeph>
-                </p>
-                <p>
-                  <codeph>gpperfmon_port</codeph>
-                </p>
-              </stentry>
-            </strow>
-          </simpletable>
-        </body>
-      </topic>
-    </topic>
     <topic id="topic37" xml:lang="en">
       <title id="kh171364">Runtime Statistics Collection Parameters</title>
       <body>
         <p>These parameters control the server statistics collection feature. When statistics
-          collection is enabled, you can access the statistics data using the <i>pg_stat</i> and
-            <i>pg_statio</i> family of system catalog views.</p>
+          collection is enabled, you can access system catalog statistics data using the
+            <i>pg_stat</i> and <i>pg_statio</i> family of system catalog views.</p>
         <simpletable id="kh171301">
           <strow>
             <stentry>
               <p>
                 <codeph>stats_queue_level</codeph>
               </p>
-              <p>
-                <codeph>track_activities</codeph>
-              </p>
             </stentry>
             <stentry>
-              <p>
-                <codeph>track_counts</codeph>
-              </p>
               <p>
                 <codeph>update_process_title</codeph>
               </p>
@@ -1047,10 +952,10 @@
                 <codeph>gp_resqueue_priority</codeph>
               </p>
               <p>
-                <codeph>gp_resqueue_priority_cpucores_per_ segment</codeph>
+                <codeph>gp_resqueue_priority_cpucores_per_segment</codeph>
               </p>
               <p>
-                <codeph>gp_resqueue_priority_sweeper_ interval</codeph>
+                <codeph>gp_resqueue_priority_sweeper_interval</codeph>
               </p>
               <p>
                 <codeph>gp_vmem_idle_resource_timeout</codeph>
@@ -1059,7 +964,7 @@
                 <codeph>gp_vmem_protect_limit</codeph>
               </p>
               <p>
-                <codeph>gp_vmem_protect_segworker_cache_ limit</codeph>
+                <codeph>gp_vmem_protect_segworker_cache_limit</codeph>
               </p>
             </stentry>
             <stentry>
@@ -1067,10 +972,10 @@
                 <codeph>max_resource_queues</codeph>
               </p>
               <p>
-                <codeph>max_resource_portals_per_ transaction</codeph>
+                <codeph>max_resource_portals_per_transaction</codeph>
               </p>
               <p>
-                <codeph>resource_cleanup_gangs_on_ wait</codeph>
+                <codeph>resource_cleanup_gangs_on_wait</codeph>
               </p>
               <p>
                 <codeph>resource_select_only</codeph>
@@ -1142,9 +1047,6 @@
           <strow>
             <stentry>
               <p>
-                <codeph>add_missing_from</codeph>
-              </p>
-              <p>
                 <codeph>array_nulls</codeph>
               </p>
               <p>
@@ -1186,9 +1088,6 @@
                   <codeph>gp_interconnect_fc_method</codeph>
                 </p>
                 <p>
-                  <codeph>gp_interconnect_hash_multiplier</codeph>
-                </p>
-                <p>
                   <codeph>gp_interconnect_queue_depth</codeph>
                 </p>
                 <p>
@@ -1197,7 +1096,10 @@
               </stentry>
               <stentry>
                 <p>
-                  <codeph>gp_interconnect_setup_ timeout</codeph>
+                  <codeph>gp_interconnect_setup_timeout</codeph>
+                </p>
+                <p>
+                  <codeph>gp_interconnect_transmit_timeout</codeph>
                 </p>
                 <p>
                   <codeph>gp_interconnect_type</codeph>
@@ -1244,13 +1146,10 @@
                 <p>
                   <codeph>gp_set_read_only</codeph>
                 </p>
-                <p>
-                  <codeph>gp_fts_probe_interval</codeph>
-                </p>
               </stentry>
               <stentry>
                 <p>
-                  <codeph>gp_fts_probe_threadcount</codeph>
+                  <codeph>gp_fts_probe_interval</codeph>
                 </p>
               </stentry>
             </strow>
@@ -1280,9 +1179,6 @@
             <li id="kh177743">
               <codeph>gp_dbid</codeph>
             </li>
-            <li id="kh178565">
-              <codeph>gp_num_contents_in_cluster</codeph>
-            </li>
             <li id="kh164511">
               <codeph>gp_role</codeph>
             </li>
@@ -1299,14 +1195,14 @@
         <p>The parameters in this topic control the configuration of the replication between
           Greenplum Database primary master and standby master.</p>
         <ul>
-          <li id="kh184294">
-            <codeph>keep_wal_segments</codeph>
-          </li>
           <li id="kh184295">
             <codeph>repl_catchup_within_range</codeph>
           </li>
           <li id="kh184296">
             <codeph>replication_timeout</codeph>
+          </li>
+          <li id="kh184294">
+            <codeph>wal_keep_segments</codeph>
           </li>
           <li id="kh184297">
             <codeph>wal_receiver_status_interval</codeph>

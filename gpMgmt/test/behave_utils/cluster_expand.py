@@ -1,13 +1,14 @@
 import glob
 from datetime import datetime, timedelta
 from subprocess import Popen, PIPE
-from utils import run_gpcommand
+from .utils import run_gpcommand
 
 from gppylib.commands.base import Command
+from gppylib.db import dbconn
 
 class Gpexpand:
-    def __init__(self, context, working_directory=None, database='pivotal'):
-        self.database = database
+    def __init__(self, context, working_directory=None):
+        self.database = 'postgres'
         self.working_directory = working_directory
         self.context = context
 
@@ -32,7 +33,7 @@ class Gpexpand:
 
         # If working_directory is None, then Popen will use the directory where
         # the python code is being ran.
-        p1 = Popen(["gpexpand", "-D", self.database], stdout=PIPE, stdin=PIPE,
+        p1 = Popen(["gpexpand"], stdout=PIPE, stdin=PIPE,
                    cwd=self.working_directory)
 
         # Very raw form of doing the interview part of gpexpand.
@@ -40,32 +41,44 @@ class Gpexpand:
         # Cannot guarantee that this is not flaky either.
 
         # Would you like to initiate a new System Expansion Yy|Nn (default=N):
-        p1.stdin.write("y\n")
+        p1.stdin.write(b"y\n")
 
         # **Enter a blank line to only add segments to existing hosts**[]:
-        p1.stdin.write("%s\n" % (",".join(hosts) if hosts else ""))
+        p1.stdin.write(("%s\n" % (",".join(hosts) if hosts else "")).encode())
 
         if has_mirrors:
             #What type of mirroring strategy would you like? spread|grouped (default=grouped):
-            p1.stdin.write("\n")
+            p1.stdin.write(b"\n")
 
         #How many new primary segments per host do you want to add? (default=0):
-        p1.stdin.write("%s\n" % num_of_segments)
+        p1.stdin.write(("%s\n" % num_of_segments).encode())
 
         # Enter new primary data directory #<number primary segment>
         for directory in directory_pairs:
             primary, mirror = directory
-            p1.stdin.write("%s\n" % primary)
+            p1.stdin.write(("%s\n" % primary).encode())
             if mirror:
-                p1.stdin.write("%s\n" % mirror)
+                p1.stdin.write(("%s\n" % mirror).encode())
 
         output, err = p1.communicate()
 
         return output, p1.wait()
 
-    def initialize_segments(self):
-        input_files = sorted(glob.glob('%s/gpexpand_inputfile*' % self.working_directory))
-        return run_gpcommand(self.context, "gpexpand -D %s -i %s" % (self.database, input_files[-1]))
+    def initialize_segments(self, additional_params=''):
+        fns = [fn for fn in glob.glob('%s/gpexpand_inputfile*' % self.working_directory) if not fn.endswith(".ts")]
+        input_files = sorted(fns)
+        return run_gpcommand(self.context, "gpexpand -i %s %s" % (input_files[-1], additional_params))
+
+    def get_redistribute_status(self):
+        sql = 'select status from gpexpand.status order by updated desc limit 1'
+        dburl = dbconn.DbURL(dbname=self.database)
+        conn = dbconn.connect(dburl, encoding='UTF8', unsetSearchPath=False)
+        status = dbconn.querySingleton(conn, sql)
+        if status == 'EXPANSION COMPLETE':
+            rc = 0
+        else:
+            rc = 1
+        return rc
 
     def redistribute(self, duration, endtime):
         # Can flake with "[ERROR]:-End time occurs in the past"
@@ -78,8 +91,13 @@ class Gpexpand:
         else:
             flags = ""
 
-        return run_gpcommand(self.context, "gpexpand -D %s %s" % (self.database, flags))
+        rc, stderr, stdout = run_gpcommand(self.context, "gpexpand %s" % (flags))
+        if rc == 0:
+            rc = self.get_redistribute_status()
+        return (rc, stderr, stdout)
 
+    def rollback(self):
+        return run_gpcommand(self.context, "gpexpand -r")
 
 if __name__ == '__main__':
     gpexpand = Gpexpand()

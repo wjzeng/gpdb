@@ -70,7 +70,7 @@ main(void)
 
 	ECPGdebug(1, stderr);
 
-	{ ECPGconnect(__LINE__, 0, "regress1" , NULL, NULL , NULL, 0); 
+	{ ECPGconnect(__LINE__, 0, "ecpg1_regression" , NULL, NULL , NULL, 0); 
 #line 34 "define.pgc"
 
 if (sqlca.sqlcode < 0) sqlprint();}
@@ -164,5 +164,5 @@ if (sqlca.sqlcode < 0) sqlprint();}
 #line 59 "define.pgc"
 
 
-	return (0);
+	return 0;
 }

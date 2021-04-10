@@ -20,7 +20,7 @@ CREATE TABLE sreh_copy(a int, b int, c int) distributed by(a);
 -- ROW reject limit only
 --
 COPY sreh_copy FROM '@abs_srcdir@/data/bad_data1.data' DELIMITER '|' SEGMENT REJECT LIMIT 1000;
-NOTICE:  Found 10 data formatting errors (10 or more input rows). Rejected related input data.
+NOTICE:  found 10 data formatting errors (10 or more input rows), rejected related input data
 SELECT * FROM sreh_copy ORDER BY a,b,c;
  a  | b  | c  
 ----+----+----
@@ -37,8 +37,8 @@ SELECT * FROM sreh_copy ORDER BY a,b,c;
 --
 COPY sreh_copy FROM '@abs_srcdir@/data/bad_data1.data' DELIMITER '|' SEGMENT REJECT LIMIT 2;
 ERROR:  segment reject limit reached, aborting operation
-DETAIL:  Last error was: invalid input syntax for integer: "", column b
-CONTEXT:  COPY sreh_copy, line 8, column a
+DETAIL:  Last error was: invalid input syntax for type integer: "eleven", column a
+CONTEXT:  COPY sreh_copy, line 11, column a: "eleven"
 SELECT * FROM sreh_copy ORDER BY a,b,c;
  a  | b  | c  
 ----+----+----
@@ -55,14 +55,15 @@ SELECT * FROM sreh_copy ORDER BY a,b,c;
 --
 DROP TABLE IF EXISTS sreh_copy; CREATE TABLE sreh_copy(a int, b int, c int) distributed by(a);
 COPY sreh_copy FROM '@abs_srcdir@/data/bad_data1.data' DELIMITER '|' LOG ERRORS INTO WHATEVER SEGMENT REJECT LIMIT 1000;
-ERROR:  Error table is not supported.
+ERROR:  error table is not supported
 LINE 1: ...ess/data/bad_data1.data' DELIMITER '|' LOG ERRORS INTO WHATE...
                                                              ^
 HINT:  Set gp_ignore_error_table to ignore the [INTO error-table] clause for backward compatibility.
 SET gp_ignore_error_table=true;
 COPY sreh_copy FROM '@abs_srcdir@/data/bad_data1.data' DELIMITER '|' LOG ERRORS INTO WHATEVER SEGMENT REJECT LIMIT 1000;
-WARNING:  Error table is not supported, use gp_read_error_log() and gp_truncate_error_log() to view and manage the internal error log associated with your table.
-NOTICE:  Found 10 data formatting errors (10 or more input rows). Rejected related input data.
+WARNING:  error table is not supported
+HINT:  Use gp_read_error_log() and gp_truncate_error_log() to view and manage the internal error log associated with your table.
+NOTICE:  found 10 data formatting errors (10 or more input rows), rejected related input data
 SELECT * FROM sreh_copy ORDER BY a,b,c;
  a  | b  | c  
 ----+----+----
@@ -84,7 +85,7 @@ WITH error_log AS (SELECT gp_read_error_log('sreh_copy')) select count(*) from e
 -- error logs - do the same thing again. this time error logs exist and should get data appended
 --
 COPY sreh_copy FROM '@abs_srcdir@/data/bad_data1.data' DELIMITER '|' LOG ERRORS SEGMENT REJECT LIMIT 1000;
-NOTICE:  Found 10 data formatting errors (10 or more input rows). Rejected related input data.
+NOTICE:  found 10 data formatting errors (10 or more input rows), rejected related input data
 SELECT * FROM sreh_copy ORDER BY a,b,c;
  a  | b  | c  
 ----+----+----
@@ -132,7 +133,7 @@ SELECT linenum, rawdata FROM gp_read_error_log('sreh_copy') ORDER BY linenum;
 --
 DROP TABLE IF EXISTS sreh_copy; CREATE TABLE sreh_copy(a int, b int, c int) distributed by(a);
 COPY sreh_copy FROM STDIN DELIMITER '|' LOG ERRORS SEGMENT REJECT LIMIT 1000;
-NOTICE:  Found 2 data formatting errors (2 or more input rows). Rejected related input data.
+NOTICE:  found 2 data formatting errors (2 or more input rows), rejected related input data
 SELECT * FROM sreh_copy ORDER BY a,b,c;
   a  |  b  |  c  
 -----+-----+-----
@@ -197,10 +198,10 @@ SELECT * FROM sreh_constr; -- should exist and be empty
 --
 set gp_reject_percent_threshold = 100;
 COPY sreh_copy FROM '@abs_srcdir@/data/bad_data3.data' DELIMITER '|' SEGMENT REJECT LIMIT 10 PERCENT; --pass
-NOTICE:  Found 9 data formatting errors (9 or more input rows). Rejected related input data.
+NOTICE:  found 9 data formatting errors (9 or more input rows), rejected related input data
 COPY sreh_copy FROM '@abs_srcdir@/data/bad_data3.data' DELIMITER '|' SEGMENT REJECT LIMIT 2 PERCENT; --fail
 ERROR:  segment reject limit reached, aborting operation
-DETAIL:  Last error was: invalid input syntax for integer: "BAD", column a
+DETAIL:  Last error was: invalid input syntax for type integer: "BAD", column a
 CONTEXT:  COPY sreh_copy, line 107, column a
 --
 -- test PERCENT reject limit logic with custom threshold 10 (only practical for test purposes)
@@ -208,15 +209,15 @@ CONTEXT:  COPY sreh_copy, line 107, column a
 set gp_reject_percent_threshold = 10;
 COPY sreh_copy FROM '@abs_srcdir@/data/bad_data3.data' DELIMITER '|' SEGMENT REJECT LIMIT 10 PERCENT; --fail
 ERROR:  segment reject limit reached, aborting operation
-DETAIL:  Last error was: invalid input syntax for integer: "BAD", column a
+DETAIL:  Last error was: invalid input syntax for type integer: "BAD", column a
 CONTEXT:  COPY sreh_copy, line 15, column a
 COPY sreh_copy FROM '@abs_srcdir@/data/bad_data3.data' DELIMITER '|' SEGMENT REJECT LIMIT 20 PERCENT; --pass
-NOTICE:  Found 9 data formatting errors (9 or more input rows). Rejected related input data.
+NOTICE:  found 9 data formatting errors (9 or more input rows), rejected related input data
 -- MPP-2933 (multiple dist-key attr conversion errors)
 create table t2933 (col1 varchar(3) NULL , col2 char(1) NULL, col3 varchar(4) NULL, col4 char(1) NULL, col5 varchar(20) NULL) 
 Distributed By (col1, col2, col3, col4);
 COPY t2933 FROM STDIN DELIMITER '|' SEGMENT REJECT LIMIT 10;
-NOTICE:  Found 1 data formatting errors (1 or more input rows). Rejected related input data.
+NOTICE:  found 1 data formatting errors (1 or more input rows), rejected related input data
 -- cleanup
 DROP TABLE sreh_copy;
 DROP TABLE sreh_constr;
@@ -224,11 +225,11 @@ DROP TABLE sreh_constr;
 -- External Tables 
 -- ###########################################################
 CREATE EXTERNAL WEB TABLE gpfdist_sreh_start (x text)
-execute E'((@bindir@/gpfdist -p 8080 -d @abs_srcdir@/data  </dev/null >/dev/null 2>&1 &); sleep 3; echo "starting...") '
+execute E'((@bindir@/gpfdist -p 8080 -d @abs_srcdir@/data  </dev/null >/dev/null 2>&1 &); for i in `seq 1 30`; do curl 127.0.0.1:8080 >/dev/null 2>&1 && break; sleep 1; done; echo "starting...") '
 on SEGMENT 0
 FORMAT 'text' (delimiter '|');
 CREATE EXTERNAL WEB TABLE gpfdist_sreh_stop (x text)
-execute E'(/bin/pkill gpfdist || killall gpfdist) > /dev/null 2>&1; echo "stopping..."'
+execute E'(pkill gpfdist || killall gpfdist) > /dev/null 2>&1; echo "stopping..."'
 on SEGMENT 0
 FORMAT 'text' (delimiter '|');
 select * from gpfdist_sreh_stop;
@@ -253,7 +254,7 @@ LOCATION ('gpfdist://@hostname@:8080/bad_data1.data' )
 FORMAT 'text' (delimiter '|')
 SEGMENT REJECT LIMIT 10000;
 SELECT * FROM sreh_ext;
-NOTICE:  Found 10 data formatting errors (10 or more input rows). Rejected related input data.
+NOTICE:  found 10 data formatting errors (10 or more input rows), rejected related input data
  a  | b  | c  
 ----+----+----
   1 |  1 |  1
@@ -265,7 +266,7 @@ NOTICE:  Found 10 data formatting errors (10 or more input rows). Rejected relat
 (6 rows)
 
 INSERT INTO sreh_target SELECT * FROM sreh_ext;
-NOTICE:  Found 10 data formatting errors (10 or more input rows). Rejected related input data.
+NOTICE:  found 10 data formatting errors (10 or more input rows), rejected related input data
 SELECT count(*) FROM sreh_target;
  count 
 -------
@@ -283,11 +284,11 @@ FORMAT 'text' (delimiter '|')
 SEGMENT REJECT LIMIT 2;
 SELECT * FROM sreh_ext ORDER BY a;
 ERROR:  segment reject limit reached, aborting operation
-DETAIL:  Last error was: invalid input syntax for integer: "", column b  (seg1 slice1 @hostname@:11002 pid=68457)
+DETAIL:  Last error was: invalid input syntax for type integer: "", column b  (seg1 slice1 @hostname@:11002 pid=68457)
 CONTEXT:  External table sreh_ext, line 3 of gpfdist://@hostname@:8080/bad_data1.data: "3|"
 INSERT INTO sreh_target SELECT * FROM sreh_ext;
 ERROR:  segment reject limit reached, aborting operation
-DETAIL:  Last error was: invalid input syntax for integer: "", column b  (seg1 slice1 @hostname@:11002 pid=68459)
+DETAIL:  Last error was: invalid input syntax for type integer: "", column b  (seg1 slice1 @hostname@:11002 pid=68459)
 CONTEXT:  External table sreh_ext, line 3 of gpfdist://@hostname@:8080/bad_data1.data: "3|"
 SELECT count(*) FROM sreh_target;
  count 
@@ -305,9 +306,10 @@ LOCATION ('gpfdist://@hostname@:8080/bad_data1.data' )
 FORMAT 'text' (delimiter '|')
 LOG ERRORS INTO WHATEVER
 SEGMENT REJECT LIMIT 1000;
-WARNING:  Error table is not supported, use gp_read_error_log() and gp_truncate_error_log() to view and manage the internal error log associated with your table.
+WARNING:  error table is not supported
+HINT:  Use gp_read_error_log() and gp_truncate_error_log() to view and manage the internal error log associated with your table.
 SELECT * FROM sreh_ext_err_tbl ORDER BY a;
-NOTICE:  Found 10 data formatting errors (10 or more input rows). Rejected related input data.
+NOTICE:  found 10 data formatting errors (10 or more input rows), rejected related input data
  a  | b  | c  
 ----+----+----
   1 |  1 |  1
@@ -318,11 +320,22 @@ NOTICE:  Found 10 data formatting errors (10 or more input rows). Rejected relat
  14 | 14 | 14
 (6 rows)
 
-WITH error_log AS (SELECT gp_read_error_log('sreh_ext_err_tbl')) select count(*) from error_log;
- count 
--------
-    10
-(1 row)
+-- Verify the fields that we easily can.
+WITH error_log AS (SELECT * FROM gp_read_error_log('sreh_ext_err_tbl'))
+  SELECT relname, filename LIKE 'gpfdist://@hostname@:8080/bad_data1.data [%]' as filename_ok, linenum, errmsg from error_log;
+     relname      | filename_ok | linenum |                           errmsg                           
+------------------+-------------+---------+------------------------------------------------------------
+ sreh_ext_err_tbl | t           |       2 | missing data for column "b"
+ sreh_ext_err_tbl | t           |       3 | invalid input syntax for type integer: "", column b
+ sreh_ext_err_tbl | t           |       4 | extra data after last expected column, column b
+ sreh_ext_err_tbl | t           |       7 | invalid input syntax for type integer: "bad", column c
+ sreh_ext_err_tbl | t           |       8 | invalid input syntax for type integer: "bad", column a
+ sreh_ext_err_tbl | t           |      11 | invalid input syntax for type integer: "eleven", column a
+ sreh_ext_err_tbl | t           |      12 | extra data after last expected column, column a
+ sreh_ext_err_tbl | t           |      13 | invalid input syntax for type integer: ",13,", column b
+ sreh_ext_err_tbl | t           |      15 | missing data for column "b"
+ sreh_ext_err_tbl | t           |      16 | invalid input syntax for type integer: "sixteen", column a
+(10 rows)
 
 CREATE EXTERNAL TABLE sreh_ext(a int, b int, c int)
 LOCATION ('gpfdist://@hostname@:8080/bad_data1.data' )
@@ -330,7 +343,7 @@ FORMAT 'text' (delimiter '|')
 LOG ERRORS
 SEGMENT REJECT LIMIT 1000;
 SELECT * FROM sreh_ext ORDER BY a;
-NOTICE:  Found 10 data formatting errors (10 or more input rows). Rejected related input data.
+NOTICE:  found 10 data formatting errors (10 or more input rows), rejected related input data
  a  | b  | c  
 ----+----+----
   1 |  1 |  1
@@ -348,7 +361,7 @@ WITH error_log AS (SELECT gp_read_error_log('sreh_ext')) select count(*) from er
 (1 row)
 
 INSERT INTO sreh_target SELECT * FROM sreh_ext;
-NOTICE:  Found 10 data formatting errors (10 or more input rows). Rejected related input data.
+NOTICE:  found 10 data formatting errors (10 or more input rows), rejected related input data
 SELECT count(*) FROM sreh_target;
  count 
 -------
@@ -360,7 +373,7 @@ TRUNCATE sreh_target;
 -- error logs - do the same thing again. this time error logs exist and should get data appended
 --
 SELECT * FROM sreh_ext ORDER BY a;
-NOTICE:  Found 10 data formatting errors (10 or more input rows). Rejected related input data.
+NOTICE:  found 10 data formatting errors (10 or more input rows), rejected related input data
  a  | b  | c  
 ----+----+----
   1 |  1 |  1
@@ -407,7 +420,7 @@ SELECT linenum, rawdata FROM gp_read_error_log('sreh_ext') ORDER BY linenum;
 (30 rows)
 
 INSERT INTO sreh_target SELECT * FROM sreh_ext;
-NOTICE:  Found 10 data formatting errors (10 or more input rows). Rejected related input data.
+NOTICE:  found 10 data formatting errors (10 or more input rows), rejected related input data
 SELECT count(*) FROM sreh_target;
  count 
 -------
@@ -456,7 +469,7 @@ LOCATION ('gpfdist://@hostname@:8080/bad_data3.data' )
 FORMAT 'text' (delimiter '|')
 SEGMENT REJECT LIMIT 10 PERCENT;
 SELECT count(*) FROM sreh_ext_10percent; -- pass
-NOTICE:  Found 9 data formatting errors (9 or more input rows). Rejected related input data.
+NOTICE:  found 9 data formatting errors (9 or more input rows), rejected related input data
  count 
 -------
    291
@@ -468,7 +481,7 @@ FORMAT 'text' (delimiter '|')
 SEGMENT REJECT LIMIT 2 PERCENT;
 SELECT count(*) FROM sreh_ext_2percent; -- fail
 ERROR:  segment reject limit reached, aborting operation
-DETAIL:  Last error was: invalid input syntax for integer: "BAD", column a  (seg0 slice1 @hostname@:11001 pid=68456)
+DETAIL:  Last error was: invalid input syntax for type integer: "BAD", column a  (seg0 slice1 @hostname@:11001 pid=68456)
 CONTEXT:  External table sreh_ext_2percent, line 107 of gpfdist://@hostname@:8080/bad_data3.data, column a
 --
 -- test PERCENT reject limit logic with custom threshold 10 (only practical for test purposes)
@@ -476,14 +489,14 @@ CONTEXT:  External table sreh_ext_2percent, line 107 of gpfdist://@hostname@:808
 set gp_reject_percent_threshold = 10;
 SELECT count(*) FROM sreh_ext_10percent; -- fail
 ERROR:  segment reject limit reached, aborting operation
-DETAIL:  Last error was: invalid input syntax for integer: "BAD", column a  (seg0 slice1 @hostname@:11001 pid=68456)
+DETAIL:  Last error was: invalid input syntax for type integer: "BAD", column a  (seg0 slice1 @hostname@:11001 pid=68456)
 CONTEXT:  External table sreh_ext_10percent, line 15 of gpfdist://@hostname@:8080/bad_data3.data, column a
 CREATE EXTERNAL TABLE sreh_ext_20percent(a int, b int, c int)
 LOCATION ('gpfdist://@hostname@:8080/bad_data3.data' )
 FORMAT 'text' (delimiter '|')
 SEGMENT REJECT LIMIT 20 PERCENT;
 SELECT count(*) FROM sreh_ext_20percent; -- pass
-NOTICE:  Found 9 data formatting errors (9 or more input rows). Rejected related input data.
+NOTICE:  found 9 data formatting errors (9 or more input rows), rejected related input data
  count 
 -------
    291

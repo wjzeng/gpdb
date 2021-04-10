@@ -3,7 +3,7 @@
  *	   Functions for serializing and deserializing heap tuples.
  *
  * Portions Copyright (c) 2005-2008, Greenplum inc
- * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
  *
  *
  * IDENTIFICATION
@@ -17,7 +17,6 @@
 #include "access/heapam.h"
 #include "cdb/tupchunklist.h"
 #include "lib/stringinfo.h"
-#include "utils/lsyscache.h"
 #include "cdb/tupleremap.h"
 
 
@@ -82,18 +81,12 @@ extern void SerializeRecordCacheIntoChunks(SerTupInfo *pSerInfo,
 										   TupleChunkList tcList,
 										   MotionConn *conn);
 
-/* Convert a HeapTuple into chunks ready to send out, in one pass */
-extern void SerializeTupleIntoChunks(GenericTuple tuple, SerTupInfo *pSerInfo, TupleChunkList tcList);
-
-/* Convert a HeapTuple into chunks directly in a set of transport buffers */
-extern int SerializeTupleDirect(GenericTuple tuple, SerTupInfo *pSerInfo, struct directTransportBuffer *b);
-
-/* Deserialize a HeapTuple's data from a byte-array. */
-extern HeapTuple DeserializeTuple(SerTupInfo * pSerInfo, StringInfo serialTup);
+/* Convert a tuple into chunks directly in a set of transport buffers */
+extern int SerializeTuple(TupleTableSlot *tuple, SerTupInfo *pSerInfo, struct directTransportBuffer *b, TupleChunkList tcList, int16 targetRoute);
 
 /* Convert a sequence of chunks containing serialized tuple data into a
- * HeapTuple.
+ * MinimalTuple.
  */
-extern GenericTuple CvtChunksToTup(TupleChunkList tclist, SerTupInfo * pSerInfo, TupleRemapper *remapper);
+extern MinimalTuple CvtChunksToTup(TupleChunkList tclist, SerTupInfo *pSerInfo, TupleRemapper *remapper);
 
 #endif   /* TUPSER_H */

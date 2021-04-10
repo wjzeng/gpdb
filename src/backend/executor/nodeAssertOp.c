@@ -4,7 +4,7 @@
  *	  Implementation of nodeAssertOp.
  *
  * Portions Copyright (c) 2012, EMC Corp.
- * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
  *
  *
  * IDENTIFICATION
@@ -16,22 +16,10 @@
 #include "postgres.h"
 #include "miscadmin.h"
 
-#include "cdb/cdbpartition.h"
 #include "commands/tablecmds.h"
 #include "executor/nodeAssertOp.h"
 #include "executor/instrument.h"
-
-/* memory used by node.*/
-#define ASSERTOP_MEM 	1
-
-/*
- * Estimated Memory Usage of AssertOp Node.
- * */
-void
-ExecAssertOpExplainEnd(PlanState *planstate, struct StringInfoData *buf)
-{
-	planstate->instrument->execmemused += ASSERTOP_MEM;
-}
+#include "utils/memutils.h"
 
 /*
  * Check for assert violations and error out, if any.
@@ -42,7 +30,9 @@ CheckForAssertViolations(AssertOpState* node, TupleTableSlot* slot)
 	AssertOp* plannode = (AssertOp*) node->ps.plan;
 	ExprContext* econtext = node->ps.ps_ExprContext;
 	ResetExprContext(econtext);
-	List* predicates = node->ps.qual;
+	// GPDB_12_MERGE_FIXME: Is this really always a list? Even after the merge of all
+	// the JIT stuff?
+	List *predicates = (List *) node->ps.qual;
 	/* Arrange for econtext's scan tuple to be the tuple under test */
 	econtext->ecxt_outertuple = slot;
 	/*
@@ -61,7 +51,7 @@ CheckForAssertViolations(AssertOpState* node, TupleTableSlot* slot)
 	{
 		ExprState *clause = (ExprState *) lfirst(l);
 		bool isNull = false;
-		Datum expr_value = ExecEvalExpr(clause, econtext, &isNull, NULL);
+		Datum expr_value = ExecEvalExpr(clause, econtext, &isNull);
 
 		if (!isNull && !DatumGetBool(expr_value))
 		{
@@ -82,7 +72,7 @@ CheckForAssertViolations(AssertOpState* node, TupleTableSlot* slot)
 	{
 		ereport(ERROR,
 				(errcode(plannode->errcode),
-				 errmsg("One or more assertions failed"),
+				 errmsg("one or more assertions failed"),
 				 errdetail("%s", errorString.data)));
 
 	}
@@ -107,7 +97,7 @@ ExecAssertOp(AssertOpState *node)
 
 	CheckForAssertViolations(node, slot);
 
-	return ExecProject(node->ps.ps_ProjInfo, NULL);
+	return ExecProject(node->ps.ps_ProjInfo);
 }
 
 /**
@@ -117,29 +107,18 @@ ExecAssertOp(AssertOpState *node)
 AssertOpState*
 ExecInitAssertOp(AssertOp *node, EState *estate, int eflags)
 {
+	AssertOpState *assertOpState;
 
 	/* Check for unsupported flags */
 	Assert(!(eflags & (EXEC_FLAG_BACKWARD | EXEC_FLAG_MARK)));
 	Assert(outerPlan(node) != NULL);
 
-	AssertOpState *assertOpState = makeNode(AssertOpState);
+	assertOpState = makeNode(AssertOpState);
 	assertOpState->ps.plan = (Plan *)node;
 	assertOpState->ps.state = estate;
-	PlanState *planState = &assertOpState->ps;
-
-
-	ExecInitResultTupleSlot(estate, &assertOpState->ps);
 
 	/* Create expression evaluation context */
-	ExecAssignExprContext(estate, planState);
-
-	assertOpState->ps.targetlist = (List *)
-		ExecInitExpr((Expr *) node->plan.targetlist,
-					 (PlanState *) assertOpState);
-
-	assertOpState->ps.qual = (List *)
-			ExecInitExpr((Expr *) node->plan.qual,
-						 (PlanState *) assertOpState);
+	ExecAssignExprContext(estate, &assertOpState->ps);
 
 	/*
 	 * Initialize outer plan
@@ -148,20 +127,17 @@ ExecInitAssertOp(AssertOp *node, EState *estate, int eflags)
 	outerPlanState(assertOpState) = ExecInitNode(outerPlan, estate, eflags);
 
 	/*
-	 * Initialize projection info for this
-	 * node appropriately
+	 * Initialize result type and projection.
 	 */
-	ExecAssignResultTypeFromTL(&assertOpState->ps);
-	TupleDesc tupDesc = ExecTypeFromTL(node->plan.targetlist, false);
+	ExecInitResultTypeTL(&assertOpState->ps);
+	ExecAssignProjectionInfo(&assertOpState->ps, NULL);
 
-	ExecAssignProjectionInfo(planState, tupDesc);
+	assertOpState->ps.qual =
+		ExecInitQual(node->plan.qual, (PlanState *) assertOpState);
 
 	if (estate->es_instrument && (estate->es_instrument & INSTRUMENT_CDB))
 	{
-	        assertOpState->ps.cdbexplainbuf = makeStringInfo();
-
-	        /* Request a callback at end of query. */
-	        assertOpState->ps.cdbexplainfun = ExecAssertOpExplainEnd;
+		assertOpState->ps.cdbexplainbuf = makeStringInfo();
 	}
 
 	return assertOpState;
@@ -186,5 +162,4 @@ ExecEndAssertOp(AssertOpState *node)
 {
 	ExecFreeExprContext(&node->ps);
 	ExecEndNode(outerPlanState(node));
-	EndPlanStateGpmonPkt(&node->ps);
 }

@@ -1,69 +1,65 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-# Copyright (c) 2015 Pivotal Software, Inc. All Rights Reserved
+# Copyright (c) 2015 VMware, Inc. or its affiliates. All Rights Reserved
 #
-# This software contains the intellectual property of Pivotal Software, Inc.
-# or is licensed to Pivotal Software, Inc. from third parties. Use of this
+# This software contains the intellectual property of VMware, Inc. or its affiliates.
+# or is licensed to VMware, Inc. or its affiliates. from third parties. Use of this
 # software and the intellectual property contained therein is expressly
 # limited to the terms and conditions of the License Agreement under which
-# it is provided by or on behalf of Pivotal Software, Inc.
+# it is provided by or on behalf of VMware, Inc. or its affiliates.
 
 
 # import mainUtils FIRST to get python version check
 from gppylib.mainUtils import *
 from optparse import OptionParser
-from Queue import Queue, Empty
+from queue import Queue, Empty
 import os
 import re
 import shutil
 import fnmatch
 import tempfile
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
+from contextlib import closing
 import pipes  # for shell-quoting, pipes.quote()
 import fcntl
+import itertools
 
 try:
+    import pg
+
     from gppylib import gplog, pgconf, userinput
     from gppylib.commands.base import Command, WorkerPool, Worker
     from gppylib.operations import Operation
     from gppylib.gpversion import GpVersion
     from gppylib.db import dbconn
     from gppylib.operations.unix import CheckDir, CheckFile, MakeDir
-    from pygresql import pg
 
-except ImportError, e:
+except ImportError as e:
     sys.exit('Cannot import modules.  Please check that you have sourced greenplum_path.sh.  Detail: ' + str(e))
 
 EXECNAME = 'analyzedb'
 STATEFILE_DIR = 'db_analyze'
 logger = gplog.get_default_logger()
 WRITE_LOCK_FILE_NAME = "write_lock_semaphore"
+ANALYZE_GUCS = "set optimizer_analyze_root_partition=off; "
 ANALYZE_SQL = """analyze %s"""
 ANALYZE_ROOT_SQL = """analyze rootpartition %s"""
-
-PG_PARTITIONS_SURROGATE = """
-SELECT n.nspname AS schemaname, cl.relname AS tablename, n2.nspname AS partitionschemaname, cl2.relname AS partitiontablename, cl3.relname AS parentpartitiontablename
-FROM pg_namespace n, pg_namespace n2, pg_class cl, pg_class cl2, pg_partition pp,
-pg_partition_rule pr1
-LEFT JOIN pg_partition_rule pr2 ON pr1.parparentrule = pr2.oid
-LEFT JOIN pg_class cl3 ON pr2.parchildrelid = cl3.oid
-WHERE pp.paristemplate = false AND pp.parrelid = cl.oid AND pr1.paroid = pp.oid AND cl2.oid = pr1.parchildrelid AND cl.relnamespace = n.oid AND cl2.relnamespace = n2.oid
-"""
+REPORTS_ARE_STALE_AFTER_N_DAYS = 8
+NUM_REPORTS_TO_SAVE = 3
 
 GET_ALL_DATA_TABLES_SQL = """
-select n.nspname as schemaname, c.relname as tablename from pg_class c, pg_namespace n where
-c.relnamespace = n.oid and c.relkind='r'::char and (c.relnamespace > 16384 or n.nspname = 'public' or n.nspname = 'pg_catalog') and c.oid not in (select reloid from pg_exttable)
-EXCEPT
-select distinct schemaname, tablename from (%s) AS pps1
-EXCEPT
-select distinct partitionschemaname, parentpartitiontablename from (%s) AS pps2 where parentpartitiontablename is not NULL
-""" % (PG_PARTITIONS_SURROGATE, PG_PARTITIONS_SURROGATE)
+select n.nspname as schemaname, c.relname as tablename
+from pg_class c, pg_namespace n
+where c.relnamespace = n.oid and c.relkind='r'::char
+and (c.relnamespace >= 16384 or n.nspname = 'public' or n.nspname = 'pg_catalog')
+and c.oid not in (select ftrelid from pg_foreign_table)
+"""
 
 GET_VALID_DATA_TABLES_SQL = """
 select n.nspname as schemaname, c.relname as tablename from pg_class c, pg_namespace n where
-c.relnamespace = n.oid and c.oid in (%s) and c.relkind='r'::char and (c.relnamespace > 16384 or n.nspname = 'public' or n.nspname = 'pg_catalog') and c.oid not in (select reloid from pg_exttable)
+c.relnamespace = n.oid and c.oid in (%s) and c.relkind='r'::char and (c.relnamespace >= 16384 or n.nspname = 'public' or n.nspname = 'pg_catalog') and c.oid not in (select ftrelid from pg_foreign_table)
 """
 
 GET_REQUESTED_AO_DATA_TABLE_INFO_SQL = """
@@ -76,8 +72,10 @@ GET_REQUESTED_AO_DATA_TABLE_INFO_SQL = """
     AND OUTER_PG_CLASS.oid = pg_appendonly.segrelid
 """
 
+# pygresql 5 automatically converts psql timestamp to type datetime.datetime.
+# We need to cast it as text for easy comparison to the state file on disk
 GET_REQUESTED_LAST_OP_INFO_SQL = """
-    SELECT PGN.nspname, PGC.relname, objid, staactionname, stasubtype, statime FROM pg_stat_last_operation, pg_class PGC, pg_namespace PGN
+    SELECT PGN.nspname, PGC.relname, objid, staactionname, stasubtype, cast(statime AS TEXT) FROM pg_stat_last_operation, pg_class PGC, pg_namespace PGN
     WHERE objid = PGC.oid
     AND objid in (%s)
     AND PGC.relnamespace = PGN.oid
@@ -86,35 +84,40 @@ GET_REQUESTED_LAST_OP_INFO_SQL = """
 """
 
 GET_ALL_DATA_TABLES_IN_SCHEMA_SQL = """
-select n.nspname as schemaname, c.relname as tablename from pg_class c, pg_namespace n where
-c.relnamespace = n.oid and c.relkind='r'::char and (c.relnamespace > 16384 or n.nspname = 'public' or n.nspname = 'pg_catalog') and c.oid not in (select reloid from pg_exttable)
+select n.nspname as schemaname, c.relname as tablename
+from pg_class c, pg_namespace n
+where c.relnamespace = n.oid and c.relkind='r'::char
+ and (c.relnamespace >= 16384 or n.nspname = 'public' or n.nspname = 'pg_catalog')
+and c.oid not in (select ftrelid from pg_foreign_table)
 and n.nspname = '%s'
-EXCEPT
-select distinct schemaname, tablename from (%s) AS pps1
-EXCEPT
-select distinct partitionschemaname, parentpartitiontablename from (%s) AS pps2 where parentpartitiontablename is not NULL
-""" % ('%s', PG_PARTITIONS_SURROGATE, PG_PARTITIONS_SURROGATE)
+"""
 
+# Get leaf partitions of named root table.
 GET_LEAF_PARTITIONS_SQL = """
-select partitionschemaname, partitiontablename from (%s) AS pps1 where schemaname = '%s' and tablename = '%s'
-EXCEPT
-select distinct partitionschemaname, parentpartitiontablename from (%s) AS pps2 where parentpartitiontablename is not NULL
-and schemaname = '%s' and tablename = '%s'
-""" % (PG_PARTITIONS_SURROGATE, '%s', '%s', PG_PARTITIONS_SURROGATE, '%s', '%s')
+select n.nspname, c.relname
+from pg_partition_tree(
+  (select c.oid from pg_class c, pg_namespace n where n.oid = c.relnamespace and nspname='%s' and relname='%s' and not relispartition)
+), pg_class c, pg_namespace n
+where n.oid = c.relnamespace and relid = c.oid
+"""
 
+# Get mid-level partitions of table with given OID
 GET_MID_LEVEL_PARTITIONS_SQL = """
-select distinct partitionschemaname, parentpartitiontablename from (%s) AS pps1 where parentpartitiontablename is not NULL
-""" % PG_PARTITIONS_SURROGATE
+select n.nspname, c.relname
+from pg_class c, pg_namespace n
+where n.oid = c.relnamespace
+and c.relkind = 'p' and c.relispartition
+"""
 
 GET_REQUESTED_NON_AO_TABLES_SQL = """
-select n.nspname as schemaname, c.relname as tablename from pg_class c, pg_namespace n where
-c.relnamespace = n.oid and c.relkind='r'::char and (c.relnamespace > 16384 or n.nspname = 'public' or n.nspname = 'pg_catalog')
-and c.oid not in (select relid from pg_appendonly) and c.oid in (%s) and c.oid not in (select reloid from pg_exttable)
-EXCEPT
-select distinct schemaname, tablename from (%s) AS pps1
-EXCEPT
-select distinct partitionschemaname, parentpartitiontablename from (%s) AS pps2 where parentpartitiontablename is not NULL
-""" % ('%s', PG_PARTITIONS_SURROGATE, PG_PARTITIONS_SURROGATE)
+select n.nspname as schemaname, c.relname as tablename
+from pg_class c, pg_namespace n
+where c.relnamespace = n.oid and c.relkind='r'::char
+and (c.relnamespace >= 16384 or n.nspname = 'public' or n.nspname = 'pg_catalog')
+and c.oid not in (select ftrelid from pg_foreign_table)
+and c.oid not in (select relid from pg_appendonly)
+and c.oid in (%s)
+"""
 
 GET_COLUMN_NAMES_SQL = """
 SELECT attname FROM pg_attribute WHERE attrelid = %s AND attnum > 0 AND NOT attisdropped
@@ -136,13 +139,20 @@ INNER JOIN (VALUES %s) o(orig_name) ON c.oid = o.orig_name::regclass
 """
 
 GET_LEAF_ROOT_MAPPING_SQL = """
-SELECT n.nspname, c2.relname, n.nspname, c.relname from pg_class c, pg_class c2, pg_namespace n, pg_partition pp, pg_partition_rule ppr
-WHERE ppr.parchildrelid in (%s) AND ppr.paroid = pp.oid AND pp.parrelid = c.oid AND c.relnamespace = n.oid AND ppr.parchildrelid = c2.oid;
+SELECT child_nsp.nspname, child_c.relname, root_nsp.nspname, root_c.relname
+FROM pg_class child_c, pg_namespace child_nsp,
+     pg_class root_c, pg_namespace root_nsp
+WHERE child_c.relnamespace = child_nsp.oid
+AND   root_c.relnamespace = root_nsp.oid
+AND child_c.oid IN (%s)
+AND root_c.oid = pg_partition_root(child_c.oid)
+and root_c.oid <> child_c.oid
 """
 
 GET_ALL_ROOT_PARTITION_TABLES_SQL = """
-SELECT distinct n.nspname || '.' || c.relname from pg_class c, pg_namespace n, pg_partition pp
-WHERE pp.parrelid = c.oid AND c.relnamespace = n.oid AND pp.paristemplate = false
+SELECT distinct n.nspname || '.' || c.relname
+FROM pg_class c, pg_namespace n
+WHERE n.oid = c.relnamespace AND c.relkind = 'p' AND NOT c.relispartition;
 """
 
 ORDER_CANDIDATES_BY_OID_SQL = """
@@ -156,18 +166,12 @@ def validate_schema_exists(pg_port, dbname, schema):
     try:
         dburl = dbconn.DbURL(port=pg_port, dbname=dbname)
         conn = dbconn.connect(dburl)
-        count = dbconn.execSQLForSingleton(conn, "select count(*) from pg_namespace where nspname='%s';" % pg.escape_string(schema))
+        count = dbconn.querySingleton(conn, "select count(*) from pg_namespace where nspname='%s';" % pg.escape_string(schema))
         if count == 0:
             raise ExceptionNoStackTraceNeeded("Schema %s does not exist in database %s." % (schema, dbname))
     finally:
         if conn:
             conn.close()
-
-def execute_sql(query, master_port, dbname):
-    dburl = dbconn.DbURL(port=master_port, dbname=dbname)
-    conn = dbconn.connect(dburl)
-    cursor = dbconn.execSQL(conn, query)
-    return cursor.fetchall()
 
 def get_lines_from_file(fname):
     content = []
@@ -197,37 +201,37 @@ def verify_lines_in_file(fname, expected):
 def get_partition_state_tuples(pg_port, dbname, catalog_schema, partition_info):
     """
     Reads the partition state for an AO or AOCS relation, which is the sum of
-    the modication counters over all ao segment files.
-    The sum might be an invalid number even when the relation contains tuples.
-    The reason is that the master aoseg info tuple for segno 0 is not there
-    after the CTAS. Vacuum will correct in missing state on the master.
-
-    Thus, partition state returns 0 also when the aoseg relation is empty.
-    Why is that correct?
-    A table that as a modcount of 0 can only be there iff the last operation
-    was a special operation (TRUNCATE, CREATE, ALTER TABLE). Every DML operation
-    will increase the modcount by 1. Therefore it is save to assume that to
-    relations with modcount 0 with the same last special operation do not have a
-    logical change in them.
+    the modification counters over all ao segment files, on all QE nodes.
 
     The result is a list of tuples, of the format (schema_schema, partition_name, modcount)
     """
     partition_list = list()
     dburl = dbconn.DbURL(port=pg_port, dbname=dbname)
     num_sqls = 0
-    with dbconn.connect(dburl) as conn:
+    with closing(dbconn.connect(dburl)) as conn:
         for (oid, schemaname, partition_name, tupletable) in partition_info:
-            modcount_sql = "select to_char(coalesce(sum(modcount::bigint), 0), '999999999999999999999') from %s.%s" % (catalog_schema, tupletable)
-            modcount = dbconn.execSQLForSingleton(conn, modcount_sql)
-            num_sqls += 1
-            if num_sqls == 1000: # The choice of batch size was chosen arbitrarily
-                logger.debug('Completed executing batch of 1000 tuple count SQLs')
-                conn.commit()
-                num_sqls = 0
-            if modcount:
-                modcount = modcount.strip()
-            validate_modcount(schemaname, partition_name, modcount)
-            partition_list.append((schemaname, partition_name, modcount))
+            try:
+                modcount_sql = "select to_char(coalesce(sum(modcount::bigint), 0), '999999999999999999999') from gp_dist_random('%s.%s')" % (catalog_schema, tupletable)
+                modcount = dbconn.querySingleton(conn, modcount_sql)
+            except pg.DatabaseError as e:
+                if "does not exist" in str(e):
+                    logger.info("Table %s.%s (%s) no longer exists and will not be analyzed", schemaname, partition_name, tupletable)
+                else:
+                    logger.error(str(e))
+                if conn:
+                    conn.close()
+                # If there's an exception, the transaction is closed so we need to reconnect
+                conn = dbconn.connect(dburl)
+            else:
+                num_sqls += 1
+                if num_sqls == 1000: # The choice of batch size was chosen arbitrarily
+                    logger.debug('Completed executing batch of 1000 tuple count SQLs')
+                    conn.commit()
+                    num_sqls = 0
+                if modcount:
+                    modcount = modcount.strip()
+                validate_modcount(schemaname, partition_name, modcount)
+                partition_list.append((schemaname, partition_name, modcount))
     return partition_list
 
 def validate_modcount(schema, tablename, cnt):
@@ -243,9 +247,9 @@ class AnalyzeDb(Operation):
 
         if args:
             logger.warn("Please note that some of the arguments (%s) aren't valid and will be ignored.", args)
-        if options.masterDataDirectory is None:
-            options.masterDataDirectory = gp.get_masterdatadir()
-        self.master_datadir = options.masterDataDirectory
+        if options.coordinatorDataDirectory is None:
+            options.coordinatorDataDirectory = gp.get_coordinatordatadir()
+        self.coordinator_datadir = options.coordinatorDataDirectory
         self.analyze_dir = STATEFILE_DIR
         self.pg_port = self._get_pgport()
         self.dbname = options.dbname
@@ -258,12 +262,13 @@ class AnalyzeDb(Operation):
         self.full_analyze = options.full_analyze
         self.dry_run = options.dry_run
         self.parallel_level = options.parallel_level
-        self.rootstats = options.rootstats
         self.silent = options.silent
         self.verbose = options.verbose
         self.clean_last = options.clean_last
         self.clean_all = options.clean_all
+        self.orca_rootstats = options.orca_rootstats
         self.gen_profile_only = options.gen_profile_only
+        self.analyze_gucs = ANALYZE_GUCS
 
         self.success_list = []
 
@@ -295,17 +300,10 @@ class AnalyzeDb(Operation):
         if self.parallel_level < 1 or self.parallel_level > 10:
             raise ProgramArgumentValidationException('option -p requires a value between 1 and 10')
 
-        if self.rootstats:
-            qresult = execute_sql("SELECT version()", self.pg_port, self.dbname)
-            version = GpVersion(qresult[0][0])
-            if version < GpVersion('4.3.4.0'):
-                logger.debug("Adding --skip_root_stats option since Greenplum version is lower than 4.3.4.0")
-                self.rootstats = False
-
     def _preprocess_options(self):
 
         if self.clean_all:
-            analyze_folder = os.path.join(self.master_datadir, self.analyze_dir, self.dbname)
+            analyze_folder = os.path.join(self.coordinator_datadir, self.analyze_dir, self.dbname)
             if os.path.exists(analyze_folder):
                 if not self.silent \
                         and not userinput.ask_yesno(None,
@@ -322,9 +320,9 @@ class AnalyzeDb(Operation):
                 logger.warning("Folder %s does not exist. Exiting...")
 
         if self.clean_last:
-            last_analyze_timestamp = get_lastest_analyze_timestamp(self.master_datadir, self.analyze_dir, self.dbname)
+            last_analyze_timestamp = get_latest_analyze_timestamp(self.coordinator_datadir, self.analyze_dir, self.dbname)
             if last_analyze_timestamp is not None:
-                analyze_folder = os.path.join(self.master_datadir, self.analyze_dir, self.dbname,
+                analyze_folder = os.path.join(self.coordinator_datadir, self.analyze_dir, self.dbname,
                                               last_analyze_timestamp)
                 if os.path.exists(analyze_folder):
                     if not self.silent \
@@ -409,7 +407,9 @@ class AnalyzeDb(Operation):
             # and its corresponding columns to be analyzed
             # key: name of the root partition whose stats needs to be refreshed
             # value: a set of column names to be analyzed, or '-1' meaning all columns of that table
-            if self.rootstats:
+            # this can be suppressed with a flag if ORCA is not used
+            # (performance improvement when there are many partitions and columns)
+            if self.orca_rootstats:
                 root_partition_col_dict = self._get_root_partition_col_dict(candidates, input_col_dict)
 
             ordered_candidates = self._get_ordered_candidates(candidates, root_partition_col_dict)
@@ -446,7 +446,7 @@ class AnalyzeDb(Operation):
                 self._write_report(curr_ao_state, curr_last_op, heap_partitions, input_col_dict,
                                    root_partition_col_dict, dirty_partitions, target_list)
                 logger.info("Done.")
-        except Exception, ex:
+        except Exception as ex:
             logger.exception(ex)
             raise
 
@@ -456,44 +456,57 @@ class AnalyzeDb(Operation):
 
         return 0
 
+    # We run 'analyze <table>' and 'analyze rootpartition <root>' commands in
+    # separate batches, as 'analyze rootpartition' commands will go through
+    # different codepaths depending on whether all leaf partitions have been
+    # analyzed. If all leaves have been analyzed, 'analyze rootpartition'
+    # simply merges the HLL statistics. If any leaves have not been analyzed, a
+    # sample is taken, which can take longer. Thus we run all 'analyze'
+    # statements before 'analyze rootpartition' statments
     def run_analyze(self, logger, ordered_candidates, candidates, input_col_dict, root_partition_col_dict):
         logger.info("Starting analyze with %d workers..." % self.parallel_level)
-        pool = AnalyzeWorkerPool(numWorkers=self.parallel_level)
+        non_root_pool = AnalyzeWorkerPool(numWorkers=self.parallel_level)
+        root_pool = AnalyzeWorkerPool(numWorkers=self.parallel_level)
 
         for can in ordered_candidates:
             can_schema, can_table = can[0], can[1]
             if can in candidates:
                 target = self._get_tablename_with_cols(can_schema, can_table, input_col_dict)
-                cmd = create_psql_command(self.dbname, ANALYZE_SQL % target)
+                cmd = create_psql_command(self.dbname, self.analyze_gucs + ANALYZE_SQL % target)
+                non_root_pool.addCommand(cmd)
 
             else:  # can in root_partition_col_dict
                 target = self._get_tablename_with_cols(can_schema, can_table, root_partition_col_dict)
                 cmd = create_psql_command(self.dbname, ANALYZE_ROOT_SQL % target)
+                root_pool.addCommand(cmd)
 
             # Also stash the name of the target table in the object, so that it can be extracted
             # from it later.
             cmd.target_schema = can_schema
             cmd.target_table = can_table
-            pool.addCommand(cmd)
 
-        wait_count = len(ordered_candidates)
+        wait_count = num_tables = len(ordered_candidates)
+        num_roots = root_pool.assigned
         start_time = time.time()
+        non_root_pool.run()
         try:
-            while wait_count > 0:
-                done_cmd = pool.completed_queue.get()
-                if done_cmd.was_successful():
-                    subject = (done_cmd.target_schema, done_cmd.target_table)
-                    self.success_list.append(subject)
-                if wait_count % 10 == 0:
-                    logger.info("progress status: completed %d out of %d tables or partitions" %
-                                (len(self.success_list), len(ordered_candidates)))
+            while wait_count > num_roots:
+                self.run_analyze_statements(non_root_pool, wait_count, num_tables)
                 wait_count -= 1
-
-            pool.join()
-            pool.haltWork()
+            non_root_pool.join()
+            non_root_pool.haltWork()
+            root_pool.run()
+            while wait_count > 0:
+                self.run_analyze_statements(root_pool, wait_count, num_tables)
+                wait_count -= 1
+            root_pool.join()
+            root_pool.haltWork()
         except:
-            pool.haltWork()
-            pool.joinWorkers()
+            non_root_pool.haltWork()
+            non_root_pool.joinWorkers()
+            if non_root_pool.completed_queue.qsize() == 0:
+                root_pool.haltWork()
+                root_pool.joinWorkers()
             raise
 
         finally:
@@ -502,21 +515,30 @@ class AnalyzeDb(Operation):
                         "Total elapsed time: %d seconds. Analyzed %d out of %d table(s) or partition(s) successfully."
                         % (int(end_time - start_time), len(self.success_list), len(ordered_candidates)))
 
+    def run_analyze_statements(self, pool, wait_count, total_to_analyze):
+        done_cmd = pool.completed_queue.get()
+        if done_cmd.was_successful():
+            subject = (done_cmd.target_schema, done_cmd.target_table)
+            self.success_list.append(subject)
+        if wait_count % 10 == 0:
+            logger.info("progress status: completed %d out of %d tables or partitions" %
+                        (len(self.success_list), total_to_analyze))
+
     def read_last_analyzedb_output(self):
-        last_analyze_timestamp = get_lastest_analyze_timestamp(self.master_datadir, self.analyze_dir, self.dbname)
-        prev_ao_state = get_prev_ao_state(last_analyze_timestamp, self.master_datadir, self.analyze_dir, self.dbname)
-        prev_col_dict = get_prev_col_state(last_analyze_timestamp, self.master_datadir, self.analyze_dir, self.dbname)
-        prev_last_op = get_prev_last_op(last_analyze_timestamp, self.master_datadir, self.analyze_dir, self.dbname)
+        last_analyze_timestamp = get_latest_analyze_timestamp(self.coordinator_datadir, self.analyze_dir, self.dbname)
+        prev_ao_state = get_prev_ao_state(last_analyze_timestamp, self.coordinator_datadir, self.analyze_dir, self.dbname)
+        prev_col_dict = get_prev_col_state(last_analyze_timestamp, self.coordinator_datadir, self.analyze_dir, self.dbname)
+        prev_last_op = get_prev_last_op(last_analyze_timestamp, self.coordinator_datadir, self.analyze_dir, self.dbname)
         return last_analyze_timestamp, prev_ao_state, prev_col_dict, prev_last_op
 
     def _get_pgport(self):
         env_pgport = os.getenv('PGPORT')
         if not env_pgport:
-            return self._get_master_port(self.master_datadir)
+            return self._get_coordinator_port(self.coordinator_datadir)
         return env_pgport
 
-    def _get_master_port(self, datadir):
-        logger.debug("Obtaining master's port from master data directory")
+    def _get_coordinator_port(self, datadir):
+        logger.debug("Obtaining coordinator's port from coordinator data directory")
         pgconf_dict = pgconf.readfile(datadir + "/postgresql.conf")
         return pgconf_dict.int('port')
 
@@ -563,15 +585,18 @@ class AnalyzeDb(Operation):
                 (schema, table) = canonical_tables[orig_table]
                 included_cols = self._get_include_or_exclude_cols(toks, '-i')
                 excluded_cols = self._get_include_or_exclude_cols(toks, '-x')
-                self._parse_column(col_dict, orig_table, schema, table, included_cols, excluded_cols,
-                                   [table] in all_root_partitions)
+                is_root_part = False
+                for row in all_root_partitions:
+                    if orig_table in row:
+                        is_root_part = True
+                self._parse_column(col_dict, orig_table, schema, table, included_cols, excluded_cols, is_root_part)
 
         else:  # all user tables in database
             alltables = run_sql(self.conn, GET_ALL_DATA_TABLES_SQL)
             for schema_table in alltables:
                 col_dict[(schema_table[0], schema_table[1])] = set(['-1'])
 
-        return col_dict.keys()
+        return list(col_dict.keys())
 
     def _get_include_or_exclude_cols(self, line_tokens, option_str):
         """
@@ -598,12 +623,12 @@ class AnalyzeDb(Operation):
         3. skip views and external tables
         """
         qresult = run_sql(self.conn, GET_MID_LEVEL_PARTITIONS_SQL)
-        mid_level_partitions = []
+        mid_level_partitions = set()
         for schema_tbl in qresult:
             tup = (schema_tbl[0], schema_tbl[1])
-            mid_level_partitions.append(tup)
+            mid_level_partitions.add(tup)
 
-        ret = []
+        ret = set()
         for can in candidates:
             schema = can[0]
             table = can[1]
@@ -614,16 +639,16 @@ class AnalyzeDb(Operation):
             if can in mid_level_partitions:
                 logger.warning("Skipping mid-level partition %s.%s" % (schema, table))
             else:
-                ret.append(can)
+                ret.add(can)
 
         if self.config_file is not None or self.single_table is not None:
-            valid_tables = []
+            valid_tables = set()
             if len(ret) > 0:
                 oid_str = get_oid_str(ret)
                 qresult = run_sql(self.conn, GET_VALID_DATA_TABLES_SQL % oid_str)
                 for schema_tbl in qresult:
                     tup = (schema_tbl[0], schema_tbl[1])
-                    valid_tables.append(tup)
+                    valid_tables.add(tup)
             return valid_tables
 
         return ret
@@ -661,7 +686,7 @@ class AnalyzeDb(Operation):
                     input_col_dict, prev_col_dict, root_partition_col_dict, is_full, dirty_partitions, target_list):
 
         current_time = generate_timestamp() # timestamp used for output directory
-        validate_dir("%s/%s/%s/%s" % (self.master_datadir, self.analyze_dir, self.dbname, current_time))
+        validate_dir("%s/%s/%s/%s" % (self.coordinator_datadir, self.analyze_dir, self.dbname, current_time))
 
         curr_ao_state_dict = create_ao_state_dict(curr_ao_state)
         curr_last_op_dict = create_last_op_dict(curr_last_op)
@@ -671,12 +696,14 @@ class AnalyzeDb(Operation):
         for schema_table in (x for x in self.success_list if
                              x not in heap_partitions and x not in root_partition_col_dict):
             # update modcount for tables that are successfully analyzed
-            new_modcount = curr_ao_state_dict[schema_table]
-            prev_ao_state_dict[schema_table] = new_modcount
+            if schema_table in curr_ao_state_dict:
+                new_modcount = curr_ao_state_dict[schema_table]
+                prev_ao_state_dict[schema_table] = new_modcount
 
             # update last op for tables that are successfully analyzed
-            last_op_info = curr_last_op_dict[schema_table]  # {'CREATE':'<entry>', 'ALTER':'<entry>', ...}
-            prev_last_op_dict[schema_table] = last_op_info
+            if schema_table in curr_last_op_dict:
+                last_op_info = curr_last_op_dict[schema_table]  # {'CREATE':'<entry>', 'ALTER':'<entry>', ...}
+                prev_last_op_dict[schema_table] = last_op_info
 
             # update column dict
             if is_full or schema_table in dirty_partitions or schema_table not in prev_col_dict or '-1' in \
@@ -690,7 +717,7 @@ class AnalyzeDb(Operation):
         col_state_output = construct_entries_from_dict_colstate(prev_col_dict)
 
         if len(ao_state_output) > 0:
-            ao_state_filename = generate_statefile_name('ao', self.master_datadir, self.analyze_dir, self.dbname,
+            ao_state_filename = generate_statefile_name('ao', self.coordinator_datadir, self.analyze_dir, self.dbname,
                                                         current_time)
             logger.info("Writing ao state file %s" % ao_state_filename)
             write_lines_to_file(ao_state_filename, ao_state_output)
@@ -698,24 +725,24 @@ class AnalyzeDb(Operation):
             verify_lines_in_file(ao_state_filename, ao_state_output)
 
         if len(last_op_output) > 0:
-            last_operation_filename = generate_statefile_name('lastop', self.master_datadir, self.analyze_dir,
+            last_operation_filename = generate_statefile_name('lastop', self.coordinator_datadir, self.analyze_dir,
                                                               self.dbname, current_time)
             logger.info("Writing last operation file %s" % last_operation_filename)
 
-            lines_to_write = map((lambda x: '%s,%s,%s,%s,%s,%s' % (x[0], x[1], x[2], x[3], x[4], x[5])), last_op_output)
+            lines_to_write = list(map((lambda x: '%s,%s,%s,%s,%s,%s' % (x[0], x[1], x[2], x[3], x[4], x[5])), last_op_output))
             write_lines_to_file(last_operation_filename, lines_to_write)
             logger.debug("Verifying last operation file ...")
             verify_lines_in_file(last_operation_filename, lines_to_write)
 
         if len(prev_col_dict) > 0:
-            col_state_filename = generate_statefile_name('col', self.master_datadir, self.analyze_dir, self.dbname,
+            col_state_filename = generate_statefile_name('col', self.coordinator_datadir, self.analyze_dir, self.dbname,
                                                          current_time)
             logger.info("Writing column state file %s" % col_state_filename)
             write_lines_to_file(col_state_filename, col_state_output)
             logger.debug("Verifying column state ...")
             verify_lines_in_file(col_state_filename, col_state_output)
 
-        report_filename = generate_statefile_name('report', self.master_datadir, self.analyze_dir, self.dbname,
+        report_filename = generate_statefile_name('report', self.coordinator_datadir, self.analyze_dir, self.dbname,
                                                   current_time)
         logger.info("Writing report file %s" % report_filename)
         with open(report_filename, 'w') as fp:
@@ -731,10 +758,11 @@ class AnalyzeDb(Operation):
             fp.write("\n%d out of %d tables are analyzed.\n" % (len(self.success_list), len(target_list)))
             if len(target_list) == len(self.success_list):
                 fp.write("\nanalyzedb finished successfully.\n")
+            self._clean_stale_directories(current_time)
 
     def _get_dirty_lastop_tables(self, curr_last_op, prev_last_op):
-        old_pgstatoperations_dict = get_pgstatlastoperations_dict(prev_last_op)
-        dirty_tables = compare_metadata(old_pgstatoperations_dict, curr_last_op)
+        old_pgstatlastoperation_dict = get_pgstatlastoperation_dict(prev_last_op)
+        dirty_tables = compare_metadata(old_pgstatlastoperation_dict, curr_last_op)
         return dirty_tables
 
     def _get_dirty_ao_state_tables(self, curr_ao_state, prev_ao_state):
@@ -789,7 +817,7 @@ class AnalyzeDb(Operation):
         return s
 
     def _expand_partition_tables(self, schema, parent):
-        qresult = run_sql(self.conn, GET_LEAF_PARTITIONS_SQL % (schema, parent, schema, parent))
+        qresult = run_sql(self.conn, GET_LEAF_PARTITIONS_SQL % (schema, parent))
         if len(qresult) == 0:
             return [(schema, parent)]
         else:
@@ -837,7 +865,7 @@ class AnalyzeDb(Operation):
         2. The leaf partitions (if range partitioned, especially by date) will be ordered in descending
            order of the partition key, so that newer partitions can be analyzed first.
         """
-        candidate_regclass_str = get_oid_str(candidates + root_partition_col_dict.keys())
+        candidate_regclass_str = get_oid_str(itertools.chain(candidates, root_partition_col_dict.keys()))
         qresult = run_sql(self.conn, ORDER_CANDIDATES_BY_OID_SQL % candidate_regclass_str)
         ordered_candidates = []
         for schema_tbl in qresult:
@@ -853,7 +881,7 @@ class AnalyzeDb(Operation):
             return col_dict[schema_table]
 
     def ensure_semaphore_file_exists(self):
-        db_directory = "%s/%s/%s" % (self.master_datadir, self.analyze_dir, self.dbname)
+        db_directory = "%s/%s/%s" % (self.coordinator_datadir, self.analyze_dir, self.dbname)
         validate_dir(db_directory)
         lock_file_path = os.path.join(db_directory, WRITE_LOCK_FILE_NAME)
 
@@ -886,6 +914,28 @@ class AnalyzeDb(Operation):
             finally:
                 fcntl.flock(lock_file, fcntl.LOCK_UN)
 
+    def _clean_stale_directories(self, current_time_str):
+        # extract the date and time from the string of the form yyyymmddhhmmss
+        current_analyze_time = datetime.strptime(current_time_str, '%Y%m%d%H%M%S')
+        num_previous_statefiles = 0
+        # Now walk through the log directories and delete those that are more than
+        # REPORTS_ARE_STALE_AFTER_N_DAYS days older than the current analyze timestamp,
+        # but leave at least NUM_REPORTS_TO_SAVE, even if they are older than the threshold
+        analyze_dirs = get_analyze_dirs(self.coordinator_datadir, self.analyze_dir, self.dbname)
+        for saved_analyze_dir in analyze_dirs:
+            try:
+                time_of_saved_analyze = datetime.strptime(os.path.basename(saved_analyze_dir), '%Y%m%d%H%M%S')
+                time_diff = current_analyze_time - time_of_saved_analyze
+                if num_previous_statefiles >= NUM_REPORTS_TO_SAVE and time_diff > timedelta(days=REPORTS_ARE_STALE_AFTER_N_DAYS):
+                    # this directory more than a week older than the most recent valid analyze directory, remove it
+                    if os.path.exists(saved_analyze_dir):
+                        shutil.rmtree(saved_analyze_dir)
+                        logger.info("Deleted archived log directory %s" % saved_analyze_dir)
+                if time_diff > timedelta(seconds=0):
+                    num_previous_statefiles += 1
+            except:
+                logger.info("Ignoring log directory that does not conform to naming convention: %s" % saved_analyze_dir)
+
 
 # Create a Command object that executes a query using psql.
 def create_psql_command(dbname, query):
@@ -895,9 +945,9 @@ def create_psql_command(dbname, query):
 
 def run_sql(conn, query):
     try:
-        cursor = dbconn.execSQL(conn, query)
+        cursor = dbconn.query(conn, query)
         res = cursor.fetchall()
-    except Exception, db_err:
+    except Exception as db_err:
         raise ExceptionNoStackTraceNeeded("%s" % db_err.__str__())  # .split('\n')[0])
     cursor.close()
     return res
@@ -908,25 +958,20 @@ def generate_timestamp():
     return timestamp.strftime("%Y%m%d%H%M%S")
 
 
-def construct_oid_regclass_str(schema_table):
-    schema = schema_table[0]
-    table = schema_table[1]
-
-    return "'" + pg.escape_string("%s.%s" % (escape_identifier(schema), escape_identifier(table))) + "'::regclass"
-
-
 # The argument is a list of (schema, table) tuples. The output is a string containing an
-# SQL expression like: 'schema.table'::regclass, that can be embedded safely in an SQL string.
+# SQL expression like: to_regclass('schema.table'), that can be embedded safely in an SQL string.
 # The escaping is a bit tricky here: the schema and table name need to be double-quoted, and the
 # whole string needs to be in single quotes.
 def get_oid_str(table_list):
     return ','.join(map((lambda x: regclass_schema_tbl(x[0], x[1])), table_list))
 
 
+# Returns a string that uses to_regclass instead of ::regclass
+# to_regclass returns NULL instead of an error if the table does not exist
 def regclass_schema_tbl(schema, tbl):
     schema_tbl = "%s.%s" % (escape_identifier(schema), escape_identifier(tbl))
 
-    return "'%s'::regclass" % (pg.escape_string(schema_tbl))
+    return "to_regclass('%s')" % (pg.escape_string(schema_tbl))
 
 
 # Escape double-quotes in a string, so that the resulting string is suitable for
@@ -955,8 +1000,8 @@ def get_heap_tables_set(conn, input_tables_set):
     return dirty_tables
 
 
-def get_lastest_analyze_timestamp(master_datadir, statefile_dir, dbname):
-    analyze_dirs = get_analyze_dirs(master_datadir, statefile_dir, dbname)
+def get_latest_analyze_timestamp(coordinator_datadir, statefile_dir, dbname):
+    analyze_dirs = get_analyze_dirs(coordinator_datadir, statefile_dir, dbname)
 
     for analyze_dir in analyze_dirs:
         files = sorted(os.listdir(analyze_dir))
@@ -978,47 +1023,47 @@ def get_lastest_analyze_timestamp(master_datadir, statefile_dir, dbname):
     return None
 
 
-def get_prev_ao_state(timestamp, master_datadir, analyze_dir, dbname):
+def get_prev_ao_state(timestamp, coordinator_datadir, analyze_dir, dbname):
     logger.debug("getting previous ao state...")
-    prev_state_filename = generate_statefile_name('ao', master_datadir, analyze_dir, dbname, timestamp)
+    prev_state_filename = generate_statefile_name('ao', coordinator_datadir, analyze_dir, dbname, timestamp)
     if not os.path.isfile(prev_state_filename):
         return []
     lines = get_lines_from_file(prev_state_filename)
     # Parse the lines into (schemaname, tablename, modcount) tuples. Each line is
     # a comma-separated string. XXX: This file format cannot deal with names
     # with commas.
-    return map((lambda x: x.split(',')), lines)
+    return list(map((lambda x: x.split(',')), lines))
 
 
-def get_prev_last_op(timestamp, master_datadir, analyze_dir, dbname):
+def get_prev_last_op(timestamp, coordinator_datadir, analyze_dir, dbname):
     logger.debug("getting previous last operation...")
-    old_pgstatoperations_file = generate_statefile_name('lastop', master_datadir, analyze_dir, dbname, timestamp)
-    if not os.path.isfile(old_pgstatoperations_file):
-        old_pgstatoperations = []
+    old_pgstatlastoperation_file = generate_statefile_name('lastop', coordinator_datadir, analyze_dir, dbname, timestamp)
+    if not os.path.isfile(old_pgstatlastoperation_file):
+        old_pgstatlastoperation = []
     else:
-        old_pgstatoperations = get_lines_from_file(old_pgstatoperations_file)
+        old_pgstatlastoperation = get_lines_from_file(old_pgstatlastoperation_file)
     # Parse the lines into tuples like:
     # [('public', 'ao_tab', 67468, 'ALTER', 'ADD COLUMN', '2014-10-15 14:49:27.658777-07'), ...]
     # Each line is a comma-separated string. XXX: This file format cannot deal with names
     # with commas.
     ret = []
-    for l in old_pgstatoperations:
+    for l in old_pgstatlastoperation:
         r = l.split(',')
         tup = (r[0], r[1], r[2], r[3], r[4], r[5])
         ret.append(tup)
     return ret
 
 
-def get_prev_col_state(timestamp, master_datadir, analyze_dir, dbname):
+def get_prev_col_state(timestamp, coordinator_datadir, analyze_dir, dbname):
     logger.debug("getting previous column states...")
-    prev_col_state_file = generate_statefile_name('col', master_datadir, analyze_dir, dbname, timestamp)
+    prev_col_state_file = generate_statefile_name('col', coordinator_datadir, analyze_dir, dbname, timestamp)
     if not os.path.isfile(prev_col_state_file):
         return {}
     lines = get_lines_from_file(prev_col_state_file)
     prev_col_dict = {}
     for line in lines:
         toks = line.strip().split(',')
-        toks = map(str.strip, toks)
+        toks = list(map(str.strip, toks))
         prev_col_dict[(toks[0], toks[1])] = set(toks[2:])
 
     return prev_col_dict
@@ -1048,7 +1093,7 @@ def create_last_op_dict(last_op_entries):
 
 def construct_entries_from_dict_aostate(ao_state_dict):
     ret = []
-    for key, item in ao_state_dict.iteritems():
+    for key, item in ao_state_dict.items():
         schema = key[0]
         table = key[1]
         ret.append("%s,%s,%s" % (schema, table, item))
@@ -1057,15 +1102,15 @@ def construct_entries_from_dict_aostate(ao_state_dict):
 
 def construct_entries_from_dict_lastop(last_op_dict):
     ret = []
-    for value in last_op_dict.itervalues():
-        for entry in value.itervalues():
+    for value in last_op_dict.values():
+        for entry in value.values():
             ret.append(entry)
     return ret
 
 
 def construct_entries_from_dict_colstate(prev_col_dict):
     ret = []
-    for schema_table, col_set in prev_col_dict.iteritems():
+    for schema_table, col_set in prev_col_dict.items():
         schema = schema_table[0]
         table = schema_table[1]
         cols = ','.join(col_set)
@@ -1073,24 +1118,27 @@ def construct_entries_from_dict_colstate(prev_col_dict):
     return ret
 
 
-def compare_metadata(old_pgstatoperations, cur_pgstatoperations):
+def compare_metadata(old_pgstatlastoperation, cur_pgstatlastoperation):
     diffs = set()
-    for operation in cur_pgstatoperations:
-        if (operation[2], operation[3]) not in old_pgstatoperations \
-                or old_pgstatoperations[(operation[2], operation[3])] != operation:
+    for operation in cur_pgstatlastoperation:
+        # operation[0] and [1] give the schema and table name respectively
+        # operation[3] gives the staactionname
+        # all three are required to create a unique key for a specific operation
+        if (operation[0], operation[1], operation[3]) not in old_pgstatlastoperation \
+                or old_pgstatlastoperation[(operation[0], operation[1], operation[3])] != operation:
             diffs.add((operation[0], operation[1]))
     return diffs
 
 
-def get_pgstatlastoperations_dict(last_operations):
+def get_pgstatlastoperation_dict(last_operations):
     last_operations_dict = {}
     for operation in last_operations:
-        last_operations_dict[(str(operation[2]), operation[3])] = operation
+        last_operations_dict[(operation[0], operation[1], operation[3])] = operation
     return last_operations_dict
 
 
-def generate_statefile_name(type_str, master_data_dir, analyze_dir, dbname, timestamp):
-    use_dir = "%s/%s/%s/%s" % (master_data_dir, analyze_dir, dbname, timestamp)
+def generate_statefile_name(type_str, coordinator_data_dir, analyze_dir, dbname, timestamp):
+    use_dir = "%s/%s/%s/%s" % (coordinator_data_dir, analyze_dir, dbname, timestamp)
     if type_str == 'lastop':
         ret_str = "%s/analyze_%s_last_operation"
     elif type_str == 'ao':
@@ -1104,8 +1152,8 @@ def generate_statefile_name(type_str, master_data_dir, analyze_dir, dbname, time
     return ret_str % (use_dir, timestamp)
 
 
-def get_analyze_dirs(master_datadir, statefile_dir, dbname):
-    analyze_path = os.path.join(master_datadir, statefile_dir, dbname)
+def get_analyze_dirs(coordinator_datadir, statefile_dir, dbname):
+    analyze_path = os.path.join(coordinator_datadir, statefile_dir, dbname)
 
     if not os.path.isdir(analyze_path):
         return []
@@ -1133,7 +1181,7 @@ def validate_dir(path):
     else:
         try:
             MakeDir(path).run()
-        except OSError, e:
+        except OSError as e:
             logger.exception("Could not create directory %s" % path)
             raise AnalyzeDirCreateFailed()
         else:
@@ -1141,7 +1189,7 @@ def validate_dir(path):
     try:
         with tempfile.TemporaryFile(dir=path) as f:
             pass
-    except Exception, e:
+    except Exception as e:
         logger.exception("Cannot write to %s" % path)
         raise AnalyzeDirNotWritable()
 
@@ -1192,6 +1240,8 @@ def validate_tables(conn, tablenames):
         batch = tablenames[curr_batch * batch_size:(curr_batch + 1) * batch_size]
 
         oid_str = ','.join(map((lambda x: "('%s')" % pg.escape_string(x)), batch))
+        if not oid_str:
+            break
 
         rows = run_sql(conn, VALIDATE_TABLE_NAMES_SQL % oid_str)
         curr_batch += 1
@@ -1222,7 +1272,7 @@ def validate_columns(conn, schema, table, column_list):
 
     sql = VALIDATE_COLUMN_NAMES_SQL % (regclass_schema_tbl(schema, table),
                                        ','.join(["'%s'" % pg.escape_string(x) for x in column_list]))
-    valid_col_count = dbconn.execSQLForSingleton(conn, sql)
+    valid_col_count = dbconn.querySingleton(conn, sql)
 
     if int(valid_col_count) != len(column_list):
         raise Exception(
@@ -1262,16 +1312,16 @@ def create_parser():
                       help="List the tables to be analyzed without actually running analyze (dry run).")
     parser.add_option('-p', type='int', dest='parallel_level', default=5, metavar="<parallel level>",
                       help="Parallel level, i.e. the number of tables to be analyzed in parallel. Valid numbers are between 1 and 10. Default value is 5.")
-    parser.add_option('--skip_root_stats', action='store_false', dest='rootstats', default=True,
-                      help="Skip refreshing root partition stats if any of the leaf partitions is analyzed.")
+    parser.add_option('--skip_orca_root_stats', action='store_false', dest='orca_rootstats', default=True,
+                      help="Suppress generation of root partition stats for ORCA.")
     parser.add_option('--gen_profile_only', action='store_true', dest='gen_profile_only', default=False,
                       help="Create cached state files to indicate specified table or all tables have been analyzed.")
     parser.add_option('--full', action='store_true', dest='full_analyze', default=False,
                       help="Analyze without using incremental. All tables requested by the user will be analyzed.")
     parser.add_option('--clean_last', action='store_true', dest='clean_last', default=False,
-                      help="Clean the state files generated by last analyzedb run. All other options except -d will be ignored.")
+                      help="Clean the state files generated by last analyzedb run. All other options except -d and -a will be ignored.")
     parser.add_option('--clean_all', action='store_true', dest='clean_all', default=False,
-                      help="Clean all the state files generated by analyzedb. All other options except -d will be ignored.")
+                      help="Clean all the state files generated by analyzedb. All other options except -d and -a will be ignored.")
     parser.add_option('-h', '-?', '--help', action='help',
                       help='Show this help message and exit.')
     parser.add_option('-v', '--verbose', action='store_true', dest='verbose', help='Print debug messages.')
@@ -1297,21 +1347,23 @@ class AnalyzeWorkerPool(WorkerPool):
         self.work_queue = Queue()
         self.completed_queue = Queue()
         self.should_stop = False
-        self.num_assigned = 0
+        self._assigned = 0
         self.daemonize = False
+        self.logger = logger
+
         if items is not None:
             for item in items:
-                self.work_queue.put(item)
-                self.num_assigned += 1
+                self.addCommand(item)
 
         for i in range(0, numWorkers):
             # use AnalyzeWorker instead of Worker
             w = AnalyzeWorker("worker%d" % i, self)
             self.workers.append(w)
-            w.start()
         self.numWorkers = numWorkers
-        self.logger = logger
 
+    def run(self):
+        for w in self.workers:
+            w.start()
 
 class AnalyzeWorker(Worker):
     """
@@ -1344,7 +1396,10 @@ class AnalyzeWorker(Worker):
                     self.pool.markTaskDone()
                     self.cmd = None
                 else:
-                    self.logger.info("[%s] started  %s" % (self.name, self.cmd.name))
+                    # run the command
+                    # get rid of the gucs for displaying in the log
+                    cmd_display = re.sub(r'set .*;\s*', '', self.cmd.name)
+                    self.logger.info("[%s] started  %s" % (self.name, cmd_display))
                     start_time = time.time()
                     self.cmd.run()
                     end_time = time.time()
@@ -1352,12 +1407,12 @@ class AnalyzeWorker(Worker):
                     if len(stderr) > 0:  # emit stderr if there is any
                         self.logger.warning('\n'.join(stderr))
                     if self.cmd.was_successful():
-                        self.logger.info("[%s] finished %s. Elapsed time: %d seconds." % (self.name, self.cmd.name,
+                        self.logger.info("[%s] finished %s. Elapsed time: %d seconds." % (self.name, cmd_display,
                                                                                           int(end_time - start_time)))
                     self.pool.addFinishedWorkItem(self.cmd)
                     self.cmd = None
 
-            except Exception, e:
+            except Exception as e:
                 self.logger.exception(e)
                 if self.cmd:
                     self.logger.debug("[%s] finished cmd with exception: %s" % (self.name, self.cmd))

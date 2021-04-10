@@ -5,7 +5,7 @@
 
 SELECT * FROM street;
 
-SELECT name, #thepath FROM iexit ORDER BY 1, 2;
+SELECT name, #thepath FROM iexit ORDER BY name COLLATE "C", 2;
 
 SELECT * FROM toyemp WHERE name = 'sharon';
 
@@ -108,6 +108,20 @@ EXPLAIN (COSTS OFF) SELECT * FROM my_property_normal WHERE f_leak(passwd);
 
 SELECT * FROM my_property_secure WHERE f_leak(passwd);
 EXPLAIN (COSTS OFF) SELECT * FROM my_property_secure WHERE f_leak(passwd);
+
+--
+-- scenario: qualifiers can be pushed down if they contain leaky functions,
+--           provided they aren't passed data from inside the view.
+--
+SELECT * FROM my_property_normal v
+		WHERE f_leak('passwd') AND f_leak(passwd);
+EXPLAIN (COSTS OFF) SELECT * FROM my_property_normal v
+		WHERE f_leak('passwd') AND f_leak(passwd);
+
+SELECT * FROM my_property_secure v
+		WHERE f_leak('passwd') AND f_leak(passwd);
+EXPLAIN (COSTS OFF) SELECT * FROM my_property_secure v
+		WHERE f_leak('passwd') AND f_leak(passwd);
 
 --
 -- scenario: if a qualifier references only one-side of a particular join-

@@ -3,7 +3,7 @@
  * cdbappendonlyxlog.h
  *
  * Portions Copyright (c) 2009-2010, Greenplum inc
- * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
  *
  *
  * IDENTIFICATION
@@ -15,7 +15,8 @@
 #define CDBAPPENDONLYXLOG_H
 
 
-#include "access/xlog.h"
+#include "access/xlogreader.h"
+#include "lib/stringinfo.h"
 #include "storage/fd.h"
 #include "storage/relfilenode.h"
 #include "storage/smgr.h"
@@ -54,9 +55,10 @@ extern void xlog_ao_insert(RelFileNode relFileNode, int32 segmentFileNum,
 extern void xlog_ao_truncate(RelFileNode relFileNode, int32 segmentFileNum, int64 offset);
 
 
-extern void appendonly_redo(XLogRecPtr beginLoc, XLogRecPtr lsn, XLogRecord *record);
+extern void appendonly_redo(XLogReaderState *record);
 
 /* in appendonlydesc.c */
-extern void appendonly_desc(StringInfo buf, XLogRecord *record);
+extern void appendonly_desc(StringInfo buf, XLogReaderState *record);
+extern const char *appendonly_identify(uint8 info);
 
 #endif   /* CDBAPPENDONLYXLOG_H */

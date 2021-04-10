@@ -13,10 +13,9 @@ CREATE EXTENSION IF NOT EXISTS gp_inject_fault;
 -- end_matchsubs
 -- skip FTS probes always
 select gp_inject_fault_infinite('fts_probe', 'skip', 1);
-NOTICE:  Success:
  gp_inject_fault_infinite 
 --------------------------
- t
+ Success:
 (1 row)
 
 select gp_request_fts_probe_scan();
@@ -26,32 +25,44 @@ select gp_request_fts_probe_scan();
 (1 row)
 
 select gp_wait_until_triggered_fault('fts_probe', 1, 1);
-NOTICE:  Success:
  gp_wait_until_triggered_fault 
 -------------------------------
- t
+ Success:
 (1 row)
 
--- skip GDD scan always
-select gp_inject_fault_infinite('gdd_probe', 'skip', 1);
-NOTICE:  Success:
- gp_inject_fault_infinite 
---------------------------
- t
+-- Test cdbdisp_getDispatchResults() fail in CdbDispatchCopyStart()
+create table dispatch_tbl (a int) distributed by (a);
+insert into dispatch_tbl values (2),(1),(5);
+-- fault on seg1 to block insert command into the dispatch_tbl table
+select gp_inject_fault('DoCopyToFail', 'error', '', '', '',
+   1, 1, 0, dbid) from gp_segment_configuration
+   where content = 1 and role = 'p';
+ gp_inject_fault 
+-----------------
+ Success:
 (1 row)
 
--- acting like gp_request_fts_probe_scan() to wake up GDD backend so
--- 'gdd_probe' can be triggered as soon as possible
--- start_ignore
-\! gpstop -u
--- end_ignore
-select gp_wait_until_triggered_fault('gdd_probe', 1, 1);
-NOTICE:  Success:
- gp_wait_until_triggered_fault 
--------------------------------
- t
+copy dispatch_tbl to stdout;
+ERROR:  fault triggered, fault name:'DoCopyToFail' fault type:'error'  (seg1 192.168.235.128:7003 pid=68980)
+--select gp_wait_until_triggered_fault('DoCopyToFail', 1, dbid)
+--  from gp_segment_configuration where content = 1 and role = 'p';
+select gp_inject_fault('DoCopyToFail', 'reset', dbid)
+   from gp_segment_configuration
+   where content = 1 and role = 'p';
+ gp_inject_fault 
+-----------------
+ Success:
 (1 row)
 
+select * from dispatch_tbl;
+ a 
+---
+ 1
+ 5
+ 2
+(3 rows)
+
+drop table dispatch_tbl;
 -- Test quoting of GUC values and database names when they're sent to segments
 set client_min_messages='warning';
 DROP DATABASE IF EXISTS "funny""db'with\\quotes";
@@ -64,6 +75,42 @@ ALTER DATABASE "funny""db'with\\quotes" SET search_path="funny""schema'with\\quo
 -- Remove this DROP DATABASE once it's fixed. That should happen when we
 -- reach commit a2385cac13, which was backported to PostgreSQL 9.1.
 DROP DATABASE "funny""db'with\\quotes";
+-- set_config() used to have quoting problems as well when dispatching to
+-- segments.
+CREATE TABLE IF NOT EXISTS should_be_visible();
+CREATE OR REPLACE FUNCTION visible_to_segments(tbl oid)
+    RETURNS SETOF boolean
+    EXECUTE ON ALL SEGMENTS
+    LANGUAGE plpgsql AS
+$$
+BEGIN
+    RETURN NEXT pg_catalog.pg_table_is_visible(tbl);
+END
+$$;
+-- Spin up any gangs necessary to handle the SELECT DISTINCT so that they
+-- receive the new search_path setting from the set_config() dispatch.
+SELECT DISTINCT visible_to_segments('public.should_be_visible'::regclass);
+ visible_to_segments 
+---------------------
+ t
+(1 row)
+
+-- Now change search_path. This setting should not affect the visibility of the
+-- public schema if it's dispatched correctly.
+SELECT set_config('search_path', 'pg_catalog,public', false);
+    set_config     
+-------------------
+ pg_catalog,public
+(1 row)
+
+-- Check that our test table is still visible.
+SELECT DISTINCT visible_to_segments('public.should_be_visible'::regclass);
+ visible_to_segments 
+---------------------
+ t
+(1 row)
+
+RESET search_path;
 -- There used to be a bug in the quoting when the search_path setting was sent
 -- to the segment. It was not easily visible when search_path was set with a
 -- SET command, only when the setting was sent as part of the startup packet.
@@ -109,6 +156,48 @@ CREATE TABLE "my table" (id integer);
 NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column named 'id' as the Greenplum Database data distribution key for this table.
 HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
 DROP TABLE "my table";
+-- test ALTER DATABASE SET FROM CURRENT
+SHOW search_path;
+     search_path     
+---------------------
+ "my schema", public
+(1 row)
+
+ALTER DATABASE "dispatch test db" RESET ALL;
+\c
+SHOW search_path;
+   search_path   
+-----------------
+ "$user", public
+(1 row)
+
+SET search_path="my schema", public;
+SHOW search_path;
+     search_path     
+---------------------
+ "my schema", public
+(1 row)
+
+ALTER DATABASE "dispatch test db" SET search_path FROM CURRENT;
+\c
+SHOW search_path;
+     search_path     
+---------------------
+ "my schema", public
+(1 row)
+
+SELECT 0 as gp_segment_id, setconfig FROM gp_dist_random('pg_db_role_setting')
+WHERE setdatabase = (SELECT oid FROM pg_database WHERE datname='dispatch test db') and gp_segment_id = 0
+UNION
+SELECT -1 as gp_segment_id, setconfig FROM pg_db_role_setting
+WHERE setdatabase = (SELECT oid FROM pg_database WHERE datname='dispatch test db')
+ORDER BY gp_segment_id;
+ gp_segment_id |                   setconfig                   
+---------------+-----------------------------------------------
+            -1 | {"search_path=\"my schema\", public"}
+             0 | {"search_path=\"\"\"my schema\"\", public\""}
+(2 rows)
+
 -- Clean up
 \c dispatch_test_db
 DROP DATABASE "dispatch test db";
@@ -125,18 +214,16 @@ HINT:  Size controlled by gp_max_plan_size
 -- during backend initialization
 --
 select gp_inject_fault('send_qe_details_init_backend', 'reset', 2);
-NOTICE:  Success:  (seg0 127.0.0.1:40000 pid=11034)
  gp_inject_fault 
 -----------------
- t
+ Success:
 (1 row)
 
 -- inject a 'skip' fault before QE sends its motion_listener
 select gp_inject_fault('send_qe_details_init_backend', 'skip', 2);
-NOTICE:  Success:  (seg0 127.0.0.1:40000 pid=11034)
  gp_inject_fault 
 -----------------
- t
+ Success:
 (1 row)
 
 -- terminate exiting QEs first
@@ -147,10 +234,9 @@ ERROR:  failed to acquire resources on one or more segments
 DETAIL:  Internal error: No motion listener port (seg0 127.0.0.1:40000)
 -- reset fault injector
 select gp_inject_fault('send_qe_details_init_backend', 'reset', 2);
-NOTICE:  Success:  (seg0 127.0.0.1:40000 pid=11048)
  gp_inject_fault 
 -----------------
- t
+ Success:
 (1 row)
 
 --
@@ -184,13 +270,11 @@ insert into dispatch_test_t3 values (3,1,2);
 CREATE OR REPLACE FUNCTION cleanupAllGangs() RETURNS BOOL
 AS '@abs_builddir@/regress@DLSUFFIX@', 'cleanupAllGangs' LANGUAGE C;
 -- check if segments has backend running
-CREATE OR REPLACE FUNCTION hasBackendsExist(int) RETURNS BOOL 
-AS '@abs_builddir@/regress@DLSUFFIX@', 'hasBackendsExist' LANGUAGE C;
+CREATE OR REPLACE FUNCTION hasBackendsExist(int) RETURNS SETOF BOOL
+AS '@abs_builddir@/regress@DLSUFFIX@', 'hasBackendsExist' LANGUAGE C EXECUTE ON ALL SEGMENTS;
 -- check if QD has reusable gangs
 CREATE OR REPLACE FUNCTION hasGangsExist() RETURNS BOOL
 AS '@abs_builddir@/regress@DLSUFFIX@', 'hasGangsExist' LANGUAGE C;
--- disable debug linger to get immediate feedback from FATAL errors.
-set gp_debug_linger to 0;
 -- test log debug related code within dispatch
 set gp_log_gang to debug;
 set log_min_messages to DEBUG;
@@ -208,10 +292,9 @@ select cleanupAllGangs();
 
 -- trigger fault and report segment 0 in recovery for 5 times
 select gp_inject_fault('process_startup_packet', 'skip', '', 'dispatch_test_db', '', 1, 5, 0, 2::smallint);
-NOTICE:  Success:  (seg0 10.153.101.106:25432 pid=373785)
  gp_inject_fault 
 -----------------
- t
+ Success:
 (1 row)
 
 select cleanupAllGangs();
@@ -229,10 +312,9 @@ where dispatch_test_t1.c2 = dispatch_test_t2.c2 and dispatch_test_t2.c3 = dispat
 (1 row)
 
 select gp_inject_fault('process_startup_packet', 'reset', 2);
-NOTICE:  Success:  (seg0 127.0.0.1:40000 pid=11092)
  gp_inject_fault 
 -----------------
- t
+ Success:
 (1 row)
 
 -- Case 1.2
@@ -249,10 +331,9 @@ select cleanupAllGangs();
 
 -- trigger fault and put segment 0 into recovery mode
 select gp_inject_fault('process_startup_packet', 'skip', '', 'dispatch_test_db', '', 1, 5, 0, 2::smallint);
-NOTICE:  Success:  (seg0 10.153.101.106:25432 pid=373867)
  gp_inject_fault 
 -----------------
- t
+ Success:
 (1 row)
 
 select cleanupAllGangs();
@@ -276,10 +357,9 @@ where dispatch_test_t1.c2 = dispatch_test_t2.c2 and dispatch_test_t2.c3 = dispat
 (1 row)
 
 select gp_inject_fault('process_startup_packet', 'reset', 2);
-NOTICE:  Success:  (seg0 10.153.101.106:25432 pid=373925)
  gp_inject_fault 
 -----------------
- t
+ Success:
 (1 row)
 
 --start_ignore
@@ -304,7 +384,7 @@ select cleanupAllGangs();
 (1 row)
 
 -- expect no zombie backends left on segments 
-select sum(case when hasBackendsExist(30)='t' then 1 else 0 end) > 0 as hasbackends from gp_dist_random('gp_id');
+select sum(case when h = 't' then 1 else 0 end) > 0 as hasbackends from hasbackendsexist(30) as h;
  hasbackends 
 -------------
  f
@@ -330,10 +410,9 @@ select cleanupAllGangs();
 
 -- segment 0 report an error when get a request 
 select gp_inject_fault('send_qe_details_init_backend', 'error', 2);
-NOTICE:  Success:  (seg0 127.0.0.1:40000 pid=11221)
  gp_inject_fault 
 -----------------
- t
+ Success:
 (1 row)
 
 select cleanupAllGangs();
@@ -356,7 +435,7 @@ select * from hasGangsExist();
 (1 row)
 
 -- expect no zombie backends left on segments.
-select sum(case when hasBackendsExist(30)='t' then 1 else 0 end) > 0 as hasbackends from gp_dist_random('gp_id');
+select sum(case when h = 't' then 1 else 0 end) > 0 as hasbackends from hasbackendsexist(30) as h;
  hasbackends 
 -------------
  f
@@ -370,18 +449,16 @@ select cleanupAllGangs();
 (1 row)
 
 select gp_inject_fault('send_qe_details_init_backend', 'reset', 2);
-NOTICE:  Success:  (seg0 127.0.0.1:40000 pid=11272)
  gp_inject_fault 
 -----------------
- t
+ Success:
 (1 row)
 
 -- segment 0 report an error when get the second request (reader gang creation request)
 select gp_inject_fault('send_qe_details_init_backend', 'error', '', '', '', 3, 3, 0, 2::smallint);
-NOTICE:  Success:  (seg0 127.0.0.1:40000 pid=11272)
  gp_inject_fault 
 -----------------
- t
+ Success:
 (1 row)
 
 select cleanupAllGangs();
@@ -404,17 +481,16 @@ select * from hasGangsExist();
 (1 row)
 
 -- expect QEs exist.
-select sum(case when hasBackendsExist(0)='t' then 1 else 0 end) > 0 as hasbackends from gp_dist_random('gp_id');
+select sum(case when h = 't' then 1 else 0 end) > 0 as hasbackends from hasbackendsexist(0) as h;
  hasbackends 
 -------------
  t
 (1 row)
 
 select gp_inject_fault('send_qe_details_init_backend', 'reset', 2);
-NOTICE:  Success:  (seg0 127.0.0.1:40000 pid=11284)
  gp_inject_fault 
 -----------------
- t
+ Success:
 (1 row)
 
 -- Case 1.4
@@ -423,10 +499,9 @@ NOTICE:  Success:  (seg0 127.0.0.1:40000 pid=11284)
 -- gp_segment_connect_timeout = 1 : wait 1 second
 set gp_segment_connect_timeout to 1;
 select gp_inject_fault('process_startup_packet', 'suspend', '', 'dispatch_test_db', '', 1, 1, 0, 2::smallint);
-NOTICE:  Success:  (seg0 10.153.101.106:25432 pid=374053)
  gp_inject_fault 
 -----------------
- t
+ Success:
 (1 row)
 
 select cleanupAllGangs();
@@ -441,26 +516,23 @@ where dispatch_test_t1.c2 = dispatch_test_t2.c2 and dispatch_test_t2.c3 = dispat
 ERROR:  failed to acquire resources on one or more segments
 DETAIL:  timeout expired
  (seg0 127.0.0.1:40000)
+set gp_segment_connect_timeout to 0;
 select gp_inject_fault('process_startup_packet', 'resume', 2);
-NOTICE:  Success:  (seg0 127.0.0.1:40000 pid=11314)
  gp_inject_fault 
 -----------------
- t
+ Success:
 (1 row)
 
 select gp_inject_fault('process_startup_packet', 'reset', 2);
-NOTICE:  Success:  (seg0 127.0.0.1:40000 pid=11314)
  gp_inject_fault 
 -----------------
- t
+ Success:
 (1 row)
 
-set gp_segment_connect_timeout to 0;
 select gp_inject_fault('process_startup_packet', 'sleep', '', '', '', 1, 1, 2, 2::smallint);
-NOTICE:  Success:  (seg0 127.0.0.1:40000 pid=11337)
  gp_inject_fault 
 -----------------
- t
+ Success:
 (1 row)
 
 select cleanupAllGangs();
@@ -478,10 +550,9 @@ where dispatch_test_t1.c2 = dispatch_test_t2.c2 and dispatch_test_t2.c3 = dispat
 (1 row)
 
 select gp_inject_fault('process_startup_packet', 'reset', 2);
-NOTICE:  Success:  (seg0 127.0.0.1:40000 pid=11337)
  gp_inject_fault 
 -----------------
- t
+ Success:
 (1 row)
 
 -- Case 1.5
@@ -490,10 +561,9 @@ NOTICE:  Success:  (seg0 127.0.0.1:40000 pid=11337)
 -- must set log_min_messages to default when using interrupt, there is a bug in fault injection.
 set log_min_messages to default;
 select gp_inject_fault('after_one_slice_dispatched', 'interrupt', 1);
-NOTICE:  Success:
  gp_inject_fault 
 -----------------
- t
+ Success:
 (1 row)
 
 -- should fail and report error
@@ -501,10 +571,9 @@ select * from dispatch_test_t1, dispatch_test_t2, dispatch_test_t3
 where dispatch_test_t1.c2 = dispatch_test_t2.c2 and dispatch_test_t2.c3 = dispatch_test_t3.c3;
 ERROR:  canceling statement due to user request
 select gp_inject_fault('after_one_slice_dispatched', 'reset', 1);
-NOTICE:  Success:
  gp_inject_fault 
 -----------------
- t
+ Success:
 (1 row)
 
 -- Case 1.6
@@ -512,20 +581,18 @@ NOTICE:  Success:
 -- dispatched, the query can be cancelled correctly.
 -- 
 select gp_inject_fault('before_one_slice_dispatched', 'error', 1);
-NOTICE:  Success:
  gp_inject_fault 
 -----------------
- t
+ Success:
 (1 row)
 
 update dispatch_test_t1 set c2 = 3 from dispatch_test_t2, dispatch_test_t3
 where dispatch_test_t1.c2 = dispatch_test_t2.c2 and dispatch_test_t2.c3 = dispatch_test_t3.c3;
 ERROR:  fault triggered, fault name:'before_one_slice_dispatched' fault type:'error'
 select gp_inject_fault('before_one_slice_dispatched', 'reset', 1);
-NOTICE:  Success:
  gp_inject_fault 
 -----------------
- t
+ Success:
 (1 row)
 
 -- test logging of gang management
@@ -604,17 +671,15 @@ select cleanupAllGangs();
 (1 row)
 
 select gp_inject_fault('gang_created', 'reset', 1);
-NOTICE:  Success:
  gp_inject_fault 
 -----------------
- t
+ Success:
 (1 row)
 
 select gp_inject_fault('gang_created', 'error', 1);
-NOTICE:  Success:
  gp_inject_fault 
 -----------------
- t
+ Success:
 (1 row)
 
 select 1 from gp_dist_random('gp_id') limit 1;
@@ -627,30 +692,27 @@ select 1 from gp_dist_random('gp_id') limit 1;
 (1 row)
 
 select gp_inject_fault('gang_created', 'reset', 1);
-NOTICE:  Success:
  gp_inject_fault 
 -----------------
- t
+ Success:
 (1 row)
 
 --
 -- Test that an error happens after a big command is dispatched.
 --
 select gp_inject_fault('after_one_slice_dispatched', 'error', 1);
-NOTICE:  Success:
  gp_inject_fault 
 -----------------
- t
+ Success:
 (1 row)
 
 select * from gp_dist_random('gp_id')
 	where gpname > (select * from repeat('sssss', 10000000));
 ERROR:  fault triggered, fault name:'after_one_slice_dispatched' fault type:'error'
 select gp_inject_fault('after_one_slice_dispatched', 'reset', 1);
-NOTICE:  Success:
  gp_inject_fault 
 -----------------
- t
+ Success:
 (1 row)
 
 select * from gp_dist_random('gp_id')
@@ -687,16 +749,15 @@ HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sur
 insert into disp_temp_test1 values (1, 2);
 -- Let cleanupSegdb() return false and writer gang be destroyed
 select gp_inject_fault('cleanup_qe', 'skip', 1);
-NOTICE:  Success:
  gp_inject_fault 
 -----------------
- t
+ Success:
 (1 row)
 
 select * from disp_temp_test1 where c1 / 0 = 9;
 ERROR:  division by zero  (seg2 slice1 127.0.0.1:25434 pid=27218)
 rollback to savepoint s1;
-WARNING:  Writer gang of current global transaction is lost
+WARNING:  writer gang of current global transaction is lost
 WARNING:  Any temporary tables for this session have been dropped because the gang was disconnected (session id = 104)
 ERROR:  Could not rollback to savepoint (ROLLBACK TO SAVEPOINT s1)
 rollback;
@@ -711,27 +772,103 @@ LINE 1: select * from disp_temp_test1;
                       ^
 -- reset fault
 select gp_inject_fault('cleanup_qe', 'reset', 1);
-NOTICE:  Success:
  gp_inject_fault 
 -----------------
- t
+ Success:
 (1 row)
 
 -- resume FTS probes
 select gp_inject_fault('fts_probe', 'reset', 1);
-NOTICE:  Success:
  gp_inject_fault 
 -----------------
- t
+ Success:
 (1 row)
 
--- resume GDD scan 
-select gp_inject_fault('gdd_probe', 'reset', 1);
-NOTICE:  Success:
- gp_inject_fault 
------------------
- t
+--
+-- Test portal cleanup
+-- prepare a query contains init plan, main plan create a unnamed portal
+-- and will need multiple slices , init plan also need to allocated multiple
+-- slices in a named portal (eg: a cursor). The executing order is:
+-- 1. gangs of main plan is pre-assigned 2. init plan is executed 3. main plan
+-- is executed. This test it meant to test that cleanup of the named portal in
+-- the end of step2 will not affect the pre-allocated gangs of the main plan.
+--
+create table dispatch_foo (c1 int, c2 int);
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column named 'c1' as the Greenplum Database data distribution key for this table.
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
+create table dispatch_bar (c1 int, c2 int);
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column named 'c1' as the Greenplum Database data distribution key for this table.
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
+create or replace function dispatch_foo_func()
+returns int
+as
+$BODY$
+declare
+t_record record;
+BEGIN
+	drop table if exists tmp1;
+	create temp table tmp1 as select dispatch_foo.c1, dispatch_bar.c2 from dispatch_foo, dispatch_bar;
+	for t_record in (select count(*) from dispatch_foo, dispatch_bar)
+	loop
+		NULL;
+	end loop;
+	return 1;
+END;
+$BODY$
+language plpgsql volatile;
+set gp_cached_segworkers_threshold to 1;
+select count(*) from dispatch_foo, dispatch_bar where exists (select dispatch_foo_func());
+ count 
+-------
+     0
 (1 row)
 
+reset gp_cached_segworkers_threshold;
+--
+-- Test executor double fault
+-- check PG_TRY/PG_CATCH - we should always return an original error
+-- (for a query and its explain analyze)
+--
+drop table if exists double_fault;
+create table double_fault(a int) distributed by (a);
+insert into double_fault select generate_series(1, 10);
+create or replace function fault_exec_plan(explain_analyze bool default true) returns void as $_$
+declare
+    query text;
+begin
+    perform gp_inject_fault('executor_pre_tuple_processed', 'reset', dbid) from gp_segment_configuration;
+    perform gp_inject_fault('send_exec_stats', 'reset', dbid) from gp_segment_configuration;
+
+    perform gp_inject_fault('executor_pre_tuple_processed', 'error', dbid)
+    from gp_segment_configuration where role = 'p' and content > -1;
+    perform gp_inject_fault('send_exec_stats', 'error', dbid)
+    from gp_segment_configuration where role = 'p' and content > -1;
+
+    if explain_analyze then
+        query := 'explain analyze select count(*) from double_fault';
+    else
+        query := 'select count(*) from double_fault';
+    end if;
+    execute query;
+
+    perform gp_inject_fault('executor_pre_tuple_processed', 'reset', dbid) from gp_segment_configuration;
+    perform gp_inject_fault('send_exec_stats', 'reset', dbid) from gp_segment_configuration;
+exception when fault_inject then
+    perform gp_inject_fault('executor_pre_tuple_processed', 'reset', dbid) from gp_segment_configuration;
+    perform gp_inject_fault('send_exec_stats', 'reset', dbid) from gp_segment_configuration;
+
+    raise exception $$'%' fault triggered$$, case
+        when coalesce(substring(sqlerrm from 'send_exec_stats'), '') != '' then 'send_exec_stats'
+        when coalesce(substring(sqlerrm from 'executor_pre_tuple_processed'), '') != '' then 'executor_pre_tuple_processed'
+    end;
+end;
+$_$ language plpgsql;
+-- Query raising 'executor_pre_tuple_processed' error
+select fault_exec_plan(false);
+ERROR:  'executor_pre_tuple_processed' fault triggered
+-- Same query with explain analyze (should raise
+-- 'executor_pre_tuple_processed' not 'send_exec_stats')
+select fault_exec_plan(true);
+ERROR:  'executor_pre_tuple_processed' fault triggered
 \c regression
 DROP DATABASE dispatch_test_db;

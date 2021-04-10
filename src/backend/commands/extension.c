@@ -9,10 +9,10 @@
  * dependent objects can be associated with it.  An extension is created by
  * populating the pg_extension catalog from a "control" file.
  * The extension control file is parsed with the same parser we use for
- * postgresql.conf and recovery.conf.  An extension also has an installation
- * script file, containing SQL commands to create the extension's objects.
+ * postgresql.conf.  An extension also has an installation script file,
+ * containing SQL commands to create the extension's objects.
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -29,9 +29,13 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "access/genam.h"
 #include "access/htup_details.h"
+#include "access/relation.h"
 #include "access/sysattr.h"
+#include "access/table.h"
 #include "access/xact.h"
+#include "catalog/catalog.h"
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
 #include "catalog/namespace.h"
@@ -41,28 +45,32 @@
 #include "catalog/pg_extension.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_type.h"
+#include "cdb/cdbgang.h"
 #include "commands/alter.h"
 #include "commands/comment.h"
+#include "commands/defrem.h"
 #include "commands/extension.h"
 #include "commands/schemacmds.h"
 #include "funcapi.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
+#include "nodes/makefuncs.h"
 #include "storage/fd.h"
 #include "tcop/utility.h"
+#include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
-#include "utils/tqual.h"
+#include "utils/varlena.h"
 
 #include "catalog/oid_dispatch.h"
 #include "cdb/cdbdisp_query.h"
 #include "cdb/cdbvars.h"
 #include "utils/memutils.h"
-
+#include "nodes/makefuncs.h"
 
 /* Globally visible state variables */
 bool		creating_extension = false;
@@ -76,7 +84,8 @@ typedef struct ExtensionControlFile
 	char	   *name;			/* name of the extension */
 	char	   *directory;		/* directory for script files */
 	char	   *default_version;	/* default install target version, if any */
-	char	   *module_pathname;	/* string to substitute for MODULE_PATHNAME */
+	char	   *module_pathname;	/* string to substitute for
+									 * MODULE_PATHNAME */
 	char	   *comment;		/* comment, if any */
 	char	   *schema;			/* target schema (allowed if !relocatable) */
 	bool		relocatable;	/* is ALTER EXTENSION SET SCHEMA supported? */
@@ -96,21 +105,32 @@ typedef struct ExtensionVersionInfo
 	/* working state for Dijkstra's algorithm: */
 	bool		distance_known; /* is distance from start known yet? */
 	int			distance;		/* current worst-case distance estimate */
-	struct ExtensionVersionInfo *previous;		/* current best predecessor */
+	struct ExtensionVersionInfo *previous;	/* current best predecessor */
 } ExtensionVersionInfo;
 
 /* Local functions */
 static List *find_update_path(List *evi_list,
-				 ExtensionVersionInfo *evi_start,
-				 ExtensionVersionInfo *evi_target,
-				 bool reinitialize);
+							  ExtensionVersionInfo *evi_start,
+							  ExtensionVersionInfo *evi_target,
+							  bool reject_indirect,
+							  bool reinitialize);
+static Oid	get_required_extension(char *reqExtensionName,
+								   char *extensionName,
+								   char *origSchemaName,
+								   bool cascade,
+								   List *parents,
+								   bool is_create);
 static void get_available_versions_for_extension(ExtensionControlFile *pcontrol,
-									 Tuplestorestate *tupstore,
-									 TupleDesc tupdesc);
+												 Tuplestorestate *tupstore,
+												 TupleDesc tupdesc);
+static Datum convert_requires_to_datum(List *requires);
 static void ApplyExtensionUpdates(Oid extensionOid,
-					  ExtensionControlFile *pcontrol,
-					  const char *initialVersion,
-					  List *updateVersions);
+								  ExtensionControlFile *pcontrol,
+								  const char *initialVersion,
+								  List *updateVersions,
+								  char *origSchemaName,
+								  bool cascade,
+								  bool is_create);
 static char *read_whole_file(const char *filename, int *length);
 
 
@@ -129,7 +149,7 @@ get_extension_oid(const char *extname, bool missing_ok)
 	HeapTuple	tuple;
 	ScanKeyData entry[1];
 
-	rel = heap_open(ExtensionRelationId, AccessShareLock);
+	rel = table_open(ExtensionRelationId, AccessShareLock);
 
 	ScanKeyInit(&entry[0],
 				Anum_pg_extension_extname,
@@ -143,13 +163,13 @@ get_extension_oid(const char *extname, bool missing_ok)
 
 	/* We assume that there can be at most one matching tuple */
 	if (HeapTupleIsValid(tuple))
-		result = HeapTupleGetOid(tuple);
+		result = ((Form_pg_extension) GETSTRUCT(tuple))->oid;
 	else
 		result = InvalidOid;
 
 	systable_endscan(scandesc);
 
-	heap_close(rel, AccessShareLock);
+	table_close(rel, AccessShareLock);
 
 	if (!OidIsValid(result) && !missing_ok)
 		ereport(ERROR,
@@ -174,10 +194,10 @@ get_extension_name(Oid ext_oid)
 	HeapTuple	tuple;
 	ScanKeyData entry[1];
 
-	rel = heap_open(ExtensionRelationId, AccessShareLock);
+	rel = table_open(ExtensionRelationId, AccessShareLock);
 
 	ScanKeyInit(&entry[0],
-				ObjectIdAttributeNumber,
+				Anum_pg_extension_oid,
 				BTEqualStrategyNumber, F_OIDEQ,
 				ObjectIdGetDatum(ext_oid));
 
@@ -194,7 +214,7 @@ get_extension_name(Oid ext_oid)
 
 	systable_endscan(scandesc);
 
-	heap_close(rel, AccessShareLock);
+	table_close(rel, AccessShareLock);
 
 	return result;
 }
@@ -213,10 +233,10 @@ get_extension_schema(Oid ext_oid)
 	HeapTuple	tuple;
 	ScanKeyData entry[1];
 
-	rel = heap_open(ExtensionRelationId, AccessShareLock);
+	rel = table_open(ExtensionRelationId, AccessShareLock);
 
 	ScanKeyInit(&entry[0],
-				ObjectIdAttributeNumber,
+				Anum_pg_extension_oid,
 				BTEqualStrategyNumber, F_OIDEQ,
 				ObjectIdGetDatum(ext_oid));
 
@@ -233,7 +253,7 @@ get_extension_schema(Oid ext_oid)
 
 	systable_endscan(scandesc);
 
-	heap_close(rel, AccessShareLock);
+	table_close(rel, AccessShareLock);
 
 	return result;
 }
@@ -275,7 +295,7 @@ check_valid_extension_name(const char *extensionname)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("invalid extension name: \"%s\"", extensionname),
-			errdetail("Extension names must not begin or end with \"-\".")));
+				 errdetail("Extension names must not begin or end with \"-\".")));
 
 	/*
 	 * No directory separators either (this is sufficient to prevent ".."
@@ -300,7 +320,7 @@ check_valid_version_name(const char *versionname)
 	if (namelen == 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-			   errmsg("invalid extension version name: \"%s\"", versionname),
+				 errmsg("invalid extension version name: \"%s\"", versionname),
 				 errdetail("Version names must not be empty.")));
 
 	/*
@@ -309,7 +329,7 @@ check_valid_version_name(const char *versionname)
 	if (strstr(versionname, "--"))
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-			   errmsg("invalid extension version name: \"%s\"", versionname),
+				 errmsg("invalid extension version name: \"%s\"", versionname),
 				 errdetail("Version names must not contain \"--\".")));
 
 	/*
@@ -318,8 +338,8 @@ check_valid_version_name(const char *versionname)
 	if (versionname[0] == '-' || versionname[namelen - 1] == '-')
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-			   errmsg("invalid extension version name: \"%s\"", versionname),
-			  errdetail("Version names must not begin or end with \"-\".")));
+				 errmsg("invalid extension version name: \"%s\"", versionname),
+				 errdetail("Version names must not begin or end with \"-\".")));
 
 	/*
 	 * No directory separators either (this is sufficient to prevent ".."
@@ -328,7 +348,7 @@ check_valid_version_name(const char *versionname)
 	if (first_dir_separator(versionname) != NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-			   errmsg("invalid extension version name: \"%s\"", versionname),
+				 errmsg("invalid extension version name: \"%s\"", versionname),
 				 errdetail("Version names must not contain directory separator characters.")));
 }
 
@@ -564,8 +584,8 @@ parse_extension_control_file(ExtensionControlFile *control,
 				/* syntax error in name list */
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("parameter \"%s\" must be a list of extension names",
-						item->name)));
+						 errmsg("parameter \"%s\" must be a list of extension names",
+								item->name)));
 			}
 		}
 		else
@@ -672,8 +692,6 @@ read_extension_script_file(const ExtensionControlFile *control,
 /*
  * Execute given SQL string.
  *
- * filename is used only to report errors.
- *
  * Note: it's tempting to just use SPI to execute the string, but that does
  * not work very well.  The really serious problem is that SPI will parse,
  * analyze, and plan the whole string before executing any of it; of course
@@ -682,8 +700,8 @@ read_extension_script_file(const ExtensionControlFile *control,
  * on printing the whole string as errcontext in case of any error, and that
  * could be very long.
  */
-static void
-execute_sql_string(const char *sql, const char *filename)
+void
+execute_sql_string(const char *sql)
 {
 	List	   *raw_parsetree_list;
 	DestReceiver *dest;
@@ -704,41 +722,39 @@ execute_sql_string(const char *sql, const char *filename)
 	 */
 	foreach(lc1, raw_parsetree_list)
 	{
-		Node	   *parsetree = (Node *) lfirst(lc1);
+		RawStmt    *parsetree = lfirst_node(RawStmt, lc1);
 		List	   *stmt_list;
 		ListCell   *lc2;
+
+		/* Be sure parser can see any DDL done so far */
+		CommandCounterIncrement();
 
 		stmt_list = pg_analyze_and_rewrite(parsetree,
 										   sql,
 										   NULL,
-										   0);
-		stmt_list = pg_plan_queries(stmt_list, 0, NULL);
+										   0,
+										   NULL);
+		stmt_list = pg_plan_queries(stmt_list, CURSOR_OPT_PARALLEL_OK, NULL);
 
 		foreach(lc2, stmt_list)
 		{
-			Node	   *stmt = (Node *) lfirst(lc2);
-
-			if (IsA(stmt, TransactionStmt))
-				ereport(ERROR,
-						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						 errmsg("transaction control statements are not allowed within an extension script")));
+			PlannedStmt *stmt = lfirst_node(PlannedStmt, lc2);
 
 			CommandCounterIncrement();
 
 			PushActiveSnapshot(GetTransactionSnapshot());
 
-			if (IsA(stmt, PlannedStmt) &&
-				((PlannedStmt *) stmt)->utilityStmt == NULL)
+			if (stmt->utilityStmt == NULL)
 			{
 				QueryDesc  *qdesc;
 
-				qdesc = CreateQueryDesc((PlannedStmt *) stmt,
+				qdesc = CreateQueryDesc(stmt,
 										sql,
 										GetActiveSnapshot(), NULL,
-										dest, NULL, GP_INSTRUMENT_OPTS);
+										dest, NULL, NULL, GP_INSTRUMENT_OPTS);
 
 				ExecutorStart(qdesc, 0);
-				ExecutorRun(qdesc, ForwardScanDirection, 0);
+				ExecutorRun(qdesc, ForwardScanDirection, 0, true);
 				ExecutorFinish(qdesc);
 				ExecutorEnd(qdesc);
 
@@ -746,9 +762,15 @@ execute_sql_string(const char *sql, const char *filename)
 			}
 			else
 			{
+				if (IsA(stmt->utilityStmt, TransactionStmt))
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("transaction control statements are not allowed within an extension script")));
+
 				ProcessUtility(stmt,
 							   sql,
 							   PROCESS_UTILITY_QUERY,
+							   NULL,
 							   NULL,
 							   dest,
 							   NULL);
@@ -762,13 +784,42 @@ execute_sql_string(const char *sql, const char *filename)
 	CommandCounterIncrement();
 }
 
+static void
+set_end_state(Node *stmt)
+{
+	AssertState(stmt != NULL);
+	AssertState(nodeTag(stmt) == T_CreateExtensionStmt || nodeTag(stmt) == T_AlterExtensionStmt);
+	if (IsA(stmt, CreateExtensionStmt))
+		((CreateExtensionStmt*)stmt)->create_ext_state = CREATE_EXTENSION_END;
+	else if (IsA(stmt, AlterExtensionStmt))
+		((AlterExtensionStmt*)stmt)->update_ext_state = UPDATE_EXTENSION_END;
+}
+
+#ifdef USE_ASSERT_CHECKING
+static bool
+is_begin_state(const Node *stmt)
+{
+	AssertState(stmt != NULL);
+	AssertState(nodeTag(stmt) == T_CreateExtensionStmt || nodeTag(stmt) == T_AlterExtensionStmt);
+	if (IsA(stmt, CreateExtensionStmt))
+		return ((const CreateExtensionStmt*)stmt)->create_ext_state == CREATE_EXTENSION_BEGIN;
+	else if (IsA(stmt, AlterExtensionStmt))
+		return ((const AlterExtensionStmt*)stmt)->update_ext_state == UPDATE_EXTENSION_BEGIN;
+	else
+		return false;  /* unreachable */
+}
+#endif
+
 /*
  * Execute the appropriate script file for installing or updating the extension
  *
  * If from_version isn't NULL, it's an update
+ *
+ * If stmt isn't NULL, it means that there already has been a Gang of type GANGTYPE_PRIMARY_WRITER,
+ * and the BEGIN phase of stmt has been executed in every QE in this Gang.
  */
 static void
-execute_extension_script(CreateExtensionStmt *stmt,
+execute_extension_script(Node *stmt,
 						 Oid extensionOid, ExtensionControlFile *control,
 						 const char *from_version,
 						 const char *version,
@@ -779,6 +830,11 @@ execute_extension_script(CreateExtensionStmt *stmt,
 	int			save_nestlevel;
 	StringInfoData pathbuf;
 	ListCell   *lc;
+
+	AssertState(Gp_role != GP_ROLE_EXECUTE);
+	AssertImply(Gp_role == GP_ROLE_DISPATCH, stmt != NULL &&
+			(nodeTag(stmt) == T_CreateExtensionStmt || nodeTag(stmt) == T_AlterExtensionStmt) &&
+			is_begin_state(stmt));
 
 	/*
 	 * Enforce superuser-ness if appropriate.  We postpone this check until
@@ -817,11 +873,11 @@ execute_extension_script(CreateExtensionStmt *stmt,
 	if (client_min_messages < WARNING)
 		(void) set_config_option("client_min_messages", "warning",
 								 PGC_USERSET, PGC_S_SESSION,
-								 GUC_ACTION_SAVE, true, 0);
+								 GUC_ACTION_SAVE, true, 0, false);
 	if (log_min_messages < WARNING)
 		(void) set_config_option("log_min_messages", "warning",
 								 PGC_SUSET, PGC_S_SESSION,
-								 GUC_ACTION_SAVE, true, 0);
+								 GUC_ACTION_SAVE, true, 0, false);
 
 	/*
 	 * Set up the search path to contain the target schema, then the schemas
@@ -846,7 +902,7 @@ execute_extension_script(CreateExtensionStmt *stmt,
 
 	(void) set_config_option("search_path", pathbuf.data,
 							 PGC_USERSET, PGC_S_SESSION,
-							 GUC_ACTION_SAVE, true, 0);
+							 GUC_ACTION_SAVE, true, 0, false);
 
 	/*
 	 * Set creating_extension and related variables so that
@@ -886,10 +942,11 @@ execute_extension_script(CreateExtensionStmt *stmt,
 		{
 			const char *qSchemaName = quote_identifier(schemaName);
 
-			t_sql = DirectFunctionCall3(replace_text,
-										t_sql,
-										CStringGetTextDatum("@extschema@"),
-										CStringGetTextDatum(qSchemaName));
+			t_sql = DirectFunctionCall3Coll(replace_text,
+											C_COLLATION_OID,
+											t_sql,
+											CStringGetTextDatum("@extschema@"),
+											CStringGetTextDatum(qSchemaName));
 		}
 
 		/*
@@ -898,16 +955,17 @@ execute_extension_script(CreateExtensionStmt *stmt,
 		 */
 		if (control->module_pathname)
 		{
-			t_sql = DirectFunctionCall3(replace_text,
-										t_sql,
-									  CStringGetTextDatum("MODULE_PATHNAME"),
-							  CStringGetTextDatum(control->module_pathname));
+			t_sql = DirectFunctionCall3Coll(replace_text,
+											C_COLLATION_OID,
+											t_sql,
+											CStringGetTextDatum("MODULE_PATHNAME"),
+											CStringGetTextDatum(control->module_pathname));
 		}
 
 		/* And now back to C string */
 		c_sql = text_to_cstring(DatumGetTextPP(t_sql));
 
-		execute_sql_string(c_sql, filename);
+		execute_sql_string(c_sql);
 	}
 	PG_CATCH();
 	{
@@ -923,20 +981,16 @@ execute_extension_script(CreateExtensionStmt *stmt,
 			/*
 			 * We must reset QE CurrentExtensionObject to InvalidOid.
 			 *
-			 * Doing heavy operations like this during exception processing
-			 * is not very cool. Let's at least get out of ErrorContext, to
-			 * leave that free for actual error processing. (Besides, the
-			 * error handling in dispatcher will hit an assertion in
-			 * CopyErrorData(), if another error happens while we're already
-			 * in ErrorContext.)
+			 * Previously, we dispatch a statement with end tag to implement
+			 * the logic of reset QE CurrentExtensionObject to InvalidOid. 
+			 * But this method has a big drawback: since current code is in 
+			 * a Catch block, which means some errors must have happened and 
+			 * QEs may have already been in the Abort State and cannot execute 
+			 * any statement dispatched to them.
+			 * 
+			 * So we simply destroy all QEs here to implement the clear logic.
 			 */
-			MemoryContext oldcxt = MemoryContextSwitchTo(CurTransactionContext);
-			stmt->create_ext_state = CREATE_EXTENSION_END;
-			CdbDispatchUtilityStatement((Node *) stmt,
-										DF_WITH_SNAPSHOT | DF_CANCEL_ON_ERROR | DF_NEED_TWO_PHASE,
-										GetAssignedOidsForDispatch(),
-										NULL);
-			MemoryContextSwitchTo(oldcxt);
+			DisconnectAndDestroyAllGangs(false);
 		}
 		PG_RE_THROW();
 	}
@@ -952,8 +1006,8 @@ execute_extension_script(CreateExtensionStmt *stmt,
 	if (Gp_role == GP_ROLE_DISPATCH && stmt != NULL)
 	{
 		/* We must reset QE CurrentExtensionObject to InvalidOid */
-		stmt->create_ext_state = CREATE_EXTENSION_END;
-		CdbDispatchUtilityStatement((Node *) stmt,
+		set_end_state(stmt);
+		CdbDispatchUtilityStatement(stmt,
 									DF_WITH_SNAPSHOT | DF_CANCEL_ON_ERROR | DF_NEED_TWO_PHASE,
 									GetAssignedOidsForDispatch(),
 									NULL);
@@ -1109,7 +1163,7 @@ identify_update_path(ExtensionControlFile *control,
 	evi_target = get_ext_ver_info(newVersion, &evi_list);
 
 	/* Find shortest path */
-	result = find_update_path(evi_list, evi_start, evi_target, false);
+	result = find_update_path(evi_list, evi_start, evi_target, false, false);
 
 	if (result == NIL)
 		ereport(ERROR,
@@ -1124,9 +1178,13 @@ identify_update_path(ExtensionControlFile *control,
  * Apply Dijkstra's algorithm to find the shortest path from evi_start to
  * evi_target.
  *
+ * If reject_indirect is true, ignore paths that go through installable
+ * versions.  This saves work when the caller will consider starting from
+ * all installable versions anyway.
+ *
  * If reinitialize is false, assume the ExtensionVersionInfo list has not
  * been used for this before, and the initialization done by get_ext_ver_info
- * is still good.
+ * is still good.  Otherwise, reinitialize all transient fields used here.
  *
  * Result is a List of names of versions to transition through (the initial
  * version is *not* included).  Returns NIL if no such path.
@@ -1135,6 +1193,7 @@ static List *
 find_update_path(List *evi_list,
 				 ExtensionVersionInfo *evi_start,
 				 ExtensionVersionInfo *evi_target,
+				 bool reject_indirect,
 				 bool reinitialize)
 {
 	List	   *result;
@@ -1143,6 +1202,8 @@ find_update_path(List *evi_list,
 
 	/* Caller error if start == target */
 	Assert(evi_start != evi_target);
+	/* Caller error if reject_indirect and target is installable */
+	Assert(!(reject_indirect && evi_target->installable));
 
 	if (reinitialize)
 	{
@@ -1169,6 +1230,9 @@ find_update_path(List *evi_list,
 			ExtensionVersionInfo *evi2 = (ExtensionVersionInfo *) lfirst(lc);
 			int			newdist;
 
+			/* if reject_indirect, treat installable versions as unreachable */
+			if (reject_indirect && evi2->installable)
+				continue;
 			newdist = evi->distance + 1;
 			if (newdist < evi2->distance)
 			{
@@ -1205,18 +1269,85 @@ find_update_path(List *evi_list,
 }
 
 /*
- * CREATE EXTENSION
+ * Given a target version that is not directly installable, find the
+ * best installation sequence starting from a directly-installable version.
+ *
+ * evi_list: previously-collected version update graph
+ * evi_target: member of that list that we want to reach
+ *
+ * Returns the best starting-point version, or NULL if there is none.
+ * On success, *best_path is set to the path from the start point.
+ *
+ * If there's more than one possible start point, prefer shorter update paths,
+ * and break any ties arbitrarily on the basis of strcmp'ing the starting
+ * versions' names.
  */
-Oid
-CreateExtension(CreateExtensionStmt *stmt)
+static ExtensionVersionInfo *
+find_install_path(List *evi_list, ExtensionVersionInfo *evi_target,
+				  List **best_path)
 {
-	DefElem    *d_schema = NULL;
-	DefElem    *d_new_version = NULL;
-	DefElem    *d_old_version = NULL;
-	char	   *schemaName;
-	Oid			schemaOid;
-	char	   *versionName;
-	char	   *oldVersionName;
+	ExtensionVersionInfo *evi_start = NULL;
+	ListCell   *lc;
+
+	*best_path = NIL;
+
+	/*
+	 * We don't expect to be called for an installable target, but if we are,
+	 * the answer is easy: just start from there, with an empty update path.
+	 */
+	if (evi_target->installable)
+		return evi_target;
+
+	/* Consider all installable versions as start points */
+	foreach(lc, evi_list)
+	{
+		ExtensionVersionInfo *evi1 = (ExtensionVersionInfo *) lfirst(lc);
+		List	   *path;
+
+		if (!evi1->installable)
+			continue;
+
+		/*
+		 * Find shortest path from evi1 to evi_target; but no need to consider
+		 * paths going through other installable versions.
+		 */
+		path = find_update_path(evi_list, evi1, evi_target, true, true);
+		if (path == NIL)
+			continue;
+
+		/* Remember best path */
+		if (evi_start == NULL ||
+			list_length(path) < list_length(*best_path) ||
+			(list_length(path) == list_length(*best_path) &&
+			 strcmp(evi_start->name, evi1->name) < 0))
+		{
+			evi_start = evi1;
+			*best_path = path;
+		}
+	}
+
+	return evi_start;
+}
+
+/*
+ * CREATE EXTENSION worker
+ *
+ * When CASCADE is specified, CreateExtensionInternal() recurses if required
+ * extensions need to be installed.  To sanely handle cyclic dependencies,
+ * the "parents" list contains a list of names of extensions already being
+ * installed, allowing us to error out if we recurse to one of those.
+ */
+static ObjectAddress
+CreateExtensionInternal(char *extensionName,
+						char *schemaName,
+						const char *versionName,
+						const char *oldVersionName,
+						bool cascade,
+						List *parents,
+						bool is_create)
+{
+	char	   *origSchemaName = schemaName;
+	Oid			schemaOid = InvalidOid;
 	Oid			extowner = GetUserId();
 	ExtensionControlFile *pcontrol;
 	ExtensionControlFile *control;
@@ -1224,133 +1355,44 @@ CreateExtension(CreateExtensionStmt *stmt)
 	List	   *requiredExtensions;
 	List	   *requiredSchemas;
 	Oid			extensionOid;
+	ObjectAddress address;
 	ListCell   *lc;
-
-	/* Check extension name validity before any filesystem access */
-	check_valid_extension_name(stmt->extname);
-
-	/*
-	 * Check for duplicate extension name.  The unique index on
-	 * pg_extension.extname would catch this anyway, and serves as a backstop
-	 * in case of race conditions; but this is a friendlier error message, and
-	 * besides we need a check to support IF NOT EXISTS.
-	 */
-	if (stmt->create_ext_state != CREATE_EXTENSION_END &&
-			get_extension_oid(stmt->extname, true) != InvalidOid)
-	{
-		if (stmt->if_not_exists)
-		{
-			ereport(NOTICE,
-					(errcode(ERRCODE_DUPLICATE_OBJECT),
-					 errmsg("extension \"%s\" already exists, skipping",
-							stmt->extname)));
-			return InvalidOid;
-		}
-		else
-			ereport(ERROR,
-					(errcode(ERRCODE_DUPLICATE_OBJECT),
-					 errmsg("extension \"%s\" already exists",
-							stmt->extname)));
-	}
-
-	if (Gp_role == GP_ROLE_EXECUTE)
-	{
-		switch (stmt->create_ext_state)
-		{
-			case CREATE_EXTENSION_INIT:
-				elog(ERROR, "invalid CREATE EXTENSION state");
-				return InvalidOid;
-
-			case CREATE_EXTENSION_BEGIN:	/* Mark creating_extension flag and add pg_extension catalog tuple */
-				creating_extension = true;
-				break;
-			case CREATE_EXTENSION_END:		/* Mark creating_extension flag = false */
-				creating_extension = false;
-				CurrentExtensionObject = InvalidOid;
-				return get_extension_oid(stmt->extname, true);
-
-			default:
-				elog(ERROR, "unrecognized create_ext_state: %d",
-						stmt->create_ext_state);
-		}
-	}
-
-	/*
-	 * We use global variables to track the extension being created, so we can
-	 * create only one extension at the same time.
-	 * Except that QE do CREATE_EXTENSION_BEGIN.
-	 */
-	if (creating_extension && !(stmt->create_ext_state == CREATE_EXTENSION_BEGIN &&
-				Gp_role == GP_ROLE_EXECUTE))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("nested CREATE EXTENSION is not supported")));
+	CreateExtensionStmt *stmt;
 
 	/*
 	 * Read the primary control file.  Note we assume that it does not contain
 	 * any non-ASCII data, so there is no need to worry about encoding at this
 	 * point.
 	 */
-	pcontrol = read_extension_control_file(stmt->extname);
-
-	/*
-	 * Read the statement option list
-	 */
-	foreach(lc, stmt->options)
-	{
-		DefElem    *defel = (DefElem *) lfirst(lc);
-
-		if (strcmp(defel->defname, "schema") == 0)
-		{
-			if (d_schema)
-				ereport(ERROR,
-						(errcode(ERRCODE_SYNTAX_ERROR),
-						 errmsg("conflicting or redundant options")));
-			d_schema = defel;
-		}
-		else if (strcmp(defel->defname, "new_version") == 0)
-		{
-			if (d_new_version)
-				ereport(ERROR,
-						(errcode(ERRCODE_SYNTAX_ERROR),
-						 errmsg("conflicting or redundant options")));
-			d_new_version = defel;
-		}
-		else if (strcmp(defel->defname, "old_version") == 0)
-		{
-			if (d_old_version)
-				ereport(ERROR,
-						(errcode(ERRCODE_SYNTAX_ERROR),
-						 errmsg("conflicting or redundant options")));
-			d_old_version = defel;
-		}
-		else
-			elog(ERROR, "unrecognized option: %s", defel->defname);
-	}
+	pcontrol = read_extension_control_file(extensionName);
 
 	/*
 	 * Determine the version to install
 	 */
-	if (d_new_version && d_new_version->arg)
-		versionName = strVal(d_new_version->arg);
-	else if (pcontrol->default_version)
-		versionName = pcontrol->default_version;
-	else
+	if (versionName == NULL)
 	{
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("version to install must be specified")));
-		versionName = NULL;		/* keep compiler quiet */
+		if (pcontrol->default_version)
+			versionName = pcontrol->default_version;
+		else
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("version to install must be specified")));
 	}
 	check_valid_version_name(versionName);
 
 	/*
-	 * Determine the (unpackaged) version to update from, if any, and then
-	 * figure out what sequence of update scripts we need to apply.
+	 * Figure out which script(s) we need to run to install the desired
+	 * version of the extension.  If we do not have a script that directly
+	 * does what is needed, we try to find a sequence of update scripts that
+	 * will get us there.
 	 */
-	if (d_old_version && d_old_version->arg)
+	if (oldVersionName)
 	{
-		oldVersionName = strVal(d_old_version->arg);
+		/*
+		 * "FROM old_version" was specified, indicating that we're trying to
+		 * update from some unpackaged version of the extension.  Locate a
+		 * series of update scripts that will do it.
+		 */
 		check_valid_version_name(oldVersionName);
 
 		if (strcmp(oldVersionName, versionName) == 0)
@@ -1385,8 +1427,48 @@ CreateExtension(CreateExtensionStmt *stmt)
 	}
 	else
 	{
+		/*
+		 * No FROM, so we're installing from scratch.  If there is an install
+		 * script for the desired version, we only need to run that one.
+		 */
+		char	   *filename;
+		struct stat fst;
+
 		oldVersionName = NULL;
-		updateVersions = NIL;
+
+		filename = get_extension_script_filename(pcontrol, NULL, versionName);
+		if (stat(filename, &fst) == 0)
+		{
+			/* Easy, no extra scripts */
+			updateVersions = NIL;
+		}
+		else
+		{
+			/* Look for best way to install this version */
+			List	   *evi_list;
+			ExtensionVersionInfo *evi_start;
+			ExtensionVersionInfo *evi_target;
+
+			/* Extract the version update graph from the script directory */
+			evi_list = get_ext_ver_list(pcontrol);
+
+			/* Identify the target version */
+			evi_target = get_ext_ver_info(versionName, &evi_list);
+
+			/* Identify best path to reach target */
+			evi_start = find_install_path(evi_list, evi_target,
+										  &updateVersions);
+
+			/* Fail if no path ... */
+			if (evi_start == NULL)
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("extension \"%s\" has no installation script nor update path for version \"%s\"",
+								pcontrol->name, versionName)));
+
+			/* Otherwise, install best starting point and then upgrade */
+			versionName = evi_start->name;
+		}
 	}
 
 	/*
@@ -1397,58 +1479,59 @@ CreateExtension(CreateExtensionStmt *stmt)
 	/*
 	 * Determine the target schema to install the extension into
 	 */
-	if (d_schema && d_schema->arg)
+	if (schemaName)
 	{
-		/*
-		 * User given schema, CREATE EXTENSION ... WITH SCHEMA ...
-		 *
-		 * It's an error to give a schema different from control->schema if
-		 * control->schema is specified.
-		 */
-		schemaName = strVal(d_schema->arg);
-
-		if (control->schema != NULL &&
-			strcmp(control->schema, schemaName) != 0)
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				errmsg("extension \"%s\" must be installed in schema \"%s\"",
-					   control->name,
-					   control->schema)));
-
-		/* If the user is giving us the schema name, it must exist already */
+		/* If the user is giving us the schema name, it must exist already. */
 		schemaOid = get_namespace_oid(schemaName, false);
 	}
-	else if (control->schema != NULL)
+
+	if (control->schema != NULL)
 	{
 		/*
 		 * The extension is not relocatable and the author gave us a schema
-		 * for it.  We create the schema here if it does not already exist.
+		 * for it.
+		 *
+		 * Unless CASCADE parameter was given, it's an error to give a schema
+		 * different from control->schema if control->schema is specified.
 		 */
+		if (schemaName && strcmp(control->schema, schemaName) != 0 &&
+			!cascade)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("extension \"%s\" must be installed in schema \"%s\"",
+							control->name,
+							control->schema)));
+
+		/* Always use the schema from control file for current extension. */
 		schemaName = control->schema;
+
+		/* Find or create the schema in case it does not exist. */
 		schemaOid = get_namespace_oid(schemaName, true);
 
-		if (schemaOid == InvalidOid)
+		if (!OidIsValid(schemaOid))
 		{
 			CreateSchemaStmt *csstmt = makeNode(CreateSchemaStmt);
 
 			csstmt->schemaname = schemaName;
-			csstmt->authid = NULL;		/* will be created by current user */
+			csstmt->authrole = NULL;	/* will be created by current user */
 			csstmt->schemaElts = NIL;
 			csstmt->if_not_exists = false;
-			CreateSchemaCommand(csstmt, NULL);
+			CreateSchemaCommand(csstmt, "(generated CREATE SCHEMA command)",
+								-1, -1);
 
 			/*
 			 * CreateSchemaCommand includes CommandCounterIncrement, so new
-			 * schema is now visible
+			 * schema is now visible.
 			 */
 			schemaOid = get_namespace_oid(schemaName, false);
 		}
 	}
-	else
+	else if (!OidIsValid(schemaOid))
 	{
 		/*
-		 * Else, use the current default creation namespace, which is the
-		 * first explicit entry in the search_path.
+		 * Neither user nor author of the extension specified schema; use the
+		 * current default creation namespace, which is the first explicit
+		 * entry in the search_path.
 		 */
 		List	   *search_path = fetch_search_path(false);
 
@@ -1466,6 +1549,15 @@ CreateExtension(CreateExtensionStmt *stmt)
 		list_free(search_path);
 	}
 
+#if 0 /* Upstream code not applicable to GPDB */
+	/*
+	 * Make note if a temporary namespace has been accessed in this
+	 * transaction.
+	 */
+	if (isTempNamespace(schemaOid))
+		MyXactFlags |= XACT_FLAGS_ACCESSEDTEMPNAMESPACE;
+#endif
+
 	/*
 	 * We don't check creation rights on the target namespace here.  If the
 	 * extension script actually creates any objects there, it will fail if
@@ -1476,8 +1568,8 @@ CreateExtension(CreateExtensionStmt *stmt)
 	 */
 
 	/*
-	 * Look up the prerequisite extensions, and build lists of their OIDs and
-	 * the OIDs of their target schemas.
+	 * Look up the prerequisite extensions, install them if necessary, and
+	 * build lists of their OIDs and the OIDs of their target schemas.
 	 */
 	requiredExtensions = NIL;
 	requiredSchemas = NIL;
@@ -1487,16 +1579,12 @@ CreateExtension(CreateExtensionStmt *stmt)
 		Oid			reqext;
 		Oid			reqschema;
 
-		/*
-		 * We intentionally don't use get_extension_oid's default error
-		 * message here, because it would be confusing in this context.
-		 */
-		reqext = get_extension_oid(curreq, true);
-		if (!OidIsValid(reqext))
-			ereport(ERROR,
-					(errcode(ERRCODE_UNDEFINED_OBJECT),
-					 errmsg("required extension \"%s\" is not installed",
-							curreq)));
+		reqext = get_required_extension(curreq,
+										extensionName,
+										origSchemaName,
+										cascade,
+										parents,
+										is_create);
 		reqschema = get_extension_schema(reqext);
 		requiredExtensions = lappend_oid(requiredExtensions, reqext);
 		requiredSchemas = lappend_oid(requiredSchemas, reqschema);
@@ -1505,12 +1593,13 @@ CreateExtension(CreateExtensionStmt *stmt)
 	/*
 	 * Insert new tuple into pg_extension, and create dependency entries.
 	 */
-	extensionOid = InsertExtensionTuple(control->name, extowner,
-										schemaOid, control->relocatable,
-										versionName,
-										PointerGetDatum(NULL),
-										PointerGetDatum(NULL),
-										requiredExtensions);
+	address = InsertExtensionTuple(control->name, extowner,
+								   schemaOid, control->relocatable,
+								   versionName,
+								   PointerGetDatum(NULL),
+								   PointerGetDatum(NULL),
+								   requiredExtensions);
+	extensionOid = address.objectId;
 
 	/*
 	 * Apply any control-file comment on extension
@@ -1528,7 +1617,30 @@ CreateExtension(CreateExtensionStmt *stmt)
 	 */
 	if (Gp_role == GP_ROLE_DISPATCH)
 	{
-		/* We must tell QE to create extension */
+		/*
+		 * We must tell QE to create extension. We don't have the original
+		 * statement at hand here, and if we're recursing for required
+		 * extension dependencies, there is no original statement object
+		 * anyway.
+		 */
+		stmt = makeNode(CreateExtensionStmt);
+
+		stmt->extname = extensionName;
+
+		if (schemaName)
+			stmt->options = lappend(stmt->options,
+									makeDefElem("schema", (Node *) makeString(schemaName), -1));
+		if (versionName)
+			stmt->options = lappend(stmt->options,
+									makeDefElem("new_version", (Node *) makeString(pstrdup(versionName)), -1));
+		if (oldVersionName)
+			stmt->options = lappend(stmt->options,
+									makeDefElem("old_version", (Node *) makeString(pstrdup(oldVersionName)), -1));
+		/*
+		 * no cascading in the QE. We'll cascade in the QD and dispatch separate
+		 * commands for each step.
+		 */
+		stmt->if_not_exists = false;
 		stmt->create_ext_state = CREATE_EXTENSION_BEGIN;
 		CdbDispatchUtilityStatement((Node *) stmt,
 									DF_WITH_SNAPSHOT | DF_CANCEL_ON_ERROR | DF_NEED_TWO_PHASE,
@@ -1538,11 +1650,12 @@ CreateExtension(CreateExtensionStmt *stmt)
 	else
 	{
 		CurrentExtensionObject = extensionOid;
+		stmt = NULL;
 	}
 
 	if (Gp_role != GP_ROLE_EXECUTE)
 	{
-		execute_extension_script(stmt, extensionOid, control,
+		execute_extension_script((Node *) stmt, extensionOid, control,
 							 oldVersionName, versionName,
 							 requiredSchemas,
 							 schemaName, schemaOid);
@@ -1552,10 +1665,222 @@ CreateExtension(CreateExtensionStmt *stmt)
 		 * though a series of ALTER EXTENSION UPDATE commands were given
 		 */
 		ApplyExtensionUpdates(extensionOid, pcontrol,
-							  versionName, updateVersions);
+							  versionName, updateVersions,
+							  origSchemaName, cascade, is_create);
 	}
 
-	return extensionOid;
+	return address;
+}
+
+/*
+ * Get the OID of an extension listed in "requires", possibly creating it.
+ */
+static Oid
+get_required_extension(char *reqExtensionName,
+					   char *extensionName,
+					   char *origSchemaName,
+					   bool cascade,
+					   List *parents,
+					   bool is_create)
+{
+	Oid			reqExtensionOid;
+
+	reqExtensionOid = get_extension_oid(reqExtensionName, true);
+	if (!OidIsValid(reqExtensionOid))
+	{
+		if (cascade)
+		{
+			/* Must install it. */
+			ObjectAddress addr;
+			List	   *cascade_parents;
+			ListCell   *lc;
+
+			/* Check extension name validity before trying to cascade. */
+			check_valid_extension_name(reqExtensionName);
+
+			/* Check for cyclic dependency between extensions. */
+			foreach(lc, parents)
+			{
+				char	   *pname = (char *) lfirst(lc);
+
+				if (strcmp(pname, reqExtensionName) == 0)
+					ereport(ERROR,
+							(errcode(ERRCODE_INVALID_RECURSION),
+							 errmsg("cyclic dependency detected between extensions \"%s\" and \"%s\"",
+									reqExtensionName, extensionName)));
+			}
+
+			ereport(NOTICE,
+					(errmsg("installing required extension \"%s\"",
+							reqExtensionName)));
+
+			/* Add current extension to list of parents to pass down. */
+			cascade_parents = lappend(list_copy(parents), extensionName);
+
+			/*
+			 * Create the required extension.  We propagate the SCHEMA option
+			 * if any, and CASCADE, but no other options.
+			 */
+			addr = CreateExtensionInternal(reqExtensionName,
+										   origSchemaName,
+										   NULL,
+										   NULL,
+										   cascade,
+										   cascade_parents,
+										   is_create);
+
+			/* Get its newly-assigned OID. */
+			reqExtensionOid = addr.objectId;
+		}
+		else
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("required extension \"%s\" is not installed",
+							reqExtensionName),
+					 is_create ?
+					 errhint("Use CREATE EXTENSION ... CASCADE to install required extensions too.") : 0));
+	}
+
+	return reqExtensionOid;
+}
+
+/*
+ * CREATE EXTENSION
+ */
+ObjectAddress
+CreateExtension(ParseState *pstate, CreateExtensionStmt *stmt)
+{
+	ObjectAddress address;
+	DefElem    *d_schema = NULL;
+	DefElem    *d_new_version = NULL;
+	DefElem    *d_old_version = NULL;
+	DefElem    *d_cascade = NULL;
+	char	   *schemaName = NULL;
+	char	   *versionName = NULL;
+	char	   *oldVersionName = NULL;
+	bool		cascade = false;
+	ListCell   *lc;
+
+	/* Check extension name validity before any filesystem access */
+	check_valid_extension_name(stmt->extname);
+
+	/*
+	 * Check for duplicate extension name.  The unique index on
+	 * pg_extension.extname would catch this anyway, and serves as a backstop
+	 * in case of race conditions; but this is a friendlier error message, and
+	 * besides we need a check to support IF NOT EXISTS.
+	 */
+	if (stmt->create_ext_state != CREATE_EXTENSION_END &&
+		get_extension_oid(stmt->extname, true) != InvalidOid)
+	{
+		if (stmt->if_not_exists)
+		{
+			ereport(NOTICE,
+					(errcode(ERRCODE_DUPLICATE_OBJECT),
+					 errmsg("extension \"%s\" already exists, skipping",
+							stmt->extname)));
+			return InvalidObjectAddress;
+		}
+		else
+			ereport(ERROR,
+					(errcode(ERRCODE_DUPLICATE_OBJECT),
+					 errmsg("extension \"%s\" already exists",
+							stmt->extname)));
+	}
+
+	if (Gp_role == GP_ROLE_EXECUTE)
+	{
+		switch (stmt->create_ext_state)
+		{
+			case CREATE_EXTENSION_INIT:
+				elog(ERROR, "invalid CREATE EXTENSION state");
+				break;
+
+			case CREATE_EXTENSION_BEGIN:	/* Mark creating_extension flag and add pg_extension catalog tuple */
+				creating_extension = true;
+				break;
+			case CREATE_EXTENSION_END:		/* Mark creating_extension flag = false */
+				creating_extension = false;
+				CurrentExtensionObject = InvalidOid;
+				ObjectAddressSet(address,
+								 ExtensionRelationId,
+								 get_extension_oid(stmt->extname, true));
+				return address;
+
+			default:
+				elog(ERROR, "unrecognized create_ext_state: %d",
+					 stmt->create_ext_state);
+		}
+	}
+
+	/*
+	 * We use global variables to track the extension being created, so we can
+	 * create only one extension at the same time.
+	 * Except that QE do CREATE_EXTENSION_BEGIN.
+	 */
+	if (creating_extension && !(stmt->create_ext_state == CREATE_EXTENSION_BEGIN &&
+		Gp_role == GP_ROLE_EXECUTE))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					errmsg("nested CREATE EXTENSION is not supported")));
+
+	/* Deconstruct the statement option list */
+	foreach(lc, stmt->options)
+	{
+		DefElem    *defel = (DefElem *) lfirst(lc);
+
+		if (strcmp(defel->defname, "schema") == 0)
+		{
+			if (d_schema)
+				ereport(ERROR,
+						(errcode(ERRCODE_SYNTAX_ERROR),
+						 errmsg("conflicting or redundant options"),
+						 parser_errposition(pstate, defel->location)));
+			d_schema = defel;
+			schemaName = defGetString(d_schema);
+		}
+		else if (strcmp(defel->defname, "new_version") == 0)
+		{
+			if (d_new_version)
+				ereport(ERROR,
+						(errcode(ERRCODE_SYNTAX_ERROR),
+						 errmsg("conflicting or redundant options"),
+						 parser_errposition(pstate, defel->location)));
+			d_new_version = defel;
+			versionName = defGetString(d_new_version);
+		}
+		else if (strcmp(defel->defname, "old_version") == 0)
+		{
+			if (d_old_version)
+				ereport(ERROR,
+						(errcode(ERRCODE_SYNTAX_ERROR),
+						 errmsg("conflicting or redundant options"),
+						 parser_errposition(pstate, defel->location)));
+			d_old_version = defel;
+			oldVersionName = defGetString(d_old_version);
+		}
+		else if (strcmp(defel->defname, "cascade") == 0)
+		{
+			if (d_cascade)
+				ereport(ERROR,
+						(errcode(ERRCODE_SYNTAX_ERROR),
+						 errmsg("conflicting or redundant options"),
+						 parser_errposition(pstate, defel->location)));
+			d_cascade = defel;
+			cascade = defGetBoolean(d_cascade);
+		}
+		else
+			elog(ERROR, "unrecognized option: %s", defel->defname);
+	}
+
+	/* Call CreateExtensionInternal to do the real work. */
+	return CreateExtensionInternal(stmt->extname,
+								   schemaName,
+								   versionName,
+								   oldVersionName,
+								   cascade,
+								   NIL,
+								   true);
 }
 
 /*
@@ -1571,7 +1896,7 @@ CreateExtension(CreateExtensionStmt *stmt)
  * extConfig and extCondition should be arrays or PointerGetDatum(NULL).
  * We declare them as plain Datum to avoid needing array.h in extension.h.
  */
-Oid
+ObjectAddress
 InsertExtensionTuple(const char *extName, Oid extOwner,
 					 Oid schemaOid, bool relocatable, const char *extVersion,
 					 Datum extConfig, Datum extCondition,
@@ -1589,11 +1914,15 @@ InsertExtensionTuple(const char *extName, Oid extOwner,
 	/*
 	 * Build and insert the pg_extension tuple
 	 */
-	rel = heap_open(ExtensionRelationId, RowExclusiveLock);
+	rel = table_open(ExtensionRelationId, RowExclusiveLock);
 
 	memset(values, 0, sizeof(values));
 	memset(nulls, 0, sizeof(nulls));
 
+	extensionOid = GetNewOidForExtension(rel, ExtensionOidIndexId,
+										 Anum_pg_extension_oid,
+										 unconstify(char *, extName));
+	values[Anum_pg_extension_oid - 1] = ObjectIdGetDatum(extensionOid);
 	values[Anum_pg_extension_extname - 1] =
 		DirectFunctionCall1(namein, CStringGetDatum(extName));
 	values[Anum_pg_extension_extowner - 1] = ObjectIdGetDatum(extOwner);
@@ -1613,11 +1942,10 @@ InsertExtensionTuple(const char *extName, Oid extOwner,
 
 	tuple = heap_form_tuple(rel->rd_att, values, nulls);
 
-	extensionOid = simple_heap_insert(rel, tuple);
-	CatalogUpdateIndexes(rel, tuple);
+	CatalogTupleInsert(rel, tuple);
 
 	heap_freetuple(tuple);
-	heap_close(rel, RowExclusiveLock);
+	table_close(rel, RowExclusiveLock);
 
 	/*
 	 * Record dependencies on owner, schema, and prerequisite extensions
@@ -1648,7 +1976,7 @@ InsertExtensionTuple(const char *extName, Oid extOwner,
 	/* Post creation hook for new extension */
 	InvokeObjectPostCreateHook(ExtensionRelationId, extensionOid, 0);
 
-	return extensionOid;
+	return myself;
 }
 
 /*
@@ -1679,13 +2007,13 @@ RemoveExtensionById(Oid extId)
 	if (extId == CurrentExtensionObject)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-		  errmsg("cannot drop extension \"%s\" because it is being modified",
-				 get_extension_name(extId))));
+				 errmsg("cannot drop extension \"%s\" because it is being modified",
+						get_extension_name(extId))));
 
-	rel = heap_open(ExtensionRelationId, RowExclusiveLock);
+	rel = table_open(ExtensionRelationId, RowExclusiveLock);
 
 	ScanKeyInit(&entry[0],
-				ObjectIdAttributeNumber,
+				Anum_pg_extension_oid,
 				BTEqualStrategyNumber, F_OIDEQ,
 				ObjectIdGetDatum(extId));
 	scandesc = systable_beginscan(rel, ExtensionOidIndexId, true,
@@ -1695,11 +2023,11 @@ RemoveExtensionById(Oid extId)
 
 	/* We assume that there can be at most one matching tuple */
 	if (HeapTupleIsValid(tuple))
-		simple_heap_delete(rel, &tuple->t_self);
+		CatalogTupleDelete(rel, &tuple->t_self);
 
 	systable_endscan(scandesc);
 
-	heap_close(rel, RowExclusiveLock);
+	table_close(rel, RowExclusiveLock);
 }
 
 /*
@@ -1912,43 +2240,28 @@ get_available_versions_for_extension(ExtensionControlFile *pcontrol,
 									 Tuplestorestate *tupstore,
 									 TupleDesc tupdesc)
 {
-	int			extnamelen = strlen(pcontrol->name);
-	char	   *location;
-	DIR		   *dir;
-	struct dirent *de;
+	List	   *evi_list;
+	ListCell   *lc;
 
-	location = get_extension_script_directory(pcontrol);
-	dir = AllocateDir(location);
-	/* Note this will fail if script directory doesn't exist */
-	while ((de = ReadDir(dir, location)) != NULL)
+	/* Extract the version update graph from the script directory */
+	evi_list = get_ext_ver_list(pcontrol);
+
+	/* For each installable version ... */
+	foreach(lc, evi_list)
 	{
+		ExtensionVersionInfo *evi = (ExtensionVersionInfo *) lfirst(lc);
 		ExtensionControlFile *control;
-		char	   *vername;
 		Datum		values[7];
 		bool		nulls[7];
+		ListCell   *lc2;
 
-		/* must be a .sql file ... */
-		if (!is_extension_script_filename(de->d_name))
-			continue;
-
-		/* ... matching extension name followed by separator */
-		if (strncmp(de->d_name, pcontrol->name, extnamelen) != 0 ||
-			de->d_name[extnamelen] != '-' ||
-			de->d_name[extnamelen + 1] != '-')
-			continue;
-
-		/* extract version name from 'extname--something.sql' filename */
-		vername = pstrdup(de->d_name + extnamelen + 2);
-		*strrchr(vername, '.') = '\0';
-
-		/* ignore it if it's an update script */
-		if (strstr(vername, "--"))
+		if (!evi->installable)
 			continue;
 
 		/*
 		 * Fetch parameters for specific version (pcontrol is not changed)
 		 */
-		control = read_extension_aux_control_file(pcontrol, vername);
+		control = read_extension_aux_control_file(pcontrol, evi->name);
 
 		memset(values, 0, sizeof(values));
 		memset(nulls, 0, sizeof(nulls));
@@ -1957,7 +2270,7 @@ get_available_versions_for_extension(ExtensionControlFile *pcontrol,
 		values[0] = DirectFunctionCall1(namein,
 										CStringGetDatum(control->name));
 		/* version */
-		values[1] = CStringGetTextDatum(vername);
+		values[1] = CStringGetTextDatum(evi->name);
 		/* superuser */
 		values[2] = BoolGetDatum(control->superuser);
 		/* relocatable */
@@ -1972,27 +2285,7 @@ get_available_versions_for_extension(ExtensionControlFile *pcontrol,
 		if (control->requires == NIL)
 			nulls[5] = true;
 		else
-		{
-			Datum	   *datums;
-			int			ndatums;
-			ArrayType  *a;
-			ListCell   *lc;
-
-			ndatums = list_length(control->requires);
-			datums = (Datum *) palloc(ndatums * sizeof(Datum));
-			ndatums = 0;
-			foreach(lc, control->requires)
-			{
-				char	   *curreq = (char *) lfirst(lc);
-
-				datums[ndatums++] =
-					DirectFunctionCall1(namein, CStringGetDatum(curreq));
-			}
-			a = construct_array(datums, ndatums,
-								NAMEOID,
-								NAMEDATALEN, false, 'c');
-			values[5] = PointerGetDatum(a);
-		}
+			values[5] = convert_requires_to_datum(control->requires);
 		/* comment */
 		if (control->comment == NULL)
 			nulls[6] = true;
@@ -2000,9 +2293,75 @@ get_available_versions_for_extension(ExtensionControlFile *pcontrol,
 			values[6] = CStringGetTextDatum(control->comment);
 
 		tuplestore_putvalues(tupstore, tupdesc, values, nulls);
-	}
 
-	FreeDir(dir);
+		/*
+		 * Find all non-directly-installable versions that would be installed
+		 * starting from this version, and report them, inheriting the
+		 * parameters that aren't changed in updates from this version.
+		 */
+		foreach(lc2, evi_list)
+		{
+			ExtensionVersionInfo *evi2 = (ExtensionVersionInfo *) lfirst(lc2);
+			List	   *best_path;
+
+			if (evi2->installable)
+				continue;
+			if (find_install_path(evi_list, evi2, &best_path) == evi)
+			{
+				/*
+				 * Fetch parameters for this version (pcontrol is not changed)
+				 */
+				control = read_extension_aux_control_file(pcontrol, evi2->name);
+
+				/* name stays the same */
+				/* version */
+				values[1] = CStringGetTextDatum(evi2->name);
+				/* superuser */
+				values[2] = BoolGetDatum(control->superuser);
+				/* relocatable */
+				values[3] = BoolGetDatum(control->relocatable);
+				/* schema stays the same */
+				/* requires */
+				if (control->requires == NIL)
+					nulls[5] = true;
+				else
+				{
+					values[5] = convert_requires_to_datum(control->requires);
+					nulls[5] = false;
+				}
+				/* comment stays the same */
+
+				tuplestore_putvalues(tupstore, tupdesc, values, nulls);
+			}
+		}
+	}
+}
+
+/*
+ * Convert a list of extension names to a name[] Datum
+ */
+static Datum
+convert_requires_to_datum(List *requires)
+{
+	Datum	   *datums;
+	int			ndatums;
+	ArrayType  *a;
+	ListCell   *lc;
+
+	ndatums = list_length(requires);
+	datums = (Datum *) palloc(ndatums * sizeof(Datum));
+	ndatums = 0;
+	foreach(lc, requires)
+	{
+		char	   *curreq = (char *) lfirst(lc);
+
+		datums[ndatums++] =
+			DirectFunctionCall1(namein, CStringGetDatum(curreq));
+	}
+	a = construct_array(datums, ndatums,
+						NAMEOID,
+						NAMEDATALEN, false, 'c');
+	return PointerGetDatum(a);
 }
 
 /*
@@ -2074,7 +2433,7 @@ pg_extension_update_paths(PG_FUNCTION_ARGS)
 				continue;
 
 			/* Find shortest path from evi1 to evi2 */
-			path = find_update_path(evi_list, evi1, evi2, true);
+			path = find_update_path(evi_list, evi1, evi2, false, true);
 
 			/* Emit result row */
 			memset(values, 0, sizeof(values));
@@ -2127,7 +2486,7 @@ Datum
 pg_extension_config_dump(PG_FUNCTION_ARGS)
 {
 	Oid			tableoid = PG_GETARG_OID(0);
-	text	   *wherecond = PG_GETARG_TEXT_P(1);
+	text	   *wherecond = PG_GETARG_TEXT_PP(1);
 	char	   *tablename;
 	Relation	extRel;
 	ScanKeyData key[1];
@@ -2150,8 +2509,8 @@ pg_extension_config_dump(PG_FUNCTION_ARGS)
 	if (!creating_extension)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("pg_extension_config_dump() can only be called "
-						"from an SQL script executed by CREATE EXTENSION")));
+				 errmsg("%s can only be called from an SQL script executed by CREATE EXTENSION",
+						"pg_extension_config_dump()")));
 
 	/*
 	 * Check that the table exists and is a member of the extension being
@@ -2167,8 +2526,8 @@ pg_extension_config_dump(PG_FUNCTION_ARGS)
 		CurrentExtensionObject)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-		errmsg("table \"%s\" is not a member of the extension being created",
-			   tablename)));
+				 errmsg("table \"%s\" is not a member of the extension being created",
+						tablename)));
 
 	/*
 	 * Add the table OID and WHERE condition to the extension's extconfig and
@@ -2179,10 +2538,10 @@ pg_extension_config_dump(PG_FUNCTION_ARGS)
 	 */
 
 	/* Find the pg_extension tuple */
-	extRel = heap_open(ExtensionRelationId, RowExclusiveLock);
+	extRel = table_open(ExtensionRelationId, RowExclusiveLock);
 
 	ScanKeyInit(&key[0],
-				ObjectIdAttributeNumber,
+				Anum_pg_extension_oid,
 				BTEqualStrategyNumber, F_OIDEQ,
 				ObjectIdGetDatum(CurrentExtensionObject));
 
@@ -2191,8 +2550,8 @@ pg_extension_config_dump(PG_FUNCTION_ARGS)
 
 	extTup = systable_getnext(extScan);
 
-	if (!HeapTupleIsValid(extTup))		/* should not happen */
-		elog(ERROR, "extension with oid %u does not exist",
+	if (!HeapTupleIsValid(extTup))	/* should not happen */
+		elog(ERROR, "could not find tuple for extension %u",
 			 CurrentExtensionObject);
 
 	memset(repl_val, 0, sizeof(repl_val));
@@ -2237,7 +2596,7 @@ pg_extension_config_dump(PG_FUNCTION_ARGS)
 		{
 			if (arrayData[i] == tableoid)
 			{
-				arrayIndex = i + 1;		/* replace this element instead */
+				arrayIndex = i + 1; /* replace this element instead */
 				break;
 			}
 		}
@@ -2294,12 +2653,11 @@ pg_extension_config_dump(PG_FUNCTION_ARGS)
 	extTup = heap_modify_tuple(extTup, RelationGetDescr(extRel),
 							   repl_val, repl_null, repl_repl);
 
-	simple_heap_update(extRel, &extTup->t_self, extTup);
-	CatalogUpdateIndexes(extRel, extTup);
+	CatalogTupleUpdate(extRel, &extTup->t_self, extTup);
 
 	systable_endscan(extScan);
 
-	heap_close(extRel, RowExclusiveLock);
+	table_close(extRel, RowExclusiveLock);
 
 	PG_RETURN_VOID();
 }
@@ -2328,10 +2686,10 @@ extension_config_remove(Oid extensionoid, Oid tableoid)
 	ArrayType  *a;
 
 	/* Find the pg_extension tuple */
-	extRel = heap_open(ExtensionRelationId, RowExclusiveLock);
+	extRel = table_open(ExtensionRelationId, RowExclusiveLock);
 
 	ScanKeyInit(&key[0],
-				ObjectIdAttributeNumber,
+				Anum_pg_extension_oid,
 				BTEqualStrategyNumber, F_OIDEQ,
 				ObjectIdGetDatum(extensionoid));
 
@@ -2340,8 +2698,8 @@ extension_config_remove(Oid extensionoid, Oid tableoid)
 
 	extTup = systable_getnext(extScan);
 
-	if (!HeapTupleIsValid(extTup))		/* should not happen */
-		elog(ERROR, "extension with oid %u does not exist",
+	if (!HeapTupleIsValid(extTup))	/* should not happen */
+		elog(ERROR, "could not find tuple for extension %u",
 			 extensionoid);
 
 	/* Search extconfig for the tableoid */
@@ -2386,7 +2744,7 @@ extension_config_remove(Oid extensionoid, Oid tableoid)
 	if (arrayIndex < 0)
 	{
 		systable_endscan(extScan);
-		heap_close(extRel, RowExclusiveLock);
+		table_close(extRel, RowExclusiveLock);
 		return;
 	}
 
@@ -2404,14 +2762,13 @@ extension_config_remove(Oid extensionoid, Oid tableoid)
 	{
 		/* squeeze out the target element */
 		Datum	   *dvalues;
-		bool	   *dnulls;
 		int			nelems;
 		int			i;
 
+		/* We already checked there are no nulls */
 		deconstruct_array(a, OIDOID, sizeof(Oid), true, 'i',
-						  &dvalues, &dnulls, &nelems);
+						  &dvalues, NULL, &nelems);
 
-		/* We already checked there are no nulls, so ignore dnulls */
 		for (i = arrayIndex; i < arrayLength - 1; i++)
 			dvalues[i] = dvalues[i + 1];
 
@@ -2451,14 +2808,13 @@ extension_config_remove(Oid extensionoid, Oid tableoid)
 	{
 		/* squeeze out the target element */
 		Datum	   *dvalues;
-		bool	   *dnulls;
 		int			nelems;
 		int			i;
 
+		/* We already checked there are no nulls */
 		deconstruct_array(a, TEXTOID, -1, false, 'i',
-						  &dvalues, &dnulls, &nelems);
+						  &dvalues, NULL, &nelems);
 
-		/* We already checked there are no nulls, so ignore dnulls */
 		for (i = arrayIndex; i < arrayLength - 1; i++)
 			dvalues[i] = dvalues[i + 1];
 
@@ -2472,21 +2828,19 @@ extension_config_remove(Oid extensionoid, Oid tableoid)
 	extTup = heap_modify_tuple(extTup, RelationGetDescr(extRel),
 							   repl_val, repl_null, repl_repl);
 
-	simple_heap_update(extRel, &extTup->t_self, extTup);
-	CatalogUpdateIndexes(extRel, extTup);
+	CatalogTupleUpdate(extRel, &extTup->t_self, extTup);
 
 	systable_endscan(extScan);
 
-	heap_close(extRel, RowExclusiveLock);
+	table_close(extRel, RowExclusiveLock);
 }
 
 /*
  * Execute ALTER EXTENSION SET SCHEMA
  */
-Oid
-AlterExtensionNamespace(List *names, const char *newschema)
+ObjectAddress
+AlterExtensionNamespace(const char *extensionName, const char *newschema, Oid *oldschema)
 {
-	char	   *extensionName;
 	Oid			extensionOid;
 	Oid			nspOid;
 	Oid			oldNspOid = InvalidOid;
@@ -2500,12 +2854,7 @@ AlterExtensionNamespace(List *names, const char *newschema)
 	SysScanDesc depScan;
 	HeapTuple	depTup;
 	ObjectAddresses *objsMoved;
-
-	if (list_length(names) != 1)
-		ereport(ERROR,
-				(errcode(ERRCODE_SYNTAX_ERROR),
-				 errmsg("extension name cannot be qualified")));
-	extensionName = strVal(linitial(names));
+	ObjectAddress extAddr;
 
 	extensionOid = get_extension_oid(extensionName, false);
 
@@ -2516,13 +2865,13 @@ AlterExtensionNamespace(List *names, const char *newschema)
 	 * check ownership of the individual member objects ...
 	 */
 	if (!pg_extension_ownercheck(extensionOid, GetUserId()))
-		aclcheck_error(ACLCHECK_NOT_OWNER, ACL_KIND_EXTENSION,
+		aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_EXTENSION,
 					   extensionName);
 
 	/* Permission check: must have creation rights in target namespace */
 	aclresult = pg_namespace_aclcheck(nspOid, GetUserId(), ACL_CREATE);
 	if (aclresult != ACLCHECK_OK)
-		aclcheck_error(aclresult, ACL_KIND_NAMESPACE, newschema);
+		aclcheck_error(aclresult, OBJECT_SCHEMA, newschema);
 
 	/*
 	 * If the schema is currently a member of the extension, disallow moving
@@ -2536,10 +2885,10 @@ AlterExtensionNamespace(List *names, const char *newschema)
 						extensionName, newschema)));
 
 	/* Locate the pg_extension tuple */
-	extRel = heap_open(ExtensionRelationId, RowExclusiveLock);
+	extRel = table_open(ExtensionRelationId, RowExclusiveLock);
 
 	ScanKeyInit(&key[0],
-				ObjectIdAttributeNumber,
+				Anum_pg_extension_oid,
 				BTEqualStrategyNumber, F_OIDEQ,
 				ObjectIdGetDatum(extensionOid));
 
@@ -2548,8 +2897,9 @@ AlterExtensionNamespace(List *names, const char *newschema)
 
 	extTup = systable_getnext(extScan);
 
-	if (!HeapTupleIsValid(extTup))		/* should not happen */
-		elog(ERROR, "extension with oid %u does not exist", extensionOid);
+	if (!HeapTupleIsValid(extTup))	/* should not happen */
+		elog(ERROR, "could not find tuple for extension %u",
+			 extensionOid);
 
 	/* Copy tuple so we can modify it below */
 	extTup = heap_copytuple(extTup);
@@ -2563,8 +2913,8 @@ AlterExtensionNamespace(List *names, const char *newschema)
 	 */
 	if (extForm->extnamespace == nspOid)
 	{
-		heap_close(extRel, RowExclusiveLock);
-		return InvalidOid;
+		table_close(extRel, RowExclusiveLock);
+		return InvalidObjectAddress;
 	}
 
 	/* Check extension is supposed to be relocatable */
@@ -2580,7 +2930,7 @@ AlterExtensionNamespace(List *names, const char *newschema)
 	 * Scan pg_depend to find objects that depend directly on the extension,
 	 * and alter each one's schema.
 	 */
-	depRel = heap_open(DependRelationId, AccessShareLock);
+	depRel = table_open(DependRelationId, AccessShareLock);
 
 	ScanKeyInit(&key[0],
 				Anum_pg_depend_refclassid,
@@ -2612,7 +2962,7 @@ AlterExtensionNamespace(List *names, const char *newschema)
 		dep.objectId = pg_depend->objid;
 		dep.objectSubId = pg_depend->objsubid;
 
-		if (dep.objectSubId != 0)		/* should not happen */
+		if (dep.objectSubId != 0)	/* should not happen */
 			elog(ERROR, "extension should not have a sub-object dependency");
 
 		/* Relocate the object */
@@ -2641,6 +2991,10 @@ AlterExtensionNamespace(List *names, const char *newschema)
 							   get_namespace_name(oldNspOid))));
 	}
 
+	/* report old schema, if caller wants it */
+	if (oldschema)
+		*oldschema = oldNspOid;
+
 	systable_endscan(depScan);
 
 	relation_close(depRel, AccessShareLock);
@@ -2648,10 +3002,9 @@ AlterExtensionNamespace(List *names, const char *newschema)
 	/* Now adjust pg_extension.extnamespace */
 	extForm->extnamespace = nspOid;
 
-	simple_heap_update(extRel, &extTup->t_self, extTup);
-	CatalogUpdateIndexes(extRel, extTup);
+	CatalogTupleUpdate(extRel, &extTup->t_self, extTup);
 
-	heap_close(extRel, RowExclusiveLock);
+	table_close(extRel, RowExclusiveLock);
 
 	/* update dependencies to point to the new schema */
 	changeDependencyFor(ExtensionRelationId, extensionOid,
@@ -2659,14 +3012,16 @@ AlterExtensionNamespace(List *names, const char *newschema)
 
 	InvokeObjectPostAlterHook(ExtensionRelationId, extensionOid, 0);
 
-	return extensionOid;
+	ObjectAddressSet(extAddr, ExtensionRelationId, extensionOid);
+
+	return extAddr;
 }
 
 /*
  * Execute ALTER EXTENSION UPDATE
  */
-Oid
-ExecAlterExtensionStmt(AlterExtensionStmt *stmt)
+ObjectAddress
+ExecAlterExtensionStmt(ParseState *pstate, AlterExtensionStmt *stmt)
 {
 	DefElem    *d_new_version = NULL;
 	char	   *versionName;
@@ -2681,6 +3036,31 @@ ExecAlterExtensionStmt(AlterExtensionStmt *stmt)
 	Datum		datum;
 	bool		isnull;
 	ListCell   *lc;
+	ObjectAddress address;
+
+	if (Gp_role == GP_ROLE_EXECUTE)
+	{
+		switch (stmt->update_ext_state)
+		{
+			case UPDATE_EXTENSION_INIT:
+				elog(ERROR, "invalid ALTER EXTENSION UPDATE state");
+				break;
+
+			case UPDATE_EXTENSION_BEGIN:
+				break;
+			case UPDATE_EXTENSION_END:		/* Mark creating_extension flag = false */
+				creating_extension = false;
+				CurrentExtensionObject = InvalidOid;
+				ObjectAddressSet(address,
+								 ExtensionRelationId,
+								 get_extension_oid(stmt->extname, true));
+				return address;
+
+			default:
+				elog(ERROR, "unrecognized update_ext_state: %d",
+						stmt->update_ext_state);
+		}
+	}
 
 	/*
 	 * We use global variables to track the extension being created, so we can
@@ -2694,7 +3074,7 @@ ExecAlterExtensionStmt(AlterExtensionStmt *stmt)
 	/*
 	 * Look up the extension --- it must already exist in pg_extension
 	 */
-	extRel = heap_open(ExtensionRelationId, AccessShareLock);
+	extRel = table_open(ExtensionRelationId, AccessShareLock);
 
 	ScanKeyInit(&key[0],
 				Anum_pg_extension_extname,
@@ -2712,7 +3092,7 @@ ExecAlterExtensionStmt(AlterExtensionStmt *stmt)
 				 errmsg("extension \"%s\" does not exist",
 						stmt->extname)));
 
-	extensionOid = HeapTupleGetOid(extTup);
+	extensionOid = ((Form_pg_extension) GETSTRUCT(extTup))->oid;
 
 	/*
 	 * Determine the existing version we are updating from
@@ -2725,11 +3105,11 @@ ExecAlterExtensionStmt(AlterExtensionStmt *stmt)
 
 	systable_endscan(extScan);
 
-	heap_close(extRel, AccessShareLock);
+	table_close(extRel, AccessShareLock);
 
 	/* Permission check: must own extension */
 	if (!pg_extension_ownercheck(extensionOid, GetUserId()))
-		aclcheck_error(ACLCHECK_NOT_OWNER, ACL_KIND_EXTENSION,
+		aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_EXTENSION,
 					   stmt->extname);
 
 	/*
@@ -2751,7 +3131,8 @@ ExecAlterExtensionStmt(AlterExtensionStmt *stmt)
 			if (d_new_version)
 				ereport(ERROR,
 						(errcode(ERRCODE_SYNTAX_ERROR),
-						 errmsg("conflicting or redundant options")));
+						 errmsg("conflicting or redundant options"),
+						 parser_errposition(pstate, defel->location)));
 			d_new_version = defel;
 		}
 		else
@@ -2780,9 +3161,9 @@ ExecAlterExtensionStmt(AlterExtensionStmt *stmt)
 	if (strcmp(oldVersionName, versionName) == 0)
 	{
 		ereport(NOTICE,
-		   (errmsg("version \"%s\" of extension \"%s\" is already installed",
-				   versionName, stmt->extname)));
-		return InvalidOid;
+				(errmsg("version \"%s\" of extension \"%s\" is already installed",
+						versionName, stmt->extname)));
+		return InvalidObjectAddress;
 	}
 
 	/*
@@ -2791,15 +3172,17 @@ ExecAlterExtensionStmt(AlterExtensionStmt *stmt)
 	updateVersions = identify_update_path(control,
 										  oldVersionName,
 										  versionName);
-
 	/*
 	 * Update the pg_extension row and execute the update scripts, one at a
 	 * time
 	 */
 	ApplyExtensionUpdates(extensionOid, control,
-						  oldVersionName, updateVersions);
+						  oldVersionName, updateVersions,
+						  NULL, false, false);
 
-	return extensionOid;
+	ObjectAddressSet(address, ExtensionRelationId, extensionOid);
+
+	return address;
 }
 
 /*
@@ -2814,10 +3197,19 @@ static void
 ApplyExtensionUpdates(Oid extensionOid,
 					  ExtensionControlFile *pcontrol,
 					  const char *initialVersion,
-					  List *updateVersions)
+					  List *updateVersions,
+					  char *origSchemaName,
+					  bool cascade,
+					  bool is_create)
 {
 	const char *oldVersionName = initialVersion;
 	ListCell   *lcv;
+
+	/*
+	 * The update of extension in QE is driven by QD, so we only handle 1 version upgrade
+	 * per dispatch on the QE
+	 */
+	AssertImply(Gp_role == GP_ROLE_EXECUTE, list_length(updateVersions) == 1);
 
 	foreach(lcv, updateVersions)
 	{
@@ -2844,10 +3236,10 @@ ApplyExtensionUpdates(Oid extensionOid,
 		control = read_extension_aux_control_file(pcontrol, versionName);
 
 		/* Find the pg_extension tuple */
-		extRel = heap_open(ExtensionRelationId, RowExclusiveLock);
+		extRel = table_open(ExtensionRelationId, RowExclusiveLock);
 
 		ScanKeyInit(&key[0],
-					ObjectIdAttributeNumber,
+					Anum_pg_extension_oid,
 					BTEqualStrategyNumber, F_OIDEQ,
 					ObjectIdGetDatum(extensionOid));
 
@@ -2857,7 +3249,7 @@ ApplyExtensionUpdates(Oid extensionOid,
 		extTup = systable_getnext(extScan);
 
 		if (!HeapTupleIsValid(extTup))	/* should not happen */
-			elog(ERROR, "extension with oid %u does not exist",
+			elog(ERROR, "could not find tuple for extension %u",
 				 extensionOid);
 
 		extForm = (Form_pg_extension) GETSTRUCT(extTup);
@@ -2885,16 +3277,16 @@ ApplyExtensionUpdates(Oid extensionOid,
 		extTup = heap_modify_tuple(extTup, RelationGetDescr(extRel),
 								   values, nulls, repl);
 
-		simple_heap_update(extRel, &extTup->t_self, extTup);
-		CatalogUpdateIndexes(extRel, extTup);
+		CatalogTupleUpdate(extRel, &extTup->t_self, extTup);
 
 		systable_endscan(extScan);
 
-		heap_close(extRel, RowExclusiveLock);
+		table_close(extRel, RowExclusiveLock);
 
 		/*
-		 * Look up the prerequisite extensions for this version, and build
-		 * lists of their OIDs and the OIDs of their target schemas.
+		 * Look up the prerequisite extensions for this version, install them
+		 * if necessary, and build lists of their OIDs and the OIDs of their
+		 * target schemas.
 		 */
 		requiredExtensions = NIL;
 		requiredSchemas = NIL;
@@ -2904,16 +3296,12 @@ ApplyExtensionUpdates(Oid extensionOid,
 			Oid			reqext;
 			Oid			reqschema;
 
-			/*
-			 * We intentionally don't use get_extension_oid's default error
-			 * message here, because it would be confusing in this context.
-			 */
-			reqext = get_extension_oid(curreq, true);
-			if (!OidIsValid(reqext))
-				ereport(ERROR,
-						(errcode(ERRCODE_UNDEFINED_OBJECT),
-						 errmsg("required extension \"%s\" is not installed",
-								curreq)));
+			reqext = get_required_extension(curreq,
+											control->name,
+											origSchemaName,
+											cascade,
+											NIL,
+											is_create);
 			reqschema = get_extension_schema(reqext);
 			requiredExtensions = lappend_oid(requiredExtensions, reqext);
 			requiredSchemas = lappend_oid(requiredSchemas, reqschema);
@@ -2944,14 +3332,42 @@ ApplyExtensionUpdates(Oid extensionOid,
 
 		InvokeObjectPostAlterHook(ExtensionRelationId, extensionOid, 0);
 
-		/*
-		 * Finally, execute the update script file
-		 * Only execute SQL script on QD.
-		 */
-		execute_extension_script(NULL, extensionOid, control,
-								 oldVersionName, versionName,
-								 requiredSchemas,
-								 schemaName, schemaOid);
+		if (Gp_role != GP_ROLE_EXECUTE)
+		{
+			Node *stmt = NULL;
+
+			if (Gp_role == GP_ROLE_DISPATCH)
+			{
+				AlterExtensionStmt *update_stmt = makeNode(AlterExtensionStmt);
+				update_stmt->extname = pcontrol->name;
+				update_stmt->options = lappend(NIL,
+											   makeDefElem("new_version",
+														   (Node *) makeString(versionName),
+														   -1));
+				update_stmt->update_ext_state = UPDATE_EXTENSION_BEGIN;
+				stmt = (Node*)update_stmt;
+				CdbDispatchUtilityStatement(stmt,
+											DF_WITH_SNAPSHOT | DF_CANCEL_ON_ERROR | DF_NEED_TWO_PHASE,
+											NIL  /* We don't create any object in UPDATE EXTENSION, so NIL here. */,
+											NULL);
+			}
+
+			/*
+			 * Finally, execute the update script file
+			 */
+			execute_extension_script(stmt, extensionOid, control,
+									 oldVersionName, versionName,
+									 requiredSchemas,
+									 schemaName, schemaOid);
+		}
+		else
+		{
+			/* GP_ROLE_EXECUTE */
+			/* Set these global states for the execute_extension_script() that is called next in QD. */
+			creating_extension = true;
+			CurrentExtensionObject = extensionOid;
+			/* break */
+		}
 
 		/*
 		 * Update prior-version name and loop around.  Since
@@ -2963,10 +3379,16 @@ ApplyExtensionUpdates(Oid extensionOid,
 }
 
 /*
- * Execute ALTER EXTENSION ADD/DROP
+ * Execute ALTER EXTENSION ADD/DROP on QD or QE.
+ *
+ * Return value is the address of the altered extension.
+ *
+ * objAddr is an output argument which, if not NULL, is set to the address of
+ * the added/dropped object.
  */
-Oid
-ExecAlterExtensionContentsStmt(AlterExtensionContentsStmt *stmt)
+static ObjectAddress
+ExecAlterExtensionContentsStmt_internal(AlterExtensionContentsStmt *stmt,
+							   ObjectAddress *objAddr)
 {
 	ObjectAddress extension;
 	ObjectAddress object;
@@ -2979,7 +3401,7 @@ ExecAlterExtensionContentsStmt(AlterExtensionContentsStmt *stmt)
 
 	/* Permission check: must own extension */
 	if (!pg_extension_ownercheck(extension.objectId, GetUserId()))
-		aclcheck_error(ACLCHECK_NOT_OWNER, ACL_KIND_EXTENSION,
+		aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_EXTENSION,
 					   stmt->extname);
 
 	/*
@@ -2988,12 +3410,16 @@ ExecAlterExtensionContentsStmt(AlterExtensionContentsStmt *stmt)
 	 * does not exist, and will also acquire a lock on the object to guard
 	 * against concurrent DROP and ALTER EXTENSION ADD/DROP operations.
 	 */
-	object = get_object_address(stmt->objtype, stmt->objname, stmt->objargs,
+	object = get_object_address(stmt->objtype, stmt->object,
 								&relation, ShareUpdateExclusiveLock, false);
+
+	Assert(object.objectSubId == 0);
+	if (objAddr)
+		*objAddr = object;
 
 	/* Permission check: must own target object, too */
 	check_object_ownership(GetUserId(), stmt->objtype, object,
-						   stmt->objname, stmt->objargs, relation);
+						   stmt->object, relation);
 
 	/*
 	 * Check existing extension membership.
@@ -3029,6 +3455,16 @@ ExecAlterExtensionContentsStmt(AlterExtensionContentsStmt *stmt)
 		 * OK, add the dependency.
 		 */
 		recordDependencyOn(&object, &extension, DEPENDENCY_EXTENSION);
+
+		/*
+		 * Also record the initial ACL on the object, if any.
+		 *
+		 * Note that this will handle the object's ACLs, as well as any ACLs
+		 * on object subIds.  (In other words, when the object is a table,
+		 * this will record the table's ACL and the ACLs for the columns on
+		 * the table, if any).
+		 */
+		recordExtObjInitPriv(object.objectId, object.classId);
 	}
 	else
 	{
@@ -3056,6 +3492,16 @@ ExecAlterExtensionContentsStmt(AlterExtensionContentsStmt *stmt)
 		 */
 		if (object.classId == RelationRelationId)
 			extension_config_remove(extension.objectId, object.objectId);
+
+		/*
+		 * Remove all the initial ACLs, if any.
+		 *
+		 * Note that this will remove the object's ACLs, as well as any ACLs
+		 * on object subIds.  (In other words, when the object is a table,
+		 * this will remove the table's ACL and the ACLs for the columns on
+		 * the table, if any).
+		 */
+		removeExtObjInitPriv(object.objectId, object.classId);
 	}
 
 	InvokeObjectPostAlterHook(ExtensionRelationId, extension.objectId, 0);
@@ -3069,7 +3515,27 @@ ExecAlterExtensionContentsStmt(AlterExtensionContentsStmt *stmt)
 	if (relation != NULL)
 		relation_close(relation, NoLock);
 
-	return extension.objectId;
+	return extension;
+}
+
+ObjectAddress
+ExecAlterExtensionContentsStmt(AlterExtensionContentsStmt *stmt,
+							   ObjectAddress *objAddr)
+{
+	ObjectAddress result;
+	result = ExecAlterExtensionContentsStmt_internal(stmt, objAddr);
+
+	if (Gp_role == GP_ROLE_DISPATCH)
+	{
+		CdbDispatchUtilityStatement((Node *) stmt,
+									DF_CANCEL_ON_ERROR|
+									DF_WITH_SNAPSHOT|
+									DF_NEED_TWO_PHASE,
+									NIL,
+									NULL);
+	}
+
+	return result;
 }
 
 /*
@@ -3094,7 +3560,7 @@ read_whole_file(const char *filename, int *length)
 	if (fst.st_size > (MaxAllocSize - 1))
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("file too large")));
+				 errmsg("file \"%s\" is too large", filename)));
 	bytes_to_read = (size_t) fst.st_size;
 
 	if ((file = AllocateFile(filename, PG_BINARY_R)) == NULL)

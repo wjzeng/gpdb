@@ -17,16 +17,18 @@
 
 extern "C" {
 #include "postgres.h"
+
 #include "fmgr.h"
+#include "lib/stringinfo.h"
 #include "utils/builtins.h"
 }
 
-#include "gpopt/utils/COptTasks.h"
-
 #include "gpos/_api.h"
-#include "gpopt/gpdbwrappers.h"
 
-#include "gpopt/version.h"
+#include "gpopt/gpdbwrappers.h"
+#include "gpopt/utils/COptTasks.h"
+#include "gpopt/utils/funcs.h"
+
 #include "xercesc/util/XercesVersion.hpp"
 
 //---------------------------------------------------------------------------
@@ -39,8 +41,7 @@ extern "C" {
 //---------------------------------------------------------------------------
 
 extern "C" {
-Datum
-DisableXform(PG_FUNCTION_ARGS)
+Datum DisableXform(PG_FUNCTION_ARGS)
 {
 	char *szXform = text_to_cstring(PG_GETARG_TEXT_P(0));
 	bool is_result = COptTasks::SetXform(szXform, true /*fDisable*/);
@@ -72,8 +73,7 @@ DisableXform(PG_FUNCTION_ARGS)
 //---------------------------------------------------------------------------
 
 extern "C" {
-Datum
-EnableXform(PG_FUNCTION_ARGS)
+Datum EnableXform(PG_FUNCTION_ARGS)
 {
 	char *szXform = text_to_cstring(PG_GETARG_TEXT_P(0));
 	bool is_result = COptTasks::SetXform(szXform, false /*fDisable*/);
@@ -110,18 +110,10 @@ LibraryVersion()
 {
 	StringInfoData str;
 	initStringInfo(&str);
-	appendStringInfo(&str, "GPOPT version: %s", GPORCA_VERSION_STRING);
+	appendStringInfo(&str, "GPOPT version: 4.0.0");
 	appendStringInfo(&str, ", Xerces version: %s", XERCES_FULLVERSIONDOT);
 	text *result = cstring_to_text(str.data);
 
 	PG_RETURN_TEXT_P(result);
-}
-}
-
-extern "C" {
-const char *
-OptVersion()
-{
-	return GPORCA_VERSION_STRING;
 }
 }

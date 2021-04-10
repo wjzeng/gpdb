@@ -26,7 +26,7 @@ insert into ao1 values('dd', 4);
 select * from ao1;
 
 alter table ao1 alter column col2 set default 2;
-select adsrc from pg_attrdef pdef, pg_attribute pattr
+select pg_get_expr(adbin, adrelid) from pg_attrdef pdef, pg_attribute pattr
     where pdef.adrelid='ao1'::regclass and pdef.adrelid=pattr.attrelid and pdef.adnum=pattr.attnum and pattr.attname='col2';
 
 alter table ao1 rename col2 to col2_renamed;
@@ -68,7 +68,7 @@ select  pg_class.relname, attname, typname from pg_attribute, pg_class, pg_type 
 
 -- There's an explicit entry in pg_attrdef for the NULL default (although it has
 -- the same effect as no entry).
-select relname, attname, adsrc from pg_class, pg_attribute, pg_attrdef where attrelid = pg_class.oid and adrelid = pg_class.oid and adnum = pg_attribute.attnum and pg_class.relname = 'ao1';
+select relname, attname, pg_get_expr(adbin, adrelid) from pg_class, pg_attribute, pg_attrdef where attrelid = pg_class.oid and adrelid = pg_class.oid and adnum = pg_attribute.attnum and pg_class.relname = 'ao1';
 
 
 ---
@@ -153,7 +153,7 @@ select  pg_class.relname, attname, typname from pg_attribute, pg_class, pg_type 
 
 -- There's an explicit entry in pg_attrdef for the NULL default (although it has
 -- the same effect as no entry).
-select relname, attname, adsrc from pg_class, pg_attribute, pg_attrdef where attrelid = pg_class.oid and adrelid = pg_class.oid and adnum = pg_attribute.attnum and pg_class.relname = 'aoco1';
+select relname, attname, pg_get_expr(adbin, adrelid) from pg_class, pg_attribute, pg_attrdef where attrelid = pg_class.oid and adrelid = pg_class.oid and adnum = pg_attribute.attnum and pg_class.relname = 'aoco1';
 
 ---
 --- check with IS NOT NULL constraint
@@ -262,6 +262,8 @@ insert into testbug_char5 (timest,user_id,to_be_drop) select '201203',1111,'1000
 insert into testbug_char5 (timest,user_id,to_be_drop) select '201204',1111,'10000';
 insert into testbug_char5 (timest,user_id,to_be_drop) select '201205',1111,'10000';
 
+analyze testbug_char5;
+
 select * from testbug_char5 order by 1,2;
 
 ALTER TABLE testbug_char5 drop column to_be_drop;
@@ -288,6 +290,7 @@ select * from testbug_char5 order by 1,2;
 begin work;
 create table testbug_char5_exchange (timest character varying(6), user_id numeric(16,0) NOT NULL, tag1 char(5), tag2 char(5))
   with (appendonly=true, compresstype=zlib, compresslevel=3) distributed by (user_id);
+create index on testbug_char5_exchange using btree(tag1);
 insert into testbug_char5_exchange values ('201205', 3333, '2', '2');
 alter table testbug_char5 truncate partition part201205;
 select count(*) from testbug_char5;
@@ -315,10 +318,13 @@ alter table ao_multi_level_part_table add partition part3 start(date '2010-01-01
 
 -- Add default partition (defaults to heap storage unless set with AO)
 alter table ao_multi_level_part_table add default partition yearYYYY (default subpartition def);
-select count(*) from pg_appendonly where relid='ao_multi_level_part_table_1_prt_yearyyyy'::regclass;
+SELECT am.amname FROM pg_class c LEFT JOIN pg_am am ON (c.relam = am.oid)
+WHERE c.relname = 'ao_multi_level_part_table_1_prt_yearyyyy_2_prt_def';
+
 alter table ao_multi_level_part_table drop partition yearYYYY;
 alter table ao_multi_level_part_table add default partition yearYYYY with (appendonly=true) (default subpartition def);
-select count(*) from pg_appendonly where relid='ao_multi_level_part_table_1_prt_yearyyyy'::regclass;
+SELECT am.amname FROM pg_class c LEFT JOIN pg_am am ON (c.relam = am.oid)
+WHERE c.relname = 'ao_multi_level_part_table_1_prt_yearyyyy_2_prt_def';
 
 -- index on atts 1, 4
 create index ao_mlp_idx on ao_multi_level_part_table(date, amount);
@@ -330,7 +336,7 @@ select indexname from pg_indexes where tablename='ao_multi_level_part_table';
 select * from ao_multi_level_part_table;
 truncate ao_multi_level_part_table_1_prt_part1_2_prt_asia;
 select * from ao_multi_level_part_table;
-alter table ao_multi_level_part_table truncate partition for (rank(1));
+alter table ao_multi_level_part_table truncate partition for ('2008-02-02');
 select * from ao_multi_level_part_table;
 alter table ao_multi_level_part_table alter partition part2 truncate partition usa;
 select * from ao_multi_level_part_table;

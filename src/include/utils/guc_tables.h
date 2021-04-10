@@ -6,8 +6,8 @@
  * See src/backend/utils/misc/README for design notes.
  *
  * Portions Copyright (c) 2006-2008, Greenplum inc
- * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  *
  *	  src/include/utils/guc_tables.h
  *
@@ -61,7 +61,8 @@ enum config_group
 	FILE_LOCATIONS,
 	CONN_AUTH,
 	CONN_AUTH_SETTINGS,
-	CONN_AUTH_SECURITY,
+	CONN_AUTH_AUTH,
+	CONN_AUTH_SSL,
 
 	EXTERNAL_TABLES,                    /*CDB*/
 	APPENDONLY_TABLES,                  /*CDB*/
@@ -77,10 +78,13 @@ enum config_group
 	WAL_SETTINGS,
 	WAL_CHECKPOINTS,
 	WAL_ARCHIVING,
+	WAL_ARCHIVE_RECOVERY,
+	WAL_RECOVERY_TARGET,
 	REPLICATION,
 	REPLICATION_SENDING,
 	REPLICATION_MASTER,
 	REPLICATION_STANDBY,
+	REPLICATION_SUBSCRIBERS,
 	QUERY_TUNING,
 	QUERY_TUNING_METHOD,
 	QUERY_TUNING_COST,
@@ -90,6 +94,7 @@ enum config_group
 	LOGGING_WHERE,
 	LOGGING_WHEN,
 	LOGGING_WHAT,
+	PROCESS_TITLE,
 	STATS,
 
     STATS_ANALYZE,                      /*CDB*/
@@ -200,20 +205,13 @@ struct config_generic
 	int			sourceline;		/* line in source file */
 };
 
-/* bit values in flags field are defined in guc.h */
-
-#define GUC_NOT_WHILE_SEC_REST	0x8000	/* can't set if security restricted */
-
-#define GUC_GPDB_ADDOPT        0x10000  /* Send by cdbgang */
-
-#define GUC_DISALLOW_USER_SET  0x20000 /* Do not allow this GUC to be set by the user */
-
 /* bit values in status field */
-#define GUC_IS_IN_FILE		0x0001		/* found it in config file */
+#define GUC_IS_IN_FILE		0x0001	/* found it in config file */
 /*
  * Caution: the GUC_IS_IN_FILE bit is transient state for ProcessConfigFile.
  * Do not assume that its value represents useful information elsewhere.
  */
+#define GUC_PENDING_RESTART 0x0002
 
 /* upper limit for GUC variables measured in kilobytes of memory */
 /* note that various places assume the byte size fits in a "long" variable */
@@ -313,9 +311,10 @@ extern int get_num_guc_variables(void);
 extern void build_guc_variables(void);
 
 /* search in enum options */
-extern const char *config_enum_lookup_by_value(struct config_enum * record, int val);
-extern bool config_enum_lookup_by_name(struct config_enum * record,
-						   const char *value, int *retval);
+extern const char *config_enum_lookup_by_value(struct config_enum *record, int val);
+extern bool config_enum_lookup_by_name(struct config_enum *record,
+									   const char *value, int *retval);
+extern struct config_generic **get_explain_guc_options(int *num);
 
 extern bool parse_int(const char *value, int *result, int flags, const char **hintmsg);
 
@@ -329,4 +328,6 @@ extern struct config_real ConfigureNamesReal_gp[];
 extern struct config_string ConfigureNamesString_gp[];
 extern struct config_enum ConfigureNamesEnum_gp[];
 
-#endif   /* GUC_TABLES_H */
+extern void gpdb_assign_sync_flag(struct config_generic **guc_variables, int size, bool predefine);
+
+#endif							/* GUC_TABLES_H */

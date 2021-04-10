@@ -3,7 +3,7 @@
  * cdbtargeteddispatch.c
  *
  * Portions Copyright (c) 2009, Greenplum inc
- * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
  *
  *
  * IDENTIFICATION
@@ -14,21 +14,24 @@
 
 #include "postgres.h"
 
+#include "access/relation.h"
 #include "cdb/cdbtargeteddispatch.h"
 #include "optimizer/clauses.h"
 #include "parser/parsetree.h"	/* for rt_fetch() */
 #include "nodes/makefuncs.h"	/* for makeVar() */
 #include "utils/relcache.h"		/* RelationGetPartitioningKey() */
-#include "optimizer/predtest.h"
+#include "optimizer/optimizer.h"
+#include "optimizer/predtest_valueset.h"
 
-#include "catalog/gp_policy.h"
+#include "catalog/gp_distribution_policy.h"
 #include "catalog/pg_type.h"
 
 #include "catalog/pg_proc.h"
 #include "utils/syscache.h"
+#include "utils/lsyscache.h"
 
 #include "cdb/cdbdisp_query.h"
-#include "cdb/cdbhash.h"		/* isGreenplumDbHashable() */
+#include "cdb/cdbhash.h"
 #include "cdb/cdbllize.h"
 #include "cdb/cdbmutate.h"
 #include "cdb/cdbplan.h"
@@ -55,68 +58,13 @@ typedef struct PartitionKeyInfo
 } PartitionKeyInfo;
 
 /**
- * Targeted dispatch info: used when building the dispatch information for a given qual or slice
- */
-typedef struct DirectDispatchCalculationInfo
-{
-	/*
-	 * In this use of the  DirectDispatchInfo structure, a NULL contentIds
-	 * means that ANY contentID is valid (when dd->isDirectDispatch is true)
-	 *
-	 * Note also that we don't free dd->contentIds.  We let memory context
-	 * cleanup handle that.
-	 */
-	DirectDispatchInfo dd;
-
-	/**
-	 * Have any calculations been processed and used to update dd ?  If false then
-	 *    no, and dd should be considered uninitialized.
-	 */
-	bool		haveProcessedAnyCalculations;
-}
-DirectDispatchCalculationInfo;
-
-/**
- * ContentIdAssignmentData: used as the context parameter to the plan walking function that assigns
- *   targeted dispatch values to slices
- */
-typedef struct ContentIdAssignmentData
-{
-	plan_tree_base_prefix base; /* Required prefix for
-								 * plan_tree_walker/mutator */
-
-	/**
-	 * the range table!
-	 */
-	List	   *rtable;
-
-	/**
-	 * of DirectDispatchCalculationInfo*
-	 */
-	List	   *sliceStack;
-
-	/*
-	 * For use when constructing the output data structure -- objects in the
-	 * output structure will be allocated in this memory context
-	 */
-	MemoryContext memoryContextForOutput;
-
-	/**
-	 * of Plan*
-	 */
-	List	   *allSlices;
-} ContentIdAssignmentData;
-
-static bool AssignContentIdsToPlanData_Walker(Node *node, void *context);
-
-/**
  * Initialize a DirectDispatchCalculationInfo.
  */
 static void
-InitDirectDispatchCalculationInfo(DirectDispatchCalculationInfo *data)
+InitDirectDispatchCalculationInfo(DirectDispatchInfo *data)
 {
-	data->dd.isDirectDispatch = false;
-	data->dd.contentIds = NULL;
+	data->isDirectDispatch = false;
+	data->contentIds = NULL;
 	data->haveProcessedAnyCalculations = false;
 }
 
@@ -124,33 +72,30 @@ InitDirectDispatchCalculationInfo(DirectDispatchCalculationInfo *data)
  * Mark a DirectDispatchCalculationInfo as having targeted dispatch disabled
  */
 static void
-DisableTargetedDispatch(DirectDispatchCalculationInfo *data)
+DisableTargetedDispatch(DirectDispatchInfo *data)
 {
-	data->dd.isDirectDispatch = false;
-	data->dd.contentIds = NULL; /* leaks but it's okay, we made a new memory
-								 * context for the entire calculation */
+	data->isDirectDispatch = false;
+	data->contentIds = NULL;
 	data->haveProcessedAnyCalculations = true;
 }
 
 /**
  * helper function for AssignContentIdsFromUpdateDeleteQualification
  */
-static DirectDispatchCalculationInfo
-GetContentIdsFromPlanForSingleRelation(List *rtable, Plan *plan, int rangeTableIndex, Node *qualification)
+static DirectDispatchInfo
+GetContentIdsFromPlanForSingleRelation(PlannerInfo *root, Plan *plan, int rangeTableIndex, List *qualification)
 {
 	GpPolicy   *policy = NULL;
 	PartitionKeyInfo *parts = NULL;
 	int			i;
 
-	DirectDispatchCalculationInfo result;
+	DirectDispatchInfo result;
 	RangeTblEntry *rte;
 	Relation	relation = NULL;
 
 	InitDirectDispatchCalculationInfo(&result);
 
-	if (nodeTag((Node *) plan) == T_BitmapHeapScan ||
-		nodeTag((Node *) plan) == T_BitmapAppendOnlyScan ||
-		nodeTag((Node *) plan) == T_BitmapTableScan)
+	if (nodeTag((Node *) plan) == T_BitmapHeapScan)
 	{
 		/*
 		 * do not assert for bitmap heap scan --> it can have a child which is
@@ -169,7 +114,7 @@ GetContentIdsFromPlanForSingleRelation(List *rtable, Plan *plan, int rangeTableI
 	Assert(plan->righttree == NULL);
 
 	/* open and get relation info */
-	rte = rt_fetch(rangeTableIndex, rtable);
+	rte = planner_rt_fetch(rangeTableIndex, root);
 	if (rte->rtekind == RTE_RELATION)
 	{
 		/* Get a copy of the rel's GpPolicy from the relcache. */
@@ -181,7 +126,7 @@ GetContentIdsFromPlanForSingleRelation(List *rtable, Plan *plan, int rangeTableI
 			parts = (PartitionKeyInfo *) palloc(policy->nattrs * sizeof(PartitionKeyInfo));
 			for (i = 0; i < policy->nattrs; i++)
 			{
-				parts[i].attr = relation->rd_att->attrs[policy->attrs[i] - 1];
+				parts[i].attr = TupleDescAttr(relation->rd_att, policy->attrs[i] - 1);
 				parts[i].values = NULL;
 				parts[i].numValues = 0;
 				parts[i].counter = 0;
@@ -193,13 +138,76 @@ GetContentIdsFromPlanForSingleRelation(List *rtable, Plan *plan, int rangeTableI
 		/* fall through, policy will be NULL so we won't direct dispatch */
 	}
 
-	if (rte->forceDistRandom ||
-		policy == NULL ||
-		!GpPolicyIsHashPartitioned(policy))
+	if (rte->forceDistRandom ||	policy == NULL)
 	{
-		result.dd.isDirectDispatch = false;
+		/*  we won't direct dispatch  */
+		if (rte->rtekind == RTE_RELATION)
+			relation_close(relation, NoLock);
+		result.haveProcessedAnyCalculations = true;
+		return result;
 	}
-	else
+
+	/*
+	 * We first test if the predict contains a qual like
+	 * gp_segment_id = some_const. This is very suitable
+	 * for a direct dispatch. If this leads to direct dispatch
+	 * then we just return because it does not need to
+	 * eval distkey.
+	 */
+	if (GpPolicyIsPartitioned(policy))
+	{
+		Var                *seg_id_var;
+		Oid                 vartypeid;
+		int32               type_mod;
+		Oid                 type_coll;
+		PossibleValueSet    pvs_segids;
+		Node              **seg_ids;
+		int                 len;
+		int                 i;
+		List               *contentIds = NULL;
+
+		get_atttypetypmodcoll(rte->relid, GpSegmentIdAttributeNumber,
+							  &vartypeid, &type_mod, &type_coll);
+		seg_id_var = makeVar(rangeTableIndex,
+							 GpSegmentIdAttributeNumber,
+							 vartypeid, type_mod, type_coll, 0);
+		pvs_segids = DeterminePossibleValueSet((Node *) qualification,
+											   (Node *) seg_id_var);
+		if (!pvs_segids.isAnyValuePossible)
+		{
+			seg_ids = GetPossibleValuesAsArray(&pvs_segids, &len);
+			if (len > 0 && len < policy->numsegments)
+			{
+				result.isDirectDispatch = true;
+				for (i = 0; i < len; i++)
+				{
+					Node *val = seg_ids[i];
+					if (IsA(val, Const))
+					{
+						int32 segid = DatumGetInt32(((Const *) val)->constvalue);
+						contentIds = list_append_unique_int(contentIds, segid);
+					}
+					else
+					{
+						result.isDirectDispatch = false;
+						break;
+					}
+				}
+			}
+		}
+
+		DeletePossibleValueSetData(&pvs_segids);
+		if (result.isDirectDispatch)
+		{
+			result.contentIds = contentIds;
+			result.haveProcessedAnyCalculations = true;
+			if (rte->rtekind == RTE_RELATION)
+				relation_close(relation, NoLock);
+			return result;
+		}
+	}
+
+	if (GpPolicyIsHashPartitioned(policy))
 	{
 		long		totalCombinations = 1;
 
@@ -223,7 +231,7 @@ GetContentIdsFromPlanForSingleRelation(List *rtable, Plan *plan, int rangeTableI
 			 *   quals on the plan then those would be ANDed with the qual, which can only narrow our choice
 			 *   of segment and not expand it.
 			 */
-			pvs = DeterminePossibleValueSet(qualification, (Node *) var);
+			pvs = DeterminePossibleValueSet((Node *) qualification, (Node *) var);
 
 			if (pvs.isAnyValuePossible)
 			{
@@ -253,8 +261,8 @@ GetContentIdsFromPlanForSingleRelation(List *rtable, Plan *plan, int rangeTableI
 			 * one of the possible sets was empty and so we don't care where
 			 * we run this
 			 */
-			result.dd.isDirectDispatch = true;
-			Assert(result.dd.contentIds == NULL);	/* direct dispatch but no
+			result.isDirectDispatch = true;
+			Assert(result.contentIds == NULL);		/* direct dispatch but no
 													 * specific content at
 													 * all! */
 		}
@@ -267,8 +275,8 @@ GetContentIdsFromPlanForSingleRelation(List *rtable, Plan *plan, int rangeTableI
 
 			h = makeCdbHashForRelation(relation);
 
-			result.dd.isDirectDispatch = true;
-			result.dd.contentIds = NULL;
+			result.isDirectDispatch = true;
+			result.contentIds = NULL;
 
 			/* for each combination of keys calculate target segment */
 			for (index = 0; index < totalCombinations; index++)
@@ -293,64 +301,66 @@ GetContentIdsFromPlanForSingleRelation(List *rtable, Plan *plan, int rangeTableI
 					}
 					else
 					{
-						result.dd.isDirectDispatch = false;
+						result.isDirectDispatch = false;
 						break;
 					}
 					curIndex /= numValues;
 				}
 
-				if (!result.dd.isDirectDispatch)
+				if (!result.isDirectDispatch)
 					break;
 
 				hashCode = cdbhashreduce(h);
 
-				result.dd.contentIds = list_append_unique_int(result.dd.contentIds, hashCode);
+				result.contentIds = list_append_unique_int(result.contentIds, hashCode);
 			}
 		}
 		else
 		{
 			/* know nothing, can't do directed dispatch */
-			result.dd.isDirectDispatch = false;
+			result.isDirectDispatch = false;
 		}
 	}
 
 	if (rte->rtekind == RTE_RELATION)
+	{
 		relation_close(relation, NoLock);
+	}
 
 	result.haveProcessedAnyCalculations = true;
 	return result;
 }
 
-static void
-MergeDirectDispatchCalculationInfo(DirectDispatchCalculationInfo *to, DirectDispatchCalculationInfo *from)
+void
+MergeDirectDispatchCalculationInfo(DirectDispatchInfo *to, DirectDispatchInfo *from)
 {
-	if (!from->dd.isDirectDispatch)
+	if (!from->isDirectDispatch)
 	{
 		/* from eliminates all options so take it */
-		to->dd.isDirectDispatch = false;
+		to->isDirectDispatch = false;
 	}
 	else if (!to->haveProcessedAnyCalculations)
 	{
 		/* to has no data, so just take from */
 		*to = *from;
 	}
-	else if (!to->dd.isDirectDispatch)
+	else if (!to->isDirectDispatch)
 	{
 		/* to cannot get better -- leave it alone */
 	}
-	else if (from->dd.contentIds == NULL)
+	else if (from->contentIds == NULL)
 	{
 		/* from says that it doesn't need to run anywhere -- so we accept to */
 	}
-	else if (to->dd.contentIds == NULL)
+	else if (to->contentIds == NULL)
 	{
 		/* to didn't even think it needed to run so accept from */
-		to->dd.contentIds = from->dd.contentIds;
+		to->contentIds = from->contentIds;
 	}
 	else
 	{
 		/* union to with from */
-		to->dd.contentIds = list_union_int(to->dd.contentIds, from->dd.contentIds);
+		to->contentIds = list_union_int(to->contentIds, from->contentIds);
 	}
 
 	to->haveProcessedAnyCalculations = true;
@@ -367,364 +377,282 @@ ShouldPrintTestMessages()
 	return gp_test_options && strstr(gp_test_options, PRINT_DISPATCH_DECISIONS_STRING) != NULL;
 }
 
-/**
- * If node is not a plan then no direct dispatch data is copied in.
- *
- * Otherwise, overrides any previous direct dispatch data on the given node and updates it
- *   with the targeted dispatch info from the ContentIdAssignmentData
- *
- * @param isFromTopRoot is this being finalized on the topmost node of the tree, or on a lower motion node?
- */
-static void
-FinalizeDirectDispatchDataForSlice(Node *node, ContentIdAssignmentData *data, bool isFromTopRoot)
+void
+FinalizeDirectDispatchDataForSlice(PlanSlice *slice)
 {
-	/* pop it from the top and set it on the root of the slice */
-	DirectDispatchCalculationInfo *ddcr = (DirectDispatchCalculationInfo *) lfirst(list_tail(data->sliceStack));
+	DirectDispatchInfo *dd = &slice->directDispatch;
 
-	data->sliceStack = list_truncate(data->sliceStack, list_length(data->sliceStack) - 1);
-
-	if (is_plan_node(node))
+	if (dd->haveProcessedAnyCalculations)
 	{
-		Plan	   *plan = (Plan *) node;
-
-		data->allSlices = lappend(data->allSlices, plan);
-
-		list_free(plan->directDispatch.contentIds);
-		plan->directDispatch.contentIds = NIL;
-
-		if (ddcr->haveProcessedAnyCalculations)
+		if (dd->isDirectDispatch)
 		{
-			plan->directDispatch.isDirectDispatch = ddcr->dd.isDirectDispatch;
-			if (ddcr->dd.isDirectDispatch)
+			if (dd->contentIds == NULL)
 			{
-				MemoryContext oldContext;
+				int			random_segno;
 
-				if (ddcr->dd.contentIds == NULL)
-				{
-					ddcr->dd.contentIds = list_make1_int(cdb_randint(getgpsegmentCount() - 1, 0));
-					if (ShouldPrintTestMessages())
-						elog(INFO, "DDCR learned no content dispatch is required");
-				}
-				else
-				{
-					if (ShouldPrintTestMessages())
-						elog(INFO, "DDCR learned dispatch to content %d", linitial_int(ddcr->dd.contentIds));
-				}
-
-				oldContext = MemoryContextSwitchTo(data->memoryContextForOutput);
-				plan->directDispatch.contentIds = list_copy(ddcr->dd.contentIds);
-				MemoryContextSwitchTo(oldContext);
+				random_segno = cdbhashrandomseg(getgpsegmentCount());
+				dd->contentIds = list_make1_int(random_segno);
+				if (ShouldPrintTestMessages())
+					elog(INFO, "DDCR learned no content dispatch is required");
 			}
 			else
 			{
 				if (ShouldPrintTestMessages())
-					elog(INFO, "DDCR learned full dispatch is required");
+					elog(INFO, "DDCR learned dispatch to content %d", linitial_int(dd->contentIds));
 			}
 		}
 		else
 		{
 			if (ShouldPrintTestMessages())
-				elog(INFO, "DDCR learned no information: default to full dispatch");
-			plan->directDispatch.isDirectDispatch = false;
+				elog(INFO, "DDCR learned full dispatch is required");
 		}
 	}
-
-	pfree(ddcr);
+	else
+	{
+		if (ShouldPrintTestMessages())
+			elog(INFO, "DDCR learned no information: default to full dispatch");
+		dd->isDirectDispatch = false;
+	}
 }
 
-/**
- * Recursively assign content ids to the motion nodes of each slice.
- */
-static bool
-AssignContentIdsToPlanData_Walker(Node *node, void *context)
-{
-	ContentIdAssignmentData *data = (ContentIdAssignmentData *) context;
-	DirectDispatchCalculationInfo *ddcr = NULL;
-	DirectDispatchCalculationInfo dispatchInfo;
-	bool		pushNewDirectDispatchInfo = false;
-	bool		result;
-
-	if (node == NULL)
-		return false;
-
-	if (is_plan_node(node) || IsA(node, SubPlan))
-	{
-		InitDirectDispatchCalculationInfo(&dispatchInfo);
-
-		switch (nodeTag(node))
-		{
-			case T_Result:
-				/* no change to dispatchInfo --> just iterate children */
-				break;
-			case T_Append:
-			case T_MergeAppend:
-				/* no change to dispatchInfo --> just iterate children */
-				break;
-			case T_LockRows:
-			case T_ModifyTable:
-				/* no change to dispatchInfo --> just iterate children */
-				break;
-			case T_BitmapAnd:
-			case T_BitmapOr:
-				/* no change to dispatchInfo --> just iterate children */
-				break;
-			case T_BitmapHeapScan:
-			case T_BitmapAppendOnlyScan:
-			case T_BitmapTableScan:
-				/* no change to dispatchInfo --> just iterate children */
-				break;
-			case T_SeqScan:
-
-				/*
-				 * we can determine the dispatch data to merge by looking at
-				 * the relation begin scanned
-				 */
-				dispatchInfo = GetContentIdsFromPlanForSingleRelation(data->rtable,
-																	 (Plan *) node,
-																	 ((Scan *) node)->scanrelid,
-																	 (Node *) ((Plan *) node)->qual);
-				break;
-
-			case T_ExternalScan:
-				DisableTargetedDispatch(&dispatchInfo); /* not sure about
-														 * external tables ...
-														 * so disable */
-				break;
-
-			case T_IndexScan:
-				{
-					IndexScan  *indexScan = (IndexScan *) node;
-
-					/*
-					 * we can determine the dispatch data to merge by looking
-					 * at the relation begin scanned
-					 */
-					dispatchInfo = GetContentIdsFromPlanForSingleRelation(data->rtable,
-																		 (Plan *) node,
-																		 ((Scan *) node)->scanrelid,
-																		 (Node *) indexScan->indexqualorig);
-					/* must use _orig_ qual ! */
-				}
-				break;
-
-			case T_IndexOnlyScan:
-				{
-					IndexOnlyScan  *indexOnlyScan = (IndexOnlyScan *) node;
-
-					/*
-					 * we can determine the dispatch data to merge by looking
-					 * at the relation begin scanned
-					 */
-					dispatchInfo = GetContentIdsFromPlanForSingleRelation(data->rtable,
-																		 (Plan *) node,
-																		 ((Scan *) node)->scanrelid,
-																		 (Node *) indexOnlyScan->indexqualorig);
-					/* must use _orig_ qual ! */
-				}
-				break;
-
-			case T_BitmapIndexScan:
-				{
-					BitmapIndexScan *bitmapScan = (BitmapIndexScan *) node;
-
-					/*
-					 * we can determine the dispatch data to merge by looking
-					 * at the relation begin scanned
-					 */
-					dispatchInfo = GetContentIdsFromPlanForSingleRelation(data->rtable,
-																		 (Plan *) node,
-																		 ((Scan *) node)->scanrelid,
-																		 (Node *) bitmapScan->indexqualorig);
-					/* must use original qual ! */
-				}
-				break;
-			case T_SubqueryScan:
-				/* Regular walker goes into subplans */
-				break;
-			case T_TidScan:
-			case T_FunctionScan:
-			case T_WorkTableScan:
-				DisableTargetedDispatch(&dispatchInfo);
-				break;
-			case T_ValuesScan:
-				/* no change to dispatchInfo */
-				break;
-			case T_NestLoop:
-			case T_MergeJoin:
-			case T_HashJoin:
-				/* join: no change to dispatchInfo --> just iterate children */
-
-				/*
-				 * note that we could want to look at the join qual but
-				 * constant checks should have been pushed down to the
-				 * underlying scans so we shouldn't learn anything
-				 */
-				break;
-			case T_Material:
-			case T_Sort:
-			case T_Agg:
-			case T_Unique:
-			case T_Hash:
-			case T_SetOp:
-			case T_Limit:
-			case T_PartitionSelector:
-				break;
-			case T_Motion:
-
-				/*
-				 * receiving end knows nothing (since we don't analyze the
-				 * distribution key right now)
-				 */
-
-				/*
-				 * ideally we would take subsegments from analyzing the
-				 * distribution key's distribution but that is not done right
-				 * now
-				 */
-				DisableTargetedDispatch(&dispatchInfo);
-
-				/* and we must push a new slice */
-				pushNewDirectDispatchInfo = true;
-				break;
-			case T_ShareInputScan:
-
-				/*
-				 * note: could try to peek into the building slice to get its
-				 * direct dispatch values but we don't
-				 */
-				DisableTargetedDispatch(&dispatchInfo);
-				break;
-			case T_WindowAgg:
-			case T_TableFunctionScan:
-			case T_Repeat:
-			case T_RecursiveUnion:
-				/* no change to dispatchInfo --> just iterate children */
-				break;
-			case T_SubPlan:
-				{
-					SubPlan    *subplan = (SubPlan *) node;
-
-					if (!subplan->is_initplan)
-					{
-						/*
-						 * init subplans are dispatched independently of the
-						 * main plan, but for regular subplans we need to
-						 * process the subplan plan as it may require
-						 * dispatching to all segments even if the main plan
-						 * does not need to (MPP-22019)
-						 */
-						Plan	   *subplan_plan = plan_tree_base_subplan_get_plan(context, subplan);
-
-						plan_tree_walker((Node *) subplan_plan, AssignContentIdsToPlanData_Walker, context);
-					}
-					pushNewDirectDispatchInfo = true;
-					break;
-				}
-			case T_ForeignScan:
-				DisableTargetedDispatch(&dispatchInfo); /* not sure about
-														 * foreign tables ...
-														 * so disable */
-				break;
-			case T_SplitUpdate:
-			case T_Reshuffle:
-				break;
-			default:
-				elog(ERROR, "Invalid plan node %d", nodeTag(node));
-				break;
-		}
-
-		/*
-		 * analyzed node type, now do the work (for all except subquery scan,
-		 * which do work in the switch above and return
-		 */
-		if (dispatchInfo.haveProcessedAnyCalculations)
-		{
-			/* learned new info: merge it in */
-			ddcr = llast(data->sliceStack);
-			MergeDirectDispatchCalculationInfo(ddcr, &dispatchInfo);
-		}
-
-		if (pushNewDirectDispatchInfo)
-		{
-			/* recursing to a child slice */
-			ddcr = palloc(sizeof(DirectDispatchCalculationInfo));
-			InitDirectDispatchCalculationInfo(ddcr);
-			data->sliceStack = lappend(data->sliceStack, ddcr);
-		}
-
-	}
-
-	/*
-	 * recurse -- must recurse even for non-plan nodes because of
-	 * qualifications?
-	 */
-
-	/*
-	 * note that the SubqueryScan nodes do NOT reach here -- its children are
-	 * managed in the switch above
-	 */
-	result = plan_tree_walker(node, AssignContentIdsToPlanData_Walker, context);
-	Assert(!result);
-
-	if (pushNewDirectDispatchInfo)
-	{
-		FinalizeDirectDispatchDataForSlice(node, data, false);
-	}
-
-	return result;
-}
-
-/**
- * Update the plan and its descendants with markings telling which subsets of content the node can run on.
- *
- */
 void
-AssignContentIdsToPlanData(Query *query, Plan *plan, PlannerInfo *root)
+DirectDispatchUpdateContentIdsFromPlan(PlannerInfo *root, Plan *plan)
 {
-	ContentIdAssignmentData data;
+	DirectDispatchInfo dispatchInfo;
 
-	/* setup */
-	SwitchedMemoryContext mem = AllocSetCreateDefaultContextInCurrentAndSwitchTo("AssignContentIdsToPlanData");
-	DirectDispatchCalculationInfo *ddcr = palloc(sizeof(DirectDispatchCalculationInfo));
+	InitDirectDispatchCalculationInfo(&dispatchInfo);
 
-	InitDirectDispatchCalculationInfo(ddcr);
-
-	planner_init_plan_tree_base(&data.base, root);
-	data.memoryContextForOutput = mem.oldContext;
-	data.sliceStack = list_make1(ddcr);
-	data.rtable = root->glob->finalrtable;
-	data.allSlices = NULL;
-
-	/* Do it! */
-	AssignContentIdsToPlanData_Walker((Node *) plan, &data);
-
-	if (!IsA(plan, SubPlan) &&!IsA(plan, Motion))
+	switch (nodeTag(plan))
 	{
-		/* subplan and motion will already have been finalized */
-		FinalizeDirectDispatchDataForSlice((Node *) plan, &data, true);
+		case T_Result:
+		case T_Append:
+		case T_MergeAppend:
+		case T_LockRows:
+		case T_ModifyTable:
+		case T_BitmapAnd:
+		case T_BitmapOr:
+		case T_BitmapHeapScan:
+			/* no change to dispatchInfo */
+			break;
+		case T_SampleScan:
+			DisableTargetedDispatch(&dispatchInfo);
+			break;
+		case T_SeqScan:
+			/*
+			 * we can determine the dispatch data to merge by looking at
+			 * the relation begin scanned
+			 */
+			dispatchInfo = GetContentIdsFromPlanForSingleRelation(root,
+																  plan,
+																  ((Scan *) plan)->scanrelid,
+																  plan->qual);
+			break;
+
+		case T_IndexScan:
+			{
+				IndexScan  *indexScan = (IndexScan *) plan;
+
+				/*
+				 * we can determine the dispatch data to merge by looking
+				 * at the relation begin scanned
+				 */
+				dispatchInfo = GetContentIdsFromPlanForSingleRelation(root,
+																	  plan,
+																	  ((Scan *) plan)->scanrelid,
+																	  indexScan->indexqualorig);
+				/* must use _orig_ qual ! */
+			}
+			break;
+
+		case T_IndexOnlyScan:
+			{
+				IndexOnlyScan  *indexOnlyScan = (IndexOnlyScan *) plan;
+
+				/*
+				 * we can determine the dispatch data to merge by looking
+				 * at the relation begin scanned
+				 */
+				dispatchInfo = GetContentIdsFromPlanForSingleRelation(root,
+																	  plan,
+																	  ((Scan *) plan)->scanrelid,
+																	  indexOnlyScan->indexqualorig);
+				/* must use _orig_ qual ! */
+			}
+			break;
+
+		case T_BitmapIndexScan:
+			{
+				BitmapIndexScan *bitmapScan = (BitmapIndexScan *) plan;
+
+				/*
+				 * we can determine the dispatch data to merge by looking
+				 * at the relation begin scanned
+				 */
+				dispatchInfo = GetContentIdsFromPlanForSingleRelation(root,
+																	  plan,
+																	  ((Scan *) plan)->scanrelid,
+																	  bitmapScan->indexqualorig);
+				/* must use original qual ! */
+			}
+			break;
+		case T_SubqueryScan:
+		case T_NamedTuplestoreScan:
+			/* no change to dispatchInfo */
+			break;
+		case T_TidScan:
+		case T_FunctionScan:
+		case T_TableFuncScan:
+		case T_WorkTableScan:
+			DisableTargetedDispatch(&dispatchInfo);
+			break;
+		case T_ValuesScan:
+			/* no change to dispatchInfo */
+			break;
+		case T_NestLoop:
+		case T_MergeJoin:
+		case T_HashJoin:
+			/* join: no change to dispatchInfo */
+
+			/*
+			 * note that we could want to look at the join qual but
+			 * constant checks should have been pushed down to the
+			 * underlying scans so we shouldn't learn anything
+			 */
+			break;
+		case T_Material:
+		case T_Sort:
+		case T_Agg:
+		case T_TupleSplit:
+		case T_Unique:
+		case T_Gather:
+		case T_Hash:
+		case T_SetOp:
+		case T_Limit:
+		case T_PartitionSelector:
+			break;
+		case T_Motion:
+			/*
+			 * It's currently not allowed to direct-dispatch a slice that
+			 * has a Motion that sends tuples to it. It would be possible
+			 * in principle, but the interconnect initialization code gets
+			 * confused.
+			 */
+			DisableTargetedDispatch(&dispatchInfo);
+			break;
+
+		case T_ShareInputScan:
+
+			/*
+			 * note: could try to peek into the building slice to get its
+			 * direct dispatch values but we don't
+			 */
+			DisableTargetedDispatch(&dispatchInfo);
+			break;
+		case T_WindowAgg:
+		case T_TableFunctionScan:
+		case T_RecursiveUnion:
+			/* no change to dispatchInfo */
+			break;
+		case T_ForeignScan:
+			DisableTargetedDispatch(&dispatchInfo); /* not sure about
+													 * foreign tables ...
+													 * so disable */
+			break;
+		case T_SplitUpdate:
+			break;
+		default:
+			elog(ERROR, "unknown plan node %d", nodeTag(plan));
+			break;
 	}
 
 	/*
-	 * now check to see if we are multi-slice.  If so then we will disable the
-	 * direct dispatch (because it's not working right now -- see MPP-7630)
+	 * analyzed node type, now do the work (for all except subquery scan,
+	 * which do work in the switch above and return
 	 */
-	if (list_length(data.allSlices) > 2)
+	if (dispatchInfo.haveProcessedAnyCalculations)
 	{
-		/*
-		 * NOTE!!!  When this is fixed, make a test for subquery initPlan and
-		 * qual case (hitting code in AssignContentIdsToPlanData_SubqueryScan)
-		 */
-		ListCell   *cell;
+		/* learned new info: merge it in */
+		MergeDirectDispatchCalculationInfo(&root->curSlice->directDispatch, &dispatchInfo);
+	}
+}
 
-		foreach(cell, data.allSlices)
+void
+DirectDispatchUpdateContentIdsForInsert(PlannerInfo *root, Plan *plan,
+										GpPolicy *targetPolicy, Oid *hashfuncs)
+{
+	DirectDispatchInfo dispatchInfo;
+	int			i;
+	ListCell   *cell = NULL;
+	bool		isDirectDispatch;
+	Datum	   *values;
+	bool	   *nulls;
+
+	InitDirectDispatchCalculationInfo(&dispatchInfo);
+
+	values = (Datum *) palloc(targetPolicy->nattrs * sizeof(Datum));
+	nulls = (bool *) palloc(targetPolicy->nattrs * sizeof(bool));
+
+	/*
+	 * the nested loops here seem scary -- especially since we've already
+	 * walked them before -- but I think this is still required since they may
+	 * not be in the same order. (also typically we don't distribute by more
+	 * than a handful of attributes).
+	 */
+	isDirectDispatch = true;
+	for (i = 0; i < targetPolicy->nattrs; i++)
+	{
+		foreach(cell, plan->targetlist)
 		{
-			Plan	   *plan = (Plan *) lfirst(cell);
+			TargetEntry *tle = (TargetEntry *) lfirst(cell);
+			Const	   *c;
 
-			plan->directDispatch.isDirectDispatch = false;
-			list_free(plan->directDispatch.contentIds);
-			plan->directDispatch.contentIds = NIL;
+			Assert(tle->expr);
+
+			if (tle->resno != targetPolicy->attrs[i])
+				continue;
+
+			if (!IsA(tle->expr, Const))
+			{
+				/* the planner could not simplify this */
+				isDirectDispatch = false;
+				break;
+			}
+
+			c = (Const *) tle->expr;
+
+			values[i] = c->constvalue;
+			nulls[i] = c->constisnull;
+			break;
 		}
+
+		if (!isDirectDispatch)
+			break;
 	}
 
-	DeleteAndRestoreSwitchedMemoryContext(mem);
+	if (isDirectDispatch)
+	{
+		uint32		hashcode;
+		CdbHash    *h;
+
+		h = makeCdbHash(targetPolicy->numsegments, targetPolicy->nattrs, hashfuncs);
+
+		cdbhashinit(h);
+		for (i = 0; i < targetPolicy->nattrs; i++)
+		{
+			cdbhash(h, i + 1, values[i], nulls[i]);
+		}
+
+		/* We now have the hash-partition that this row belong to */
+		hashcode = cdbhashreduce(h);
+		dispatchInfo.isDirectDispatch = true;
+		dispatchInfo.contentIds = list_make1_int(hashcode);
+		dispatchInfo.haveProcessedAnyCalculations = true;
+
+		/* learned new info: merge it in */
+		MergeDirectDispatchCalculationInfo(&root->curSlice->directDispatch, &dispatchInfo);
+
+		elog(DEBUG1, "sending single row constant insert to content %d", hashcode);
+	}
+	pfree(values);
+	pfree(nulls);
 }

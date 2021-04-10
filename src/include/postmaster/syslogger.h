@@ -3,7 +3,7 @@
  * syslogger.h
  *	  Exports from postmaster/syslogger.c.
  *
- * Copyright (c) 2004-2014, PostgreSQL Global Development Group
+ * Copyright (c) 2004-2019, PostgreSQL Global Development Group
  *
  * src/include/postmaster/syslogger.h
  *
@@ -99,7 +99,6 @@ extern void syslogger_log_chunk_list(PipeProtoChunk *chunk);
 typedef struct
 {
 	pg_time_t session_start_time;
-	char send_alert;
 	char omit_location;
 	char gp_is_primary;
 	int32 gp_session_id;
@@ -194,7 +193,17 @@ extern void syslogger_write_int32(bool test0, const char *prefix, int32 i,
 extern int syslogger_write_str(const char *data, int len, bool amsyslogger, bool csv);
 
 #ifdef EXEC_BACKEND
-extern void SysLoggerMain(int argc, char *argv[]) __attribute__((noreturn));
+extern void SysLoggerMain(int argc, char *argv[]) pg_attribute_noreturn();
 #endif
 
-#endif   /* _SYSLOGGER_H */
+extern bool CheckLogrotateSignal(void);
+extern void RemoveLogrotateSignalFiles(void);
+
+/*
+ * Name of files saving meta-data information about the log
+ * files currently in use by the syslogger
+ */
+#define LOG_METAINFO_DATAFILE  "current_logfiles"
+#define LOG_METAINFO_DATAFILE_TMP  LOG_METAINFO_DATAFILE ".tmp"
+
+#endif							/* _SYSLOGGER_H */

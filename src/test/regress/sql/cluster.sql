@@ -106,13 +106,13 @@ WHERE pg_class.oid=indexrelid
 	AND indisclustered;
 
 -- Verify that clustering all tables does in fact cluster the right ones
-CREATE USER clstr_user;
-CREATE TABLE clstr_1 (a INT PRIMARY KEY) DISTRIBUTED BY (a);
-CREATE TABLE clstr_2 (a INT PRIMARY KEY) DISTRIBUTED BY (a);
-CREATE TABLE clstr_3 (a INT PRIMARY KEY) DISTRIBUTED BY (a);
-ALTER TABLE clstr_1 OWNER TO clstr_user;
-ALTER TABLE clstr_3 OWNER TO clstr_user;
-GRANT SELECT ON clstr_2 TO clstr_user;
+CREATE USER regress_clstr_user;
+CREATE TABLE clstr_1 (a INT PRIMARY KEY);
+CREATE TABLE clstr_2 (a INT PRIMARY KEY);
+CREATE TABLE clstr_3 (a INT PRIMARY KEY);
+ALTER TABLE clstr_1 OWNER TO regress_clstr_user;
+ALTER TABLE clstr_3 OWNER TO regress_clstr_user;
+GRANT SELECT ON clstr_2 TO regress_clstr_user;
 INSERT INTO clstr_1 VALUES (2);
 INSERT INTO clstr_1 VALUES (1);
 INSERT INTO clstr_2 VALUES (2);
@@ -142,7 +142,7 @@ INSERT INTO clstr_3 VALUES (1);
 
 -- this user can only cluster clstr_1 and clstr_3, but the latter
 -- has not been clustered
-SET SESSION AUTHORIZATION clstr_user;
+SET SESSION AUTHORIZATION regress_clstr_user;
 CLUSTER;
 SELECT * FROM clstr_1 UNION ALL
   SELECT * FROM clstr_2 UNION ALL
@@ -196,10 +196,54 @@ cluster clstr_temp using clstr_temp_pkey;
 select * from clstr_temp;
 drop table clstr_temp;
 
+RESET SESSION AUTHORIZATION;
+
+-- Check that partitioned tables cannot be clustered
+CREATE TABLE clstrpart (a int) PARTITION BY RANGE (a);
+CREATE INDEX clstrpart_idx ON clstrpart (a);
+ALTER TABLE clstrpart CLUSTER ON clstrpart_idx;
+CLUSTER clstrpart USING clstrpart_idx;
+DROP TABLE clstrpart;
+
+-- Test CLUSTER with external tuplesorting
+
+-- The tests assume that the rows come out in the physical order, as
+-- sorted by CLUSTER. In GPDB, add a dummy column to force all the rows to go
+-- to the same segment, otherwise the rows come out in random order from the
+-- segments.
+create table clstr_4 as select 1 as dummy, * from tenk1 distributed by (dummy);
+create index cluster_sort on clstr_4 (hundred, thousand, tenthous);
+-- ensure we don't use the index in CLUSTER nor the checking SELECTs
+set enable_indexscan = off;
+
+-- Use external sort:
+set maintenance_work_mem = '1MB';
+cluster clstr_4 using cluster_sort;
+select * from
+(select hundred, lag(hundred) over () as lhundred,
+        thousand, lag(thousand) over () as lthousand,
+        tenthous, lag(tenthous) over () as ltenthous from clstr_4) ss
+where row(hundred, thousand, tenthous) <= row(lhundred, lthousand, ltenthous);
+
+reset enable_indexscan;
+reset maintenance_work_mem;
+
 -- clean up
-\c -
 DROP TABLE clustertest;
 DROP TABLE clstr_1;
 DROP TABLE clstr_2;
 DROP TABLE clstr_3;
-DROP USER clstr_user;
+DROP TABLE clstr_4;
+DROP USER regress_clstr_user;
+
+-- Test transactional safety of CLUSTER against heap
+CREATE TABLE foo (a int, b varchar, c int) DISTRIBUTED BY (a);
+INSERT INTO foo SELECT i, 'initial insert' || i, i FROM generate_series(1,10000)i;
+CREATE index ifoo on foo using btree (b);
+-- execute cluster in a transaction but don't commit the transaction
+BEGIN;
+CLUSTER foo USING ifoo;
+ABORT;
+-- try cluster again
+CLUSTER foo USING ifoo;
+DROP TABLE foo;

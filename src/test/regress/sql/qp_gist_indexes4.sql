@@ -196,7 +196,7 @@ INSERT INTO geometricTypes (seed, c, b, p)
    SeedToPolygon(x)
   FROM generate_series(1, 20000)x
  ;
-
+ANALYZE geometricTypes;
 
 
 -- ----------------------------------------------------------------------
@@ -556,6 +556,7 @@ INSERT INTO textSearch VALUES (4, 'orca');
 INSERT INTO textSearch VALUES (3, 'gpdb');
 INSERT INTO textSearch VALUES (4, 'gist');
 INSERT INTO textSearch VALUES (3, 'cool');
+ANALYZE textSearch;
 
 SELECT * FROM textSearch 
  WHERE t @@ to_tsquery('test'); 
@@ -577,7 +578,7 @@ DROP TABLE IF EXISTS textSearch;
 --     commands, but a later part of the test checks that we used an index 
 --     scan rather than a sequential scan when executing the SELECT 
 --     statements. This test should not be taking longer than a couple of 
---     seconds. If it goes for a table scan/seq scan, then this query will take
+--     seconds. If it goes for a seq scan, then this query will take
 --     at least 70x times longer. 
 -- ----------------------------------------------------------------------------
 SET optimizer_enable_tablescan = TRUE;

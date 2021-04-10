@@ -3,7 +3,7 @@
  * cdbdistributedsnapshot.h
  *
  * Portions Copyright (c) 2007-2008, Greenplum inc
- * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
  *
  *
  * IDENTIFICATION
@@ -22,12 +22,6 @@
 typedef struct DistributedSnapshot
 {
 	/*
-	 * The unique timestamp for this start of the DTM.  It applies to all of
-	 * the distributed transactions in this snapshot.
-	 */
-	DistributedTransactionTimeStamp	distribTransactionTimeStamp;
-
-	/*
 	 * The lowest distributed transaction being used for distributed snapshots.
 	 */
 	DistributedTransactionId xminAllDistributedSnapshots;
@@ -40,8 +34,6 @@ typedef struct DistributedSnapshot
 	DistributedTransactionId xmin;	/* XID < xmin are visible to me */
 	DistributedTransactionId xmax;	/* XID >= xmax are invisible to me */
 	int32		count;		/*  # of distributed xids in inProgressXidArray */
-	int32		maxCount;	/* allocated size of inProgressXidArray, or -1
-							 * if it's not malloc'd */
 
 	/* Array of distributed transactions in progress. */
 	DistributedTransactionId        *inProgressXidArray;
@@ -62,7 +54,6 @@ typedef struct DistributedSnapshotWithLocalMapping
 	TransactionId minCachedLocalXid;
 	TransactionId maxCachedLocalXid;
 	int32 currentLocalXidsCount;
-	int32 maxLocalXidsCount;
 	TransactionId *inProgressMappedLocalXids;
 } DistributedSnapshotWithLocalMapping;
 
@@ -71,6 +62,7 @@ typedef enum
 	DISTRIBUTEDSNAPSHOT_COMMITTED_NONE = 0,		
 	DISTRIBUTEDSNAPSHOT_COMMITTED_INPROGRESS,
 	DISTRIBUTEDSNAPSHOT_COMMITTED_VISIBLE,
+	DISTRIBUTEDSNAPSHOT_COMMITTED_UNKNOWN,
 	DISTRIBUTEDSNAPSHOT_COMMITTED_IGNORE
 } DistributedSnapshotCommitted;
 

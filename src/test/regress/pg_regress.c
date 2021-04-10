@@ -8,7 +8,7 @@
  *
  * This code is released under the terms of the PostgreSQL License.
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/test/regress/pg_regress.c
@@ -16,7 +16,7 @@
  *-------------------------------------------------------------------------
  */
 
-#include "pg_regress.h"
+#include "postgres_fe.h"
 
 #include <ctype.h>
 #include <sys/stat.h>
@@ -33,8 +33,17 @@
 #include <sys/resource.h>
 #endif
 
+#include "pg_regress.h"
+
+#include "common/logging.h"
+#include "common/restricted_token.h"
+#include "common/string.h"
+#include "common/username.h"
 #include "getopt_long.h"
+#include "lib/stringinfo.h"
+#include "libpq/pqcomm.h"		/* needed for UNIXSOCK_PATH() */
 #include "pg_config_paths.h"
+#include "portability/instr_time.h"
 
 /* for resultmap we need a list of pairs of strings */
 typedef struct _resultmap
@@ -46,24 +55,9 @@ typedef struct _resultmap
 } _resultmap;
 
 /*
- * Values obtained from pg_config_paths.h and Makefile.  The PG installation
- * paths are only used in temp_install mode: we use these strings to find
- * out where "make install" will put stuff under the temp_install directory.
- * In non-temp_install mode, the only thing we need is the location of psql,
- * which we expect to find in psqldir, or in the PATH if psqldir isn't given.
- *
- * XXX Because pg_regress is not installed in bindir, we can't support
- * this for relocatable trees as it is.  --psqldir would need to be
- * specified in those cases.
+ * Values obtained from Makefile.
  */
-char	   *bindir = PGBINDIR;
-char	   *libdir = LIBDIR;
-char	   *datadir = PGSHAREDIR;
 char	   *host_platform = HOST_TUPLE;
-
-#ifndef WIN32_ONLY_COMPILER
-static char *makeprog = MAKEPROG;
-#endif
 
 #ifndef WIN32					/* not used in WIN32 case */
 static char *shellprog = SHELLPROG;
@@ -83,28 +77,34 @@ const char *basic_diff_opts = "-I HINT: -I CONTEXT: -I GP_IGNORE:";
 const char *pretty_diff_opts = "-I HINT: -I CONTEXT: -I GP_IGNORE: -U3";
 #else
 const char *basic_diff_opts = "-w";
-const char *pretty_diff_opts = "-w -C3";
+const char *pretty_diff_opts = "-w -U3";
 #endif
 
+_stringlist *setup_tests = NULL;
 /* options settable from command line */
 _stringlist *dblist = NULL;
 bool		debug = false;
 char	   *inputdir = ".";
 char	   *outputdir = ".";
-char	   *psqldir = PGBINDIR;
+char	   *tablespacedir = ".";
+char	   *exclude_tests_file = "";
+char	   *prehook = "";
+char	   *bindir = PGBINDIR;
 char	   *launcher = NULL;
+bool        print_failure_diffs_is_enabled = false;
 bool 		optimizer_enabled = false;
 bool 		resgroup_enabled = false;
 static _stringlist *loadlanguage = NULL;
 static _stringlist *loadextension = NULL;
 static int	max_connections = 0;
+static int	max_concurrent_tests = 0;
 static char *encoding = NULL;
+static _stringlist *init_file_list = NULL;
 static _stringlist *schedulelist = NULL;
 static _stringlist *exclude_tests = NULL;
 static _stringlist *extra_tests = NULL;
-static char *temp_install = NULL;
-static char *temp_config = NULL;
-static char *top_builddir = NULL;
+static char *temp_instance = NULL;
+static _stringlist *temp_configs = NULL;
 static bool nolocale = false;
 static bool use_existing = false;
 static char *hostname = NULL;
@@ -113,16 +113,20 @@ static bool port_specified_by_user = false;
 static char *dlpath = PKGLIBDIR;
 static char *user = NULL;
 static _stringlist *extraroles = NULL;
-static _stringlist *extra_install = NULL;
-static char *initfile = NULL;
-static char *aodir = NULL;
-static char *resgroupdir = NULL;
+static char *config_auth_datadir = NULL;
+static bool  ignore_plans = false;
 
 /* internal variables */
 static const char *progname;
 static char *logfilename;
 static FILE *logfile;
 static char *difffilename;
+static const char *sockdir;
+#ifdef HAVE_UNIX_SOCKETS
+static const char *temp_sockdir;
+static char sockself[MAXPGPATH];
+static char socklock[MAXPGPATH];
+#endif
 
 static _resultmap *resultmap = NULL;
 
@@ -133,43 +137,22 @@ static int	success_count = 0;
 static int	fail_count = 0;
 static int	fail_ignore_count = 0;
 
+static bool halt_work = false;
+
 static bool directory_exists(const char *dir);
 static void make_directory(const char *dir);
 
-static void create_database(const char *dbname);
-static void drop_database_if_exists(const char *dbname);
-
-static int
-run_diff(const char *cmd, const char *filename);
-
-static bool should_exclude_test(char *test);
-
-static void
-header(const char *fmt,...)
-/* This extension allows gcc to check the format string for consistency with
-   the supplied arguments. */
-__attribute__((format(PG_PRINTF_ATTRIBUTE, 1, 2)));
-static void
-status(const char *fmt,...)
-/* This extension allows gcc to check the format string for consistency with
-   the supplied arguments. */
-__attribute__((format(PG_PRINTF_ATTRIBUTE, 1, 2)));
-static void
-psql_command(const char *database, const char *query,...)
-/* This extension allows gcc to check the format string for consistency with
-   the supplied arguments. */
-__attribute__((format(PG_PRINTF_ATTRIBUTE, 2, 3)));
-
-#ifdef WIN32
-typedef BOOL (WINAPI * __CreateRestrictedToken) (HANDLE, DWORD, DWORD, PSID_AND_ATTRIBUTES, DWORD, PLUID_AND_ATTRIBUTES, DWORD, PSID_AND_ATTRIBUTES, PHANDLE);
-
-/* Windows API define missing from some versions of MingW headers */
-#ifndef  DISABLE_MAX_PRIVILEGE
-#define DISABLE_MAX_PRIVILEGE	0x1
-#endif
-#endif
+static void header(const char *fmt,...) pg_attribute_printf(1, 2);
+static void status(const char *fmt,...) pg_attribute_printf(1, 2);
+static void psql_command(const char *database, const char *query,...) pg_attribute_printf(2, 3);
 
 static bool detectCgroupMountPoint(char *cgdir, int len);
+static bool should_exclude_test(char *test);
+static int run_diff(const char *cmd, const char *filename);
+
+static char *content_zero_hostname = NULL;
+static char *get_host_name(int16 contentid, char role);
+static bool cluster_healthy(void);
 
 /*
  * allow core files if possible.
@@ -203,10 +186,10 @@ unlimit_core_size(void)
 void
 add_stringlist_item(_stringlist **listhead, const char *str)
 {
-	_stringlist *newentry = malloc(sizeof(_stringlist));
+	_stringlist *newentry = pg_malloc(sizeof(_stringlist));
 	_stringlist *oldentry;
 
-	newentry->str = strdup(str);
+	newentry->str = pg_strdup(str);
 	newentry->next = NULL;
 	if (*listhead == NULL)
 		*listhead = newentry;
@@ -239,7 +222,7 @@ free_stringlist(_stringlist **listhead)
 static void
 split_to_stringlist(const char *s, const char *delim, _stringlist **listhead)
 {
-	char	   *sc = strdup(s);
+	char	   *sc = pg_strdup(s);
 	char	   *token = strtok(sc, delim);
 
 	while (token)
@@ -248,6 +231,40 @@ split_to_stringlist(const char *s, const char *delim, _stringlist **listhead)
 		token = strtok(NULL, delim);
 	}
 	free(sc);
+}
+
+static void
+load_exclude_tests_file(_stringlist **listhead, const char *exclude_tests_file)
+{
+	char buf[1024];
+	FILE *excludefile;
+	int i;
+	excludefile = fopen(exclude_tests_file, "r");
+	if (!excludefile)
+	{
+		fprintf(stderr, _("\ncould not open file %s: %s\n"),
+				exclude_tests_file, strerror(errno));
+		_exit(2);
+	}
+	while (fgets(buf, sizeof(buf), excludefile))
+	{
+		i = strlen(buf);
+		if (buf[i-1] == '\n')
+			buf[i-1] = '\0';
+		add_stringlist_item(&exclude_tests, buf);
+	}
+	if (ferror(excludefile))
+	{
+		fprintf(stderr, _("\ncould not read file %s: %s\n"),
+				exclude_tests_file, strerror(errno));
+		_exit(2);
+	}
+	if (fclose(excludefile))
+	{
+		fprintf(stderr, _("\ncould not close file %s: %s\n"),
+				exclude_tests_file, strerror(errno));
+		_exit(2);
+	}
 }
 
 /*
@@ -317,8 +334,10 @@ stop_postmaster(void)
 		fflush(stderr);
 
 		snprintf(buf, sizeof(buf),
-				 "\"%s/pg_ctl\" stop -D \"%s/data\" -s -m fast",
-				 bindir, temp_install);
+				 "\"%s%spg_ctl\" stop -D \"%s/data\" -s",
+				 bindir ? bindir : "",
+				 bindir ? "/" : "",
+				 temp_instance);
 		r = system(buf);
 		if (r != 0)
 		{
@@ -331,16 +350,81 @@ stop_postmaster(void)
 	}
 }
 
+#ifdef HAVE_UNIX_SOCKETS
 /*
- * Always exit through here, not through plain exit(), to ensure we make
- * an effort to shut down a temp postmaster
+ * Remove the socket temporary directory.  pg_regress never waits for a
+ * postmaster exit, so it is indeterminate whether the postmaster has yet to
+ * unlink the socket and lock file.  Unlink them here so we can proceed to
+ * remove the directory.  Ignore errors; leaking a temporary directory is
+ * unimportant.  This can run from a signal handler.  The code is not
+ * acceptable in a Windows signal handler (see initdb.c:trapsig()), but
+ * Windows is not a HAVE_UNIX_SOCKETS platform.
  */
-void
-exit_nicely(int code)
+static void
+remove_temp(void)
 {
-	stop_postmaster();
-	exit(code);
+	Assert(temp_sockdir);
+	unlink(sockself);
+	unlink(socklock);
+	rmdir(temp_sockdir);
 }
+
+/*
+ * Signal handler that calls remove_temp() and reraises the signal.
+ */
+static void
+signal_remove_temp(int signum)
+{
+	remove_temp();
+
+	pqsignal(signum, SIG_DFL);
+	raise(signum);
+}
+
+/*
+ * Create a temporary directory suitable for the server's Unix-domain socket.
+ * The directory will have mode 0700 or stricter, so no other OS user can open
+ * our socket to exploit our use of trust authentication.  Most systems
+ * constrain the length of socket paths well below _POSIX_PATH_MAX, so we
+ * place the directory under /tmp rather than relative to the possibly-deep
+ * current working directory.
+ *
+ * Compared to using the compiled-in DEFAULT_PGSOCKET_DIR, this also permits
+ * testing to work in builds that relocate it to a directory not writable to
+ * the build/test user.
+ */
+static const char *
+make_temp_sockdir(void)
+{
+	char	   *template = pg_strdup("/tmp/pg_regress-XXXXXX");
+
+	temp_sockdir = mkdtemp(template);
+	if (temp_sockdir == NULL)
+	{
+		fprintf(stderr, _("%s: could not create directory \"%s\": %s\n"),
+				progname, template, strerror(errno));
+		exit(2);
+	}
+
+	/* Stage file names for remove_temp().  Unsafe in a signal handler. */
+	UNIXSOCK_PATH(sockself, port, temp_sockdir);
+	snprintf(socklock, sizeof(socklock), "%s.lock", sockself);
+
+	/* Remove the directory during clean exit. */
+	atexit(remove_temp);
+
+	/*
+	 * Remove the directory before dying to the usual signals.  Omit SIGQUIT,
+	 * preserving it as a quick, untidy exit.
+	 */
+	pqsignal(SIGHUP, signal_remove_temp);
+	pqsignal(SIGINT, signal_remove_temp);
+	pqsignal(SIGPIPE, signal_remove_temp);
+	pqsignal(SIGTERM, signal_remove_temp);
+
+	return temp_sockdir;
+}
+#endif							/* HAVE_UNIX_SOCKETS */
 
 /*
  * Check whether string matches pattern
@@ -416,22 +500,32 @@ string_matches_pattern(const char *str, const char *pattern)
 }
 
 /*
- * Replace all occurrences of a string in a string with a different string.
- * NOTE: Assumes there is enough room in the target buffer!
+ * Replace all occurrences of "replace" in "string" with "replacement".
+ * The StringInfo will be suitably enlarged if necessary.
+ *
+ * Note: this is optimized on the assumption that most calls will find
+ * no more than one occurrence of "replace", and quite likely none.
  */
 void
-replace_string(char *string, char *replace, char *replacement)
+replace_string(StringInfo string, const char *replace, const char *replacement)
 {
+	int			pos = 0;
 	char	   *ptr;
 
-	while ((ptr = strstr(string, replace)) != NULL)
+	while ((ptr = strstr(string->data + pos, replace)) != NULL)
 	{
-		char	   *dup = strdup(string);
+		/* Must copy the remainder of the string out of the StringInfo */
+		char	   *suffix = pg_strdup(ptr + strlen(replace));
 
-		strlcpy(string, dup, ptr - string + 1);
-		strcat(string, replacement);
-		strcat(string, dup + (ptr - string) + strlen(replace));
-		free(dup);
+		/* Truncate StringInfo at start of found string ... */
+		string->len = ptr - string->data;
+		/* ... and append the replacement (this restores the trailing '\0') */
+		appendStringInfoString(string, replacement);
+		/* Next search should start after the replacement */
+		pos = string->len;
+		/* Put back the remainder of the string */
+		appendStringInfoString(string, suffix);
+		free(suffix);
 	}
 }
 
@@ -443,8 +537,10 @@ typedef struct replacements
 	char *dlpath;
 	char *dlsuffix;
 	char *bindir;
-	char *orientation;
+	char *amname;
 	char *cgroup_mnt_point;
+	char *content_zero_hostname;
+	const char *username;
 } replacements;
 
 /* Internal helper function to detect cgroup mount point at runtime.*/
@@ -486,7 +582,7 @@ detectCgroupMountPoint(char *cgdir, int len)
 }
 
 static void
-convert_line(char *line, replacements *repls)
+convert_line(StringInfo line, replacements *repls)
 {
 	replace_string(line, "@cgroup_mnt_point@", repls->cgroup_mnt_point);
 	replace_string(line, "@abs_srcdir@", repls->abs_srcdir);
@@ -495,10 +591,12 @@ convert_line(char *line, replacements *repls)
 	replace_string(line, "@libdir@", repls->dlpath);
 	replace_string(line, "@DLSUFFIX@", repls->dlsuffix);
 	replace_string(line, "@bindir@", repls->bindir);
-	if (repls->orientation)
+	replace_string(line, "@hostname@", repls->content_zero_hostname);
+	replace_string(line, "@curusername@", (char *) repls->username);
+	if (repls->amname)
 	{
-		replace_string(line, "@orientation@", repls->orientation);
-		if (strcmp(repls->orientation, "row") == 0)
+		replace_string(line, "@amname@", repls->amname);
+		if (strcmp(repls->amname, "ao_row") == 0)
 			replace_string(line, "@aoseg@", "aoseg");
 		else
 			replace_string(line, "@aoseg@", "aocsseg");
@@ -507,10 +605,10 @@ convert_line(char *line, replacements *repls)
 
 /*
  * Generate two files for each UAO test case, one for row and the
- * other for column orientation.
+ * other for column amname.
  */
 static int
-generate_uao_sourcefiles(char *src_dir, char *dest_dir, char *suffix, replacements *repls)
+generate_uao_sourcefiles(const char *src_dir, const char *dest_dir, const char *suffix, replacements *repls)
 {
 	struct stat st;
 	int			ret;
@@ -533,7 +631,7 @@ generate_uao_sourcefiles(char *src_dir, char *dest_dir, char *suffix, replacemen
 	names = pgfnames(src_dir);
 	if (!names)
 		/* Error logged in pgfnames */
-		exit_nicely(2);
+		exit(2);
 
 	/* finally loop on each file and generate the files */
 	for (name = names; *name; name++)
@@ -545,8 +643,8 @@ generate_uao_sourcefiles(char *src_dir, char *dest_dir, char *suffix, replacemen
 		FILE	   *infile,
 				   *outfile_row,
 				   *outfile_col;
-		char		line[1024];
-		char		line_row[1024];
+		StringInfoData line;
+		StringInfoData line_row;
 		bool		has_tokens = false;
 
 		/* reject filenames not finishing in ".source" */
@@ -585,43 +683,51 @@ generate_uao_sourcefiles(char *src_dir, char *dest_dir, char *suffix, replacemen
 		{
 			fprintf(stderr, _("%s: could not open file \"%s\" for reading: %s\n"),
 					progname, srcfile, strerror(errno));
-			exit_nicely(2);
+			exit(2);
 		}
 		outfile_row = fopen(destfile_row, "w");
 		if (!outfile_row)
 		{
 			fprintf(stderr, _("%s: could not open file \"%s\" for writing: %s\n"),
 					progname, destfile_row, strerror(errno));
-			exit_nicely(2);
+			exit(2);
 		}
 		outfile_col = fopen(destfile_col, "w");
 		if (!outfile_col)
 		{
 			fprintf(stderr, _("%s: could not open file \"%s\" for writing: %s\n"),
 					progname, destfile_col, strerror(errno));
-			exit_nicely(2);
+			exit(2);
 		}
 
-		while (fgets(line, sizeof(line), infile))
+		initStringInfo(&line);
+		initStringInfo(&line_row);
+
+		while (pg_get_line_buf(infile, &line))
 		{
-			strncpy(line_row, line, sizeof(line));
-			repls->orientation = "row";
-			convert_line(line_row, repls);
-			repls->orientation = "column";
-			convert_line(line, repls);
-			fputs(line, outfile_col);
-			fputs(line_row, outfile_row);
+			appendStringInfoString(&line_row, line.data);
+			repls->amname = "ao_row";
+			convert_line(&line_row, repls);
+			repls->amname = "ao_column";
+			convert_line(&line, repls);
+			fputs(line.data, outfile_col);
+			fputs(line_row.data, outfile_row);
 			/*
 			 * Remember if there are any more tokens that we didn't recognize.
 			 * They need to be handled by the gpstringsubs.pl script
 			 */
-			if (!has_tokens && strchr(line, '@') != NULL)
+			if (!has_tokens && strstr(line.data, "@gp") != NULL)
 				has_tokens = true;
+
+			resetStringInfo(&line_row);
 		}
 
+		pfree(line.data);
+		pfree(line_row.data);
 		fclose(infile);
 		fclose(outfile_row);
 		fclose(outfile_col);
+
 		if (has_tokens)
 		{
 			char		cmd[MAXPGPATH * 3];
@@ -653,7 +759,7 @@ generate_uao_sourcefiles(char *src_dir, char *dest_dir, char *suffix, replacemen
  * the given suffix.
  */
 static int
-convert_sourcefiles_in(char *source_subdir, char *dest_dir, char *dest_subdir, char *suffix)
+convert_sourcefiles_in(const char *source_subdir, const char *dest_dir, const char *dest_subdir, const char *suffix)
 {
 	char		testtablespace[MAXPGPATH];
 	char		indir[MAXPGPATH];
@@ -664,6 +770,7 @@ convert_sourcefiles_in(char *source_subdir, char *dest_dir, char *dest_subdir, c
 	char	  **name;
 	char	  **names;
 	int			count = 0;
+	char *errstr;
 
 	snprintf(indir, MAXPGPATH, "%s/%s", inputdir, source_subdir);
 
@@ -687,7 +794,7 @@ convert_sourcefiles_in(char *source_subdir, char *dest_dir, char *dest_subdir, c
 	if (!directory_exists(dest_subdir))
 		make_directory(dest_subdir);
 
-	snprintf(testtablespace, MAXPGPATH, "%s/testtablespace", outputdir);
+	snprintf(testtablespace, MAXPGPATH, "%s/testtablespace", tablespacedir);
 
 #ifdef WIN32
 
@@ -704,8 +811,8 @@ convert_sourcefiles_in(char *source_subdir, char *dest_dir, char *dest_subdir, c
 	if (directory_exists(testtablespace))
 		if (!rmtree(testtablespace, true))
 		{
-			fprintf(stderr, _("\n%s: could not remove test tablespace \"%s\": %s\n"),
-					progname, testtablespace, strerror(errno));
+			fprintf(stderr, _("\n%s: could not remove test tablespace \"%s\"\n"),
+					progname, testtablespace);
 			exit(2);
 		}
 	make_directory(testtablespace);
@@ -724,6 +831,14 @@ convert_sourcefiles_in(char *source_subdir, char *dest_dir, char *dest_subdir, c
 	repls.dlsuffix = DLSUFFIX;
 	repls.bindir = bindir;
 	repls.cgroup_mnt_point = cgroup_mnt_point;
+	repls.content_zero_hostname = content_zero_hostname;
+	repls.username = get_user_name(&errstr);
+
+	if (repls.username == NULL)
+	{
+		fprintf(stderr, "%s: %s\n", progname, errstr);
+		exit(2);
+	}
 
 	/* finally loop on each file and do the replacement */
 	for (name = names; *name; name++)
@@ -733,24 +848,32 @@ convert_sourcefiles_in(char *source_subdir, char *dest_dir, char *dest_subdir, c
 		char		prefix[MAXPGPATH];
 		FILE	   *infile,
 				   *outfile;
-		char		line[1024];
+		StringInfoData line;
 		bool		has_tokens = false;
+		struct stat fst;
 
-		if (aodir && strncmp(*name, aodir, strlen(aodir)) == 0 &&
-			(strlen(*name) < 8 || strcmp(*name + strlen(*name) - 7, ".source") != 0))
+		snprintf(srcfile, MAXPGPATH, "%s/%s",  indir, *name);
+		if (stat(srcfile, &fst) < 0)
 		{
-			snprintf(srcfile, MAXPGPATH, "%s/%s",  indir, *name);
-			snprintf(destfile, MAXPGPATH, "%s/%s", dest_subdir, *name);
-			count += generate_uao_sourcefiles(srcfile, destfile, suffix, &repls);
-			continue;
+			fprintf(stderr, _("\n%s: stat failed for \"%s\"\n"),
+					progname, srcfile);
+			exit(2);
 		}
 
-		if (resgroupdir && strncmp(*name, resgroupdir, strlen(resgroupdir)) == 0 &&
-			(strlen(*name) < 8 || strcmp(*name + strlen(*name) - 7, ".source") != 0))
+		/* recurse if it's a directory */
+		if (S_ISDIR(fst.st_mode))
 		{
+			char generate_uao_file[MAXPGPATH];
+			snprintf(generate_uao_file, MAXPGPATH, "%s/%s",  srcfile, "GENERATE_ROW_AND_COLUMN_FILES");
+
 			snprintf(srcfile, MAXPGPATH, "%s/%s", source_subdir, *name);
 			snprintf(destfile, MAXPGPATH, "%s/%s", dest_subdir, *name);
-			count += convert_sourcefiles_in(srcfile, dest_dir, destfile, suffix);
+
+			if (access(generate_uao_file, F_OK) != -1)
+				count += generate_uao_sourcefiles(srcfile, destfile, suffix, &repls);
+			else
+				count += convert_sourcefiles_in(srcfile, dest_dir, destfile, suffix);
+
 			continue;
 		}
 
@@ -782,18 +905,23 @@ convert_sourcefiles_in(char *source_subdir, char *dest_dir, char *dest_subdir, c
 					progname, destfile, strerror(errno));
 			exit(2);
 		}
-		while (fgets(line, sizeof(line), infile))
+
+		initStringInfo(&line);
+
+		while (pg_get_line_buf(infile, &line))
 		{
-			convert_line(line, &repls);
-			fputs(line, outfile);
+			convert_line(&line, &repls);
+			fputs(line.data, outfile);
 
 			/*
 			 * Remember if there are any more tokens that we didn't recognize.
 			 * They need to be handled by the gpstringsubs.pl script
 			 */
-			if (!has_tokens && strchr(line, '@') != NULL)
+			if (!has_tokens && strstr(line.data, "@gp") != NULL)
 				has_tokens = true;
 		}
+
+		pfree(line.data);
 		fclose(infile);
 		fclose(outfile);
 
@@ -831,6 +959,8 @@ convert_sourcefiles_in(char *source_subdir, char *dest_dir, char *dest_subdir, c
 static void
 convert_sourcefiles(void)
 {
+	content_zero_hostname = get_host_name(0, 'p');
+
 	convert_sourcefiles_in("input", outputdir, "sql", "sql");
 	convert_sourcefiles_in("output", outputdir, "expected", "out");
 
@@ -916,11 +1046,11 @@ load_resultmap(void)
 		 */
 		if (string_matches_pattern(host_platform, platform))
 		{
-			_resultmap *entry = malloc(sizeof(_resultmap));
+			_resultmap *entry = pg_malloc(sizeof(_resultmap));
 
-			entry->test = strdup(buf);
-			entry->type = strdup(file_type);
-			entry->resultfile = strdup(expected);
+			entry->test = pg_strdup(buf);
+			entry->type = pg_strdup(file_type);
+			entry->resultfile = pg_strdup(expected);
 			entry->next = resultmap;
 			resultmap = entry;
 		}
@@ -1021,27 +1151,6 @@ doputenv(const char *var, const char *val)
 }
 
 /*
- * Set the environment variable "pathname", prepending "addval" to its
- * old value (if any).
- */
-static void
-add_to_path(const char *pathname, char separator, const char *addval)
-{
-	char	   *oldval = getenv(pathname);
-	char	   *newval;
-
-	if (!oldval || !oldval[0])
-	{
-		/* no previous value */
-		newval = psprintf("%s=%s", pathname, addval);
-	}
-	else
-		newval = psprintf("%s=%s%c%s", pathname, addval, separator, oldval);
-
-	putenv(newval);
-}
-
-/*
  * Prepare environment variables for running regression tests
  */
 static void
@@ -1060,9 +1169,17 @@ initialize_environment(void)
 		unsetenv("LC_NUMERIC");
 		unsetenv("LC_TIME");
 		unsetenv("LANG");
-		/* On Windows the default locale cannot be English, so force it */
-#if defined(WIN32) || defined(__CYGWIN__)
-		putenv("LANG=en");
+
+		/*
+		 * Most platforms have adopted the POSIX locale as their
+		 * implementation-defined default locale.  Exceptions include native
+		 * Windows, macOS with --enable-nls, and Cygwin with --enable-nls.
+		 * (Use of --enable-nls matters because libintl replaces setlocale().)
+		 * Also, PostgreSQL does not support macOS with locale environment
+		 * variables unset; see PostmasterMain().
+		 */
+#if defined(WIN32) || defined(__CYGWIN__) || defined(__darwin__)
+		putenv("LANG=C");
 #endif
 	}
 
@@ -1107,15 +1224,14 @@ initialize_environment(void)
 		putenv(new_pgoptions);
 	}
 
-	if (temp_install)
+	if (temp_instance)
 	{
 		/*
 		 * Clear out any environment vars that might cause psql to connect to
 		 * the wrong postmaster, or otherwise behave in nondefault ways. (Note
 		 * we also use psql's -X switch consistently, so that ~/.psqlrc files
 		 * won't mess things up.)  Also, set PGPORT to the temp port, and set
-		 * or unset PGHOST depending on whether we are using TCP or Unix
-		 * sockets.
+		 * PGHOST depending on whether we are using TCP or Unix sockets.
 		 */
 		unsetenv("PGDATABASE");
 		unsetenv("PGUSER");
@@ -1124,10 +1240,20 @@ initialize_environment(void)
 		unsetenv("PGREQUIRESSL");
 		unsetenv("PGCONNECT_TIMEOUT");
 		unsetenv("PGDATA");
+#ifdef HAVE_UNIX_SOCKETS
 		if (hostname != NULL)
 			doputenv("PGHOST", hostname);
 		else
-			unsetenv("PGHOST");
+		{
+			sockdir = getenv("PG_REGRESS_SOCK_DIR");
+			if (!sockdir)
+				sockdir = make_temp_sockdir();
+			doputenv("PGHOST", sockdir);
+		}
+#else
+		Assert(hostname != NULL);
+		doputenv("PGHOST", hostname);
+#endif
 		unsetenv("PGHOSTADDR");
 		if (port != -1)
 		{
@@ -1136,49 +1262,6 @@ initialize_environment(void)
 			sprintf(s, "%d", port);
 			doputenv("PGPORT", s);
 		}
-
-		/*
-		 * GNU make stores some flags in the MAKEFLAGS environment variable to
-		 * pass arguments to its own children.  If we are invoked by make,
-		 * that causes the make invoked by us to think its part of the make
-		 * task invoking us, and so it tries to communicate with the toplevel
-		 * make.  Which fails.
-		 *
-		 * Unset the variable to protect against such problems.  We also reset
-		 * MAKELEVEL to be certain the child doesn't notice the make above us.
-		 */
-		unsetenv("MAKEFLAGS");
-		unsetenv("MAKELEVEL");
-
-		/*
-		 * Adjust path variables to point into the temp-install tree
-		 */
-		bindir = psprintf("%s/install/%s", temp_install, bindir);
-
-		libdir = psprintf("%s/install/%s", temp_install, libdir);
-
-		datadir = psprintf("%s/install/%s", temp_install, datadir);
-
-		/* psql will be installed into temp-install bindir */
-		psqldir = bindir;
-
-		/*
-		 * Set up shared library paths to include the temp install.
-		 *
-		 * LD_LIBRARY_PATH covers many platforms.  DYLD_LIBRARY_PATH works on
-		 * Darwin, and maybe other Mach-based systems.  LIBPATH is for AIX.
-		 * Windows needs shared libraries in PATH (only those linked into
-		 * executables, not dlopen'ed ones). Feel free to account for others
-		 * as well.
-		 */
-		add_to_path("LD_LIBRARY_PATH", ':', libdir);
-		add_to_path("DYLD_LIBRARY_PATH", ':', libdir);
-		add_to_path("LIBPATH", ':', libdir);
-#if defined(WIN32)
-		add_to_path("PATH", ';', libdir);
-#elif defined(__CYGWIN__)
-		add_to_path("PATH", ':', libdir);
-#endif
 	}
 	else
 	{
@@ -1228,6 +1311,211 @@ initialize_environment(void)
 	load_resultmap();
 }
 
+#ifdef ENABLE_SSPI
+
+/* support for config_sspi_auth() */
+static const char *
+fmtHba(const char *raw)
+{
+	static char *ret;
+	const char *rp;
+	char	   *wp;
+
+	wp = ret = realloc(ret, 3 + strlen(raw) * 2);
+
+	*wp++ = '"';
+	for (rp = raw; *rp; rp++)
+	{
+		if (*rp == '"')
+			*wp++ = '"';
+		*wp++ = *rp;
+	}
+	*wp++ = '"';
+	*wp++ = '\0';
+
+	return ret;
+}
+
+/*
+ * Get account and domain/realm names for the current user.  This is based on
+ * pg_SSPI_recvauth().  The returned strings use static storage.
+ */
+static void
+current_windows_user(const char **acct, const char **dom)
+{
+	static char accountname[MAXPGPATH];
+	static char domainname[MAXPGPATH];
+	HANDLE		token;
+	TOKEN_USER *tokenuser;
+	DWORD		retlen;
+	DWORD		accountnamesize = sizeof(accountname);
+	DWORD		domainnamesize = sizeof(domainname);
+	SID_NAME_USE accountnameuse;
+
+	if (!OpenProcessToken(GetCurrentProcess(), TOKEN_READ, &token))
+	{
+		fprintf(stderr,
+				_("%s: could not open process token: error code %lu\n"),
+				progname, GetLastError());
+		exit(2);
+	}
+
+	if (!GetTokenInformation(token, TokenUser, NULL, 0, &retlen) && GetLastError() != 122)
+	{
+		fprintf(stderr,
+				_("%s: could not get token information buffer size: error code %lu\n"),
+				progname, GetLastError());
+		exit(2);
+	}
+	tokenuser = pg_malloc(retlen);
+	if (!GetTokenInformation(token, TokenUser, tokenuser, retlen, &retlen))
+	{
+		fprintf(stderr,
+				_("%s: could not get token information: error code %lu\n"),
+				progname, GetLastError());
+		exit(2);
+	}
+
+	if (!LookupAccountSid(NULL, tokenuser->User.Sid, accountname, &accountnamesize,
+						  domainname, &domainnamesize, &accountnameuse))
+	{
+		fprintf(stderr,
+				_("%s: could not look up account SID: error code %lu\n"),
+				progname, GetLastError());
+		exit(2);
+	}
+
+	free(tokenuser);
+
+	*acct = accountname;
+	*dom = domainname;
+}
+
+/*
+ * Rewrite pg_hba.conf and pg_ident.conf to use SSPI authentication.  Permit
+ * the current OS user to authenticate as the bootstrap superuser and as any
+ * user named in a --create-role option.
+ *
+ * In --config-auth mode, the --user switch can be used to specify the
+ * bootstrap superuser's name, otherwise we assume it is the default.
+ */
+static void
+config_sspi_auth(const char *pgdata, const char *superuser_name)
+{
+	const char *accountname,
+			   *domainname;
+	char	   *errstr;
+	bool		have_ipv6;
+	char		fname[MAXPGPATH];
+	int			res;
+	FILE	   *hba,
+			   *ident;
+	_stringlist *sl;
+
+	/* Find out the name of the current OS user */
+	current_windows_user(&accountname, &domainname);
+
+	/* Determine the bootstrap superuser's name */
+	if (superuser_name == NULL)
+	{
+		/*
+		 * Compute the default superuser name the same way initdb does.
+		 *
+		 * It's possible that this result always matches "accountname", the
+		 * value SSPI authentication discovers.  But the underlying system
+		 * functions do not clearly guarantee that.
+		 */
+		superuser_name = get_user_name(&errstr);
+		if (superuser_name == NULL)
+		{
+			fprintf(stderr, "%s: %s\n", progname, errstr);
+			exit(2);
+		}
+	}
+
+	/*
+	 * Like initdb.c:setup_config(), determine whether the platform recognizes
+	 * ::1 (IPv6 loopback) as a numeric host address string.
+	 */
+	{
+		struct addrinfo *gai_result;
+		struct addrinfo hints;
+		WSADATA		wsaData;
+
+		hints.ai_flags = AI_NUMERICHOST;
+		hints.ai_family = AF_UNSPEC;
+		hints.ai_socktype = 0;
+		hints.ai_protocol = 0;
+		hints.ai_addrlen = 0;
+		hints.ai_canonname = NULL;
+		hints.ai_addr = NULL;
+		hints.ai_next = NULL;
+
+		have_ipv6 = (WSAStartup(MAKEWORD(2, 2), &wsaData) == 0 &&
+					 getaddrinfo("::1", NULL, &hints, &gai_result) == 0);
+	}
+
+	/* Check a Write outcome and report any error. */
+#define CW(cond)	\
+	do { \
+		if (!(cond)) \
+		{ \
+			fprintf(stderr, _("%s: could not write to file \"%s\": %s\n"), \
+					progname, fname, strerror(errno)); \
+			exit(2); \
+		} \
+	} while (0)
+
+	res = snprintf(fname, sizeof(fname), "%s/pg_hba.conf", pgdata);
+	if (res < 0 || res >= sizeof(fname))
+	{
+		/*
+		 * Truncating this name is a fatal error, because we must not fail to
+		 * overwrite an original trust-authentication pg_hba.conf.
+		 */
+		fprintf(stderr, _("%s: directory name too long\n"), progname);
+		exit(2);
+	}
+	hba = fopen(fname, "w");
+	if (hba == NULL)
+	{
+		fprintf(stderr, _("%s: could not open file \"%s\" for writing: %s\n"),
+				progname, fname, strerror(errno));
+		exit(2);
+	}
+	CW(fputs("# Configuration written by config_sspi_auth()\n", hba) >= 0);
+	CW(fputs("host all all 127.0.0.1/32  sspi include_realm=1 map=regress\n",
+			 hba) >= 0);
+	if (have_ipv6)
+		CW(fputs("host all all ::1/128  sspi include_realm=1 map=regress\n",
+				 hba) >= 0);
+	CW(fclose(hba) == 0);
+
+	snprintf(fname, sizeof(fname), "%s/pg_ident.conf", pgdata);
+	ident = fopen(fname, "w");
+	if (ident == NULL)
+	{
+		fprintf(stderr, _("%s: could not open file \"%s\" for writing: %s\n"),
+				progname, fname, strerror(errno));
+		exit(2);
+	}
+	CW(fputs("# Configuration written by config_sspi_auth()\n", ident) >= 0);
+
+	/*
+	 * Double-quote for the benefit of account names containing whitespace or
+	 * '#'.  Windows forbids the double-quote character itself, so don't
+	 * bother escaping embedded double-quote characters.
+	 */
+	CW(fprintf(ident, "regress  \"%s@%s\"  %s\n",
+			   accountname, domainname, fmtHba(superuser_name)) >= 0);
+	for (sl = extraroles; sl; sl = sl->next)
+		CW(fprintf(ident, "regress  \"%s@%s\"  %s\n",
+				   accountname, domainname, fmtHba(sl->str)) >= 0);
+	CW(fclose(ident) == 0);
+}
+
+#endif							/* ENABLE_SSPI */
+
 /*
  * Issue a command via psql, connecting to the specified database
  *
@@ -1261,8 +1549,8 @@ psql_command(const char *database, const char *query,...)
 	/* And now we can build and execute the shell command */
 	snprintf(psql_cmd, sizeof(psql_cmd),
 			 "\"%s%spsql\" -X -c \"%s\" \"%s\"",
-			 psqldir ? psqldir : "",
-			 psqldir ? "/" : "",
+			 bindir ? bindir : "",
+			 bindir ? "/" : "",
 			 query_escaped,
 			 database);
 
@@ -1321,100 +1609,17 @@ spawn_process(const char *cmdline)
 	/* in parent */
 	return pid;
 #else
-	char	   *cmdline2;
-	BOOL		b;
-	STARTUPINFO si;
 	PROCESS_INFORMATION pi;
-	HANDLE		origToken;
+	char	   *cmdline2;
 	HANDLE		restrictedToken;
-	SID_IDENTIFIER_AUTHORITY NtAuthority = {SECURITY_NT_AUTHORITY};
-	SID_AND_ATTRIBUTES dropSids[2];
-	__CreateRestrictedToken _CreateRestrictedToken = NULL;
-	HANDLE		Advapi32Handle;
 
-	ZeroMemory(&si, sizeof(si));
-	si.cb = sizeof(si);
-
-	Advapi32Handle = LoadLibrary("ADVAPI32.DLL");
-	if (Advapi32Handle != NULL)
-	{
-		_CreateRestrictedToken = (__CreateRestrictedToken) GetProcAddress(Advapi32Handle, "CreateRestrictedToken");
-	}
-
-	if (_CreateRestrictedToken == NULL)
-	{
-		if (Advapi32Handle != NULL)
-			FreeLibrary(Advapi32Handle);
-		fprintf(stderr, _("%s: cannot create restricted tokens on this platform\n"),
-				progname);
-		exit(2);
-	}
-
-	/* Open the current token to use as base for the restricted one */
-	if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ALL_ACCESS, &origToken))
-	{
-		fprintf(stderr, _("could not open process token: error code %lu\n"),
-				GetLastError());
-		exit(2);
-	}
-
-	/* Allocate list of SIDs to remove */
-	ZeroMemory(&dropSids, sizeof(dropSids));
-	if (!AllocateAndInitializeSid(&NtAuthority, 2,
-								  SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_ADMINS, 0, 0, 0, 0, 0, 0, &dropSids[0].Sid) ||
-		!AllocateAndInitializeSid(&NtAuthority, 2,
-								  SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_POWER_USERS, 0, 0, 0, 0, 0, 0, &dropSids[1].Sid))
-	{
-		fprintf(stderr, _("could not allocate SIDs: error code %lu\n"), GetLastError());
-		exit(2);
-	}
-
-	b = _CreateRestrictedToken(origToken,
-							   DISABLE_MAX_PRIVILEGE,
-							   sizeof(dropSids) / sizeof(dropSids[0]),
-							   dropSids,
-							   0, NULL,
-							   0, NULL,
-							   &restrictedToken);
-
-	FreeSid(dropSids[1].Sid);
-	FreeSid(dropSids[0].Sid);
-	CloseHandle(origToken);
-	FreeLibrary(Advapi32Handle);
-
-	if (!b)
-	{
-		fprintf(stderr, _("could not create restricted token: error code %lu\n"),
-				GetLastError());
-		exit(2);
-	}
-
+	memset(&pi, 0, sizeof(pi));
 	cmdline2 = psprintf("cmd /c \"%s\"", cmdline);
 
-#ifndef __CYGWIN__
-	AddUserToTokenDacl(restrictedToken);
-#endif
-
-	if (!CreateProcessAsUser(restrictedToken,
-							 NULL,
-							 cmdline2,
-							 NULL,
-							 NULL,
-							 TRUE,
-							 CREATE_SUSPENDED,
-							 NULL,
-							 NULL,
-							 &si,
-							 &pi))
-	{
-		fprintf(stderr, _("could not start process for \"%s\": error code %lu\n"),
-				cmdline2, GetLastError());
+	if ((restrictedToken =
+		 CreateRestrictedProcess(cmdline2, &pi)) == 0)
 		exit(2);
-	}
 
-	free(cmdline2);
-
-	ResumeThread(pi.hThread);
 	CloseHandle(pi.hThread);
 	return pi.hProcess;
 #endif
@@ -1464,6 +1669,32 @@ file_line_count(const char *file)
 	}
 	fclose(f);
 	return l;
+}
+
+static FILE *
+open_file_for_reading(const char *filename) {
+	FILE *file = fopen(filename, "r");
+
+	if (!file)
+	{
+		fprintf(stderr, _("%s: could not open file \"%s\" for reading: %s\n"),
+				progname, filename, strerror(errno));
+		exit(1);
+	}
+
+	return file;
+}
+
+static void
+print_contents_of_file(const char* filename) {
+	FILE *file;
+	char string[1024];
+
+	file = open_file_for_reading(filename);
+	while (fgets(string, sizeof(string), file))
+		fprintf(stdout, "%s", string);
+
+	fclose(file);
 }
 
 bool
@@ -1560,8 +1791,6 @@ run_diff(const char *cmd, const char *filename)
 		fprintf(stderr, _("diff command not found: %s\n"), cmd);
 		exit(2);
 	}
-#else
-	UnusedArg(filename);
 #endif
 
 	return WEXITSTATUS(r);
@@ -1580,13 +1809,19 @@ results_differ(const char *testname, const char *resultsfile, const char *defaul
 	char		diff[MAXPGPATH];
 	char		cmd[MAXPGPATH * 3];
 	char		best_expect_file[MAXPGPATH];
-    char        diff_opts[MAXPGPATH];
-    char        m_pretty_diff_opts[MAXPGPATH];
+    char		diff_opts[MAXPGPATH];
+	char	   *diff_opts_st = diff_opts;
+	char	   *diff_opts_en = diff_opts + sizeof(diff_opts);
+    char		m_pretty_diff_opts[MAXPGPATH];
+    char	   *pretty_diff_opts_st = m_pretty_diff_opts;
+    char	   *pretty_diff_opts_en = m_pretty_diff_opts + sizeof(m_pretty_diff_opts);
 	FILE	   *difffile;
 	int			best_line_count;
 	int			i;
 	int			l;
 	const char *platform_expectfile;
+	const char *ignore_plans_opts;
+	_stringlist *sl;
 
 	/*
 	 * We can pass either the resultsfile or the expectfile, they should have
@@ -1599,25 +1834,32 @@ results_differ(const char *testname, const char *resultsfile, const char *defaul
 	else
 		strlcpy(expectfile, default_expectfile, sizeof(expectfile));
 
+	if (ignore_plans)
+		ignore_plans_opts = " -gpd_ignore_plans";
+	else
+		ignore_plans_opts = "";
+
 	/* Name to use for temporary diff file */
 	snprintf(diff, sizeof(diff), "%s.diff", resultsfile);
     
 	/* Add init file arguments if provided via commandline */
-	if (initfile)
-	{
-	  snprintf(diff_opts, sizeof(diff_opts),
-			   "%s --gpd_init %s", basic_diff_opts, initfile);
+	diff_opts_st += snprintf(diff_opts_st,
+							 diff_opts_en - diff_opts_st,
+							 "%s%s", basic_diff_opts, ignore_plans_opts);
 
-	  snprintf(m_pretty_diff_opts, sizeof(m_pretty_diff_opts),
-			   "%s --gpd_init %s", pretty_diff_opts, initfile);
-	}
-	else
-	{
-		snprintf(diff_opts, sizeof(diff_opts),
-			   "%s", basic_diff_opts);
+	pretty_diff_opts_st += snprintf(pretty_diff_opts_st,
+									pretty_diff_opts_en - pretty_diff_opts_st,
+									"%s%s", pretty_diff_opts, ignore_plans_opts);
 
-		snprintf(m_pretty_diff_opts, sizeof(m_pretty_diff_opts),
-                 "%s", pretty_diff_opts);
+	for (sl = init_file_list; sl != NULL; sl = sl->next)
+	{
+		diff_opts_st += snprintf(diff_opts_st,
+								 diff_opts_en - diff_opts_st,
+								 " --gpd_init %s", sl->str);
+
+		pretty_diff_opts_st += snprintf(pretty_diff_opts_st,
+										pretty_diff_opts_en - pretty_diff_opts_st,
+										" --gpd_init %s", sl->str);
 	}
 
 	/* OK, run the diff */
@@ -1714,19 +1956,22 @@ results_differ(const char *testname, const char *resultsfile, const char *defaul
 	 * Use the best comparison file to generate the "pretty" diff, which we
 	 * append to the diffs summary file.
 	 */
-	snprintf(cmd, sizeof(cmd),
-			 "%s %s \"%s\" \"%s\" >> \"%s\"",
-			 gpdiffprog, m_pretty_diff_opts, best_expect_file, resultsfile, difffilename);
-	run_diff(cmd, difffilename);
 
-	/* And append a separator */
+	/* Write diff header */
 	difffile = fopen(difffilename, "a");
 	if (difffile)
 	{
 		fprintf(difffile,
-				"\n======================================================================\n\n");
+				"diff %s %s %s\n",
+				pretty_diff_opts, best_expect_file, resultsfile);
 		fclose(difffile);
 	}
+
+	/* Run diff */
+	snprintf(cmd, sizeof(cmd),
+			 "%s %s \"%s\" \"%s\" >> \"%s\"",
+			 gpdiffprog, m_pretty_diff_opts, best_expect_file, resultsfile, difffilename);
+	run_diff(cmd, difffilename);
 
 	unlink(diff);
 	return true;
@@ -1734,20 +1979,21 @@ results_differ(const char *testname, const char *resultsfile, const char *defaul
 
 /*
  * Wait for specified subprocesses to finish, and return their exit
- * statuses into statuses[]
+ * statuses into statuses[] and stop times into stoptimes[]
  *
  * If names isn't NULL, print each subprocess's name as it finishes
  *
  * Note: it's OK to scribble on the pids array, but not on the names array
  */
 static void
-wait_for_tests(PID_TYPE *pids, int *statuses, char **names, struct timeval *end_times, int num_tests)
+wait_for_tests(PID_TYPE * pids, int *statuses, instr_time *stoptimes,
+			   char **names, int num_tests)
 {
 	int			tests_left;
 	int			i;
 
 #ifdef WIN32
-	PID_TYPE   *active_pids = malloc(num_tests * sizeof(PID_TYPE));
+	PID_TYPE   *active_pids = pg_malloc(num_tests * sizeof(PID_TYPE));
 
 	memcpy(active_pids, pids, num_tests * sizeof(PID_TYPE));
 #endif
@@ -1782,7 +2028,7 @@ wait_for_tests(PID_TYPE *pids, int *statuses, char **names, struct timeval *end_
 		p = active_pids[r - WAIT_OBJECT_0];
 		/* compact the active_pids array */
 		active_pids[r - WAIT_OBJECT_0] = active_pids[tests_left - 1];
-#endif   /* WIN32 */
+#endif							/* WIN32 */
 
 		for (i = 0; i < num_tests; i++)
 		{
@@ -1794,10 +2040,9 @@ wait_for_tests(PID_TYPE *pids, int *statuses, char **names, struct timeval *end_
 #endif
 				pids[i] = INVALID_PID;
 				statuses[i] = (int) exit_status;
+				INSTR_TIME_SET_CURRENT(stoptimes[i]);
 				if (names)
 					status(" %s", names[i]);
-				if (end_times)
-					gettimeofday(&end_times[i], NULL);
 				tests_left--;
 				break;
 			}
@@ -1823,14 +2068,9 @@ log_child_failure(int exitstatus)
 #if defined(WIN32)
 		status(_(" (test process was terminated by exception 0x%X)"),
 			   WTERMSIG(exitstatus));
-#elif defined(HAVE_DECL_SYS_SIGLIST) && HAVE_DECL_SYS_SIGLIST
-		status(_(" (test process was terminated by signal %d: %s)"),
-			   WTERMSIG(exitstatus),
-			   WTERMSIG(exitstatus) < NSIG ?
-			   sys_siglist[WTERMSIG(exitstatus)] : "(unknown))");
 #else
-		status(_(" (test process was terminated by signal %d)"),
-			   WTERMSIG(exitstatus));
+		status(_(" (test process was terminated by signal %d: %s)"),
+			   WTERMSIG(exitstatus), pg_strsignal(WTERMSIG(exitstatus)));
 #endif
 	}
 	else
@@ -1850,17 +2090,18 @@ run_schedule(const char *schedule, test_function tfunc)
 	_stringlist *expectfiles[MAX_PARALLEL_TESTS];
 	_stringlist *tags[MAX_PARALLEL_TESTS];
 	PID_TYPE	pids[MAX_PARALLEL_TESTS];
+	instr_time	starttimes[MAX_PARALLEL_TESTS];
+	instr_time	stoptimes[MAX_PARALLEL_TESTS];
 	int			statuses[MAX_PARALLEL_TESTS];
-	struct timeval end_times[MAX_PARALLEL_TESTS];
 	_stringlist *ignorelist = NULL;
 	char		scbuf[1024];
 	FILE	   *scf;
 	int			line_num = 0;
 
-	memset(resultfiles, 0, sizeof(_stringlist *) * MAX_PARALLEL_TESTS);
-	memset(expectfiles, 0, sizeof(_stringlist *) * MAX_PARALLEL_TESTS);
-	memset(tags, 0, sizeof(_stringlist *) * MAX_PARALLEL_TESTS);
-	memset(end_times, 0, sizeof(struct timeval) * MAX_PARALLEL_TESTS);
+	memset(tests, 0, sizeof(tests));
+	memset(resultfiles, 0, sizeof(resultfiles));
+	memset(expectfiles, 0, sizeof(expectfiles));
+	memset(tags, 0, sizeof(tags));
 
 	scf = fopen(schedule, "r");
 	if (!scf)
@@ -1875,20 +2116,12 @@ run_schedule(const char *schedule, test_function tfunc)
 		char	   *test = NULL;
 		char	   *c;
 		int			num_tests;
+		int			excluded_tests;
 		bool		inword;
 		int			i;
 		struct timeval start_time;
 
 		line_num++;
-
-		for (i = 0; i < MAX_PARALLEL_TESTS; i++)
-		{
-			if (resultfiles[i] == NULL)
-				break;
-			free_stringlist(&resultfiles[i]);
-			free_stringlist(&expectfiles[i]);
-			free_stringlist(&tags[i]);
-		}
 
 		/* strip trailing whitespace, especially the newline */
 		i = strlen(scbuf);
@@ -1921,29 +2154,47 @@ run_schedule(const char *schedule, test_function tfunc)
 		}
 
 		num_tests = 0;
+		excluded_tests = 0;
 		inword = false;
-		for (c = test; *c; c++)
+		for (c = test;; c++)
 		{
-			if (isspace((unsigned char) *c))
+			if (*c == '\0' || isspace((unsigned char) *c))
 			{
-				*c = '\0';
-				inword = false;
+				if (inword)
+				{
+					/* Reached end of a test name */
+					char		sav;
+
+					if (num_tests >= MAX_PARALLEL_TESTS)
+					{
+						fprintf(stderr, _("too many parallel tests (more than %d) in schedule file \"%s\" line %d: %s\n"),
+								MAX_PARALLEL_TESTS, schedule, line_num, scbuf);
+						exit(2);
+					}
+					sav = *c;
+					*c = '\0';
+					tests[num_tests] = pg_strdup(test);
+					num_tests++;
+					*c = sav;
+					inword = false;
+
+					/*
+					 * GPDB: if this test is in the exclude list, don't add it to the
+					 * array, after all.
+					 */
+					if (should_exclude_test(tests[num_tests - 1]))
+					{
+						excluded_tests++;
+						num_tests--;
+					}
+				}
+				if (*c == '\0')
+					break;		/* loop exit is here */
 			}
 			else if (!inword)
 			{
-				if (num_tests >= MAX_PARALLEL_TESTS)
-				{
-					/* can't print scbuf here, it's already been trashed */
-					fprintf(stderr, _("too many parallel tests in schedule file \"%s\", line %d\n"),
-							schedule, line_num);
-					exit(2);
-				}
-
-				if (num_tests - 1 >= 0 && should_exclude_test(tests[num_tests - 1]))
-					num_tests--;
-
-				tests[num_tests] = c;
-				num_tests++;
+				/* Start of a test name */
+				test = c;
 				inword = true;
 			}
 		}
@@ -1952,26 +2203,37 @@ run_schedule(const char *schedule, test_function tfunc)
 		if (num_tests - 1 >= 0 && should_exclude_test(tests[num_tests - 1]))
 		{
 			num_tests--;
-
-			/* All tests in this line are to be excluded, so go to the next line */
-			if (num_tests == 0)
-				continue;
+			excluded_tests++;
 		}
 
-		if (num_tests == 0)
+		if (num_tests == 0 && excluded_tests == 0)
 		{
 			fprintf(stderr, _("syntax error in schedule file \"%s\" line %d: %s\n"),
 					schedule, line_num, scbuf);
 			exit(2);
 		}
 
+		/* All tests in this line are to be excluded, so go to the next line */
+		if (num_tests == 0)
+			continue;
+
+		if (!cluster_healthy())
+			break;
+
 		gettimeofday(&start_time, NULL);
 		if (num_tests == 1)
 		{
-			status(_("test %-24s ... "), tests[0]);
+			status(_("test %-28s ... "), tests[0]);
 			pids[0] = (tfunc) (tests[0], &resultfiles[0], &expectfiles[0], &tags[0]);
-			wait_for_tests(pids, statuses, NULL, end_times, 1);
+			INSTR_TIME_SET_CURRENT(starttimes[0]);
+			wait_for_tests(pids, statuses, stoptimes, NULL, 1);
 			/* status line is finished below */
+		}
+		else if (max_concurrent_tests > 0 && max_concurrent_tests < num_tests)
+		{
+			fprintf(stderr, _("too many parallel tests (more than %d) in schedule file \"%s\" line %d: %s\n"),
+					max_concurrent_tests, schedule, line_num, scbuf);
+			exit(2);
 		}
 		else if (max_connections > 0 && max_connections < num_tests)
 		{
@@ -1984,13 +2246,16 @@ run_schedule(const char *schedule, test_function tfunc)
 				if (i - oldest >= max_connections)
 				{
 					wait_for_tests(pids + oldest, statuses + oldest,
-								   tests + oldest, end_times + oldest, i - oldest);
+								   stoptimes + oldest,
+								   tests + oldest, i - oldest);
 					oldest = i;
 				}
 				pids[i] = (tfunc) (tests[i], &resultfiles[i], &expectfiles[i], &tags[i]);
+				INSTR_TIME_SET_CURRENT(starttimes[i]);
 			}
 			wait_for_tests(pids + oldest, statuses + oldest,
-						   tests + oldest, end_times + oldest, i - oldest);
+						   stoptimes + oldest,
+						   tests + oldest, i - oldest);
 			status_end();
 		}
 		else
@@ -1999,8 +2264,9 @@ run_schedule(const char *schedule, test_function tfunc)
 			for (i = 0; i < num_tests; i++)
 			{
 				pids[i] = (tfunc) (tests[i], &resultfiles[i], &expectfiles[i], &tags[i]);
+				INSTR_TIME_SET_CURRENT(starttimes[i]);
 			}
-			wait_for_tests(pids, statuses, tests, end_times, num_tests);
+			wait_for_tests(pids, statuses, stoptimes, tests, num_tests);
 			status_end();
 		}
 
@@ -2011,15 +2277,12 @@ run_schedule(const char *schedule, test_function tfunc)
 					   *el,
 					   *tl;
 			bool		differ = false;
-			double		diff_secs = 0, diff_elapse = 0;
-			struct timeval diff_start_time, diff_end_time;
+			instr_time diff_start_time;
+			instr_time diff_stop_time;
 
 			if (num_tests > 1)
-				status(_("     %-24s ... "), tests[i]);
+				status(_("     %-28s ... "), tests[i]);
 
-			diff_secs = end_times[i].tv_usec - start_time.tv_usec;
-			diff_secs /= 1000000;
-			diff_secs += end_times[i].tv_sec - start_time.tv_sec;
 			/*
 			 * Advance over all three lists simultaneously.
 			 *
@@ -2028,16 +2291,13 @@ run_schedule(const char *schedule, test_function tfunc)
 			 * length as the other two lists.
 			 */
 
-			gettimeofday(&diff_start_time, NULL);
+			INSTR_TIME_SET_CURRENT(diff_start_time);
 			for (rl = resultfiles[i], el = expectfiles[i], tl = tags[i];
 				 rl != NULL;	/* rl and el have the same length */
-				 rl = rl->next, el = el->next)
+				 rl = rl->next, el = el->next,
+				 tl = tl ? tl->next : NULL)
 			{
 				bool		newdiff;
-
-				if (tl)
-					tl = tl->next;		/* tl has the same length as rl and el
-										 * if it exists */
 
 				newdiff = results_differ(tests[i], rl->str, el->str);
 				if (newdiff && tl)
@@ -2046,11 +2306,7 @@ run_schedule(const char *schedule, test_function tfunc)
 				}
 				differ |= newdiff;
 			}
-			gettimeofday(&diff_end_time, NULL);
-
-			diff_elapse = diff_end_time.tv_usec - diff_start_time.tv_usec;
-			diff_elapse /= 1000000;
-			diff_elapse += diff_end_time.tv_sec - diff_start_time.tv_sec;
+			INSTR_TIME_SET_CURRENT(diff_stop_time);
 
 			if (differ)
 			{
@@ -2073,21 +2329,34 @@ run_schedule(const char *schedule, test_function tfunc)
 				else
 				{
 					status(_("FAILED"));
-    				status(_(" (%.2f sec)  (diff:%.2f sec)"), diff_secs, diff_elapse);
 					fail_count++;
 				}
 			}
 			else
 			{
-				status(_("ok"));
-				status(_(" (%.2f sec)  (diff:%.2f sec)"), diff_secs, diff_elapse);
+				status(_("ok    "));	/* align with FAILED */
 				success_count++;
 			}
 
 			if (statuses[i] != 0)
 				log_child_failure(statuses[i]);
 
+			INSTR_TIME_SUBTRACT(stoptimes[i], starttimes[i]);
+			status(_(" %8.0f ms"), INSTR_TIME_GET_MILLISEC(stoptimes[i]));
+
+			INSTR_TIME_SUBTRACT(diff_stop_time, diff_start_time);
+			status(_(" (diff %4.0f ms)"), INSTR_TIME_GET_MILLISEC(diff_stop_time));
+
 			status_end();
+		}
+
+		for (i = 0; i < num_tests; i++)
+		{
+			pg_free(tests[i]);
+			tests[i] = NULL;
+			free_stringlist(&resultfiles[i]);
+			free_stringlist(&expectfiles[i]);
+			free_stringlist(&tags[i]);
 		}
 	}
 
@@ -2103,6 +2372,8 @@ static void
 run_single_test(const char *test, test_function tfunc)
 {
 	PID_TYPE	pid;
+	instr_time	starttime;
+	instr_time	stoptime;
 	int			exit_status;
 	_stringlist *resultfiles = NULL;
 	_stringlist *expectfiles = NULL;
@@ -2112,9 +2383,16 @@ run_single_test(const char *test, test_function tfunc)
 			   *tl;
 	bool		differ = false;
 
-	status(_("test %-24s ... "), test);
+	if (!cluster_healthy())
+		return;
+
+	if (should_exclude_test((char *) test))
+		return;
+
+	status(_("test %-28s ... "), test);
 	pid = (tfunc) (test, &resultfiles, &expectfiles, &tags);
-	wait_for_tests(&pid, &exit_status, NULL, NULL, 1);
+	INSTR_TIME_SET_CURRENT(starttime);
+	wait_for_tests(&pid, &exit_status, &stoptime, NULL, 1);
 
 	/*
 	 * Advance over all three lists simultaneously.
@@ -2125,13 +2403,10 @@ run_single_test(const char *test, test_function tfunc)
 	 */
 	for (rl = resultfiles, el = expectfiles, tl = tags;
 		 rl != NULL;			/* rl and el have the same length */
-		 rl = rl->next, el = el->next)
+		 rl = rl->next, el = el->next,
+		 tl = tl ? tl->next : NULL)
 	{
 		bool		newdiff;
-
-		if (tl)
-			tl = tl->next;		/* tl has the same length as rl and el if it
-								 * exists */
 
 		newdiff = results_differ(test, rl->str, el->str);
 		if (newdiff && tl)
@@ -2148,12 +2423,15 @@ run_single_test(const char *test, test_function tfunc)
 	}
 	else
 	{
-		status(_("ok"));
+		status(_("ok    "));	/* align with FAILED */
 		success_count++;
 	}
 
 	if (exit_status != 0)
 		log_child_failure(exit_status);
+
+	INSTR_TIME_SUBTRACT(stoptime, starttime);
+	status(_(" %8.0f ms"), INSTR_TIME_GET_MILLISEC(stoptime));
 
 	status_end();
 }
@@ -2165,7 +2443,7 @@ run_single_test(const char *test, test_function tfunc)
 static void
 find_helper_programs(const char *argv0)
 {
-	if (find_other_exec(argv0, "gpdiff.pl", NULL, gpdiffprog) != 0)
+	if (find_other_exec(argv0, "gpdiff.pl", "gpdiff.pl " GP_VERSION"\n", gpdiffprog) != 0)
 	{
 		char		full_path[MAXPGPATH];
 
@@ -2178,7 +2456,8 @@ find_helper_programs(const char *argv0)
 				progname, full_path);
 		exit(1);
 	}
-	if (find_other_exec(argv0, "gpstringsubs.pl", NULL, gpstringsubsprog) != 0)
+
+	if (find_other_exec(argv0, "gpstringsubs.pl", "gpstringsubs.pl " GP_VERSION"\n", gpstringsubsprog) != 0)
 	{
 		char		full_path[MAXPGPATH];
 
@@ -2201,9 +2480,13 @@ open_result_files(void)
 	char		file[MAXPGPATH];
 	FILE	   *difffile;
 
+	/* create outputdir directory if not present */
+	if (!directory_exists(outputdir))
+		make_directory(outputdir);
+
 	/* create the log file (copy of running status output) */
 	snprintf(file, sizeof(file), "%s/regression.out", outputdir);
-	logfilename = strdup(file);
+	logfilename = pg_strdup(file);
 	logfile = fopen(logfilename, "w");
 	if (!logfile)
 	{
@@ -2214,7 +2497,7 @@ open_result_files(void)
 
 	/* create the diffs file as empty */
 	snprintf(file, sizeof(file), "%s/regression.diffs", outputdir);
-	difffilename = strdup(file);
+	difffilename = pg_strdup(file);
 	difffile = fopen(difffilename, "w");
 	if (!difffile)
 	{
@@ -2225,7 +2508,7 @@ open_result_files(void)
 	/* we don't keep the diffs file open continuously */
 	fclose(difffile);
 
-	/* also create the output directory if not present */
+	/* also create the results directory if not present */
 	snprintf(file, sizeof(file), "%s/results", outputdir);
 	if (!directory_exists(file))
 		make_directory(file);
@@ -2258,8 +2541,9 @@ create_database(const char *dbname)
 				 "ALTER DATABASE \"%s\" SET lc_monetary TO 'C';"
 				 "ALTER DATABASE \"%s\" SET lc_numeric TO 'C';"
 				 "ALTER DATABASE \"%s\" SET lc_time TO 'C';"
-			"ALTER DATABASE \"%s\" SET timezone_abbreviations TO 'Default';",
-				 dbname, dbname, dbname, dbname, dbname);
+				 "ALTER DATABASE \"%s\" SET bytea_output TO 'hex';"
+				 "ALTER DATABASE \"%s\" SET timezone_abbreviations TO 'Default';",
+				 dbname, dbname, dbname, dbname, dbname, dbname);
 
 	/*
 	 * Install any requested procedural languages.  We use CREATE OR REPLACE
@@ -2280,6 +2564,7 @@ create_database(const char *dbname)
 		header(_("installing %s"), sl->str);
 		psql_command(dbname, "CREATE EXTENSION IF NOT EXISTS \"%s\"", sl->str);
 	}
+
 }
 
 static void
@@ -2334,7 +2619,7 @@ should_exclude_test(char *test)
 	_stringlist *sl;
 	for (sl = exclude_tests; sl != NULL; sl = sl->next)
 	{
-		if (strcmp(test, sl->str) == 0)
+		if (strncmp(test, sl->str, strlen(sl->str)) == 0)
 			return true;
 	}
 
@@ -2368,23 +2653,23 @@ check_feature_status(const char *feature_name, const char *feature_value,
 
 	len = snprintf(psql_cmd, sizeof(psql_cmd),
 			"\"%s%spsql\" -X -t -c \"show %s;\" -o \"%s\" -d \"postgres\"",
-			psqldir ? psqldir : "",
-			psqldir ? "/" : "",
+			bindir ? bindir : "",
+			bindir ? "/" : "",
 			feature_name,
 			statusfilename);
 
 	if (len >= sizeof(psql_cmd))
-		exit_nicely(2);
+		exit(2);
 
 	if (system(psql_cmd) != 0)
-		exit_nicely(2);
+		exit(2);
 
 	FILE *statusfile = fopen(statusfilename, "r");
 	if (!statusfile)
 	{
 		fprintf(stderr, _("%s: could not open file \"%s\" for reading: %s\n"),
 				progname, statusfilename, strerror(errno));
-		exit_nicely(2);
+		exit(2);
 	}
 
 	while (fgets(line, sizeof(line), statusfile))
@@ -2414,43 +2699,50 @@ help(void)
 	printf(_("Usage:\n  %s [OPTION]... [EXTRA-TEST]...\n"), progname);
 	printf(_("\n"));
 	printf(_("Options:\n"));
-	printf(_("  --create-role=ROLE        create the specified role before testing\n"));
-	printf(_("  --dbname=DB               use database DB (default \"regression\")\n"));
-	printf(_("  --debug                   turn on debug mode in programs that are run\n"));
-	printf(_("  --dlpath=DIR              look for dynamic libraries in DIR\n"));
-	printf(_("  --encoding=ENCODING       use ENCODING as the encoding\n"));
-	printf(_("  --inputdir=DIR            take input files from DIR (default \".\")\n"));
-	printf(_("  --launcher=CMD            use CMD as launcher of psql\n"));
-	printf(_("  --load-extension=EXT      load the named extension before running the\n"));
-	printf(_("                            tests; can appear multiple times\n"));
-	printf(_("  --load-language=LANG      load the named language before running the\n"));
-	printf(_("                            tests; can appear multiple times\n"));
-	printf(_("  --max-connections=N       maximum number of concurrent connections\n"));
-	printf(_("                            (default is 0, meaning unlimited)\n"));
-	printf(_("  --outputdir=DIR           place output files in DIR (default \".\")\n"));
-	printf(_("  --schedule=FILE           use test ordering schedule from FILE\n"));
-	printf(_("                            (can be used multiple times to concatenate)\n"));
-	printf(_("  --temp-install=DIR        create a temporary installation in DIR\n"));
-	printf(_("  --use-existing            use an existing installation\n"));
-	/* Please put GPDB speicifc options at the end. */
-	printf(_("  --exclude-tests=TEST      command or space delimited tests to exclude from running\n"));
-    printf(_(" --init-file=GPD_INIT_FILE  init file to be used for gpdiff\n"));
-	printf(_("  --ao-dir=DIR              directory name prefix containing generic\n"));
-	printf(_("                            UAO row and column tests\n"));
-	printf(_("  --resgroup-dir=DIR        directory name prefix containing resgroup tests\n"));
+	printf(_("      --bindir=BINPATH          use BINPATH for programs that are run;\n"));
+	printf(_("                                if empty, use PATH from the environment\n"));
+	printf(_("      --config-auth=DATADIR     update authentication settings for DATADIR\n"));
+	printf(_("      --create-role=ROLE        create the specified role before testing\n"));
+	printf(_("      --dbname=DB               use database DB (default \"regression\")\n"));
+	printf(_("      --debug                   turn on debug mode in programs that are run\n"));
+	printf(_("      --dlpath=DIR              look for dynamic libraries in DIR\n"));
+	printf(_("      --encoding=ENCODING       use ENCODING as the encoding\n"));
+	printf(_("  -h, --help                    show this help, then exit\n"));
+	printf(_("      --inputdir=DIR            take input files from DIR (default \".\")\n"));
+	printf(_("      --launcher=CMD            use CMD as launcher of psql\n"));
+	printf(_("      --load-extension=EXT      load the named extension before running the\n"));
+	printf(_("                                tests; can appear multiple times\n"));
+	printf(_("      --load-language=LANG      load the named language before running the\n"));
+	printf(_("                                tests; can appear multiple times\n"));
+	printf(_("      --max-connections=N       maximum number of concurrent connections\n"));
+	printf(_("                                (default is 0, meaning unlimited)\n"));
+	printf(_("      --max-concurrent-tests=N  maximum number of concurrent tests in schedule\n"));
+	printf(_("                                (default is 0, meaning unlimited)\n"));
+	printf(_("      --outputdir=DIR           place output files in DIR (default \".\")\n"));
+	printf(_("      --schedule=FILE           use test ordering schedule from FILE\n"));
+	printf(_("                                (can be used multiple times to concatenate)\n"));
+	printf(_("      --temp-instance=DIR       create a temporary instance in DIR\n"));
+	printf(_("      --use-existing            use an existing installation\n"));
+	/* Please put GPDB specific options here, at the end */
+	printf(_("      --prehook=NAME            pre-hook name (default \"\")\n"));
+	printf(_("      --exclude-tests=TEST      command or space delimited tests to exclude from running\n"));
+	printf(_("      --exclude-file=FILE       file with tests to exclude from running, one test name per line\n"));
+    printf(_("      --init-file=GPD_INIT_FILE  init file to be used for gpdiff (could be used multiple times)\n"));
+	printf(_("      --ignore-plans            ignore any explain plan diffs\n"));
+	printf(_("      --print-failure-diffs     Print the diff file to standard out after a failure\n"));
+	printf(_("      --tablespace-dir=DIR      place tablespace files in DIR/testtablespace (default \"./testtablespace\")\n"));
+	/* end of GPDB specific options */
+	printf(_("  -V, --version                 output version information, then exit\n"));
 	printf(_("\n"));
-	printf(_("Options for \"temp-install\" mode:\n"));
-	printf(_("  --extra-install=DIR       additional directory to install (e.g., contrib)\n"));
-	printf(_("  --no-locale               use C locale\n"));
-	printf(_("  --port=PORT               start postmaster on PORT\n"));
-	printf(_("  --temp-config=FILE        append contents of FILE to temporary config\n"));
-	printf(_("  --top-builddir=DIR        (relative) path to top level build directory\n"));
+	printf(_("Options for \"temp-instance\" mode:\n"));
+	printf(_("      --no-locale               use C locale\n"));
+	printf(_("      --port=PORT               start postmaster on PORT\n"));
+	printf(_("      --temp-config=FILE        append contents of FILE to temporary config\n"));
 	printf(_("\n"));
 	printf(_("Options for using an existing installation:\n"));
-	printf(_("  --host=HOST               use postmaster running on HOST\n"));
-	printf(_("  --port=PORT               use postmaster running at PORT\n"));
-	printf(_("  --user=USER               connect as USER\n"));
-	printf(_("  --psqldir=DIR             use psql in DIR (default: configured bindir)\n"));
+	printf(_("      --host=HOST               use postmaster running on HOST\n"));
+	printf(_("      --port=PORT               use postmaster running at PORT\n"));
+	printf(_("      --user=USER               connect as USER\n"));
 	printf(_("\n"));
 	printf(_("The exit status is 0 if all tests passed, 1 if some tests failed, and 2\n"));
 	printf(_("if the tests could not be run for some reason.\n"));
@@ -2472,24 +2764,27 @@ regression_main(int argc, char *argv[], init_function ifunc, test_function tfunc
 		{"encoding", required_argument, NULL, 6},
 		{"outputdir", required_argument, NULL, 7},
 		{"schedule", required_argument, NULL, 8},
-		{"temp-install", required_argument, NULL, 9},
+		{"temp-instance", required_argument, NULL, 9},
 		{"no-locale", no_argument, NULL, 10},
-		{"top-builddir", required_argument, NULL, 11},
 		{"host", required_argument, NULL, 13},
 		{"port", required_argument, NULL, 14},
 		{"user", required_argument, NULL, 15},
-		{"psqldir", required_argument, NULL, 16},
+		{"bindir", required_argument, NULL, 16},
 		{"dlpath", required_argument, NULL, 17},
 		{"create-role", required_argument, NULL, 18},
 		{"temp-config", required_argument, NULL, 19},
 		{"use-existing", no_argument, NULL, 20},
 		{"launcher", required_argument, NULL, 21},
 		{"load-extension", required_argument, NULL, 22},
-		{"extra-install", required_argument, NULL, 23},
-        {"init-file", required_argument, NULL, 25},
-        {"ao-dir", required_argument, NULL, 26},
-        {"resgroup-dir", required_argument, NULL, 27},
-        {"exclude-tests", required_argument, NULL, 28},
+		{"config-auth", required_argument, NULL, 24},
+		{"max-concurrent-tests", required_argument, NULL, 25},
+		{"init-file", required_argument, NULL, 80},
+		{"exclude-tests", required_argument, NULL, 81},
+		{"ignore-plans", no_argument, NULL, 82},
+		{"prehook", required_argument, NULL, 83},
+		{"print-failure-diffs", no_argument, NULL, 84},
+		{"tablespace-dir", required_argument, NULL, 85},
+		{"exclude-file", required_argument, NULL, 87}, /* 86 conflicts with 'V' */
 		{NULL, 0, NULL, 0}
 	};
 
@@ -2500,8 +2795,11 @@ regression_main(int argc, char *argv[], init_function ifunc, test_function tfunc
 	char		buf[MAXPGPATH * 4];
 	char		buf2[MAXPGPATH * 4];
 
+	pg_logging_init(argv[0]);
 	progname = get_progname(argv[0]);
 	set_pglocale_pgservice(argv[0], PG_TEXTDOMAIN("pg_regress"));
+
+	get_restricted_token();
 
 	atexit(stop_postmaster);
 
@@ -2536,13 +2834,13 @@ regression_main(int argc, char *argv[], init_function ifunc, test_function tfunc
 				 * before we add the specified one.
 				 */
 				free_stringlist(&dblist);
-				split_to_stringlist(strdup(optarg), ", ", &dblist);
+				split_to_stringlist(optarg, ",", &dblist);
 				break;
 			case 2:
 				debug = true;
 				break;
 			case 3:
-				inputdir = strdup(optarg);
+				inputdir = pg_strdup(optarg);
 				break;
 			case 4:
 				add_stringlist_item(&loadlanguage, optarg);
@@ -2551,71 +2849,85 @@ regression_main(int argc, char *argv[], init_function ifunc, test_function tfunc
 				max_connections = atoi(optarg);
 				break;
 			case 6:
-				encoding = strdup(optarg);
+				encoding = pg_strdup(optarg);
 				break;
 			case 7:
-				outputdir = strdup(optarg);
+				outputdir = pg_strdup(optarg);
 				break;
 			case 8:
 				add_stringlist_item(&schedulelist, optarg);
 				break;
 			case 9:
-				temp_install = make_absolute_path(optarg);
+				temp_instance = make_absolute_path(optarg);
 				break;
 			case 10:
 				nolocale = true;
 				break;
-			case 11:
-				top_builddir = strdup(optarg);
-				break;
 			case 13:
-				hostname = strdup(optarg);
+				hostname = pg_strdup(optarg);
 				break;
 			case 14:
 				port = atoi(optarg);
 				port_specified_by_user = true;
 				break;
 			case 15:
-				user = strdup(optarg);
+				user = pg_strdup(optarg);
 				break;
 			case 16:
-				/* "--psqldir=" should mean to use PATH */
+				/* "--bindir=" means to use PATH */
 				if (strlen(optarg))
-					psqldir = strdup(optarg);
+					bindir = pg_strdup(optarg);
+				else
+					bindir = NULL;
 				break;
 			case 17:
-				dlpath = strdup(optarg);
+				dlpath = pg_strdup(optarg);
 				break;
 			case 18:
-				split_to_stringlist(strdup(optarg), ", ", &extraroles);
+				split_to_stringlist(optarg, ",", &extraroles);
 				break;
 			case 19:
-				temp_config = strdup(optarg);
+				add_stringlist_item(&temp_configs, optarg);
 				break;
 			case 20:
 				use_existing = true;
 				break;
 			case 21:
-				launcher = strdup(optarg);
+				launcher = pg_strdup(optarg);
 				break;
 			case 22:
 				add_stringlist_item(&loadextension, optarg);
 				break;
-			case 23:
-				add_stringlist_item(&extra_install, optarg);
+			case 24:
+				config_auth_datadir = pg_strdup(optarg);
 				break;
-            case 25:
-                initfile = strdup(optarg);
+			case 25:
+				max_concurrent_tests = atoi(optarg);
+				break;
+
+			/* GPDB-added options */
+            case 80:
+				add_stringlist_item(&init_file_list, optarg);
                 break;
-            case 26:
-                aodir = strdup(optarg);
-                break;
-            case 27:
-                resgroupdir = strdup(optarg);
-                break;
-            case 28:
+            case 81:
                 split_to_stringlist(strdup(optarg), ", ", &exclude_tests);
                 break;
+			case 82:
+				ignore_plans = true;
+				break;
+			case 83:
+				prehook = strdup(optarg);
+				break;
+			case 84:
+				print_failure_diffs_is_enabled = true;
+				break;
+			case 85:
+				tablespacedir = strdup(optarg);
+				break;
+			case 87:
+				exclude_tests_file = strdup(optarg);
+				load_exclude_tests_file(&exclude_tests, exclude_tests_file);
+				break;
 			default:
 				/* getopt_long already emitted a complaint */
 				fprintf(stderr, _("\nTry \"%s -h\" for more information.\n"),
@@ -2633,18 +2945,29 @@ regression_main(int argc, char *argv[], init_function ifunc, test_function tfunc
 		optind++;
 	}
 
-	if (temp_install && !port_specified_by_user)
+	if (config_auth_datadir)
+	{
+#ifdef ENABLE_SSPI
+		config_sspi_auth(config_auth_datadir, user);
+#endif
+		exit(0);
+	}
+
+	if (temp_instance && !port_specified_by_user)
 
 		/*
 		 * To reduce chances of interference with parallel installations, use
 		 * a port number starting in the private range (49152-65535)
-		 * calculated from the version number.
+		 * calculated from the version number.  This aids !HAVE_UNIX_SOCKETS
+		 * systems; elsewhere, the use of a private socket directory already
+		 * prevents interference.
 		 */
 		port = 0xC000 | (PG_VERSION_NUM & 0x3FFF);
 
 	inputdir = make_absolute_path(inputdir);
 	outputdir = make_absolute_path(outputdir);
 	dlpath = make_absolute_path(dlpath);
+	tablespacedir = make_absolute_path(tablespacedir);
 
 	/*
 	 * Initialization
@@ -2652,85 +2975,67 @@ regression_main(int argc, char *argv[], init_function ifunc, test_function tfunc
 	find_helper_programs(argv[0]);
 	open_result_files();
 
+	if (prehook[0])
+	{
+		char *fullname = psprintf("%s/sql/hooks/%s.sql", inputdir, prehook);
+
+		if (!file_exists(fullname))
+		{
+			convert_sourcefiles_in("input/hooks", outputdir, "sql/hooks", "sql");
+
+			if (!file_exists(fullname))
+			{
+				fprintf(stderr, _("%s: could not open file \"%s\" for reading: %s\n"),
+						progname, fullname, strerror(errno));
+				exit(2);
+			}
+		}
+	}
+
 	initialize_environment();
 
 #if defined(HAVE_GETRLIMIT) && defined(RLIMIT_CORE)
 	unlimit_core_size();
 #endif
 
-	if (temp_install)
+	if (temp_instance)
 	{
 		FILE	   *pg_conf;
-		_stringlist *sl;
+		const char *env_wait;
+		int			wait_seconds;
 
 		/*
-		 * Prepare the temp installation
+		 * Prepare the temp instance
 		 */
-		if (!top_builddir)
-		{
-			fprintf(stderr, _("--top-builddir must be specified when using --temp-install\n"));
-			exit(2);
-		}
 
-		if (directory_exists(temp_install))
+		if (directory_exists(temp_instance))
 		{
-			header(_("removing existing temp installation"));
-			if (!rmtree(temp_install, true))
+			header(_("removing existing temp instance"));
+			if (!rmtree(temp_instance, true))
 			{
-				fprintf(stderr, _("\n%s: could not remove temp installation \"%s\": %s\n"), progname, temp_install, strerror(errno));
+				fprintf(stderr, _("\n%s: could not remove temp instance \"%s\"\n"),
+						progname, temp_instance);
 				exit(2);
 			}
 		}
 
-		header(_("creating temporary installation"));
+		header(_("creating temporary instance"));
 
-		/* make the temp install top directory */
-		make_directory(temp_install);
+		/* make the temp instance top directory */
+		make_directory(temp_instance);
 
 		/* and a directory for log files */
 		snprintf(buf, sizeof(buf), "%s/log", outputdir);
 		if (!directory_exists(buf))
 			make_directory(buf);
 
-		/* "make install" */
-#ifndef WIN32_ONLY_COMPILER
-		snprintf(buf, sizeof(buf),
-				 "\"%s\" -C \"%s\" DESTDIR=\"%s/install\" install > \"%s/log/install.log\" 2>&1",
-				 makeprog, top_builddir, temp_install, outputdir);
-#else
-		snprintf(buf, sizeof(buf),
-				 "perl \"%s/src/tools/msvc/install.pl\" \"%s/install\" >\"%s/log/install.log\" 2>&1",
-				 top_builddir, temp_install, outputdir);
-#endif
-		if (system(buf))
-		{
-			fprintf(stderr, _("\n%s: installation failed\nExamine %s/log/install.log for the reason.\nCommand was: %s\n"), progname, outputdir, buf);
-			exit(2);
-		}
-
-		for (sl = extra_install; sl != NULL; sl = sl->next)
-		{
-#ifndef WIN32_ONLY_COMPILER
-			snprintf(buf, sizeof(buf),
-					 "\"%s\" -C \"%s/%s\" DESTDIR=\"%s/install\" install >> \"%s/log/install.log\" 2>&1",
-				   makeprog, top_builddir, sl->str, temp_install, outputdir);
-#else
-			fprintf(stderr, _("\n%s: --extra-install option not supported on this platform\n"), progname);
-			exit(2);
-#endif
-
-			if (system(buf))
-			{
-				fprintf(stderr, _("\n%s: installation failed\nExamine %s/log/install.log for the reason.\nCommand was: %s\n"), progname, outputdir, buf);
-				exit(2);
-			}
-		}
-
 		/* initdb */
 		header(_("initializing database system"));
 		snprintf(buf, sizeof(buf),
-				 "\"%s/initdb\" -D \"%s/data\" -L \"%s\" --noclean --nosync%s%s > \"%s/log/initdb.log\" 2>&1",
-				 bindir, temp_install, datadir,
+				 "\"%s%sinitdb\" -D \"%s/data\" --no-clean --no-sync%s%s > \"%s/log/initdb.log\" 2>&1",
+				 bindir ? bindir : "",
+				 bindir ? "/" : "",
+				 temp_instance,
 				 debug ? " --debug" : "",
 				 nolocale ? " --no-locale" : "",
 				 outputdir);
@@ -2741,14 +3046,14 @@ regression_main(int argc, char *argv[], init_function ifunc, test_function tfunc
 		}
 
 		/*
-		 * Adjust the default postgresql.conf as needed for regression
-		 * testing. The user can specify a file to be appended; in any case we
-		 * set max_prepared_transactions to enable testing of prepared xacts.
-		 * (Note: to reduce the probability of unexpected shmmax failures,
-		 * don't set max_prepared_transactions any higher than actually needed
-		 * by the prepared_xacts regression test.)
+		 * Adjust the default postgresql.conf for regression testing. The user
+		 * can specify a file to be appended; in any case we expand logging
+		 * and set max_prepared_transactions to enable testing of prepared
+		 * xacts.  (Note: to reduce the probability of unexpected shmmax
+		 * failures, don't set max_prepared_transactions any higher than
+		 * actually needed by the prepared_xacts regression test.)
 		 */
-		snprintf(buf, sizeof(buf), "%s/data/postgresql.conf", temp_install);
+		snprintf(buf, sizeof(buf), "%s/data/postgresql.conf", temp_instance);
 		pg_conf = fopen(buf, "a");
 		if (pg_conf == NULL)
 		{
@@ -2756,10 +3061,16 @@ regression_main(int argc, char *argv[], init_function ifunc, test_function tfunc
 			exit(2);
 		}
 		fputs("\n# Configuration added by pg_regress\n\n", pg_conf);
+		fputs("log_autovacuum_min_duration = 0\n", pg_conf);
+		fputs("log_checkpoints = on\n", pg_conf);
+		fputs("log_line_prefix = '%m [%p] %q%a '\n", pg_conf);
+		fputs("log_lock_waits = on\n", pg_conf);
+		fputs("log_temp_files = 128kB\n", pg_conf);
 		fputs("max_prepared_transactions = 2\n", pg_conf);
 
-		if (temp_config != NULL)
+		for (sl = temp_configs; sl != NULL; sl = sl->next)
 		{
+			char	   *temp_config = sl->str;
 			FILE	   *extra_conf;
 			char		line_buf[1024];
 
@@ -2776,12 +3087,26 @@ regression_main(int argc, char *argv[], init_function ifunc, test_function tfunc
 
 		fclose(pg_conf);
 
+#ifdef ENABLE_SSPI
+
+		/*
+		 * Since we successfully used the same buffer for the much-longer
+		 * "initdb" command, this can't truncate.
+		 */
+		snprintf(buf, sizeof(buf), "%s/data", temp_instance);
+		config_sspi_auth(buf, NULL);
+#elif !defined(HAVE_UNIX_SOCKETS)
+#error Platform has no means to secure the test installation.
+#endif
+
 		/*
 		 * Check if there is a postmaster running already.
 		 */
 		snprintf(buf2, sizeof(buf2),
-				 "\"%s/psql\" -X postgres <%s 2>%s",
-				 bindir, DEVNULL, DEVNULL);
+				 "\"%s%spsql\" -X postgres <%s 2>%s",
+				 bindir ? bindir : "",
+				 bindir ? "/" : "",
+				 DEVNULL, DEVNULL);
 
 		for (i = 0; i < 16; i++)
 		{
@@ -2812,10 +3137,13 @@ regression_main(int argc, char *argv[], init_function ifunc, test_function tfunc
 		 */
 		header(_("starting postmaster"));
 		snprintf(buf, sizeof(buf),
-				 "\"%s/postgres\" -D \"%s/data\" -F%s -c \"listen_addresses=%s\" > \"%s/log/postmaster.log\" 2>&1",
-				 bindir, temp_install,
-				 debug ? " -d 5" : "",
-				 hostname ? hostname : "",
+				 "\"%s%spostgres\" -D \"%s/data\" -F%s "
+				 "-c \"listen_addresses=%s\" -k \"%s\" "
+				 "> \"%s/log/postmaster.log\" 2>&1",
+				 bindir ? bindir : "",
+				 bindir ? "/" : "",
+				 temp_instance, debug ? " -d 5" : "",
+				 hostname ? hostname : "", sockdir ? sockdir : "",
 				 outputdir);
 		postmaster_pid = spawn_process(buf);
 		if (postmaster_pid == INVALID_PID)
@@ -2826,11 +3154,23 @@ regression_main(int argc, char *argv[], init_function ifunc, test_function tfunc
 		}
 
 		/*
-		 * Wait till postmaster is able to accept connections (normally only a
-		 * second or so, but Cygwin is reportedly *much* slower).  Don't wait
-		 * forever, however.
+		 * Wait till postmaster is able to accept connections; normally this
+		 * is only a second or so, but Cygwin is reportedly *much* slower, and
+		 * test builds using Valgrind or similar tools might be too.  Hence,
+		 * allow the default timeout of 60 seconds to be overridden from the
+		 * PGCTLTIMEOUT environment variable.
 		 */
-		for (i = 0; i < 60; i++)
+		env_wait = getenv("PGCTLTIMEOUT");
+		if (env_wait != NULL)
+		{
+			wait_seconds = atoi(env_wait);
+			if (wait_seconds <= 0)
+				wait_seconds = 60;
+		}
+		else
+			wait_seconds = 60;
+
+		for (i = 0; i < wait_seconds; i++)
 		{
 			/* Done if psql succeeds */
 			if (system(buf2) == 0)
@@ -2840,7 +3180,7 @@ regression_main(int argc, char *argv[], init_function ifunc, test_function tfunc
 			 * Fail immediately if postmaster has exited
 			 */
 #ifndef WIN32
-			if (kill(postmaster_pid, 0) != 0)
+			if (waitpid(postmaster_pid, NULL, WNOHANG) == postmaster_pid)
 #else
 			if (WaitForSingleObject(postmaster_pid, 0) == WAIT_OBJECT_0)
 #endif
@@ -2851,9 +3191,10 @@ regression_main(int argc, char *argv[], init_function ifunc, test_function tfunc
 
 			pg_usleep(1000000L);
 		}
-		if (i >= 60)
+		if (i >= wait_seconds)
 		{
-			fprintf(stderr, _("\n%s: postmaster did not respond within 60 seconds\nExamine %s/log/postmaster.log for the reason\n"), progname, outputdir);
+			fprintf(stderr, _("\n%s: postmaster did not respond within %d seconds\nExamine %s/log/postmaster.log for the reason\n"),
+					progname, wait_seconds, outputdir);
 
 			/*
 			 * If we get here, the postmaster is probably wedged somewhere in
@@ -2877,7 +3218,7 @@ regression_main(int argc, char *argv[], init_function ifunc, test_function tfunc
 
 		postmaster_running = true;
 
-#ifdef WIN64
+#ifdef _WIN64
 /* need a series of two casts to convert HANDLE without compiler warning */
 #define ULONGPID(x) (unsigned long) (unsigned long long) (x)
 #else
@@ -2900,6 +3241,12 @@ regression_main(int argc, char *argv[], init_function ifunc, test_function tfunc
 				drop_role_if_exists(sl->str);
 		}
 	}
+
+#ifdef FAULT_INJECTOR
+	header(_("faultinjector enabled"));
+#else
+	header(_("faultinjector not enabled"));
+#endif
 
 	/*
 	 * Create the test database(s) and role(s)
@@ -2931,12 +3278,17 @@ regression_main(int argc, char *argv[], init_function ifunc, test_function tfunc
 	 */
 	header(_("running regression test queries"));
 
-	for (sl = schedulelist; sl != NULL; sl = sl->next)
+	for (sl = setup_tests; sl != NULL && !halt_work; sl = sl->next)
+	{
+		run_single_test(sl->str, tfunc);
+	}
+
+	for (sl = schedulelist; sl != NULL && !halt_work; sl = sl->next)
 	{
 		run_schedule(sl->str, tfunc);
 	}
 
-	for (sl = extra_tests; sl != NULL; sl = sl->next)
+	for (sl = extra_tests; sl != NULL && !halt_work; sl = sl->next)
 	{
 		run_single_test(sl->str, tfunc);
 	}
@@ -2944,10 +3296,23 @@ regression_main(int argc, char *argv[], init_function ifunc, test_function tfunc
 	/*
 	 * Shut down temp installation's postmaster
 	 */
-	if (temp_install)
+	if (temp_instance)
 	{
 		header(_("shutting down postmaster"));
 		stop_postmaster();
+	}
+
+	/*
+	 * If there were no errors, remove the temp instance immediately to
+	 * conserve disk space.  (If there were errors, we leave the instance in
+	 * place for possible manual investigation.)
+	 */
+	if (temp_instance && fail_count == 0 && fail_ignore_count == 0)
+	{
+		header(_("removing temporary instance"));
+		if (!rmtree(temp_instance, true))
+			fprintf(stderr, _("\n%s: could not remove temp instance \"%s\"\n"),
+					progname, temp_instance);
 	}
 
 	fclose(logfile);
@@ -2989,6 +3354,9 @@ regression_main(int argc, char *argv[], init_function ifunc, test_function tfunc
 
 	if (file_size(difffilename) > 0)
 	{
+		if (print_failure_diffs_is_enabled)
+			print_contents_of_file(difffilename);
+
 		printf(_("The differences that caused some tests to fail can be viewed in the\n"
 				 "file \"%s\".  A copy of the test summary that you see\n"
 				 "above is saved in the file \"%s\".\n\n"),
@@ -3004,4 +3372,109 @@ regression_main(int argc, char *argv[], init_function ifunc, test_function tfunc
 		exit(1);
 
 	return 0;
+}
+
+/*
+ * Issue a command via psql, connecting to the specified database
+ *
+ */
+static void
+psql_command_output(const char *database, char *buffer, int buf_len, const char *query,...)
+{
+	char		query_formatted[1024];
+	char		query_escaped[2048];
+	char		psql_cmd[MAXPGPATH + 2048];
+	va_list		args;
+	char	   *s;
+	char	   *d;
+	FILE *fp;
+	int len;
+
+	/* Generate the query with insertion of sprintf arguments */
+	va_start(args, query);
+	vsnprintf(query_formatted, sizeof(query_formatted), query, args);
+	va_end(args);
+
+	/* Now escape any shell double-quote metacharacters */
+	d = query_escaped;
+	for (s = query_formatted; *s; s++)
+	{
+		if (strchr("\\\"$`", *s))
+			*d++ = '\\';
+		*d++ = *s;
+	}
+	*d = '\0';
+
+	/* And now we can build and execute the shell command */
+	len = snprintf(psql_cmd, sizeof(psql_cmd),
+				   "\"%s%spsql\" -X -t -c \"%s\" \"%s\"",
+				   bindir ? bindir : "",
+				   bindir ? "/" : "",
+				   query_escaped,
+				   database);
+
+	if (len >= sizeof(psql_cmd))
+		exit(2);
+
+	/* Execute the command with pipe and read the standard output. */
+	if ((fp = popen(psql_cmd, "r")) == NULL)
+	{
+		fprintf(stderr, "%s: cannot launch shell command\n", progname);
+		exit(2);
+	}
+
+	if (fgets(buffer, buf_len, fp) == NULL)
+	{
+		fprintf(stderr, "%s: cannot read the result\n", progname);
+		(void) pclose(fp);
+		exit(2);
+	}
+
+	if (pclose(fp) < 0)
+	{
+		fprintf(stderr, "%s: cannot close shell command\n", progname);
+		exit(2);
+	}
+}
+
+static bool
+cluster_healthy(void)
+{
+	char line[1024];
+	psql_command_output("postgres", line, 1024,
+						"SELECT * FROM gp_segment_configuration WHERE status = 'd' OR preferred_role != role;");
+
+	halt_work = false;
+	if (strcmp(line, "\n") != 0)
+	{
+		fprintf(stderr, _("\n==================================\n"));
+		fprintf(stderr, _(" Cluster validation failed:\n%s"), line);
+		fprintf(stderr, _("==================================\n"));
+		halt_work = true;
+	}
+
+	return !halt_work;
+}
+
+static char *
+get_host_name(int16 contentid, char role)
+{
+	char line[1024];
+	char *hostname = NULL;
+
+	psql_command_output("postgres", line, 1024,
+						"SELECT hostname FROM gp_segment_configuration WHERE role=\'%c\' AND content = %d;",
+						role,
+						contentid);
+
+	hostname = psprintf("%s", trim_white_space(line));
+
+	if (strcmp("", hostname) == 0)
+	{
+		fprintf(stderr, _("%s: failed to determine hostname for content 0 primary\n"),
+				progname);
+		exit(2);
+	}
+
+	return hostname;
 }

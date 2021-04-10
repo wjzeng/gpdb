@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 import unittest
 import sys
@@ -11,7 +11,8 @@ import fileinput
 import platform
 import re
 import subprocess
-from pygresql import pg
+
+from gppylib.commands.gp import get_coordinatordatadir
 
 """
 Global Values
@@ -91,13 +92,13 @@ def psql_run(ifile = None, ofile = None, cmd = None,
     @param port    : port where gpdb is running
     @param PGOPTIONS: connects to postgres via utility mode
     '''
-    if dbname == None:
+    if dbname is None:
         dbname = DBNAME
 
-    if username == None:
+    if username is None:
         username = PGUSER  # Use the default login user
 
-    if PGOPTIONS == None:
+    if PGOPTIONS is None:
         PGOPTIONS = ""
     else:
         PGOPTIONS = "PGOPTIONS='%s'" % PGOPTIONS
@@ -181,17 +182,17 @@ def isFileEqual( f1, f2, optionalFlags = "", outputPath = "", myinitfile = ""):
     # Gets the suitePath name to add init_file
     suitePath = f1[0:f1.rindex( "/" )]
     if os.path.exists(suitePath + "/init_file"):
-        (ok, out) = run('gpdiff.pl -w ' + optionalFlags + \
+        (ok, out) = run('../gpdiff.pl -w ' + optionalFlags + \
                               ' -I NOTICE: -I HINT: -I CONTEXT: -I GP_IGNORE: --gp_init_file=%s/global_init_file --gp_init_file=%s/init_file '
                               '%s %s > %s 2>&1' % (LMYD, suitePath, f1, f2, dfile))
 
     else:
         if os.path.exists(myinitfile):
-            (ok, out) = run('gpdiff.pl -w ' + optionalFlags + \
+            (ok, out) = run('../gpdiff.pl -w ' + optionalFlags + \
                                   ' -I NOTICE: -I HINT: -I CONTEXT: -I GP_IGNORE: --gp_init_file=%s/global_init_file --gp_init_file=%s '
                                   '%s %s > %s 2>&1' % (LMYD, myinitfile, f1, f2, dfile))
         else:
-            (ok, out) = run( 'gpdiff.pl -w ' + optionalFlags + \
+            (ok, out) = run( '../gpdiff.pl -w ' + optionalFlags + \
                               ' -I NOTICE: -I HINT: -I CONTEXT: -I GP_IGNORE: --gp_init_file=%s/global_init_file '
                               '%s %s > %s 2>&1' % ( LMYD, f1, f2, dfile ) )
 
@@ -332,7 +333,7 @@ def modify_sql_file(num):
                 line = re.sub('-U \w+', '-U fake_user', line)
             else:
                 line = re.sub('-U \w+', '-U '+user, line)
-            print str(re.sub('\n','',line))
+            print((str(re.sub('\n','',line))))
 
 def windows_path(command):
     if platform.system() in ['Windows', 'Microsoft']:
@@ -345,10 +346,10 @@ def windows_path(command):
         return command
 
 def get_port():
-    file = os.environ.get('MASTER_DATA_DIRECTORY')+'/postgresql.conf'
+    file = get_coordinatordatadir()+'/postgresql.conf'
     if os.path.isfile(file):
         f = open(file)
-        for line in f.xreadlines():
+        for line in f:
             match = re.search('port=\d+',line)
             if match:
                 match1 = re.search('\d+', match.group())

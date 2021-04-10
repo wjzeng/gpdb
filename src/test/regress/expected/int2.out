@@ -3,10 +3,11 @@
 --
 CREATE TABLE INT2_TBL(f1 int2);
 INSERT INTO INT2_TBL(f1) VALUES ('0   ');
+ANALYZE INT2_TBL;
 INSERT INTO INT2_TBL(f1) VALUES ('  1234 ');
 INSERT INTO INT2_TBL(f1) VALUES ('    -1234');
 INSERT INTO INT2_TBL(f1) VALUES ('34.5');
-ERROR:  invalid input syntax for integer: "34.5"
+ERROR:  invalid input syntax for type smallint: "34.5"
 LINE 1: INSERT INTO INT2_TBL(f1) VALUES ('34.5');
                                          ^
 -- largest and smallest values
@@ -18,27 +19,27 @@ ERROR:  value "100000" is out of range for type smallint
 LINE 1: INSERT INTO INT2_TBL(f1) VALUES ('100000');
                                          ^
 INSERT INTO INT2_TBL(f1) VALUES ('asdf');
-ERROR:  invalid input syntax for integer: "asdf"
+ERROR:  invalid input syntax for type smallint: "asdf"
 LINE 1: INSERT INTO INT2_TBL(f1) VALUES ('asdf');
                                          ^
 INSERT INTO INT2_TBL(f1) VALUES ('    ');
-ERROR:  invalid input syntax for integer: "    "
+ERROR:  invalid input syntax for type smallint: "    "
 LINE 1: INSERT INTO INT2_TBL(f1) VALUES ('    ');
                                          ^
 INSERT INTO INT2_TBL(f1) VALUES ('- 1234');
-ERROR:  invalid input syntax for integer: "- 1234"
+ERROR:  invalid input syntax for type smallint: "- 1234"
 LINE 1: INSERT INTO INT2_TBL(f1) VALUES ('- 1234');
                                          ^
 INSERT INTO INT2_TBL(f1) VALUES ('4 444');
-ERROR:  invalid input syntax for integer: "4 444"
+ERROR:  invalid input syntax for type smallint: "4 444"
 LINE 1: INSERT INTO INT2_TBL(f1) VALUES ('4 444');
                                          ^
 INSERT INTO INT2_TBL(f1) VALUES ('123 dt');
-ERROR:  invalid input syntax for integer: "123 dt"
+ERROR:  invalid input syntax for type smallint: "123 dt"
 LINE 1: INSERT INTO INT2_TBL(f1) VALUES ('123 dt');
                                          ^
 INSERT INTO INT2_TBL(f1) VALUES ('');
-ERROR:  invalid input syntax for integer: ""
+ERROR:  invalid input syntax for type smallint: ""
 LINE 1: INSERT INTO INT2_TBL(f1) VALUES ('');
                                          ^
 SELECT '' AS five, * FROM INT2_TBL;
@@ -265,4 +266,44 @@ SELECT (-32768)::int2 % (-1)::int2;
 ----------
         0
 (1 row)
+
+-- check rounding when casting from float
+SELECT x, x::int2 AS int2_value
+FROM (VALUES (-2.5::float8),
+             (-1.5::float8),
+             (-0.5::float8),
+             (0.0::float8),
+             (0.5::float8),
+             (1.5::float8),
+             (2.5::float8)) t(x);
+  x   | int2_value 
+------+------------
+ -2.5 |         -2
+ -1.5 |         -2
+ -0.5 |          0
+    0 |          0
+  0.5 |          0
+  1.5 |          2
+  2.5 |          2
+(7 rows)
+
+-- check rounding when casting from numeric
+SELECT x, x::int2 AS int2_value
+FROM (VALUES (-2.5::numeric),
+             (-1.5::numeric),
+             (-0.5::numeric),
+             (0.0::numeric),
+             (0.5::numeric),
+             (1.5::numeric),
+             (2.5::numeric)) t(x);
+  x   | int2_value 
+------+------------
+ -2.5 |         -3
+ -1.5 |         -2
+ -0.5 |         -1
+  0.0 |          0
+  0.5 |          1
+  1.5 |          2
+  2.5 |          3
+(7 rows)
 

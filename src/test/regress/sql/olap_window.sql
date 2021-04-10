@@ -217,7 +217,6 @@ window w1 as (order by a nulls first, t),
 order by t;
 
 ---- 6 -- Exclude clause ----
--- MPP-13628: exclude clause doesn't work
 select vn, sum(vn) over (w)
 from sale
 window w as (order by vn rows between unbounded preceding and unbounded following exclude CURRENT ROW);
@@ -233,13 +232,6 @@ window w as (order by vn rows between unbounded preceding and unbounded followin
 select vn, sum(vn) over (w)
 from sale
 window w as (order by vn rows between unbounded preceding and unbounded following exclude NO OTHERS);
-
--- MPP-14244: add guc to ignore exclude clause so the above won't error.
--- Note: produces the wrong answer, we will probably want to remove this once we fix the MPP-13628
-set gp_ignore_window_exclude = true;
-select vn, sum(vn) over (w)
-from sale
-window w as (order by vn rows between unbounded preceding and unbounded following exclude GROUP);
 
 
 ---- X -- Miscellaneous (e.g. old bugs, etc.) ----
@@ -1629,3 +1621,10 @@ FROM
   GROUP BY name,device_model
   HAVING COUNT(DISTINCT CASE WHEN ppp > 0 THEN device_id ELSE NULL END)>0
 ) b;
+
+-- check SRF in WindowAgg's targetlist can be handled correctly
+
+explain (costs off)
+select unnest(array[a,a]), rank() over (order by a) from generate_series(2,3) a;
+
+select unnest(array[a,a]), rank() over (order by a) from generate_series(2,3) a;

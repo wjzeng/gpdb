@@ -15,7 +15,7 @@
  * The error constants are taken from the Frambak Bakfram LGSOCKET
  * library guys who in turn took them from the Winsock FAQ.
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  */
@@ -32,11 +32,9 @@
 
 #include "win32.h"
 
-/* Declared here to avoid pulling in all includes, which causes name collissions */
+/* Declared here to avoid pulling in all includes, which causes name collisions */
 #ifdef ENABLE_NLS
-extern char *
-libpq_gettext(const char *msgid)
-__attribute__((format_arg(1)));
+extern char *libpq_gettext(const char *msgid) pg_attribute_format_arg(1);
 #else
 #define libpq_gettext(x) (x)
 #endif
@@ -46,7 +44,7 @@ static struct WSErrorEntry
 {
 	DWORD		error;
 	const char *description;
-}	WSErrors[] =
+}			WSErrors[] =
 
 {
 	{
@@ -238,7 +236,7 @@ struct MessageDLL
 	const char *dll_name;
 	void	   *handle;
 	int			loaded;			/* BOOL */
-}	dlls[] =
+}			dlls[] =
 
 {
 	{
@@ -246,9 +244,6 @@ struct MessageDLL
 	},
 	{
 		"winsock.dll", 0, 0
-	},
-	{
-		"wsock32.dll", 0, 0
 	},
 	{
 		"ws2_32.dll", 0, 0
@@ -312,7 +307,7 @@ winsock_strerror(int err, char *strerrbuf, size_t buflen)
 		success = 0 != FormatMessage(
 									 flags,
 									 dlls[i].handle, err,
-								   MAKELANGID(LANG_ENGLISH, SUBLANG_DEFAULT),
+									 MAKELANGID(LANG_ENGLISH, SUBLANG_DEFAULT),
 									 strerrbuf, buflen - 64,
 									 0
 			);

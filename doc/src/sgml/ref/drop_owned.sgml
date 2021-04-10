@@ -3,7 +3,7 @@ doc/src/sgml/ref/drop_owned.sgml
 PostgreSQL documentation
 -->
 
-<refentry id="SQL-DROP-OWNED">
+<refentry id="sql-drop-owned">
  <indexterm zone="sql-drop-owned">
   <primary>DROP OWNED</primary>
  </indexterm>
@@ -21,7 +21,7 @@ PostgreSQL documentation
 
  <refsynopsisdiv>
 <synopsis>
-DROP OWNED BY <replaceable class="PARAMETER">name</replaceable> [, ...] [ CASCADE | RESTRICT ]
+DROP OWNED BY { <replaceable class="parameter">name</replaceable> | CURRENT_USER | SESSION_USER } [, ...] [ CASCADE | RESTRICT ]
 </synopsis>
  </refsynopsisdiv>
 
@@ -32,7 +32,7 @@ DROP OWNED BY <replaceable class="PARAMETER">name</replaceable> [, ...] [ CASCAD
    <command>DROP OWNED</command> drops all the objects within the current
    database that are owned by one of the specified roles. Any
    privileges granted to the given roles on objects in the current
-   database and on shared objects (databases, tablespaces) will also be
+   database or on shared objects (databases, tablespaces) will also be
    revoked.
   </para>
  </refsect1>
@@ -42,7 +42,7 @@ DROP OWNED BY <replaceable class="PARAMETER">name</replaceable> [, ...] [ CASCAD
 
   <variablelist>
    <varlistentry>
-    <term><replaceable class="PARAMETER">name</replaceable></term>
+    <term><replaceable class="parameter">name</replaceable></term>
     <listitem>
      <para>
       The name of a role whose objects will be dropped, and whose
@@ -55,7 +55,9 @@ DROP OWNED BY <replaceable class="PARAMETER">name</replaceable> [, ...] [ CASCAD
     <term><literal>CASCADE</literal></term>
     <listitem>
      <para>
-      Automatically drop objects that depend on the affected objects.
+      Automatically drop objects that depend on the affected objects,
+      and in turn all objects that depend on those objects
+      (see <xref linkend="ddl-depend"/>).
      </para>
     </listitem>
    </varlistentry>
@@ -88,13 +90,18 @@ DROP OWNED BY <replaceable class="PARAMETER">name</replaceable> [, ...] [ CASCAD
   </para>
 
   <para>
-   The <xref linkend="sql-reassign-owned"> command is an alternative that
+   The <xref linkend="sql-reassign-owned"/> command is an alternative that
    reassigns the ownership of all the database objects owned by one or
-   more roles.
+   more roles.  However, <command>REASSIGN OWNED</command> does not deal with
+   privileges for other objects.
   </para>
 
   <para>
    Databases and tablespaces owned by the role(s) will not be removed.
+  </para>
+
+  <para>
+   See <xref linkend="role-removal"/> for more discussion.
   </para>
  </refsect1>
 
@@ -102,7 +109,7 @@ DROP OWNED BY <replaceable class="PARAMETER">name</replaceable> [, ...] [ CASCAD
   <title>Compatibility</title>
 
   <para>
-   The <command>DROP OWNED</command> statement is a
+   The <command>DROP OWNED</command> command is a
    <productname>PostgreSQL</productname> extension.
   </para>
  </refsect1>
@@ -111,8 +118,8 @@ DROP OWNED BY <replaceable class="PARAMETER">name</replaceable> [, ...] [ CASCAD
   <title>See Also</title>
 
   <simplelist type="inline">
-   <member><xref linkend="sql-reassign-owned"></member>
-   <member><xref linkend="sql-droprole"></member>
+   <member><xref linkend="sql-reassign-owned"/></member>
+   <member><xref linkend="sql-droprole"/></member>
   </simplelist>
  </refsect1>
 

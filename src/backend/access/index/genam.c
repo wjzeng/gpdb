@@ -3,7 +3,7 @@
  * genam.c
  *	  general index access method routines
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -19,17 +19,23 @@
 
 #include "postgres.h"
 
+#include "access/genam.h"
+#include "access/heapam.h"
 #include "access/relscan.h"
+#include "access/tableam.h"
 #include "access/transam.h"
 #include "catalog/index.h"
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
+#include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
+#include "utils/rls.h"
+#include "utils/ruleutils.h"
 #include "utils/snapmgr.h"
-#include "utils/tqual.h"
+#include "utils/syscache.h"
 
 
 /* ----------------------------------------------------------------
@@ -78,8 +84,9 @@ RelationGetIndexScan(Relation indexRelation, int nkeys, int norderbys)
 	scan = (IndexScanDesc) palloc(sizeof(IndexScanDescData));
 
 	scan->heapRelation = NULL;	/* may be set later */
+	scan->xs_heapfetch = NULL;
 	scan->indexRelation = indexRelation;
-	scan->xs_snapshot = InvalidSnapshot;		/* caller must initialize this */
+	scan->xs_snapshot = InvalidSnapshot;	/* caller must initialize this */
 	scan->numberOfKeys = nkeys;
 	scan->numberOfOrderBys = norderbys;
 
@@ -115,11 +122,8 @@ RelationGetIndexScan(Relation indexRelation, int nkeys, int norderbys)
 
 	scan->xs_itup = NULL;
 	scan->xs_itupdesc = NULL;
-
-	ItemPointerSetInvalid(&scan->xs_ctup.t_self);
-	scan->xs_ctup.t_data = NULL;
-	scan->xs_cbuf = InvalidBuffer;
-	scan->xs_continue_hot = false;
+	scan->xs_hitup = NULL;
+	scan->xs_hitupdesc = NULL;
 
 	return scan;
 }
@@ -152,26 +156,88 @@ IndexScanEnd(IndexScanDesc scan)
  *
  * Construct a string describing the contents of an index entry, in the
  * form "(key_name, ...)=(key_value, ...)".  This is currently used
- * for building unique-constraint and exclusion-constraint error messages.
+ * for building unique-constraint and exclusion-constraint error messages,
+ * so only key columns of the index are checked and printed.
+ *
+ * Note that if the user does not have permissions to view all of the
+ * columns involved then a NULL is returned.  Returning a partial key seems
+ * unlikely to be useful and we have no way to know which of the columns the
+ * user provided (unlike in ExecBuildSlotValueDescription).
  *
  * The passed-in values/nulls arrays are the "raw" input to the index AM,
  * e.g. results of FormIndexDatum --- this is not necessarily what is stored
  * in the index, but it's what the user perceives to be stored.
+ *
+ * Note: if you change anything here, check whether
+ * ExecBuildSlotPartitionKeyDescription() in execMain.c needs a similar
+ * change.
  */
 char *
 BuildIndexValueDescription(Relation indexRelation,
 						   Datum *values, bool *isnull)
 {
-	int			natts = indexRelation->rd_rel->relnatts;
 	StringInfoData buf;
+	Form_pg_index idxrec;
+	int			indnkeyatts;
 	int			i;
+	int			keyno;
+	Oid			indexrelid = RelationGetRelid(indexRelation);
+	Oid			indrelid;
+	AclResult	aclresult;
+
+	indnkeyatts = IndexRelationGetNumberOfKeyAttributes(indexRelation);
+
+	/*
+	 * Check permissions- if the user does not have access to view all of the
+	 * key columns then return NULL to avoid leaking data.
+	 *
+	 * First check if RLS is enabled for the relation.  If so, return NULL to
+	 * avoid leaking data.
+	 *
+	 * Next we need to check table-level SELECT access and then, if there is
+	 * no access there, check column-level permissions.
+	 */
+	idxrec = indexRelation->rd_index;
+	indrelid = idxrec->indrelid;
+	Assert(indexrelid == idxrec->indexrelid);
+
+	/* RLS check- if RLS is enabled then we don't return anything. */
+	if (check_enable_rls(indrelid, InvalidOid, true) == RLS_ENABLED)
+		return NULL;
+
+	/* Table-level SELECT is enough, if the user has it */
+	aclresult = pg_class_aclcheck(indrelid, GetUserId(), ACL_SELECT);
+	if (aclresult != ACLCHECK_OK)
+	{
+		/*
+		 * No table-level access, so step through the columns in the index and
+		 * make sure the user has SELECT rights on all of them.
+		 */
+		for (keyno = 0; keyno < indnkeyatts; keyno++)
+		{
+			AttrNumber	attnum = idxrec->indkey.values[keyno];
+
+			/*
+			 * Note that if attnum == InvalidAttrNumber, then this is an index
+			 * based on an expression and we return no detail rather than try
+			 * to figure out what column(s) the expression includes and if the
+			 * user has SELECT rights on them.
+			 */
+			if (attnum == InvalidAttrNumber ||
+				pg_attribute_aclcheck(indrelid, attnum, GetUserId(),
+									  ACL_SELECT) != ACLCHECK_OK)
+			{
+				/* No access, so clean up and return */
+				return NULL;
+			}
+		}
+	}
 
 	initStringInfo(&buf);
 	appendStringInfo(&buf, "(%s)=(",
-					 pg_get_indexdef_columns(RelationGetRelid(indexRelation),
-											 true));
+					 pg_get_indexdef_columns(indexrelid, true));
 
-	for (i = 0; i < natts; i++)
+	for (i = 0; i < indnkeyatts; i++)
 	{
 		char	   *val;
 
@@ -205,6 +271,43 @@ BuildIndexValueDescription(Relation indexRelation,
 	appendStringInfoChar(&buf, ')');
 
 	return buf.data;
+}
+
+/*
+ * Get the latestRemovedXid from the table entries pointed at by the index
+ * tuples being deleted.
+ */
+TransactionId
+index_compute_xid_horizon_for_tuples(Relation irel,
+									 Relation hrel,
+									 Buffer ibuf,
+									 OffsetNumber *itemnos,
+									 int nitems)
+{
+	ItemPointerData *ttids =
+	(ItemPointerData *) palloc(sizeof(ItemPointerData) * nitems);
+	TransactionId latestRemovedXid = InvalidTransactionId;
+	Page		ipage = BufferGetPage(ibuf);
+	IndexTuple	itup;
+
+	/* identify what the index tuples about to be deleted point to */
+	for (int i = 0; i < nitems; i++)
+	{
+		ItemId		iitemid;
+
+		iitemid = PageGetItemId(ipage, itemnos[i]);
+		itup = (IndexTuple) PageGetItem(ipage, iitemid);
+
+		ItemPointerCopy(&itup->t_tid, &ttids[i]);
+	}
+
+	/* determine the actual xid horizon */
+	latestRemovedXid =
+		table_compute_xid_horizon_for_tuples(hrel, ttids, nitems);
+
+	pfree(ttids);
+
+	return latestRemovedXid;
 }
 
 
@@ -266,6 +369,7 @@ systable_beginscan(Relation heapRelation,
 
 	sysscan->heap_rel = heapRelation;
 	sysscan->irel = irel;
+	sysscan->slot = table_slot_create(heapRelation, NULL);
 
 	if (snapshot == NULL)
 	{
@@ -284,17 +388,12 @@ systable_beginscan(Relation heapRelation,
 	{
 		int			i;
 
-		if (!IsBootstrapProcessingMode())
-		{
-			Insist(RelationGetRelid(heapRelation) == irel->rd_index->indrelid);
-		}
-
 		/* Change attribute numbers to be index column numbers. */
 		for (i = 0; i < nkeys; i++)
 		{
 			int			j;
 
-			for (j = 0; j < irel->rd_index->indnatts; j++)
+			for (j = 0; j < IndexRelationGetNumberOfAttributes(irel); j++)
 			{
 				if (key[i].sk_attno == irel->rd_index->indkey.values[j])
 				{
@@ -302,7 +401,7 @@ systable_beginscan(Relation heapRelation,
 					break;
 				}
 			}
-			if (j == irel->rd_index->indnatts)
+			if (j == IndexRelationGetNumberOfAttributes(irel))
 				elog(ERROR, "column is not in index");
 		}
 
@@ -320,9 +419,9 @@ systable_beginscan(Relation heapRelation,
 		 * disadvantage; and there are no compensating advantages, because
 		 * it's unlikely that such scans will occur in parallel.
 		 */
-		sysscan->scan = heap_beginscan_strat(heapRelation, snapshot,
-											 nkeys, key,
-											 true, false);
+		sysscan->scan = table_beginscan_strat(heapRelation, snapshot,
+											  nkeys, key,
+											  true, false);
 		sysscan->iscan = NULL;
 	}
 
@@ -337,28 +436,46 @@ systable_beginscan(Relation heapRelation,
  * Note that returned tuple is a reference to data in a disk buffer;
  * it must not be modified, and should be presumed inaccessible after
  * next getnext() or endscan() call.
+ *
+ * XXX: It'd probably make sense to offer a slot based interface, at least
+ * optionally.
  */
 HeapTuple
 systable_getnext(SysScanDesc sysscan)
 {
-	HeapTuple	htup;
+	HeapTuple	htup = NULL;
 
 	if (sysscan->irel)
 	{
-		htup = index_getnext(sysscan->iscan, ForwardScanDirection);
+		if (index_getnext_slot(sysscan->iscan, ForwardScanDirection, sysscan->slot))
+		{
+			bool		shouldFree;
 
-		/*
-		 * We currently don't need to support lossy index operators for any
-		 * system catalog scan.  It could be done here, using the scan keys to
-		 * drive the operator calls, if we arranged to save the heap attnums
-		 * during systable_beginscan(); this is practical because we still
-		 * wouldn't need to support indexes on expressions.
-		 */
-		if (htup && sysscan->iscan->xs_recheck)
-			elog(ERROR, "system catalog scans with lossy index conditions are not implemented");
+			htup = ExecFetchSlotHeapTuple(sysscan->slot, false, &shouldFree);
+			Assert(!shouldFree);
+
+			/*
+			 * We currently don't need to support lossy index operators for
+			 * any system catalog scan.  It could be done here, using the scan
+			 * keys to drive the operator calls, if we arranged to save the
+			 * heap attnums during systable_beginscan(); this is practical
+			 * because we still wouldn't need to support indexes on
+			 * expressions.
+			 */
+			if (sysscan->iscan->xs_recheck)
+				elog(ERROR, "system catalog scans with lossy index conditions are not implemented");
+		}
 	}
 	else
-		htup = heap_getnext(sysscan->scan, ForwardScanDirection);
+	{
+		if (table_scan_getnextslot(sysscan->scan, ForwardScanDirection, sysscan->slot))
+		{
+			bool		shouldFree;
+
+			htup = ExecFetchSlotHeapTuple(sysscan->slot, false, &shouldFree);
+			Assert(!shouldFree);
+		}
+	}
 
 	return htup;
 }
@@ -382,37 +499,20 @@ systable_recheck_tuple(SysScanDesc sysscan, HeapTuple tup)
 	Snapshot	freshsnap;
 	bool		result;
 
+	Assert(tup == ExecFetchSlotHeapTuple(sysscan->slot, false, NULL));
+
 	/*
-	 * Trust that LockBuffer() and HeapTupleSatisfiesMVCC() do not themselves
+	 * Trust that table_tuple_satisfies_snapshot() and its subsidiaries
+	 * (commonly LockBuffer() and HeapTupleSatisfiesMVCC()) do not themselves
 	 * acquire snapshots, so we need not register the snapshot.  Those
 	 * facilities are too low-level to have any business scanning tables.
 	 */
 	freshsnap = GetCatalogSnapshot(RelationGetRelid(sysscan->heap_rel));
 
-	if (sysscan->irel)
-	{
-		IndexScanDesc scan = sysscan->iscan;
+	result = table_tuple_satisfies_snapshot(sysscan->heap_rel,
+											sysscan->slot,
+											freshsnap);
 
-		Assert(IsMVCCSnapshot(scan->xs_snapshot));
-		Assert(tup == &scan->xs_ctup);
-		Assert(BufferIsValid(scan->xs_cbuf));
-		/* must hold a buffer lock to call HeapTupleSatisfiesVisibility */
-		LockBuffer(scan->xs_cbuf, BUFFER_LOCK_SHARE);
-		result = HeapTupleSatisfiesVisibility(NULL, tup, freshsnap, scan->xs_cbuf);
-		LockBuffer(scan->xs_cbuf, BUFFER_LOCK_UNLOCK);
-	}
-	else
-	{
-		HeapScanDesc scan = sysscan->scan;
-
-		Assert(IsMVCCSnapshot(scan->rs_snapshot));
-		Assert(tup == &scan->rs_ctup);
-		Assert(BufferIsValid(scan->rs_cbuf));
-		/* must hold a buffer lock to call HeapTupleSatisfiesVisibility */
-		LockBuffer(scan->rs_cbuf, BUFFER_LOCK_SHARE);
-		result = HeapTupleSatisfiesVisibility(NULL, tup, freshsnap, scan->rs_cbuf);
-		LockBuffer(scan->rs_cbuf, BUFFER_LOCK_UNLOCK);
-	}
 	return result;
 }
 
@@ -424,13 +524,19 @@ systable_recheck_tuple(SysScanDesc sysscan, HeapTuple tup)
 void
 systable_endscan(SysScanDesc sysscan)
 {
+	if (sysscan->slot)
+	{
+		ExecDropSingleTupleTableSlot(sysscan->slot);
+		sysscan->slot = NULL;
+	}
+
 	if (sysscan->irel)
 	{
 		index_endscan(sysscan->iscan);
 		index_close(sysscan->irel, AccessShareLock);
 	}
 	else
-		heap_endscan(sysscan->scan);
+		table_endscan(sysscan->scan);
 
 	if (sysscan->snapshot)
 		UnregisterSnapshot(sysscan->snapshot);
@@ -477,6 +583,7 @@ systable_beginscan_ordered(Relation heapRelation,
 
 	sysscan->heap_rel = heapRelation;
 	sysscan->irel = indexRelation;
+	sysscan->slot = table_slot_create(heapRelation, NULL);
 
 	if (snapshot == NULL)
 	{
@@ -496,7 +603,7 @@ systable_beginscan_ordered(Relation heapRelation,
 	{
 		int			j;
 
-		for (j = 0; j < indexRelation->rd_index->indnatts; j++)
+		for (j = 0; j < IndexRelationGetNumberOfAttributes(indexRelation); j++)
 		{
 			if (key[i].sk_attno == indexRelation->rd_index->indkey.values[j])
 			{
@@ -504,7 +611,7 @@ systable_beginscan_ordered(Relation heapRelation,
 				break;
 			}
 		}
-		if (j == indexRelation->rd_index->indnatts)
+		if (j == IndexRelationGetNumberOfAttributes(indexRelation))
 			elog(ERROR, "column is not in index");
 	}
 
@@ -522,10 +629,12 @@ systable_beginscan_ordered(Relation heapRelation,
 HeapTuple
 systable_getnext_ordered(SysScanDesc sysscan, ScanDirection direction)
 {
-	HeapTuple	htup;
+	HeapTuple	htup = NULL;
 
 	Assert(sysscan->irel);
-	htup = index_getnext(sysscan->iscan, direction);
+	if (index_getnext_slot(sysscan->iscan, direction, sysscan->slot))
+		htup = ExecFetchSlotHeapTuple(sysscan->slot, false, NULL);
+
 	/* See notes in systable_getnext */
 	if (htup && sysscan->iscan->xs_recheck)
 		elog(ERROR, "system catalog scans with lossy index conditions are not implemented");
@@ -539,6 +648,12 @@ systable_getnext_ordered(SysScanDesc sysscan, ScanDirection direction)
 void
 systable_endscan_ordered(SysScanDesc sysscan)
 {
+	if (sysscan->slot)
+	{
+		ExecDropSingleTupleTableSlot(sysscan->slot);
+		sysscan->slot = NULL;
+	}
+
 	Assert(sysscan->irel);
 	index_endscan(sysscan->iscan);
 	if (sysscan->snapshot)

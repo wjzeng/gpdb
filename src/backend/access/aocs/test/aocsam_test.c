@@ -11,22 +11,18 @@
 /*
  * aocs_begin_headerscan()
  *
- * Verify that we are setting correct storage attributes (no
- * compression, no checksum) for scanning an existing column in ALTER
- * TABLE ADD COLUMN case.
+ * Verify that we are setting correct storage attributes (no compression) for
+ * scanning an existing column in ALTER TABLE ADD COLUMN case.
  */
-void
+static void
 test__aocs_begin_headerscan(void **state)
 {
 	AOCSHeaderScanDesc desc;
 	RelationData reldata;
-	FormData_pg_appendonly pgappendonly;
-
-	pgappendonly.checksum = true;
-	reldata.rd_appendonly = &pgappendonly;
 	FormData_pg_class pgclass;
 
 	reldata.rd_rel = &pgclass;
+	reldata.rd_id = 12345;
 	StdRdOptions opt;
 
 	opt.blocksize = 8192 * 5;
@@ -37,33 +33,36 @@ test__aocs_begin_headerscan(void **state)
 	strncpy(&pgclass.relname.data[0], "mock_relation", 13);
 	expect_value(RelationGetAttributeOptions, rel, &reldata);
 	will_return(RelationGetAttributeOptions, &opts);
-	expect_any(AppendOnlyStorageRead_Init, storageRead);
-	expect_any(AppendOnlyStorageRead_Init, memoryContext);
-	expect_any(AppendOnlyStorageRead_Init, maxBufferLen);
-	expect_any(AppendOnlyStorageRead_Init, relationName);
-	expect_any(AppendOnlyStorageRead_Init, title);
-	expect_any(AppendOnlyStorageRead_Init, storageAttributes);
+
+	expect_value(GetAppendOnlyEntryAttributes, relid, 12345);
+	expect_any(GetAppendOnlyEntryAttributes, blocksize);
+	expect_any(GetAppendOnlyEntryAttributes, safefswritesize);
+	expect_any(GetAppendOnlyEntryAttributes, compresslevel);
+	expect_any(GetAppendOnlyEntryAttributes, checksum);
+	expect_any(GetAppendOnlyEntryAttributes, compresstype);
+	will_be_called(GetAppendOnlyEntryAttributes);
 
 	/*
-	 * AppendOnlyStorageRead_Init assigns storageRead->storageAttributes.
-	 * will_assign_*() functions mandate a paramter as an argument.  Here we
-	 * want to set selective members of a parameter.  I don't know how this
-	 * can be achieved using cmockery.  This test will be meaningful only when
-	 * we are able to set storageAttributes member of desc.ao_read.
+	 * We used to mock AppendOnlyStorageRead_Init() here, however as the mocked
+	 * one does not initialize desc->ao_read.storageAttributes at all, it makes
+	 * the following assertion flaky.
+	 *
+	 * On the other hand aocs_begin_headerscan() itself does not do many useful
+	 * things, the actual job is done inside AppendOnlyStorageRead_Init(), so
+	 * to make the test more useful we removed the mocking and test against the
+	 * real AppendOnlyStorageRead_Init() now.
 	 */
-	will_be_called(AppendOnlyStorageRead_Init);
 	desc = aocs_begin_headerscan(&reldata, 0);
 	assert_false(desc->ao_read.storageAttributes.compress);
 	assert_int_equal(desc->colno, 0);
 }
 
 
-void
+static void
 test__aocs_addcol_init(void **state)
 {
 	AOCSAddColumnDesc desc;
 	RelationData reldata;
-	FormData_pg_appendonly pgappendonly;
 	int			nattr = 5;
 	StdRdOptions **opts =
 	(StdRdOptions **) malloc(sizeof(StdRdOptions *) * nattr);
@@ -90,22 +89,34 @@ test__aocs_addcol_init(void **state)
 	expect_string(create_datumstreamwrite, compName, "none");
 	expect_value(create_datumstreamwrite, compLevel, 2);
 	expect_value(create_datumstreamwrite, compLevel, 0);
-	expect_value_count(create_datumstreamwrite, checksum, true, 2);
+	expect_any_count(create_datumstreamwrite, checksum, 2);
 	expect_value_count(create_datumstreamwrite, safeFSWriteSize, 0, 2);
 	expect_value(create_datumstreamwrite, maxsz, 8192);
 	expect_value(create_datumstreamwrite, maxsz, 8192 * 2);
+	expect_value(create_datumstreamwrite, needsWAL, true);
+	expect_value(create_datumstreamwrite, needsWAL, true);
 	expect_any_count(create_datumstreamwrite, attr, 2);
 	expect_any_count(create_datumstreamwrite, relname, 2);
 	expect_any_count(create_datumstreamwrite, title, 2);
 	will_return_count(create_datumstreamwrite, NULL, 2);
 
-	pgappendonly.checksum = true;
-	reldata.rd_appendonly = &pgappendonly;
-	reldata.rd_att = (TupleDesc) malloc(sizeof(struct tupleDesc));
-	reldata.rd_att->attrs =
-		(Form_pg_attribute *) malloc(sizeof(Form_pg_attribute *) * nattr);
+	FormData_pg_class rel;
+	rel.relpersistence = RELPERSISTENCE_PERMANENT;
+	reldata.rd_id = 12345;
+	reldata.rd_rel = &rel;
+	reldata.rd_att = (TupleDesc) malloc(sizeof(TupleDescData) +
+										(sizeof(Form_pg_attribute *) * nattr));
 	memset(reldata.rd_att->attrs, 0, sizeof(Form_pg_attribute *) * nattr);
-	reldata.rd_att->natts = 5;
+	reldata.rd_att->natts = nattr;
+
+	expect_value(GetAppendOnlyEntryAttributes, relid, 12345);
+	expect_any(GetAppendOnlyEntryAttributes, blocksize);
+	expect_any(GetAppendOnlyEntryAttributes, safefswritesize);
+	expect_any(GetAppendOnlyEntryAttributes, compresslevel);
+	expect_any(GetAppendOnlyEntryAttributes, checksum);
+	expect_any(GetAppendOnlyEntryAttributes, compresstype);
+	will_be_called(GetAppendOnlyEntryAttributes);
+
 	/* 3 existing columns, 2 new columns */
 	desc = aocs_addcol_init(&reldata, 2);
 	assert_int_equal(desc->num_newcols, 2);

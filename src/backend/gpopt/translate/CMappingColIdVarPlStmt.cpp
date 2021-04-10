@@ -14,20 +14,21 @@
 //
 //---------------------------------------------------------------------------
 
+extern "C" {
 #include "postgres.h"
+
 #include "nodes/primnodes.h"
-
-#include "gpopt/translate/CMappingColIdVarPlStmt.h"
-#include "gpopt/translate/CDXLTranslateContextBaseTable.h"
-
-#include "naucrates/exception.h"
-#include "naucrates/md/CMDIdGPDB.h"
-#include "naucrates/dxl/operators/CDXLScalarIdent.h"
+}
 
 #include "gpos/base.h"
 #include "gpos/common/CAutoP.h"
 
 #include "gpopt/gpdbwrappers.h"
+#include "gpopt/translate/CDXLTranslateContextBaseTable.h"
+#include "gpopt/translate/CMappingColIdVarPlStmt.h"
+#include "naucrates/dxl/operators/CDXLScalarIdent.h"
+#include "naucrates/exception.h"
+#include "naucrates/md/CMDIdGPDB.h"
 
 using namespace gpdxl;
 using namespace gpos;
@@ -41,20 +42,16 @@ using namespace gpmd;
 //		Constructor
 //
 //---------------------------------------------------------------------------
-CMappingColIdVarPlStmt::CMappingColIdVarPlStmt
-	(
-	IMemoryPool *mp,
-	const CDXLTranslateContextBaseTable *base_table_context,
+CMappingColIdVarPlStmt::CMappingColIdVarPlStmt(
+	CMemoryPool *mp, const CDXLTranslateContextBaseTable *base_table_context,
 	CDXLTranslationContextArray *child_contexts,
 	CDXLTranslateContext *output_context,
-	CContextDXLToPlStmt *dxl_to_plstmt_context
-	)
-	:
-	CMappingColIdVar(mp),
-	m_base_table_context(base_table_context),
-	m_child_contexts(child_contexts),
-	m_output_context(output_context),
-	m_dxl_to_plstmt_context(dxl_to_plstmt_context)
+	CContextDXLToPlStmt *dxl_to_plstmt_context)
+	: CMappingColIdVar(mp),
+	  m_base_table_context(base_table_context),
+	  m_child_contexts(child_contexts),
+	  m_output_context(output_context),
+	  m_dxl_to_plstmt_context(dxl_to_plstmt_context)
 {
 }
 
@@ -95,19 +92,17 @@ CMappingColIdVarPlStmt::GetOutputContext()
 //
 //---------------------------------------------------------------------------
 Param *
-CMappingColIdVarPlStmt::ParamFromDXLNodeScId
-	(
-	const CDXLScalarIdent *dxlop
-	)
+CMappingColIdVarPlStmt::ParamFromDXLNodeScId(const CDXLScalarIdent *dxlop)
 {
-	GPOS_ASSERT(NULL != m_output_context);
+	GPOS_ASSERT(nullptr != m_output_context);
 
-	Param *param = NULL;
+	Param *param = nullptr;
 
 	const ULONG colid = dxlop->GetDXLColRef()->Id();
-	const CMappingElementColIdParamId *elem = m_output_context->GetParamIdMappingElement(colid);
+	const CMappingElementColIdParamId *elem =
+		m_output_context->GetParamIdMappingElement(colid);
 
-	if (NULL != elem)
+	if (nullptr != elem)
 	{
 		param = MakeNode(Param);
 		param->paramkind = PARAM_EXEC;
@@ -128,10 +123,7 @@ CMappingColIdVarPlStmt::ParamFromDXLNodeScId
 //
 //---------------------------------------------------------------------------
 Var *
-CMappingColIdVarPlStmt::VarFromDXLNodeScId
-	(
-	const CDXLScalarIdent *dxlop
-	)
+CMappingColIdVarPlStmt::VarFromDXLNodeScId(const CDXLScalarIdent *dxlop)
 {
 	Index varno = 0;
 	AttrNumber attno = 0;
@@ -140,7 +132,7 @@ CMappingColIdVarPlStmt::VarFromDXLNodeScId
 	AttrNumber attno_old = 0;
 
 	const ULONG colid = dxlop->GetDXLColRef()->Id();
-	if (NULL != m_base_table_context)
+	if (nullptr != m_base_table_context)
 	{
 		// scalar id is used in a base table operator node
 		varno = m_base_table_context->GetRelIndex();
@@ -151,19 +143,19 @@ CMappingColIdVarPlStmt::VarFromDXLNodeScId
 	}
 
 	// if lookup has failed in the first step, attempt lookup again using outer and inner contexts
-	if (0 == attno && NULL != m_child_contexts)
+	if (0 == attno && nullptr != m_child_contexts)
 	{
 		GPOS_ASSERT(0 != m_child_contexts->Size());
 
 		const CDXLTranslateContext *left_context = (*m_child_contexts)[0];
 
 		// not a base table
-		GPOS_ASSERT(NULL != left_context);
+		GPOS_ASSERT(nullptr != left_context);
 
 		// lookup column in the left child translation context
 		const TargetEntry *target_entry = left_context->GetTargetEntry(colid);
 
-		if (NULL != target_entry)
+		if (nullptr != target_entry)
 		{
 			// identifier comes from left child
 			varno = OUTER_VAR;
@@ -175,38 +167,40 @@ CMappingColIdVarPlStmt::VarFromDXLNodeScId
 			{
 				// there are no more children. col id not found in this tree
 				// and must be an outer ref
-				return NULL;
+				return nullptr;
 			}
 
 			const CDXLTranslateContext *right_context = (*m_child_contexts)[1];
 
 			// identifier must come from right child
-			GPOS_ASSERT(NULL != right_context);
+			GPOS_ASSERT(nullptr != right_context);
 
 			target_entry = right_context->GetTargetEntry(colid);
 
 			varno = INNER_VAR;
 
 			// check any additional contexts if col is still not found yet
-			for (ULONG ul = 2; NULL == target_entry && ul < num_contexts; ul++)
+			for (ULONG ul = 2; nullptr == target_entry && ul < num_contexts;
+				 ul++)
 			{
 				const CDXLTranslateContext *context = (*m_child_contexts)[ul];
-				GPOS_ASSERT(NULL != context);
+				GPOS_ASSERT(nullptr != context);
 
 				target_entry = context->GetTargetEntry(colid);
-				if (NULL == target_entry)
+				if (nullptr == target_entry)
 				{
 					continue;
 				}
 
-				Var *var = (Var*) target_entry->expr;
+				Var *var = (Var *) target_entry->expr;
 				varno = var->varno;
 			}
 		}
 
-		if (NULL  == target_entry)
+		if (nullptr == target_entry)
 		{
-			GPOS_RAISE(gpdxl::ExmaDXL, gpdxl::ExmiDXL2PlStmtAttributeNotFound, colid);
+			GPOS_RAISE(gpdxl::ExmaDXL, gpdxl::ExmiDXL2PlStmtAttributeNotFound,
+					   colid);
 		}
 
 		attno = target_entry->resno;
@@ -214,7 +208,7 @@ CMappingColIdVarPlStmt::VarFromDXLNodeScId
 		// find the original varno and attno for this column
 		if (IsA(target_entry->expr, Var))
 		{
-			Var *var = (Var*) target_entry->expr;
+			Var *var = (Var *) target_entry->expr;
 			varno_old = var->varnoold;
 			attno_old = var->varoattno;
 		}
@@ -225,14 +219,11 @@ CMappingColIdVarPlStmt::VarFromDXLNodeScId
 		}
 	}
 
-	Var *var = gpdb::MakeVar
-						(
-						varno,
-						attno,
-						CMDIdGPDB::CastMdid(dxlop->MdidType())->Oid(),
-						dxlop->TypeModifier(),
-						0	// varlevelsup
-						);
+	Var *var = gpdb::MakeVar(varno, attno,
+							 CMDIdGPDB::CastMdid(dxlop->MdidType())->Oid(),
+							 dxlop->TypeModifier(),
+							 0	// varlevelsup
+	);
 
 	// set varnoold and varoattno since makeVar does not set them properly
 	var->varnoold = varno_old;

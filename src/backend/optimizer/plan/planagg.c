@@ -18,8 +18,8 @@
  *
  *
  * Portions Copyright (c) 2006-2008, Greenplum inc
- * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -37,26 +37,28 @@
 #include "nodes/nodeFuncs.h"
 #include "optimizer/clauses.h"
 #include "optimizer/cost.h"
+#include "optimizer/optimizer.h"
+#include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
 #include "optimizer/planmain.h"
-#include "optimizer/planner.h"
 #include "optimizer/subselect.h"
 #include "optimizer/tlist.h"
 #include "parser/parsetree.h"
 #include "parser/parse_clause.h"
+#include "rewrite/rewriteManip.h"
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
 
-#include "cdb/cdbllize.h"                   /* pull_up_Flow() */
+#include "cdb/cdbpath.h"
 #include "cdb/cdbsetop.h"
+#include "cdb/cdbutil.h"
+#include "cdb/cdbvars.h"
 
 
 static bool find_minmax_aggs_walker(Node *node, List **context);
 static bool build_minmax_path(PlannerInfo *root, MinMaxAggInfo *mminfo,
-				  Oid eqop, Oid sortop, bool nulls_first);
+							  Oid eqop, Oid sortop, bool nulls_first);
 static void minmax_qp_callback(PlannerInfo *root, void *extra);
-static void make_agg_subplan(PlannerInfo *root, MinMaxAggInfo *mminfo);
-static Node *replace_aggs_with_params_mutator(Node *node, PlannerInfo *root);
 static Oid	fetch_agg_sort_op(Oid aggfnoid);
 
 
@@ -65,20 +67,24 @@ static Oid	fetch_agg_sort_op(Oid aggfnoid);
  *
  * Check to see whether the query contains MIN/MAX aggregate functions that
  * might be optimizable via indexscans.  If it does, and all the aggregates
- * are potentially optimizable, then set up root->minmax_aggs with a list of
- * these aggregates.
+ * are potentially optimizable, then create a MinMaxAggPath and add it to
+ * the (UPPERREL_GROUP_AGG, NULL) upperrel.
  *
- * Note: we are passed the preprocessed targetlist separately, because it's
- * not necessarily equal to root->parse->targetList.
+ * This should be called by grouping_planner() just before it's ready to call
+ * query_planner(), because we generate indexscan paths by cloning the
+ * planner's state and invoking query_planner() on a modified version of
+ * the query parsetree.  Thus, all preprocessing needed before query_planner()
+ * must already be done.
  */
 void
-preprocess_minmax_aggregates(PlannerInfo *root, List *tlist)
+preprocess_minmax_aggregates(PlannerInfo *root)
 {
 	Query	   *parse = root->parse;
 	FromExpr   *jtnode;
 	RangeTblRef *rtr;
 	RangeTblEntry *rte;
 	List	   *aggs_list;
+	RelOptInfo *grouped_rel;
 	ListCell   *lc;
 
 	/* minmax_aggs list should be empty at this point */
@@ -88,26 +94,32 @@ preprocess_minmax_aggregates(PlannerInfo *root, List *tlist)
 	if (!parse->hasAggs)
 		return;
 
-	Assert(!parse->setOperations);		/* shouldn't get here if a setop */
-	Assert(parse->rowMarks == NIL);		/* nor if FOR UPDATE */
+	Assert(!parse->setOperations);	/* shouldn't get here if a setop */
+	Assert(parse->rowMarks == NIL); /* nor if FOR UPDATE */
 
 	/*
 	 * Reject unoptimizable cases.
 	 *
 	 * We don't handle GROUP BY or windowing, because our current
 	 * implementations of grouping require looking at all the rows anyway, and
-	 * so there's not much point in optimizing MIN/MAX.  (Note: relaxing this
-	 * would likely require some restructuring in grouping_planner(), since it
-	 * performs assorted processing related to these features between calling
-	 * preprocess_minmax_aggregates and optimize_minmax_aggregates.)
+	 * so there's not much point in optimizing MIN/MAX.
 	 */
-	if (parse->groupClause || parse->hasWindowFuncs)
+	if (parse->groupClause || list_length(parse->groupingSets) > 1 ||
+		parse->hasWindowFuncs)
 		return;
 
 	/*
 	 * Reject if disabled by caller.
 	 */
 	if (!root->config->gp_enable_minmax_optimization)
+		return;
+
+	/*
+	 * Reject if query contains any CTEs; there's no way to build an indexscan
+	 * on one so we couldn't succeed here.  (If the CTEs are unreferenced,
+	 * that's not true, but it doesn't seem worth expending cycles to check.)
+	 */
+	if (parse->cteList)
 		return;
 
 	/*
@@ -142,18 +154,16 @@ preprocess_minmax_aggregates(PlannerInfo *root, List *tlist)
 	 * all are MIN/MAX aggregates.  Stop as soon as we find one that isn't.
 	 */
 	aggs_list = NIL;
-	if (find_minmax_aggs_walker((Node *) tlist, &aggs_list))
+	if (find_minmax_aggs_walker((Node *) root->processed_tlist, &aggs_list))
 		return;
 	if (find_minmax_aggs_walker(parse->havingQual, &aggs_list))
 		return;
 
 	/*
 	 * OK, there is at least the possibility of performing the optimization.
-	 * Build an access path for each aggregate.  (We must do this now because
-	 * we need to call query_planner with a pristine copy of the current query
-	 * tree; it'll be too late when optimize_minmax_aggregates gets called.)
-	 * If any of the aggregates prove to be non-indexable, give up; there is
-	 * no point in optimizing just some of them.
+	 * Build an access path for each aggregate.  If any of the aggregates
+	 * prove to be non-indexable, give up; there is no point in optimizing
+	 * just some of them.
 	 */
 	foreach(lc, aggs_list)
 	{
@@ -188,111 +198,46 @@ preprocess_minmax_aggregates(PlannerInfo *root, List *tlist)
 	}
 
 	/*
-	 * We're done until path generation is complete.  Save info for later.
-	 * (Setting root->minmax_aggs non-NIL signals we succeeded in making index
-	 * access paths for all the aggregates.)
-	 */
-	root->minmax_aggs = aggs_list;
-}
-
-/*
- * optimize_minmax_aggregates - check for optimizing MIN/MAX via indexes
- *
- * Check to see whether using the aggregate indexscans is cheaper than the
- * generic aggregate method.  If so, generate and return a Plan that does it
- * that way.  Otherwise, return NULL.
- *
- * Note: it seems likely that the generic method will never be cheaper
- * in practice, except maybe for tiny tables where it'd hardly matter.
- * Should we skip even trying to build the standard plan, if
- * preprocess_minmax_aggregates succeeds?
- *
- * We are passed the preprocessed tlist, as well as the estimated costs for
- * doing the aggregates the regular way, and the best path devised for
- * computing the input of a standard Agg node.
- */
-Plan *
-optimize_minmax_aggregates(PlannerInfo *root, List *tlist,
-						   const AggClauseCosts *aggcosts, Path *best_path)
-{
-	Query	   *parse = root->parse;
-	Cost		total_cost;
-	Path		agg_p;
-	Plan	   *plan;
-	Node	   *hqual;
-	ListCell   *lc;
-
-	/* Nothing to do if preprocess_minmax_aggs rejected the query */
-	if (root->minmax_aggs == NIL)
-		return NULL;
-
-	/*
-	 * Now we have enough info to compare costs against the generic aggregate
-	 * implementation.
+	 * OK, we can do the query this way.  Prepare to create a MinMaxAggPath
+	 * node.
 	 *
-	 * Note that we don't include evaluation cost of the tlist here; this is
-	 * OK since it isn't included in best_path's cost either, and should be
-	 * the same in either case.
+	 * First, create an output Param node for each agg.  (If we end up not
+	 * using the MinMaxAggPath, we'll waste a PARAM_EXEC slot for each agg,
+	 * which is not worth worrying about.  We can't wait till create_plan time
+	 * to decide whether to make the Param, unfortunately.)
 	 */
-	total_cost = 0;
-	foreach(lc, root->minmax_aggs)
+	foreach(lc, aggs_list)
 	{
 		MinMaxAggInfo *mminfo = (MinMaxAggInfo *) lfirst(lc);
 
-		total_cost += mminfo->pathcost;
-	}
-
-	cost_agg(&agg_p, root, AGG_PLAIN, aggcosts,
-			 0, 0,
-			 best_path->startup_cost, best_path->total_cost,
-			 best_path->parent->rows, 0.0, 0.0, 0.0, false);
-
-	if (total_cost > agg_p.total_cost)
-		return NULL;			/* too expensive */
-
-	/*
-	 * OK, we are going to generate an optimized plan.
-	 *
-	 * First, generate a subplan and output Param node for each agg.
-	 */
-	foreach(lc, root->minmax_aggs)
-	{
-		MinMaxAggInfo *mminfo = (MinMaxAggInfo *) lfirst(lc);
-
-		make_agg_subplan(root, mminfo);
+		mminfo->param =
+			SS_make_initplan_output_param(root,
+										  exprType((Node *) mminfo->target),
+										  -1,
+										  exprCollation((Node *) mminfo->target));
 	}
 
 	/*
-	 * Modify the targetlist and HAVING qual to reference subquery outputs
-	 */
-	tlist = (List *) replace_aggs_with_params_mutator((Node *) tlist, root);
-	hqual = replace_aggs_with_params_mutator(parse->havingQual, root);
-
-	/*
-	 * We have to replace Aggrefs with Params in equivalence classes too, else
-	 * ORDER BY or DISTINCT on an optimized aggregate will fail.  We don't
-	 * need to process child eclass members though, since they aren't of
-	 * interest anymore --- and replace_aggs_with_params_mutator isn't able to
-	 * handle Aggrefs containing translated child Vars, anyway.
+	 * Create a MinMaxAggPath node with the appropriate estimated costs and
+	 * other needed data, and add it to the UPPERREL_GROUP_AGG upperrel, where
+	 * it will compete against the standard aggregate implementation.  (It
+	 * will likely always win, but we need not assume that here.)
 	 *
-	 * Note: at some point it might become necessary to mutate other data
-	 * structures too, such as the query's sortClause or distinctClause. Right
-	 * now, those won't be examined after this point.
+	 * Note: grouping_planner won't have created this upperrel yet, but it's
+	 * fine for us to create it first.  We will not have inserted the correct
+	 * consider_parallel value in it, but MinMaxAggPath paths are currently
+	 * never parallel-safe anyway, so that doesn't matter.  Likewise, it
+	 * doesn't matter that we haven't filled FDW-related fields in the rel.
+	 * Also, because there are no rowmarks, we know that the processed_tlist
+	 * doesn't need to change anymore, so making the pathtarget now is safe.
 	 */
-	mutate_eclass_expressions(root,
-							  replace_aggs_with_params_mutator,
-							  (void *) root,
-							  false);
-
-	/*
-	 * Generate the output plan --- basically just a Result
-	 */
-	plan = (Plan *) make_result(root, tlist, hqual, NULL);
-
-	/* Account for evaluation cost of the tlist (make_result did the rest) */
-	add_tlist_costs_to_plan(root, plan, tlist);
-
-	return plan;
+	grouped_rel = fetch_upper_rel(root, UPPERREL_GROUP_AGG, NULL);
+	add_path(grouped_rel, (Path *)
+			 create_minmaxagg_path(root, grouped_rel,
+								   create_pathtarget(root,
+													 root->processed_tlist),
+								   aggs_list,
+								   (List *) parse->havingQual));
 }
 
 /*
@@ -301,9 +246,9 @@ optimize_minmax_aggregates(PlannerInfo *root, List *tlist,
  *		that each one is a MIN/MAX aggregate.  If so, build a list of the
  *		distinct aggregate calls in the tree.
  *
- * Returns TRUE if a non-MIN/MAX aggregate is found, FALSE otherwise.
+ * Returns true if a non-MIN/MAX aggregate is found, false otherwise.
  * (This seemingly-backward definition is used because expression_tree_walker
- * aborts the scan on TRUE return, which is what we want.)
+ * aborts the scan on true return, which is what we want.)
  *
  * Found aggregates are added to the list at *context; it's up to the caller
  * to initialize the list to NIL.
@@ -404,8 +349,8 @@ find_minmax_aggs_walker(Node *node, List **context)
  *		Given a MIN/MAX aggregate, try to build an indexscan Path it can be
  *		optimized with.
  *
- * If successful, stash the best path in *mminfo and return TRUE.
- * Otherwise, return FALSE.
+ * If successful, stash the best path in *mminfo and return true.
+ * Otherwise, return false.
  */
 static bool
 build_minmax_path(PlannerInfo *root, MinMaxAggInfo *mminfo,
@@ -414,12 +359,42 @@ build_minmax_path(PlannerInfo *root, MinMaxAggInfo *mminfo,
 	PlannerInfo *subroot;
 	Query	   *parse;
 	TargetEntry *tle;
+	List	   *tlist;
 	NullTest   *ntest;
 	SortGroupClause *sortcl;
 	RelOptInfo *final_rel;
 	Path	   *sorted_path;
 	Cost		path_cost;
 	double		path_fraction;
+
+	/*
+	 * We are going to construct what is effectively a sub-SELECT query, so
+	 * clone the current query level's state and adjust it to make it look
+	 * like a subquery.  Any outer references will now be one level higher
+	 * than before.  (This means that when we are done, there will be no Vars
+	 * of level 1, which is why the subquery can become an initplan.)
+	 */
+	subroot = (PlannerInfo *) palloc(sizeof(PlannerInfo));
+	memcpy(subroot, root, sizeof(PlannerInfo));
+	subroot->query_level++;
+	subroot->parent_root = root;
+	/* reset subplan-related stuff */
+	subroot->plan_params = NIL;
+	subroot->outer_params = NULL;
+	subroot->init_plans = NIL;
+
+	subroot->parse = parse = copyObject(root->parse);
+	IncrementVarSublevelsUp((Node *) parse, 1, 1);
+
+	/* append_rel_list might contain outer Vars? */
+	subroot->append_rel_list = copyObject(root->append_rel_list);
+	IncrementVarSublevelsUp((Node *) subroot->append_rel_list, 1, 1);
+	/* There shouldn't be any OJ info to translate, as yet */
+	Assert(subroot->join_info_list == NIL);
+	/* and we haven't made equivalence classes, either */
+	Assert(subroot->eq_classes == NIL);
+	/* and we haven't created PlaceHolderInfos, either */
+	Assert(subroot->placeholder_list == NIL);
 
 	/*----------
 	 * Generate modified query of the form
@@ -429,23 +404,13 @@ build_minmax_path(PlannerInfo *root, MinMaxAggInfo *mminfo,
 	 *		 LIMIT 1)
 	 *----------
 	 */
-	subroot = (PlannerInfo *) palloc(sizeof(PlannerInfo));
-	memcpy(subroot, root, sizeof(PlannerInfo));
-	subroot->parse = parse = (Query *) copyObject(root->parse);
-	/* make sure subroot planning won't change root->init_plans contents */
-	subroot->init_plans = list_copy(root->init_plans);
-	/* There shouldn't be any OJ or LATERAL info to translate, as yet */
-	Assert(subroot->join_info_list == NIL);
-	Assert(subroot->lateral_info_list == NIL);
-	/* and we haven't created PlaceHolderInfos, either */
-	Assert(subroot->placeholder_list == NIL);
-
 	/* single tlist entry that is the aggregate target */
 	tle = makeTargetEntry(copyObject(mminfo->target),
 						  (AttrNumber) 1,
 						  pstrdup("agg_target"),
 						  false);
-	parse->targetList = list_make1(tle);
+	tlist = list_make1(tle);
+	subroot->processed_tlist = parse->targetList = tlist;
 
 	/* No HAVING, no DISTINCT, no aggregates anymore */
 	parse->havingQual = NULL;
@@ -460,6 +425,7 @@ build_minmax_path(PlannerInfo *root, MinMaxAggInfo *mminfo,
 	ntest->arg = copyObject(mminfo->target);
 	/* we checked it wasn't a rowtype in find_minmax_aggs_walker */
 	ntest->argisrow = false;
+	ntest->location = -1;
 
 	/* User might have had that in WHERE already */
 	if (!list_member((List *) parse->jointree->quals, ntest))
@@ -468,7 +434,7 @@ build_minmax_path(PlannerInfo *root, MinMaxAggInfo *mminfo,
 
 	/* Build suitable ORDER BY clause */
 	sortcl = makeNode(SortGroupClause);
-	sortcl->tleSortGroupRef = assignSortGroupRef(tle, parse->targetList);
+	sortcl->tleSortGroupRef = assignSortGroupRef(tle, subroot->processed_tlist);
 	sortcl->eqop = eqop;
 	sortcl->sortop = sortop;
 	sortcl->nulls_first = nulls_first;
@@ -489,8 +455,16 @@ build_minmax_path(PlannerInfo *root, MinMaxAggInfo *mminfo,
 	subroot->tuple_fraction = 1.0;
 	subroot->limit_tuples = 1.0;
 
-	final_rel = query_planner(subroot, parse->targetList,
-							  minmax_qp_callback, NULL);
+	final_rel = query_planner(subroot, minmax_qp_callback, NULL);
+
+	/*
+	 * Since we didn't go through subquery_planner() to handle the subquery,
+	 * we have to do some of the same cleanup it would do, in particular cope
+	 * with params and initplans used within this subquery.  (This won't
+	 * matter if we end up not using the subplan.)
+	 */
+	SS_identify_outer_params(subroot);
+	SS_charge_for_initplans(subroot, final_rel);
 
 	/*
 	 * Get the best presorted path, that being the one that's cheapest for
@@ -510,6 +484,39 @@ build_minmax_path(PlannerInfo *root, MinMaxAggInfo *mminfo,
 		return false;
 
 	/*
+	 * The path might not return exactly what we want, so fix that.  (We
+	 * assume that this won't change any conclusions about which was the
+	 * cheapest path.)
+	 */
+	sorted_path = apply_projection_to_path(subroot, final_rel, sorted_path,
+										   create_pathtarget(subroot,
+															 subroot->processed_tlist));
+
+	/*
+	 * Need to gather the results to a single node, if it's not already
+	 * like that. Otherwise, we won't get the single min/max row, but
+	 * one min/max row from every segment.
+	 */
+	if (Gp_role == GP_ROLE_DISPATCH && CdbPathLocus_IsPartitioned(sorted_path->locus))
+	{
+		CdbPathLocus singleQE;
+		List	   *pathkeys;
+
+		CdbPathLocus_MakeSingleQE(&singleQE, getgpsegmentCount());
+
+		pathkeys = sorted_path->pathkeys;
+		sorted_path = cdbpath_create_motion_path(root, sorted_path, sorted_path->pathkeys,
+												 false, singleQE);
+		/*
+		 * Sanity check that order was preserved. (Given how cdbpath_create_motion_path() is
+		 * implemented, pointer equality is enough here, but in principle we should be
+		 * using something more sophisticated for the comparison.)
+		 */
+		if (sorted_path->pathkeys != pathkeys)
+			elog(ERROR, "could not create an order-preserving gather motion for min/max path");
+	}
+
+	/*
 	 * Determine cost to get just the first row of the presorted path.
 	 *
 	 * Note: cost calculation here should match
@@ -527,7 +534,7 @@ build_minmax_path(PlannerInfo *root, MinMaxAggInfo *mminfo,
 }
 
 /*
- * Compute query_pathkeys and other pathkeys during plan generation
+ * Compute query_pathkeys and other pathkeys during query_planner()
  */
 static void
 minmax_qp_callback(PlannerInfo *root, void *extra)
@@ -542,99 +549,6 @@ minmax_qp_callback(PlannerInfo *root, void *extra)
 									  root->parse->targetList);
 
 	root->query_pathkeys = root->sort_pathkeys;
-}
-
-/*
- * Construct a suitable plan for a converted aggregate query
- */
-static void
-make_agg_subplan(PlannerInfo *root, MinMaxAggInfo *mminfo)
-{
-	PlannerInfo *subroot = mminfo->subroot;
-	Query	   *subparse = subroot->parse;
-	Plan	   *plan;
-
-	/*
-	 * Generate the plan for the subquery. We already have a Path, but we have
-	 * to convert it to a Plan and attach a LIMIT node above it.
-	 */
-	plan = create_plan(subroot, mminfo->path);
-
-	/*
-	 * If the top-level plan node is one that cannot do expression evaluation
-	 * and its existing target list isn't already what we need, we must insert
-	 * a Result node to project the desired tlist.
-	 */
-	plan = plan_pushdown_tlist(root, plan, copyObject(subparse->targetList));
-
-	if (plan->flow->flotype == FLOW_SINGLETON)
-	{
-		/* ok */
-	}
-	else if (plan->flow->flotype == FLOW_PARTITIONED)
-	{
-		plan = (Plan *) make_motion_gather(subroot, plan, subroot->sort_pathkeys);
-	}
-	else
-		elog(ERROR, "MIN/MAX subplan has unexpected flowtype: %d", plan->flow->type);
-
-	if (!focusPlan(plan, true, false))
-		elog(ERROR, "could not focus MIN/MAX subplan");
-	plan = (Plan *) make_limit(plan,
-							   subparse->limitOffset,
-							   subparse->limitCount,
-							   0, 1);
-
-    /* Decorate the Limit node with a Flow node. */
-    plan->flow = pull_up_Flow(plan, plan->lefttree);
-
-	/*
-	 * Convert the plan into an InitPlan, and make a Param for its result.
-	 */
-	mminfo->param =
-		SS_make_initplan_from_plan(subroot, plan,
-								   exprType((Node *) mminfo->target),
-								   -1,
-								   exprCollation((Node *) mminfo->target));
-
-	/*
-	 * Make sure the initplan gets into the outer PlannerInfo, along with any
-	 * other initplans generated by the sub-planning run.  We had to include
-	 * the outer PlannerInfo's pre-existing initplans into the inner one's
-	 * init_plans list earlier, so make sure we don't put back any duplicate
-	 * entries.
-	 */
-	root->init_plans = list_concat_unique_ptr(root->init_plans,
-											  subroot->init_plans);
-}
-
-/*
- * Replace original aggregate calls with subplan output Params
- */
-static Node *
-replace_aggs_with_params_mutator(Node *node, PlannerInfo *root)
-{
-	if (node == NULL)
-		return NULL;
-	if (IsA(node, Aggref))
-	{
-		Aggref	   *aggref = (Aggref *) node;
-		TargetEntry *curTarget = (TargetEntry *) linitial(aggref->args);
-		ListCell   *lc;
-
-		foreach(lc, root->minmax_aggs)
-		{
-			MinMaxAggInfo *mminfo = (MinMaxAggInfo *) lfirst(lc);
-
-			if (mminfo->aggfnoid == aggref->aggfnoid &&
-				equal(mminfo->target, curTarget->expr))
-				return (Node *) mminfo->param;
-		}
-		elog(ERROR, "failed to re-find MinMaxAggInfo record");
-	}
-	Assert(!IsA(node, SubLink));
-	return expression_tree_mutator(node, replace_aggs_with_params_mutator,
-								   (void *) root);
 }
 
 /*

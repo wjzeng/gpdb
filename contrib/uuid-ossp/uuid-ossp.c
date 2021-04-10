@@ -2,7 +2,7 @@
  *
  * UUID generation functions using the BSD, E2FS or OSSP UUID library
  *
- * Copyright (c) 2007-2014, PostgreSQL Global Development Group
+ * Copyright (c) 2007-2019, PostgreSQL Global Development Group
  *
  * Portions Copyright (c) 2009 Andrew Gierth
  *
@@ -14,8 +14,13 @@
 #include "postgres.h"
 
 #include "fmgr.h"
+#include "port/pg_bswap.h"
 #include "utils/builtins.h"
 #include "utils/uuid.h"
+
+/* for ntohl/htonl */
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
 /*
  * It's possible that there's more than one uuid.h header file present.
@@ -26,14 +31,14 @@
  */
 #define uuid_hash bsd_uuid_hash
 
-#ifdef HAVE_UUID_H
+#if defined(HAVE_UUID_H)
 #include <uuid.h>
-#endif
-#ifdef HAVE_OSSP_UUID_H
+#elif defined(HAVE_OSSP_UUID_H)
 #include <ossp/uuid.h>
-#endif
-#ifdef HAVE_UUID_UUID_H
+#elif defined(HAVE_UUID_UUID_H)
 #include <uuid/uuid.h>
+#else
+#error "please use configure's --with-uuid switch to select a UUID library"
 #endif
 
 #undef uuid_hash
@@ -86,16 +91,16 @@ typedef struct
 
 #define UUID_TO_NETWORK(uu) \
 do { \
-	uu.time_low = htonl(uu.time_low); \
-	uu.time_mid = htons(uu.time_mid); \
-	uu.time_hi_and_version = htons(uu.time_hi_and_version); \
+	uu.time_low = pg_hton32(uu.time_low); \
+	uu.time_mid = pg_hton16(uu.time_mid); \
+	uu.time_hi_and_version = pg_hton16(uu.time_hi_and_version); \
 } while (0)
 
 #define UUID_TO_LOCAL(uu) \
 do { \
-	uu.time_low = ntohl(uu.time_low); \
-	uu.time_mid = ntohs(uu.time_mid); \
-	uu.time_hi_and_version = ntohs(uu.time_hi_and_version); \
+	uu.time_low = pg_ntoh32(uu.time_low); \
+	uu.time_mid = pg_ntoh16(uu.time_mid); \
+	uu.time_hi_and_version = pg_ntoh16(uu.time_hi_and_version); \
 } while (0)
 
 #define UUID_V3_OR_V5(uu, v) \
@@ -106,11 +111,9 @@ do { \
 	uu.clock_seq_hi_and_reserved |= 0x80; \
 } while(0)
 
-#endif   /* !HAVE_UUID_OSSP */
-
+#endif							/* !HAVE_UUID_OSSP */
 
 PG_MODULE_MAGIC;
-
 
 PG_FUNCTION_INFO_V1(uuid_nil);
 PG_FUNCTION_INFO_V1(uuid_ns_dns);
@@ -254,17 +257,17 @@ uuid_generate_v35_internal(int mode, pg_uuid_t *ns, text *name)
 #else							/* !HAVE_UUID_OSSP */
 
 static Datum
-uuid_generate_internal(int v, unsigned char *ns, char *ptr, int len)
+uuid_generate_internal(int v, unsigned char *ns, const char *ptr, int len)
 {
 	char		strbuf[40];
 
 	switch (v)
 	{
-		case 0:			/* constant-value uuids */
+		case 0:					/* constant-value uuids */
 			strlcpy(strbuf, ptr, 37);
 			break;
 
-		case 1:			/* time/node-based uuids */
+		case 1:					/* time/node-based uuids */
 			{
 #ifdef HAVE_UUID_E2FS
 				uuid_t		uu;
@@ -314,8 +317,8 @@ uuid_generate_internal(int v, unsigned char *ns, char *ptr, int len)
 				break;
 			}
 
-		case 3:			/* namespace-based MD5 uuids */
-		case 5:			/* namespace-based SHA1 uuids */
+		case 3:					/* namespace-based MD5 uuids */
+		case 5:					/* namespace-based SHA1 uuids */
 			{
 				dce_uuid_t	uu;
 #ifdef HAVE_UUID_BSD
@@ -371,7 +374,7 @@ uuid_generate_internal(int v, unsigned char *ns, char *ptr, int len)
 				break;
 			}
 
-		case 4:			/* random uuid */
+		case 4:					/* random uuid */
 		default:
 			{
 #ifdef HAVE_UUID_E2FS
@@ -396,7 +399,7 @@ uuid_generate_internal(int v, unsigned char *ns, char *ptr, int len)
 	return DirectFunctionCall1(uuid_in, CStringGetDatum(strbuf));
 }
 
-#endif   /* HAVE_UUID_OSSP */
+#endif							/* HAVE_UUID_OSSP */
 
 
 Datum
@@ -501,13 +504,13 @@ Datum
 uuid_generate_v3(PG_FUNCTION_ARGS)
 {
 	pg_uuid_t  *ns = PG_GETARG_UUID_P(0);
-	text	   *name = PG_GETARG_TEXT_P(1);
+	text	   *name = PG_GETARG_TEXT_PP(1);
 
 #ifdef HAVE_UUID_OSSP
 	return uuid_generate_v35_internal(UUID_MAKE_V3, ns, name);
 #else
 	return uuid_generate_internal(UUID_MAKE_V3, (unsigned char *) ns,
-								  VARDATA(name), VARSIZE(name) - VARHDRSZ);
+								  VARDATA_ANY(name), VARSIZE_ANY_EXHDR(name));
 #endif
 }
 
@@ -523,12 +526,12 @@ Datum
 uuid_generate_v5(PG_FUNCTION_ARGS)
 {
 	pg_uuid_t  *ns = PG_GETARG_UUID_P(0);
-	text	   *name = PG_GETARG_TEXT_P(1);
+	text	   *name = PG_GETARG_TEXT_PP(1);
 
 #ifdef HAVE_UUID_OSSP
 	return uuid_generate_v35_internal(UUID_MAKE_V5, ns, name);
 #else
 	return uuid_generate_internal(UUID_MAKE_V5, (unsigned char *) ns,
-								  VARDATA(name), VARSIZE(name) - VARHDRSZ);
+								  VARDATA_ANY(name), VARSIZE_ANY_EXHDR(name));
 #endif
 }

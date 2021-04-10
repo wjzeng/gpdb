@@ -1,4 +1,4 @@
-#! /usr/bin/env python
+#! /usr/bin/env python3
 import psutil
 import os
 import resource
@@ -15,8 +15,8 @@ class SystemInfo():
 
     def print_mem_usage(self):
         mem = psutil.virtual_memory()
-        print "available: %sMB percent: %s" % (mem.available >> 20, mem.percent)
-        print "process memory usage %s" % (self.process.memory_info().vms >> 20)
+        print("available: %sMB percent: %s" % (mem.available >> 20, mem.percent))
+        print("process memory usage %s" % (self.process.memory_info().vms >> 20))
 
     def debug_log_mem_usage(self):
         mem = psutil.virtual_memory()
@@ -29,7 +29,7 @@ def get_max_available_thread_count():
     # assuming a generous 10K bytes per line of error output,
     # 20 MB allows 2000 errors in a single run; if user has more,
     # we will explain in the manual
-    # the the user can always set batch (number of threads) manually
+    # the user can always set batch (number of threads) manually
     thread_size = 20 * MB + stack_size
 
     mem = psutil.virtual_memory()

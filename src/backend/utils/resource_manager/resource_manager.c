@@ -4,7 +4,7 @@
  *	  GPDB resource manager code.
  *
  * Portions Copyright (c) 2006-2017, Greenplum inc.
- * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
  *
  *
  * IDENTIFICATION
@@ -18,10 +18,13 @@
 #include "cdb/memquota.h"
 #include "executor/spi.h"
 #include "postmaster/fts.h"
+#include "postmaster/postmaster.h"
 #include "replication/walsender.h"
+#include "utils/faultinjector.h"
 #include "utils/guc.h"
 #include "utils/resource_manager.h"
 #include "utils/resgroup-ops.h"
+#include "utils/session_state.h"
 
 /*
  * GUC variables.
@@ -29,35 +32,10 @@
 bool	ResourceScheduler = false;						/* Is scheduling enabled? */
 ResourceManagerPolicy Gp_resource_manager_policy;
 
-static bool resourceGroupActivated = false;
-
-bool
-IsResQueueEnabled(void)
-{
-	return ResourceScheduler &&
-		Gp_resource_manager_policy == RESOURCE_MANAGER_POLICY_QUEUE;
-}
-
 /*
- * Caution: resource group may be enabled but not activated.
+ * Global variables.
  */
-bool
-IsResGroupEnabled(void)
-{
-	return ResourceScheduler &&
-		Gp_resource_manager_policy == RESOURCE_MANAGER_POLICY_GROUP;
-}
-
-/*
- * Resource group do not govern the auxiliary processes and special backends
- * like ftsprobe, filerep process, so we need to check if resource group is
- * actually activated
- */
-bool
-IsResGroupActivated(void)
-{
-	return IsResGroupEnabled() && resourceGroupActivated;
-}
+bool		ResGroupActivated = false;
 
 void
 ResManagerShmemInit(void)
@@ -88,7 +66,8 @@ InitResManager(void)
 	else if  (IsResGroupEnabled() &&
 			 (Gp_role == GP_ROLE_DISPATCH || Gp_role == GP_ROLE_EXECUTE) &&
 			 IsUnderPostmaster &&
-			 !am_walsender && !am_ftshandler)
+			 !amAuxiliaryBgWorker() &&
+			 !am_walsender && !am_ftshandler && !IsFaultHandler)
 	{
 		/*
 		 * InitResManager() is called under PostgresMain(), so resource group is not
@@ -104,7 +83,7 @@ InitResManager(void)
 		InitResGroups();
 		ResGroupOps_AdjustGUCs();
 
-		resourceGroupActivated = true;
+		ResGroupActivated = true;
 	}
 	else
 	{
@@ -118,4 +97,9 @@ InitResManager(void)
 	{
 		SPI_InitMemoryReservation();
 	}
+
+	if (MySessionState &&
+		!IsBackgroundWorker &&
+		(Gp_role == GP_ROLE_DISPATCH || Gp_role == GP_ROLE_EXECUTE))
+		GPMemoryProtect_TrackStartupMemory();
 }

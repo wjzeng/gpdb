@@ -5,8 +5,8 @@
  *
  *
  * Portions Copyright (c) 2006-2009, Greenplum inc
- * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
- * Copyright (c) 2001-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
+ * Copyright (c) 2001-2019, PostgreSQL Global Development Group
  *
  * src/include/executor/instrument.h
  *
@@ -25,15 +25,15 @@ struct CdbExplain_NodeSummary;          /* private def in cdb/cdbexplain.c */
 typedef struct BufferUsage
 {
 	long		shared_blks_hit;	/* # of shared buffer hits */
-	long		shared_blks_read;		/* # of shared disk blocks read */
+	long		shared_blks_read;	/* # of shared disk blocks read */
 	long		shared_blks_dirtied;	/* # of shared blocks dirtied */
 	long		shared_blks_written;	/* # of shared disk blocks written */
 	long		local_blks_hit; /* # of local buffer hits */
 	long		local_blks_read;	/* # of local disk blocks read */
-	long		local_blks_dirtied;		/* # of shared blocks dirtied */
-	long		local_blks_written;		/* # of local disk blocks written */
+	long		local_blks_dirtied; /* # of shared blocks dirtied */
+	long		local_blks_written; /* # of local disk blocks written */
 	long		temp_blks_read; /* # of temp blocks read */
-	long		temp_blks_written;		/* # of temp blocks written */
+	long		temp_blks_written;	/* # of temp blocks written */
 	instr_time	blk_read_time;	/* time spent reading */
 	instr_time	blk_write_time; /* time spent writing */
 } BufferUsage;
@@ -45,18 +45,19 @@ typedef enum InstrumentOption
 	INSTRUMENT_TIMER = 1 << 0,	/* needs timer (and row counts) */
 	INSTRUMENT_BUFFERS = 1 << 1,	/* needs buffer usage (not implemented yet) */
 	INSTRUMENT_ROWS = 1 << 2,	/* needs row count */
+	INSTRUMENT_MEMORY_DETAIL = 0x20000000,	/* needs detailed memory accounting */
 	INSTRUMENT_CDB = 0x40000000,	/* needs cdb statistics */
-	INSTRUMENT_ALL = 0x7FFFFFFF
+	INSTRUMENT_ALL = PG_INT32_MAX
 } InstrumentOption;
 
 typedef struct Instrumentation
 {
 	/* Parameters set at node creation: */
-	bool		need_timer;		/* TRUE if we need timer data */
-	bool		need_cdb;		/* TRUE if we need cdb statistics */
-	bool		need_bufusage;	/* TRUE if we need buffer usage data */
+	bool		need_timer;		/* true if we need timer data */
+	bool		need_cdb;		/* true if we need cdb statistics */
+	bool		need_bufusage;	/* true if we need buffer usage data */
 	/* Info about current plan cycle: */
-	bool		running;		/* TRUE if we've completed first tuple */
+	bool		running;		/* true if we've completed first tuple */
 	instr_time	starttime;		/* Start time of current iteration of node */
 	instr_time	counter;		/* Accumulated runtime for this node */
 	double		firsttuple;		/* Time for first tuple of this cycle */
@@ -66,6 +67,9 @@ typedef struct Instrumentation
 	double		startup;		/* Total startup time (in seconds) */
 	double		total;			/* Total total time (in seconds) */
 	uint64		ntuples;		/* Total tuples produced */
+	// GPDB_12_MERGE_FIXME: we had changed 'ntuples' and 'nloops' to uint64. Do the same
+	// for 'ntuples2', or?
+	double		ntuples2;		/* Secondary node-specific tuple counter */
 	uint64		nloops;			/* # of run cycles for this node */
 	double		nfiltered1;		/* # tuples removed by scanqual or joinqual */
 	double		nfiltered2;		/* # tuples removed by "other" quals */
@@ -84,12 +88,23 @@ typedef struct Instrumentation
 	struct CdbExplain_NodeSummary *cdbNodeSummary;	/* stats from all qExecs */
 } Instrumentation;
 
+typedef struct WorkerInstrumentation
+{
+	int			num_workers;	/* # of structures that follow */
+	Instrumentation instrument[FLEXIBLE_ARRAY_MEMBER];
+} WorkerInstrumentation;
+
 extern PGDLLIMPORT BufferUsage pgBufferUsage;
 
 extern Instrumentation *InstrAlloc(int n, int instrument_options);
+extern void InstrInit(Instrumentation *instr, int instrument_options);
 extern void InstrStartNode(Instrumentation *instr);
 extern void InstrStopNode(Instrumentation *instr, uint64 nTuples);
 extern void InstrEndLoop(Instrumentation *instr);
+extern void InstrAggNode(Instrumentation *dst, Instrumentation *add);
+extern void InstrStartParallelQuery(void);
+extern void InstrEndParallelQuery(BufferUsage *result);
+extern void InstrAccumParallelQuery(BufferUsage *result);
 
 #define GP_INSTRUMENT_OPTS (gp_enable_query_metrics ? INSTRUMENT_ROWS : INSTRUMENT_NONE)
 
@@ -152,4 +167,4 @@ extern Instrumentation *GpInstrAlloc(const Plan *node, int instrument_options);
  */
 #define MAX_SCAN_ON_SHMEM 300
 
-#endif   /* INSTRUMENT_H */
+#endif							/* INSTRUMENT_H */

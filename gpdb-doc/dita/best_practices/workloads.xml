@@ -80,24 +80,28 @@ VM Protect failed to allocate 4096 bytes, 0 MB available</codeblock></p>
         <li>Do not configure the OS to use huge pages. </li>
         <li>
           <b>vm.overcommit_memory</b>
-          <p>This is a Linux kernel parameter, set in <codeph>/etc/sysctl.conf</codeph>. It should
-            always be set to 2. It determines the method the OS uses for determining how much memory
-            can be allocated to processes and 2 is the only safe setting for Greenplum Database.
-          </p>
+          <p>This is a Linux kernel parameter, set in <codeph>/etc/sysctl.conf</codeph> and it
+            should always be set to 2. It determines the method the OS uses for determining how much
+            memory can be allocated to processes and 2 is the only safe setting for Greenplum
+            Database. Please review the sysctl parameters in the <xref
+              href="../install_guide/prep_os.xml#topic3__sysctl_file" scope="peer" format="dita"
+              >Greenplum Database Installation Guide</xref>.</p>
         </li>
         <li>
           <b>vm.overcommit_ratio</b>
-          <p>This is a Linux kernel parameter, set in <codeph>/etc/sysctl.conf</codeph>. It is the
-            percentage of RAM that is used for application processes. The remainder is reserved for
-            the operating system. The default on Red Hat is 50. </p><p>Setting
-              <codeph>vm.overcommit_ratio</codeph> too high may result in not enough memory being
-            reserved for the operating system, which can result in segment host failure or database
-            failure. Setting the value too low reduces the amount of concurrency and query
-            complexity that can be run by reducing the amount of memory available to Greenplum
-            Database. When increasing the setting it is important to remember to always reserve some
-            memory for operating system activities. </p><p>See <xref
-              href="sysconfig.xml#topic_dt3_fkv_r4/segment_mem_config"/> for instructions to
-            calculate a value for <codeph>vm.overcommit_ratio</codeph>.</p></li>
+          <p>This is a Linux kernel parameter, set in <xref
+              href="../install_guide/prep_os.xml#topic3__sysctl_file" format="dita" scope="peer"
+                ><codeph>/etc/sysctl.conf</codeph></xref>. It is the percentage of RAM that is used
+            for application processes. The remainder is reserved for the operating system. The
+            default on Red Hat is 50. </p><p>Setting <codeph>vm.overcommit_ratio</codeph> too high
+            may result in not enough memory being reserved for the operating system, which can
+            result in segment host failure or database failure. Setting the value too low reduces
+            the amount of concurrency and query complexity that can be run by reducing the amount of
+            memory available to Greenplum Database. When increasing the setting it is important to
+            remember to always reserve some memory for operating system activities. </p><p>See <xref
+              href="../admin_guide/wlmgmt_intro.xml" scope="peer" format="dita">Greenplum Database
+              Memory Overview</xref> for instructions to calculate a value for
+              <codeph>vm.overcommit_ratio</codeph>.</p></li>
         <li>
           <b>gp_vmem_protect_limit</b>
           <p>Use <codeph>gp_vmem_protect_limit</codeph> to set the maximum memory that the instance
@@ -117,7 +121,7 @@ VM Protect failed to allocate 4096 bytes, 0 MB available</codeblock></p>
             memory conditions. The <codeph>runaway_detector_activation_percent</codeph> system
             parameter controls the percentage of <codeph>gp_vmem_protect_limit</codeph> memory
             utilized that triggers termination of queries. It is set on by default at 90%. If the
-            percentage of <codeph>gp_vmem_protect_limit memory</codeph> that is utilized for a
+            percentage of <codeph>gp_vmem_protect_limit</codeph> memory that is utilized for a
             segment exceeds the specified value, Greenplum Database terminates queries based on
             memory usage, beginning with the query consuming the largest amount of memory. Queries
             are terminated until the utilized percentage of <codeph> gp_vmem_protect_limit</codeph>
@@ -129,9 +133,9 @@ VM Protect failed to allocate 4096 bytes, 0 MB available</codeblock></p>
             database. If additional memory is required it will spill to disk. Set the optimal value
             for <codeph>statement_mem</codeph> as follows:
             <codeblock>(vmprotect * .9) / max_expected_concurrent_queries</codeblock></p><p>The
-            default value of <codeph>statement_mem</codeph> is 125MB. For example, a query running
-            on a Dell EMC DCA V2 system using the default <codeph>statement_mem</codeph> value will use
-            1GB of memory on each segment server (8 segments ⨉ 125MB). Set
+            default value of <codeph>statement_mem</codeph> is 125MB. For example, on a system that 
+            is configured with 8 segments per host, a query uses 1GB of memory on each segment server 
+            (8 segments ⨉ 125MB) with the default <codeph>statement_mem</codeph> setting. Set
               <codeph>statement_mem</codeph> at the session level for specific queries that require
             additional memory to complete. This setting works well to manage query memory on
             clusters with low concurrency. For clusters with high concurrency also use resource
@@ -147,10 +151,10 @@ VM Protect failed to allocate 4096 bytes, 0 MB available</codeblock></p>
         </li>
         <li>
           <p>
-            <b>gp_workfile_compress_algorithm</b>
+            <b>gp_workfile_compression</b>
           </p>
           <p>If there are numerous spill files then set
-              <codeph>gp_workfile_compress_algorithm</codeph> to compress the spill files.
+              <codeph>gp_workfile_compression</codeph> to compress the spill files.
             Compressing spill files may help to avoid overloading the disk subsystem with IO
             operations. </p>
         </li>

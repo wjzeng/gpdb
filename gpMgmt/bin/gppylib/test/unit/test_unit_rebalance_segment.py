@@ -1,6 +1,6 @@
 from mock import *
 
-from gp_unittest import *
+from .gp_unittest import *
 from gppylib.gparray import GpArray, Segment
 from gppylib.commands.base import CommandResult
 from gppylib.operations.rebalanceSegments import GpSegmentRebalanceOperation
@@ -26,11 +26,11 @@ class RebalanceSegmentsTestCase(GpTestCase):
 
         self.failure_command_mock = Mock()
         self.failure_command_mock.get_results.return_value = CommandResult(
-            1, "stdout failure text", "stderr text", True, False)
+            1, b"stdout failure text", b"stderr text", True, False)
 
         self.success_command_mock = Mock()
         self.success_command_mock.get_results.return_value = CommandResult(
-            0, "stdout success text", "stderr text", True, False)
+            0, b"stdout success text", b"stderr text", True, False)
 
         self.subject = GpSegmentRebalanceOperation(Mock(), self._create_gparray_with_2_primary_2_mirrors())
         self.subject.logger = Mock()
@@ -49,7 +49,7 @@ class RebalanceSegmentsTestCase(GpTestCase):
         self.pool.getCompletedItems.return_value = [self.failure_command_mock]
         self.mock_gp_recover_segment_prog.run.side_effect = SystemExit(1)
 
-        with self.assertRaisesRegexp(Exception, "Error synchronizing."):
+        with self.assertRaisesRegex(Exception, "Error synchronizing."):
             self.subject.rebalance()
 
     def test_rebalance_returns_failure(self):
@@ -59,17 +59,17 @@ class RebalanceSegmentsTestCase(GpTestCase):
         self.assertFalse(result)
 
     def _create_gparray_with_2_primary_2_mirrors(self):
-        master = Segment.initFromString(
-            "1|-1|p|p|s|u|mdw|mdw|5432|/data/master")
+        coordinator = Segment.initFromString(
+            "1|-1|p|p|s|u|cdw|cdw|5432|/data/coordinator")
         self.primary0 = Segment.initFromString(
-            "2|0|p|p|s|u|sdw1|sdw1|40000|/data/primary0")
+            "2|0|p|m|s|u|sdw1|sdw1|40000|/data/primary0")
         primary1 = Segment.initFromString(
             "3|1|p|p|s|u|sdw2|sdw2|40001|/data/primary1")
         self.mirror0 = Segment.initFromString(
-            "4|0|m|m|s|u|sdw2|sdw2|50000|/data/mirror0")
+            "4|0|m|p|s|u|sdw2|sdw2|50000|/data/mirror0")
         mirror1 = Segment.initFromString(
             "5|1|m|m|s|u|sdw1|sdw1|50001|/data/mirror1")
-        return GpArray([master, self.primary0, primary1, self.mirror0, mirror1])
+        return GpArray([coordinator, self.primary0, primary1, self.mirror0, mirror1])
 
 
 if __name__ == '__main__':

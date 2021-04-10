@@ -6770,14 +6770,13 @@ select * from sirv_test12_result1;
 -- ----------------------------------------------------------------------
 --start_ignore
 
-drop language if exists plpythonu cascade;
+drop language if exists plpython3u cascade;
 
 drop table if exists sirv_test13_result1;
 drop table if exists sirv_test13_result2;
 
+CREATE LANGUAGE plpython3u;
 --end_ignore
-
-CREATE LANGUAGE plpythonu;
 
 CREATE or replace FUNCTION sirv_test13_fun1 ()
   RETURNS text
@@ -6803,7 +6802,7 @@ AS $$
   plpy.execute('DROP TABLE test_data2')
   return result3
   
-$$ LANGUAGE plpythonu MODIFIES SQL DATA;
+$$ LANGUAGE plpython3u MODIFIES SQL DATA;
 
 
 
@@ -6831,7 +6830,7 @@ CREATE OR REPLACE FUNCTION sirv_test13_fun2(gnp_diff float8, opt integer)  RETUR
  
   return res[0]["gnp_values"]
 
-$$ LANGUAGE plpythonu MODIFIES SQL DATA;
+$$ LANGUAGE plpython3u MODIFIES SQL DATA;
 
 
 --select list
@@ -6859,13 +6858,12 @@ select * from sirv_test13_result2;
 -- ----------------------------------------------------------------------
 --start_ignore
 
-drop language if exists plpythonu cascade;
+drop language if exists plpython3u cascade;
 
 drop table if exists sirv_test14_result1;
 
+CREATE LANGUAGE plpython3u;
 --end_ignore
-
-CREATE LANGUAGE plpythonu;
 
 CREATE or replace FUNCTION sirv_test14_fun1 ()
   RETURNS text
@@ -6891,7 +6889,7 @@ AS $$
   plpy.execute('DROP TABLE test_data2')
   return result3
   
-$$ LANGUAGE plpythonu MODIFIES SQL DATA;
+$$ LANGUAGE plpython3u MODIFIES SQL DATA;
 
 
 
@@ -6919,7 +6917,7 @@ CREATE OR REPLACE FUNCTION sirv_test14_fun2(gnp_diff float8, opt integer)  RETUR
  
   return res[0]["gnp_values"]
 
-$$ LANGUAGE plpythonu MODIFIES SQL DATA;
+$$ LANGUAGE plpython3u MODIFIES SQL DATA;
 
 
 --select list

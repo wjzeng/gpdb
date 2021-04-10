@@ -33,6 +33,7 @@
  */
 
 #include "postgres.h"
+#include "miscadmin.h"
 
 #include "px-crypt.h"
 #include "px.h"
@@ -602,6 +603,17 @@ _crypt_blowfish_rn(const char *key, const char *setting,
 	if (size < 7 + 22 + 31 + 1)
 		return NULL;
 
+	/*
+	 * Blowfish salt value must be formatted as follows: "$2a$" or "$2x$", a
+	 * two digit cost parameter, "$", and 22 digits from the alphabet
+	 * "./0-9A-Za-z". -- from the PHP crypt docs. Apparently we enforce a few
+	 * more restrictions on the count in the salt as well.
+	 */
+	if (strlen(setting) < 29)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("invalid salt")));
+
 	if (setting[0] != '$' ||
 		setting[1] != '2' ||
 		(setting[2] != 'a' && setting[2] != 'x') ||
@@ -611,14 +623,18 @@ _crypt_blowfish_rn(const char *key, const char *setting,
 		(setting[4] == '3' && setting[5] > '1') ||
 		setting[6] != '$')
 	{
-		return NULL;
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("invalid salt")));
 	}
 
 	count = (BF_word) 1 << ((setting[4] - '0') * 10 + (setting[5] - '0'));
 	if (count < 16 || BF_decode(data.binary.salt, &setting[7], 16))
 	{
 		px_memset(data.binary.salt, 0, sizeof(data.binary.salt));
-		return NULL;
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("invalid salt")));
 	}
 	BF_swap(data.binary.salt, 4);
 
@@ -655,6 +671,8 @@ _crypt_blowfish_rn(const char *key, const char *setting,
 
 	do
 	{
+		CHECK_FOR_INTERRUPTS();
+
 		data.ctx.P[0] ^= data.expanded_key[0];
 		data.ctx.P[1] ^= data.expanded_key[1];
 		data.ctx.P[2] ^= data.expanded_key[2];
@@ -719,7 +737,7 @@ _crypt_blowfish_rn(const char *key, const char *setting,
 
 	memcpy(output, setting, 7 + 22 - 1);
 	output[7 + 22 - 1] = BF_itoa64[(int)
-						 BF_atoi64[(int) setting[7 + 22 - 1] - 0x20] & 0x30];
+								   BF_atoi64[(int) setting[7 + 22 - 1] - 0x20] & 0x30];
 
 /* This has to be bug-compatible with the original implementation, so
  * only encode 23 of the 24 bytes. :-) */

@@ -1,3 +1,22 @@
+/*-------------------------------------------------------------------------
+ *
+ * sparse_vector.c
+ *
+ * Sparse Vector Datatype.  We would like to store sparse arrays in a terse
+ * representation that fits in a small amount of memory.  We also want to be
+ * able to compare the number of instances where the svec of one document
+ * intersects another.
+
+ * Copyright (c) 2010, Greenplum Software
+ * Portions Copyright (c) 2013-Present VMware, Inc. or its affiliates.
+ *
+ *
+ * IDENTIFICATION
+ *	    gpcontrib/gp_sparse_vector/sparse_vector.c
+ *
+ *-------------------------------------------------------------------------
+ */
+
 #include <stdio.h>
 #include <string.h>
 #include <search.h>
@@ -19,16 +38,6 @@
 #include "lib/stringinfo.h"
 #include "utils/memutils.h"
 
-/*
- * Sparse Vector Datatype
- *   We would like to store sparse arrays in a terse representation that fits in a small amount of memory.
- *   We also want to be able to compare the number of instances where the svec of one document intersects
- *   another.
- *
- * License: Use of this code is restricted to those with explicit authorization from Greenplum.
- * 	 All rights to this code are asserted.
- *
- */
 /*
  * Input and Output routines
  */
@@ -217,7 +226,7 @@ svec_in(PG_FUNCTION_ARGS)
 	{
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("Invalid input string for svec")));
+				 errmsg("invalid input string for svec")));
 	} else {
 		*values = '\0';
 		values = values+1;
@@ -226,7 +235,7 @@ svec_in(PG_FUNCTION_ARGS)
 	pgarray_vals = DatumGetArrayTypeP(OidFunctionCall3(F_ARRAY_IN,CStringGetDatum(values),
 				ObjectIdGetDatum(FLOAT8OID),Int32GetDatum(-1)));
 
-	/* Make an empty StringInfo becase we have the data array already */
+	/* Make an empty StringInfo because we have the data array already */
 	vals = (double *)ARR_DATA_PTR(pgarray_vals);
 	num_values = *(ARR_DIMS(pgarray_vals));
 
@@ -238,7 +247,7 @@ svec_in(PG_FUNCTION_ARGS)
 	{
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("Unique value count not equal to run length count")));
+				 errmsg("unique value count not equal to run length count")));
 	}
 
 	index = makeStringInfo();

@@ -4,7 +4,7 @@
  *	 Definitions and API functions for cdbhash.c
  *
  * Portions Copyright (c) 2005-2008, Greenplum inc
- * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
  *
  *
  * IDENTIFICATION
@@ -17,13 +17,8 @@
 
 #include "utils/rel.h"
 
-/*
- * Hash Method
- * if change here, please also change pg_database.h
- */
-#define INVALID_HASH_METHOD      (-1)
-#define MODULO_HASH_METHOD       0
-#define JUMP_HASH_METHOD         1
+/* GUC */
+extern bool gp_use_legacy_hashops;
 
 /*
  * reduction methods.
@@ -44,10 +39,10 @@ typedef struct CdbHash
 	int			numsegs;		/* number of segments in Greenplum Database used for
 								 * partitioning  */
 	CdbHashReduce reducealg;	/* the algorithm used for reducing to buckets		*/
-	uint32		rrindex;		/* round robin index for empty policy tables		*/
+	bool		is_legacy_hash;
 
 	int			natts;
-	Oid			typeoids[FLEXIBLE_ARRAY_MEMBER];
+	FmgrInfo   *hashfuncs;
 } CdbHash;
 
 /*
@@ -67,23 +62,34 @@ extern void cdbhashinit(CdbHash *h);
 extern void cdbhash(CdbHash *h, int attno, Datum datum, bool isnull);
 
 /*
- * Hash a tuple for a relation with an empty (no hash keys) partitioning policy.
- */
-extern void cdbhashnokey(CdbHash *h);
-
-/*
  * Reduce the hash to a segment number.
  */
 extern unsigned int cdbhashreduce(CdbHash *h);
 
 /*
- * Return true if Oid is hashable internally in Greenplum Database.
+ * Return a random segment number, for a randomly distributed policy.
  */
-extern bool isGreenplumDbHashable(Oid typid);
+extern unsigned int cdbhashrandomseg(int numsegs);
 
 /*
- * Return true if the operator Oid is hashable internally in Greenplum Database.
+ * Catalog lookup functions related to distribution keys and hash opclasses.
  */
-extern bool isGreenplumDbOprRedistributable(Oid oprid);
+extern Oid cdb_get_opclass_for_column_def(List *opclass, Oid attrType);
+extern Oid cdb_default_distribution_opfamily_for_type(Oid typid);
+extern Oid cdb_default_distribution_opclass_for_type(Oid typid);
+extern Oid cdb_hashproc_in_opfamily(Oid opfamily, Oid typeoid);
+extern Oid cdb_eqop_in_hash_opfamily(Oid opfamily, Oid typeoid);
+
+/* prototypes and other things, from cdblegacyhash.c */
+
+/* 32 bit FNV-1  non-zero initial basis */
+#define FNV1_32_INIT ((uint32)0x811c9dc5)
+
+extern uint32 magic_hash_stash;
+
+extern bool isLegacyCdbHashFunction(Oid funcid);
+
+extern Oid get_legacy_cdbhash_opclass_for_base_type(Oid typid);
+extern uint32 cdblegacyhash_null(void);
 
 #endif   /* CDBHASH_H */

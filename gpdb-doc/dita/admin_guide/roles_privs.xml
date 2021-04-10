@@ -263,7 +263,7 @@
       </p>
       <p>The role attributes <codeph>LOGIN</codeph>, <codeph>SUPERUSER</codeph>,
           <codeph>CREATEDB</codeph>, <codeph>CREATEROLE</codeph>, <codeph>CREATEEXTTABLE</codeph>,
-          and<codeph>RESOURCE QUEUE</codeph> are never inherited as ordinary privileges on database
+          and <codeph>RESOURCE QUEUE</codeph> are never inherited as ordinary privileges on database
         objects are. User members must actually <codeph>SET ROLE</codeph> to a specific role having
         one of these attributes in order to make use of the attribute. In the above example, we gave
           <codeph>CREATEDB</codeph> and <codeph>CREATEROLE</codeph> to the <codeph>admin</codeph>
@@ -297,9 +297,11 @@
           </thead>
           <tbody>
             <row>
-              <entry colname="col1">Tables, Views, Sequences</entry>
+              <entry colname="col1">Tables, External Tables, Views</entry>
               <entry colname="col2">
+                <p>
                 <codeph>SELECT</codeph>
+                </p>
                 <p>
                   <codeph>INSERT</codeph>
                 </p>
@@ -310,7 +312,13 @@
                   <codeph>DELETE</codeph>
                 </p>
                 <p>
-                  <codeph>RULE</codeph>
+                  <codeph>REFERENCES</codeph>
+                </p>
+                <p>
+                  <codeph>TRIGGER</codeph>
+                </p>
+                <p>
+                  <codeph>TRUNCATE</codeph>
                 </p>
                 <p>
                   <codeph>ALL</codeph>
@@ -318,26 +326,56 @@
               </entry>
             </row>
             <row>
-              <entry colname="col1">External Tables</entry>
+              <entry colname="col1">Columns</entry>
               <entry colname="col2">
-                <codeph>SELECT</codeph>
                 <p>
-                  <codeph>RULE</codeph>
+                  <codeph>SELECT</codeph>
+                </p>
+                <p>
+                  <codeph>INSERT</codeph>
+                </p>
+                <p>
+                  <codeph>UPDATE</codeph>
+                </p>
+                <p>
+                  <codeph>REFERENCES</codeph>
                 </p>
                 <p>
                   <codeph>ALL</codeph>
                 </p>
               </entry>
+            </row>
+            <row>
+                <entry colname="col1">Sequences</entry>
+                <entry colname="col2">
+                  <p>
+                    <codeph>USAGE</codeph>
+                  </p>
+                  <p>
+                    <codeph>SELECT</codeph>
+                  </p>
+                  <p>
+                    <codeph>UPDATE</codeph>
+                  </p>
+                  <p>
+                    <codeph>ALL</codeph>
+                  </p>
+                </entry>
             </row>
             <row>
               <entry colname="col1">Databases</entry>
               <entry colname="col2">
-                <codeph>CONNECT</codeph>
                 <p>
                   <codeph>CREATE</codeph>
                 </p>
                 <p>
-                  <codeph>TEMPORARY | TEMP</codeph>
+                  <codeph>CONNECT</codeph>
+                </p>
+                <p>
+                  <codeph>TEMPORARY</codeph>
+                </p>
+                <p>
+                  <codeph>TEMP</codeph>
                 </p>
                 <p>
                   <codeph>ALL</codeph>
@@ -345,21 +383,19 @@
               </entry>
             </row>
             <row>
-              <entry colname="col1">Functions</entry>
+              <entry colname="col1">Domains</entry>
               <entry colname="col2">
-                <codeph>EXECUTE</codeph>
-              </entry>
-            </row>
-            <row>
-              <entry colname="col1">Procedural Languages</entry>
-              <entry colname="col2">
+                <p>
                 <codeph>USAGE</codeph>
+                </p>
+                <p>
+                <codeph>ALL</codeph>
+                </p>
               </entry>
             </row>
             <row>
-              <entry colname="col1">Schemas</entry>
+              <entry colname="col1">Foreign Data Wrappers</entry>
               <entry colname="col2">
-                <codeph>CREATE</codeph>
                 <p>
                   <codeph>USAGE</codeph>
                 </p>
@@ -369,20 +405,82 @@
               </entry>
             </row>
             <row>
-              <entry colname="col1">Custom Protocol</entry>
+              <entry colname="col1">Foreign Servers</entry>
               <entry colname="col2">
-                <codeph>SELECT</codeph>
+                <p>
+                  <codeph>USAGE</codeph>
+                </p>
+                <p>
+                  <codeph>ALL</codeph>
+                </p>
+              </entry>
+            </row>
+            <row>
+              <entry colname="col1">Functions</entry>
+              <entry colname="col2">
+                <p>
+                <codeph>EXECUTE</codeph>
+                </p>
+                <p>
+                <codeph>ALL</codeph>
+                </p>
+              </entry>
+            </row>
+            <row>
+              <entry colname="col1">Procedural Languages</entry>
+              <entry colname="col2">
+                <p>
+                <codeph>USAGE</codeph>
+                </p>
+                <p>
+                <codeph>ALL</codeph>
+                </p>
+              </entry>
+            </row>
+            <row>
+              <entry colname="col1">Schemas</entry>
+              <entry colname="col2">
+                <p>
+                <codeph>CREATE</codeph>
+                </p>
+                <p>
+                  <codeph>USAGE</codeph>
+                </p>
+                <p>
+                  <codeph>ALL</codeph>
+                </p>
+              </entry>
+            </row>
+            <row>
+              <entry colname="col1">Tablespaces</entry>
+              <entry colname="col2">
+                <p>
+                  <codeph>CREATE</codeph>
+                </p>
+                <p>
+                  <codeph>ALL</codeph>
+                </p>
+              </entry>
+            </row>
+            <row>
+              <entry colname="col1">Types</entry>
+              <entry colname="col2">
+                <p>
+                  <codeph>USAGE</codeph>
+                </p>
+                <p>
+                  <codeph>ALL</codeph>
+                </p>
+              </entry>
+            </row>
+            <row>
+              <entry colname="col1">Protocols</entry>
+              <entry colname="col2">
+                <p>
+                  <codeph>SELECT</codeph>
+                </p>
                 <p>
                   <codeph>INSERT</codeph>
-                </p>
-                <p>
-                  <codeph>UPDATE</codeph>
-                </p>
-                <p>
-                  <codeph>DELETE</codeph>
-                </p>
-                <p>
-                  <codeph>RULE</codeph>
                 </p>
                 <p>
                   <codeph>ALL</codeph>
@@ -392,15 +490,19 @@
           </tbody>
         </tgroup>
       </table>
-      <note type="note">Privileges must be granted for each object individually. For example,
+      <note type="note">You must grant privileges for each object individually. For example,
         granting <codeph>ALL</codeph> on a database does not grant full access to the objects within
         that database. It only grants all of the database-level privileges
         (<codeph>CONNECT</codeph>, <codeph>CREATE</codeph>, <codeph>TEMPORARY</codeph>) to the
         database itself.</note>
       <p>Use the <codeph>GRANT</codeph> SQL command to give a specified role privileges on an
-        object. For example:</p>
+        object. For example, to grant the role named <codeph>jsmith</codeph> insert
+        privileges on the table named <codeph>mytable</codeph>:</p>
       <p>
         <codeblock>=# GRANT INSERT ON mytable TO jsmith;</codeblock>
+        Similarly, to grant <codeph>jsmith</codeph> select privileges only to the column named
+        <codeph>col1</codeph> in the table named <codeph>table2</codeph>:
+        <codeblock>=# GRANT SELECT (col1) on TABLE table2 TO jsmith;</codeblock>
       </p>
       <p>To revoke privileges, use the <codeph>REVOKE</codeph> command. For example:</p>
       <p>
@@ -417,13 +519,13 @@
       </p>
     </body>
     <topic id="topic7" xml:lang="en">
-      <title>Simulating Row and Column Level Access Control</title>
+      <title>Simulating Row Level Access Control</title>
       <body>
-        <p>Row-level or column-level access is not supported, nor is labeled security. Row-level and
-          column-level access can be simulated using views to restrict the columns and/or rows that
-          are selected. Row-level labels can be simulated by adding an extra column to the table to
+        <p>Greenplum Database does not support row-level access or row-level, labeled security. You can
+          simulate row-level access by using views to restrict the rows that
+          are selected. You can simulate row-level labels by adding an extra column to the table to
           store sensitivity information, and then using views to control row-level access based on
-          this column. Roles can then be granted access to the views rather than the base table.
+          this column. You can then grant roles access to the views rather than to the base table.
         </p>
       </body>
     </topic>
@@ -441,12 +543,11 @@
         all the data and passwords move between <codeph>pgcrypto</codeph> and the client application
         in clear-text. For optimal security, consider also using SSL connections between the client
         and the Greenplum master server.</note>
-      <p>To use <codeph>pgcrypto</codeph> functions, run the installation script
-          <codeph>$GPHOME/share/postgresql/contrib/pgcrypto.sql</codeph> in each database where you
-        want the ability to query other
-        databases:<codeblock>$ psql -d testdb -f $GPHOME/share/postgresql/contrib/pgcrypto.sql</codeblock></p>
+      <p>To use <codeph>pgcrypto</codeph> functions, register the <codeph>pgcrypto</codeph>
+        extension in each database in which you want to use the functions. For example:
+        <codeblock>$ psql -d testdb -c "CREATE EXTENSION pgcrypto"</codeblock></p>
       <p>See <xref
-          href="https://www.postgresql.org/docs/8.3/static/pgcrypto.html"
+          href="https://www.postgresql.org/docs/9.4/pgcrypto.html"
           format="html" scope="external">pgcrypto</xref> in the PostgreSQL documentation for more
         information about individual functions.</p>
     </body>
@@ -494,31 +595,6 @@
 $ gpstop -u</codeblock></p>
       <p>To set <codeph>password_encryption</codeph> in a session, use the SQL <codeph>SET</codeph>
         command:<codeblock>=# SET password_encryption = 'on';</codeblock></p>
-      <p>Passwords may be hashed using the SHA-256 hash algorithm instead of the
-        default MD5 hash algorithm. The algorithm produces a 64-byte hexadecimal string prefixed
-        with the characters <codeph>sha256</codeph>.</p>
-      <note>
-        <p>Although SHA-256 uses a stronger cryptographic algorithm and produces a longer hash
-          string, it cannot be used with the MD5 authentication method. To use SHA-256 password
-          hashing the authentication method must be set to <codeph>password</codeph> in the
-            <codeph>pg_hba.conf</codeph> configuration file so that clear text passwords are sent to
-            Greenplum Database. Because clear text passwords are sent over the
-          network, it is very important to use SSL for client connections when you use SHA-256. The
-          default <codeph>md5</codeph> authentication method, on the other hand, hashes the password
-          twice before sending it to Greenplum Database, once on the password and role
-          name and then again with a salt value shared between the client and server, so the clear
-          text password is never sent on the network. </p>
-      </note>
-      <p>To enable SHA-256 hashing, change the <codeph>password_hash_algorithm</codeph>
-        configuration parameter from its default value, <codeph>md5</codeph>, to
-          <codeph>sha-256</codeph>. The parameter can be set either
-        globally or at the session level. To set <codeph>password_hash_algorithm</codeph> globally,
-        execute these commands in a shell as the <codeph>gpadmin</codeph>
-        user:<codeblock>$ gpconfig -c password_hash_algorithm -v 'sha-256'
-$ gpstop -u</codeblock></p>
-      <p>To set <codeph>password_hash_algorithm</codeph> in a session, use the SQL
-          <codeph>SET</codeph>
-        command:<codeblock>=# SET password_hash_algorithm = 'sha-256';</codeblock></p>
     </body>
   </topic>
   <topic id="topic13" xml:lang="en">

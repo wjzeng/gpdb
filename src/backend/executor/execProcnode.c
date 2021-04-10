@@ -8,8 +8,8 @@
  *	 processing.
  *
  * Portions Copyright (c) 2005-2008, Greenplum inc
- * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -19,16 +19,10 @@
  *-------------------------------------------------------------------------
  */
 /*
- *	 INTERFACE ROUTINES
- *		ExecInitNode	-		initialize a plan node and its subplans
- *		ExecProcNode	-		get a tuple by executing the plan node
- *		ExecEndNode		-		shut down a plan node and its subplans
- *		ExecSquelchNode		-	notify subtree that no more tuples are needed
- *
  *	 NOTES
  *		This used to be three files.  It is now all combined into
- *		one file so that it is easier to keep ExecInitNode, ExecProcNode,
- *		and ExecEndNode in sync when new nodes are added.
+ *		one file so that it is easier to keep the dispatch routines
+ *		in sync when new nodes are added.
  *
  *	 EXAMPLE
  *		Suppose we want the age of the manager of the shoe department and
@@ -75,7 +69,7 @@
  *
  *		This should show how the executor works by having
  *		ExecInitNode(), ExecProcNode() and ExecEndNode() dispatch
- *		their work to the appopriate node support routines which may
+ *		their work to the appropriate node support routines which may
  *		in turn call these routines themselves on their subplans.
  */
 #include "postgres.h"
@@ -86,11 +80,13 @@
 #include "executor/nodeBitmapAnd.h"
 #include "executor/nodeBitmapHeapscan.h"
 #include "executor/nodeBitmapIndexscan.h"
-#include "executor/nodeDynamicBitmapIndexscan.h"
 #include "executor/nodeBitmapOr.h"
 #include "executor/nodeCtescan.h"
+#include "executor/nodeCustom.h"
 #include "executor/nodeForeignscan.h"
 #include "executor/nodeFunctionscan.h"
+#include "executor/nodeGather.h"
+#include "executor/nodeGatherMerge.h"
 #include "executor/nodeHash.h"
 #include "executor/nodeHashjoin.h"
 #include "executor/nodeIndexonlyscan.h"
@@ -101,41 +97,39 @@
 #include "executor/nodeMergeAppend.h"
 #include "executor/nodeMergejoin.h"
 #include "executor/nodeModifyTable.h"
+#include "executor/nodeNamedtuplestorescan.h"
 #include "executor/nodeNestloop.h"
+#include "executor/nodeProjectSet.h"
 #include "executor/nodeRecursiveunion.h"
-#include "executor/nodeReshuffle.h"
 #include "executor/nodeResult.h"
+#include "executor/nodeSamplescan.h"
+#include "executor/nodeSeqscan.h"
 #include "executor/nodeSetOp.h"
 #include "executor/nodeSort.h"
 #include "executor/nodeSubplan.h"
 #include "executor/nodeSubqueryscan.h"
+#include "executor/nodeTableFuncscan.h"
 #include "executor/nodeTidscan.h"
+#include "executor/nodeTupleSplit.h"
 #include "executor/nodeUnique.h"
 #include "executor/nodeValuesscan.h"
 #include "executor/nodeWindowAgg.h"
 #include "executor/nodeWorktablescan.h"
+#include "nodes/nodeFuncs.h"
 #include "miscadmin.h"
 
 #include "cdb/cdbvars.h"
 #include "cdb/ml_ipc.h"			/* interconnect context */
 #include "executor/nodeAssertOp.h"
-#include "executor/nodeBitmapAppendOnlyscan.h"
-#include "executor/nodeBitmapTableScan.h"
-#include "executor/nodeDML.h"
-#include "executor/nodeDynamicIndexscan.h"
-#include "executor/nodeDynamicTableScan.h"
-#include "executor/nodeExternalscan.h"
 #include "executor/nodeMotion.h"
 #include "executor/nodePartitionSelector.h"
-#include "executor/nodeRepeat.h"
-#include "executor/nodeRowTrigger.h"
 #include "executor/nodeSequence.h"
 #include "executor/nodeShareInputScan.h"
 #include "executor/nodeSplitUpdate.h"
 #include "executor/nodeTableFunction.h"
-#include "executor/nodeTableScan.h"
 #include "pg_trace.h"
 #include "tcop/tcopprot.h"
+#include "utils/memutils.h"
 #include "utils/metrics_utils.h"
 
  /* flags bits for planstate walker */
@@ -160,81 +154,11 @@ static CdbVisitOpt planstate_walk_kids(PlanState *planstate,
 					void *context,
 					int flags);
 
-/*
- * saveExecutorMemoryAccount saves an operator specific memory account
- * into the PlanState of that operator
- */
-static inline void
-saveExecutorMemoryAccount(PlanState *execState,
-						  MemoryAccountIdType curMemoryAccountId)
-{
-	Assert(curMemoryAccountId != MEMORY_OWNER_TYPE_Undefined);
-	Assert(MEMORY_OWNER_TYPE_Undefined == execState->memoryAccountId);
-	execState->memoryAccountId = curMemoryAccountId;
-}
-
-
-/*
- * CREATE_EXECUTOR_MEMORY_ACCOUNT is a convenience macro to create a new
- * operator specific memory account *if* the operator will be executed in
- * the current slice, i.e., it is not part of some other slice (alien
- * plan node). We assign a shared AlienExecutorMemoryAccount for plan nodes
- * that will not be executed in current slice
- *
- * If the operator is a child of an 'X_NestedExecutor' account, the operator
- * is also assigned to the 'X_NestedExecutor' account, unless the
- * explain_memory_verbosity guc is set to 'debug' or above.
- */
-#define CREATE_EXECUTOR_MEMORY_ACCOUNT(isAlienPlanNode, planNode, NodeType)    \
-	MemoryAccounting_CreateExecutorAccountWithType(                            \
-		(isAlienPlanNode), (planNode), MEMORY_OWNER_TYPE_Exec_##NodeType)
-
-static inline MemoryAccountIdType
-MemoryAccounting_CreateExecutorAccountWithType(bool isAlienPlanNode,
-											   Plan *node,
-											   MemoryOwnerType ownerType)
-{
-	if (isAlienPlanNode)
-		return MEMORY_OWNER_TYPE_Exec_AlienShared;
-	else
-		if (MemoryAccounting_IsUnderNestedExecutor() &&
-			explain_memory_verbosity < EXPLAIN_MEMORY_VERBOSITY_DEBUG)
-			return MemoryAccounting_GetOrCreateNestedExecutorAccount();
-		else
-		{
-			long maxLimit =
-				node->operatorMemKB == 0 ? work_mem : node->operatorMemKB;
-			return MemoryAccounting_CreateAccount(maxLimit, ownerType);
-		}
-}
-
-/*
- * setSubplanSliceId
- *	 Set the slice id info for the given subplan.
- */
-static void
-setSubplanSliceId(SubPlan *subplan, EState *estate)
-{
-	Assert(subplan != NULL && IsA(subplan, SubPlan) &&estate != NULL);
-
-	estate->currentSliceIdInPlan = subplan->qDispSliceId;
-
-	/*
-	 * The slice that the initPlan will be running is the same as the root
-	 * slice. Depending on the location of InitPlan in the plan, the root
-	 * slice is the root slice of the whole plan, or the root slice of the
-	 * parent subplan of this InitPlan.
-	 */
-	if (Gp_role == GP_ROLE_DISPATCH)
-	{
-		estate->currentExecutingSliceId = RootSliceIndex(estate);
-	}
-	else
-	{
-		estate->currentExecutingSliceId = estate->rootSliceId;
-	}
-}
-
+static TupleTableSlot *ExecProcNodeFirst(PlanState *node);
+#if 0
+static TupleTableSlot *ExecProcNodeInstr(PlanState *node);
+#endif
+static TupleTableSlot *ExecProcNodeGPDB(PlanState *node);
 
 
 /* ------------------------------------------------------------------------
@@ -257,6 +181,8 @@ ExecInitNode(Plan *node, EState *estate, int eflags)
 	PlanState  *result;
 	List	   *subps;
 	ListCell   *l;
+	MemoryContext nodecxt = NULL;
+	MemoryContext oldcxt = NULL;
 
 	/*
 	 * do nothing when we get to the end of a leaf on tree.
@@ -264,60 +190,29 @@ ExecInitNode(Plan *node, EState *estate, int eflags)
 	if (node == NULL)
 		return NULL;
 
-	Assert(estate != NULL);
-	int			origSliceIdInPlan = estate->currentSliceIdInPlan;
-	int			origExecutingSliceId = estate->currentExecutingSliceId;
-
-	MemoryAccountIdType curMemoryAccountId;
-
-
-	int localMotionId = LocallyExecutingSliceIndex(estate);
+	/*
+	 * Make sure there's enough stack available. Need to check here, in
+	 * addition to ExecProcNode() (via ExecProcNodeFirst()), to ensure the
+	 * stack isn't overrun while initializing the node tree.
+	 */
+	check_stack_depth();
 
 	/*
-	 * For most plan nodes the ascendant motion is the parent motion
-	 * node. However, subplans are different. They can be executed under
-	 * different slices, although appearing in another slice. Other
-	 * exception includes two stage agg where agg node on the master
-	 * does not have any parent motion. Any time we see such null parent
-	 * motion, we assume they are not alien. They either assume "citizen"
-	 * status under a subplan, or they are the root of the execution on
-	 * the master.
+	 * If per-node memory usage was requested
+	 * (explain_memory_verbosity=detail), create a separate memory context
+	 * for every node, so that we can attribute memory usage to each node.
+	 * Otherwise, everything is allocated in the per-query ExecutorState
+	 * context. The extra memory contexts consume some memory on their
+	 * own, and prevent reusing memory allocated in one node in another
+	 * node, so we only want to do this if the level of detail is needed.
 	 */
-	Motion *parentMotion = (Motion *) node->motionNode;
-	int parentMotionId = parentMotion != NULL ? parentMotion->motionID : UNSET_SLICE_ID;
-
-	/*
-	 * Is current plan node supposed to execute in current slice?
-	 * Special case is sending motion node, which may be at the root
-	 * and therefore parentless. We can sending motions motionId to
-	 * determine its alien status.
-	 *
-	 * On master we don't do alien elimination because of EXPLAIN ANALYZE
-	 * gathering stats from all slices.
-	 */
-	bool isAlienPlanNode = !((localMotionId == parentMotionId) || (parentMotionId == UNSET_SLICE_ID) ||
-							 (nodeTag(node) == T_Motion && ((Motion*)node)->motionID == localMotionId) || IS_QUERY_DISPATCHER());
-
-	/* We cannot have alien nodes if we are eliminating aliens */
-	AssertImply(estate->eliminateAliens, !isAlienPlanNode);
-
-	/*
-	 * As of 03/28/2014, there is no support for BitmapTableScan
-	 * in the planner/optimizer. Therefore, for testing purpose
-	 * we treat Bitmap Heap/AO/AOCO as BitmapTableScan, if the guc
-	 * force_bitmap_table_scan is true.
-	 *
-	 * TODO rahmaf2 04/01/2014: remove all "fake" BitmapTableScan
-	 * once the planner/optimizer is capable of generating BitmapTableScan
-	 * nodes. [JIRA: MPP-23177]
-	 */
-	if (force_bitmap_table_scan)
+	if ((estate->es_instrument & INSTRUMENT_MEMORY_DETAIL) != 0)
 	{
-		if (IsA(node, BitmapHeapScan) ||
-				IsA(node, BitmapAppendOnlyScan))
-		{
-			node->type = T_BitmapTableScan;
-		}
+		nodecxt = AllocSetContextCreate(CurrentMemoryContext,
+										"executor node",
+										ALLOCSET_SMALL_SIZES);
+		MemoryContextDeclareAccountingRoot(nodecxt);
+		oldcxt = MemoryContextSwitchTo(nodecxt);
 	}
 
 	switch (nodeTag(node))
@@ -326,47 +221,28 @@ ExecInitNode(Plan *node, EState *estate, int eflags)
 			 * control nodes
 			 */
 		case T_Result:
-			curMemoryAccountId = CREATE_EXECUTOR_MEMORY_ACCOUNT(isAlienPlanNode, node, Result);
-
-			START_MEMORY_ACCOUNT(curMemoryAccountId);
-			{
 			result = (PlanState *) ExecInitResult((Result *) node,
 												  estate, eflags);
-			}
-			END_MEMORY_ACCOUNT();
+			break;
+
+		case T_ProjectSet:
+			result = (PlanState *) ExecInitProjectSet((ProjectSet *) node,
+													  estate, eflags);
 			break;
 
 		case T_ModifyTable:
-			curMemoryAccountId = CREATE_EXECUTOR_MEMORY_ACCOUNT(isAlienPlanNode, node, ModifyTable);
-
-			START_MEMORY_ACCOUNT(curMemoryAccountId);
-			{
 			result = (PlanState *) ExecInitModifyTable((ModifyTable *) node,
 													   estate, eflags);
-			}
-			END_MEMORY_ACCOUNT();
 			break;
 
 		case T_Append:
-			curMemoryAccountId = CREATE_EXECUTOR_MEMORY_ACCOUNT(isAlienPlanNode, node, Append);
-
-			START_MEMORY_ACCOUNT(curMemoryAccountId);
-			{
 			result = (PlanState *) ExecInitAppend((Append *) node,
 												  estate, eflags);
-			}
-			END_MEMORY_ACCOUNT();
 			break;
 
 		case T_Sequence:
-			curMemoryAccountId = CREATE_EXECUTOR_MEMORY_ACCOUNT(isAlienPlanNode, node, Sequence);
-
-			START_MEMORY_ACCOUNT(curMemoryAccountId);
-			{
 			result = (PlanState *) ExecInitSequence((Sequence *) node,
 													estate, eflags);
-			}
-			END_MEMORY_ACCOUNT();
 			break;
 
 		case T_MergeAppend:
@@ -375,483 +251,212 @@ ExecInitNode(Plan *node, EState *estate, int eflags)
 			break;
 
 		case T_RecursiveUnion:
-			curMemoryAccountId = CREATE_EXECUTOR_MEMORY_ACCOUNT(isAlienPlanNode, node, Sequence);
-
-			START_MEMORY_ACCOUNT(curMemoryAccountId);
-			{
 			result = (PlanState *) ExecInitRecursiveUnion((RecursiveUnion *) node,
 														  estate, eflags);
-			}
-			END_MEMORY_ACCOUNT();
 			break;
 
 		case T_BitmapAnd:
-			curMemoryAccountId = CREATE_EXECUTOR_MEMORY_ACCOUNT(isAlienPlanNode, node, BitmapAnd);
-
-			START_MEMORY_ACCOUNT(curMemoryAccountId);
-			{
-
 			result = (PlanState *) ExecInitBitmapAnd((BitmapAnd *) node,
 													 estate, eflags);
-			}
-			END_MEMORY_ACCOUNT();
 			break;
 
 		case T_BitmapOr:
-			curMemoryAccountId = CREATE_EXECUTOR_MEMORY_ACCOUNT(isAlienPlanNode, node, BitmapOr);
-
-			START_MEMORY_ACCOUNT(curMemoryAccountId);
-			{
 			result = (PlanState *) ExecInitBitmapOr((BitmapOr *) node,
 													estate, eflags);
-			}
-			END_MEMORY_ACCOUNT();
 			break;
 
 			/*
 			 * scan nodes
 			 */
 		case T_SeqScan:
-			/* SeqScan is defunct */
-			curMemoryAccountId = CREATE_EXECUTOR_MEMORY_ACCOUNT(isAlienPlanNode, node, TableScan);
-
-			START_MEMORY_ACCOUNT(curMemoryAccountId);
-			{
-			result = (PlanState *) ExecInitTableScan((TableScan *) node,
+			result = (PlanState *) ExecInitSeqScan((SeqScan *) node,
 													 estate, eflags);
-			}
-			END_MEMORY_ACCOUNT();
 			break;
 
-		case T_DynamicTableScan:
-			curMemoryAccountId = CREATE_EXECUTOR_MEMORY_ACCOUNT(isAlienPlanNode, node, DynamicTableScan);
-
-			START_MEMORY_ACCOUNT(curMemoryAccountId);
-			{
-			result = (PlanState *) ExecInitDynamicTableScan((DynamicTableScan *) node,
-												   estate, eflags);
-			}
-			END_MEMORY_ACCOUNT();
-			break;
-
-		case T_ExternalScan:
-			curMemoryAccountId = CREATE_EXECUTOR_MEMORY_ACCOUNT(isAlienPlanNode, node, ExternalScan);
-
-			START_MEMORY_ACCOUNT(curMemoryAccountId);
-			{
-			result = (PlanState *) ExecInitExternalScan((ExternalScan *) node,
-														estate, eflags);
-			}
-			END_MEMORY_ACCOUNT();
+		case T_SampleScan:
+			result = (PlanState *) ExecInitSampleScan((SampleScan *) node,
+													  estate, eflags);
 			break;
 
 		case T_IndexScan:
-			curMemoryAccountId = CREATE_EXECUTOR_MEMORY_ACCOUNT(isAlienPlanNode, node, IndexScan);
-
-			START_MEMORY_ACCOUNT(curMemoryAccountId);
-			{
 			result = (PlanState *) ExecInitIndexScan((IndexScan *) node,
 													 estate, eflags);
-			}
-			END_MEMORY_ACCOUNT();
-			break;
-
-		case T_DynamicIndexScan:
-			curMemoryAccountId = CREATE_EXECUTOR_MEMORY_ACCOUNT(isAlienPlanNode, node, DynamicIndexScan);
-
-			START_MEMORY_ACCOUNT(curMemoryAccountId);
-			{
-			result = (PlanState *) ExecInitDynamicIndexScan((DynamicIndexScan *) node,
-													estate, eflags);
-			}
-			END_MEMORY_ACCOUNT();
 			break;
 
 		case T_IndexOnlyScan:
-			curMemoryAccountId = CREATE_EXECUTOR_MEMORY_ACCOUNT(isAlienPlanNode, node, IndexOnlyScan);
-
-			START_MEMORY_ACCOUNT(curMemoryAccountId);
-			{
 			result = (PlanState *) ExecInitIndexOnlyScan((IndexOnlyScan *) node,
 														 estate, eflags);
-			}
-			END_MEMORY_ACCOUNT();
 			break;
 
 		case T_BitmapIndexScan:
-			curMemoryAccountId = CREATE_EXECUTOR_MEMORY_ACCOUNT(isAlienPlanNode, node, BitmapIndexScan);
-
-			START_MEMORY_ACCOUNT(curMemoryAccountId);
-			{
-				result = (PlanState *) ExecInitBitmapIndexScan((BitmapIndexScan *) node,
-															   estate, eflags);
-			}
-			END_MEMORY_ACCOUNT();
-			break;
-
-		case T_DynamicBitmapIndexScan:
-			curMemoryAccountId = CREATE_EXECUTOR_MEMORY_ACCOUNT(isAlienPlanNode, node, DynamicBitmapIndexScan);
-
-			START_MEMORY_ACCOUNT(curMemoryAccountId);
-			{
-				result = (PlanState *) ExecInitDynamicBitmapIndexScan((DynamicBitmapIndexScan *) node,
-																	  estate, eflags);
-			}
-			END_MEMORY_ACCOUNT();
+			result = (PlanState *) ExecInitBitmapIndexScan((BitmapIndexScan *) node,
+														   estate, eflags);
 			break;
 
 		case T_BitmapHeapScan:
-			curMemoryAccountId = CREATE_EXECUTOR_MEMORY_ACCOUNT(isAlienPlanNode, node, BitmapHeapScan);
-
-			START_MEMORY_ACCOUNT(curMemoryAccountId);
-			{
 			result = (PlanState *) ExecInitBitmapHeapScan((BitmapHeapScan *) node,
 														  estate, eflags);
-			}
-			END_MEMORY_ACCOUNT();
-			break;
-
-		case T_BitmapAppendOnlyScan:
-			curMemoryAccountId = CREATE_EXECUTOR_MEMORY_ACCOUNT(isAlienPlanNode, node, BitmapAppendOnlyScan);
-
-			START_MEMORY_ACCOUNT(curMemoryAccountId);
-			{
-			result = (PlanState *) ExecInitBitmapAppendOnlyScan((BitmapAppendOnlyScan*) node,
-														        estate, eflags);
-			}
-			END_MEMORY_ACCOUNT();
-			break;
-
-		case T_BitmapTableScan:
-			curMemoryAccountId = CREATE_EXECUTOR_MEMORY_ACCOUNT(isAlienPlanNode, node, BitmapTableScan);
-
-			START_MEMORY_ACCOUNT(curMemoryAccountId);
-			{
-			result = (PlanState *) ExecInitBitmapTableScan((BitmapTableScan*) node,
-														        estate, eflags);
-			}
-			END_MEMORY_ACCOUNT();
 			break;
 
 		case T_TidScan:
-			curMemoryAccountId = CREATE_EXECUTOR_MEMORY_ACCOUNT(isAlienPlanNode, node, TidScan);
-
-			START_MEMORY_ACCOUNT(curMemoryAccountId);
-			{
 			result = (PlanState *) ExecInitTidScan((TidScan *) node,
 												   estate, eflags);
-			}
-			END_MEMORY_ACCOUNT();
 			break;
 
 		case T_SubqueryScan:
-			curMemoryAccountId = CREATE_EXECUTOR_MEMORY_ACCOUNT(isAlienPlanNode, node, SubqueryScan);
-
-			START_MEMORY_ACCOUNT(curMemoryAccountId);
-			{
 			result = (PlanState *) ExecInitSubqueryScan((SubqueryScan *) node,
 														estate, eflags);
-			}
-			END_MEMORY_ACCOUNT();
 			break;
 
 		case T_FunctionScan:
-			curMemoryAccountId = CREATE_EXECUTOR_MEMORY_ACCOUNT(isAlienPlanNode, node, FunctionScan);
-
-			START_MEMORY_ACCOUNT(curMemoryAccountId);
-			{
 			result = (PlanState *) ExecInitFunctionScan((FunctionScan *) node,
 														estate, eflags);
-			}
-			END_MEMORY_ACCOUNT();
 			break;
 
 		case T_TableFunctionScan:
-			curMemoryAccountId = CREATE_EXECUTOR_MEMORY_ACCOUNT(isAlienPlanNode, node, TableFunctionScan);
-
-			START_MEMORY_ACCOUNT(curMemoryAccountId);
-			{
 			result = (PlanState *) ExecInitTableFunction((TableFunctionScan *) node,
 														 estate, eflags);
-			}
-			END_MEMORY_ACCOUNT();
+			break;
+
+		case T_TableFuncScan:
+			result = (PlanState *) ExecInitTableFuncScan((TableFuncScan *) node,
+														 estate, eflags);
 			break;
 
 		case T_ValuesScan:
-			curMemoryAccountId = CREATE_EXECUTOR_MEMORY_ACCOUNT(isAlienPlanNode, node, ValuesScan);
-
-			START_MEMORY_ACCOUNT(curMemoryAccountId);
-			{
 			result = (PlanState *) ExecInitValuesScan((ValuesScan *) node,
 													  estate, eflags);
-			}
-			END_MEMORY_ACCOUNT();
 			break;
 
 		case T_CteScan:
-			curMemoryAccountId = CREATE_EXECUTOR_MEMORY_ACCOUNT(isAlienPlanNode, node, CteScan);
-
-			START_MEMORY_ACCOUNT(curMemoryAccountId);
-			{
 			result = (PlanState *) ExecInitCteScan((CteScan *) node,
 												   estate, eflags);
-			}
-			END_MEMORY_ACCOUNT();
+			break;
+
+		case T_NamedTuplestoreScan:
+			result = (PlanState *) ExecInitNamedTuplestoreScan((NamedTuplestoreScan *) node,
+															   estate, eflags);
 			break;
 
 		case T_WorkTableScan:
-			curMemoryAccountId = CREATE_EXECUTOR_MEMORY_ACCOUNT(isAlienPlanNode, node, WorkTableScan);
-
-			START_MEMORY_ACCOUNT(curMemoryAccountId);
-			{
 			result = (PlanState *) ExecInitWorkTableScan((WorkTableScan *) node,
 														 estate, eflags);
-			}
-			END_MEMORY_ACCOUNT();
 			break;
 
 		case T_ForeignScan:
-			curMemoryAccountId = CREATE_EXECUTOR_MEMORY_ACCOUNT(isAlienPlanNode, node, ForeignScan);
-
-			START_MEMORY_ACCOUNT(curMemoryAccountId);
-			{
 			result = (PlanState *) ExecInitForeignScan((ForeignScan *) node,
 														estate, eflags);
-			}
-			END_MEMORY_ACCOUNT();
+			break;
+
+		case T_CustomScan:
+			result = (PlanState *) ExecInitCustomScan((CustomScan *) node,
+													  estate, eflags);
 			break;
 
 			/*
 			 * join nodes
 			 */
 		case T_NestLoop:
-			curMemoryAccountId = CREATE_EXECUTOR_MEMORY_ACCOUNT(isAlienPlanNode, node, NestLoop);
-
-			START_MEMORY_ACCOUNT(curMemoryAccountId);
-			{
 			result = (PlanState *) ExecInitNestLoop((NestLoop *) node,
 													estate, eflags);
-			}
-			END_MEMORY_ACCOUNT();
 			break;
 
 		case T_MergeJoin:
-			curMemoryAccountId = CREATE_EXECUTOR_MEMORY_ACCOUNT(isAlienPlanNode, node, MergeJoin);
-
-			START_MEMORY_ACCOUNT(curMemoryAccountId);
-			{
 			result = (PlanState *) ExecInitMergeJoin((MergeJoin *) node,
 													 estate, eflags);
-			}
-			END_MEMORY_ACCOUNT();
 			break;
 
 		case T_HashJoin:
-			curMemoryAccountId = CREATE_EXECUTOR_MEMORY_ACCOUNT(isAlienPlanNode, node, HashJoin);
-
-			START_MEMORY_ACCOUNT(curMemoryAccountId);
-			{
 			result = (PlanState *) ExecInitHashJoin((HashJoin *) node,
 													estate, eflags);
-			}
-			END_MEMORY_ACCOUNT();
 			break;
 
 			/*
 			 * share input nodes
 			 */
 		case T_ShareInputScan:
-			curMemoryAccountId = CREATE_EXECUTOR_MEMORY_ACCOUNT(isAlienPlanNode, node, ShareInputScan);
-
-			START_MEMORY_ACCOUNT(curMemoryAccountId);
-			{
 			result = (PlanState *) ExecInitShareInputScan((ShareInputScan *) node, estate, eflags);
-			}
-			END_MEMORY_ACCOUNT();
 			break;
 
 			/*
 			 * materialization nodes
 			 */
 		case T_Material:
-			curMemoryAccountId = CREATE_EXECUTOR_MEMORY_ACCOUNT(isAlienPlanNode, node, Material);
-
-			START_MEMORY_ACCOUNT(curMemoryAccountId);
-			{
 			result = (PlanState *) ExecInitMaterial((Material *) node,
 													estate, eflags);
-			}
-			END_MEMORY_ACCOUNT();
 			break;
 
 		case T_Sort:
-			curMemoryAccountId = CREATE_EXECUTOR_MEMORY_ACCOUNT(isAlienPlanNode, node, Sort);
-
-			START_MEMORY_ACCOUNT(curMemoryAccountId);
-			{
 			result = (PlanState *) ExecInitSort((Sort *) node,
 												estate, eflags);
-			}
-			END_MEMORY_ACCOUNT();
 			break;
 
 		case T_Agg:
-			curMemoryAccountId = CREATE_EXECUTOR_MEMORY_ACCOUNT(isAlienPlanNode, node, Agg);
-
-			START_MEMORY_ACCOUNT(curMemoryAccountId);
-			{
 			result = (PlanState *) ExecInitAgg((Agg *) node,
 												 estate, eflags);
-			}
-			END_MEMORY_ACCOUNT();
+			break;
+
+		case T_TupleSplit:
+			result = (PlanState *) ExecInitTupleSplit((TupleSplit *) node,
+													  estate, eflags);
 			break;
 
 		case T_WindowAgg:
-			curMemoryAccountId = CREATE_EXECUTOR_MEMORY_ACCOUNT(isAlienPlanNode, node, WindowAgg);
-
-			START_MEMORY_ACCOUNT(curMemoryAccountId);
-			{
 			result = (PlanState *) ExecInitWindowAgg((WindowAgg *) node,
 													 estate, eflags);
-			}
-			END_MEMORY_ACCOUNT();
 			break;
 
 		case T_Unique:
-			curMemoryAccountId = CREATE_EXECUTOR_MEMORY_ACCOUNT(isAlienPlanNode, node, Unique);
-
-			START_MEMORY_ACCOUNT(curMemoryAccountId);
-			{
 			result = (PlanState *) ExecInitUnique((Unique *) node,
 												  estate, eflags);
-			}
-			END_MEMORY_ACCOUNT();
+			break;
+
+		case T_Gather:
+			result = (PlanState *) ExecInitGather((Gather *) node,
+												  estate, eflags);
+			break;
+
+		case T_GatherMerge:
+			result = (PlanState *) ExecInitGatherMerge((GatherMerge *) node,
+													   estate, eflags);
 			break;
 
 		case T_Hash:
-			curMemoryAccountId = CREATE_EXECUTOR_MEMORY_ACCOUNT(isAlienPlanNode, node, Hash);
-
-			START_MEMORY_ACCOUNT(curMemoryAccountId);
-			{
 			result = (PlanState *) ExecInitHash((Hash *) node,
 												estate, eflags);
-			}
-			END_MEMORY_ACCOUNT();
 			break;
 
 		case T_SetOp:
-			curMemoryAccountId = CREATE_EXECUTOR_MEMORY_ACCOUNT(isAlienPlanNode, node, SetOp);
-
-			START_MEMORY_ACCOUNT(curMemoryAccountId);
-			{
 			result = (PlanState *) ExecInitSetOp((SetOp *) node,
 												 estate, eflags);
-			}
-			END_MEMORY_ACCOUNT();
 			break;
 
 		case T_LockRows:
-			curMemoryAccountId = CREATE_EXECUTOR_MEMORY_ACCOUNT(isAlienPlanNode, node, LockRows);
-
-			START_MEMORY_ACCOUNT(curMemoryAccountId);
-			{
 			result = (PlanState *) ExecInitLockRows((LockRows *) node,
 													estate, eflags);
-			}
-			END_MEMORY_ACCOUNT();
 			break;
 
 		case T_Limit:
-			curMemoryAccountId = CREATE_EXECUTOR_MEMORY_ACCOUNT(isAlienPlanNode, node, Limit);
-
-			START_MEMORY_ACCOUNT(curMemoryAccountId);
-			{
 			result = (PlanState *) ExecInitLimit((Limit *) node,
 												 estate, eflags);
-			}
-			END_MEMORY_ACCOUNT();
 			break;
 
 		case T_Motion:
-			curMemoryAccountId = CREATE_EXECUTOR_MEMORY_ACCOUNT(isAlienPlanNode, node, Motion);
-
-			START_MEMORY_ACCOUNT(curMemoryAccountId);
-			{
 			result = (PlanState *) ExecInitMotion((Motion *) node,
 												  estate, eflags);
-			}
-			END_MEMORY_ACCOUNT();
 			break;
 
-		case T_Repeat:
-			curMemoryAccountId = CREATE_EXECUTOR_MEMORY_ACCOUNT(isAlienPlanNode, node, Repeat);
-
-			START_MEMORY_ACCOUNT(curMemoryAccountId);
-			{
-			result = (PlanState *) ExecInitRepeat((Repeat *) node,
-												  estate, eflags);
-			}
-			END_MEMORY_ACCOUNT();
-			break;
-		case T_DML:
-			curMemoryAccountId = CREATE_EXECUTOR_MEMORY_ACCOUNT(isAlienPlanNode, node, DML);
-
-			START_MEMORY_ACCOUNT(curMemoryAccountId);
-			{
-			result = (PlanState *) ExecInitDML((DML *) node,
-												  estate, eflags);
-			}
-			END_MEMORY_ACCOUNT();
-			break;
 		case T_SplitUpdate:
-			curMemoryAccountId = CREATE_EXECUTOR_MEMORY_ACCOUNT(isAlienPlanNode, node, SplitUpdate);
-
-			START_MEMORY_ACCOUNT(curMemoryAccountId);
-			{
 			result = (PlanState *) ExecInitSplitUpdate((SplitUpdate *) node,
 												  estate, eflags);
-			}
-			END_MEMORY_ACCOUNT();
 			break;
 		case T_AssertOp:
-			curMemoryAccountId = CREATE_EXECUTOR_MEMORY_ACCOUNT(isAlienPlanNode, node, AssertOp);
-
-			START_MEMORY_ACCOUNT(curMemoryAccountId);
-			{
  			result = (PlanState *) ExecInitAssertOp((AssertOp *) node,
  												  estate, eflags);
-			}
-			END_MEMORY_ACCOUNT();
 			break;
-		case T_RowTrigger:
-			curMemoryAccountId = CREATE_EXECUTOR_MEMORY_ACCOUNT(isAlienPlanNode, node, RowTrigger);
-
-			START_MEMORY_ACCOUNT(curMemoryAccountId);
-			{
- 			result = (PlanState *) ExecInitRowTrigger((RowTrigger *) node,
- 												   estate, eflags);
-			}
-			END_MEMORY_ACCOUNT();
- 			break;
 		case T_PartitionSelector:
-			curMemoryAccountId = CREATE_EXECUTOR_MEMORY_ACCOUNT(isAlienPlanNode, node, PartitionSelector);
-
-			START_MEMORY_ACCOUNT(curMemoryAccountId);
-			{
 			result = (PlanState *) ExecInitPartitionSelector((PartitionSelector *) node,
 															estate, eflags);
-			}
-			END_MEMORY_ACCOUNT();
-			break;
-		case T_Reshuffle:
-			curMemoryAccountId = CREATE_EXECUTOR_MEMORY_ACCOUNT(isAlienPlanNode, node, Reshuffle);
-
-			START_MEMORY_ACCOUNT(curMemoryAccountId);
-			{
-				result = (PlanState *) ExecInitReshuffle((Reshuffle *) node,
-														 estate, eflags);
-			}
-			END_MEMORY_ACCOUNT();
 			break;
 		default:
 			elog(ERROR, "unrecognized node type: %d", (int) nodeTag(node));
@@ -859,8 +464,14 @@ ExecInitNode(Plan *node, EState *estate, int eflags)
 			break;
 	}
 
-	estate->currentSliceIdInPlan = origSliceIdInPlan;
-	estate->currentExecutingSliceId = origExecutingSliceId;
+	ExecSetExecProcNode(result, result->ExecProcNode);
+
+	if ((estate->es_instrument & INSTRUMENT_MEMORY_DETAIL) != 0)
+	{
+		Assert(CurrentMemoryContext == nodecxt);
+		result->node_context = nodecxt;
+		MemoryContextSwitchTo(oldcxt);
+	}
 
 	/*
 	 * Initialize any initPlans present in this node.  The planner put them in
@@ -871,92 +482,89 @@ ExecInitNode(Plan *node, EState *estate, int eflags)
 	{
 		SubPlan    *subplan = (SubPlan *) lfirst(l);
 		SubPlanState *sstate;
+		int			origSliceId = estate->currentSliceId;
 
 		Assert(IsA(subplan, SubPlan));
 
-		setSubplanSliceId(subplan, estate);
+		estate->currentSliceId = estate->es_plannedstmt->subplan_sliceIds[subplan->plan_id - 1];
 
 		sstate = ExecInitSubPlan(subplan, result);
 		subps = lappend(subps, sstate);
+
+		estate->currentSliceId = origSliceId;
 	}
 	if (result != NULL)
 		result->initPlan = subps;
-
-	estate->currentSliceIdInPlan = origSliceIdInPlan;
-	estate->currentExecutingSliceId = origExecutingSliceId;
 
 	/* Set up instrumentation for this node if requested */
 	if (estate->es_instrument && result != NULL)
 		result->instrument = GpInstrAlloc(node, estate->es_instrument);
 
-	/* Also set up gpmon counters */
-	InitPlanNodeGpmonPkt(node, &result->gpmon_pkt, estate);
-
-	if (result != NULL)
-	{
-		saveExecutorMemoryAccount(result, curMemoryAccountId);
-	}
 	return result;
 }
 
-/* ----------------------------------------------------------------
- *		ExecSliceDependencyNode
- *
- *		Exec dependency, block till slice dependency are met
- * ----------------------------------------------------------------
+/*
+ * If a node wants to change its ExecProcNode function after ExecInitNode()
+ * has finished, it should do so with this function.  That way any wrapper
+ * functions can be reinstalled, without the node having to know how that
+ * works.
  */
 void
-ExecSliceDependencyNode(PlanState *node)
+ExecSetExecProcNode(PlanState *node, ExecProcNodeMtd function)
 {
-	CHECK_FOR_INTERRUPTS();
-
-	if (node == NULL)
-		return;
-
-	if (nodeTag(node) == T_ShareInputScanState)
-		ExecSliceDependencyShareInputScan((ShareInputScanState *) node);
-	else if (nodeTag(node) == T_SubqueryScanState)
-	{
-		SubqueryScanState *subq = (SubqueryScanState *) node;
-
-		ExecSliceDependencyNode(subq->subplan);
-	}
-	else if (nodeTag(node) == T_AppendState)
-	{
-		int			i = 0;
-		AppendState *app = (AppendState *) node;
-
-		for (; i < app->as_nplans; ++i)
-			ExecSliceDependencyNode(app->appendplans[i]);
-	}
-	else if (nodeTag(node) == T_SequenceState)
-	{
-		int			i = 0;
-		SequenceState *ss = (SequenceState *) node;
-
-		for (; i < ss->numSubplans; ++i)
-			ExecSliceDependencyNode(ss->subplans[i]);
-	}
-
-	ExecSliceDependencyNode(outerPlanState(node));
-	ExecSliceDependencyNode(innerPlanState(node));
+	/*
+	 * Add a wrapper around the ExecProcNode callback that checks stack depth
+	 * during the first execution and maybe adds an instrumentation wrapper.
+	 * When the callback is changed after execution has already begun that
+	 * means we'll superfluously execute ExecProcNodeFirst, but that seems ok.
+	 */
+	node->ExecProcNodeReal = function;
+	node->ExecProcNode = ExecProcNodeFirst;
 }
 
-/* ----------------------------------------------------------------
- *		ExecProcNode
- *
- *		Execute the given node to return a(nother) tuple.
- * ----------------------------------------------------------------
+
+/*
+ * ExecProcNode wrapper that performs some one-time checks, before calling
+ * the relevant node method (possibly via an instrumentation wrapper).
  */
-TupleTableSlot *
-ExecProcNode(PlanState *node)
+static TupleTableSlot *
+ExecProcNodeFirst(PlanState *node)
 {
-	TupleTableSlot *result = NULL;
+	/*
+	 * Perform stack depth check during the first execution of the node.  We
+	 * only do so the first time round because it turns out to not be cheap on
+	 * some common architectures (eg. x86).  This relies on the assumption
+	 * that ExecProcNode calls for a given plan node will always be made at
+	 * roughly the same stack depth.
+	 */
+	check_stack_depth();
 
-	START_MEMORY_ACCOUNT(node->memoryAccountId);
-	{
+	/*
+	 * If instrumentation is required, change the wrapper to one that just
+	 * does instrumentation.  Otherwise we can dispense with all wrappers and
+	 * have ExecProcNode() directly call the relevant function from now on.
+	 *
+	 * GPDB: Unfortunately, GPDB has a bunch of extra stuff that we need
+	 * to do on every node, so we cannot make use of this upstream optimization.
+	 * ExecProcNodeGPDB() is a wrapper that does all the Greenplum-specific
+	 * extra stuff.
+	 */
+#if 0
+	if (node->instrument)
+		node->ExecProcNode = ExecProcNodeInstr;
+	else
+		node->ExecProcNode = node->ExecProcNodeReal;
+#endif
+	node->ExecProcNode = ExecProcNodeGPDB;
 
-	CHECK_FOR_INTERRUPTS();
+	return node->ExecProcNode(node);
+}
+
+static TupleTableSlot *
+ExecProcNodeGPDB(PlanState *node)
+{
+	TupleTableSlot *result;
+	MemoryContext oldcxt = NULL;
 
 	/*
 	 * Even if we are requested to finish query, Motion has to do its work
@@ -970,16 +578,11 @@ ExecProcNode(PlanState *node)
 	if (node->plan)
 		TRACE_POSTGRESQL_EXECPROCNODE_ENTER(GpIdentity.segindex, currentSliceId, nodeTag(node), node->plan->plan_node_id);
 
-	if (node->chgParam != NULL) /* something changed */
-		ExecReScan(node);		/* let ReScan handle this */
+	if (node->squelched)
+		elog(ERROR, "cannot execute squelched plan node of type: %d",
+			 (int) nodeTag(node));
 
-	if (node->instrument)
-		InstrStartNode(node->instrument);
-
-	if(!node->fHadSentGpmon)
-		CheckSendPlanStateGpmonPkt(node);
-
-	if(!node->fHadSentNodeStart)
+	if (!node->fHadSentNodeStart)
 	{
 		/* GPDB hook for collecting query info */
 		if (query_info_collect_hook)
@@ -987,249 +590,49 @@ ExecProcNode(PlanState *node)
 		node->fHadSentNodeStart = true;
 	}
 
-	switch (nodeTag(node))
+	if (node->instrument)
+		InstrStartNode(node->instrument);
+
+	if ((node->state->es_instrument & INSTRUMENT_MEMORY_DETAIL) != 0)
+		oldcxt = MemoryContextSwitchTo(node->node_context);
+
+	result = node->ExecProcNodeReal(node);
+
+	if ((node->state->es_instrument & INSTRUMENT_MEMORY_DETAIL) != 0)
 	{
-			/*
-			 * control nodes
-			 */
-		case T_ResultState:
-			result = ExecResult((ResultState *) node);
-			break;
-
-		case T_ModifyTableState:
-			result = ExecModifyTable((ModifyTableState *) node);
-			break;
-
-		case T_AppendState:
-			result = ExecAppend((AppendState *) node);
-			break;
-
-		case T_MergeAppendState:
-			result = ExecMergeAppend((MergeAppendState *) node);
-			break;
-
-		case T_RecursiveUnionState:
-			result = ExecRecursiveUnion((RecursiveUnionState *) node);
-			break;
-
-		case T_SequenceState:
-			result = ExecSequence((SequenceState *) node);
-			break;
-
-			/* BitmapAndState does not yield tuples */
-
-			/* BitmapOrState does not yield tuples */
-
-			/*
-			 * scan nodes
-			 */
-		case T_TableScanState:
-			result = ExecTableScan((TableScanState *)node);
-			break;
-
-		case T_DynamicTableScanState:
-			result = ExecDynamicTableScan((DynamicTableScanState *) node);
-			break;
-
-		case T_ExternalScanState:
-			result = ExecExternalScan((ExternalScanState *) node);
-			break;
-
-		case T_IndexScanState:
-			result = ExecIndexScan((IndexScanState *) node);
-			break;
-
-		case T_DynamicIndexScanState:
-			result = ExecDynamicIndexScan((DynamicIndexScanState *) node);
-			break;
-
-		case T_IndexOnlyScanState:
-			result = ExecIndexOnlyScan((IndexOnlyScanState *) node);
-			break;
-
-			/* BitmapIndexScanState does not yield tuples */
-
-		case T_BitmapHeapScanState:
-			result = ExecBitmapHeapScan((BitmapHeapScanState *) node);
-			break;
-
-		case T_BitmapAppendOnlyScanState:
-			result = ExecBitmapAppendOnlyScan((BitmapAppendOnlyScanState *) node);
-			break;
-
-		case T_BitmapTableScanState:
-			result = ExecBitmapTableScan((BitmapTableScanState *) node);
-			break;
-
-		case T_TidScanState:
-			result = ExecTidScan((TidScanState *) node);
-			break;
-
-		case T_SubqueryScanState:
-			result = ExecSubqueryScan((SubqueryScanState *) node);
-			break;
-
-		case T_FunctionScanState:
-			result = ExecFunctionScan((FunctionScanState *) node);
-			break;
-
-		case T_TableFunctionState:
-			result = ExecTableFunction((TableFunctionState *) node);
-			break;
-
-		case T_ValuesScanState:
-			result = ExecValuesScan((ValuesScanState *) node);
-			break;
-
-		case T_CteScanState:
-			result = ExecCteScan((CteScanState *) node);
-			break;
-
-		case T_WorkTableScanState:
-			result = ExecWorkTableScan((WorkTableScanState *) node);
-			break;
-
-		case T_ForeignScanState:
-			result = ExecForeignScan((ForeignScanState *) node);
-			break;
-
-			/*
-			 * join nodes
-			 */
-		case T_NestLoopState:
-			result = ExecNestLoop((NestLoopState *) node);
-			break;
-
-		case T_MergeJoinState:
-			result = ExecMergeJoin((MergeJoinState *) node);
-			break;
-
-		case T_HashJoinState:
-			result = ExecHashJoin((HashJoinState *) node);
-			break;
-
-			/*
-			 * materialization nodes
-			 */
-		case T_MaterialState:
-			result = ExecMaterial((MaterialState *) node);
-			break;
-
-		case T_SortState:
-			result = ExecSort((SortState *) node);
-			break;
-
-		case T_AggState:
-			result = ExecAgg((AggState *) node);
-			break;
-
-		case T_UniqueState:
-			result = ExecUnique((UniqueState *) node);
-			break;
-
-		case T_HashState:
-			result = ExecHash((HashState *) node);
-			break;
-
-		case T_SetOpState:
-			result = ExecSetOp((SetOpState *) node);
-			break;
-
-		case T_LockRowsState:
-			result = ExecLockRows((LockRowsState *) node);
-			break;
-
-		case T_LimitState:
-			result = ExecLimit((LimitState *) node);
-			break;
-
-		case T_MotionState:
-			result = ExecMotion((MotionState *) node);
-			break;
-
-		case T_ShareInputScanState:
-			result = ExecShareInputScan((ShareInputScanState *) node);
-			break;
-
-		case T_WindowAggState:
-			result = ExecWindowAgg((WindowAggState *) node);
-			break;
-
-		case T_RepeatState:
-			result = ExecRepeat((RepeatState *) node);
-			break;
-
-		case T_DMLState:
-			result = ExecDML((DMLState *) node);
-			break;
-
-		case T_SplitUpdateState:
-			result = ExecSplitUpdate((SplitUpdateState *) node);
-			break;
-
-		case T_RowTriggerState:
-			result = ExecRowTrigger((RowTriggerState *) node);
-			break;
-
-		case T_AssertOpState:
-			result = ExecAssertOp((AssertOpState *) node);
-			break;
-
-		case T_PartitionSelectorState:
-			result = ExecPartitionSelector((PartitionSelectorState *) node);
-			break;
-
-		case T_ReshuffleState:
-			result = ExecReshuffle((ReshuffleState *) node);
-			break;
-
-		default:
-			elog(ERROR, "unrecognized node type: %d", (int) nodeTag(node));
-			result = NULL;
-			break;
-	}
-
-	if (!TupIsNull(result))
-	{
-		Gpmon_Incr_Rows_Out(&node->gpmon_pkt);
-		CheckSendPlanStateGpmonPkt(node);
+		Assert(CurrentMemoryContext == node->node_context);
+		MemoryContextSwitchTo(oldcxt);
 	}
 
 	if (node->instrument)
-		InstrStopNode(node->instrument, TupIsNull(result) ? 0 : 1);
+		InstrStopNode(node->instrument, TupIsNull(result) ? 0.0 : 1.0);
 
 	if (node->plan)
 		TRACE_POSTGRESQL_EXECPROCNODE_EXIT(GpIdentity.segindex, currentSliceId, nodeTag(node), node->plan->plan_node_id);
 
-	/*
-	 * Eager free and squelch the subplans, unless it's a nested subplan.
-	 * In that case we cannot free or squelch, because it will be re-executed.
-	 */
-	if (TupIsNull(result))
-	{
-		ListCell *subp;
-		foreach(subp, node->subPlan)
-		{
-			SubPlanState *subplanState = (SubPlanState *)lfirst(subp);
-			Assert(subplanState != NULL &&
-				   subplanState->planstate != NULL);
-
-			bool subplanAtTopNestLevel = (node->state->currentSubplanLevel == 0);
-
-			if (subplanAtTopNestLevel)
-			{
-				ExecSquelchNode(subplanState->planstate);
-				ExecEagerFreeChildNodes(subplanState->planstate, subplanAtTopNestLevel);
-				ExecEagerFree(subplanState->planstate);
-			}
-		}
-	}
-
-	}
-	END_MEMORY_ACCOUNT();
 	return result;
 }
 
+/*
+ * ExecProcNode wrapper that performs instrumentation calls.  By keeping
+ * this a separate function, we avoid overhead in the normal case where
+ * no instrumentation is wanted.
+ */
+#if 0
+static TupleTableSlot *
+ExecProcNodeInstr(PlanState *node)
+{
+	TupleTableSlot *result;
+
+	InstrStartNode(node->instrument);
+
+	result = node->ExecProcNodeReal(node);
+
+	InstrStopNode(node->instrument, TupIsNull(result) ? 0.0 : 1.0);
+
+	return result;
+}
+#endif
 
 /* ----------------------------------------------------------------
  *		MultiExecProcNode
@@ -1249,13 +652,21 @@ MultiExecProcNode(PlanState *node)
 {
 	Node	   *result;
 
+	check_stack_depth();
+
 	CHECK_FOR_INTERRUPTS();
 
 	Assert(NULL != node->plan);
 
-	START_MEMORY_ACCOUNT(node->memoryAccountId);
-{
 	TRACE_POSTGRESQL_EXECPROCNODE_ENTER(GpIdentity.segindex, currentSliceId, nodeTag(node), node->plan->plan_node_id);
+	
+	if (!node->fHadSentNodeStart)
+	{
+		/* GPDB hook for collecting query info */
+		if (query_info_collect_hook)
+			(*query_info_collect_hook)(METRICS_PLAN_NODE_EXECUTING, node);
+		node->fHadSentNodeStart = true;
+	}
 
 	if (node->chgParam != NULL) /* something changed */
 		ExecReScan(node);		/* let ReScan handle this */
@@ -1274,10 +685,6 @@ MultiExecProcNode(PlanState *node)
 			result = MultiExecBitmapIndexScan((BitmapIndexScanState *) node);
 			break;
 
-		case T_DynamicBitmapIndexScanState:
-			result = MultiExecDynamicBitmapIndexScan((DynamicBitmapIndexScanState *) node);
-			break;
-
 		case T_BitmapAndState:
 			result = MultiExecBitmapAnd((BitmapAndState *) node);
 			break;
@@ -1293,114 +700,9 @@ MultiExecProcNode(PlanState *node)
 	}
 
 	TRACE_POSTGRESQL_EXECPROCNODE_EXIT(GpIdentity.segindex, currentSliceId, nodeTag(node), node->plan->plan_node_id);
-}
-	END_MEMORY_ACCOUNT();
+
 	return result;
 }
-
-/* ----------------------------------------------------------------
- *		ExecSquelchNode
- *
- *		When a node decides that it will not consume any more
- *		input tuples from a subtree that has not yet returned
- *		end-of-data, it must call ExecSquelchNode() on the subtree.
- * ----------------------------------------------------------------
- */
-
-static CdbVisitOpt
-squelchNodeWalker(PlanState *node,
-				  void *context)
-{
-	if (IsA(node, ShareInputScanState))
-	{
-		ShareInputScanState* sisc_state = (ShareInputScanState *)node;
-		ShareType share_type = ((ShareInputScan *)sisc_state->ss.ps.plan)->share_type;
-		bool isWriter = outerPlanState(sisc_state) != NULL;
-		bool tuplestoreInitialized = sisc_state->ts_state != NULL;
-
-		/*
-		 * If there is a SharedInputScan that is shared within the same slice
-		 * then its subtree may still need to be executed and the motions in the
-		 * subtree cannot yet be stopped. Thus, we short-circuit
-		 * squelchNodeWalker in this case.
-		 *
-		 * In squelching a cross-slice SharedInputScan writer, we need to
-		 * ensure we don't block any reader on other slices as a result of
-		 * not materializing the shared plan.
-		 *
-		 * Note that we emphatically can't "fake" an empty tuple store
-		 * and just go ahead waking up the readers because that can
-		 * lead to wrong results.  c.f. nodeShareInputScan.c
-		*/
-		switch (share_type)
-		{
-			case SHARE_MATERIAL:
-			case SHARE_SORT:
-				return CdbVisit_Skip;
-
-			case SHARE_MATERIAL_XSLICE:
-			case SHARE_SORT_XSLICE:
-				if (isWriter && !tuplestoreInitialized)
-					ExecProcNode(node);
-				break;
-			case SHARE_NOTSHARED:
-				break;
-		}
-	}
-	else if (IsA(node, MotionState))
-	{
-		ExecStopMotion((MotionState *) node);
-		return CdbVisit_Skip;	/* don't visit subtree */
-	}
-	else if (IsA(node, ExternalScanState))
-	{
-		ExecStopExternalScan((ExternalScanState *) node);
-		/* ExternalScan nodes are expected to be leaf nodes (without subplans) */
-	}
-
-	return CdbVisit_Walk;
-}	/* squelchNodeWalker */
-
-
-void
-ExecSquelchNode(PlanState *node)
-{
-	/*
-	 * If parameters have changed, then node can be part of subquery
-	 * execution. In this case we cannot squelch node, otherwise next subquery
-	 * invocations will receive no tuples from lower motion nodes (MPP-13921).
-	 */
-	if (node->chgParam == NULL)
-	{
-		planstate_walk_node_extended(node, squelchNodeWalker, NULL, PSW_IGNORE_INITPLAN);
-	}
-}	/* ExecSquelchNode */
-
-
-static CdbVisitOpt
-transportUpdateNodeWalker(PlanState *node, void *context)
-{
-	/*
-	 * For motion nodes, we just transfer the context information established
-	 * during SetupInterconnect
-	 */
-	if (IsA(node, MotionState))
-	{
-		node->state->interconnect_context = (ChunkTransportState *) context;
-		/* visit subtree */
-	}
-
-	return CdbVisit_Walk;
-}	/* transportUpdateNodeWalker */
-
-void
-ExecUpdateTransportState(PlanState *node, ChunkTransportState * state)
-{
-	Assert(node);
-	Assert(state);
-	planstate_walk_node(node, transportUpdateNodeWalker, state);
-}	/* ExecUpdateTransportState */
-
 
 /* ----------------------------------------------------------------
  *		ExecEndNode
@@ -1422,14 +724,12 @@ ExecEndNode(PlanState *node)
 	if (node == NULL)
 		return;
 
-	EState	   *estate = node->state;
-
-	Assert(estate != NULL);
-	int			origSliceIdInPlan = estate->currentSliceIdInPlan;
-	int			origExecutingSliceId = estate->currentExecutingSliceId;
-
-	estate->currentSliceIdInPlan = origSliceIdInPlan;
-	estate->currentExecutingSliceId = origExecutingSliceId;
+	/*
+	 * Make sure there's enough stack available. Need to check here, in
+	 * addition to ExecProcNode() (via ExecProcNodeFirst()), because it's not
+	 * guaranteed that ExecProcNode() is reached for all nodes.
+	 */
+	check_stack_depth();
 
 	if (node->chgParam != NULL)
 	{
@@ -1453,6 +753,10 @@ ExecEndNode(PlanState *node)
 			 */
 		case T_ResultState:
 			ExecEndResult((ResultState *) node);
+			break;
+
+		case T_ProjectSetState:
+			ExecEndProjectSet((ProjectSetState *) node);
 			break;
 
 		case T_ModifyTableState:
@@ -1487,27 +791,23 @@ ExecEndNode(PlanState *node)
 			 * scan nodes
 			 */
 		case T_SeqScanState:
-			elog(ERROR, "SeqScan is defunct");
+			ExecEndSeqScan((SeqScanState *) node);
 			break;
 
-		case T_TableScanState:
-			ExecEndTableScan((TableScanState *) node);
+		case T_SampleScanState:
+			ExecEndSampleScan((SampleScanState *) node);
 			break;
 
-		case T_DynamicTableScanState:
-			ExecEndDynamicTableScan((DynamicTableScanState *) node);
+		case T_GatherState:
+			ExecEndGather((GatherState *) node);
+			break;
+
+		case T_GatherMergeState:
+			ExecEndGatherMerge((GatherMergeState *) node);
 			break;
 
 		case T_IndexScanState:
 			ExecEndIndexScan((IndexScanState *) node);
-			break;
-
-		case T_DynamicIndexScanState:
-			ExecEndDynamicIndexScan((DynamicIndexScanState *) node);
-			break;
-
-		case T_ExternalScanState:
-			ExecEndExternalScan((ExternalScanState *) node);
 			break;
 
 		case T_IndexOnlyScanState:
@@ -1518,20 +818,8 @@ ExecEndNode(PlanState *node)
 			ExecEndBitmapIndexScan((BitmapIndexScanState *) node);
 			break;
 
-		case T_DynamicBitmapIndexScanState:
-			ExecEndDynamicBitmapIndexScan((DynamicBitmapIndexScanState *) node);
-			break;
-
 		case T_BitmapHeapScanState:
 			ExecEndBitmapHeapScan((BitmapHeapScanState *) node);
-			break;
-
-		case T_BitmapAppendOnlyScanState:
-			ExecEndBitmapAppendOnlyScan((BitmapAppendOnlyScanState *) node);
-			break;
-
-		case T_BitmapTableScanState:
-			ExecEndBitmapTableScan((BitmapTableScanState *) node);
 			break;
 
 		case T_TidScanState:
@@ -1550,6 +838,10 @@ ExecEndNode(PlanState *node)
 			ExecEndTableFunction((TableFunctionState *) node);
 			break;
 
+		case T_TableFuncScanState:
+			ExecEndTableFuncScan((TableFuncScanState *) node);
+			break;
+
 		case T_ValuesScanState:
 			ExecEndValuesScan((ValuesScanState *) node);
 			break;
@@ -1558,12 +850,20 @@ ExecEndNode(PlanState *node)
 			ExecEndCteScan((CteScanState *) node);
 			break;
 
+		case T_NamedTuplestoreScanState:
+			ExecEndNamedTuplestoreScan((NamedTuplestoreScanState *) node);
+			break;
+
 		case T_WorkTableScanState:
 			ExecEndWorkTableScan((WorkTableScanState *) node);
 			break;
 
 		case T_ForeignScanState:
 			ExecEndForeignScan((ForeignScanState *) node);
+			break;
+
+		case T_CustomScanState:
+			ExecEndCustomScan((CustomScanState *) node);
 			break;
 
 			/*
@@ -1603,6 +903,10 @@ ExecEndNode(PlanState *node)
 			ExecEndAgg((AggState *) node);
 			break;
 
+		case T_TupleSplitState:
+			ExecEndTupleSplit((TupleSplitState *) node);
+			break;
+
 		case T_WindowAggState:
 			ExecEndWindowAgg((WindowAggState *) node);
 			break;
@@ -1631,31 +935,17 @@ ExecEndNode(PlanState *node)
 			ExecEndMotion((MotionState *) node);
 			break;
 
-		case T_RepeatState:
-			ExecEndRepeat((RepeatState *) node);
-			break;
-
 			/*
 			 * DML nodes
 			 */
-		case T_DMLState:
-			ExecEndDML((DMLState *) node);
-			break;
 		case T_SplitUpdateState:
 			ExecEndSplitUpdate((SplitUpdateState *) node);
 			break;
 		case T_AssertOpState:
 			ExecEndAssertOp((AssertOpState *) node);
 			break;
-		case T_RowTriggerState:
-			ExecEndRowTrigger((RowTriggerState *) node);
-			break;
 		case T_PartitionSelectorState:
 			ExecEndPartitionSelector((PartitionSelectorState *) node);
-			break;
-
-		case T_ReshuffleState:
-			ExecEndReshuffle((ReshuffleState *) node);
 			break;
 
 		default:
@@ -1665,9 +955,6 @@ ExecEndNode(PlanState *node)
 	/* GPDB hook for collecting query info */
 	if (query_info_collect_hook)
 		(*query_info_collect_hook)(METRICS_PLAN_NODE_FINISHED, node);
-
-	estate->currentSliceIdInPlan = origSliceIdInPlan;
-	estate->currentExecutingSliceId = origExecutingSliceId;
 }
 
 
@@ -1846,6 +1133,15 @@ planstate_walk_kids(PlanState *planstate,
 				break;
 			}
 
+		case T_MergeAppendState:
+			{
+				MergeAppendState *ms = (MergeAppendState *) planstate;
+
+				v = planstate_walk_array(ms->mergeplans, ms->ms_nplans, walker, context, flags);
+				Assert(!planstate->lefttree && !planstate->righttree);
+				break;
+			}
+
 		case T_ModifyTableState:
 			{
 				ModifyTableState *mts = (ModifyTableState *) planstate;
@@ -1939,3 +1235,197 @@ planstate_walk_kids(PlanState *planstate,
 
 	return v;
 }	/* planstate_walk_kids */
+
+/*
+ * ExecShutdownNode
+ *
+ * Give execution nodes a chance to stop asynchronous resource consumption
+ * and release any resources still held.
+ */
+bool
+ExecShutdownNode(PlanState *node)
+{
+	if (node == NULL)
+		return false;
+
+	check_stack_depth();
+
+	planstate_tree_walker(node, ExecShutdownNode, NULL);
+
+	/*
+	 * Treat the node as running while we shut it down, but only if it's run
+	 * at least once already.  We don't expect much CPU consumption during
+	 * node shutdown, but in the case of Gather or Gather Merge, we may shut
+	 * down workers at this stage.  If so, their buffer usage will get
+	 * propagated into pgBufferUsage at this point, and we want to make sure
+	 * that it gets associated with the Gather node.  We skip this if the node
+	 * has never been executed, so as to avoid incorrectly making it appear
+	 * that it has.
+	 */
+	if (node->instrument && node->instrument->running)
+		InstrStartNode(node->instrument);
+
+	switch (nodeTag(node))
+	{
+		case T_GatherState:
+			ExecShutdownGather((GatherState *) node);
+			break;
+		case T_ForeignScanState:
+			ExecShutdownForeignScan((ForeignScanState *) node);
+			break;
+		case T_CustomScanState:
+			ExecShutdownCustomScan((CustomScanState *) node);
+			break;
+		case T_GatherMergeState:
+			ExecShutdownGatherMerge((GatherMergeState *) node);
+			break;
+		case T_HashState:
+			ExecShutdownHash((HashState *) node);
+			break;
+		case T_HashJoinState:
+			ExecShutdownHashJoin((HashJoinState *) node);
+			break;
+		default:
+			break;
+	}
+
+	/* Stop the node if we started it above, reporting 0 tuples. */
+	if (node->instrument && node->instrument->running)
+		InstrStopNode(node->instrument, 0);
+
+	return false;
+}
+
+/*
+ * ExecSetTupleBound
+ *
+ * Set a tuple bound for a planstate node.  This lets child plan nodes
+ * optimize based on the knowledge that the maximum number of tuples that
+ * their parent will demand is limited.  The tuple bound for a node may
+ * only be changed between scans (i.e., after node initialization or just
+ * before an ExecReScan call).
+ *
+ * Any negative tuples_needed value means "no limit", which should be the
+ * default assumption when this is not called at all for a particular node.
+ *
+ * Note: if this is called repeatedly on a plan tree, the exact same set
+ * of nodes must be updated with the new limit each time; be careful that
+ * only unchanging conditions are tested here.
+ */
+void
+ExecSetTupleBound(int64 tuples_needed, PlanState *child_node)
+{
+	/*
+	 * Since this function recurses, in principle we should check stack depth
+	 * here.  In practice, it's probably pointless since the earlier node
+	 * initialization tree traversal would surely have consumed more stack.
+	 */
+
+	if (IsA(child_node, SortState))
+	{
+		/*
+		 * If it is a Sort node, notify it that it can use bounded sort.
+		 *
+		 * Note: it is the responsibility of nodeSort.c to react properly to
+		 * changes of these parameters.  If we ever redesign this, it'd be a
+		 * good idea to integrate this signaling with the parameter-change
+		 * mechanism.
+		 */
+		SortState  *sortState = (SortState *) child_node;
+
+		if (tuples_needed < 0)
+		{
+			/* make sure flag gets reset if needed upon rescan */
+			sortState->bounded = false;
+		}
+		else
+		{
+			sortState->bounded = true;
+			sortState->bound = tuples_needed;
+		}
+	}
+	else if (IsA(child_node, AppendState))
+	{
+		/*
+		 * If it is an Append, we can apply the bound to any nodes that are
+		 * children of the Append, since the Append surely need read no more
+		 * than that many tuples from any one input.
+		 */
+		AppendState *aState = (AppendState *) child_node;
+		int			i;
+
+		for (i = 0; i < aState->as_nplans; i++)
+			ExecSetTupleBound(tuples_needed, aState->appendplans[i]);
+	}
+	else if (IsA(child_node, MergeAppendState))
+	{
+		/*
+		 * If it is a MergeAppend, we can apply the bound to any nodes that
+		 * are children of the MergeAppend, since the MergeAppend surely need
+		 * read no more than that many tuples from any one input.
+		 */
+		MergeAppendState *maState = (MergeAppendState *) child_node;
+		int			i;
+
+		for (i = 0; i < maState->ms_nplans; i++)
+			ExecSetTupleBound(tuples_needed, maState->mergeplans[i]);
+	}
+	else if (IsA(child_node, ResultState))
+	{
+		/*
+		 * Similarly, for a projecting Result, we can apply the bound to its
+		 * child node.
+		 *
+		 * If Result supported qual checking, we'd have to punt on seeing a
+		 * qual.  Note that having a resconstantqual is not a showstopper: if
+		 * that condition succeeds it affects nothing, while if it fails, no
+		 * rows will be demanded from the Result child anyway.
+		 */
+		if (outerPlanState(child_node))
+			ExecSetTupleBound(tuples_needed, outerPlanState(child_node));
+	}
+	else if (IsA(child_node, SubqueryScanState))
+	{
+		/*
+		 * We can also descend through SubqueryScan, but only if it has no
+		 * qual (otherwise it might discard rows).
+		 */
+		SubqueryScanState *subqueryState = (SubqueryScanState *) child_node;
+
+		if (subqueryState->ss.ps.qual == NULL)
+			ExecSetTupleBound(tuples_needed, subqueryState->subplan);
+	}
+	else if (IsA(child_node, GatherState))
+	{
+		/*
+		 * A Gather node can propagate the bound to its workers.  As with
+		 * MergeAppend, no one worker could possibly need to return more
+		 * tuples than the Gather itself needs to.
+		 *
+		 * Note: As with Sort, the Gather node is responsible for reacting
+		 * properly to changes to this parameter.
+		 */
+		GatherState *gstate = (GatherState *) child_node;
+
+		gstate->tuples_needed = tuples_needed;
+
+		/* Also pass down the bound to our own copy of the child plan */
+		ExecSetTupleBound(tuples_needed, outerPlanState(child_node));
+	}
+	else if (IsA(child_node, GatherMergeState))
+	{
+		/* Same comments as for Gather */
+		GatherMergeState *gstate = (GatherMergeState *) child_node;
+
+		gstate->tuples_needed = tuples_needed;
+
+		ExecSetTupleBound(tuples_needed, outerPlanState(child_node));
+	}
+
+	/*
+	 * In principle we could descend through any plan node type that is
+	 * certain not to discard or combine input rows; but on seeing a node that
+	 * can do that, we can't propagate the bound any further.  For the moment
+	 * it's unclear that any other cases are worth checking here.
+	 */
+}

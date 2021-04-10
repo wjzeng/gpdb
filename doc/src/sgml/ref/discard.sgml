@@ -3,7 +3,7 @@ doc/src/sgml/ref/discard.sgml
 PostgreSQL documentation
 -->
 
-<refentry id="SQL-DISCARD">
+<refentry id="sql-discard">
  <indexterm zone="sql-discard">
   <primary>DISCARD</primary>
  </indexterm>
@@ -29,17 +29,11 @@ DISCARD { ALL | PLANS | SEQUENCES | TEMPORARY | TEMP }
   <title>Description</title>
 
   <para>
-   <command>DISCARD</> releases internal resources associated with a
-   database session. These resources are normally released at the end
-   of the session.
-  </para>
-
-  <para>
-   <command>DISCARD TEMP</> drops all temporary tables created in the
-   current session.  <command>DISCARD PLANS</> releases all internally
-   cached query plans.  <command>DISCARD ALL</> resets a session to
-   its original state, discarding temporary resources and resetting
-   session-local configuration changes.
+   <command>DISCARD</command> releases internal resources associated with a
+   database session.  This command is useful for partially or fully
+   resetting the session's state.  There are several subcommands to
+   release different types of resources; the <command>DISCARD ALL</command>
+   variant subsumes all the others, and also resets additional state.
   </para>
  </refsect1>
 
@@ -49,19 +43,11 @@ DISCARD { ALL | PLANS | SEQUENCES | TEMPORARY | TEMP }
   <variablelist>
 
    <varlistentry>
-    <term><literal>TEMPORARY</literal> or <literal>TEMP</literal></term>
-    <listitem>
-     <para>
-      Drops all temporary tables created in the current session.
-     </para>
-    </listitem>
-   </varlistentry>
-
-   <varlistentry>
     <term><literal>PLANS</literal></term>
     <listitem>
      <para>
-      Releases all cached query plans.
+      Releases all cached query plans, forcing re-planning to occur
+      the next time the associated prepared statement is used.
      </para>
     </listitem>
    </varlistentry>
@@ -70,7 +56,21 @@ DISCARD { ALL | PLANS | SEQUENCES | TEMPORARY | TEMP }
     <term><literal>SEQUENCES</literal></term>
     <listitem>
      <para>
-      Discards all cached sequence values.
+      Discards all cached sequence-related state,
+      including <function>currval()</function>/<function>lastval()</function>
+      information and any preallocated sequence values that have not
+      yet been returned by <function>nextval()</function>.
+      (See <xref linkend="sql-createsequence"/> for a description of
+      preallocated sequence values.)
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry>
+    <term><literal>TEMPORARY</literal> or <literal>TEMP</literal></term>
+    <listitem>
+     <para>
+      Drops all temporary tables created in the current session.
      </para>
     </listitem>
    </varlistentry>
@@ -84,10 +84,10 @@ DISCARD { ALL | PLANS | SEQUENCES | TEMPORARY | TEMP }
       Currently, this has the same effect as executing the following sequence
       of statements:
 <programlisting>
+CLOSE ALL;
 SET SESSION AUTHORIZATION DEFAULT;
 RESET ALL;
 DEALLOCATE ALL;
-CLOSE ALL;
 UNLISTEN *;
 SELECT pg_advisory_unlock_all();
 DISCARD PLANS;
@@ -104,7 +104,7 @@ DISCARD SEQUENCES;
   <title>Notes</title>
 
    <para>
-    <command>DISCARD ALL</> cannot be executed inside a transaction block.
+    <command>DISCARD ALL</command> cannot be executed inside a transaction block.
    </para>
  </refsect1>
 

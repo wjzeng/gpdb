@@ -3,7 +3,7 @@
 ! sunstudio_sparc.s
 !	  compare and swap for Sun Studio on Sparc
 !
-! Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+! Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
 ! Portions Copyright (c) 1994, Regents of the University of California
 !
 ! IDENTIFICATION
@@ -26,7 +26,7 @@
 pg_atomic_cas:
 
 	! "cas" only works on sparcv9 and sparcv8plus chips, and
-	! requies a compiler targeting these CPUs.  It will fail
+	! requires a compiler targeting these CPUs.  It will fail
 	! on a compiler targeting sparcv8, and of course will not
 	! be understood by a sparcv8 CPU.  gcc continues to use
 	! "ldstub" because it targets sparcv7.
@@ -37,6 +37,8 @@ pg_atomic_cas:
 	!
 	!   http://cvs.opensolaris.org/source/xref/on/usr/src/lib/libc/sparc/threads/sparc.il
 	!
+	! NB: We're assuming we're running on a TSO system here - solaris
+	! userland luckily always has done so.
 
 #if defined(__sparcv9) || defined(__sparcv8plus)
 	cas     [%o0],%o2,%o1

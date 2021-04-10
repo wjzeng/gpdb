@@ -11,10 +11,10 @@ DATACHECKSUMS=1
 # Data Directories
 # ======================================================================
 
-if [ -z "${MASTER_DATADIR}" ]; then
+if [ -z "${COORDINATOR_DATADIR}" ]; then
   DATADIRS=${DATADIRS:-`pwd`/datadirs}
 else
-  DATADIRS="${MASTER_DATADIR}/datadirs"
+  DATADIRS="${COORDINATOR_DATADIR}/datadirs"
 fi
 
 QDDIR=$DATADIRS/qddir
@@ -26,6 +26,9 @@ STANDBYDIR=$DATADIRS/standby
 # Database Ports
 # ======================================================================
 
+COORDINATOR_DEMO_PORT=${DEMO_PORT_BASE}
+STANDBY_DEMO_PORT=`expr ${DEMO_PORT_BASE} + 1`
+DEMO_PORT_BASE=`expr ${DEMO_PORT_BASE} + 2`
 for (( i=0; i<`expr 2 \* $NUM_PRIMARY_MIRROR_PAIRS`; i++ )); do
   PORT_NUM=`expr $DEMO_PORT_BASE + $i`
   DEMO_SEG_PORTS_LIST="$DEMO_SEG_PORTS_LIST $PORT_NUM"
@@ -41,16 +44,17 @@ checkDemoConfig(){
     echo "                   Checking for port availability"
     echo "----------------------------------------------------------------------"
     echo ""
-    # Check if Master_DEMO_Port is free
-    echo "  Master port check ... : ${MASTER_DEMO_PORT}"
-    PORT_FILE="/tmp/.s.PGSQL.${MASTER_DEMO_PORT}"
+    # Check if Coordinator_DEMO_Port is free
+    echo "  Coordinator port check ... : ${COORDINATOR_DEMO_PORT}"
+    PORT_FILE="/tmp/.s.PGSQL.${COORDINATOR_DEMO_PORT}"
     if [ -f ${PORT_FILE} -o  -S ${PORT_FILE} ] ; then 
         echo ""
-        echo -n " Port ${MASTER_DEMO_PORT} appears to be in use. " 
-        echo " This port is needed by the Master Database instance. "
-        echo ">>> Edit Makefile to correct the port number (MASTER_PORT). <<<" 
+        echo -n " Port ${COORDINATOR_DEMO_PORT} appears to be in use. " 
+        echo " This port is needed by the Coordinator Database instance. "
+        echo ">>> Edit Makefile to correct the port number (COORDINATOR_PORT). <<<" 
         echo -n " Check to see if the port is free by using : "
-        echo " 'netstat -an | grep ${MASTER_DEMO_PORT}"
+        echo " 'netstat -an | grep ${COORDINATOR_DEMO_PORT}'"
+        echo " If the port is not used please make sure files ${PORT_FILE}* are deleted"
         echo ""
         return 1
     fi
@@ -64,7 +68,8 @@ checkDemoConfig(){
         echo " This port is needed by the Standby Database instance. "
         echo ">>> Edit Makefile to correct the port number (STANDBY_PORT). <<<"
         echo -n " Check to see if the port is free by using : "
-        echo " 'netstat -an | grep ${STANDBY_DEMO_PORT}"
+        echo " 'netstat -an | grep ${STANDBY_DEMO_PORT}'."
+        echo " If the port is not used please make sure files ${PORT_FILE}* are deleted"
         echo ""
         return 1
     fi
@@ -80,7 +85,8 @@ checkDemoConfig(){
             echo " This port is needed for segment database instance."
             echo ">>> Edit Makefile to correct the base ports (PORT_BASE). <<<"
             echo -n " Check to see if the port is free by using : "
-            echo " 'netstat -an | grep ${PORT_NUM}"
+            echo " 'netstat -an | grep ${PORT_NUM}'"
+            echo " If the port is not used please make sure files ${PORT_FILE}* are deleted"
             echo ""
             return 1
         fi
@@ -108,9 +114,9 @@ cleanDemo(){
     ## Attempt to bring down using GPDB cluster instance using gpstop
     ##
 
-    (export MASTER_DATA_DIRECTORY=$QDDIR/${SEG_PREFIX}-1;
+    (export COORDINATOR_DATA_DIRECTORY=$QDDIR/${SEG_PREFIX}-1;
      source ${GPHOME}/greenplum_path.sh;
-     gpstop -a)
+     gpstop -ai)
 
     ##
     ## Remove the files and directories created; allow test harnesses
@@ -172,8 +178,6 @@ if [ -z "${GPHOME}" ]; then
     echo "  file in your Greenplum installation directory."
     echo ""
     exit 1
-else
-    GPSEARCH=$GPHOME
 fi
 
 cat <<-EOF
@@ -185,15 +189,15 @@ cat <<-EOF
 	----------------------------------------------------------------------
 
 	  This is a demo of the Greenplum Database system.  We will create
-	  a cluster installation with master and `expr 2 \* ${NUM_PRIMARY_MIRROR_PAIRS}` segment instances
+	  a cluster installation with coordinator and `expr 2 \* ${NUM_PRIMARY_MIRROR_PAIRS}` segment instances
 	  (${NUM_PRIMARY_MIRROR_PAIRS} primary & ${NUM_PRIMARY_MIRROR_PAIRS} mirror).
 
-	    GPHOME ................. : ${GPHOME}
-	    MASTER_DATA_DIRECTORY .. : ${QDDIR}/${SEG_PREFIX}-1
+	    GPHOME ................... : ${GPHOME}
+	    COORDINATOR_DATA_DIRECTORY : ${QDDIR}/${SEG_PREFIX}-1
 
-	    MASTER PORT (PGPORT) ... : ${MASTER_DEMO_PORT}
-	    STANDBY PORT ........... : ${STANDBY_DEMO_PORT}
-	    SEGMENT PORTS .......... : ${DEMO_SEG_PORTS_LIST}
+	    COORDINATOR PORT (PGPORT). : ${COORDINATOR_DEMO_PORT}
+	    STANDBY PORT ............. : ${STANDBY_DEMO_PORT}
+	    SEGMENT PORTS ............ : ${DEMO_SEG_PORTS_LIST}
 
 	  NOTE(s):
 
@@ -204,16 +208,16 @@ cat <<-EOF
 
 EOF
 
-GPPATH=`find $GPSEARCH -name gpstart| tail -1`
+GPPATH=`find -H $GPHOME -name gpstart| tail -1`
 RETVAL=$?
 
 if [ "$RETVAL" -ne 0 ]; then
-    echo "Error attempting to find Greenplum executables in $GPSEARCH"
+    echo "Error attempting to find Greenplum executables in $GPHOME"
     exit 1
 fi
 
 if [ ! -x "$GPPATH" ]; then
-    echo "No executables found for Greenplum installation in $GPSEARCH"
+    echo "No executables found for Greenplum installation in $GPHOME"
     exit 1
 fi
 GPPATH=`dirname $GPPATH`
@@ -264,10 +268,6 @@ rm -f ${CLUSTER_CONFIG_POSTGRES_ADDONS}
 #*****************************************************************************************
 
 cat >> $CLUSTER_CONFIG <<-EOF
-	# Set this to anything you like
-	ARRAY_NAME="Demo $HOSTNAME Cluster"
-	CLUSTER_NAME="Demo $HOSTNAME Cluster"
-	
 	# This file must exist in the same directory that you execute gpinitsystem in
 	MACHINE_LIST_FILE=`pwd`/hostfile
 	
@@ -278,29 +278,20 @@ cat >> $CLUSTER_CONFIG <<-EOF
 	#   psql -p \$PORT_BASE -d template1
 	PORT_BASE=${DEMO_PORT_BASE}
 	
-	# Prefix for script created database
-	DATABASE_PREFIX=demoDatabase
-	
 	# Array of data locations for each hosts Segment Instances, the number of directories in this array will
 	# set the number of segment instances per host
 	declare -a DATA_DIRECTORY=(${PRIMARY_DIRS_LIST})
 	
 	# Name of host on which to setup the QD
-	MASTER_HOSTNAME=$LOCALHOST
+	COORDINATOR_HOSTNAME=$LOCALHOST
 	
 	# Name of directory on that host in which to setup the QD
-	MASTER_DIRECTORY=$QDDIR
+	COORDINATOR_DIRECTORY=$QDDIR
 	
-	MASTER_PORT=${MASTER_DEMO_PORT}
-	
-	# Hosts to allow to connect to the QD (and Segment Instances)
-	# By default, allow everyone to connect (0.0.0.0/0)
-	IP_ALLOW=0.0.0.0/0
+	COORDINATOR_PORT=${COORDINATOR_DEMO_PORT}
 	
 	# Shell to use to execute commands on all hosts
 	TRUSTED_SHELL="`pwd`/lalshell"
-	
-	CHECK_POINT_SEGMENTS=8
 	
 	ENCODING=UNICODE
 EOF
@@ -320,32 +311,18 @@ if [ "${WITH_MIRRORS}" == "true" ]; then
 		declare -a MIRROR_DATA_DIRECTORY=(${MIRROR_DIRS_LIST})
 
 		MIRROR_PORT_BASE=`expr $DEMO_PORT_BASE + $NUM_PRIMARY_MIRROR_PAIRS`
-
-		REPLICATION_PORT_BASE=`expr $DEMO_PORT_BASE + 2 \* $NUM_PRIMARY_MIRROR_PAIRS`
-		MIRROR_REPLICATION_PORT_BASE=`expr $DEMO_PORT_BASE + 3 \* $NUM_PRIMARY_MIRROR_PAIRS`
 	EOF
 fi
 
 
 STANDBY_INIT_OPTS=""
 if [ "${WITH_STANDBY}" == "true" ]; then
-	STANDBY_INIT_OPTS="-s ${LOCALHOST} -P ${STANDBY_DEMO_PORT} -F ${STANDBYDIR}"
+	STANDBY_INIT_OPTS="-s ${LOCALHOST} -P ${STANDBY_DEMO_PORT} -S ${STANDBYDIR}"
 fi
 
 if [ ! -z "${EXTRA_CONFIG}" ]; then
   echo ${EXTRA_CONFIG} >> $CLUSTER_CONFIG
 fi
-
-cat >> $CLUSTER_CONFIG <<-EOF
-
-	# Path for Greenplum mgmt utils and Greenplum binaries
-	PATH=$GPHOME/bin:$PATH
-	LD_LIBRARY_PATH=$GPHOME/lib:$LD_LIBRARY_PATH
-	export PATH
-	export LD_LIBRARY_PATH
-	export MASTER_DATA_DIRECTORY
-	export TRUSTED_SHELL
-EOF
 
 if [ -z "${DEFAULT_QD_MAX_CONNECT}" ]; then
    DEFAULT_QD_MAX_CONNECT=25
@@ -445,7 +422,7 @@ if [ "$enable_gpfdist" = "yes" ] && [ "$with_openssl" = "yes" ]; then
 	echo ""
 fi
 
-OPTIMIZER=$(psql -t -p ${MASTER_DEMO_PORT} -d template1 -c "show optimizer"   2>&1)
+OPTIMIZER=$(psql -t -p ${COORDINATOR_DEMO_PORT} -d template1 -c "show optimizer"   2>&1)
 
 echo "======================================================================" 2>&1 | tee -a optimizer-state.log
 echo "                           OPTIMIZER STATE"                             2>&1 | tee -a optimizer-state.log
@@ -454,16 +431,16 @@ echo "  Optimizer state .. : ${OPTIMIZER}"                                    2>
 echo "======================================================================" 2>&1 | tee -a optimizer-state.log
 echo ""                                                                       2>&1 | tee -a optimizer-state.log
 
-psql -p ${MASTER_DEMO_PORT} -d template1 -c "select version();"               2>&1 | tee -a optimizer-state.log
+psql -p ${COORDINATOR_DEMO_PORT} -d template1 -c "select version();"               2>&1 | tee -a optimizer-state.log
 
-psql -p ${MASTER_DEMO_PORT} -d template1 -c "show optimizer;" > /dev/null     2>&1
+psql -p ${COORDINATOR_DEMO_PORT} -d template1 -c "show optimizer;" > /dev/null     2>&1
 if [ $? = 0 ]; then
-    psql -p ${MASTER_DEMO_PORT} -d template1 -c "show optimizer;"             2>&1 | tee -a optimizer-state.log
+    psql -p ${COORDINATOR_DEMO_PORT} -d template1 -c "show optimizer;"             2>&1 | tee -a optimizer-state.log
 fi
 
-psql -p ${MASTER_DEMO_PORT} -d template1 -c "select gp_opt_version();" > /dev/null 2>&1
+psql -p ${COORDINATOR_DEMO_PORT} -d template1 -c "select gp_opt_version();" > /dev/null 2>&1
 if [ $? = 0 ]; then
-    psql -p ${MASTER_DEMO_PORT} -d template1 -c "select gp_opt_version();"    2>&1 | tee -a optimizer-state.log
+    psql -p ${COORDINATOR_DEMO_PORT} -d template1 -c "select gp_opt_version();"    2>&1 | tee -a optimizer-state.log
 fi
 
 echo "======================================================================" 2>&1 | tee -a optimizer-state.log
@@ -476,7 +453,8 @@ cat > gpdemo-env.sh <<-EOF
 	## timestamp: $( date )
 	## ======================================================================
 
-	export PGPORT=${MASTER_DEMO_PORT}
+	export PGPORT=${COORDINATOR_DEMO_PORT}
+	export COORDINATOR_DATA_DIRECTORY=$QDDIR/${SEG_PREFIX}-1
 	export MASTER_DATA_DIRECTORY=$QDDIR/${SEG_PREFIX}-1
 EOF
 

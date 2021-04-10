@@ -15,10 +15,10 @@
 #include "storage/bufmgr.h"
 
 
-#define NUM_BUFFERCACHE_PAGES_ELEM	8
+#define NUM_BUFFERCACHE_PAGES_MIN_ELEM	8
+#define NUM_BUFFERCACHE_PAGES_ELEM	9
 
 PG_MODULE_MAGIC;
-
 
 /*
  * Record structure holding the to be exposed cache data.
@@ -34,6 +34,13 @@ typedef struct
 	bool		isvalid;
 	bool		isdirty;
 	uint16		usagecount;
+
+	/*
+	 * An int32 is sufficiently large, as MAX_BACKENDS prevents a buffer from
+	 * being pinned by too many backends and each backend will only pin once
+	 * because of bufmgr.c's PrivateRefCount infrastructure.
+	 */
+	int32		pinning_backends;
 } BufferCachePagesRec;
 
 
@@ -59,14 +66,14 @@ pg_buffercache_pages(PG_FUNCTION_ARGS)
 	FuncCallContext *funcctx;
 	Datum		result;
 	MemoryContext oldcontext;
-	BufferCachePagesContext *fctx;		/* User function context. */
+	BufferCachePagesContext *fctx;	/* User function context. */
 	TupleDesc	tupledesc;
+	TupleDesc	expected_tupledesc;
 	HeapTuple	tuple;
 
 	if (SRF_IS_FIRSTCALL())
 	{
 		int			i;
-		volatile BufferDesc *bufHdr;
 
 		funcctx = SRF_FIRSTCALL_INIT();
 
@@ -76,8 +83,23 @@ pg_buffercache_pages(PG_FUNCTION_ARGS)
 		/* Create a user function context for cross-call persistence */
 		fctx = (BufferCachePagesContext *) palloc(sizeof(BufferCachePagesContext));
 
+		/*
+		 * To smoothly support upgrades from version 1.0 of this extension
+		 * transparently handle the (non-)existence of the pinning_backends
+		 * column. We unfortunately have to get the result type for that... -
+		 * we can't use the result type determined by the function definition
+		 * without potentially crashing when somebody uses the old (or even
+		 * wrong) function definition though.
+		 */
+		if (get_call_result_type(fcinfo, NULL, &expected_tupledesc) != TYPEFUNC_COMPOSITE)
+			elog(ERROR, "return type must be a row type");
+
+		if (expected_tupledesc->natts < NUM_BUFFERCACHE_PAGES_MIN_ELEM ||
+			expected_tupledesc->natts > NUM_BUFFERCACHE_PAGES_ELEM)
+			elog(ERROR, "incorrect number of output arguments");
+
 		/* Construct a tuple descriptor for the result rows. */
-		tupledesc = CreateTemplateTupleDesc(NUM_BUFFERCACHE_PAGES_ELEM, false);
+		tupledesc = CreateTemplateTupleDesc(expected_tupledesc->natts);
 		TupleDescInitEntry(tupledesc, (AttrNumber) 1, "bufferid",
 						   INT4OID, -1, 0);
 		TupleDescInitEntry(tupledesc, (AttrNumber) 2, "relfilenode",
@@ -95,10 +117,16 @@ pg_buffercache_pages(PG_FUNCTION_ARGS)
 		TupleDescInitEntry(tupledesc, (AttrNumber) 8, "usage_count",
 						   INT2OID, -1, 0);
 
+		if (expected_tupledesc->natts == NUM_BUFFERCACHE_PAGES_ELEM)
+			TupleDescInitEntry(tupledesc, (AttrNumber) 9, "pinning_backends",
+							   INT4OID, -1, 0);
+
 		fctx->tupdesc = BlessTupleDesc(tupledesc);
 
 		/* Allocate NBuffers worth of BufferCachePagesRec records. */
-		fctx->record = (BufferCachePagesRec *) palloc(sizeof(BufferCachePagesRec) * NBuffers);
+		fctx->record = (BufferCachePagesRec *)
+			MemoryContextAllocHuge(CurrentMemoryContext,
+								   sizeof(BufferCachePagesRec) * NBuffers);
 
 		/* Set max calls and remember the user function context. */
 		funcctx->max_calls = NBuffers;
@@ -108,22 +136,21 @@ pg_buffercache_pages(PG_FUNCTION_ARGS)
 		MemoryContextSwitchTo(oldcontext);
 
 		/*
-		 * To get a consistent picture of the buffer state, we must lock all
-		 * partitions of the buffer map.  Needless to say, this is horrible
-		 * for concurrency.  Must grab locks in increasing order to avoid
-		 * possible deadlocks.
-		 */
-		for (i = 0; i < NUM_BUFFER_PARTITIONS; i++)
-			LWLockAcquire(BufMappingPartitionLockByIndex(i), LW_SHARED);
-
-		/*
-		 * Scan though all the buffers, saving the relevant fields in the
+		 * Scan through all the buffers, saving the relevant fields in the
 		 * fctx->record structure.
+		 *
+		 * We don't hold the partition locks, so we don't get a consistent
+		 * snapshot across all buffers, but we do grab the buffer header
+		 * locks, so the information of each buffer is self-consistent.
 		 */
-		for (i = 0, bufHdr = BufferDescriptors; i < NBuffers; i++, bufHdr++)
+		for (i = 0; i < NBuffers; i++)
 		{
+			BufferDesc *bufHdr;
+			uint32		buf_state;
+
+			bufHdr = GetBufferDescriptor(i);
 			/* Lock each buffer header before inspecting. */
-			LockBufHdr(bufHdr);
+			buf_state = LockBufHdr(bufHdr);
 
 			fctx->record[i].bufferid = BufferDescriptorGetBuffer(bufHdr);
 			fctx->record[i].relfilenode = bufHdr->tag.rnode.relNode;
@@ -131,31 +158,22 @@ pg_buffercache_pages(PG_FUNCTION_ARGS)
 			fctx->record[i].reldatabase = bufHdr->tag.rnode.dbNode;
 			fctx->record[i].forknum = bufHdr->tag.forkNum;
 			fctx->record[i].blocknum = bufHdr->tag.blockNum;
-			fctx->record[i].usagecount = bufHdr->usage_count;
+			fctx->record[i].usagecount = BUF_STATE_GET_USAGECOUNT(buf_state);
+			fctx->record[i].pinning_backends = BUF_STATE_GET_REFCOUNT(buf_state);
 
-			if (bufHdr->flags & BM_DIRTY)
+			if (buf_state & BM_DIRTY)
 				fctx->record[i].isdirty = true;
 			else
 				fctx->record[i].isdirty = false;
 
 			/* Note if the buffer is valid, and has storage created */
-			if ((bufHdr->flags & BM_VALID) && (bufHdr->flags & BM_TAG_VALID))
+			if ((buf_state & BM_VALID) && (buf_state & BM_TAG_VALID))
 				fctx->record[i].isvalid = true;
 			else
 				fctx->record[i].isvalid = false;
 
-			UnlockBufHdr(bufHdr);
+			UnlockBufHdr(bufHdr, buf_state);
 		}
-
-		/*
-		 * And release locks.  We do this in reverse order for two reasons:
-		 * (1) Anyone else who needs more than one of the locks will be trying
-		 * to lock them in increasing order; we don't want to release the
-		 * other process until it can get all the locks it needs. (2) This
-		 * avoids O(N^2) behavior inside LWLockRelease.
-		 */
-		for (i = NUM_BUFFER_PARTITIONS; --i >= 0;)
-			LWLockRelease(BufMappingPartitionLockByIndex(i));
 	}
 
 	funcctx = SRF_PERCALL_SETUP();
@@ -186,6 +204,8 @@ pg_buffercache_pages(PG_FUNCTION_ARGS)
 			nulls[5] = true;
 			nulls[6] = true;
 			nulls[7] = true;
+			/* unused for v1.0 callers, but the array is always long enough */
+			nulls[8] = true;
 		}
 		else
 		{
@@ -203,6 +223,9 @@ pg_buffercache_pages(PG_FUNCTION_ARGS)
 			nulls[6] = false;
 			values[7] = Int16GetDatum(fctx->record[i].usagecount);
 			nulls[7] = false;
+			/* unused for v1.0 callers, but the array is always long enough */
+			values[8] = Int32GetDatum(fctx->record[i].pinning_backends);
+			nulls[8] = false;
 		}
 
 		/* Build and return the tuple. */

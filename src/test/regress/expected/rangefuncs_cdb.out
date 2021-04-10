@@ -1,20 +1,32 @@
 SELECT name, setting FROM pg_settings WHERE name LIKE 'enable%';
-         name         | setting 
-----------------------+---------
- enable_bitmapscan    | on
- enable_groupagg      | on
- enable_hashagg       | on
- enable_hashjoin      | on
- enable_indexonlyscan | on
- enable_indexscan     | on
- enable_material      | on
- enable_mergejoin     | off
- enable_nestloop      | off
- enable_seqscan       | on
- enable_sort          | on
- enable_tidscan       | on
-(12 rows)
+              name              | setting 
+--------------------------------+---------
+ enable_bitmapscan              | on
+ enable_gathermerge             | on
+ enable_groupagg                | on
+ enable_groupingsets_hash_disk  | off
+ enable_hashagg                 | on
+ enable_hashagg_disk            | on
+ enable_hashjoin                | on
+ enable_indexonlyscan           | on
+ enable_indexscan               | on
+ enable_material                | on
+ enable_mergejoin               | off
+ enable_nestloop                | off
+ enable_parallel_append         | on
+ enable_parallel_hash           | on
+ enable_partition_pruning       | on
+ enable_partitionwise_aggregate | off
+ enable_partitionwise_join      | off
+ enable_seqscan                 | on
+ enable_sort                    | on
+ enable_tidscan                 | on
+(20 rows)
 
+-- start_ignore
+create schema rangefuncs_cdb;
+set search_path to rangefuncs_cdb, public;
+-- end_ignore
 DROP TABLE IF EXISTS foo;
 NOTICE:  table "foo" does not exist, skipping
 CREATE TABLE foo(
@@ -812,7 +824,7 @@ SELECT dup(22);
 (1 row)
 
 SELECT dup('xyz');	-- fails
-ERROR:  could not determine polymorphic type because input has type "unknown"
+ERROR:  could not determine polymorphic type because input has type unknown
 SELECT dup('xyz'::text);
         dup        
 -------------------
@@ -842,4 +854,34 @@ CREATE FUNCTION bad (f1 int, out f2 anyelement, out f3 anyarray)
 AS 'select $1, array[$1,$1]' LANGUAGE sql;
 ERROR:  cannot determine result data type
 DETAIL:  A function returning a polymorphic type must have at least one polymorphic argument.
+--
+-- Test that a set-returning function is not called unnecessarily.
+--
+-- The planner could legitimately call an immutable function as many times it
+-- wishes, but there's no need to call it more than once. (ORCA used to create
+-- plans where the FunctionScan was executed on every segment, but a Result
+-- on top of it filtered all the rows, except on one segment.
+--
+CREATE FUNCTION notice_srf() RETURNS SETOF text AS $$
+begin
+   RAISE NOTICE 'notice_srf called in segment %', gp_execution_segment();
+
+   RETURN NEXT 'foo';
+   RETURN NEXT 'bar';
+end;
+$$ LANGUAGE plpgsql IMMUTABLE;
+-- gpdiff suppresses identical NOTICEs coming from multiple segments. But we
+-- specifically want to check that we get the NOTICE only from one segment.
+-- To defeat gpdiff's duplicate-elimination, the NOTICE includes the segment
+-- number in the message, so that the message is different on every segment.
+-- But we don't actually don't care which segment it executes on, so filter
+-- out the segment number for comparison.
+--
+-- start_matchsubs
+-- m/NOTICE:  notice_srf called in segment (\d+)/
+-- s/in segment (\d+)/in segment ###/
+-- end_matchsubs
+CREATE TEMPORARY TABLE srfdest (t text) DISTRIBUTED RANDOMLY;
+INSERT INTO srfdest select * FROM notice_srf();
+NOTICE:  notice_srf called in segment 1  (seg1 slice1 127.0.0.1:40001 pid=21879)
 reset optimizer_segments;

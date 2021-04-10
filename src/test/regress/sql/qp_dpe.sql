@@ -21,7 +21,7 @@ RESET ALL;
 --
 
 -- start_ignore
-create language plpythonu;
+create language plpython3u;
 -- end_ignore
 
 create or replace function count_operator(query text, operator text) returns int as
@@ -35,7 +35,7 @@ for i in range(len(rv)):
         result = result+1
 return result
 $$
-language plpythonu;
+language plpython3u;
 
 -- ----------------------------------------------------------------------
 -- Test: DPE not being applied for tables partitioned by a string column
@@ -62,7 +62,7 @@ analyze foo2;
 -- end_ignore
 
 select count_operator('select count(*) from foo1,foo2 where foo1.j = foo2.j;', 'Append') > 0;
-select count_operator('select count(*) from foo1,foo2 where foo1.j = foo2.j;', 'Dynamic Table Scan') > 0;
+select count_operator('select count(*) from foo1,foo2 where foo1.j = foo2.j;', 'Dynamic Seq Scan') > 0;
 
 select count(*) from foo1,foo2 where foo1.j = foo2.j;
 
@@ -87,7 +87,7 @@ analyze foo2;
 -- end_ignore
 
 select count_operator('select count(*) from foo1,foo2 where foo1.j = foo2.j;', 'Append') > 0;
-select count_operator('select count(*) from foo1,foo2 where foo1.j = foo2.j;', 'Dynamic Table Scan') > 0;
+select count_operator('select count(*) from foo1,foo2 where foo1.j = foo2.j;', 'Dynamic Seq Scan') > 0;
 
 select count(*) from foo1,foo2 where foo1.j = foo2.j;
 
@@ -112,7 +112,7 @@ analyze foo2;
 -- end_ignore
 
 select count_operator('select count(*) from foo1,foo2 where foo1.j = foo2.j;', 'Append') > 0;
-select count_operator('select count(*) from foo1,foo2 where foo1.j = foo2.j;', 'Dynamic Table Scan') > 0;
+select count_operator('select count(*) from foo1,foo2 where foo1.j = foo2.j;', 'Dynamic Seq Scan') > 0;
 
 select count(*) from foo1,foo2 where foo1.j = foo2.j;
 
@@ -137,7 +137,7 @@ analyze foo2;
 -- end_ignore
 
 select count_operator('select count(*) from foo1,foo2 where foo1.j = foo2.j;', 'Append') > 0;
-select count_operator('select count(*) from foo1,foo2 where foo1.j = foo2.j;', 'Dynamic Table Scan') > 0;
+select count_operator('select count(*) from foo1,foo2 where foo1.j = foo2.j;', 'Dynamic Seq Scan') > 0;
 
 select count(*) from foo1,foo2 where foo1.j = foo2.j;
 
@@ -162,7 +162,7 @@ analyze foo2;
 -- end_ignore
 
 select count_operator('select count(*) from foo1,foo2 where foo1.j = foo2.j;', 'Append') > 0;
-select count_operator('select count(*) from foo1,foo2 where foo1.j = foo2.j;', 'Dynamic Table Scan') > 0;
+select count_operator('select count(*) from foo1,foo2 where foo1.j = foo2.j;', 'Dynamic Seq Scan') > 0;
 
 select count(*) from foo1,foo2 where foo1.j = foo2.j;
 
@@ -190,9 +190,9 @@ analyze foo2;
 -- ----------------------------------------------------------------------
 
 select count_operator('select count(*) from foo1,foo2 where foo1.j =foo2.j;', 'Append') > 0;
-select count_operator('select count(*) from foo1,foo2 where foo1.j =foo2.j;', 'Dynamic Table Scan') > 0;
+select count_operator('select count(*) from foo1,foo2 where foo1.j =foo2.j;', 'Dynamic Seq Scan') > 0;
 
-select count_operator('select count(*) from foo1,foo2 where foo1.j =foo2.j and foo2.i <= ALL(select 1 UNION select 2);', 'Dynamic Table Scan') > 0;
+select count_operator('select count(*) from foo1,foo2 where foo1.j =foo2.j and foo2.i <= ALL(select 1 UNION select 2);', 'Dynamic Seq Scan') > 0;
 
 select count(*) from foo1,foo2 where foo1.j =foo2.j and foo2.i <= ALL(select 1 UNION select 2);
 RESET ALL;

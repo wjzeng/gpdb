@@ -56,7 +56,7 @@
 int
 getopt_long(int argc, char *const argv[],
 			const char *optstring,
-			const struct option * longopts, int *longindex)
+			const struct option *longopts, int *longindex)
 {
 	static char *place = EMSG;	/* option letter processing */
 	char	   *oli;			/* option letter list index */
@@ -100,11 +100,14 @@ getopt_long(int argc, char *const argv[],
 				if (strlen(longopts[i].name) == namelen
 					&& strncmp(place, longopts[i].name, namelen) == 0)
 				{
-					if (longopts[i].has_arg)
+					int			has_arg = longopts[i].has_arg;
+
+					if (has_arg != no_argument)
 					{
 						if (place[namelen] == '=')
 							optarg = place + namelen + 1;
-						else if (optind < argc - 1)
+						else if (optind < argc - 1 &&
+								 has_arg == required_argument)
 						{
 							optind++;
 							optarg = argv[optind];
@@ -113,13 +116,18 @@ getopt_long(int argc, char *const argv[],
 						{
 							if (optstring[0] == ':')
 								return BADARG;
-							if (opterr)
+
+							if (opterr && has_arg == required_argument)
 								fprintf(stderr,
-								   "%s: option requires an argument -- %s\n",
+										"%s: option requires an argument -- %s\n",
 										argv[0], place);
+
 							place = EMSG;
 							optind++;
-							return BADCH;
+
+							if (has_arg == required_argument)
+								return BADCH;
+							optarg = NULL;
 						}
 					}
 					else

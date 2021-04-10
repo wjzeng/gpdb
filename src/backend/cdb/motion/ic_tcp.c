@@ -3,7 +3,7 @@
  *	   Interconnect code specific to TCP transport.
  *
  * Portions Copyright (c) 2005-2008, Greenplum, Inc.
- * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
  *
  *
  * IDENTIFICATION
@@ -12,23 +12,15 @@
  *-------------------------------------------------------------------------
  */
 
-#ifdef WIN32
-/*
- * Need this to get WSAPoll (poll). And it
- * has to be set before any header from the Win32 API is loaded.
- */
-#undef _WIN32_WINNT
-#define _WIN32_WINNT 0x0600
-#endif
-
 #include "postgres.h"
 
-#include "nodes/execnodes.h"	/* Slice, SliceTable */
+#include "common/ip.h"
+#include "nodes/execnodes.h"	/* ExecSlice, SliceTable */
 #include "nodes/pg_list.h"
 #include "nodes/print.h"
 #include "miscadmin.h"
 #include "libpq/libpq-be.h"
-#include "libpq/ip.h"
+#include "postmaster/postmaster.h"
 #include "utils/builtins.h"
 
 #include "cdb/cdbselect.h"
@@ -37,12 +29,35 @@
 #include "cdb/cdbvars.h"
 #include "cdb/cdbdisp.h"
 
+#ifdef ENABLE_IC_PROXY
+#include "ic_proxy_backend.h"
+#endif  /* ENABLE_IC_PROXY */
+
 #include <fcntl.h>
 #include <limits.h>
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <sys/time.h>
 #include <netinet/in.h>
+
+#define USECS_PER_SECOND 1000000
+#define MSECS_PER_SECOND 1000
+
+/*
+ * GpMonotonicTime: used to guarantee that the elapsed time is in
+ * the monotonic order between two gp_get_monotonic_time calls.
+ */
+typedef struct GpMonotonicTime
+{
+	struct timeval beginTime;
+	struct timeval endTime;
+} GpMonotonicTime;
+
+static void gp_set_monotonic_begin_time(GpMonotonicTime *time);
+static void gp_get_monotonic_time(GpMonotonicTime *time);
+static inline uint64 gp_get_elapsed_ms(GpMonotonicTime *time);
+static inline uint64 gp_get_elapsed_us(GpMonotonicTime *time);
+static inline int timeCmp(struct timeval *t1, struct timeval *t2);
 
 /*
  * backlog for listen() call: it is important that this be something like a
@@ -55,65 +70,6 @@
 /* listener backlog is calculated at listener-creation time */
 int			listenerBacklog = 128;
 
-#ifdef WIN32
-#define WIN32_LEAN_AND_MEAN
-#ifndef _WIN32_WINNT
-#define _WIN32_WINNT 0x0600
-#endif
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#define SHUT_RDWR SD_BOTH
-#define SHUT_RD SD_RECEIVE
-#define SHUT_WR SD_SEND
-
-/* If we have old platform sdk headers, WSAPoll() might not be there */
-#ifndef POLLIN
-/* Event flag definitions for WSAPoll(). */
-
-#define POLLRDNORM  0x0100
-#define POLLRDBAND  0x0200
-#define POLLIN      (POLLRDNORM | POLLRDBAND)
-#define POLLPRI     0x0400
-
-#define POLLWRNORM  0x0010
-#define POLLOUT     (POLLWRNORM)
-#define POLLWRBAND  0x0020
-
-#define POLLERR     0x0001
-#define POLLHUP     0x0002
-#define POLLNVAL    0x0004
-
-typedef struct pollfd
-{
-
-	SOCKET		fd;
-	SHORT		events;
-	SHORT		revents;
-
-}			WSAPOLLFD, *PWSAPOLLFD, FAR * LPWSAPOLLFD;
-
-__control_entrypoint(DllExport)
-WINSOCK_API_LINKAGE
-int
-			WSAAPI
-WSAPoll(
-		IN OUT LPWSAPOLLFD fdArray,
-		IN ULONG fds,
-		IN INT timeout
-);
-#endif
-
-#define poll WSAPoll
-
-/*
- * Postgres normally uses its own custom select implementation
- * on Windows, but they haven't implemented execeptfds, which
- * we use here.  So, undef this to use the normal Winsock version
- * for now
- */
-#undef select
-#endif
-
 /* our timeout value for select() and other socket operations. */
 static struct timeval tval;
 
@@ -122,18 +78,16 @@ getMotionConn(ChunkTransportStateEntry *pEntry, int iConn)
 {
 	Assert(pEntry);
 	Assert(pEntry->conns);
-	Assert(iConn < pEntry->numConns + pEntry->numPrimaryConns);
+	Assert(iConn < pEntry->numConns);
 
 	return pEntry->conns + iConn;
 }
 
 static ChunkTransportStateEntry *startOutgoingConnections(ChunkTransportState *transportStates,
-						 Slice *sendSlice,
+						 ExecSlice *sendSlice,
 						 int *pOutgoingCount);
 
 static void format_fd_set(StringInfo buf, int nfds, mpp_fd_set *fds, char *pfx, char *sfx);
-static char *format_sockaddr(struct sockaddr *sa, char *buf, int bufsize);
-
 static void setupOutgoingConnection(ChunkTransportState *transportStates,
 						ChunkTransportStateEntry *pEntry, MotionConn *conn);
 static void updateOutgoingConnection(ChunkTransportState *transportStates,
@@ -166,6 +120,11 @@ static bool flushBuffer(ChunkTransportState *transportStates,
 
 static void doSendStopMessageTCP(ChunkTransportState *transportStates, int16 motNodeID);
 
+#ifdef AMS_VERBOSE_LOGGING
+static void dumpEntryConnections(int elevel, ChunkTransportStateEntry *pEntry);
+static void print_connection(ChunkTransportState *transportStates, int fd, const char *msg);
+#endif
+
 /*
  * setupTCPListeningSocket
  */
@@ -187,8 +146,6 @@ setupTCPListeningSocket(int backlog, int *listenerSocketFd, uint16 *listenerPort
 			   *rp;
 	int			s;
 	char		service[32];
-	char		myname[128];
-	char	   *localname = NULL;
 
 	/*
 	 * we let the system pick the TCP port here so we don't have to manage
@@ -197,36 +154,31 @@ setupTCPListeningSocket(int backlog, int *listenerSocketFd, uint16 *listenerPort
 	snprintf(service, 32, "%d", 0);
 	memset(&hints, 0, sizeof(struct addrinfo));
 	hints.ai_family = AF_UNSPEC;	/* Allow IPv4 or IPv6 */
-	hints.ai_socktype = SOCK_STREAM;	/* TCP socket */
+	hints.ai_socktype = SOCK_STREAM;	/* Two-way, out of band connection */
 	hints.ai_flags = AI_PASSIVE;	/* For wildcard IP address */
-	hints.ai_protocol = 0;		/* Any protocol */
+	hints.ai_protocol = 0;		/* Any protocol - TCP implied for network use due to SOCK_STREAM */
 
 	/*
-	 * We use INADDR_ANY if we don't have a valid address for ourselves (e.g.
-	 * QD local connections tend to be AF_UNIX, or on 127.0.0.1 -- so bind
-	 * everything)
+	 * We set interconnect_address on the primary to the local address of the connection from QD
+	 * to the primary, which is the primary's ADDRESS from gp_segment_configuration,
+	 * used for interconnection.
+	 * However it's wrong on the master. Because the connection from the client to the master may
+	 * have different IP addresses as its destination, which is very likely not the master's
+	 * ADDRESS in gp_segment_configuration.
 	 */
-	if (Gp_role == GP_ROLE_DISPATCH ||
-		(MyProcPort->laddr.addr.ss_family != AF_INET &&
-		 MyProcPort->laddr.addr.ss_family != AF_INET6))
-		localname = NULL;		/* We will listen on all network adapters */
-	else
+	if (interconnect_address)
 	{
 		/*
 		 * Restrict what IP address we will listen on to just the one that was
 		 * used to create this QE session.
 		 */
-		getnameinfo((const struct sockaddr *) &(MyProcPort->laddr.addr), MyProcPort->laddr.salen,
-					myname, sizeof(myname),
-					NULL, 0, NI_NUMERICHOST);
 		hints.ai_flags |= AI_NUMERICHOST;
-		localname = myname;
-		elog(DEBUG1, "binding to %s only", localname);
+		ereport(DEBUG1, (errmsg("binding to %s only", interconnect_address)));
 		if (gp_log_interconnect >= GPVARS_VERBOSITY_DEBUG)
-			ereport(DEBUG4, (errmsg("binding listener %s", localname)));
+			ereport(DEBUG4, (errmsg("binding listener %s", interconnect_address)));
 	}
 
-	s = getaddrinfo(localname, service, &hints, &addrs);
+	s = getaddrinfo(interconnect_address, service, &hints, &addrs);
 	if (s != 0)
 		elog(ERROR, "getaddrinfo says %s", gai_strerror(s));
 
@@ -331,9 +283,10 @@ error:
 		closesocket(fd);
 	errno = errnoSave;
 	freeaddrinfo(addrs);
-	ereport(ERROR, (errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
-					errmsg("Interconnect Error: Could not set up tcp listener socket."),
-					errdetail("%s: %m", fun)));
+	ereport(ERROR,
+			(errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
+			 errmsg("interconnect Error: Could not set up tcp listener socket"),
+			 errdetail("%s: %m", fun)));
 }								/* setupListeningSocket */
 
 /*
@@ -344,10 +297,6 @@ InitMotionTCP(int *listenerSocketFd, uint16 *listenerPort)
 {
 	tval.tv_sec = 0;
 	tval.tv_usec = 500000;
-
-#ifdef pg_on_solaris
-	listenerBacklog = Min(1024, Max(getgpsegmentCount() * 4, listenerBacklog));
-#endif
 
 	setupTCPListeningSocket(listenerBacklog, listenerSocketFd, listenerPort);
 
@@ -465,25 +414,24 @@ readPacket(MotionConn *conn, ChunkTransportState *transportStates)
 						continue;
 					else if (n < 0)
 					{
-						ereport(ERROR, (errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
-										errmsg("Interconnect error reading an incoming packet."),
-										errdetail("%s from seg%d at %s: %m",
-												  "select",
-												  conn->remoteContentId,
-												  conn->remoteHostAndPort)));
+						ereport(ERROR,
+								(errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
+								 errmsg("interconnect error reading an incoming packet"),
+								 errdetail("select from seg%d at %s: %m",
+										   conn->remoteContentId,
+										   conn->remoteHostAndPort)));
 					}
-
 				}
 				while (n < 1);
 			}
 			else
 			{
-				ereport(ERROR, (errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
-								errmsg("Interconnect error reading an incoming packet."),
-								errdetail("%s from seg%d at %s: %m",
-										  "read",
-										  conn->remoteContentId,
-										  conn->remoteHostAndPort)));
+				ereport(ERROR,
+						(errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
+						 errmsg("interconnect error reading an incoming packet"),
+						 errdetail("read from seg%d at %s: %m",
+								   conn->remoteContentId,
+								   conn->remoteHostAndPort)));
 			}
 		}
 		else if (n == 0)
@@ -492,10 +440,11 @@ readPacket(MotionConn *conn, ChunkTransportState *transportStates)
 			elog(DEBUG5, "readpacket(); breaking in while (fd %d) recvBytes %d msgSize %d", conn->sockfd, conn->recvBytes, conn->msgSize);
 			print_connection(transportStates, conn->sockfd, "interconnect error on");
 #endif
-			ereport(ERROR, (errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
-							errmsg("Interconnect error: connection closed prematurely."),
-							errdetail("from Remote Connection: contentId=%d at %s",
-									  conn->remoteContentId, conn->remoteHostAndPort)));
+			ereport(ERROR,
+					(errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
+					 errmsg("interconnect error: connection closed prematurely"),
+					 errdetail("from Remote Connection: contentId=%d at %s",
+							   conn->remoteContentId, conn->remoteHostAndPort)));
 			break;
 		}
 		else
@@ -551,24 +500,22 @@ flushIncomingData(int fd)
  */
 static ChunkTransportStateEntry *
 startOutgoingConnections(ChunkTransportState *transportStates,
-						 Slice *sendSlice,
+						 ExecSlice *sendSlice,
 						 int *pOutgoingCount)
 {
 	ChunkTransportStateEntry *pEntry;
 	MotionConn *conn;
 	ListCell   *cell;
-	Slice	   *recvSlice;
+	ExecSlice  *recvSlice;
 	CdbProcess *cdbProc;
 
 	*pOutgoingCount = 0;
 
-	recvSlice = (Slice *) list_nth(transportStates->sliceTable->slices, sendSlice->parentIndex);
-
-	adjustMasterRouting(recvSlice);
+	recvSlice = &transportStates->sliceTable->slices[sendSlice->parentIndex];
 
 	if (gp_interconnect_aggressive_retry)
 	{
-		if ((list_length(recvSlice->children) * sendSlice->gangSize) > listenerBacklog)
+		if ((list_length(recvSlice->children) * list_length(sendSlice->segments)) > listenerBacklog)
 			transportStates->aggressiveRetry = true;
 	}
 	else
@@ -586,8 +533,7 @@ startOutgoingConnections(ChunkTransportState *transportStates,
 
 	/*
 	 * Setup a MotionConn entry for each of our outbound connections. Request
-	 * a connection to each receiving backend's listening port. NB: Some
-	 * mirrors could be down & have no CdbProcess entry.
+	 * a connection to each receiving backend's listening port.
 	 */
 	conn = pEntry->conns;
 
@@ -624,7 +570,6 @@ setupOutgoingConnection(ChunkTransportState *transportStates, ChunkTransportStat
 {
 	CdbProcess *cdbProc = conn->cdbProc;
 
-	int			sockopt;
 	int			n;
 
 	int			ret;
@@ -644,9 +589,6 @@ setupOutgoingConnection(ChunkTransportState *transportStates, ChunkTransportStat
 	 * IP addr might be IPv6, it might have ':' embedded, so in that case, put
 	 * '[]' around it so we can see that the string is an IP and port
 	 * (otherwise it might look just like an IP).
-	 *
-	 * Should we really put this info into these fields? Later we replace this
-	 * with the source IP and port (after the bind call).
 	 */
 	if (strchr(cdbProc->listenerAddr, ':') != 0)
 		snprintf(conn->remoteHostAndPort, sizeof(conn->remoteHostAndPort),
@@ -661,6 +603,30 @@ setupOutgoingConnection(ChunkTransportState *transportStates, ChunkTransportStat
 		closesocket(conn->sockfd);
 		conn->sockfd = -1;
 	}
+
+#ifdef ENABLE_IC_PROXY
+	if (Gp_interconnect_type == INTERCONNECT_TYPE_PROXY)
+	{
+		/* 
+		 * Using libuv pipe to register backend to proxy.
+		 * ic_proxy_backend_connect only appends the connect request into
+		 * connection queue and waits for the libuv_run_loop to handle the queue. 
+		 */
+		ic_proxy_backend_connect(transportStates->proxyContext,
+								 pEntry, conn, true);
+
+		conn->pBuff = palloc(Gp_max_packet_size);
+		conn->recvBytes = 0;
+		conn->msgPos = NULL;
+		conn->msgSize = PACKET_HEADER_SIZE;
+
+		conn->state = mcsStarted;
+		conn->stillActive = true;
+		conn->tupleCount = 0;
+		conn->remoteContentId = conn->cdbProc->contentid;
+		return;
+	}
+#endif  /* ENABLE_IC_PROXY */
 
 	/* Initialize hint structure */
 	MemSet(&hint, 0, sizeof(hint));
@@ -700,102 +666,17 @@ setupOutgoingConnection(ChunkTransportState *transportStates, ChunkTransportStat
 	 */
 	conn->sockfd = socket(addrs->ai_family, addrs->ai_socktype, addrs->ai_protocol);
 	if (conn->sockfd < 0)
-		ereport(ERROR, (errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
-						errmsg("Interconnect error setting up outgoing "
-							   "connection."),
-						errdetail("%s: %m", "socket")));
+		ereport(ERROR,
+				(errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
+				 errmsg("interconnect error setting up outgoing connection"),
+				 errdetail("%s: %m", "socket")));
 
 	/* make socket non-blocking BEFORE we connect. */
 	if (!pg_set_noblock(conn->sockfd))
-	{
-		ereport(ERROR, (errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
-						errmsg("Interconnect error setting up outgoing "
-							   "connection."),
-						errdetail("%s: %m", "fcntl(O_NONBLOCK)")));
-	}
-
-	/* Allow bind() to succeed even if the port is in TIME_WAIT state. */
-	sockopt = 1;
-	if (setsockopt(conn->sockfd, SOL_SOCKET, SO_REUSEADDR,
-				   (void *) &sockopt, sizeof(sockopt)) < 0)
-		ereport(ERROR, (errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
-						errmsg("Interconnect error setting up outgoing "
-							   "connection."),
-						errdetail("%s: %m", "setsockopt(SO_REUSEADDR)")));
-
-
-	/*
-	 * To help with fault tolerance, try to use the same LAN adapter as was
-	 * used to connect the session to us.
-	 *
-	 * Bind that IP address to the socket.   But, we must insure that the
-	 * source address is the same address family as the destination address.
-	 *
-	 * The is especially important to check on the QD, since local sessions
-	 * are often AF_UNIX, and even if TCP, they could be either v6 or v4.
-	 *
-	 */
-
-
-	struct sockaddr_storage saddr;
-	int			saddr_len = addrs->ai_addrlen;
-
-	memset(&saddr, 0, sizeof(saddr));
-
-	if (MyProcPort->laddr.addr.ss_family == addrs->ai_family)
-	{
-		/* We need to copy the address so we can clear the port */
-
-		memcpy(&saddr, &MyProcPort->laddr.addr, MyProcPort->laddr.salen);
-		if (saddr.ss_family == AF_INET)
-			((struct sockaddr_in *) &saddr)->sin_port = 0;	/* pick any available
-															 * outbound port */
-		else if (saddr.ss_family == AF_INET6)
-			((struct sockaddr_in6 *) &saddr)->sin6_port = 0;
-
-
-		if (gp_log_interconnect >= GPVARS_VERBOSITY_DEBUG)
-		{
-			char		debugmsg[128];
-
-			inet_ntop(saddr.ss_family, (struct sockaddr *) &saddr, debugmsg, sizeof(debugmsg));
-			ereport(DEBUG4, (errmsg("bind outbound  %s", debugmsg)));
-		}
-	}
-	else
-	{
-		/*
-		 * bind to the "any ip address" "any port".  Not really necessary to
-		 * use bind() but this allows us to get the system assigned source IP
-		 * and port without waiting until after the connect() call.
-		 */
-		saddr.ss_family = addrs->ai_family;
-
-		/*
-		 * We could set the address to INADDR_ANY or INADDR_ANY6 but those are
-		 * just zeros anyway
-		 */
-	}
-
-	if (bind(conn->sockfd, (struct sockaddr *) &saddr, saddr_len) < 0)
-	{
-		char		debugmsg[128];
-
-		inet_ntop(saddr.ss_family, (struct sockaddr *) &saddr, debugmsg, sizeof(debugmsg));
-		/* Should never get EADDRINUSE because we know it's our port. */
-		ereport(ERROR, (errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
-						errmsg("Interconnect error setting up outgoing "
-							   "connection."),
-						errdetail("Could not bind to local addr %s. %m",
-								  debugmsg)));
-	}
-
-	/*
-	 * Get the source IP address and Port
-	 */
-	format_sockaddr((struct sockaddr *) &saddr, conn->remoteHostAndPort,
-					sizeof(conn->remoteHostAndPort));
-
+		ereport(ERROR,
+				(errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
+				 errmsg("interconnect error setting up outgoing connection"),
+				 errdetail("%s: %m", "fcntl(O_NONBLOCK)")));
 
 	if (gp_log_interconnect >= GPVARS_VERBOSITY_DEBUG)
 		ereport(DEBUG1, (errmsg("Interconnect connecting to seg%d slice%d %s "
@@ -860,13 +741,12 @@ updateOutgoingConnection(ChunkTransportState *transportStates, ChunkTransportSta
 				   (void *) &errnoSave, &sizeoferrno))
 	{
 		/* getsockopt failed */
-		ereport(ERROR, (errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
-						errmsg("Interconnect could not connect to seg%d %s",
-							   conn->remoteContentId,
-							   conn->remoteHostAndPort),
-						errdetail("%s sockfd=%d: %m",
-								  "getsockopt(SO_ERROR)",
-								  conn->sockfd)));
+		ereport(ERROR,
+				(errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
+				 errmsg("interconnect could not connect to seg%d %s",
+						conn->remoteContentId, conn->remoteHostAndPort),
+				 errdetail("%s sockfd=%d: %m",
+						   "getsockopt(SO_ERROR)", conn->sockfd)));
 	}
 
 	switch (errnoSave)
@@ -877,14 +757,11 @@ updateOutgoingConnection(ChunkTransportState *transportStates, ChunkTransportSta
 			return;
 		default:
 			errno = errnoSave;
-			ereport(LOG, (errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
-						  errmsg("Interconnect could not connect to seg%d %s "
-								 "pid=%d; "
-								 "will retry. %s: %m",
-								 conn->remoteContentId,
-								 conn->remoteHostAndPort,
-								 conn->cdbProc->pid,
-								 "connect")));
+			ereport(LOG,
+					(errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
+					 errmsg("interconnect could not connect to seg%d %s pid=%d; will retry; %s: %m",
+							conn->remoteContentId, conn->remoteHostAndPort,
+							conn->cdbProc->pid, "connect")));
 			break;
 	}
 
@@ -913,6 +790,7 @@ sendRegisterMessage(ChunkTransportState *transportStates, ChunkTransportStateEnt
 {
 	int			bytesToSend;
 	int			bytesSent;
+	SliceTable	*sliceTbl = transportStates->sliceTable;
 
 	if (conn->state != mcsSendRegMsg)
 	{
@@ -923,37 +801,31 @@ sendRegisterMessage(ChunkTransportState *transportStates, ChunkTransportStateEnt
 		Assert(conn->cdbProc &&
 			   conn->pBuff &&
 			   sizeof(*regMsg) <= Gp_max_packet_size);
-		Assert(pEntry->recvSlice &&
-			   pEntry->sendSlice &&
-			   IsA(pEntry->recvSlice, Slice) &&
-			   IsA(pEntry->sendSlice, Slice));
 
 		/* Save local host and port for log messages. */
 		addrsize = sizeof(localAddr);
 		if (getsockname(conn->sockfd, (struct sockaddr *) &localAddr, &addrsize))
 		{
-			ereport(ERROR, (errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
-							errmsg("Interconnect error after making connection."),
-							errdetail("%s sockfd=%d remote=%s: %m",
-									  "getsockname",
-									  conn->sockfd,
-									  conn->remoteHostAndPort)));
+			ereport(ERROR,
+					(errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
+					 errmsg("interconnect error after making connection"),
+					 errdetail("getsockname sockfd=%d remote=%s: %m",
+							   conn->sockfd, conn->remoteHostAndPort)));
 		}
-		format_sockaddr((struct sockaddr *) &localAddr, conn->localHostAndPort,
+		format_sockaddr(&localAddr, conn->localHostAndPort,
 						sizeof(conn->localHostAndPort));
 
 		if (gp_log_interconnect >= GPVARS_VERBOSITY_VERBOSE)
-			ereport(LOG, (errmsg("Interconnect sending registration message "
-								 "to seg%d slice%d %s pid=%d "
-								 "from seg%d slice%d %s sockfd=%d",
-								 conn->remoteContentId,
-								 pEntry->recvSlice->sliceIndex,
-								 conn->remoteHostAndPort,
-								 conn->cdbProc->pid,
-								 GpIdentity.segindex,
-								 pEntry->sendSlice->sliceIndex,
-								 conn->localHostAndPort,
-								 conn->sockfd)));
+			ereport(LOG,
+					(errmsg("interconnect sending registration message to seg%d slice%d %s pid=%d from seg%d slice%d %s sockfd=%d",
+							conn->remoteContentId,
+							pEntry->recvSlice->sliceIndex,
+							conn->remoteHostAndPort,
+							conn->cdbProc->pid,
+							GpIdentity.segindex,
+							pEntry->sendSlice->sliceIndex,
+							conn->localHostAndPort,
+							conn->sockfd)));
 
 		regMsg->msgBytes = sizeof(*regMsg);
 		regMsg->recvSliceIndex = pEntry->recvSlice->sliceIndex;
@@ -963,7 +835,7 @@ sendRegisterMessage(ChunkTransportState *transportStates, ChunkTransportStateEnt
 		regMsg->srcListenerPort = Gp_listener_port & 0x0ffff;
 		regMsg->srcPid = MyProcPid;
 		regMsg->srcSessionId = gp_session_id;
-		regMsg->srcCommandCount = gp_interconnect_id;
+		regMsg->srcCommandCount = sliceTbl->ic_instance_id;
 
 
 		conn->state = mcsSendRegMsg;
@@ -986,16 +858,15 @@ sendRegisterMessage(ChunkTransportState *transportStates, ChunkTransportStateEnt
 			ML_CHECK_FOR_INTERRUPTS(transportStates->teardownActive);
 		else
 		{
-			ereport(ERROR, (errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
-							errmsg("Interconnect error writing registration "
-								   "message to seg%d at %s",
-								   conn->remoteContentId,
-								   conn->remoteHostAndPort),
-							errdetail("%s pid=%d sockfd=%d local=%s: %m",
-									  "write",
-									  conn->cdbProc->pid,
-									  conn->sockfd,
-									  conn->localHostAndPort)));
+			ereport(ERROR,
+					(errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
+					 errmsg("interconnect error writing registration message to seg%d at %s",
+							conn->remoteContentId,
+							conn->remoteHostAndPort),
+					 errdetail("write pid=%d sockfd=%d local=%s: %m",
+							   conn->cdbProc->pid,
+							   conn->sockfd,
+							   conn->localHostAndPort)));
 		}
 	}
 
@@ -1031,6 +902,7 @@ readRegisterMessage(ChunkTransportState *transportStates,
 	ChunkTransportStateEntry *pEntry = NULL;
 	CdbProcess *cdbproc = NULL;
 	ListCell	*lc;
+	SliceTable	*sliceTbl = transportStates->sliceTable;
 
 	/* Get ready to receive the Register message. */
 	if (conn->state != mcsRecvRegMsg)
@@ -1066,13 +938,13 @@ readRegisterMessage(ChunkTransportState *transportStates,
 			ML_CHECK_FOR_INTERRUPTS(transportStates->teardownActive);
 		else
 		{
-			ereport(ERROR, (errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
-							errmsg("Interconnect error reading register message "
-								   "from %s", conn->remoteHostAndPort),
-							errdetail("%s sockfd=%d local=%s: %m",
-									  "read",
-									  conn->sockfd,
-									  conn->localHostAndPort)));
+			ereport(ERROR,
+					(errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
+					 errmsg("interconnect error reading register message from %s",
+							conn->remoteHostAndPort),
+					 errdetail("read sockfd=%d local=%s: %m",
+							   conn->sockfd,
+							   conn->localHostAndPort)));
 		}
 	}
 
@@ -1093,18 +965,18 @@ readRegisterMessage(ChunkTransportState *transportStates,
 	/* Check for valid message format. */
 	if (msg.msgBytes != sizeof(*regMsg))
 	{
-		ereport(ERROR, (errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
-						errmsg("Interconnect error reading register message "
-							   "from %s: format not recognized",
-							   conn->remoteHostAndPort),
-						errdetail("msgBytes=%d expected=%d sockfd=%d local=%s",
-								  msg.msgBytes, (int) sizeof(*regMsg),
-								  conn->sockfd, conn->localHostAndPort)));
+		ereport(ERROR,
+				(errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
+				 errmsg("interconnect error reading register message from %s: format not recognized",
+						conn->remoteHostAndPort),
+				 errdetail("msgBytes=%d expected=%d sockfd=%d local=%s",
+						   msg.msgBytes, (int) sizeof(*regMsg),
+						   conn->sockfd, conn->localHostAndPort)));
 	}
 
 	/* get rid of old connections first */
 	if (msg.srcSessionId != gp_session_id ||
-		msg.srcCommandCount < gp_interconnect_id)
+		msg.srcCommandCount < sliceTbl->ic_instance_id)
 	{
 		/*
 		 * This is an old connection, which can be safely ignored. We get this
@@ -1115,7 +987,7 @@ readRegisterMessage(ChunkTransportState *transportStates,
 		elog(LOG, "Received invalid, old registration message: "
 			 "will ignore ('expected:received' session %d:%d ic-id %d:%d)",
 			 gp_session_id, msg.srcSessionId,
-			 gp_interconnect_id, msg.srcCommandCount);
+			 sliceTbl->ic_instance_id, msg.srcCommandCount);
 
 		goto old_conn;
 	}
@@ -1131,17 +1003,15 @@ readRegisterMessage(ChunkTransportState *transportStates,
 	else
 	{
 		/* something is wrong */
-		ereport(ERROR, (errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
-						errmsg("Interconnect error: Invalid registration "
-							   "message received from %s.",
-							   conn->remoteHostAndPort),
-						errdetail("sendSlice=%d recvSlice=%d srcContentId=%d "
-								  "srcPid=%d srcListenerPort=%d "
-								  "srcSessionId=%d srcCommandCount=%d motnode=%d",
-								  msg.sendSliceIndex, msg.recvSliceIndex,
-								  msg.srcContentId, msg.srcPid,
-								  msg.srcListenerPort, msg.srcSessionId,
-								  msg.srcCommandCount, msg.sendSliceIndex)));
+		ereport(ERROR,
+				(errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
+				 errmsg("interconnect error: Invalid registration message received from %s",
+						conn->remoteHostAndPort),
+				 errdetail("sendSlice=%d recvSlice=%d srcContentId=%d srcPid=%d srcListenerPort=%d srcSessionId=%d srcCommandCount=%d motnode=%d",
+						   msg.sendSliceIndex, msg.recvSliceIndex,
+						   msg.srcContentId, msg.srcPid,
+						   msg.srcListenerPort, msg.srcSessionId,
+						   msg.srcCommandCount, msg.sendSliceIndex)));
 	}
 
 	/*
@@ -1166,14 +1036,13 @@ readRegisterMessage(ChunkTransportState *transportStates,
 
 	if (iconn == list_length(pEntry->sendSlice->primaryProcesses))
 	{
-		ereport(ERROR, (errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
-						errmsg("Interconnect error: Invalid registration "
-							   "message received from %s.",
-							   conn->remoteHostAndPort),
-						errdetail("sendSlice=%d srcContentId=%d "
-								  "srcPid=%d srcListenerPort=%d",
-								  msg.sendSliceIndex, msg.srcContentId,
-								  msg.srcPid, msg.srcListenerPort)));
+		ereport(ERROR,
+				(errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
+				 errmsg("interconnect error: Invalid registration message received from %s",
+						conn->remoteHostAndPort),
+				 errdetail("sendSlice=%d srcContentId=%d srcPid=%d srcListenerPort=%d",
+						   msg.sendSliceIndex, msg.srcContentId,
+						   msg.srcPid, msg.srcListenerPort)));
 	}
 
 	/*
@@ -1185,30 +1054,23 @@ readRegisterMessage(ChunkTransportState *transportStates,
 	if (newConn->sockfd != -1 ||
 		newConn->state != mcsNull)
 	{
-		ereport(ERROR, (errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
-						errmsg("Interconnect error: Duplicate registration "
-							   "message received from %s.",
-							   conn->remoteHostAndPort),
-						errdetail("Already accepted registration from %s for "
-								  "sendSlice=%d srcContentId=%d "
-								  "srcPid=%d srcListenerPort=%d",
-								  newConn->remoteHostAndPort,
-								  msg.sendSliceIndex, msg.srcContentId,
-								  msg.srcPid, msg.srcListenerPort)));
+		ereport(ERROR,
+				(errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
+				 errmsg("interconnect error: Duplicate registration message received from %s",
+						conn->remoteHostAndPort),
+				 errdetail("Already accepted registration from %s for sendSlice=%d srcContentId=%d srcPid=%d srcListenerPort=%d",
+						   newConn->remoteHostAndPort, msg.sendSliceIndex,
+						   msg.srcContentId, msg.srcPid, msg.srcListenerPort)));
 	}
 
 	/* message looks good */
 	if (gp_log_interconnect >= GPVARS_VERBOSITY_VERBOSE)
 	{
-		ereport(LOG, (errmsg("Interconnect seg%d slice%d sockfd=%d accepted "
-							 "registration message from seg%d slice%d %s pid=%d",
-							 GpIdentity.segindex,
-							 msg.recvSliceIndex,
-							 conn->sockfd,
-							 msg.srcContentId,
-							 msg.sendSliceIndex,
-							 conn->remoteHostAndPort,
-							 msg.srcPid)));
+		ereport(LOG,
+				(errmsg("interconnect seg%d slice%d sockfd=%d accepted registration message from seg%d slice%d %s pid=%d",
+						GpIdentity.segindex, msg.recvSliceIndex, conn->sockfd,
+						msg.srcContentId, msg.sendSliceIndex,
+						conn->remoteHostAndPort, msg.srcPid)));
 	}
 
 	/* Copy caller's temporary MotionConn to its assigned slot. */
@@ -1303,34 +1165,30 @@ acceptIncomingConnection(void)
 #endif
 			case EOPNOTSUPP:
 				/* Shouldn't get these errors unless there is a bug. */
-				ereport(ERROR, (errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
-								errmsg("Interconnect error on listener port %d",
-									   Gp_listener_port),
-								errdetail("%s sockfd=%d: %m",
-										  "accept",
-										  TCP_listenerFd)));
+				ereport(ERROR,
+						(errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
+						 errmsg("interconnect error on listener port %d",
+								Gp_listener_port),
+						 errdetail("accept sockfd=%d: %m", TCP_listenerFd)));
 				break;			/* not reached */
 			case ENOMEM:
 			case ENFILE:
 			case EMFILE:
 			case ENOBUFS:
 				/* Out of resources. */
-				ereport(ERROR, (errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
-								errmsg("Interconnect error on listener port %d",
-									   Gp_listener_port),
-								errdetail("%s sockfd=%d: %m",
-										  "accept",
-										  TCP_listenerFd)));
+				ereport(ERROR,
+						(errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
+						 errmsg("interconnect error on listener port %d",
+								Gp_listener_port),
+						 errdetail("accept sockfd=%d: %m", TCP_listenerFd)));
 				break;			/* not reached */
 			default:
 				/* Network problem, connection aborted, etc.  Continue. */
-				ereport(LOG, (errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
-							  errmsg("Interconnect connection request not "
-									 "completed on listener port %d",
-									 Gp_listener_port),
-							  errdetail("%s sockfd=%d: %m",
-										"accept",
-										TCP_listenerFd)));
+				ereport(LOG,
+						(errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
+						 errmsg("interconnect connection request not completed on listener port %d",
+								Gp_listener_port),
+						 errdetail("accept sockfd=%d: %m", TCP_listenerFd)));
 		}						/* switch (errno) */
 	}							/* loop until success or EWOULDBLOCK */
 
@@ -1349,31 +1207,29 @@ acceptIncomingConnection(void)
 	conn->remoteContentId = -2;
 
 	/* Save remote and local host:port strings for error messages. */
-	format_sockaddr((struct sockaddr *) &remoteAddr, conn->remoteHostAndPort,
+	format_sockaddr(&remoteAddr, conn->remoteHostAndPort,
 					sizeof(conn->remoteHostAndPort));
 	addrsize = sizeof(localAddr);
 	if (getsockname(newsockfd, (struct sockaddr *) &localAddr, &addrsize))
 	{
-		ereport(ERROR, (errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
-						errmsg("Interconnect error after accepting connection."),
-						errdetail("%s sockfd=%d remote=%s: %m",
-								  "getsockname",
-								  newsockfd,
-								  conn->remoteHostAndPort)));
+		ereport(ERROR,
+				(errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
+				 errmsg("interconnect error after accepting connection"),
+				 errdetail("getsockname sockfd=%d remote=%s: %m",
+						   newsockfd, conn->remoteHostAndPort)));
 	}
-	format_sockaddr((struct sockaddr *) &localAddr, conn->localHostAndPort,
+	format_sockaddr(&localAddr, conn->localHostAndPort,
 					sizeof(conn->localHostAndPort));
 
 	/* make socket non-blocking */
 	if (!pg_set_noblock(newsockfd))
 	{
-		ereport(ERROR, (errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
-						errmsg("Interconnect error after accepting connection."),
-						errdetail("%s sockfd=%d remote=%s local=%s: %m",
-								  "fcntl(O_NONBLOCK)",
-								  newsockfd,
-								  conn->remoteHostAndPort,
-								  conn->localHostAndPort)));
+		ereport(ERROR,
+				(errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
+				 errmsg("interconnect error after accepting connection"),
+				 errdetail("fcntl(O_NONBLOCK) sockfd=%d remote=%s local=%s: %m",
+						   newsockfd, conn->remoteHostAndPort,
+						   conn->localHostAndPort)));
 	}
 
 	if (gp_log_interconnect >= GPVARS_VERBOSITY_DEBUG)
@@ -1392,8 +1248,8 @@ SetupTCPInterconnect(EState *estate)
 				index,
 				n;
 	ListCell   *cell;
-	Slice	   *mySlice;
-	Slice	   *aSlice;
+	ExecSlice  *mySlice;
+	ExecSlice  *aSlice;
 	MotionConn *conn;
 	SliceTable *sliceTable = estate->es_sliceTable;
 	int			incoming_count = 0;
@@ -1410,7 +1266,7 @@ SetupTCPInterconnect(EState *estate)
 	ChunkTransportStateEntry *sendingChunkTransportState = NULL;
 	ChunkTransportState *interconnect_context;
 
-	SIMPLE_FAULT_INJECTOR(InterconnectSetupPalloc);
+	SIMPLE_FAULT_INJECTOR("interconnect_setup_palloc");
 	interconnect_context = palloc0(sizeof(ChunkTransportState));
 
 	/* initialize state variables */
@@ -1421,6 +1277,7 @@ SetupTCPInterconnect(EState *estate)
 
 	interconnect_context->teardownActive = false;
 	interconnect_context->activated = false;
+	interconnect_context->networkTimeoutIsLogged = false;
 	interconnect_context->incompleteConns = NIL;
 	interconnect_context->sliceTable = copyObject(sliceTable);
 	interconnect_context->sliceId = sliceTable->localSlice;
@@ -1431,37 +1288,38 @@ SetupTCPInterconnect(EState *estate)
 	interconnect_context->SendChunk = SendChunkTCP;
 	interconnect_context->doSendStopMessage = doSendStopMessageTCP;
 
-	mySlice = (Slice *) list_nth(interconnect_context->sliceTable->slices, sliceTable->localSlice);
+#ifdef ENABLE_IC_PROXY
+	ic_proxy_backend_init_context(interconnect_context);
+#endif /* ENABLE_IC_PROXY */
+
+	mySlice = &interconnect_context->sliceTable->slices[sliceTable->localSlice];
 
 	Assert(sliceTable &&
-		   IsA(mySlice, Slice) &&
 		   mySlice->sliceIndex == sliceTable->localSlice);
 
-	gp_interconnect_id = interconnect_context->sliceTable->ic_instance_id;
-
 	gp_set_monotonic_begin_time(&startTime);
-
-	/* Initiate outgoing connections. */
-	if (mySlice->parentIndex != -1)
-		sendingChunkTransportState = startOutgoingConnections(interconnect_context, mySlice, &expectedTotalOutgoing);
 
 	/* now we'll do some setup for each of our Receiving Motion Nodes. */
 	foreach(cell, mySlice->children)
 	{
 		int			totalNumProcs;
 		int			childId = lfirst_int(cell);
+		ChunkTransportStateEntry *pEntry = NULL;
 
 #ifdef AMS_VERBOSE_LOGGING
 		elog(DEBUG5, "Setting up RECEIVING motion node %d", childId);
 #endif
 
-		aSlice = (Slice *) list_nth(interconnect_context->sliceTable->slices, childId);
+		aSlice = &interconnect_context->sliceTable->slices[childId];
 
 		/*
 		 * If we're using directed-dispatch we have dummy primary-process
 		 * entries, so we count the entries.
 		 */
 		totalNumProcs = list_length(aSlice->primaryProcesses);
+
+		pEntry = createChunkTransportState(interconnect_context, aSlice, mySlice, totalNumProcs);
+
 		for (i = 0; i < totalNumProcs; i++)
 		{
 			CdbProcess *cdbProc;
@@ -1469,10 +1327,81 @@ SetupTCPInterconnect(EState *estate)
 			cdbProc = list_nth(aSlice->primaryProcesses, i);
 			if (cdbProc)
 				expectedTotalIncoming++;
-		}
 
-		(void) createChunkTransportState(interconnect_context, aSlice, mySlice, totalNumProcs);
+#ifdef ENABLE_IC_PROXY
+			if (Gp_interconnect_type == INTERCONNECT_TYPE_PROXY)
+			{
+				conn = &pEntry->conns[i];
+				conn->cdbProc = list_nth(aSlice->primaryProcesses, i);
+
+				if (conn->cdbProc)
+				{
+					incoming_count++;
+
+					/* 
+					 * Using libuv pipe to register backend to proxy.
+					 * ic_proxy_backend_connect only appends the connect request
+					 * into connection queue and waits for the libuv_run_loop to
+					 * handle the queue. 
+					 */
+					ic_proxy_backend_connect(interconnect_context->proxyContext,
+											 pEntry, conn, false /* isSender */);
+
+					conn->pBuff = palloc(Gp_max_packet_size);
+					conn->recvBytes = 0;
+					conn->msgPos = NULL;
+					conn->msgSize = 0;
+
+					conn->state = mcsStarted;
+					conn->stillActive = true;
+					conn->tupleCount = 0;
+					conn->remoteContentId = conn->cdbProc->contentid;
+
+					conn->remapper = CreateTupleRemapper();
+				}
+			}
+#endif  /* ENABLE_IC_PROXY */
+		}
 	}
+
+	/*
+	 * Initiate outgoing connections.
+	 *
+	 * startOutgoingConnections() and createChunkTransportState() must not be
+	 * called during the lifecycle of sendingChunkTransportState, they will
+	 * repalloc() interconnect_context->states so sendingChunkTransportState
+	 * points to invalid memory.
+	 */
+	if (mySlice->parentIndex != -1)
+		sendingChunkTransportState = startOutgoingConnections(interconnect_context, mySlice, &expectedTotalOutgoing);
+
+#ifdef ENABLE_IC_PROXY
+	if (Gp_interconnect_type == INTERCONNECT_TYPE_PROXY)
+	{
+		for (i = 0; i < expectedTotalOutgoing; i++)
+		{
+			conn = &sendingChunkTransportState->conns[i];
+			setupOutgoingConnection(interconnect_context,
+									sendingChunkTransportState, conn);
+		}
+		outgoing_count = expectedTotalOutgoing;
+	}
+	/*
+	 * Before ic_proxy_backend_run_loop, we have already gone though all the
+	 * incoming and outgoing connections and append them into the connect queue.
+	 * ic_proxy_backend_run_loop will trigger the uv_loop and begin to handle
+	 * the connect event in parallel and asynchronous way.
+	 *
+	 * Note that the domain socket fds are binded to libuv pipe handle, but we
+	 * still depends on ic_tcp code to send/recv interconnect data based on
+	 * these fds and close these fds in teardown function. As a result, we
+	 * should not touch the libuv pipe handles until ic_tcp close all the fds in
+	 * teardown function. In future, we should retire the ic_tcp code in ic_proxy
+	 * backend and use libuv to handle connection setup, data transfer and
+	 * teardown in a unified way.
+	 */
+	ic_proxy_backend_run_loop(interconnect_context->proxyContext);
+#endif  /* ENABLE_IC_PROXY */
 
 	if (expectedTotalIncoming > listenerBacklog)
 		ereport(WARNING, (errmsg("SetupTCPInterconnect: too many expected incoming connections(%d), Interconnect setup might possibly fail", expectedTotalIncoming),
@@ -1498,6 +1427,7 @@ SetupTCPInterconnect(EState *estate)
 		int			highsock = -1;
 		uint64		timeout_ms = 20 * 60 * 1000;
 		int			outgoing_fail_count = 0;
+		int			select_errno;
 
 		iteration++;
 
@@ -1725,7 +1655,11 @@ SetupTCPInterconnect(EState *estate)
 
 		ML_CHECK_FOR_INTERRUPTS(interconnect_context->teardownActive);
 		n = select(highsock + 1, (fd_set *) &rset, (fd_set *) &wset, (fd_set *) &eset, &timeout);
+		select_errno = errno;
+
 		ML_CHECK_FOR_INTERRUPTS(interconnect_context->teardownActive);
+		if (Gp_role == GP_ROLE_DISPATCH)
+			checkForCancelFromQD(interconnect_context);
 
 		elapsed_ms = gp_get_elapsed_ms(&startTime);
 
@@ -1739,7 +1673,6 @@ SetupTCPInterconnect(EState *estate)
 			{
 				int			elevel = (n == expectedTotalIncoming + expectedTotalOutgoing)
 				? DEBUG1 : LOG;
-				int			errnoSave = errno;
 
 				initStringInfo(&logbuf);
 				if (n > 0)
@@ -1755,16 +1688,18 @@ SetupTCPInterconnect(EState *estate)
 										elapsed_ms, logbuf.data)));
 				pfree(logbuf.data);
 				MemSet(&logbuf, 0, sizeof(logbuf));
-				errno = errnoSave;
 			}
 		}
 
+		/* An error other than EINTR is not acceptable */
 		if (n < 0)
 		{
-			if (errno == EINTR)
+			if (select_errno == EINTR)
 				continue;
-			ereport(ERROR, (errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
-							errmsg("Interconnect error: %s: %m", "select")));
+			ereport(ERROR,
+					(errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
+					 errmsg("interconnect error in select: %s",
+							strerror(select_errno))));
 		}
 
 		/*
@@ -1958,20 +1893,14 @@ SetupTCPInterconnect(EState *estate)
  * This context is destroyed at the end of the query and all memory that gets
  * allocated under it is free'd.  We don't have have to worry about pfree() but
  * we definitely have to worry about socket resources.
- *
- * If forceEOS is set, we force end-of-stream notifications out any send-nodes,
- * and we wrap that send in a PG_TRY/CATCH block because the goal is to reduce
- * confusion (and if we're being shutdown abnormally anyhow, let's not start
- * adding errors!).
  */
 void
-TeardownTCPInterconnect(ChunkTransportState *transportStates,
-						bool forceEOS, bool hasError)
+TeardownTCPInterconnect(ChunkTransportState *transportStates, bool hasErrors)
 {
 	ListCell   *cell;
 	ChunkTransportStateEntry *pEntry = NULL;
 	int			i;
-	Slice	   *mySlice;
+	ExecSlice  *mySlice;
 	MotionConn *conn;
 
 	if (transportStates == NULL || transportStates->sliceTable == NULL)
@@ -1984,17 +1913,17 @@ TeardownTCPInterconnect(ChunkTransportState *transportStates,
 	 * if we're already trying to clean up after an error -- don't allow
 	 * signals to interrupt us
 	 */
-	if (forceEOS)
+	if (hasErrors)
 		HOLD_INTERRUPTS();
 
-	mySlice = (Slice *) list_nth(transportStates->sliceTable->slices, transportStates->sliceId);
+	mySlice = &transportStates->sliceTable->slices[transportStates->sliceId];
 
 	/* Log the start of TeardownInterconnect. */
 	if (gp_log_interconnect >= GPVARS_VERBOSITY_TERSE)
 	{
 		int			elevel = 0;
 
-		if (forceEOS || !transportStates->activated)
+		if (hasErrors || !transportStates->activated)
 		{
 			if (gp_log_interconnect >= GPVARS_VERBOSITY_DEBUG)
 				elevel = LOG;
@@ -2008,7 +1937,7 @@ TeardownTCPInterconnect(ChunkTransportState *transportStates,
 			ereport(elevel, (errmsg("Interconnect seg%d slice%d cleanup state: "
 									"%s; setup was %s",
 									GpIdentity.segindex, mySlice->sliceIndex,
-									forceEOS ? "force" : "normal",
+									hasErrors ? "error" : "normal",
 									transportStates->activated ? "completed" : "exited")));
 
 		/* if setup did not complete, log the slicetable */
@@ -2084,9 +2013,6 @@ TeardownTCPInterconnect(ChunkTransportState *transportStates,
 
 		getChunkTransportState(transportStates, mySlice->sliceIndex, &pEntry);
 
-		if (forceEOS && !hasError)
-			forceEosToPeers(transportStates, mySlice->sliceIndex);
-
 		for (i = 0; i < pEntry->numConns; i++)
 		{
 			conn = pEntry->conns + i;
@@ -2109,10 +2035,10 @@ TeardownTCPInterconnect(ChunkTransportState *transportStates,
 	 */
 	foreach(cell, mySlice->children)
 	{
-		Slice	   *aSlice;
+		ExecSlice  *aSlice;
 		int			childId = lfirst_int(cell);
 
-		aSlice = (Slice *) list_nth(transportStates->sliceTable->slices, childId);
+		aSlice = &transportStates->sliceTable->slices[childId];
 
 		getChunkTransportState(transportStates, aSlice->sliceIndex, &pEntry);
 
@@ -2172,7 +2098,7 @@ TeardownTCPInterconnect(ChunkTransportState *transportStates,
 		 * If some errors are happening, senders can skip this step to avoid hung
 		 * issues, QD will take care of the error handling.
 		 */
-		if (!hasError)
+		if (!hasErrors)
 			waitOnOutbound(pEntry);
 
 		for (i = 0; i < pEntry->numConns; i++)
@@ -2199,11 +2125,15 @@ TeardownTCPInterconnect(ChunkTransportState *transportStates,
 	transportStates->activated = false;
 	transportStates->sliceTable = NULL;
 
+#ifdef ENABLE_IC_PROXY
+	ic_proxy_backend_close_context(transportStates);
+#endif  /* ENABLE_IC_PROXY */
+
 	if (transportStates->states != NULL)
 		pfree(transportStates->states);
 	pfree(transportStates);
 
-	if (forceEOS)
+	if (hasErrors)
 		RESUME_INTERRUPTS();
 
 #ifdef AMS_VERBOSE_LOGGING
@@ -2214,6 +2144,31 @@ TeardownTCPInterconnect(ChunkTransportState *transportStates,
 
 #ifdef AMS_VERBOSE_LOGGING
 void
+dumpEntryConnections(int elevel, ChunkTransportStateEntry *pEntry)
+{
+	int			i;
+	MotionConn *conn;
+
+	for (i = 0; i < pEntry->numConns; i++)
+	{
+		conn = &pEntry->conns[i];
+		if (conn->sockfd == -1 &&
+			conn->state == mcsNull)
+			elog(elevel, "... motNodeId=%d conns[%d]:         not connected",
+				 pEntry->motNodeId, i);
+		else
+			elog(elevel, "... motNodeId=%d conns[%d]:  "
+				 "%d pid=%d sockfd=%d remote=%s local=%s",
+				 pEntry->motNodeId, i,
+				 conn->remoteContentId,
+				 conn->cdbProc ? conn->cdbProc->pid : 0,
+				 conn->sockfd,
+				 conn->remoteHostAndPort,
+				 conn->localHostAndPort);
+	}
+}
+
+static void
 print_connection(ChunkTransportState *transportStates, int fd, const char *msg)
 {
 	struct sockaddr_in local,
@@ -2241,98 +2196,26 @@ print_connection(ChunkTransportState *transportStates, int fd, const char *msg)
 }
 #endif
 
-void
+static void
 format_fd_set(StringInfo buf, int nfds, mpp_fd_set *fds, char *pfx, char *sfx)
 {
 	int			i;
+	bool		first = true;
 
 	appendStringInfoString(buf, pfx);
 	for (i = 1; i < nfds; i++)
 	{
 		if (MPP_FD_ISSET(i, fds))
-			appendStringInfo(buf, "%d,", i);
+		{
+			if (!first)
+				appendStringInfoChar(buf, ',');
+			appendStringInfo(buf, "%d", i);
+			first = false;
+		}
 	}
-
-	if (buf->len > 0 &&
-		buf->data[buf->len - 1] == ',')
-		truncateStringInfo(buf, buf->len - 1);
 
 	appendStringInfoString(buf, sfx);
 }
-
-char *
-format_sockaddr(struct sockaddr *sa, char *buf, int bufsize)
-{
-	/* Save remote host:port string for error messages. */
-	if (sa->sa_family == AF_INET)
-	{
-		struct sockaddr_in *sin = (struct sockaddr_in *) sa;
-		uint32		saddr = ntohl(sin->sin_addr.s_addr);
-
-		snprintf(buf, bufsize, "%d.%d.%d.%d:%d",
-				 (saddr >> 24) & 0xff,
-				 (saddr >> 16) & 0xff,
-				 (saddr >> 8) & 0xff,
-				 saddr & 0xff,
-				 ntohs(sin->sin_port));
-	}
-#ifdef HAVE_IPV6
-	else if (sa->sa_family == AF_INET6)
-	{
-		char		remote_port[32];
-
-		if (bufsize > 10)
-		{
-			buf[0] = '[';
-
-			/*
-			 * inet_ntop isn't portable. //inet_ntop(AF_INET6,
-			 * &sin6->sin6_addr, buf, bufsize - 8);
-			 *
-			 * postgres has a standard routine for converting addresses to
-			 * printable format, which works for IPv6, IPv4, and Unix domain
-			 * sockets.  I've changed this routine to use that, but I think
-			 * the entire format_sockaddr routine could be replaced with it.
-			 */
-			int			ret = pg_getnameinfo_all((const struct sockaddr_storage *) sa, sizeof(struct sockaddr_storage),
-												 buf + 1, bufsize - 10,
-												 remote_port, sizeof(remote_port),
-												 NI_NUMERICHOST | NI_NUMERICSERV);
-
-			if (ret != 0)
-			{
-				elog(LOG, "getnameinfo returned %d: %s, and says %s port %s", ret, gai_strerror(ret), buf, remote_port);
-
-				/*
-				 * Fall back to using our internal inet_ntop routine, which
-				 * really is for inet datatype This is because of a bug in
-				 * solaris, where getnameinfo sometimes fails Once we find out
-				 * why, we can remove this
-				 */
-				snprintf(remote_port, sizeof(remote_port), "%d", ((struct sockaddr_in6 *) sa)->sin6_port);
-
-				/*
-				 * This is nasty: our internal inet_net_ntop takes
-				 * PGSQL_AF_INET6, not AF_INET6, which is very odd... They are
-				 * NOT the same value (even though PGSQL_AF_INET == AF_INET
-				 */
-#define PGSQL_AF_INET6	(AF_INET + 1)
-				inet_net_ntop(PGSQL_AF_INET6, sa, sizeof(struct sockaddr_in6), buf + 1, bufsize - 10);
-				elog(LOG, "Our alternative method says %s]:%s", buf, remote_port);
-
-			}
-			buf += strlen(buf);
-			strcat(buf, "]");
-			buf++;
-		}
-		snprintf(buf, 8, ":%s", remote_port);
-	}
-#endif
-	else
-		snprintf(buf, bufsize, "?host?:?port?");
-
-	return buf;
-}								/* format_sockaddr */
 
 static void
 flushInterconnectListenerBacklog(void)
@@ -2374,21 +2257,20 @@ flushInterconnectListenerBacklog(void)
 				if (gp_log_interconnect >= GPVARS_VERBOSITY_VERBOSE)
 				{
 					/* Get remote and local host:port strings for message. */
-					format_sockaddr((struct sockaddr *) &remoteAddr, remoteHostAndPort,
+					format_sockaddr(&remoteAddr, remoteHostAndPort,
 									sizeof(remoteHostAndPort));
 					addrsize = sizeof(localAddr);
 					if (getsockname(newfd, (struct sockaddr *) &localAddr, &addrsize))
 					{
-						ereport(LOG, (errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
-									  errmsg("Interconnect error while clearing incoming connections."),
-									  errdetail("%s sockfd=%d remote=%s: %m",
-												"getsockname",
-												newfd,
-												remoteHostAndPort)));
+						ereport(LOG,
+								(errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
+								 errmsg("interconnect error while clearing incoming connections"),
+								 errdetail("getsockname sockfd=%d remote=%s: %m",
+										   newfd, remoteHostAndPort)));
 					}
 					else
 					{
-						format_sockaddr((struct sockaddr *) &localAddr, localHostAndPort,
+						format_sockaddr(&localAddr, localHostAndPort,
 										sizeof(localHostAndPort));
 						ereport(DEBUG2, (errmsg("Interconnect clearing incoming connection "
 												"from remote=%s to local=%s.  sockfd=%d.",
@@ -2414,9 +2296,10 @@ flushInterconnectListenerBacklog(void)
 		}
 		else if (pendingConn < 0 && errno != EINTR)
 		{
-			ereport(LOG, (errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
-						  errmsg("Interconnect error during listener cleanup."),
-						  errdetail("%s sockfd=%d: %m", "select", TCP_listenerFd)));
+			ereport(LOG,
+					(errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
+					 errmsg("interconnect error during listener cleanup"),
+					 errdetail("select sockfd=%d: %m", TCP_listenerFd)));
 		}
 
 		/*
@@ -2626,7 +2509,7 @@ RecvTupleChunkFromTCP(ChunkTransportState *transportStates,
 	ML_CHECK_FOR_INTERRUPTS(transportStates->teardownActive);
 
 #ifdef AMS_VERBOSE_LOGGING
-	elog(DEBUG5, "RecvTupleChunkFrom(motNodID=%d, srcpIncIdx %d srcRoute=%d)", motNodeID, srcpInc, srcRoute);
+	elog(DEBUG5, "RecvTupleChunkFrom(motNodID=%d, srcRoute=%d)", motNodeID, srcRoute);
 #endif
 
 	getChunkTransportState(transportStates, motNodeID, &pEntry);
@@ -2641,7 +2524,6 @@ RecvTupleChunkFromAnyTCP(ChunkTransportState *transportStates,
 						 int16 *srcRoute)
 {
 	ChunkTransportStateEntry *pEntry = NULL;
-	MotionNodeEntry *pMNEntry = NULL;
 	MotionConn *conn;
 	TupleChunkListItem tcItem;
 	mpp_fd_set	rset;
@@ -2649,32 +2531,29 @@ RecvTupleChunkFromAnyTCP(ChunkTransportState *transportStates,
 				i,
 				index;
 	bool		skipSelect = false;
-
-
+	int			waitFd = PGINVALID_SOCKET;
 
 #ifdef AMS_VERBOSE_LOGGING
 	elog(DEBUG5, "RecvTupleChunkFromAny(motNodeId=%d)", motNodeID);
 #endif
 
 	getChunkTransportState(transportStates, motNodeID, &pEntry);
-	if (transportStates->estate && transportStates->estate->motionlayer_context)
-		pMNEntry = getMotionNodeEntry(transportStates->estate->motionlayer_context, motNodeID, "flushBuffer");
 
 	int			retry = 0;
 
 	do
 	{
 		/* Every 2 seconds */
-		if (retry++ > 4)
+		if (Gp_role == GP_ROLE_DISPATCH && retry++ > 4)
 		{
 			retry = 0;
 			/* check to see if the dispatcher should cancel */
-			if (Gp_role == GP_ROLE_DISPATCH)
-				checkForCancelFromQD(transportStates);
+			checkForCancelFromQD(transportStates);
 		}
 
 		struct timeval timeout = tval;
-
+		int	nfds = pEntry->highReadSock;
+		
 		/* make sure we check for these. */
 		ML_CHECK_FOR_INTERRUPTS(transportStates->teardownActive);
 
@@ -2703,17 +2582,38 @@ RecvTupleChunkFromAnyTCP(ChunkTransportState *transportStates,
 		if (skipSelect)
 			break;
 
-		n = select(pEntry->highReadSock + 1, (fd_set *) &rset, NULL, NULL, &timeout);
-		if (pMNEntry)
-			pMNEntry->sel_rd_wait += (tval.tv_sec - timeout.tv_sec) * 1000000 + (tval.tv_usec - timeout.tv_usec);
+		/* 
+		 * Also monitor the events on dispatch fds, eg, errors or sequence
+		 * request from QEs.
+		 */
+		if (Gp_role == GP_ROLE_DISPATCH)
+		{
+			waitFd = cdbdisp_getWaitSocketFd(transportStates->estate->dispatcherState);
+			if (waitFd != PGINVALID_SOCKET)
+			{
+				MPP_FD_SET(waitFd, &rset);
+				if (waitFd > nfds)
+					nfds = waitFd;
+			}
+		}
+
+		n = select(nfds + 1, (fd_set *) &rset, NULL, NULL, &timeout);
 		if (n < 0)
 		{
 			if (errno == EINTR)
 				continue;
-			ereport(ERROR, (errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
-							errmsg("Interconnect error receiving an incoming packet."),
-							errdetail("%s: %m", "select")));
+			ereport(ERROR,
+					(errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
+					 errmsg("interconnect error receiving an incoming packet"),
+					 errdetail("%s: %m", "select")));
 		}
+		else if (n > 0 && waitFd != PGINVALID_SOCKET && MPP_FD_ISSET(waitFd, &rset))
+		{
+			/* handle events on dispatch connection */
+			checkForCancelFromQD(transportStates);
+			n--;
+		}
+
 #ifdef AMS_VERBOSE_LOGGING
 		elog(DEBUG5, "RecvTupleChunkFromAny() select() returned %d ready sockets", n);
 #endif
@@ -2821,7 +2721,6 @@ flushBuffer(ChunkTransportState *transportStates,
 			ChunkTransportStateEntry *pEntry, MotionConn *conn, int16 motionId)
 {
 	char	   *sendptr;
-	MotionNodeEntry *pMNEntry = NULL;
 	int			n,
 				sent = 0;
 	mpp_fd_set	wset;
@@ -2837,9 +2736,6 @@ flushBuffer(ChunkTransportState *transportStates,
 	}
 #endif
 
-	if (transportStates->estate && transportStates->estate->motionlayer_context)
-		pMNEntry = getMotionNodeEntry(transportStates->estate->motionlayer_context, motionId, "flushBuffer");
-
 	/* first set header length */
 	*(uint32 *) conn->pBuff = conn->msgSize;
 
@@ -2850,7 +2746,7 @@ flushBuffer(ChunkTransportState *transportStates,
 	{
 		struct timeval timeout;
 
-		/* check for stop message before sending anything  */
+		/* check for stop message or peer teardown before sending anything  */
 		timeout.tv_sec = 0;
 		timeout.tv_usec = 0;
 		MPP_FD_ZERO(&rset);
@@ -2874,10 +2770,12 @@ flushBuffer(ChunkTransportState *transportStates,
 
 		if ((n = send(conn->sockfd, sendptr + sent, conn->msgSize - sent, 0)) < 0)
 		{
+			int			send_errno = errno;
+
 			ML_CHECK_FOR_INTERRUPTS(transportStates->teardownActive);
-			if (errno == EINTR)
+			if (send_errno == EINTR)
 				continue;
-			if (errno == EWOULDBLOCK)
+			if (send_errno == EWOULDBLOCK)
 			{
 				do
 				{
@@ -2890,11 +2788,11 @@ flushBuffer(ChunkTransportState *transportStates,
 					MPP_FD_SET(conn->sockfd, &wset);
 					MPP_FD_SET(conn->sockfd, &rset);
 					n = select(conn->sockfd + 1, (fd_set *) &rset, (fd_set *) &wset, NULL, &timeout);
-					if (pMNEntry)
-						pMNEntry->sel_wr_wait += (tval.tv_sec - timeout.tv_sec) * 1000000 + (tval.tv_usec - timeout.tv_usec);
 					if (n < 0)
 					{
-						if (errno == EINTR)
+						int			select_errno = errno;
+
+						if (select_errno == EINTR)
 							continue;
 
 						/*
@@ -2909,18 +2807,18 @@ flushBuffer(ChunkTransportState *transportStates,
 							conn->stillActive = false;
 							return false;
 						}
-						ereport(ERROR, (errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
-										errmsg("Interconnect error writing an outgoing packet: %m"),
-										errdetail("error during select() call (error:%d).\n"
-												  "For Remote Connection: contentId=%d at %s",
-												  errno, conn->remoteContentId,
-												  conn->remoteHostAndPort)));
+						ereport(ERROR,
+								(errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
+								 errmsg("interconnect error writing an outgoing packet: %m"),
+								 errdetail("Error during select() call (error: %d), for remote connection: contentId=%d at %s",
+										   select_errno, conn->remoteContentId,
+										   conn->remoteHostAndPort)));
 					}
 
 					/*
 					 * as a sender... if there is something to read... it must
-					 * mean its a StopSendingMessage.  we don't even bother to
-					 * read it.
+					 * mean its a StopSendingMessage or receiver has teared down
+					 * the interconnect, we don't even bother to read it.
 					 */
 					if (MPP_FD_ISSET(conn->sockfd, &rset) || transportStates->teardownActive)
 					{
@@ -2946,12 +2844,36 @@ flushBuffer(ChunkTransportState *transportStates,
 					conn->stillActive = false;
 					return false;
 				}
-				ereport(ERROR, (errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
-								errmsg("Interconnect error writing an outgoing packet"),
-								errdetail("error during send() call (error:%d).\n"
-										  "For Remote Connection: contentId=%d at %s",
-										  errno, conn->remoteContentId,
-										  conn->remoteHostAndPort)));
+
+				/* check whether receiver has teared down the interconnect */
+				timeout.tv_sec = 0;
+				timeout.tv_usec = 0;
+				MPP_FD_ZERO(&rset);
+				MPP_FD_SET(conn->sockfd, &rset);
+
+				n = select(conn->sockfd + 1, (fd_set *) &rset, NULL, NULL, &timeout);
+
+				/*
+				 * as a sender... if there is something to read... it must
+				 * mean its a StopSendingMessage or receiver has teared down
+				 * the interconnect, we don't even bother to read it.
+				 */
+				if (n > 0 && MPP_FD_ISSET(conn->sockfd, &rset))
+				{
+#ifdef AMS_VERBOSE_LOGGING
+					print_connection(transportStates, conn->sockfd, "stop from");
+#endif
+					/* got a stop message */
+					conn->stillActive = false;
+					return false;
+				}
+
+				ereport(ERROR,
+						(errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
+						 errmsg("interconnect error writing an outgoing packet"),
+						 errdetail("Error during send() call (error:%d) for remote connection: contentId=%d at %s",
+								   send_errno, conn->remoteContentId,
+								   conn->remoteHostAndPort)));
 			}
 		}
 		else
@@ -2978,7 +2900,7 @@ flushBuffer(ChunkTransportState *transportStates,
 static bool
 SendChunkTCP(ChunkTransportState *transportStates, ChunkTransportStateEntry *pEntry, MotionConn *conn, TupleChunkListItem tcItem, int16 motionId)
 {
-	int			length = TYPEALIGN(TUPLE_CHUNK_ALIGN, tcItem->chunk_length);
+	int			length = tcItem->chunk_length;
 
 	Assert(conn->msgSize > 0);
 
@@ -2997,4 +2919,122 @@ SendChunkTCP(ChunkTransportState *transportStates, ChunkTransportStateEntry *pEn
 
 	conn->tupleCount++;
 	return true;
+}
+
+
+
+/*
+ * gp_set_monotonic_begin_time: set the beginTime and endTime to the current
+ * time.
+ */
+static void
+gp_set_monotonic_begin_time(GpMonotonicTime *time)
+{
+	time->beginTime.tv_sec = 0;
+	time->beginTime.tv_usec = 0;
+	time->endTime.tv_sec = 0;
+	time->endTime.tv_usec = 0;
+
+	gp_get_monotonic_time(time);
+
+	time->beginTime.tv_sec = time->endTime.tv_sec;
+	time->beginTime.tv_usec = time->endTime.tv_usec;
+}
+
+
+/*
+ * gp_get_monotonic_time
+ *    This function returns the time in the monotonic order.
+ *
+ * The new time is stored in time->endTime, which has a larger value than
+ * the original value. The original endTime is lost.
+ *
+ * This function is intended for computing elapsed time between two
+ * calls. It is not for getting the system time.
+ */
+static void
+gp_get_monotonic_time(GpMonotonicTime *time)
+{
+	struct timeval newTime;
+	int status;
+
+#if HAVE_LIBRT
+	/* Use clock_gettime to return monotonic time value. */
+	struct timespec ts;
+	status = clock_gettime(CLOCK_MONOTONIC, &ts);
+
+	newTime.tv_sec = ts.tv_sec;
+	newTime.tv_usec = ts.tv_nsec / 1000;
+
+#else
+
+	gettimeofday(&newTime, NULL);
+	status = 0; /* gettimeofday always succeeds. */
+
+#endif
+
+	if (status == 0 &&
+		timeCmp(&time->endTime, &newTime) < 0)
+	{
+		time->endTime.tv_sec = newTime.tv_sec;
+		time->endTime.tv_usec = newTime.tv_usec;
+	}
+	else
+	{
+		time->endTime.tv_usec = time->endTime.tv_usec + 1;
+
+		time->endTime.tv_sec = time->endTime.tv_sec +
+			(time->endTime.tv_usec / USECS_PER_SECOND);
+		time->endTime.tv_usec = time->endTime.tv_usec % USECS_PER_SECOND;
+	}
+}
+
+/*
+ * Compare two times.
+ *
+ * If t1 > t2, return 1.
+ * If t1 == t2, return 0.
+ * If t1 < t2, return -1;
+ */
+static inline int
+timeCmp(struct timeval *t1, struct timeval *t2)
+{
+	if (t1->tv_sec == t2->tv_sec &&
+		t1->tv_usec == t2->tv_usec)
+		return 0;
+
+	if (t1->tv_sec > t2->tv_sec ||
+		(t1->tv_sec == t2->tv_sec &&
+		 t1->tv_usec > t2->tv_usec))
+		return 1;
+
+	return -1;
+}
+
+/*
+ * gp_get_elapsed_us -- return the elapsed time in microseconds
+ * after the given time->beginTime.
+ *
+ * If time->beginTime is not set (0), then return 0.
+ *
+ * Note that the beginTime is not changed, but the endTime is set
+ * to the current time.
+ */
+static inline uint64
+gp_get_elapsed_us(GpMonotonicTime *time)
+{
+	if (time->beginTime.tv_sec == 0 &&
+		time->beginTime.tv_usec == 0)
+		return 0;
+
+	gp_get_monotonic_time(time);
+
+	return ((time->endTime.tv_sec - time->beginTime.tv_sec) * USECS_PER_SECOND +
+			(time->endTime.tv_usec - time->beginTime.tv_usec));
+}
+
+static inline uint64
+gp_get_elapsed_ms(GpMonotonicTime *time)
+{
+	return gp_get_elapsed_us(time) / (USECS_PER_SECOND / MSECS_PER_SECOND);
 }

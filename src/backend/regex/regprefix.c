@@ -4,7 +4,7 @@
  *	  Extract a common prefix, if any, from a compiled regex.
  *
  *
- * Portions Copyright (c) 2012-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2012-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1998, 1999 Henry Spencer
  *
  * IDENTIFICATION
@@ -19,8 +19,8 @@
 /*
  * forward declarations
  */
-static int findprefix(struct cnfa * cnfa, struct colormap * cm,
-		   chr *string, size_t *slength);
+static int	findprefix(struct cnfa *cnfa, struct colormap *cm,
+					   chr *string, size_t *slength);
 
 
 /*
@@ -36,7 +36,7 @@ static int findprefix(struct cnfa * cnfa, struct colormap * cm,
  * the common prefix or exact value, of length *slength (measured in chrs
  * not bytes!).
  *
- * This function does not analyze all complex cases (such as lookahead
+ * This function does not analyze all complex cases (such as lookaround
  * constraints) exactly.  Therefore it is possible that some strings matching
  * the reported prefix or exact-match string do not satisfy the regex.  But
  * it should never be the case that a string satisfying the regex does not
@@ -109,8 +109,8 @@ pg_regprefix(regex_t *re,
  * *slength (which must be preset to zero) incremented for each chr.
  */
 static int						/* regprefix return code */
-findprefix(struct cnfa * cnfa,
-		   struct colormap * cm,
+findprefix(struct cnfa *cnfa,
+		   struct colormap *cm,
 		   chr *string,
 		   size_t *slength)
 {
@@ -162,14 +162,12 @@ findprefix(struct cnfa * cnfa,
 		thiscolor = COLORLESS;
 		for (ca = cnfa->states[st]; ca->co != COLORLESS; ca++)
 		{
-			/* We ignore lookahead constraints */
-			if (ca->co >= cnfa->ncolors)
-				continue;
-			/* We can also ignore BOS/BOL arcs */
+			/* We can ignore BOS/BOL arcs */
 			if (ca->co == cnfa->bos[0] || ca->co == cnfa->bos[1])
 				continue;
-			/* ... but EOS/EOL arcs terminate the search */
-			if (ca->co == cnfa->eos[0] || ca->co == cnfa->eos[1])
+			/* ... but EOS/EOL arcs terminate the search, as do LACONs */
+			if (ca->co == cnfa->eos[0] || ca->co == cnfa->eos[1] ||
+				ca->co >= cnfa->ncolors)
 			{
 				thiscolor = COLORLESS;
 				break;
@@ -196,7 +194,10 @@ findprefix(struct cnfa * cnfa,
 		if (thiscolor == COLORLESS)
 			break;
 		/* The color must be a singleton */
-		if (cm->cd[thiscolor].nchrs != 1)
+		if (cm->cd[thiscolor].nschrs != 1)
+			break;
+		/* Must not have any high-color-map entries */
+		if (cm->cd[thiscolor].nuchrs != 0)
 			break;
 
 		/*

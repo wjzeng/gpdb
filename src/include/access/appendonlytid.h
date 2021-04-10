@@ -3,7 +3,7 @@
  * appendonlytid.h
  *
  * Portions Copyright (c) 2007-2009, Greenplum inc
- * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
  *
  *
  * IDENTIFICATION
@@ -17,70 +17,89 @@
 #include "c.h"
 
 /*
- * AOTupleId is a unique tuple id, specific to AO
- * relation tuples, of the form (segfile#, row#)
+ * AOTupleId is a unique tuple id, specific to AO relation tuples, of the
+ * form (segfile#, row#)
  *
- * *** WARNING *** Some code interprets AOTIDs as HEAPTIDs, and would like
- * AOTIDs has the same ordering as HEAPTIDs.
+ * *** WARNING *** Outside the appendonly AM code, AOTIDs are treated as
+ * HEAPTIDs!  Therefore, AOTupleId struct must have the same size and
+ * alignment as ItemPointer, and we mustn't construct AOTupleIds that would
+ * look like invalid ItemPointers.
  *
- * Begin mischief.  Want to make sure the last 16 bits (uint16) are non-zero so that when
- * the executor asserts the item number is non-zero our AOTID will pass the test.
- * So, we create a reserved bit that is always on.  So, in the case that the segment file
- * number is 0 (utility mode) and the lower part (15 bits) of the row number is 0, our AOTID's
- * last 16 bits will be non-zero because of the always on reserved bit.
+ * The 48 bits available in the struct are divided as follow:
  *
- * Out of the following 48 bits, the 7 leftmost bits stand for which segment file the
- * tuple is in (Limit: 128 (2^8)), the 16th rightmost bit is reserved and always 1,
- * the remaining 40 bits stand for the row within the  segment file
- * (Limit: 1099 trillion (2^40 - 1)).
+ * - the 7 most significant bits stand for which segment file the tuple is in
+ *   (Limit: 128 (2^8)). This also makes up part of the "block number" when
+ *   interpreted as a heap TID.
  *
+ * - The next 25 bits come from the 25 most significant bits of the row
+ *   number. This makes up the "lower" part of the block number when
+ *   interpreted as a heap TID.
  *
- * ***WARNING*** STRUCT PACKING ISSUE.
+ * - Next up, slightly more interesting: we take the least significant 15 bits
+ *   from the row numbers, add one to it. The results take up 16 bits (range:
+ *   1 - 2^15). This forms the "offset" when interpreted as a heap TID. We
+ *   plus one on the LSB to accommodate the assumption in various places that
+ *   heap TID's never have a zero offset.
  *
- *       Previously, we had the uint16 first and the uint32 second.  But on some compilers
- *       the second uint32 would get packed on a 32-bit boundary and the struct would end
- *       up with a hole between the fields...  Arranging the uint16 second is known to work
- *       correctly since the ItemPointerData has the same layout.  And, apparently putting
- *       small fields after big ones is a policy in system catalog struct layouts.
+ * NOTE: Before GPDB6, we *always* set the reserved bit, not only when
+ * 'bytes_4_5' would otherwise be zero.  That was simpler, but caused problems
+ * of its own, because very high offset numbers, which cannot occur in heap
+ * tables, have a special meaning in some places.  See TUPLE_IS_INVALID in
+ * gist_private.h, for example.  In other words, the 'ip_posid' field now uses
+ * values in the range 1..32768, whereas before GPDB 6, it used the range
+ * (32768..65535).
  */
 typedef struct AOTupleId
 {
 	uint16		bytes_0_1;
 	uint16		bytes_2_3;
 	uint16		bytes_4_5;
-
 } AOTupleId;
 
-#define AOTUPLEID_INIT {0,0}
-
+#define AO_MAX_OFFSET	32768
 #define AOTupleIdGet_segmentFileNum(h)        ((((h)->bytes_0_1&0xFE00)>>9)) // 7 bits
-#define AOTupleIdGet_makeHeapExecutorHappy(h) (((h)->bytes_4_5&0x8000)) // 1 bit
-#define AOTupleIdGet_rowNum(h) \
-	((((uint64)((h)->bytes_0_1&0x01FF))<<31)|(((uint64)((h)->bytes_2_3))<<15)|(((uint64)((h)->bytes_4_5&0x7FFF))))
- /* top most 25 bits */	/* 15 bits from bytes_4_5 */
 
-/* ~_Init zeroes the 2 regular fields and sets the always on field to 1. */
-static inline void
-AOTupleIdInit_Init(AOTupleId *h)
+static inline uint64
+AOTupleIdGet_rowNum(AOTupleId *h)
 {
-	h->bytes_0_1 = 0;
-	h->bytes_2_3 = 0;
-	h->bytes_4_5 = 0x8000;
-}
-static inline void
-AOTupleIdInit_segmentFileNum(AOTupleId *h, uint16 e)
-{
-	h->bytes_0_1 |= ((uint16) (0x007F & e)) << 9;
-}
-static inline void
-AOTupleIdInit_rowNum(AOTupleId *h, uint64 e)
-{
-	h->bytes_0_1 |= (uint16) ((INT64CONST(0x000000FFFFFFFFFF) & e) >> 31);
-	h->bytes_2_3 |= (uint16) ((INT64CONST(0x000000007FFFFFFF) & e) >> 15);
-	h->bytes_4_5 |= 0x7FFF & e;
+	uint64 rowNumber;
+	Assert(h->bytes_4_5 > 0);
+	Assert(h->bytes_4_5 <= 0x8000);
+
+	/* top 25 bits */
+	rowNumber = ((uint64)(h->bytes_0_1&0x01FF))<<31;
+	rowNumber |= ((uint64)(h->bytes_2_3))<<15;
+
+	/* lower 15 bits */
+	/* subtract one since we always add one when initialing the bytes_4_5 */
+	rowNumber |= h->bytes_4_5 - 1;
+
+	return rowNumber;
 }
 
-#define AOTupleId_MaxRowNum            INT64CONST(1099511627775) 		// 40 bits, or 1099511627775 (1099 trillion).
+static inline void
+AOTupleIdInit(AOTupleId *h, uint16 segfilenum, uint64 rownum)
+{
+	h->bytes_0_1 = ((uint16) (0x007F & segfilenum)) << 9;
+	h->bytes_0_1 |= (uint16) ((INT64CONST(0x000000FFFFFFFFFF) & rownum) >> 31);
+	h->bytes_2_3 = (uint16) ((INT64CONST(0x000000007FFFFFFF) & rownum) >> 15);
+
+	/*
+	 * Add one to make sure bytes_4_5 is never zero. Since bytes_4_5 form
+	 * offset part when interpreted as TID, rest of system expects offset to
+	 * be greater than zero.
+	 */
+	h->bytes_4_5 = (0x7FFF & rownum) + 1;
+}
+
+/* like ItemPointerSetInvalid */
+static inline void
+AOTupleIdSetInvalid(AOTupleId *h)
+{
+	ItemPointerSetInvalid((ItemPointer) h);
+}
+
+#define AOTupleId_MaxRowNum            INT64CONST(1099511627775) 		// 40 bits, or 1099511627775 (1 trillion).
 
 #define AOTupleId_MaxSegmentFileNum    			127
 #define AOTupleId_MultiplierSegmentFileNum    	128	// Next up power of 2 as multiplier.

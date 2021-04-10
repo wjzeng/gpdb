@@ -3,7 +3,7 @@ doc/src/sgml/ref/alter_system.sgml
 PostgreSQL documentation
 -->
 
-<refentry id="SQL-ALTERSYSTEM">
+<refentry id="sql-altersystem">
  <indexterm zone="sql-altersystem">
   <primary>ALTER SYSTEM</primary>
  </indexterm>
@@ -21,7 +21,10 @@ PostgreSQL documentation
 
  <refsynopsisdiv>
 <synopsis>
-ALTER SYSTEM SET <replaceable class="PARAMETER">configuration_parameter</replaceable> { TO | = } { <replaceable class="PARAMETER">value</replaceable> | '<replaceable class="PARAMETER">value</replaceable>' | DEFAULT }
+ALTER SYSTEM SET <replaceable class="parameter">configuration_parameter</replaceable> { TO | = } { <replaceable class="parameter">value</replaceable> | '<replaceable class="parameter">value</replaceable>' | DEFAULT }
+
+ALTER SYSTEM RESET <replaceable class="parameter">configuration_parameter</replaceable>
+ALTER SYSTEM RESET ALL
 </synopsis>
  </refsynopsisdiv>
 
@@ -29,21 +32,32 @@ ALTER SYSTEM SET <replaceable class="PARAMETER">configuration_parameter</replace
   <title>Description</title>
 
   <para>
-   <command>ALTER SYSTEM</command> writes the configuration parameter
-   values to the <filename>postgresql.auto.conf</filename> file. With
-   <literal>DEFAULT</literal>, it removes a configuration entry from
-   <filename>postgresql.auto.conf</filename> file. The values will be
-   effective after reload of server configuration (SIGHUP) or in next 
-   server start based on the type of configuration parameter modified.
+   <command>ALTER SYSTEM</command> is used for changing server configuration
+   parameters across the entire database cluster.  It can be more convenient
+   than the traditional method of manually editing
+   the <filename>postgresql.conf</filename> file.
+   <command>ALTER SYSTEM</command> writes the given parameter setting to
+   the <filename>postgresql.auto.conf</filename> file, which is read in
+   addition to <filename>postgresql.conf</filename>.
+   Setting a parameter to <literal>DEFAULT</literal>, or using the
+   <command>RESET</command> variant, removes that configuration entry from the
+   <filename>postgresql.auto.conf</filename> file. Use <literal>RESET
+   ALL</literal> to remove all such configuration entries.
   </para>
 
   <para>
-   This command is not allowed inside transaction block or function.
+   Values set with <command>ALTER SYSTEM</command> will be effective after
+   the next server configuration reload, or after the next server restart
+   in the case of parameters that can only be changed at server start.
+   A server configuration reload can be commanded by calling the SQL
+   function <function>pg_reload_conf()</function>, running <literal>pg_ctl reload</literal>,
+   or sending a <systemitem>SIGHUP</systemitem> signal to the main server process.
   </para>
-  
+
   <para>
-   See <xref linkend="config-setting"> for other ways to set the parameters and 
-   how they become effective.
+   Only superusers can use <command>ALTER SYSTEM</command>.  Also, since
+   this command acts directly on the file system and cannot be rolled back,
+   it is not allowed inside a transaction block or function.
   </para>
  </refsect1>
 
@@ -55,8 +69,8 @@ ALTER SYSTEM SET <replaceable class="PARAMETER">configuration_parameter</replace
     <term><replaceable class="parameter">configuration_parameter</replaceable></term>
     <listitem>
      <para>
-      Name of a settable run-time parameter.  Available parameters are
-      documented in <xref linkend="runtime-config">.
+      Name of a settable configuration parameter.  Available parameters are
+      documented in <xref linkend="runtime-config"/>.
      </para>
     </listitem>
    </varlistentry>
@@ -65,11 +79,11 @@ ALTER SYSTEM SET <replaceable class="PARAMETER">configuration_parameter</replace
     <term><replaceable class="parameter">value</replaceable></term>
     <listitem>
      <para>
-      New value of parameter.  Values can be specified as string
+      New value of the parameter.  Values can be specified as string
       constants, identifiers, numbers, or comma-separated lists of
       these, as appropriate for the particular parameter.
-      <literal>DEFAULT</literal> can be written to specify to remove the
-      parameter and its value from <filename>postgresql.auto.conf</filename>
+      <literal>DEFAULT</literal> can be written to specify removing the
+      parameter and its value from <filename>postgresql.auto.conf</filename>.
      </para>
     </listitem>
    </varlistentry>
@@ -77,19 +91,34 @@ ALTER SYSTEM SET <replaceable class="PARAMETER">configuration_parameter</replace
  </refsect1>
 
  <refsect1>
+  <title>Notes</title>
+
+  <para>
+   This command can't be used to set <xref linkend="guc-data-directory"/>,
+   nor parameters that are not allowed in <filename>postgresql.conf</filename>
+   (e.g., <link linkend="runtime-config-preset">preset options</link>).
+  </para>
+
+  <para>
+   See <xref linkend="config-setting"/> for other ways to set the parameters.
+  </para>
+ </refsect1>
+
+ <refsect1>
   <title>Examples</title>
 
   <para>
-   Set the <literal>wal_level</>:
+   Set the <literal>wal_level</literal>:
 <programlisting>
-ALTER SYSTEM SET wal_level = hot_standby;
+ALTER SYSTEM SET wal_level = replica;
 </programlisting>
   </para>
 
   <para>
-   Set the <literal>authentication_timeout</>:
+   Undo that, restoring whatever setting was effective
+   in <filename>postgresql.conf</filename>:
 <programlisting>
-ALTER SYSTEM SET authentication_timeout = 10;
+ALTER SYSTEM RESET wal_level;
 </programlisting></para>
  </refsect1>
 
@@ -106,8 +135,8 @@ ALTER SYSTEM SET authentication_timeout = 10;
   <title>See Also</title>
 
   <simplelist type="inline">
-   <member><xref linkend="SQL-SET"></member>
-   <member><xref linkend="SQL-SHOW"></member>
+   <member><xref linkend="sql-set"/></member>
+   <member><xref linkend="sql-show"/></member>
   </simplelist>
  </refsect1>
 

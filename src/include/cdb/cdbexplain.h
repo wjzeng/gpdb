@@ -4,7 +4,7 @@
  *    Functions supporting the Greenplum EXPLAIN ANALYZE command
  *
  * Portions Copyright (c) 2006-2008, Greenplum inc
- * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
  *
  *
  * IDENTIFICATION
@@ -16,16 +16,20 @@
 #define CDBEXPLAIN_H
 
 #include "executor/instrument.h"        /* instr_time */
-#include "cdb/cdbpublic.h"              /* CdbExplain_Agg */
 
 struct CdbDispatchResults;              /* #include "cdb/cdbdispatchresult.h" */
-struct EState;                          /* #include "nodes/execnodes.h" */
 struct PlanState;                       /* #include "nodes/execnodes.h" */
 struct QueryDesc;                       /* #include "executor/execdesc.h" */
-struct StringInfoData;                  /* #include "lib/stringinfo.h" */
 
 struct CdbExplain_ShowStatCtx;          /* private, in "cdb/cdbexplain.c" */
-struct PlannedStmt;
+
+typedef struct
+{
+	double		vmax;			/* maximum value of statistic */
+	double		vsum;			/* sum of values */
+	int			vcnt;			/* count of values > 0 */
+	int			imax;			/* id of 1st observation having maximum value */
+} CdbExplain_Agg;
 
 static inline void
 cdbexplain_agg_init0(CdbExplain_Agg *agg)

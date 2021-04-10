@@ -44,21 +44,16 @@ declare -a PORTS=(5432 10001 10002 10003)
 ((PORT_MIN=0))
 ((PORT_MAX=$NUM_PRIMARY_MIRROR_PAIRS))
 
-if [ -z $MASTER_DEMO_PORT ] ; then
-    echo "set MASTER_DEMO_PORT"
-    exit 1
-fi
-
 if [ -z $DEMO_PORT_BASE ] ; then
     echo "set DEMO_PORT_BASE"
     exit 1
 fi
 
-declare -a PORTS=($MASTER_DEMO_PORT `expr $DEMO_PORT_BASE` \
-   `expr $DEMO_PORT_BASE + 1` `expr $DEMO_PORT_BASE + 2 `)
+declare -a PORTS=(`expr $DEMO_PORT_BASE` \
+   `expr $DEMO_PORT_BASE + 2` `expr $DEMO_PORT_BASE + 3 ` `expr $DEMO_PORT_BASE + 4`)
 
 #
-# Check tables on Master
+# Check tables on Coordinator
 #
 
 #***********************************************************
@@ -76,7 +71,7 @@ for ((i=PORT_MIN; i<PORT_MAX+1; i++)); do
             echo "----------------------------------------"
             echo "Table: gp_$table"
             echo "----------------------------------------"
-            PGOPTIONS="-c gp_session_role=utility" $GPPATH/psql --pset pager=off -p ${PORTS[$i]} -d template1 -c  "select * from gp_"$table
+            PGOPTIONS="-c gp_role=utility" $GPPATH/psql --pset pager=off -p ${PORTS[$i]} -d template1 -c  "select * from gp_"$table
             RETVAL=$?
             if [ $RETVAL -ne 0 ]; then
                 echo "$0 failed."
@@ -89,7 +84,7 @@ for ((i=PORT_MIN; i<PORT_MAX+1; i++)); do
             echo "----------------------------------------"
             echo "Table: gp_$table"
             echo "----------------------------------------"
-            PGOPTIONS="-c gp_session_role=utility" $GPPATH/psql --pset pager=off -p ${PORTS[$i]} -d template1 -c \
+            PGOPTIONS="-c gp_role=utility" $GPPATH/psql --pset pager=off -p ${PORTS[$i]} -d template1 -c \
                 "select * from gp_"$table
             RETVAL=$?
             if [ $RETVAL -ne 0 ]; then

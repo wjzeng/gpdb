@@ -44,6 +44,39 @@ CREATE TABLE tenk_ao10 (like tenk_heap) with (compresslevel=5);
 CREATE TABLE tenk_ao11 (like tenk_heap) with (blocksize=8192);
 CREATE TABLE tenk_ao12 (like tenk_heap) with (appendonly=false,blocksize=8192);
 
+-- appendoptimized is an alias for appendonly
+CREATE TABLE tenk_ao13 (like tenk_heap) with (appendoptimized=true);
+CREATE TABLE tenk_ao14 (like tenk_heap) with (appendonly=true, appendoptimized=false);
+CREATE TABLE tenk_ao14 (like tenk_heap) with (appendoptimized=maybe);
+CREATE TABLE tenk_ao14 (like tenk_heap) with (appendoptimized=true, appendoptimized=true);
+CREATE TABLE tenk_ao15 (like tenk_heap) with (appendoptimized=true) 
+PARTITION BY RANGE(unique2)
+(
+START (0) end (1) WITH (appendoptimized=true),
+START (1) end (2) WITH (appendoptimized=true),
+START (2) end (3) WITH (appendoptimized=true)
+);
+CREATE TABLE tenk_ao16 (like tenk_heap) with (appendoptimized=true)
+PARTITION BY RANGE(unique2)
+(
+START (0) end (1) WITH (appendonly=true, appendoptimized=false),
+START (1) end (2) WITH (appendoptimized=true),
+START (2) end (3) WITH (appendoptimized=true)
+);
+
+-- also make sure appendoptimized works in the gp_default_storage_options GUC
+SET gp_default_storage_options = 'blocksize=32768,compresstype=none,checksum=true,orientation=row,appendoptimized=false';
+SET gp_default_storage_options = 'blocksize=32768,compresstype=none,checksum=true,orientation=row';
+SET gp_default_storage_options = 'blocksize=32768,compresstype=none,checksum=true,blocksize=8';
+SET gp_default_storage_options = 'blocksize=65536,compresstype=none,checksum=true';
+SHOW gp_default_storage_options;
+SET default_table_access_method = ao_row;
+SHOW default_table_access_method;
+CREATE TABLE tenk_ao14 (like tenk_heap);
+SELECT amhandler, reloptions FROM pg_class c, PG_AM a WHERE c.relname = 'tenk_ao14' AND c.relam = a.oid;
+RESET gp_default_storage_options;
+RESET default_table_access_method;
+
 -------------------- 
 -- catalog checks
 --------------------
@@ -64,11 +97,28 @@ begin
 
   execute 'select relname from pg_class where oid=(select segrelid from pg_class, pg_appendonly where relname=''' || relname || ''' and relid = pg_class.oid)' into aosegname;
   if aosegname is not null then
-          execute 'select tupcount from pg_aoseg.' || aosegname into tupcount;
+          execute 'select sum(tupcount) from gp_dist_random(''pg_aoseg.' || aosegname || ''')' into tupcount;
   end if;
   return tupcount;
 end; $$ language plpgsql volatile READS SQL DATA;
 
+-- ------------------
+-- functions for snapshotting the current mod counts, and checking the diff
+-- vs last snapshot
+-- ------------------
+create temp table modcounts_snapshot (segment_id int, aosegno int, modcount bigint) distributed randomly;
+
+create or replace function snapshot_modcounts(relname regclass) returns void as $$
+begin
+  delete from modcounts_snapshot;
+
+  insert into modcounts_snapshot select segment_id, segno, modcount from  gp_toolkit.__gp_aoseg(relname);
+end;
+$$ language plpgsql volatile;
+
+create or replace function diff_modcounts(relname regclass, segment_id out int, aosegno out int, modcount_diff out bigint) returns setof record as $$
+  select a.segment_id, a.segno, a.modcount - coalesce(b.modcount, 0) mod_diff from gp_toolkit.__gp_aoseg($1) a left outer join modcounts_snapshot b on a.segment_id = b.segment_id and a.segno = b.aosegno;
+$$ language sql;
 
 -------------------- 
 -- supported sql
@@ -80,6 +130,11 @@ COPY tenk_ao1 FROM '@abs_srcdir@/data/tenk.data';
 COPY tenk_ao2 FROM '@abs_srcdir@/data/tenk.data';
 COPY tenk_ao3 FROM '@abs_srcdir@/data/tenk.data';
 COPY tenk_ao4 FROM '@abs_srcdir@/data/tenk.data';
+ANALYZE tenk_heap;
+ANALYZE tenk_ao1;
+ANALYZE tenk_ao2;
+ANALYZE tenk_ao3;
+ANALYZE tenk_ao4;
 
 -- SELECT
 SELECT count(*) FROM tenk_heap;
@@ -224,15 +279,24 @@ CREATE TABLE tenk_ao1 with(appendonly=true, checksum=true) AS SELECT * FROM tenk
 -- With and without ORCA last_sequence fluctuates bit and hence using >= 3300 as
 -- inserting 10k tuples to 3 node system must atleast have last_sequence >= 3300
 -- on each node.
-SELECT CASE WHEN xmin = 2 THEN 'FrozenXid' ELSE 'NormalXid' END, objmod, CASE
-WHEN objmod = 0 THEN last_sequence >= 3300 WHEN objmod = 1 THEN last_sequence =
-0 END, gp_segment_id from gp_dist_random('gp_fastsequence') WHERE objid IN (SELECT
-segrelid FROM pg_appendonly WHERE relid IN (SELECT oid FROM pg_class WHERE
-relname='tenk_ao1'));
-
-CREATE TABLE tenk_ao2 with(appendonly=true, compresslevel=0, blocksize=262144) AS SELECT * FROM tenk_heap;
+SELECT CASE WHEN xmin = 2 THEN 'FrozenXid' ELSE 'NormalXid' END,
+       objmod,
+       CASE WHEN last_sequence = 0 THEN 'zero'
+            WHEN last_sequence >= 3300 THEN '>= 3300'
+	    ELSE '1-2900' END AS last_sequence,
+       gp_segment_id
+FROM gp_dist_random('gp_fastsequence')
+WHERE objid IN (SELECT segrelid FROM pg_appendonly WHERE relid IN (
+  SELECT oid FROM pg_class WHERE relname='tenk_ao1'));
+-- Since we check last_sequence for the tenk_ao2 table later, the data distribution should be same for orca and planner.
+-- If we don't specify the DISTRIBUTED BY caluse, ORCA will mark the table distributed randomly.
+CREATE TABLE tenk_ao2 with(appendonly=true, compresslevel=0, blocksize=262144) AS SELECT * FROM tenk_heap DISTRIBUTED BY (unique1);
 CREATE TABLE tenk_ao3 with(appendonly=true, compresslevel=6, blocksize=1048576, checksum=true) AS SELECT * FROM tenk_heap;
 CREATE TABLE tenk_ao4 with(appendonly=true, compresslevel=1, compresstype=zlib) AS SELECT * FROM tenk_heap;
+ANALYZE tenk_ao1;
+ANALYZE tenk_ao2;
+ANALYZE tenk_ao3;
+ANALYZE tenk_ao4;
 SELECT c.relname, a.blocksize, a.compresstype, a.compresslevel, a.checksum FROM pg_class c, pg_appendonly a
        WHERE c.relname LIKE 'tenk_ao%' AND c.oid=a.relid AND c.relname not like 'tenk_aocs%' ORDER BY c.relname;
 SELECT count(*) FROM tenk_ao1;
@@ -245,7 +309,7 @@ SELECT count(*) FROM tenk_ao4;
 BEGIN;
 CREATE TABLE appendonly_sametxn_create_insert(a int, b int) with (appendonly=true);
 INSERT INTO appendonly_sametxn_create_insert select * from generate_series(1, 10);
--- Make sure insert is using segfile 1 for the insert, as part of create table itself.
+-- Make sure insert is using segfile 0 for the insert, as part of create table itself.
 SELECT CASE WHEN xmin = 2 THEN 'FrozenXid' ELSE 'NormalXid' END, objmod,
 last_sequence, gp_segment_id from gp_dist_random('gp_fastsequence') WHERE objid
 IN (SELECT segrelid FROM pg_appendonly WHERE relid IN (SELECT oid FROM pg_class
@@ -296,29 +360,33 @@ SELECT unique1 FROM tenk_ao1 EXCEPT SELECT unique1 FROM tenk_ao1;
 SELECT unique1 FROM tenk_heap EXCEPT SELECT unique1 FROM tenk_ao3;
 
 -- Get gp_fastsequence details before truncate
-SELECT CASE WHEN xmin = 2 THEN 'FrozenXid' ELSE 'NormalXid' END, objmod,
-last_sequence > 0, gp_segment_id from gp_dist_random('gp_fastsequence') WHERE objid
-IN (SELECT segrelid FROM pg_appendonly WHERE relid IN (SELECT oid FROM pg_class
-WHERE relname='tenk_ao2'));
+SELECT CASE WHEN xmin = 2 THEN 'FrozenXid' ELSE 'NormalXid' END,
+       objmod,
+       CASE WHEN last_sequence = 0 THEN 'zero'
+            WHEN last_sequence >= 3300 THEN '>= 3300'
+           ELSE '1-2900' END AS last_sequence,
+       gp_segment_id
+FROM gp_dist_random('gp_fastsequence')
+WHERE objid IN (SELECT segrelid FROM pg_appendonly WHERE relid IN (
+  SELECT oid FROM pg_class WHERE relname='tenk_ao2'));
 
 -- TRUNCATE
 TRUNCATE tenk_ao2;
 
 -- Truncate changes relfilnode, as a result old pg_aoseg table is truncated but
 -- gp_fastsequence remains intact.
-SELECT CASE WHEN xmin = 2 THEN 'FrozenXid' ELSE 'NormalXid' END, objmod,
-last_sequence > 0, gp_segment_id from gp_dist_random('gp_fastsequence') WHERE objid
-IN (SELECT segrelid FROM pg_appendonly WHERE relid IN (SELECT oid FROM pg_class
-WHERE relname='tenk_ao2'));
+SELECT CASE WHEN xmin = 2 THEN 'FrozenXid' ELSE 'NormalXid' END,
+       objmod,
+       CASE WHEN last_sequence = 0 THEN 'zero'
+            WHEN last_sequence >= 3300 THEN '>= 3300'
+           ELSE '1-2900' END AS last_sequence,
+       gp_segment_id
+FROM gp_dist_random('gp_fastsequence')
+WHERE objid IN (SELECT segrelid FROM pg_appendonly WHERE relid IN (
+  SELECT oid FROM pg_class WHERE relname='tenk_ao2'));
 
--- OIDS
+-- WITH OIDS is no longer supported
 CREATE TABLE aowithoids(a int, b int) WITH (appendonly=true,oids=true);
-COPY aowithoids FROM STDIN;
-1	1
-2	2
-\.
-SELECT * FROM aowithoids ORDER BY a; -- this should show a,b only
-SELECT oideq(oid,-1) FROM aowithoids; -- kind of stupid but checks that oid actually exists and is queriable. should always be 'f'
 
 -- CREATE INDEX
 CREATE INDEX tenk_ao1_unique1 ON tenk_ao1 USING btree(unique1 int4_ops);
@@ -334,6 +402,7 @@ drop table if exists ao;
 create table ao (i int, j int, k varchar) with(appendonly=true);
 insert into ao values (1,1,'a'), (2,2,'aa'), (3,3,'aaa'), (4,4,'aaaa'),
 	(5,5,'aaaaa'), (6,6,'aaaaaa'), (7,7,'aaaaaaa'), (8,8,'aaaaaaaa');
+analyze ao;
 create index ao_j on ao using btree(j);
 create index ao_k on ao using btree(k);
 create index ao_jk on ao using btree((j + length(k)));
@@ -386,17 +455,17 @@ insert into ao select i, 2, 'a' from generate_series(1, 20) i;
 select distinct j from ao where j > -1 and j < 3 order by j;
 
 -- TEMP TABLES w/ INDEXES
-create temp table temp_tenk_ao5 with (appendonly=true, orientation=column, compresstype=zlib, compresslevel=1)
+create temp table temp_tenk_ao5 with (appendonly=true, compresstype=zlib, compresslevel=1)
     as select * from tenk_ao5 distributed by (unique1);
 create index temp_even_index on temp_tenk_ao5 (even);
 select count(*) from temp_tenk_ao5;
-select tablename, indexname, indexdef from pg_indexes where tablename = 'temp_tenk_ao5';
+select i.tablename, i.indexname, pg_get_indexdef(c.oid, 0, TRUE) from pg_indexes i join pg_class c on i.indexname=c.relname and i.tablename='temp_tenk_ao5';
 insert into temp_tenk_ao5(unique1, unique2) values (99998888, 99998888);
 update temp_tenk_ao5 set unique2 = 99998889 where unique2 = 99998888;
 delete from temp_tenk_ao5 where unique2 = 99998889;
 select count(*) from temp_tenk_ao5;
-truncate table temp_tenk_ao5;
 vacuum analyze temp_tenk_ao5;
+truncate table temp_tenk_ao5;
 \d temp_tenk_ao5
 insert into temp_tenk_ao5(unique1, unique2) values (99998888, 99998888);
 select unique1 from temp_tenk_ao5;
@@ -404,7 +473,7 @@ select unique1 from temp_tenk_ao5;
 -- TEMP TABLES w/ COMMIT DROP AND USING PREPARE
 begin;
 prepare tenk_ao5_prep(int4) as select * from tenk_ao5 where unique1 > 8000;
-create temp table tenk_ao5_temp_drop with (appendonly=true, orientation=column, compresstype=zlib, compresslevel=1)
+create temp table tenk_ao5_temp_drop with (appendonly=true, compresstype=zlib, compresslevel=1)
     on commit drop as execute tenk_ao5_prep(8095);
 select count(*) from tenk_ao5_temp_drop;
 commit;
@@ -412,7 +481,7 @@ select count(*) from tenk_ao5_temp_drop;
 
 -- TEMP TABLES w/ COMMIT DELETE ROWS
 begin;
-create temp table tenk_ao5_temp_delete_rows with (appendonly=true, orientation=column, compresstype=zlib, compresslevel=1)
+create temp table tenk_ao5_temp_delete_rows with (appendonly=true, compresstype=zlib, compresslevel=1)
     on commit delete rows as select * from tenk_ao5 where unique1 > 8000 distributed by (unique1);
 select count(*) from tenk_ao5_temp_delete_rows;
 commit;
@@ -420,7 +489,7 @@ select count(*) from tenk_ao5_temp_delete_rows;
 
 -- TEMP TABLES w/ COMMIT PRESERVE ROWS
 begin;
-create temp table tenk_ao5_temp_pres_rows with (appendonly=true, orientation=column, compresstype=zlib, compresslevel=1)
+create temp table tenk_ao5_temp_pres_rows with (appendonly=true, compresstype=zlib, compresslevel=1)
     on commit preserve rows as select * from tenk_ao5 where unique1 > 8000 distributed by (unique1);
 select count(*) from tenk_ao5_temp_pres_rows;
 commit;
@@ -440,19 +509,22 @@ select * from tenk_ao5 where unique1=1;
 ---------------------
 -- DELETE
 select count(*) from tenk_ao1;
-select count(*) from gp_toolkit.__gp_aoseg('tenk_ao1') where modcount > 0;
+select snapshot_modcounts('tenk_ao1');
+select count(*) from diff_modcounts('tenk_ao1') where modcount_diff > 0; --sanity check our test function
 DELETE FROM tenk_ao1 WHERE unique1 = 1;
 -- modcount after DELETE must increment to flag table should be included in
 -- incremental backup
-select count(*) from gp_toolkit.__gp_aoseg('tenk_ao1') where modcount > 0;
+select count(*) from diff_modcounts('tenk_ao1') where modcount_diff > 0;
 select count(*) from tenk_ao1;
 -- UPDATE
+select snapshot_modcounts('tenk_ao1');
 select count(*) from tenk_ao1 where unique2 < 0;
+select count(*) from diff_modcounts('tenk_ao1') where modcount_diff > 0; --sanity check our test function
 UPDATE tenk_ao1 SET unique2 = -unique1 WHERE unique2 <= 5;
 UPDATE tenk_ao1 SET two = 2;
 -- modcount after UPDATE must increment to flag table should be included in
 -- incremental backup
-select count(*) from gp_toolkit.__gp_aoseg('tenk_ao1') where modcount > 1;
+select count(*) from diff_modcounts('tenk_ao1') where modcount_diff > 0;
 select count(*) from tenk_ao1 where unique2 < 0;
 
 -- ALTER
@@ -502,7 +574,7 @@ DROP TABLE aosizetest_2;
 
 
 -- Check that pg_total_relation_size() returns a sane value for an AO table.
--- (As of this writing, 1468872 bytes, but leave some slack for minor changes
+-- (As of this writing, 1436104 bytes, but leave some slack for minor changes
 -- to indexes etc.)
 CREATE TABLE aosizetest_3(a text) WITH (appendonly=true);
 insert into aosizetest_3 select repeat('x', 100) from generate_series(1, 10000);
@@ -536,8 +608,7 @@ insert into ao_compress_results values (pg_relation_size('ao_compress_table'), p
 insert into ao_compress_table (id, v) values (1, 'ifyouwantto99knowwhatist8329histhenkeepreadingit;;untilyou]findoutyoureyeshurtandyoustil0ldontknow103kwhatitisdoyouunderstandmeyetandifyoustillwanttoknowthenyoupleasekeepreading');
 insert into ao_compress_results values (pg_relation_size('ao_compress_table'), pg_relation_size('ao_compress_id_index'), pg_relation_size('ao_compress_v_index'));
 
--- compression ratio should be between 1.2 and 1.3
-select get_ao_compression_ratio('ao_compress_table') > 1.2 and get_ao_compression_ratio('ao_compress_table') < 1.3;
+select get_ao_compression_ratio('ao_compress_table');
 select get_ao_distribution('ao_compress_table');
 
 truncate table ao_compress_table; -- after truncate, reclaim space from the table and index
@@ -572,7 +643,6 @@ DROP TABLE tenk_ao2;
 DROP TABLE tenk_ao3;
 DROP TABLE tenk_ao4;
 DROP TABLE tenk_ao5;
-DROP TABLE aowithoids;
 DROP TABLE ao_selection;
 
 ---------------------------------------------------------------
@@ -595,14 +665,26 @@ COMMIT;
 BEGIN;
 SAVEPOINT sp1;
 CREATE TABLE appendonly_subxans_test(a int, b int) WITH (appendonly=true);
+
+select oid as appendonly_subxans_test_oid from pg_class
+where relname = 'appendonly_subxans_test' \gset
+
 SAVEPOINT sp2;
+
 INSERT INTO appendonly_subxans_test SELECT * FROM generate_series(1, 10);
+
 SELECT CASE WHEN xmin = 2 THEN 'FrozenXid' ELSE 'NormalXid' END, objmod,
-last_sequence, gp_segment_id from gp_dist_random('gp_fastsequence') WHERE objid
-IN (SELECT segrelid FROM pg_appendonly WHERE relid IN (SELECT oid FROM pg_class
-WHERE relname='appendonly_subxans_test'));
+last_sequence, gp_segment_id from gp_dist_random('gp_fastsequence')
+WHERE objid IN (SELECT segrelid FROM pg_appendonly WHERE relid =:appendonly_subxans_test_oid);
+
 ROLLBACK TO SAVEPOINT sp1;
 COMMIT;
+
+-- No entry should have leaked in gp_fastsequence after subtransaction
+-- rollback.
+SELECT CASE WHEN xmin = 2 THEN 'FrozenXid' ELSE 'NormalXid' END, objmod,
+last_sequence, gp_segment_id from gp_dist_random('gp_fastsequence')
+WHERE objid IN (SELECT segrelid FROM pg_appendonly WHERE relid =:appendonly_subxans_test_oid);
 
 -- create table and insert in independent subtransactions, validate insert to
 -- gp_fastsequence is using NormalXid and not FrozenXid and stays despite
@@ -702,9 +784,66 @@ COPY trigger_aocs_test FROM STDIN;
 SELECT * FROM trigger_ao_test;
 SELECT * FROM trigger_aocs_test;
 
+-----------------
+-- Inheritance
+-----------------
+
+CREATE TABLE ao_inh_p1(a int, b int) WITH (appendonly = true);
+CREATE TABLE ao_inh_p2(a int, b int) INHERITS (ao_inh_p1) WITH (appendonly = true);
+CREATE TABLE ao_inh_p3(a int, b int) INHERITS (ao_inh_p1) WITH (appendonly = true);
+CREATE TABLE ao_inh_p4(a int, b int, c int) INHERITS (ao_inh_p2) WITH (appendonly = true);
+
+insert into ao_inh_p1 values (1, 1);
+insert into ao_inh_p2 values (2, 2);
+insert into ao_inh_p3 values (3, 3);
+insert into ao_inh_p4 values (4, 4);
+insert into ao_inh_p4 select g, g, g from generate_series(10, 15) g;
+
+select * from ao_inh_p1;
+select * from ao_inh_p2;
+select * from ao_inh_p4;
+
+update ao_inh_p1 set a = a + 1;
+update ao_inh_p2 set b = b + 1;
+
+delete from ao_inh_p1 where a = 13;
+
+select * from ao_inh_p1;
+select * from ao_inh_p4;
+
+
 --------------------------------------------------------------------------------
 -- Finally check to detect if any dangling gp_fastsequence entries are left
 -- behind by this SQL file
 --------------------------------------------------------------------------------
 SELECT objid FROM gp_fastsequence AS gfs LEFT OUTER JOIN (SELECT oid FROM
 pg_class) AS pgc ON (gfs.objid = pgc.oid) WHERE pgc.oid IS NULL;
+
+-- test case for append optimized columnar bitmap scan when row level bitmap is promoted to page level
+
+drop table if exists bms_ao_bug;
+create table bms_ao_bug
+(c1 int not null,
+c2 int not null,
+c3 char(100) not null)
+with (appendonly=true, compresstype=zlib)
+distributed by (c1)
+;
+
+insert into bms_ao_bug select 1, 1, a.c1::char(100) from generate_series(1, 2000000) a(c1);
+
+create index bms_ao_bug_ix1 on bms_ao_bug (c2);
+
+set enable_seqscan=off;
+set work_mem=256;
+
+select
+a.c1,
+count(*) row_cnt
+from bms_ao_bug a
+where a.c2 = 1
+group by
+a.c1
+;
+
+drop table bms_ao_bug;

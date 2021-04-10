@@ -4,7 +4,7 @@
  * routines for dispatching DTX commands to the qExec processes.
  *
  * Portions Copyright (c) 2005-2008, Greenplum inc
- * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
  *
  *
  * IDENTIFICATION
@@ -15,7 +15,6 @@
 #ifndef CDBDISP_DTX_H
 #define CDBDISP_DTX_H
 
-#include "lib/stringinfo.h"         /* StringInfo */
 #include "cdb/cdbtm.h"
 
 struct pg_result;                   /* #include "libpq-fe.h" */
@@ -28,21 +27,18 @@ struct CdbPgResults;
  * produced; the caller must PQclear() them and free() the array.
  * A NULL entry follows the last used entry in the array.
  *
- * Any error messages - whether or not they are associated with
- * PGresult objects - are appended to a StringInfo buffer provided
- * by the caller.
+ * Any error message - whether or not it is associated with an
+ * PGresult object - is returned in *qeError.
  */
 struct pg_result **
 CdbDispatchDtxProtocolCommand(DtxProtocolCommand dtxProtocolCommand,
-							  int flags,
 							  char	*dtxProtocolCommandLoggingStr,
 							  char	*gid,
-							  DistributedTransactionId	gxid,
 							  ErrorData **qeError,
 							  int *resultCount,
-							  bool* badGangs,
-							  List *twophaseSegments,
-							  char *argument, int argumentLength );
+							  List *dtxSegments,
+							  char *serializedDtxContextInfo,
+							  int serializedDtxContextInfoLen);
 
 
 /*

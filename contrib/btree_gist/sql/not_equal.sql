@@ -14,10 +14,17 @@ INSERT INTO test_ne VALUES('2007-02-03', -91.3);
 INSERT INTO test_ne VALUES('2011-09-01', 43.7);
 INSERT INTO test_ne SELECT '2009-01-01', 10.7 FROM generate_series(1,1000);
 
+SET enable_indexscan to false;
+
 EXPLAIN (COSTS OFF) SELECT * FROM test_ne WHERE a <> '2009-01-01' AND b <> 10.7;
 
 SELECT * FROM test_ne WHERE a <> '2009-01-01' AND b <> 10.7;
 
+RESET enable_indexscan;
+
+-- The below test use an exclusion constraint, which isn't supported in GPDB
+-- so we need to ignore this test
+-- start_ignore
 -- test search for "not equals" using an exclusion constraint
 
 CREATE TABLE zoo (
@@ -30,3 +37,4 @@ INSERT INTO zoo VALUES(123, 'zebra');
 INSERT INTO zoo VALUES(123, 'zebra');
 INSERT INTO zoo VALUES(123, 'lion');
 INSERT INTO zoo VALUES(124, 'lion');
+-- end_ignore

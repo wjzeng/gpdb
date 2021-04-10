@@ -4,7 +4,7 @@
  *	  Standard POSTGRES buffer page definitions.
  *
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/storage/bufpage.h
@@ -19,11 +19,6 @@
 #include "storage/item.h"
 #include "storage/off.h"
 #include "miscadmin.h"
-
-#ifndef FRONTEND
-/* Needed by PageGetLSN(), only for asserts in backend code */
-#include "storage/bufmgr.h"
-#endif
 
 /*
  * A postgres disk page is an abstraction layered on top of a postgres
@@ -59,14 +54,18 @@
  *
  * NOTES:
  *
- * linp1..N form an ItemId array.  ItemPointers point into this array
- * rather than pointing directly to a tuple.  Note that OffsetNumbers
+ * linp1..N form an ItemId (line pointer) array.  ItemPointers point
+ * to a physical block number and a logical offset (line pointer
+ * number) within that block/page.  Note that OffsetNumbers
  * conventionally start at 1, not 0.
  *
- * tuple1..N are added "backwards" on the page.  because a tuple's
- * ItemPointer points to its ItemId entry rather than its actual
+ * tuple1..N are added "backwards" on the page.  Since an ItemPointer
+ * offset is used to access an ItemId entry rather than an actual
  * byte-offset position, tuples can be physically shuffled on a page
- * whenever the need arises.
+ * whenever the need arises.  This indirection also keeps crash recovery
+ * relatively simple, because the low-level details of page space
+ * management can be controlled by standard buffer page code during
+ * logging, and during recovery.
  *
  * AM-generic per-page information is kept in PageHeaderData.
  *
@@ -162,7 +161,7 @@ typedef struct PageHeaderData
 	LocationIndex pd_special;	/* offset to start of special space */
 	uint16		pd_pagesize_version;
 	TransactionId pd_prune_xid; /* oldest prunable XID, or zero if none */
-	ItemIdData	pd_linp[1];		/* beginning of line pointer array */
+	ItemIdData	pd_linp[FLEXIBLE_ARRAY_MEMBER]; /* line pointer array */
 } PageHeaderData;
 
 typedef PageHeaderData *PageHeader;
@@ -179,13 +178,12 @@ typedef PageHeaderData *PageHeader;
  * page for its new tuple version; this suggests that a prune is needed.
  * Again, this is just a hint.
  */
-#define PD_HAS_FREE_LINES	0x0001		/* are there any unused line pointers? */
-#define PD_PAGE_FULL		0x0002		/* not enough free space for new
-										 * tuple? */
-#define PD_ALL_VISIBLE		0x0004		/* all tuples on page are visible to
-										 * everyone */
+#define PD_HAS_FREE_LINES	0x0001	/* are there any unused line pointers? */
+#define PD_PAGE_FULL		0x0002	/* not enough free space for new tuple? */
+#define PD_ALL_VISIBLE		0x0004	/* all tuples on page are visible to
+									 * everyone */
 
-#define PD_VALID_FLAG_BITS	0x0007		/* OR of all valid pd_flags bits */
+#define PD_VALID_FLAG_BITS	0x0007	/* OR of all valid pd_flags bits */
 
 /*
  * Page layout version number 0 is for pre-7.3 Postgres releases.
@@ -246,7 +244,7 @@ typedef PageHeaderData *PageHeader;
 
 /*
  * PageGetContents
- *		To be used in case the page does not contain item pointers.
+ *		To be used in cases where the page does not contain line pointers.
  *
  * Note: prior to 8.3 this was not guaranteed to yield a MAXALIGN'd result.
  * Now it is.  Beware of old code that might think the offset to the contents
@@ -317,12 +315,31 @@ typedef PageHeaderData *PageHeader;
 	((uint16) (PageGetPageSize(page) - ((PageHeader)(page))->pd_special))
 
 /*
+ * Using assertions, validate that the page special pointer is OK.
+ *
+ * This is intended to catch use of the pointer before page initialization.
+ * It is implemented as a function due to the limitations of the MSVC
+ * compiler, which choked on doing all these tests within another macro.  We
+ * return true so that MacroAssert() can be used while still getting the
+ * specifics from the macro failure within this function.
+ */
+static inline bool
+PageValidateSpecialPointer(Page page)
+{
+	Assert(PageIsValid(page));
+	Assert(((PageHeader) (page))->pd_special <= BLCKSZ);
+	Assert(((PageHeader) (page))->pd_special >= SizeOfPageHeaderData);
+
+	return true;
+}
+
+/*
  * PageGetSpecialPointer
  *		Returns pointer to special space on a page.
  */
 #define PageGetSpecialPointer(page) \
 ( \
-	AssertMacro(PageIsValid(page)), \
+	AssertMacro(PageValidateSpecialPointer(page)), \
 	(char *) ((char *) (page) + ((PageHeader) (page))->pd_special) \
 )
 
@@ -366,23 +383,12 @@ typedef PageHeaderData *PageHeader;
  * local buffers do not need to worry about concurrency.
  *
  */
+extern bool BufferLockHeldByMe(Page page);
 static inline XLogRecPtr
 PageGetLSN(Page page)
 {
 #if defined (USE_ASSERT_CHECKING) && !defined(FRONTEND)
-	extern PGDLLIMPORT char *BufferBlocks; /* duplicates bufmgr.h */
-	char *pagePtr = page;
-
-	/*
-	 * We only want to assert that we hold a lock on the page contents if the
-	 * page is shared (i.e. it is one of the BufferBlocks).
-	 */
-	if (BufferBlocks <= pagePtr &&
-		pagePtr < (BufferBlocks + NBuffers * BLCKSZ))
-	{
-		BufferDesc *hdr = &BufferDescriptors[(pagePtr - BufferBlocks) / BLCKSZ];
-		Assert(LWLockHeldByMe(hdr->content_lock));
-	}
+	Assert(BufferLockHeldByMe(page));
 #endif
 	return PageXLogRecPtrGet(((PageHeader) (page))->pd_lsn);
 }
@@ -443,22 +449,33 @@ do { \
  *		extern declarations
  * ----------------------------------------------------------------
  */
+#define PAI_OVERWRITE			(1 << 0)
+#define PAI_IS_HEAP				(1 << 1)
+
+#define PageAddItem(page, item, size, offsetNumber, overwrite, is_heap) \
+	PageAddItemExtended(page, item, size, offsetNumber, \
+						((overwrite) ? PAI_OVERWRITE : 0) | \
+						((is_heap) ? PAI_IS_HEAP : 0))
 
 extern void PageInit(Page page, Size pageSize, Size specialSize);
 extern bool PageIsVerified(Page page, BlockNumber blkno);
-extern OffsetNumber PageAddItem(Page page, Item item, Size size,
-			OffsetNumber offsetNumber, bool overwrite, bool is_heap);
+extern OffsetNumber PageAddItemExtended(Page page, Item item, Size size,
+										OffsetNumber offsetNumber, int flags);
 extern Page PageGetTempPage(Page page);
 extern Page PageGetTempPageCopy(Page page);
 extern Page PageGetTempPageCopySpecial(Page page);
 extern void PageRestoreTempPage(Page tempPage, Page oldPage);
 extern void PageRepairFragmentation(Page page);
 extern Size PageGetFreeSpace(Page page);
+extern Size PageGetFreeSpaceForMultipleTuples(Page page, int ntups);
 extern Size PageGetExactFreeSpace(Page page);
 extern Size PageGetHeapFreeSpace(Page page);
 extern void PageIndexTupleDelete(Page page, OffsetNumber offset);
 extern void PageIndexMultiDelete(Page page, OffsetNumber *itemnos, int nitems);
+extern void PageIndexTupleDeleteNoCompact(Page page, OffsetNumber offset);
+extern bool PageIndexTupleOverwrite(Page page, OffsetNumber offnum,
+									Item newtup, Size newsize);
 extern char *PageSetChecksumCopy(Page page, BlockNumber blkno);
 extern void PageSetChecksumInplace(Page page, BlockNumber blkno);
 
-#endif   /* BUFPAGE_H */
+#endif							/* BUFPAGE_H */

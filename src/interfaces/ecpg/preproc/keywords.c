@@ -4,7 +4,7 @@
  *	  lexical token lookup for key words in PostgreSQL
  *
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -15,15 +15,24 @@
  */
 #include "postgres_fe.h"
 
-#include "parser/keywords.h"
-#include "type.h"
+/*
+ * This is much trickier than it looks.  We are #include'ing kwlist.h
+ * but the token numbers that go into the table are from preproc.h
+ * not the backend's gram.h.  Therefore this token table will match
+ * the ScanKeywords table supplied from common/keywords.c, including all
+ * keywords known to the backend, but it will supply the token numbers used
+ * by ecpg's grammar, which is what we need.  The ecpg grammar must
+ * define all the same token names the backend does, else we'll get
+ * undefined-symbol failures in this compile.
+ */
+
+#include "preproc_extern.h"
 #include "preproc.h"
 
-#define PG_KEYWORD(a,b,c) {a,b,c},
+#define PG_KEYWORD(kwname, value, category) value,
 
-
-const ScanKeyword SQLScanKeywords[] = {
+const uint16 SQLScanKeywordTokens[] = {
 #include "parser/kwlist.h"
 };
 
-const int	NumSQLScanKeywords = lengthof(SQLScanKeywords);
+#undef PG_KEYWORD

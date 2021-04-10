@@ -7,8 +7,8 @@ Starts a Greenplum Database system.
 SYNOPSIS
 *****************************************************
 
-gpstart [-d <master_data_directory>] [-B <parallel_processes>] 
-        [-R] [-m] [-y] [-a] [-t <timeout_seconds>] 
+gpstart [-d <coordinator_data_directory>] [-B <parallel_processes>]
+        [-R] [-m | -c] [-y] [-a] [-t <timeout_seconds>]
         [-l logfile_directory] [-v | -q]
 
 gpstart -? | -h | --help
@@ -23,16 +23,9 @@ DESCRIPTION
 The gpstart utility is used to start the Greenplum Database server 
 processes. When you start a Greenplum Database system, you are 
 actually starting several postgres database server listener processes 
-at once (the master and all of the segment instances). The gpstart utility 
+at once (the coordinator and all of the segment instances). The gpstart utility 
 handles the startup of the individual instances. Each instance is started 
 in parallel.
-
-The first time an administrator runs gpstart, the utility creates a hosts 
-cache file named .gphostcache in the user's home directory. Subsequently, 
-the utility uses this list of hosts to start the system more efficiently. 
-If new hosts are added to the system, you must manually remove this file 
-from the gpadmin user's home directory. The utility will create a new hosts 
-cache file at the next startup.
 
 Before you can start a Greenplum Database system, you must have initialized 
 the system using gpinitsystem first.
@@ -54,10 +47,10 @@ OPTIONS
   how many segment instances it needs to start.
 
 
--d <master_data_directory>
+-d <coordinator_data_directory>
 
-  Optional. The master host data directory. If not specified, 
-  the value set for $MASTER_DATA_DIRECTORY will be used.
+  Optional. The coordinator host data directory. If not specified, 
+  the value set for $COORDINATOR_DATA_DIRECTORY will be used.
 
 
 -l <logfile_directory>
@@ -65,15 +58,15 @@ OPTIONS
   The directory to write the log file. Defaults to ~/gpAdminLogs.
 
 
--m
+-m | -c | --master_only | --coordinator_only
 
-  Optional. Starts the master instance only, which may be necessary 
-  for maintenance tasks. This mode only allows connections to the master 
+  Optional. Starts the coordinator instance only, which may be necessary 
+  for maintenance tasks. This mode only allows connections to the coordinator 
   in utility mode. For example:
 
-  PGOPTIONS='-c gp_session_role=utility' psql
+  PGOPTIONS='-c gp_role=utility' psql
 
-  Note that starting the system in master-only mode is only advisable
+  Note that starting the system in coordinator-only mode is only advisable
   under supervision of Greenplum support.  Improper use of this option
   may lead to a split-brain condition and possible data loss.
 
@@ -107,8 +100,8 @@ OPTIONS
 
 -y
 
-  Optional. Do not start the standby master host. The default is to start 
-  the standby master host and synchronization process.
+  Optional. Do not start the standby coordinator host. The default is to start 
+  the standby coordinator host and synchronization process.
 
 
 -? | -h | --help
@@ -136,11 +129,11 @@ Start a Greenplum Database system in restricted mode
 gpstart -R
 
 
-Start the Greenplum master instance only and connect in utility mode:
+Start the Greenplum coordinator instance only and connect in utility mode:
 
 gpstart -m
 
-PGOPTIONS='-c gp_session_role=utility' psql
+PGOPTIONS='-c gp_role=utility' psql
 
 
 Display the online help for the gpstart utility:

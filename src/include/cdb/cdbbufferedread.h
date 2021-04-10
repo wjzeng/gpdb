@@ -7,7 +7,7 @@
  * buffers efficiency.
  *        
  * Portions Copyright (c) 2007, greenplum inc
- * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
  *
  *
  * IDENTIFICATION
@@ -70,6 +70,9 @@ typedef struct BufferedRead
     char				 *filePathName;
     int64                fileLen;
 
+	/* current read position */
+	off_t				 fileOff;
+
 	/*
 	 * Temporary limit support for random reading.
 	 */
@@ -131,15 +134,6 @@ extern void BufferedReadSetTemporaryRange(
  */
 extern int64 BufferedReadNextBufferPosition(
     BufferedRead       *bufferedRead);
-
-/*
- * Get the next, maximum buffer space for reading.
- *
- * Returns NULL when the current file has been completely read.
- */
-extern uint8 *BufferedReadGetMaxBuffer(
-    BufferedRead       *bufferedRead,
-    int32              *nextBufferLen);
 
 /*
  * Get the next buffer space for reading with a specified max read-ahead

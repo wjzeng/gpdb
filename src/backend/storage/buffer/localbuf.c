@@ -4,7 +4,7 @@
  *	  local buffer manager. Fast buffer manager for temporary tables,
  *	  which never need to be WAL-logged or checkpointed, etc.
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994-5, Regents of the University of California
  *
  *
@@ -15,6 +15,7 @@
  */
 #include "postgres.h"
 
+#include "access/parallel.h"
 #include "catalog/catalog.h"
 #include "executor/instrument.h"
 #include "storage/buf_internals.h"
@@ -85,7 +86,7 @@ LocalPrefetchBuffer(SMgrRelation smgr, ForkNumber forkNum,
 
 	/* Not in buffers, so initiate prefetch */
 	smgrprefetch(smgr, forkNum, blockNum);
-#endif   /* USE_PREFETCH */
+#endif							/* USE_PREFETCH */
 }
 
 
@@ -108,6 +109,7 @@ LocalBufferAlloc(SMgrRelation smgr, ForkNumber forkNum, BlockNumber blockNum,
 	int			b;
 	int			trycounter;
 	bool		found;
+	uint32		buf_state;
 
 	/*
 	 * Local buffers are used for temp tables in PostgreSQL.  As temp tables
@@ -129,27 +131,32 @@ LocalBufferAlloc(SMgrRelation smgr, ForkNumber forkNum, BlockNumber blockNum,
 	if (hresult)
 	{
 		b = hresult->id;
-		bufHdr = &LocalBufferDescriptors[b];
+		bufHdr = GetLocalBufferDescriptor(b);
 		Assert(BUFFERTAGS_EQUAL(bufHdr->tag, newTag));
 #ifdef LBDEBUG
 		fprintf(stderr, "LB ALLOC (%u,%d,%d) %d\n",
 				smgr->smgr_rnode.node.relNode, forkNum, blockNum, -b - 1);
 #endif
+		buf_state = pg_atomic_read_u32(&bufHdr->state);
+
 		/* this part is equivalent to PinBuffer for a shared buffer */
 		if (LocalRefCount[b] == 0)
 		{
-			if (bufHdr->usage_count < BM_MAX_USAGE_COUNT)
-				bufHdr->usage_count++;
+			if (BUF_STATE_GET_USAGECOUNT(buf_state) < BM_MAX_USAGE_COUNT)
+			{
+				buf_state += BUF_USAGECOUNT_ONE;
+				pg_atomic_unlocked_write_u32(&bufHdr->state, buf_state);
+			}
 		}
 		LocalRefCount[b]++;
 		ResourceOwnerRememberBuffer(CurrentResourceOwner,
 									BufferDescriptorGetBuffer(bufHdr));
-		if (bufHdr->flags & BM_VALID)
-			*foundPtr = TRUE;
+		if (buf_state & BM_VALID)
+			*foundPtr = true;
 		else
 		{
 			/* Previous read attempt must have failed; try again */
-			*foundPtr = FALSE;
+			*foundPtr = false;
 		}
 		return bufHdr;
 	}
@@ -172,13 +179,16 @@ LocalBufferAlloc(SMgrRelation smgr, ForkNumber forkNum, BlockNumber blockNum,
 		if (++nextFreeLocalBuf >= NLocBuffer)
 			nextFreeLocalBuf = 0;
 
-		bufHdr = &LocalBufferDescriptors[b];
+		bufHdr = GetLocalBufferDescriptor(b);
 
 		if (LocalRefCount[b] == 0)
 		{
-			if (bufHdr->usage_count > 0)
+			buf_state = pg_atomic_read_u32(&bufHdr->state);
+
+			if (BUF_STATE_GET_USAGECOUNT(buf_state) > 0)
 			{
-				bufHdr->usage_count--;
+				buf_state -= BUF_USAGECOUNT_ONE;
+				pg_atomic_unlocked_write_u32(&bufHdr->state, buf_state);
 				trycounter = NLocBuffer;
 			}
 			else
@@ -186,7 +196,7 @@ LocalBufferAlloc(SMgrRelation smgr, ForkNumber forkNum, BlockNumber blockNum,
 				/* Found a usable buffer */
 				LocalRefCount[b]++;
 				ResourceOwnerRememberBuffer(CurrentResourceOwner,
-										  BufferDescriptorGetBuffer(bufHdr));
+											BufferDescriptorGetBuffer(bufHdr));
 				break;
 			}
 		}
@@ -200,13 +210,13 @@ LocalBufferAlloc(SMgrRelation smgr, ForkNumber forkNum, BlockNumber blockNum,
 	 * this buffer is not referenced but it might still be dirty. if that's
 	 * the case, write it out before reusing it!
 	 */
-	if (bufHdr->flags & BM_DIRTY)
+	if (buf_state & BM_DIRTY)
 	{
 		SMgrRelation oreln;
 		Page		localpage = (char *) LocalBufHdrGetBlock(bufHdr);
 
 		/* Find smgr relation for buffer */
-		oreln = smgropen(bufHdr->tag.rnode, MyBackendId);
+		oreln = smgropen(bufHdr->tag.rnode, MyBackendId, 0);
 
 		// GPDB_93_MERGE_FIXME: is this TODO comment still relevant?
 		// UNDONE: Unfortunately, I think we write temp relations to the mirror...
@@ -220,7 +230,8 @@ LocalBufferAlloc(SMgrRelation smgr, ForkNumber forkNum, BlockNumber blockNum,
 				  false);
 
 		/* Mark not-dirty now in case we error out below */
-		bufHdr->flags &= ~BM_DIRTY;
+		buf_state &= ~BM_DIRTY;
+		pg_atomic_unlocked_write_u32(&bufHdr->state, buf_state);
 
 		pgBufferUsage.local_blks_written++;
 	}
@@ -237,7 +248,7 @@ LocalBufferAlloc(SMgrRelation smgr, ForkNumber forkNum, BlockNumber blockNum,
 	/*
 	 * Update the hash table: remove old entry, if any, and make new one.
 	 */
-	if (bufHdr->flags & BM_TAG_VALID)
+	if (buf_state & BM_TAG_VALID)
 	{
 		hresult = (LocalBufferLookupEnt *)
 			hash_search(LocalBufHash, (void *) &bufHdr->tag,
@@ -246,7 +257,8 @@ LocalBufferAlloc(SMgrRelation smgr, ForkNumber forkNum, BlockNumber blockNum,
 			elog(ERROR, "local buffer hash table corrupted");
 		/* mark buffer invalid just in case hash insert fails */
 		CLEAR_BUFFERTAG(bufHdr->tag);
-		bufHdr->flags &= ~(BM_VALID | BM_TAG_VALID);
+		buf_state &= ~(BM_VALID | BM_TAG_VALID);
+		pg_atomic_unlocked_write_u32(&bufHdr->state, buf_state);
 	}
 
 	hresult = (LocalBufferLookupEnt *)
@@ -259,11 +271,13 @@ LocalBufferAlloc(SMgrRelation smgr, ForkNumber forkNum, BlockNumber blockNum,
 	 * it's all ours now.
 	 */
 	bufHdr->tag = newTag;
-	bufHdr->flags &= ~(BM_VALID | BM_DIRTY | BM_JUST_DIRTIED | BM_IO_ERROR);
-	bufHdr->flags |= BM_TAG_VALID;
-	bufHdr->usage_count = 1;
+	buf_state &= ~(BM_VALID | BM_DIRTY | BM_JUST_DIRTIED | BM_IO_ERROR);
+	buf_state |= BM_TAG_VALID;
+	buf_state &= ~BUF_USAGECOUNT_MASK;
+	buf_state += BUF_USAGECOUNT_ONE;
+	pg_atomic_unlocked_write_u32(&bufHdr->state, buf_state);
 
-	*foundPtr = FALSE;
+	*foundPtr = false;
 	return bufHdr;
 }
 
@@ -276,6 +290,7 @@ MarkLocalBufferDirty(Buffer buffer)
 {
 	int			bufid;
 	BufferDesc *bufHdr;
+	uint32		buf_state;
 
 	Assert(BufferIsLocal(buffer));
 
@@ -287,12 +302,16 @@ MarkLocalBufferDirty(Buffer buffer)
 
 	Assert(LocalRefCount[bufid] > 0);
 
-	bufHdr = &LocalBufferDescriptors[bufid];
+	bufHdr = GetLocalBufferDescriptor(bufid);
 
-	if (!(bufHdr->flags & BM_DIRTY))
+	buf_state = pg_atomic_read_u32(&bufHdr->state);
+
+	if (!(buf_state & BM_DIRTY))
 		pgBufferUsage.local_blks_dirtied++;
 
-	bufHdr->flags |= BM_DIRTY;
+	buf_state |= BM_DIRTY;
+
+	pg_atomic_unlocked_write_u32(&bufHdr->state, buf_state);
 }
 
 /*
@@ -320,10 +339,13 @@ DropRelFileNodeLocalBuffers(RelFileNode rnode, ForkNumber forkNum,
 	Assert(false);
 	for (i = 0; i < NLocBuffer; i++)
 	{
-		BufferDesc *bufHdr = &LocalBufferDescriptors[i];
+		BufferDesc *bufHdr = GetLocalBufferDescriptor(i);
 		LocalBufferLookupEnt *hresult;
+		uint32		buf_state;
 
-		if ((bufHdr->flags & BM_TAG_VALID) &&
+		buf_state = pg_atomic_read_u32(&bufHdr->state);
+
+		if ((buf_state & BM_TAG_VALID) &&
 			RelFileNodeEquals(bufHdr->tag.rnode, rnode) &&
 			bufHdr->tag.forkNum == forkNum &&
 			bufHdr->tag.blockNum >= firstDelBlock)
@@ -342,8 +364,9 @@ DropRelFileNodeLocalBuffers(RelFileNode rnode, ForkNumber forkNum,
 				elog(ERROR, "local buffer hash table corrupted");
 			/* Mark buffer invalid */
 			CLEAR_BUFFERTAG(bufHdr->tag);
-			bufHdr->flags = 0;
-			bufHdr->usage_count = 0;
+			buf_state &= ~BUF_FLAG_MASK;
+			buf_state &= ~BUF_USAGECOUNT_MASK;
+			pg_atomic_unlocked_write_u32(&bufHdr->state, buf_state);
 		}
 	}
 }
@@ -362,10 +385,13 @@ DropRelFileNodeAllLocalBuffers(RelFileNode rnode)
 
 	for (i = 0; i < NLocBuffer; i++)
 	{
-		BufferDesc *bufHdr = &LocalBufferDescriptors[i];
+		BufferDesc *bufHdr = GetLocalBufferDescriptor(i);
 		LocalBufferLookupEnt *hresult;
+		uint32		buf_state;
 
-		if ((bufHdr->flags & BM_TAG_VALID) &&
+		buf_state = pg_atomic_read_u32(&bufHdr->state);
+
+		if ((buf_state & BM_TAG_VALID) &&
 			RelFileNodeEquals(bufHdr->tag.rnode, rnode))
 		{
 			if (LocalRefCount[i] != 0)
@@ -382,8 +408,9 @@ DropRelFileNodeAllLocalBuffers(RelFileNode rnode)
 				elog(ERROR, "local buffer hash table corrupted");
 			/* Mark buffer invalid */
 			CLEAR_BUFFERTAG(bufHdr->tag);
-			bufHdr->flags = 0;
-			bufHdr->usage_count = 0;
+			buf_state &= ~BUF_FLAG_MASK;
+			buf_state &= ~BUF_USAGECOUNT_MASK;
+			pg_atomic_unlocked_write_u32(&bufHdr->state, buf_state);
 		}
 	}
 }
@@ -401,6 +428,19 @@ InitLocalBuffers(void)
 	HASHCTL		info;
 	int			i;
 
+	/*
+	 * Parallel workers can't access data in temporary tables, because they
+	 * have no visibility into the local buffers of their leader.  This is a
+	 * convenient, low-cost place to provide a backstop check for that.  Note
+	 * that we don't wish to prevent a parallel worker from accessing catalog
+	 * metadata about a temp table, so checks at higher levels would be
+	 * inappropriate.
+	 */
+	if (IsParallelWorker())
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TRANSACTION_STATE),
+				 errmsg("cannot access temporary tables during a parallel operation")));
+
 	/* Allocate and zero buffer headers and auxiliary arrays */
 	LocalBufferDescriptors = (BufferDesc *) calloc(nbufs, sizeof(BufferDesc));
 	LocalBufferBlockPointers = (Block *) calloc(nbufs, sizeof(Block));
@@ -415,7 +455,7 @@ InitLocalBuffers(void)
 	/* initialize fields that need to start off nonzero */
 	for (i = 0; i < nbufs; i++)
 	{
-		BufferDesc *buf = &LocalBufferDescriptors[i];
+		BufferDesc *buf = GetLocalBufferDescriptor(i);
 
 		/*
 		 * negative to indicate local buffer. This is tricky: shared buffers
@@ -424,18 +464,24 @@ InitLocalBuffers(void)
 		 * is -1.)
 		 */
 		buf->buf_id = -i - 2;
+
+		/*
+		 * Intentionally do not initialize the buffer's atomic variable
+		 * (besides zeroing the underlying memory above). That way we get
+		 * errors on platforms without atomics, if somebody (re-)introduces
+		 * atomic operations for local buffers.
+		 */
 	}
 
 	/* Create the lookup hash table */
 	MemSet(&info, 0, sizeof(info));
 	info.keysize = sizeof(BufferTag);
 	info.entrysize = sizeof(LocalBufferLookupEnt);
-	info.hash = tag_hash;
 
 	LocalBufHash = hash_create("Local Buffer Lookup Table",
 							   nbufs,
 							   &info,
-							   HASH_ELEM | HASH_FUNCTION);
+							   HASH_ELEM | HASH_BLOBS);
 
 	if (!LocalBufHash)
 		elog(ERROR, "could not initialize local buffer hash table");
@@ -480,9 +526,7 @@ GetLocalBufferStorage(void)
 			LocalBufferContext =
 				AllocSetContextCreate(TopMemoryContext,
 									  "LocalBufferContext",
-									  ALLOCSET_DEFAULT_MINSIZE,
-									  ALLOCSET_DEFAULT_INITSIZE,
-									  ALLOCSET_DEFAULT_MAXSIZE);
+									  ALLOCSET_DEFAULT_SIZES);
 
 		/* Start with a 16-buffer request; subsequent ones double each time */
 		num_bufs = Max(num_bufs_in_block * 2, 16);
@@ -506,15 +550,15 @@ GetLocalBufferStorage(void)
 }
 
 /*
- * AtEOXact_LocalBuffers - clean up at end of transaction.
+ * CheckForLocalBufferLeaks - ensure this backend holds no local buffer pins
  *
- * This is just like AtEOXact_Buffers, but for local buffers.
+ * This is just like CheckForBufferLeaks(), but for local buffers.
  */
-void
-AtEOXact_LocalBuffers(bool isCommit)
+static void
+CheckForLocalBufferLeaks(void)
 {
 #ifdef USE_ASSERT_CHECKING
-	if (assert_enabled && LocalRefCount)
+	if (LocalRefCount)
 	{
 		int			RefCountErrors = 0;
 		int			i;
@@ -535,33 +579,28 @@ AtEOXact_LocalBuffers(bool isCommit)
 }
 
 /*
+ * AtEOXact_LocalBuffers - clean up at end of transaction.
+ *
+ * This is just like AtEOXact_Buffers, but for local buffers.
+ */
+void
+AtEOXact_LocalBuffers(bool isCommit)
+{
+	CheckForLocalBufferLeaks();
+}
+
+/*
  * AtProcExit_LocalBuffers - ensure we have dropped pins during backend exit.
  *
- * This is just like AtProcExit_Buffers, but for local buffers.  We shouldn't
- * be holding any remaining pins; if we are, and assertions aren't enabled,
- * we'll fail later in DropRelFileNodeBuffers while trying to drop the temp
- * rels.
+ * This is just like AtProcExit_Buffers, but for local buffers.
  */
 void
 AtProcExit_LocalBuffers(void)
 {
-#ifdef USE_ASSERT_CHECKING
-	if (assert_enabled && LocalRefCount)
-	{
-		int			RefCountErrors = 0;
-		int			i;
-
-		for (i = 0; i < NLocBuffer; i++)
-		{
-			if (LocalRefCount[i] != 0)
-			{
-				Buffer		b = -i - 1;
-
-				PrintBufferLeakWarning(b);
-				RefCountErrors++;
-			}
-		}
-		Assert(RefCountErrors == 0);
-	}
-#endif
+	/*
+	 * We shouldn't be holding any remaining pins; if we are, and assertions
+	 * aren't enabled, we'll fail later in DropRelFileNodeBuffers while trying
+	 * to drop the temp rels.
+	 */
+	CheckForLocalBufferLeaks();
 }

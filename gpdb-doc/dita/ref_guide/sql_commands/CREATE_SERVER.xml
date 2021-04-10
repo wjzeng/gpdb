@@ -9,11 +9,11 @@
             <title>Synopsis</title>
             <codeblock id="sql_command_synopsis">CREATE SERVER <varname>server_name</varname> [ TYPE '<varname>server_type</varname>' ] [ VERSION '<varname>server_version</varname>' ]
     FOREIGN DATA WRAPPER <varname>fdw_name</varname>
-    [ OPTIONS ( <varname>option</varname> '<varname>value</varname>' [, ... ] ) ]</codeblock>
+    [ OPTIONS ( [ mpp_execute { 'master' | 'any' | 'all segments' } [, ] ] <varname>option</varname> '<varname>value</varname>' [, ... ] ) ]</codeblock>
         </section>
         <section id="section3">
             <title>Description</title>
-            <p><codeph>CREATE SERVER</codeph> defines a new foreign server. The who defines
+            <p><codeph>CREATE SERVER</codeph> defines a new foreign server. The user who defines
                the server becomes its owner.</p>
             <p>A foreign server typically encapsulates connection information that a foreign-data
               wrapper uses to access an external data source. Additional user-specific connection
@@ -33,13 +33,13 @@
                 <plentry>
                     <pt><varname>server_type</varname></pt>
                     <pd>
-                        <p>Optional server type.</p>
+                        <p>Optional server type, potentially useful to foreign-data wrappers.</p>
                     </pd>
                 </plentry>
                 <plentry>
                     <pt><varname>server_version</varname></pt>
                     <pd>
-                        <p>Optional server version.</p>
+                        <p>Optional server version, potentially useful to foreign-data wrappers.</p>
                     </pd>
                 </plentry>
                 <plentry>
@@ -54,11 +54,31 @@
                         <p>The options for the new foreign server. The options typically define the connection details of the server, but the actual names and values are dependent upon the server's foreign-data wrapper.</p>
                     </pd>
                 </plentry>
+                <plentry>
+                    <pt>mpp_execute { 'master' | 'any' | 'all segments' }</pt>
+                    <pd>
+                        <p>An option that identifies the host from which the foreign data-wrapper
+                            requests data: <ul id="ul_zcg_2vd_mgb">
+                                <li><codeph>master</codeph> (the default)—Request data from the
+                                    master host.</li>
+                                <li><codeph>any</codeph>—Request data from either the master host or
+                                    any one segment, depending on which path costs less.</li>
+                                <li><codeph>all segments</codeph>—Request data from all segments. To
+                                    support this option value, the foreign data-wrapper must have a
+                                    policy that matches the segments to data.</li>
+                            </ul></p>
+                        <p>The <codeph>mpp_execute</codeph> option can be specified in multiple
+                            commands: <codeph>CREATE FOREIGN TABLE</codeph>, <codeph>CREATE
+                                SERVER</codeph>, and <codeph>CREATE FOREIGN DATA WRAPPER</codeph>.
+                            The foreign table setting takes precedence over the foreign server
+                            setting, followed by the foreign data wrapper setting.</p>
+                    </pd>
+                </plentry>
             </parml>
         </section>
         <section id="section5">
             <title>Notes</title>
-            <p>When using the dblink module (see <codeph><xref href="../../utility_guide/dblink.xml#topic1">dblink</xref></codeph>), you can use the foreign server name as an argument of the <codeph>dblink_connect()</codeph> function to provide the connection parameters. You must have the <codeph>USAGE</codeph> privilege on the foreign server to use it in this manner.</p>
+            <p>When using the dblink module (see <codeph><xref href="../modules/dblink.xml#topic1">dblink</xref></codeph>), you can use the foreign server name as an argument of the <codeph>dblink_connect()</codeph> function to provide the connection parameters. You must have the <codeph>USAGE</codeph> privilege on the foreign server to use it in this manner.</p>
         </section>
         <section id="section6">
             <title>Examples</title>

@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 #
 # Copyright (c) Greenplum Inc 2008. All Rights Reserved. 
 #
@@ -22,12 +22,11 @@ logger = get_default_logger()
 # global variable for our platform
 SYSTEM = "unknown"
 
-SUNOS = "sunos"
 LINUX = "linux"
 DARWIN = "darwin"
 FREEBSD = "freebsd"
 OPENBSD = "openbsd"
-platform_list = [SUNOS, LINUX, DARWIN, FREEBSD, OPENBSD]
+platform_list = [LINUX, DARWIN, FREEBSD, OPENBSD]
 
 curr_platform = platform.uname()[0].lower()
 
@@ -247,23 +246,6 @@ class LinuxPlatform(GenericPlatform):
         return findCmdInPath('ping6')
 
 
-class SolarisPlatform(GenericPlatform):
-    def __init__(self):
-        pass
-
-    def getName(self):
-        return "sunos"
-
-    def getDiskFreeCmd(self):
-        return findCmdInPath('df') + " -bk"
-
-    def getTarCmd(self):
-        return findCmdInPath('gtar')
-
-    def getIfconfigCmd(self):
-        return findCmdInPath('ifconfig') + ' -a inet'
-
-
 class DarwinPlatform(GenericPlatform):
     def __init__(self):
         pass
@@ -322,7 +304,7 @@ class Ping(Command):
                     self.pingToUse = SYSTEM.getPing6()
                     self.cmdStr = "%s -c 1 %s" % (self.pingToUse, self.hostToPing)
             except Exception as e:
-                self.results = CommandResult(1, '', 'Failed to get ip address: ' + str(e), False, True)
+                self.results = CommandResult(1, b'', b'Failed to get ip address: ' + str(e).encode(), False, True)
                 if validateAfter:
                     self.validate()
                 else:
@@ -345,43 +327,6 @@ class Ping(Command):
     def remote(name, hostToPing, hostToPingFrom):
         p = Ping(name, hostToPing, ctxt=REMOTE, remoteHost=hostToPingFrom)
         p.run(validateAfter=True)
-
-# ---------------du--------------------
-
-class DiskUsage(Command):
-    def __init__(self, name, directory, ctxt=LOCAL, remoteHost=None):
-        self.directory = directory
-        if remoteHost:
-            cmdStr = "ls -l -R %s | %s ^- | %s '{t+=\$5;} END{print t}'" % (
-                directory, findCmdInPath('grep'), findCmdInPath('awk'))
-        else:
-            cmdStr = "ls -l -R %s | %s ^- | %s '{t+=$5;} END{print t}'" % (
-                directory, findCmdInPath('grep'), findCmdInPath('awk'))
-        Command.__init__(self, name, cmdStr, ctxt, remoteHost)
-
-    @staticmethod
-    def get_size(name, remote_host, directory):
-        duCmd = DiskUsage(name, directory, ctxt=REMOTE, remoteHost=remote_host)
-        duCmd.run(validateAfter=True)
-        return duCmd.get_bytes_used()
-
-    def get_bytes_used(self):
-
-        rawIn = self.results.stdout.split('\t')[0].strip()
-
-        # TODO: revisit this idea of parsing '' and making it a 0. seems dangerous.
-        if rawIn == '':
-            return 0
-
-        if rawIn[0] == 'd':
-            raise ExecutionError("du command could not find directory: cmd: %s"
-                                 "resulted in stdout: '%s' stderr: '%s'" %
-                                 (self.cmdStr, self.results.stdout,
-                                  self.results.stderr),
-                                 self)
-        else:
-            dirBytes = int(rawIn)
-            return dirBytes
 
 
 # -------------df----------------------
@@ -442,13 +387,6 @@ class MakeDirectory(Command):
     def remote(name, remote_host, directory):
         mkdirCmd = MakeDirectory(name, directory, ctxt=REMOTE, remoteHost=remote_host)
         mkdirCmd.run(validateAfter=True)
-
-
-# -------------inline perl replace------
-class InlinePerlReplace(Command):
-    def __init__(self, name, fromStr, toStr, file, ctxt=LOCAL, remoteHost=None):
-        cmdStr = "%s -pi.bak -e's/%s/%s/g' %s" % (findCmdInPath('perl'), fromStr, toStr, file)
-        Command.__init__(self, name, cmdStr, ctxt, remoteHost)
 
 
 # ------------- remove a directory recursively ------------------
@@ -550,7 +488,7 @@ class RemoveGlob(Command):
 class FileDirExists(Command):
     def __init__(self, name, directory, ctxt=LOCAL, remoteHost=None):
         self.directory = directory
-        cmdStr = """python  -c "import os; print os.path.exists('%s')" """ % directory
+        cmdStr = """python3  -c "import os; print(os.path.exists('%s'))" """ % directory
         Command.__init__(self, name, cmdStr, ctxt, remoteHost)
 
     @staticmethod
@@ -589,16 +527,6 @@ class Scp(Command):
         cmdStr = cmdStr + dstFile
 
         Command.__init__(self, name, cmdStr, ctxt, remoteHost)
-
-# -------------local copy------------------
-class LocalDirCopy(Command):
-    def __init__(self, name, srcDirectory, dstDirectory):
-        # tar is much faster than cp for directories with lots of files
-        self.srcDirectory = srcDirectory
-        self.dstDirectory = dstDirectory
-        tarCmd = SYSTEM.getTarCmd()
-        cmdStr = "%s -cf - -C %s . | %s -xf - -C %s" % (tarCmd, srcDirectory, tarCmd, dstDirectory)
-        Command.__init__(self, name, cmdStr, LOCAL, None)
 
 # -------------create tar------------------
 class CreateTar(Command):
@@ -645,32 +573,8 @@ class Hostname(Command):
 
     def get_hostname(self):
         if not self.results:
-            raise Exception, 'Command not yet executed'
+            raise Exception('Command not yet executed')
         return self.results.stdout.strip()
-
-
-class InterfaceAddrs(Command):
-    """Returns list of interface IP Addresses.  List does not include loopback."""
-
-    def __init__(self, name, ctxt=LOCAL, remoteHost=None):
-        ifconfig = SYSTEM.getIfconfigCmd()
-        grep = findCmdInPath('grep')
-        awk = findCmdInPath('awk')
-        cut = findCmdInPath('cut')
-        cmdStr = '%s|%s "inet "|%s -v "127.0.0"|%s \'{print \$2}\'|%s -d: -f2' % (ifconfig, grep, grep, awk, cut)
-        Command.__init__(self, name, cmdStr, ctxt, remoteHost)
-
-    @staticmethod
-    def local(name):
-        cmd = InterfaceAddrs(name)
-        cmd.run(validateAfter=True)
-        return cmd.get_results().stdout.split()
-
-    @staticmethod
-    def remote(name, remoteHost):
-        cmd = InterfaceAddrs(name, ctxt=REMOTE, remoteHost=remoteHost)
-        cmd.run(validateAfter=True)
-        return cmd.get_results().stdout.split()
 
 
 # --------------tcp port is active -----------------------
@@ -740,10 +644,7 @@ class Echo(Command):
 # --------------get user id ----------------------
 class UserId(Command):
     def __init__(self, name, ctxt=LOCAL, remoteHost=None):
-        idCmd = findCmdInPath('id')
-        trCmd = findCmdInPath('tr')
-        awkCmd = findCmdInPath('awk')
-        cmdStr = "%s|%s '(' ' '|%s ')' ' '|%s '{print $2}'" % (idCmd, trCmd, trCmd, awkCmd)
+        cmdStr = "%s -un" % findCmdInPath('id')
         Command.__init__(self, name, cmdStr, ctxt, remoteHost)
 
     @staticmethod
@@ -768,9 +669,7 @@ def getDescendentProcesses(pid):
 
 # --------------global variable initialization ----------------------
 
-if curr_platform == SUNOS:
-    SYSTEM = SolarisPlatform()
-elif curr_platform == LINUX:
+if curr_platform == LINUX:
     SYSTEM = LinuxPlatform()
 elif curr_platform == DARWIN:
     SYSTEM = DarwinPlatform()

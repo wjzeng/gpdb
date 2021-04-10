@@ -7,25 +7,49 @@
         <p id="sql_command_desc">Defines a new procedural language.</p>
         <section id="section2">
             <title>Synopsis</title>
-            <codeblock id="sql_command_synopsis">CREATE [PROCEDURAL] LANGUAGE <varname>name</varname>
+            <codeblock id="sql_command_synopsis">CREATE [ OR REPLACE ] [ PROCEDURAL ] LANGUAGE <varname>name</varname>
 
-CREATE [TRUSTED] [PROCEDURAL] LANGUAGE <varname>name</varname>
-       HANDLER <varname>call_handler</varname> [ INLINE <varname>inline_handler</varname> ] [VALIDATOR <varname>valfunction</varname>]</codeblock>
+CREATE [ OR REPLACE ] [ TRUSTED ] [ PROCEDURAL ] LANGUAGE <varname>name</varname>
+    HANDLER <varname>call_handler</varname> [ INLINE <varname>inline_handler</varname> ] 
+   [ VALIDATOR <varname>valfunction</varname> ]
+            </codeblock>
         </section>
         <section id="section3">
             <title>Description</title>
             <p><codeph>CREATE LANGUAGE</codeph> registers a new procedural language with a Greenplum
                 database. Subsequently, functions and trigger procedures can be defined in this new
-                language. </p>
+                language.</p> 
+            <note>Procedural languages for Greenplum Database have been made into "extensions," and
+                should therefore be installed with <xref href="CREATE_EXTENSION.xml#topic1"/>, not
+                    <codeph>CREATE LANGUAGE</codeph>. Using <codeph>CREATE LANGUAGE</codeph>
+                directly should be restricted to extension installation scripts. If you have a
+                "bare" language in your database, perhaps as a result of an upgrade, you can convert
+                it to an extension using <codeph>CREATE EXTENSION <varname>langname</varname> FROM
+                    unpackaged</codeph>. </note>
             <p>Superusers can register a new language with a Greenplum database. A database owner
                 can also register within that database any language listed in the
                     <codeph>pg_pltemplate</codeph> catalog in which the
                     <codeph>tmpldbacreate</codeph> field is true. The default configuration allows
                 only trusted languages to be registered by database owners. The creator of a
                 language becomes its owner and can later drop it, rename it, or assign ownership to
-                a new user.</p>
-            <p><codeph>CREATE LANGUAGE</codeph> effectively associates the language name with a call
-                handler that is responsible for executing functions written in that language. For a
+                a new owner.</p>
+            <p><codeph>CREATE OR REPLACE LANGUAGE</codeph> will either create a
+                new language, or replace an existing definition. If the language
+                already exists, its parameters are updated according to the values
+                specified or taken from <varname>pg_pltemplate</varname>,
+                but the language's ownership and permissions settings do not change,
+                and any existing functions written in the language are assumed to still
+                be valid. In addition to the normal privilege requirements for creating
+                a language, the user must be superuser or owner of the existing language.
+                The <codeph>REPLACE</codeph> case is mainly meant to be used to
+                ensure that the language exists. If the language has a
+                <varname>pg_pltemplate</varname> entry then <codeph>REPLACE</codeph>
+                will not actually change anything about an existing definition, except in
+                the unusual case where the <varname>pg_pltemplate</varname> entry
+                has been modified since the language was created.
+            </p>
+            <p><codeph>CREATE LANGUAGE</codeph> effectively associates the language name with
+                handler function(s) that are responsible for executing functions written in that language. For a
                 function written in a procedural language (a language other than C or SQL), the
                 database server has no built-in knowledge about how to interpret the function's
                 source code. The task is passed to a special handler that knows the details of the
@@ -37,13 +61,13 @@ CREATE [TRUSTED] [PROCEDURAL] LANGUAGE <varname>name</varname>
                 Greenplum Database distribution: PL/pgSQL, PL/Perl, and PL/Python. Language handlers
                 have also been added for PL/Java and PL/R, but those languages are not pre-installed
                 with Greenplum Database. See the topic on <xref
-                    href="https://www.postgresql.org/docs/8.3/static/xplang.html" scope="external"
+                    href="https://www.postgresql.org/docs/9.4/xplang.html" scope="external"
                     format="html">Procedural Languages</xref> in the PostgreSQL documentation for
                 more information on developing functions using these procedural languages.</p>
             <p>The PL/Perl, PL/Java, and PL/R libraries require the correct versions of Perl, Java,
                 and R to be installed, respectively. </p>
             <p otherprops="pivotal">On RHEL and SUSE platforms, download the appropriate extensions
-                from <xref href="https://network.pivotal.io/products/pivotal-gpdb" scope="external" format="html">Pivotal
+                from <xref href="https://network.pivotal.io/products/pivotal-gpdb" scope="external" format="html">VMware Tanzu
                     Network</xref>, then install the extensions using the Greenplum Package Manager
                     (<codeph>gppkg</codeph>) utility to ensure that all dependencies are installed
                 as well as the extensions. See the Greenplum Database Utility Guide for details
@@ -64,12 +88,12 @@ CREATE [TRUSTED] [PROCEDURAL] LANGUAGE <varname>name</varname>
             <parml>
                 <plentry>
                     <pt>TRUSTED</pt>
-                    <pd>Ignored if the server has an entry for the specified language name in
-                            <codeph>pg_pltemplate</codeph>. Specifies that the call handler for the
-                        language is safe and does not offer an unprivileged user any functionality
-                        to bypass access restrictions. If this key word is omitted when registering
-                        the language, only users with the superuser privilege can use this language
-                        to create new functions.</pd>
+                    <pd><codeph>TRUSTED</codeph> specifies that the language does
+                        not grant access to data that the user would not otherwise
+                        have. If this key word is omitted
+                        when registering the language, only users with the
+                        Greenplum Database superuser privilege can
+                        use this language to create new functions.</pd>
                 </plentry>
                 <plentry>
                     <pt>PROCEDURAL</pt>
@@ -79,13 +103,12 @@ CREATE [TRUSTED] [PROCEDURAL] LANGUAGE <varname>name</varname>
                     <pt>
                         <varname>name</varname>
                     </pt>
-                    <pd>The name of the new procedural language. The language name is case
-                        insensitive. The name must be unique among the languages in the database.
-                        Built-in support is included for <codeph>plpgsql</codeph>,
-                            <codeph>plperl</codeph>, <codeph>plpythonu</codeph>, and
-                            <codeph>plr</codeph>. The languages <codeph>plpgsql</codeph> (PL/pgSQL)
-                        and <codeph>plpythonu</codeph> (PL/Python) are installed by default in
-                        Greenplum Database.</pd>
+                    <pd>The name of the new procedural language. The name must be unique among the
+                        languages in the database. Built-in support is included for
+                            <codeph>plpgsql</codeph>, <codeph>plperl</codeph>, and
+                            <codeph>plpythonu</codeph>. The languages <codeph>plpgsql</codeph>
+                        (PL/pgSQL) and <codeph>plpythonu</codeph> (PL/Python) are installed by
+                        default in Greenplum Database.</pd>
                 </plentry>
                 <plentry>
                     <pt>HANDLER <varname>call_handler</varname></pt>
@@ -145,9 +168,10 @@ CREATE [TRUSTED] [PROCEDURAL] LANGUAGE <varname>name</varname>
         </section>
         <section id="section6">
             <title>Examples</title>
-            <p>The preferred way of creating any of the standard procedural languages:</p>
-            <codeblock>CREATE LANGUAGE plpgsql;
-CREATE LANGUAGE plr;</codeblock>
+            <p>The preferred way of creating any of the standard procedural languages is to use
+                    <codeph>CREATE EXTENSION</codeph> instead of <codeph>CREATE LANGUAGE</codeph>.
+                For example:</p>
+            <codeblock>CREATE EXTENSION plperl;</codeblock>
             <p>For a language not known in the <codeph>pg_pltemplate</codeph> catalog:</p>
             <codeblock>CREATE FUNCTION plsample_call_handler() RETURNS 
 language_handler
@@ -163,9 +187,13 @@ CREATE LANGUAGE plsample
         <section id="section8">
             <title>See Also</title>
             <p><codeph><xref href="ALTER_LANGUAGE.xml#topic1" type="topic" format="dita"/></codeph>,
-                        <codeph><xref href="CREATE_FUNCTION.xml#topic1" type="topic" format="dita"
-                    /></codeph>, <codeph><xref href="./DROP_LANGUAGE.xml#topic1" type="topic"
-                        format="dita"/></codeph>
+                        <codeph><xref href="CREATE_EXTENSION.xml" type="topic" format="dita"
+                    /></codeph>, <codeph><xref href="CREATE_FUNCTION.xml#topic1" type="topic"
+                        format="dita"/></codeph>, <codeph><xref href="./DROP_EXTENSION.xml#topic1"
+                        type="topic" format="dita"/></codeph>, <codeph><xref
+                        href="./DROP_LANGUAGE.xml#topic1" type="topic" format="dita"/></codeph>,
+                        <codeph><xref href="./GRANT.xml#topic1" type="topic" format="dita"
+                    /></codeph>
                 <codeph><xref href="DO.xml#topic1"/></codeph></p>
         </section>
     </body>

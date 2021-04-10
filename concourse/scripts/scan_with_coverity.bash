@@ -13,9 +13,7 @@ function prep_env_for_centos() {
   alternatives --set java "$java7_bin"
   export JAVA_HOME="${java7_bin/jre\/bin\/java/}"
   ln -sf /usr/bin/xsubpp /usr/share/perl5/ExtUtils/xsubpp
-  source /opt/gcc_env.sh
 
-  ln -sf "$BASE_DIR"/gpdb_src/gpAux/ext/${BLD_ARCH}/python-2.7.12 /opt/python-2.7.12
   export PATH=${JAVA_HOME}/bin:${PATH}
 }
 
@@ -31,8 +29,6 @@ function generate_build_number() {
 
 function make_sync_tools() {
   pushd gpdb_src/gpAux
-    # Requires these variables in the env:
-    # IVYREPO_HOST IVYREPO_REALM IVYREPO_USER IVYREPO_PASSWD
     make sync_tools
     # We have compiled LLVM with native zlib on CentOS6 and not from
     # the zlib downloaded from artifacts.  Therefore, remove the zlib
@@ -81,7 +77,14 @@ function upload_to_coverity() {
   )
 }
 
+function install_deps_for_centos() {
+  # quicklz is proprietary code that we cannot put in our public Docker images.
+  rpm -i libquicklz-installer/libquicklz-*.rpm
+  rpm -i libquicklz-devel-installer/libquicklz-*.rpm
+}
+
 function _main() {
+  install_deps_for_centos
   prep_env_for_centos
   generate_build_number
   make_sync_tools

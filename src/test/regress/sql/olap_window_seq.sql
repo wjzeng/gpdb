@@ -97,7 +97,7 @@ select cn,
 
 select cn,
   sum(cn) over (order by cn range '1'::float8 preceding)
-  from customer; -- this, however, should work
+  from customer; -- this used to work on GPDB 6 and before, but GPDB 7 got more strict
 
 -- 4 -- Partitioned, non-ordered window specifications -- OVER (PARTITION BY ...) --
 
@@ -1259,7 +1259,7 @@ from sale; --mvd 3->4
 
 -- MPP-2078
 SELECT sale.cn,sale.vn,
-COUNT(floor(sale.cn)) OVER(partition by sale.cn order by sale.vn asc range between 1 preceding and floor(sale.cn) preceding ) 
+COUNT(floor(sale.cn)) OVER(partition by sale.cn order by sale.vn asc range between 1 preceding and sale.cn preceding ) 
 FROM sale; --mvd 1,2->3
 
 -- MPP-2080
@@ -1269,7 +1269,7 @@ FROM sale; --mvd 1->3
 
 -- MPP-2081
 SELECT cn,qty,floor(prc/cn),
-COUNT(floor(sale.pn*sale.prc)) OVER(order by sale.cn asc range between floor(sale.qty) preceding and floor(sale.prc/sale.cn) preceding) 
+COUNT(floor(sale.pn*sale.prc)) OVER(order by sale.cn asc range between sale.qty preceding and floor(sale.prc/sale.cn)::integer preceding) 
 from sale; --mvd 1->4
 
 -- MPP-2135
@@ -1294,8 +1294,8 @@ FROM (SELECT * FROM sale) sale; --mvd 3,4,5->6; 3,4->7
 create view v1 as
 select dt, sum(cn) over(order by grouping(cn) range grouping(cn) preceding) 
 from sale group by rollup(cn,dt);
-\d+ v1
-drop view v1;
+--\d+ v1
+--drop view v1;
 
 -- MPP-2194, MPP-2236
 drop table if exists win_test_for_window_seq;
@@ -1444,9 +1444,9 @@ select
     f, 
     sum(g) over (partition by f)
 from
-    (select 'A', 1) b(j, g)
+    (select 'A'::text, 1) b(j, g)
     join 
-    (select 'A', 'B') c(j, f)
+    (select 'A'::text, 'B'::text) c(j, f)
     using(j)
 group by 
     1,
@@ -1457,9 +1457,9 @@ select
     f, 
     sum(b.g) over (partition by f)
 from
-    (select 'A', 1) b(j, g)
+    (select 'A'::text, 1) b(j, g)
     join 
-    (select 'A', 'B') c(j, f)
+    (select 'A'::text, 'B'::text) c(j, f)
     using(j)
 group by 
     1,
@@ -1470,9 +1470,9 @@ select
     lower(c.f),
     sum(2*b.g) over (partition by lower(c.f))
 from
-    (select 'A', 1) b(j, g)
+    (select 'A'::text, 1) b(j, g)
     join 
-    (select 'A', 'B') c(j, f)
+    (select 'A'::text, 'B'::text) c(j, f)
     using(j)
 group by 
     2*b.g,
@@ -1483,9 +1483,9 @@ select
     lower(c.f),
     sum(2*g) over (partition by lower(c.f))
 from
-    (select 'A', 1) b(j, g)
+    (select 'A'::text, 1) b(j, g)
     join 
-    (select 'A', 'B') c(j, f)
+    (select 'A'::text, 'B'::text) c(j, f)
     using(j)
 group by 
     2*b.g,
@@ -1600,6 +1600,8 @@ create table foo (a int4) distributed by (a);
 create table bar (a int4, b int4) distributed by (a, b);
 insert into foo select g from generate_series(1, 10) g;
 insert into bar select g%2, g from generate_series(1, 5) g;
+analyze foo;
+analyze bar;
 
 select foo.a, sum(b) over (partition by bar.a order by bar.b) from foo, bar where foo.a = bar.a;
 explain select foo.a, sum(b) over (partition by bar.a order by bar.b) from foo, bar where foo.a = bar.a;
@@ -1637,6 +1639,7 @@ drop table foo;
 drop table if exists window_preds;
 create table window_preds(i int, j int, k int);
 insert into window_preds values(1,2,3);
+analyze window_preds;
 insert into window_preds values(2,3,4);
 insert into window_preds values(3,4,5);
 insert into window_preds values(4,5,6);
@@ -1693,5 +1696,32 @@ select dt, pn, corr(distinct pn, pn) over (partition by dt), sum(pn) over (parti
 create view distinct_windowagg_view as select sum(distinct g/2) OVER (partition by g/4) from generate_series (1, 5) g;
 \d+ distinct_windowagg_view
 
+-- These are tests for pushing down filter predicates in window functions.
+CREATE TABLE window_part_sales (trans_id int, date date, region text)
+DISTRIBUTED BY (trans_id)
+PARTITION BY RANGE (date)
+SUBPARTITION BY LIST (region)
+SUBPARTITION TEMPLATE
+( SUBPARTITION usa VALUES ('usa'),
+DEFAULT SUBPARTITION other_regions)
+(START (date '2011-01-01') INCLUSIVE
+END (date '2011-06-01') EXCLUSIVE
+EVERY (INTERVAL '1 month'),
+DEFAULT PARTITION outlying_dates );
+
+-- When there is no PARTITION BY in the window function, we do not want to push down any of the filter predicates.
+EXPLAIN WITH cte as (SELECT *, row_number() over () FROM window_part_sales) SELECT * FROM cte WHERE date > '2011-03-01' AND region = 'usa';
+
+-- If there is a PARTITION BY in the window function, we can push down ONLY the predicates that match the PARTITION BY column.
+EXPLAIN WITH cte as (SELECT *, row_number() over (PARTITION BY region) FROM window_part_sales) SELECT * FROM cte WHERE date > '2011-03-01' AND region = 'usa';
+
+-- When both columns in the filter predicates are in the window function, it is possible to push both down.
+EXPLAIN WITH cte as (SELECT *, row_number() over (PARTITION BY date,region) FROM window_part_sales) SELECT * FROM cte WHERE date > '2011-03-01' AND region = 'usa';
+
+-- When the column in the filter predicates is also present in the window function, it is possible to push it down.
+EXPLAIN WITH cte as (SELECT *, row_number() over (PARTITION BY date,region) FROM window_part_sales) SELECT * FROM cte WHERE region = 'usa';
+
+-- When there is a disjunct in the filter predicates, it is not possible to push down either into the window function.
+EXPLAIN WITH cte as (SELECT *, row_number() over (PARTITION BY date,region) FROM window_part_sales) SELECT * FROM cte WHERE date > '2011-03-01' OR region = 'usa';
 
 -- End of Test

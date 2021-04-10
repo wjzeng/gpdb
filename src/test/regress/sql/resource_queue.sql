@@ -1,39 +1,39 @@
 -- SQL coverage of RESOURCE QUEUE
 
 CREATE RESOURCE QUEUE regressq ACTIVE THRESHOLD 1;
-SELECT * FROM pg_resqueue WHERE rsqname='regressq';
+SELECT rsqname, rsqcountlimit, rsqcostlimit, rsqovercommit, rsqignorecostlimit FROM pg_resqueue WHERE rsqname='regressq';
 ALTER RESOURCE QUEUE regressq ACTIVE THRESHOLD 2 COST THRESHOLD 2000.00;
-SELECT * FROM pg_resqueue WHERE rsqname='regressq';
+SELECT rsqname, rsqcountlimit, rsqcostlimit, rsqovercommit, rsqignorecostlimit FROM pg_resqueue WHERE rsqname='regressq';
 ALTER RESOURCE QUEUE regressq COST THRESHOLD 3000.00 OVERCOMMIT;
-SELECT * FROM pg_resqueue WHERE rsqname='regressq';
+SELECT rsqname, rsqcountlimit, rsqcostlimit, rsqovercommit, rsqignorecostlimit FROM pg_resqueue WHERE rsqname='regressq';
 ALTER RESOURCE QUEUE regressq COST THRESHOLD 4e+3 NOOVERCOMMIT;
-SELECT * FROM pg_resqueue WHERE rsqname='regressq';
+SELECT rsqname, rsqcountlimit, rsqcostlimit, rsqovercommit, rsqignorecostlimit FROM pg_resqueue WHERE rsqname='regressq';
 COMMENT ON RESOURCE QUEUE regressq IS 'regressq comment';
 DROP RESOURCE QUEUE regressq;
-SELECT * FROM pg_resqueue WHERE rsqname='regressq';
+SELECT rsqname, rsqcountlimit, rsqcostlimit, rsqovercommit, rsqignorecostlimit FROM pg_resqueue WHERE rsqname='regressq';
 
 
 -- more coverage
 CREATE RESOURCE QUEUE regressq ACTIVE THRESHOLD 1 WITH (max_cost=2000);
-SELECT * FROM pg_resqueue WHERE rsqname='regressq';
+SELECT rsqname, rsqcountlimit, rsqcostlimit, rsqovercommit, rsqignorecostlimit FROM pg_resqueue WHERE rsqname='regressq';
 ALTER RESOURCE QUEUE regressq ACTIVE THRESHOLD 1 WITHOUT (max_cost);
-SELECT * FROM pg_resqueue WHERE rsqname='regressq';
+SELECT rsqname, rsqcountlimit, rsqcostlimit, rsqovercommit, rsqignorecostlimit FROM pg_resqueue WHERE rsqname='regressq';
 ALTER RESOURCE QUEUE regressq ACTIVE THRESHOLD 1 WITH (max_cost=2000)
 WITHOUT (overcommit); -- negative
 ALTER RESOURCE QUEUE regressq ACTIVE THRESHOLD 1 WITH (max_cost=2000)
 WITHOUT (cost_overcommit); -- works
-SELECT * FROM pg_resqueue WHERE rsqname='regressq';
+SELECT rsqname, rsqcountlimit, rsqcostlimit, rsqovercommit, rsqignorecostlimit FROM pg_resqueue WHERE rsqname='regressq';
 ALTER RESOURCE QUEUE regressq OVERCOMMIT WITH (max_cost=2000);
-SELECT * FROM pg_resqueue WHERE rsqname='regressq';
+SELECT rsqname, rsqcountlimit, rsqcostlimit, rsqovercommit, rsqignorecostlimit FROM pg_resqueue WHERE rsqname='regressq';
 ALTER RESOURCE QUEUE regressq IGNORE THRESHOLD 1 WITHOUT (max_cost);
-SELECT * FROM pg_resqueue WHERE rsqname='regressq';
+SELECT rsqname, rsqcountlimit, rsqcostlimit, rsqovercommit, rsqignorecostlimit FROM pg_resqueue WHERE rsqname='regressq';
 ALTER RESOURCE QUEUE regressq WITH (priority=high);
 SELECT * FROM pg_resqueue_attributes WHERE rsqname='regressq';
 ALTER RESOURCE QUEUE regressq WITH (priority='MeDiUm');
 SELECT * FROM pg_resqueue_attributes WHERE rsqname='regressq';
 ALTER RESOURCE QUEUE regressq;
 DROP RESOURCE QUEUE regressq;
-SELECT * FROM pg_resqueue WHERE rsqname='regressq';
+SELECT rsqname, rsqcountlimit, rsqcostlimit, rsqovercommit, rsqignorecostlimit FROM pg_resqueue WHERE rsqname='regressq';
 
 -- negative
 
@@ -72,7 +72,7 @@ DROP RESOURCE QUEUE regressq2;
 
 -- Create resource queue with cost_overcommit=true
 create resource queue t3_test_q with (active_statements = 6,max_cost=5e+06 ,cost_overcommit=true, min_cost=50000);
-select * from pg_resqueue where rsqname='t3_test_q';
+select rsqname, rsqcountlimit, rsqcostlimit, rsqovercommit, rsqignorecostlimit from pg_resqueue where rsqname='t3_test_q';
 drop resource queue t3_test_q;
 
 
@@ -196,6 +196,37 @@ DROP USER reg_u2;
 DROP RESOURCE QUEUE reg_activeq;
 DROP RESOURCE QUEUE reg_costq;
 
+-- catalog tests
+set optimizer_enable_master_only_queries = on;
+select count(*)/1000 from
+(select
+(select ressetting from pg_resqueue_attributes b
+where a.rsqname=b.rsqname and resname='priority') as "Priority",
+(select count(*) from pg_resqueue x,pg_roles y
+where x.oid=y.rolresqueue and a.rsqname=x.rsqname) as "RQAssignedUsers"
+from ( select distinct rsqname from pg_resqueue_attributes ) a)
+as foo;
+
+select count(*)/1000 from
+(select a.rsqname as "RQname",
+(select ressetting from pg_resqueue_attributes b
+where a.rsqname=b.rsqname and resname='active_statements') as "ActiveStatment",
+(select ressetting from pg_resqueue_attributes b
+where a.rsqname=b.rsqname and resname='max_cost') as "MaxCost",
+(select ressetting from pg_resqueue_attributes b
+where a.rsqname=b.rsqname and resname='min_cost') as "MinCost",
+(select ressetting from pg_resqueue_attributes b
+where a.rsqname=b.rsqname and resname='cost_overcommit') as "CostOvercommit",
+(select ressetting from pg_resqueue_attributes b
+where a.rsqname=b.rsqname and resname='memory_limit') as "MemoryLimit",
+(select ressetting from pg_resqueue_attributes b
+where a.rsqname=b.rsqname and resname='priority') as "Priority",
+(select count(*) from pg_resqueue x,pg_roles y
+where x.oid=y.rolresqueue and a.rsqname=x.rsqname) as "RQAssignedUsers"
+from ( select distinct rsqname from pg_resqueue_attributes ) a)
+as foo;
+
+reset optimizer_enable_master_only_queries;
 
 -- Followup additional tests.
 -- MPP-7474

@@ -17,8 +17,12 @@ fi
 dropdb --if-exists utf8
 createdb -T template0 -l C -E UTF8 utf8 || exit 1
 
-PSQL="psql -n -e -q"
-tests="euc_jp sjis euc_kr euc_cn euc_tw big5 utf8 mule_internal"
+PSQL="psql -X -n -e -q"
+
+# in the test list, client-only encodings must follow the server encoding
+# they're to be tested with; see hard-coded cases below
+tests="euc_jp sjis euc_kr euc_cn euc_tw big5 utf8 gb18030 mule_internal"
+
 EXITCODE=0
 
 unset PGCLIENTENCODING
@@ -36,6 +40,11 @@ do
 		export PGCLIENTENCODING
 		$PSQL euc_tw < sql/big5.sql > results/big5.out 2>&1
 		unset PGCLIENTENCODING
+        elif [ $i = gb18030 ];then
+		PGCLIENTENCODING=GB18030
+		export PGCLIENTENCODING
+		$PSQL utf8 < sql/gb18030.sql > results/gb18030.out 2>&1
+		unset PGCLIENTENCODING
 	else
 		dropdb $i >/dev/null 2>&1
 		createdb -T template0 -l C -E `echo $i | tr 'abcdefghijklmnopqrstuvwxyz' 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'` $i >/dev/null
@@ -49,9 +58,9 @@ do
 		EXPECTED="expected/${i}.out"
 	fi
 
-	if [ `gpdiff.pl ${EXPECTED} results/${i}.out | wc -l` -ne 0 ]
+	if [ `gpdiff.pl -I GP_IGNORE: ${EXPECTED} results/${i}.out | wc -l` -ne 0 ]
 	then
-		( diff -C3 ${EXPECTED} results/${i}.out; \
+		( gpdiff.pl -I GP_IGNORE: -C3 ${EXPECTED} results/${i}.out; \
 		echo "";  \
 		echo "----------------------"; \
 		echo "" ) >> regression.diffs

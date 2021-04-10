@@ -3,7 +3,7 @@
  * miscinit.c
  *	  miscellaneous initialization support stuff
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -16,6 +16,7 @@
 
 #include <sys/param.h>
 #include <signal.h>
+#include <time.h>
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -31,9 +32,11 @@
 
 #include "access/htup_details.h"
 #include "catalog/pg_authid.h"
-#include "cdb/cdbvars.h"
+#include "common/file_perm.h"
+#include "libpq/libpq.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
+#include "pgstat.h"
 #include "postmaster/autovacuum.h"
 #include "postmaster/fts.h"
 #include "postmaster/postmaster.h"
@@ -41,16 +44,25 @@
 #include "replication/walsender.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
+#include "storage/latch.h"
 #include "storage/pg_shmem.h"
+#include "storage/pmsignal.h"
 #include "storage/proc.h"
 #include "storage/procarray.h"
 #include "utils/builtins.h"
+#include "utils/faultinjector.h"
 #include "utils/gdd.h"
 #include "utils/guc.h"
+#include "utils/inval.h"
 #include "utils/memutils.h"
-#include "utils/resgroup.h"
-#include "utils/resscheduler.h"
+#include "utils/pidfile.h"
 #include "utils/syscache.h"
+#include "utils/varlena.h"
+
+#include "cdb/cdbvars.h"
+#include "utils/resgroup.h"
+#include "utils/resource_manager.h"
+#include "utils/resscheduler.h"
 
 
 #define DIRECTORY_LOCK_FILE		"postmaster.pid"
@@ -60,6 +72,7 @@ ProcessingMode Mode = InitProcessing;
 /* List of lock files to be removed at proc exit */
 static List *lock_files = NIL;
 
+static Latch LocalLatchData;
 
 /* ----------------------------------------------------------------
  *		ignoring system indexes support stuff
@@ -85,6 +98,100 @@ SetDatabasePath(const char *path)
 	/* This should happen only once per process */
 	Assert(!DatabasePath);
 	DatabasePath = MemoryContextStrdup(TopMemoryContext, path);
+}
+
+/*
+ * Validate the proposed data directory.
+ *
+ * Also initialize file and directory create modes and mode mask.
+ */
+void
+checkDataDir(void)
+{
+	struct stat stat_buf;
+
+	Assert(DataDir);
+
+	if (stat(DataDir, &stat_buf) != 0)
+	{
+		if (errno == ENOENT)
+			ereport(FATAL,
+					(errcode_for_file_access(),
+					 errmsg("data directory \"%s\" does not exist",
+							DataDir)));
+		else
+			ereport(FATAL,
+					(errcode_for_file_access(),
+					 errmsg("could not read permissions of directory \"%s\": %m",
+							DataDir)));
+	}
+
+	/* eventual chdir would fail anyway, but let's test ... */
+	if (!S_ISDIR(stat_buf.st_mode))
+		ereport(FATAL,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("specified data directory \"%s\" is not a directory",
+						DataDir)));
+
+	/*
+	 * Check that the directory belongs to my userid; if not, reject.
+	 *
+	 * This check is an essential part of the interlock that prevents two
+	 * postmasters from starting in the same directory (see CreateLockFile()).
+	 * Do not remove or weaken it.
+	 *
+	 * XXX can we safely enable this check on Windows?
+	 */
+#if !defined(WIN32) && !defined(__CYGWIN__)
+	if (stat_buf.st_uid != geteuid())
+		ereport(FATAL,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("data directory \"%s\" has wrong ownership",
+						DataDir),
+				 errhint("The server must be started by the user that owns the data directory.")));
+#endif
+
+	/*
+	 * Check if the directory has correct permissions.  If not, reject.
+	 *
+	 * Only two possible modes are allowed, 0700 and 0750.  The latter mode
+	 * indicates that group read/execute should be allowed on all newly
+	 * created files and directories.
+	 *
+	 * XXX temporarily suppress check when on Windows, because there may not
+	 * be proper support for Unix-y file permissions.  Need to think of a
+	 * reasonable check to apply on Windows.
+	 */
+#if !defined(WIN32) && !defined(__CYGWIN__)
+	if (stat_buf.st_mode & PG_MODE_MASK_GROUP)
+		ereport(FATAL,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("data directory \"%s\" has invalid permissions",
+						DataDir),
+				 errdetail("Permissions should be u=rwx (0700) or u=rwx,g=rx (0750).")));
+#endif
+
+	/*
+	 * Reset creation modes and mask based on the mode of the data directory.
+	 *
+	 * The mask was set earlier in startup to disallow group permissions on
+	 * newly created files and directories.  However, if group read/execute
+	 * are present on the data directory then modify the create modes and mask
+	 * to allow group read/execute on newly created files and directories and
+	 * set the data_directory_mode GUC.
+	 *
+	 * Suppress when on Windows, because there may not be proper support for
+	 * Unix-y file permissions.
+	 */
+#if !defined(WIN32) && !defined(__CYGWIN__)
+	SetDataDirectoryCreatePerm(stat_buf.st_mode);
+
+	umask(pg_mode_mask);
+	data_directory_mode = pg_dir_create_mode;
+#endif
+
+	/* Check for PG_VERSION */
+	ValidatePgVersion(DataDir);
 }
 
 /*
@@ -167,6 +274,112 @@ static int	SecurityRestrictionContext = 0;
 /* We also remember if a SET ROLE is currently active */
 static bool SetRoleIsActive = false;
 
+/*
+ * Initialize the basic environment for a postmaster child
+ *
+ * Should be called as early as possible after the child's startup.
+ */
+void
+InitPostmasterChild(void)
+{
+	IsUnderPostmaster = true;	/* we are a postmaster subprocess now */
+
+	InitProcessGlobals();
+
+	/*
+	 * make sure stderr is in binary mode before anything can possibly be
+	 * written to it, in case it's actually the syslogger pipe, so the pipe
+	 * chunking protocol isn't disturbed. Non-logpipe data gets translated on
+	 * redirection (e.g. via pg_ctl -l) anyway.
+	 */
+#ifdef WIN32
+	_setmode(fileno(stderr), _O_BINARY);
+#endif
+
+	/* We don't want the postmaster's proc_exit() handlers */
+	on_exit_reset();
+
+	/* Initialize process-local latch support */
+	InitializeLatchSupport();
+	MyLatch = &LocalLatchData;
+	InitLatch(MyLatch);
+
+	/*
+	 * If possible, make this process a group leader, so that the postmaster
+	 * can signal any child processes too. Not all processes will have
+	 * children, but for consistency we make all postmaster child processes do
+	 * this.
+	 */
+#ifdef HAVE_SETSID
+	if (setsid() < 0)
+		elog(FATAL, "setsid() failed: %m");
+#endif
+
+	/* Request a signal if the postmaster dies, if possible. */
+	PostmasterDeathSignalInit();
+}
+
+/*
+ * Initialize the basic environment for a standalone process.
+ *
+ * argv0 has to be suitable to find the program's executable.
+ */
+void
+InitStandaloneProcess(const char *argv0)
+{
+	Assert(!IsPostmasterEnvironment);
+
+	InitProcessGlobals();
+
+	/* Initialize process-local latch support */
+	InitializeLatchSupport();
+	MyLatch = &LocalLatchData;
+	InitLatch(MyLatch);
+
+	/* Compute paths, no postmaster to inherit from */
+	if (my_exec_path[0] == '\0')
+	{
+		if (find_my_exec(argv0, my_exec_path) < 0)
+			elog(FATAL, "%s: could not locate my own executable path",
+				 argv0);
+	}
+
+	if (pkglib_path[0] == '\0')
+		get_pkglib_path(my_exec_path, pkglib_path);
+}
+
+void
+SwitchToSharedLatch(void)
+{
+	Assert(MyLatch == &LocalLatchData);
+	Assert(MyProc != NULL);
+
+	MyLatch = &MyProc->procLatch;
+
+	if (FeBeWaitSet)
+		ModifyWaitEvent(FeBeWaitSet, 1, WL_LATCH_SET, MyLatch);
+
+	/*
+	 * Set the shared latch as the local one might have been set. This
+	 * shouldn't normally be necessary as code is supposed to check the
+	 * condition before waiting for the latch, but a bit care can't hurt.
+	 */
+	SetLatch(MyLatch);
+}
+
+void
+SwitchBackToLocalLatch(void)
+{
+	Assert(MyLatch != &LocalLatchData);
+	Assert(MyProc != NULL && MyLatch == &MyProc->procLatch);
+
+	MyLatch = &LocalLatchData;
+
+	if (FeBeWaitSet)
+		ModifyWaitEvent(FeBeWaitSet, 1, WL_LATCH_SET, MyLatch);
+
+	SetLatch(MyLatch);
+}
 
 /*
  * GetUserId - get the current effective user ID.
@@ -237,7 +450,7 @@ IsAuthenticatedUserSuperUser()
 }
 
 /*
- * GetAuthenticatedUserId
+ * GetAuthenticatedUserId - get the authenticated user ID
  */
 Oid
 GetAuthenticatedUserId(void)
@@ -246,11 +459,12 @@ GetAuthenticatedUserId(void)
 	return AuthenticatedUserId;
 }
 
+
 /*
  * GetUserIdAndSecContext/SetUserIdAndSecContext - get/set the current user ID
  * and the SecurityRestrictionContext flags.
  *
- * Currently there are two valid bits in SecurityRestrictionContext:
+ * Currently there are three valid bits in SecurityRestrictionContext:
  *
  * SECURITY_LOCAL_USERID_CHANGE indicates that we are inside an operation
  * that is temporarily changing CurrentUserId via these functions.  This is
@@ -267,6 +481,13 @@ GetAuthenticatedUserId(void)
  * these restrictions are fairly draconian, we apply them only in contexts
  * where the called functions are really supposed to be side-effect-free
  * anyway, such as VACUUM/ANALYZE/REINDEX.
+ *
+ * SECURITY_NOFORCE_RLS indicates that we are inside an operation which should
+ * ignore the FORCE ROW LEVEL SECURITY per-table indication.  This is used to
+ * ensure that FORCE RLS does not mistakenly break referential integrity
+ * checks.  Note that this is intentionally only checked when running as the
+ * owner of the table (which should always be the case for referential
+ * integrity checks).
  *
  * Unlike GetUserId, GetUserIdAndSecContext does *not* Assert that the current
  * value of CurrentUserId is valid; nor does SetUserIdAndSecContext require
@@ -308,6 +529,15 @@ bool
 InSecurityRestrictedOperation(void)
 {
 	return (SecurityRestrictionContext & SECURITY_RESTRICTED_OPERATION) != 0;
+}
+
+/*
+ * InNoForceRLSOperation - are we ignoring FORCE ROW LEVEL SECURITY ?
+ */
+bool
+InNoForceRLSOperation(void)
+{
+	return (SecurityRestrictionContext & SECURITY_NOFORCE_RLS) != 0;
 }
 
 
@@ -363,11 +593,11 @@ has_rolreplication(Oid roleid)
  * Initialize user identity during normal backend startup
  */
 void
-InitializeSessionUserId(const char *rolename)
+InitializeSessionUserId(const char *rolename, Oid roleid)
 {
 	HeapTuple	roleTup;
 	Form_pg_authid rform;
-	Oid			roleid;
+	char	   *rname;
 
 	/*
 	 * Don't do scans if we're bootstrapping, none of the system catalogs
@@ -378,14 +608,33 @@ InitializeSessionUserId(const char *rolename)
 	/* call only once */
 	AssertState(!OidIsValid(AuthenticatedUserId));
 
-	roleTup = SearchSysCache1(AUTHNAME, PointerGetDatum(rolename));
-	if (!HeapTupleIsValid(roleTup))
-		ereport(FATAL,
-				(errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
-				 errmsg("role \"%s\" does not exist", rolename), errSendAlert(false)));
+	/*
+	 * Make sure syscache entries are flushed for recent catalog changes. This
+	 * allows us to find roles that were created on-the-fly during
+	 * authentication.
+	 */
+	AcceptInvalidationMessages();
+
+	if (rolename != NULL)
+	{
+		roleTup = SearchSysCache1(AUTHNAME, PointerGetDatum(rolename));
+		if (!HeapTupleIsValid(roleTup))
+			ereport(FATAL,
+					(errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
+					 errmsg("role \"%s\" does not exist", rolename)));
+	}
+	else
+	{
+		roleTup = SearchSysCache1(AUTHOID, ObjectIdGetDatum(roleid));
+		if (!HeapTupleIsValid(roleTup))
+			ereport(FATAL,
+					(errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
+					 errmsg("role with OID %u does not exist", roleid)));
+	}
 
 	rform = (Form_pg_authid) GETSTRUCT(roleTup);
-	roleid = HeapTupleGetOid(roleTup);
+	roleid = rform->oid;
+	rname = NameStr(rform->rolname);
 
 	AuthenticatedUserId = roleid;
 	AuthenticatedUserIsSuperuser = rform->rolsuper;
@@ -411,7 +660,7 @@ InitializeSessionUserId(const char *rolename)
 			ereport(FATAL,
 					(errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
 					 errmsg("role \"%s\" is not permitted to log in",
-							rolename)));
+							rname)));
 
 		/*
 		 * Check connection limit for this role.
@@ -433,7 +682,7 @@ InitializeSessionUserId(const char *rolename)
 			ereport(FATAL,
 					(errcode(ERRCODE_TOO_MANY_CONNECTIONS),
 					 errmsg("too many connections for role \"%s\"",
-							rolename)));
+							rname)));
 	}
 
 	/*
@@ -447,7 +696,7 @@ InitializeSessionUserId(const char *rolename)
 	}
 
 	/* Record username and superuser status as GUC settings too */
-	SetConfigOption("session_authorization", rolename,
+	SetConfigOption("session_authorization", rname,
 					PGC_BACKEND, PGC_S_OVERRIDE);
 	SetConfigOption("is_superuser",
 					AuthenticatedUserIsSuperuser ? "on" : "off",
@@ -469,8 +718,8 @@ InitializeSessionUserIdStandalone(void)
 	 */
 	AssertState(!IsUnderPostmaster || IsAutoVacuumWorkerProcess() || IsBackgroundWorker
 				|| am_startup
-				|| (am_ftshandler && am_mirror)
-				|| am_global_deadlock_detector);
+				|| (IsFaultHandler && am_mirror)
+				|| (am_ftshandler && am_mirror));
 
 	/* call only once */
 	AssertState(!OidIsValid(AuthenticatedUserId));
@@ -585,23 +834,29 @@ SetCurrentRoleId(Oid roleid, bool is_superuser)
 
 
 /*
- * Get user name from user oid
+ * Get user name from user oid, returns NULL for nonexistent roleid if noerr
+ * is true.
  */
 char *
-GetUserNameFromId(Oid roleid)
+GetUserNameFromId(Oid roleid, bool noerr)
 {
 	HeapTuple	tuple;
 	char	   *result;
 
 	tuple = SearchSysCache1(AUTHOID, ObjectIdGetDatum(roleid));
 	if (!HeapTupleIsValid(tuple))
-		ereport(ERROR,
-				(errcode(ERRCODE_UNDEFINED_OBJECT),
-				 errmsg("invalid role OID: %u", roleid)));
-
-	result = pstrdup(NameStr(((Form_pg_authid) GETSTRUCT(tuple))->rolname));
-
-	ReleaseSysCache(tuple);
+	{
+		if (!noerr)
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("invalid role OID: %u", roleid)));
+		result = NULL;
+	}
+	else
+	{
+		result = pstrdup(NameStr(((Form_pg_authid) GETSTRUCT(tuple))->rolname));
+		ReleaseSysCache(tuple);
+	}
 	return result;
 }
 
@@ -638,6 +893,17 @@ UnlinkLockFiles(int status, Datum arg)
 	}
 	/* Since we're about to exit, no need to reclaim storage */
 	lock_files = NIL;
+
+	/*
+	 * Lock file removal should always be the last externally visible action
+	 * of a postmaster or standalone backend, while we won't come here at all
+	 * when exiting postmaster child processes.  Therefore, this is a good
+	 * place to log completion of shutdown.  We could alternatively teach
+	 * proc_exit() to do it, but that seems uglier.  In a standalone backend,
+	 * use NOTICE elevel to be less chatty.
+	 */
+	ereport(IsPostmasterEnvironment ? LOG : NOTICE,
+			(errmsg("database system is shut down")));
 }
 
 /*
@@ -711,10 +977,10 @@ CreateLockFile(const char *filename, bool amPostmaster,
 		/*
 		 * Try to create the lock file --- O_EXCL makes this atomic.
 		 *
-		 * Think not to make the file protection weaker than 0600.  See
+		 * Think not to make the file protection weaker than 0600/0640.  See
 		 * comments below.
 		 */
-		fd = open(filename, O_RDWR | O_CREAT | O_EXCL, 0600);
+		fd = open(filename, O_RDWR | O_CREAT | O_EXCL, pg_file_create_mode);
 		if (fd >= 0)
 			break;				/* Success; exit the retry loop */
 
@@ -731,7 +997,7 @@ CreateLockFile(const char *filename, bool amPostmaster,
 		 * Read the file to get the old owner's PID.  Note race condition
 		 * here: file might have been deleted since we tried to create it.
 		 */
-		fd = open(filename, O_RDONLY, 0600);
+		fd = open(filename, O_RDONLY, pg_file_create_mode);
 		if (fd < 0)
 		{
 			if (errno == ENOENT)
@@ -741,11 +1007,13 @@ CreateLockFile(const char *filename, bool amPostmaster,
 					 errmsg("could not open lock file \"%s\": %m",
 							filename)));
 		}
+		pgstat_report_wait_start(WAIT_EVENT_LOCK_FILE_CREATE_READ);
 		if ((len = read(fd, buffer, sizeof(buffer) - 1)) < 0)
 			ereport(FATAL,
 					(errcode_for_file_access(),
 					 errmsg("could not read lock file \"%s\": %m",
 							filename)));
+		pgstat_report_wait_end();
 		close(fd);
 
 		if (len == 0)
@@ -779,17 +1047,14 @@ CreateLockFile(const char *filename, bool amPostmaster,
 		 * implies that the existing process has a different userid than we
 		 * do, which means it cannot be a competing postmaster.  A postmaster
 		 * cannot successfully attach to a data directory owned by a userid
-		 * other than its own.  (This is now checked directly in
-		 * checkDataDir(), but has been true for a long time because of the
-		 * restriction that the data directory isn't group- or
-		 * world-accessible.)  Also, since we create the lockfiles mode 600,
-		 * we'd have failed above if the lockfile belonged to another userid
-		 * --- which means that whatever process kill() is reporting about
-		 * isn't the one that made the lockfile.  (NOTE: this last
-		 * consideration is the only one that keeps us from blowing away a
-		 * Unix socket file belonging to an instance of Postgres being run by
-		 * someone else, at least on machines where /tmp hasn't got a
-		 * stickybit.)
+		 * other than its own, as enforced in checkDataDir(). Also, since we
+		 * create the lockfiles mode 0600/0640, we'd have failed above if the
+		 * lockfile belonged to another userid --- which means that whatever
+		 * process kill() is reporting about isn't the one that made the
+		 * lockfile.  (NOTE: this last consideration is the only one that
+		 * keeps us from blowing away a Unix socket file belonging to an
+		 * instance of Postgres being run by someone else, at least on
+		 * machines where /tmp hasn't got a stickybit.)
 		 */
 		if (other_pid != my_pid && other_pid != my_p_pid &&
 			other_pid != my_gp_pid)
@@ -891,14 +1156,10 @@ CreateLockFile(const char *filename, bool amPostmaster,
 				if (PGSharedMemoryIsInUse(id1, id2))
 					ereport(FATAL,
 							(errcode(ERRCODE_LOCK_FILE_EXISTS),
-							 errmsg("pre-existing shared memory block "
-									"(key %lu, ID %lu) is still in use",
+							 errmsg("pre-existing shared memory block (key %lu, ID %lu) is still in use",
 									id1, id2),
-							 errhint("If you're sure there are no old "
-									 "server processes still running, remove "
-									 "the shared memory block "
-									 "or just delete the file \"%s\".",
-									 filename)));
+							 errhint("Terminate any old server processes associated with data directory \"%s\".",
+									 refName)));
 			}
 		}
 
@@ -913,7 +1174,7 @@ CreateLockFile(const char *filename, bool amPostmaster,
 					 errmsg("could not remove old lock file \"%s\": %m",
 							filename),
 					 errhint("The file seems accidentally left over, but "
-						   "it could not be removed. Please remove the file "
+							 "it could not be removed. Please remove the file "
 							 "by hand and try again.")));
 	}
 
@@ -938,6 +1199,7 @@ CreateLockFile(const char *filename, bool amPostmaster,
 		strlcat(buffer, "\n", sizeof(buffer));
 
 	errno = 0;
+	pgstat_report_wait_start(WAIT_EVENT_LOCK_FILE_CREATE_WRITE);
 	if (write(fd, buffer, strlen(buffer)) != strlen(buffer))
 	{
 		int			save_errno = errno;
@@ -950,6 +1212,9 @@ CreateLockFile(const char *filename, bool amPostmaster,
 				(errcode_for_file_access(),
 				 errmsg("could not write lock file \"%s\": %m", filename)));
 	}
+	pgstat_report_wait_end();
+
+	pgstat_report_wait_start(WAIT_EVENT_LOCK_FILE_CREATE_SYNC);
 	if (pg_fsync(fd) != 0)
 	{
 		int			save_errno = errno;
@@ -961,6 +1226,7 @@ CreateLockFile(const char *filename, bool amPostmaster,
 				(errcode_for_file_access(),
 				 errmsg("could not write lock file \"%s\": %m", filename)));
 	}
+	pgstat_report_wait_end();
 	if (close(fd) != 0)
 	{
 		int			save_errno = errno;
@@ -980,7 +1246,11 @@ CreateLockFile(const char *filename, bool amPostmaster,
 	if (lock_files == NIL)
 		on_proc_exit(UnlinkLockFiles, 0);
 
-	lock_files = lappend(lock_files, pstrdup(filename));
+	/*
+	 * Use lcons so that the lock files are unlinked in reverse order of
+	 * creation; this is critical!
+	 */
+	lock_files = lcons(pstrdup(filename), lock_files);
 }
 
 /*
@@ -1054,8 +1324,8 @@ TouchSocketLockFiles(void)
 			read(fd, buffer, sizeof(buffer));
 			close(fd);
 		}
-#endif   /* HAVE_UTIMES */
-#endif   /* HAVE_UTIME */
+#endif							/* HAVE_UTIMES */
+#endif							/* HAVE_UTIME */
 	}
 }
 
@@ -1066,8 +1336,9 @@ TouchSocketLockFiles(void)
  *
  * Note: because we don't truncate the file, if we were to rewrite a line
  * with less data than it had before, there would be garbage after the last
- * line.  We don't ever actually do that, so not worth adding another kernel
- * call to cover the possibility.
+ * line.  While we could fix that by adding a truncate call, that would make
+ * the file update non-atomic, which we'd rather avoid.  Therefore, callers
+ * should endeavor never to shorten a line once it's been written.
  */
 void
 AddToDataDirLockFile(int target_line, const char *str)
@@ -1089,7 +1360,9 @@ AddToDataDirLockFile(int target_line, const char *str)
 						DIRECTORY_LOCK_FILE)));
 		return;
 	}
+	pgstat_report_wait_start(WAIT_EVENT_LOCK_FILE_ADDTODATADIR_READ);
 	len = read(fd, srcbuffer, sizeof(srcbuffer) - 1);
+	pgstat_report_wait_end();
 	if (len < 0)
 	{
 		ereport(LOG,
@@ -1108,17 +1381,24 @@ AddToDataDirLockFile(int target_line, const char *str)
 	srcptr = srcbuffer;
 	for (lineno = 1; lineno < target_line; lineno++)
 	{
-		if ((srcptr = strchr(srcptr, '\n')) == NULL)
-		{
-			elog(LOG, "incomplete data in \"%s\": found only %d newlines while trying to add line %d",
-				 DIRECTORY_LOCK_FILE, lineno - 1, target_line);
-			close(fd);
-			return;
-		}
-		srcptr++;
+		char	   *eol = strchr(srcptr, '\n');
+
+		if (eol == NULL)
+			break;				/* not enough lines in file yet */
+		srcptr = eol + 1;
 	}
 	memcpy(destbuffer, srcbuffer, srcptr - srcbuffer);
 	destptr = destbuffer + (srcptr - srcbuffer);
+
+	/*
+	 * Fill in any missing lines before the target line, in case lines are
+	 * added to the file out of order.
+	 */
+	for (; lineno < target_line; lineno++)
+	{
+		if (destptr < destbuffer + sizeof(destbuffer))
+			*destptr++ = '\n';
+	}
 
 	/*
 	 * Write or rewrite the target line.
@@ -1142,9 +1422,11 @@ AddToDataDirLockFile(int target_line, const char *str)
 	 */
 	len = strlen(destbuffer);
 	errno = 0;
+	pgstat_report_wait_start(WAIT_EVENT_LOCK_FILE_ADDTODATADIR_WRITE);
 	if (lseek(fd, (off_t) 0, SEEK_SET) != 0 ||
 		(int) write(fd, destbuffer, len) != len)
 	{
+		pgstat_report_wait_end();
 		/* if write didn't set errno, assume problem is no disk space */
 		if (errno == 0)
 			errno = ENOSPC;
@@ -1155,6 +1437,8 @@ AddToDataDirLockFile(int target_line, const char *str)
 		close(fd);
 		return;
 	}
+	pgstat_report_wait_end();
+	pgstat_report_wait_start(WAIT_EVENT_LOCK_FILE_ADDTODATADIR_SYNC);
 	if (pg_fsync(fd) != 0)
 	{
 		ereport(LOG,
@@ -1162,6 +1446,7 @@ AddToDataDirLockFile(int target_line, const char *str)
 				 errmsg("could not write to file \"%s\": %m",
 						DIRECTORY_LOCK_FILE)));
 	}
+	pgstat_report_wait_end();
 	if (close(fd) != 0)
 	{
 		ereport(LOG,
@@ -1169,6 +1454,78 @@ AddToDataDirLockFile(int target_line, const char *str)
 				 errmsg("could not write to file \"%s\": %m",
 						DIRECTORY_LOCK_FILE)));
 	}
+}
+
+
+/*
+ * Recheck that the data directory lock file still exists with expected
+ * content.  Return true if the lock file appears OK, false if it isn't.
+ *
+ * We call this periodically in the postmaster.  The idea is that if the
+ * lock file has been removed or replaced by another postmaster, we should
+ * do a panic database shutdown.  Therefore, we should return true if there
+ * is any doubt: we do not want to cause a panic shutdown unnecessarily.
+ * Transient failures like EINTR or ENFILE should not cause us to fail.
+ * (If there really is something wrong, we'll detect it on a future recheck.)
+ */
+bool
+RecheckDataDirLockFile(void)
+{
+	int			fd;
+	int			len;
+	long		file_pid;
+	char		buffer[BLCKSZ];
+
+	fd = open(DIRECTORY_LOCK_FILE, O_RDWR | PG_BINARY, 0);
+	if (fd < 0)
+	{
+		/*
+		 * There are many foreseeable false-positive error conditions.  For
+		 * safety, fail only on enumerated clearly-something-is-wrong
+		 * conditions.
+		 */
+		switch (errno)
+		{
+			case ENOENT:
+			case ENOTDIR:
+				/* disaster */
+				ereport(LOG,
+						(errcode_for_file_access(),
+						 errmsg("could not open file \"%s\": %m",
+								DIRECTORY_LOCK_FILE)));
+				return false;
+			default:
+				/* non-fatal, at least for now */
+				ereport(LOG,
+						(errcode_for_file_access(),
+						 errmsg("could not open file \"%s\": %m; continuing anyway",
+								DIRECTORY_LOCK_FILE)));
+				return true;
+		}
+	}
+	pgstat_report_wait_start(WAIT_EVENT_LOCK_FILE_RECHECKDATADIR_READ);
+	len = read(fd, buffer, sizeof(buffer) - 1);
+	pgstat_report_wait_end();
+	if (len < 0)
+	{
+		ereport(LOG,
+				(errcode_for_file_access(),
+				 errmsg("could not read from file \"%s\": %m",
+						DIRECTORY_LOCK_FILE)));
+		close(fd);
+		return true;			/* treat read failure as nonfatal */
+	}
+	buffer[len] = '\0';
+	close(fd);
+	file_pid = atol(buffer);
+	if (file_pid == getpid())
+		return true;			/* all is well */
+
+	/* Trouble: someone's overwritten the lock file */
+	ereport(LOG,
+			(errmsg("lock file \"%s\" contains wrong PID: %ld instead of %ld",
+					DIRECTORY_LOCK_FILE, file_pid, (long) getpid())));
+	return false;
 }
 
 
@@ -1189,16 +1546,13 @@ ValidatePgVersion(const char *path)
 	char		full_path[MAXPGPATH];
 	FILE	   *file;
 	int			ret;
-	long		file_major,
-				file_minor;
-	long		my_major = 0,
-				my_minor = 0;
+	long		file_major;
+	long		my_major;
 	char	   *endptr;
-	const char *version_string = PG_VERSION;
+	char		file_version_string[64];
+	const char *my_version_string = PG_VERSION;
 
-	my_major = strtol(version_string, &endptr, 10);
-	if (*endptr == '.')
-		my_minor = strtol(endptr + 1, NULL, 10);
+	my_major = strtol(my_version_string, &endptr, 10);
 
 	snprintf(full_path, sizeof(full_path), "%s/PG_VERSION", path);
 
@@ -1217,8 +1571,11 @@ ValidatePgVersion(const char *path)
 					 errmsg("could not open file \"%s\": %m", full_path)));
 	}
 
-	ret = fscanf(file, "%ld.%ld", &file_major, &file_minor);
-	if (ret != 2)
+	file_version_string[0] = '\0';
+	ret = fscanf(file, "%63s", file_version_string);
+	file_major = strtol(file_version_string, &endptr, 10);
+
+	if (ret != 1 || endptr == file_version_string)
 		ereport(FATAL,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("\"%s\" is not a valid data directory",
@@ -1229,13 +1586,13 @@ ValidatePgVersion(const char *path)
 
 	FreeFile(file);
 
-	if (my_major != file_major || my_minor != file_minor)
+	if (my_major != file_major)
 		ereport(FATAL,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("database files are incompatible with server"),
-				 errdetail("The data directory was initialized by PostgreSQL version %ld.%ld, "
+				 errdetail("The data directory was initialized by PostgreSQL version %s, "
 						   "which is not compatible with this version %s.",
-						   file_major, file_minor, version_string)));
+						   file_version_string, my_version_string)));
 }
 
 /*-------------------------------------------------------------------------
@@ -1273,12 +1630,12 @@ load_libraries(const char *libraries, const char *gucname, bool restricted)
 	/* Need a modifiable copy of string */
 	rawstring = pstrdup(libraries);
 
-	/* Parse string into list of identifiers */
-	if (!SplitIdentifierString(rawstring, ',', &elemlist))
+	/* Parse string into list of filename paths */
+	if (!SplitDirectoriesString(rawstring, ',', &elemlist))
 	{
 		/* syntax error in list */
+		list_free_deep(elemlist);
 		pfree(rawstring);
-		list_free(elemlist);
 		ereport(LOG,
 				(errcode(ERRCODE_SYNTAX_ERROR),
 				 errmsg("invalid list syntax in parameter \"%s\"",
@@ -1288,28 +1645,25 @@ load_libraries(const char *libraries, const char *gucname, bool restricted)
 
 	foreach(l, elemlist)
 	{
-		char	   *tok = (char *) lfirst(l);
-		char	   *filename;
+		/* Note that filename was already canonicalized */
+		char	   *filename = (char *) lfirst(l);
+		char	   *expanded = NULL;
 
-		filename = pstrdup(tok);
-		canonicalize_path(filename);
 		/* If restricting, insert $libdir/plugins if not mentioned already */
 		if (restricted && first_dir_separator(filename) == NULL)
 		{
-			char	   *expanded;
-
 			expanded = psprintf("$libdir/plugins/%s", filename);
-			pfree(filename);
 			filename = expanded;
 		}
 		load_file(filename, restricted);
 		ereport(DEBUG1,
 				(errmsg("loaded library \"%s\"", filename)));
-		pfree(filename);
+		if (expanded)
+			pfree(expanded);
 	}
 
+	list_free_deep(elemlist);
 	pfree(rawstring);
-	list_free(elemlist);
 }
 
 /*
@@ -1319,9 +1673,11 @@ void
 process_shared_preload_libraries(void)
 {
 	process_shared_preload_libraries_in_progress = true;
+
 	load_libraries(shared_preload_libraries_string,
 				   "shared_preload_libraries",
 				   false);
+
 	process_shared_preload_libraries_in_progress = false;
 }
 

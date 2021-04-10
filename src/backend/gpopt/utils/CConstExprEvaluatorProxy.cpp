@@ -1,6 +1,6 @@
 //---------------------------------------------------------------------------
 //	Greenplum Database
-//	Copyright (C) 2014 Pivotal, Inc.
+//	Copyright (C) 2014 VMware, Inc. or its affiliates.
 //
 //	@filename:
 //		CConstExprEvaluatorProxy.cpp
@@ -14,17 +14,17 @@
 //
 //---------------------------------------------------------------------------
 
+extern "C" {
 #include "postgres.h"
 
 #include "executor/executor.h"
-
-#include "gpopt/utils/CConstExprEvaluatorProxy.h"
+}
 
 #include "gpopt/gpdbwrappers.h"
 #include "gpopt/translate/CTranslatorScalarToDXL.h"
-
-#include "naucrates/exception.h"
+#include "gpopt/utils/CConstExprEvaluatorProxy.h"
 #include "naucrates/dxl/operators/CDXLNode.h"
+#include "naucrates/exception.h"
 
 using namespace gpdxl;
 using namespace gpmd;
@@ -40,15 +40,15 @@ using namespace gpos;
 //
 //---------------------------------------------------------------------------
 Var *
-CConstExprEvaluatorProxy::CEmptyMappingColIdVar::VarFromDXLNodeScId
-	(
-	const CDXLScalarIdent */*scalar_ident*/
-	)
+CConstExprEvaluatorProxy::CEmptyMappingColIdVar::VarFromDXLNodeScId(
+	const CDXLScalarIdent * /*scalar_ident*/
+)
 {
-	elog(LOG, "Expression passed to CConstExprEvaluatorProxy contains variables. "
-			"Evaluation will fail and an exception will be thrown.");
+	elog(LOG,
+		 "Expression passed to CConstExprEvaluatorProxy contains variables. "
+		 "Evaluation will fail and an exception will be thrown.");
 	GPOS_RAISE(gpdxl::ExmaGPDB, gpdxl::ExmiGPDBError);
-	return NULL;
+	return nullptr;
 }
 
 //---------------------------------------------------------------------------
@@ -61,31 +61,33 @@ CConstExprEvaluatorProxy::CEmptyMappingColIdVar::VarFromDXLNodeScId
 //
 //---------------------------------------------------------------------------
 CDXLNode *
-CConstExprEvaluatorProxy::EvaluateExpr
-	(
-	const CDXLNode *dxl_expr
-	)
+CConstExprEvaluatorProxy::EvaluateExpr(const CDXLNode *dxl_expr)
 {
 	// Translate DXL -> GPDB Expr
-	Expr *expr = m_dxl2scalar_translator.TranslateDXLToScalar(dxl_expr, &m_emptymapcidvar);
-	GPOS_ASSERT(NULL != expr);
+	Expr *expr = m_dxl2scalar_translator.TranslateDXLToScalar(
+		dxl_expr, &m_emptymapcidvar);
+	GPOS_ASSERT(nullptr != expr);
 
 	// Evaluate the expression
-	Expr *result = gpdb::EvaluateExpr(expr,
-						gpdb::ExprType((Node *)expr),
-						gpdb::ExprTypeMod((Node *)expr));
+	Expr *result = gpdb::EvaluateExpr(expr, gpdb::ExprType((Node *) expr),
+									  gpdb::ExprTypeMod((Node *) expr));
 
 	if (!IsA(result, Const))
 	{
-		#ifdef GPOS_DEBUG
-		elog(NOTICE, "Expression did not evaluate to Const, but to an expression of type %d", result->type);
-		#endif
+#ifdef GPOS_DEBUG
+		elog(
+			NOTICE,
+			"Expression did not evaluate to Const, but to an expression of type %d",
+			result->type);
+#endif
 		GPOS_RAISE(gpdxl::ExmaConstExprEval, gpdxl::ExmiConstExprEvalNonConst);
 	}
 
-	Const *const_result = (Const *)result;
-	CDXLDatum *datum_dxl = CTranslatorScalarToDXL::TranslateConstToDXL(m_mp, m_md_accessor, const_result);
-	CDXLNode *dxl_result = GPOS_NEW(m_mp) CDXLNode(m_mp, GPOS_NEW(m_mp) CDXLScalarConstValue(m_mp, datum_dxl));
+	Const *const_result = (Const *) result;
+	CDXLDatum *datum_dxl = CTranslatorScalarToDXL::TranslateConstToDXL(
+		m_mp, m_md_accessor, const_result);
+	CDXLNode *dxl_result = GPOS_NEW(m_mp)
+		CDXLNode(m_mp, GPOS_NEW(m_mp) CDXLScalarConstValue(m_mp, datum_dxl));
 	gpdb::GPDBFree(result);
 	gpdb::GPDBFree(expr);
 

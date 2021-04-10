@@ -53,12 +53,6 @@ ALTER ROLE role_setting_test_6 IN DATABASE regression RESET ALL;
 -- if you dump the regression database.
 
 
--- SHA-256 testing
-set password_hash_algorithm to "SHA-256";
-create role sha256 password 'abc';
-select rolname, rolpassword from pg_authid where rolname = 'sha256';
-drop role sha256;
-
 create role superuser;
 create role u1;
 set role superuser;
@@ -99,7 +93,6 @@ DROP GROUP market;
 DROP USER jona11;
 DROP USER jona12;
 
-
 -- Test that a non-superuser cannot use ALTER USER RESET ALL to reset
 -- superuser-only GUCs. (A bug that was fixed in PostgreSQL commit
 -- e429448f33.)
@@ -123,3 +116,9 @@ set role guctestrole;
 alter user guctestrole reset all;
 select rolconfig from pg_roles where rolname = 'guctestrole';
 reset role;
+
+-- Test ALTER USER ALL
+BEGIN;
+ALTER USER ALL SET application_name TO 'alter_user_all_test';
+ALTER USER ALL RESET ALL;
+ROLLBACK;

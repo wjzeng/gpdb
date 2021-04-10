@@ -10,7 +10,7 @@ begin
 
   execute 'select relname from pg_class where oid=(select segrelid from pg_class, pg_appendonly where relname=''' || relname || ''' and relid = pg_class.oid)' into aosegname;
   if aosegname is not null then
-	  execute 'select tupcount from pg_aoseg.' || aosegname into tupcount;
+         execute 'select sum(tupcount) from gp_dist_random(''pg_aoseg.' || aosegname || ''')' into tupcount;
   end if;
   return tupcount;
 end; $$ language plpgsql volatile READS SQL DATA;
@@ -225,8 +225,50 @@ SELECT count(*) FROM tenk_aocs3;
 SELECT count(*) FROM tenk_aocs4;
 
 -- INHERITS
--- This is not supported in aocs and should error out
-CREATE TABLE tenk_inherits_tenk_aocs1() INHERITS (tenk_aocs1);
+-- This used to be forbidden, but we allow it now.
+CREATE TABLE aocs_inh_parent (parent_t text,
+                              parent_t_8k text encoding (blocksize=8192))
+WITH (appendonly=true, orientation=column);
+
+-- The storage options are not inherited, but you can specify them explicitly.
+CREATE TABLE aocs_inh_child1 ()
+INHERITS (aocs_parent)
+WITH (appendonly=true, orientation=column);
+CREATE TABLE aocs_inh_child2 (parent_t text ENCODING (compresstype=zlib))
+INHERITS (aocs_inh_parent)
+WITH (appendonly=true, orientation=column);
+
+-- This syntax works even without explicitly listing the column.
+CREATE TABLE aocs_inh_child3 (COLUMN parent_t ENCODING (compresstype=zlib))
+INHERITS (aocs_inh_parent)
+WITH (appendonly=true, orientation=column);
+
+SELECT c.relname, ae.attnum, ae.attoptions FROM pg_class c, pg_attribute_encoding ae WHERE c.relname LIKE 'aocs_inh%' AND c.oid=ae.attrelid ORDER BY 1,2;
+
+-- Multiple inheritance
+-- The ENCODING of parent_t_8k column doesn't match that of the other parent table.
+-- That's OK, because we don't try to copy the compression options from the parents.
+CREATE TABLE aocs_inh_parent2 (parent_t text,
+                               parent_t_8k text encoding (blocksize=16384),
+                               otherparent_t_8k text encoding (blocksize=8192))
+WITH (appendonly=true, orientation=column);
+CREATE TABLE aocs_inh_multichild ()
+INHERITS (aocs_inh_parent, aocs_inh_parent2)
+WITH (appendonly=true, orientation=column);
+
+SELECT c.relname, ae.attnum, ae.attoptions FROM pg_class c, pg_attribute_encoding ae WHERE c.relname LIKE 'aocs_inh_multi%' AND c.oid=ae.attrelid ORDER BY 1,2;
+
+-- AOCO table inherits a heap table.
+CREATE TABLE aocs_inh2_parent_heap (parent_t text, parent_t2 text);
+CREATE TABLE aocs_inh2_child1 () INHERITS (aocs_inh2_parent_heap)
+WITH (appendonly=true, orientation=column);
+CREATE TABLE aocs_inh2_child2 (COLUMN parent_t ENCODING (compresstype=zlib)) INHERITS (aocs_inh2_parent_heap)
+WITH (appendonly=true, orientation=column);
+
+SELECT c.relname, ae.attnum, ae.attoptions FROM pg_class c, pg_attribute_encoding ae WHERE c.relname LIKE 'aocs_inh2_%' AND c.oid=ae.attrelid ORDER BY 1,2;
+
+-- don't drop the tables, to also test pg_dump & restore of them.
+
 
 -- NYI
 -- test get_ao_compression_ratio. use uncompressed table, so result is always 1.
@@ -250,7 +292,7 @@ SELECT count(*) FROM tenk_aocs4;
 -- LIKE
 -- Should not copy storage options if not specified
 CREATE TABLE tenk_like_nocopy_storage (LIKE tenk_aocs1);
-SELECT count(*) FROM pg_class WHERE relstorage = 'c' AND relname = 'tenk_like_nocopy_storage';
+SELECT count(*) FROM pg_class WHERE reloptions is not null AND relname = 'tenk_like_nocopy_storage';
 -- Check tables are truly decoupled
 CREATE TABLE tenk_truly_decoupled (LIKE tenk_aocs4);
 ALTER TABLE tenk_aocs4 DROP COLUMN two;
@@ -295,12 +337,6 @@ SELECT unique1 FROM tenk_heap_for_aocs EXCEPT SELECT unique1 FROM tenk_aocs3;
 TRUNCATE tenk_aocs2;
 SELECT count(*) FROM tenk_aocs2;
 
--- OID with aocs NYI
--- OIDS
---
--- MPP-8058: should fail
-CREATE TABLE aocswithoids(a int, b int) WITH (appendonly=true, orientation=column, oids=true);
-
 -- INDEX
 CREATE INDEX tenk_aocs1_unique1 ON tenk_aocs1 USING btree(unique1 int4_ops);
 
@@ -315,6 +351,7 @@ drop table if exists co;
 create table co (i int, j int, k varchar) with(appendonly=true, orientation=column);
 insert into co values (1,1,'a'), (2,2,'aa'), (3,3,'aaa'), (4,4,'aaaa'),
 	(5,5,'aaaaa'), (6,6,'aaaaaa'), (7,7,'aaaaaaa'), (8,8,'aaaaaaaa');
+analyze co;
 create index co_j on co using btree(j);
 create index co_k on co using btree(k);
 create index co_jk on co using btree((j + length(k)));
@@ -376,13 +413,13 @@ create temp table temp_tenk_aocs5 with (appendonly=true, orientation=column, com
     as select * from tenk_aocs5 distributed by (unique1);
 create index temp_even_index on temp_tenk_aocs5 (even);
 select count(*) from temp_tenk_aocs5;
-select tablename, indexname, indexdef from pg_indexes where tablename = 'temp_tenk_aocs5';
+select i.tablename, i.indexname, pg_get_indexdef(c.oid, 0, TRUE) from pg_indexes i join pg_class c on i.indexname=c.relname and i.tablename='temp_tenk_aocs5';
 insert into temp_tenk_aocs5(unique1, unique2) values (99998888, 99998888);
 update temp_tenk_aocs5 set unique2 = 99998889 where unique2 = 99998888;
 delete from temp_tenk_aocs5 where unique2 = 99998889;
 select count(*) from temp_tenk_aocs5;
-truncate table temp_tenk_aocs5;
 vacuum analyze temp_tenk_aocs5;
+truncate table temp_tenk_aocs5;
 \d temp_tenk_aocs5
 insert into temp_tenk_aocs5(unique1, unique2) values (99998888, 99998888);
 select unique1 from temp_tenk_aocs5;
@@ -424,18 +461,40 @@ select * from tenk_aocs5 where unique1=1;
 ---------------------
 -- UAO
 ---------------------
+
+-- ------------------
+-- functions for snapshotting the current mod counts, and checking the diff
+-- vs last snapshot
+-- ------------------
+create temp table modcounts_aocs_snapshot (segment_id int, aosegno int, column_num int2, modcount bigint) distributed randomly;
+
+create or replace function snapshot_aocs_modcounts(relname regclass) returns void as $$
+begin
+  delete from modcounts_aocs_snapshot;
+
+  insert into modcounts_aocs_snapshot select segment_id, segno, column_num, modcount from  gp_toolkit.__gp_aocsseg(relname);
+end;
+$$ language plpgsql volatile;
+
+create or replace function diff_aocs_modcounts(relname regclass, segment_id out int, aosegno out int, column_num out int2, modcount_diff out bigint) returns setof record as $$
+  select a.segment_id, a.segno, a.column_num, a.modcount - coalesce(b.modcount, 0) mod_diff from gp_toolkit.__gp_aocsseg($1) a left outer join modcounts_aocs_snapshot b on a.segment_id = b.segment_id and a.segno = b.aosegno and a.column_num = b.column_num;
+$$ language sql;
+
+select snapshot_aocs_modcounts('tenk_aocs1');
+
 -- DELETE
-select count(*) from gp_toolkit.__gp_aocsseg('tenk_aocs1') where modcount > 0;
+select count(*) from diff_aocs_modcounts('tenk_aocs1') where modcount_diff > 0; --sanity check our test function
 DELETE FROM tenk_aocs1 WHERE unique1 = 1;
 -- modcount after DELETE must increment to flag table should be included in
 -- incremental backup
-select count(*) from gp_toolkit.__gp_aocsseg('tenk_aocs1') where modcount > 0;
+select count(*) from diff_aocs_modcounts('tenk_aocs1') where modcount_diff > 0;
 -- UPDATE
+select snapshot_aocs_modcounts('tenk_aocs1');
 UPDATE tenk_aocs1 SET unique2 = 1 WHERE unique2 = 2;
 UPDATE tenk_aocs1 SET two = 2;
 -- modcount after UPDATE must increment to flag table should be included in
 -- incremental backup
-select count(*) from gp_toolkit.__gp_aocsseg('tenk_aocs1') where modcount > 1;
+select count(*) from diff_aocs_modcounts('tenk_aocs1') where modcount_diff > 0;
 
 --------------------
 -- system columns
@@ -449,7 +508,7 @@ DROP TABLE syscoltest;
 -- supported sql
 --------------------
 DROP TABLE tenk_heap_for_aocs;
-DROP TABLE tenk_aocs1;
+DROP TABLE tenk_aocs1 CASCADE;
 DROP TABLE tenk_aocs2;
 DROP TABLE tenk_aocs3;
 DROP TABLE tenk_aocs4;
@@ -480,18 +539,6 @@ COPY aocs_new (a,b,c,d,e,f) FROM stdin;
 select (case when b='13' then 'replacement' else d end) as d from aocs_new order by 1;
 select distinct (case when b='13' then 'replacement' else d end) as d from aocs_new where f='M' order by 1;
 
-create table aocs_unknown(
-    a int,
-    b unknown,
-    c unknown encoding (compresstype=rle_type)
-) with (appendonly=true, orientation=column)
-distributed by (a);
-
-insert into aocs_unknown
-select i, 'unknown' from generate_series(1, 10)i;
-
-select * from aocs_unknown;
-
 -- Check compression and distribution
 create table aocs_compress_table (id int, v varchar)
     with (appendonly=true, orientation=column, compresstype=zlib, compresslevel=1) distributed by (id);
@@ -503,8 +550,7 @@ insert into aocs_compress_results values (pg_relation_size('aocs_compress_table'
 insert into aocs_compress_table (id, v) values (1, 'ifyouwantto99knowwhatist8329histhenkeepreadingit;;untilyou]findoutyoureyeshurtandyoustil0ldontknow103kwhatitisdoyouunderstandmeyetandifyoustillwanttoknowthenyoupleasekeepreading');
 insert into aocs_compress_results values (pg_relation_size('aocs_compress_table'), pg_relation_size('aocs_compress_id_index'), pg_relation_size('aocs_compress_v_index'));
 
--- compression ratio should be between 1.2 and 1.3
-select get_ao_compression_ratio('aocs_compress_table') > 1.2 and get_ao_compression_ratio('aocs_compress_table') < 1.3;
+select get_ao_compression_ratio('aocs_compress_table');
 select get_ao_distribution('aocs_compress_table');
 
 truncate table aocs_compress_table; -- after truncate, reclaim space from the table and index
@@ -558,6 +604,32 @@ a.c1
 ;
 
 drop table bms_ao_bug;
+
+
+-- When an index is created on an AOCO table, test that we correctly scan
+-- all the columns that are needed to build the index.
+create table aocs_index_cols (id int4, a text, b text) with (appendonly=true, orientation=column);
+insert into aocs_index_cols values (1, 'foo', 'bar');
+
+-- Create an index on the table. This is the first index on the table, so it
+-- creates the ao block directory, and scans all columns.
+create index on aocs_index_cols (id);
+
+-- Create a partial index. This index needs to scan two columns; one is used
+-- as the index column, and the other in the WHERE clause.
+create index on aocs_index_cols (id) WHERE a like 'f%';
+
+-- Also try an expression index.
+create index on aocs_index_cols (length(b));
+
+-- Check that the row is found using all the indexes.
+set enable_seqscan=off;
+select * from aocs_index_cols where id = 1;
+select * from aocs_index_cols where a like 'f%';
+select * from aocs_index_cols where length(b) = 3;
+reset enable_seqscan;
+
+
 -- Small content as well as bulk dense content headers need to be used
 -- appropriately if compression is found to be not useful.  This test
 -- cover a bug where only small content headers were generated in such
@@ -569,7 +641,6 @@ create table aocs_small_and_dense_content (a int, b int) with
 insert into aocs_small_and_dense_content select i,i from
 generate_series(1,800000)i;
 
-create extension if not exists gp_inject_fault;
 -- Inject fault on one primary segment that will cause compression to
 -- be considered not useful.
 select gp_inject_fault('appendonly_skip_compression', 'skip', '', '',

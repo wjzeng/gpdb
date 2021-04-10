@@ -13,15 +13,17 @@
 #include "access/genam.h"
 #include "catalog/pg_compression.h"
 #include "fmgr.h"
+#include "storage/gp_compress.h"
 #include "utils/builtins.h"
 
 #include <zstd.h>
+#include <zstd_errors.h>
 
-Datum zstd_constructor(PG_FUNCTION_ARGS);
-Datum zstd_destructor(PG_FUNCTION_ARGS);
-Datum zstd_compress(PG_FUNCTION_ARGS);
-Datum zstd_decompress(PG_FUNCTION_ARGS);
-Datum zstd_validator(PG_FUNCTION_ARGS);
+Datum		zstd_constructor(PG_FUNCTION_ARGS);
+Datum		zstd_destructor(PG_FUNCTION_ARGS);
+Datum		zstd_compress(PG_FUNCTION_ARGS);
+Datum		zstd_decompress(PG_FUNCTION_ARGS);
+Datum		zstd_validator(PG_FUNCTION_ARGS);
 
 PG_FUNCTION_INFO_V1(zstd_constructor);
 PG_FUNCTION_INFO_V1(zstd_destructor);
@@ -29,15 +31,17 @@ PG_FUNCTION_INFO_V1(zstd_compress);
 PG_FUNCTION_INFO_V1(zstd_decompress);
 PG_FUNCTION_INFO_V1(zstd_validator);
 
+#ifndef UNIT_TESTING
 PG_MODULE_MAGIC;
+#endif
 
 /* Internal state for zstd */
 typedef struct zstd_state
 {
 	int			level;			/* Compression level */
 	bool		compress;		/* Compress if true, decompress otherwise */
-	ZSTD_CCtx  *zstd_compress_context;	/* ZSTD compression context */
-	ZSTD_DCtx  *zstd_decompress_context;	/* ZSTD decompression context */
+
+	zstd_context *ctx;			/* ZSTD compression/decompresion contexts */
 } zstd_state;
 
 Datum
@@ -61,8 +65,15 @@ zstd_constructor(PG_FUNCTION_ARGS)
 
 	state->level = sa->complevel;
 	state->compress = compress;
-	state->zstd_compress_context = ZSTD_createCCtx();
-	state->zstd_decompress_context = ZSTD_createDCtx();
+
+	state->ctx = zstd_alloc_context();
+	state->ctx->cctx = ZSTD_createCCtx();
+	state->ctx->dctx = ZSTD_createDCtx();
+
+	if (!state->ctx->cctx)
+		elog(ERROR, "out of memory");
+	if (!state->ctx->dctx)
+		elog(ERROR, "out of memory");
 
 	PG_RETURN_POINTER(cs);
 }
@@ -71,18 +82,24 @@ Datum
 zstd_destructor(PG_FUNCTION_ARGS)
 {
 	CompressionState *cs = (CompressionState *) PG_GETARG_POINTER(0);
-	zstd_state *state = (zstd_state *) cs->opaque;
 
 	if (cs != NULL && cs->opaque != NULL)
 	{
-		ZSTD_freeCCtx(state->zstd_compress_context);
-		ZSTD_freeDCtx(state->zstd_decompress_context);
-		pfree(cs->opaque);
+		zstd_state *state = (zstd_state *) cs->opaque;
+
+		zstd_free_context(state->ctx);
+		pfree(state);
 	}
 
 	PG_RETURN_VOID();
 }
 
+/*
+ * zstd compression implementation
+ *
+ * Note that when compression fails due to algorithm inefficiency,
+ * dst_used is set so src_sz, but the output buffer contents are left unchanged
+ */
 Datum
 zstd_compress(PG_FUNCTION_ARGS)
 {
@@ -97,14 +114,24 @@ zstd_compress(PG_FUNCTION_ARGS)
 
 	unsigned long dst_length_used;
 
-	dst_length_used = ZSTD_compressCCtx(state->zstd_compress_context,
+	dst_length_used = ZSTD_compressCCtx(state->ctx->cctx,
 										dst, dst_sz,
 										src, src_sz,
 										state->level);
 
 	if (ZSTD_isError(dst_length_used))
 	{
-		elog(ERROR, "%s", ZSTD_getErrorName(dst_length_used));
+		if (ZSTD_getErrorCode(dst_length_used) == ZSTD_error_dstSize_tooSmall)
+		{
+			/*
+			 * This error is returned when "compressed" output is bigger than
+			 * uncompressed input. The caller can detect this by checking
+			 * dst_used >= src_size
+			 */
+			dst_length_used = src_sz;
+		}
+		else
+			elog(ERROR, "%s", ZSTD_getErrorName(dst_length_used));
 	}
 
 	*dst_used = (int32) dst_length_used;
@@ -131,7 +158,7 @@ zstd_decompress(PG_FUNCTION_ARGS)
 	if (dst_sz <= 0)
 		elog(ERROR, "invalid destination buffer size %d", dst_sz);
 
-	dst_length_used = ZSTD_decompressDCtx(state->zstd_decompress_context,
+	dst_length_used = ZSTD_decompressDCtx(state->ctx->dctx,
 										  dst, dst_sz,
 										  src, src_sz);
 
@@ -150,4 +177,3 @@ zstd_validator(PG_FUNCTION_ARGS)
 {
 	PG_RETURN_VOID();
 }
-

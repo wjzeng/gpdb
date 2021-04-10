@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 '''
 Usage: gpcheckcat [<option>] [dbname]
 
@@ -17,27 +17,31 @@ Usage: gpcheckcat [<option>] [dbname]
     -C catname : run cross consistency, FK and ACL tests for this catalog table
 
 '''
+import datetime
 import getopt
+import logging
 import re
 import sys
 import time
-from datetime import datetime
+from functools import reduce
 
 try:
+    from gppylib import gplog
     from gppylib.db import dbconn
-    from gppylib.gplog import *
     from gppylib.gpcatalog import *
     from gppylib.commands.unix import *
+    from gppylib.commands.gp import conflict_with_gpexpand
     from gppylib.system.info import *
-    from pygresql.pgdb import DatabaseError
-    from pygresql import pg
+    from pgdb import DatabaseError
     from gpcheckcat_modules.unique_index_violation_check import UniqueIndexViolationCheck
     from gpcheckcat_modules.leaked_schema_dropper import LeakedSchemaDropper
     from gpcheckcat_modules.repair import Repair
     from gpcheckcat_modules.foreign_key_check import ForeignKeyCheck
+    from gpcheckcat_modules.orphaned_toast_tables_check import OrphanedToastTablesCheck
 
+    import pg
 
-except ImportError, e:
+except ImportError as e:
     sys.exit('Error: unable to import module: ' + str(e))
 
 # cache OID -> object name cache
@@ -45,9 +49,9 @@ oidmap = {}
 
 # -------------------------------------------------------------------------------
 EXECNAME = os.path.split(__file__)[-1]
-setup_tool_logging(EXECNAME, getLocalHostname(), getUserName())
-very_quiet_stdout_logging()
-logger = get_default_logger()
+gplog.setup_tool_logging(EXECNAME, getLocalHostname(), getUserName())
+gplog.very_quiet_stdout_logging()
+logger = gplog.get_default_logger()
 
 sysinfo = SystemInfo(logger)
 
@@ -94,6 +98,8 @@ def setError(level):
 ###############################
 class Global():
     def __init__(self):
+        self.timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+
         self.retcode = SUCCESS
         self.opt = {}
         self.opt['-h'] = None
@@ -104,7 +110,7 @@ class Global():
         self.opt['-V'] = False
         self.opt['-t'] = False
 
-        self.opt['-g'] = 'gpcheckcat.repair.' + Repair.TIMESTAMP
+        self.opt['-g'] = 'gpcheckcat.repair.' + self.timestamp
         self.opt['-B'] = parallelism
         self.opt['-T'] = None
 
@@ -118,6 +124,7 @@ class Global():
 
         self.opt['-E'] = False
 
+        self.coordinator_dbid = None
         self.cfg = None
         self.dbname = None
         self.firstdb = None
@@ -128,10 +135,10 @@ class Global():
         self.reset_stmt_queues()
 
         self.home = os.environ.get('HOME')
-        if self.home == None:
+        if self.home is None:
             usage('Error: $HOME must be set')
         self.user = os.environ.get('USER') or os.environ.get('LOGNAME')
-        if self.user == None:
+        if self.user is None:
             usage('Error: either $USER or $LOGNAME must be set')
 
         self.catalog = None
@@ -183,7 +190,7 @@ GV = Global()
 
 ###############################
 def usage(exitarg=None):
-    print __doc__
+    print(__doc__)
     sys.exit(exitarg)
 
 
@@ -220,7 +227,7 @@ def parseCommandLine():
     try:
         # A colon following the flag indicates an argument is expected
         (options, args) = getopt.getopt(sys.argv[1:], '?p:P:U:B:vg:t:AOS:R:C:lE')
-    except Exception, e:
+    except Exception as e:
         usage('Error: ' + str(e))
 
     for (switch, val) in options:
@@ -242,7 +249,7 @@ def parseCommandLine():
     if GV.opt['-l']: return
 
     if GV.opt['-v']:
-        enable_verbose_logging()
+        gplog.enable_verbose_logging()
 
     setdef('-P', 'PGPASSWORD')
     setdef('-U', 'PGUSER')
@@ -288,12 +295,12 @@ def parseCommandLine():
             usage('Error: invalid value \'%s\' for shared table option. Legal values are (none, only)' % GV.opt['-S'])
         GV.opt['-S'] = GV.opt['-S'].lower()
 
-    logger.debug('master at host %s, port %s, user %s, database %s' %
+    logger.debug('coordinator at host %s, port %s, user %s, database %s' %
                  (GV.opt['-h'], GV.opt['-p'], GV.opt['-U'], GV.dbname))
 
     try:
         GV.opt['-B'] = int(GV.opt['-B'])
-    except Exception, e:
+    except Exception as e:
         usage('Error: ' + str(e))
 
     if GV.opt['-B'] < 1:
@@ -306,17 +313,23 @@ def parseCommandLine():
 def connect(user=None, password=None, host=None, port=None,
             database=None, utilityMode=False):
     '''Connect to DB using parameters in GV'''
-    options = utilityMode and '-c gp_session_role=utility' or None
+    # unset search path due to CVE-2018-1058
+    options = '-c search_path='
+    if utilityMode:
+        options += ' -c gp_role=utility'
+
     if not user: user = GV.opt['-U']
     if not password: password = GV.opt['-P']
     if not host: host = GV.opt['-h']
     if not port: port = GV.opt['-p']
     if not database: database = GV.dbname
+
     try:
         logger.debug('connecting to %s:%s %s' % (host, port, database))
         db = pg.connect(host=host, port=port, user=user,
                         passwd=password, dbname=database, opt=options)
-    except pg.InternalError, ex:
+
+    except pg.InternalError as ex:
         logger.fatal('could not connect to %s: "%s"' %
                      (database, str(ex).strip()))
         exit(1)
@@ -361,7 +374,7 @@ class execThread(Thread):
     def run(self):
         try:
             self.curs = self.db.query(self.qry)
-        except BaseException, e:
+        except BaseException as e:
             self.error = e
 
 
@@ -414,7 +427,7 @@ def connect2run(qry, col=None):
 
     err = []
     for [cfg, curs] in batch:
-        if col == None:
+        if col is None:
             col = curs.listfields()
         for row in curs.dictresult():
             err.append([cfg, col, row])
@@ -446,8 +459,8 @@ def getGPConfiguration():
           '''
     curs = db.query(qry)
     for row in curs.dictresult():
-        if row['content'] == -1 and row['isprimary'] != 't':
-            continue  # skip standby master
+        if row['content'] == -1 and not row['isprimary']:
+            continue  # skip standby coordinator
         cfg[row['dbid']] = row
     db.close()
     return cfg
@@ -461,15 +474,15 @@ def checkDistribPolicy():
       join pg_class rel on (pk.conrelid = rel.oid)
       join pg_namespace n on (rel.relnamespace = n.oid)
       join gp_distribution_policy d on (rel.oid = d.localoid)
-    where pk.contype in('p', 'u') and d.policytype = 'p' and d.attrnums is null
+    where pk.contype in('p', 'u') and d.policytype = 'p' and d.distkey = ''
     '''
 
-    db = connect2(GV.cfg[1])
+    db = connect2(GV.cfg[GV.coordinator_dbid])
     try:
         curs = db.query(qry)
         err = []
         for row in curs.dictresult():
-            err.append([GV.cfg[1], ('nspname', 'relname', 'constraint'), row])
+            err.append([GV.cfg[GV.coordinator_dbid], ('nspname', 'relname', 'constraint'), row])
 
         if not err:
             logger.info('[OK] randomly distributed tables')
@@ -485,7 +498,7 @@ def checkDistribPolicy():
                 cons = e[2]
                 removeIndexConstraint(cons['nspname'], cons['relname'],
                                       cons['constraint'])
-    except Exception, e:
+    except Exception as e:
         setError(ERROR_NOREPAIR)
         myprint('[ERROR] executing test: checkDistribPolicy')
         myprint('  Execution error: ' + str(e))
@@ -502,16 +515,15 @@ def checkDistribPolicy():
       join  pg_class rel on (pk.conrelid = rel.oid)
       join  pg_namespace n on (rel.relnamespace = n.oid)
       join  gp_distribution_policy d on (rel.oid = d.localoid)
-    where pk.contype in ('p', 'u') and d.policytype = 'p' and
-          (d.attrnums is null or not
-           d.attrnums operator(pg_catalog.<@) pk.conkey)
+    where pk.contype in ('p', 'u') and d.policytype = 'p'
+      and not d.distkey::int2[] operator(pg_catalog.<@) pk.conkey
     '''
     try:
         curs = db.query(qry)
 
         err = []
         for row in curs.dictresult():
-            err.append([GV.cfg[1], ('nspname', 'relname', 'constraint'), row])
+            err.append([GV.cfg[GV.coordinator_dbid], ('nspname', 'relname', 'constraint'), row])
 
         if not err:
             logger.info('[OK] unique constraints')
@@ -526,7 +538,7 @@ def checkDistribPolicy():
                 cons = e[2]
                 removeIndexConstraint(cons['nspname'], cons['relname'],
                                       cons['constraint'])
-    except Exception, e:
+    except Exception as e:
         setError(ERROR_NOREPAIR)
         myprint('[ERROR] executing test: checkDistribPolicy')
         myprint('  Execution error: ' + str(e))
@@ -535,158 +547,34 @@ def checkDistribPolicy():
 
 #############
 def checkPartitionIntegrity():
-    #
-    # MPP-8558: look for data in branch (not leaf) partitions
-    #
     logger.info('-----------------------------------')
     logger.info('Checking pg_partition ...')
     err = []
     db = connect()
-    qry = '''
-    select distinct
-           quote_ident(n.nspname) || '.' || quote_ident(c.relname) as parname
-    from   pg_partition_rule r1
-      join pg_partition_rule r2 on (r1.oid = r2.parparentrule)
-      join pg_class c on (r1.parchildrelid = c.oid)
-      join pg_namespace n on (c.relnamespace = n.oid)
-    where  r1.parchildrelid <> 0 and r2.parchildrelid <> 0
-    '''
-    try:
-        curs = db.query(qry)
-        for row in curs.dictresult():
-            qy2 = ('select count(*) as cc from (select 1 from only %s limit(2)) q'
-                   % (row['parname']))
-
-            curs2 = db.query(qy2)
-            for row2 in curs2.dictresult():
-                if row2['cc'] == 0:
-                    continue
-                err.append([row['parname']])
-
-        if not err:
-            logger.info('[OK] pg_partition branch integrity')
-        else:
-            GV.checkStatus = False
-            setError(ERROR_NOREPAIR)
-            logger.info('[FAIL] pg_partition branch integrity')
-            logger.error('pg_partition has %d issue(s)' % len(err))
-            logger.error('Discovered row data in branch partitions')
-            for e in err:
-                logger.error('  partition table name:  %s' % (e[0]))
-
-    except Exception, e:
-        setError(ERROR_NOREPAIR)
-        myprint('[ERROR] executing test: checkPartitionIntegrity')
-        myprint('  Execution error: ' + str(e))
-
-    # MPP-9283: look for partitions create "with oids".
-    qry = '''
-    select n1.nspname, pc.relname, pc.oid
-    from   pg_class pc, pg_partition_rule pr, pg_namespace n1
-    where  pr.parchildrelid = pc.oid and pc.relnamespace = n1.oid and pc.relhasoids
-    union
-    select n1.nspname, pc.relname, pc.oid
-    from   pg_class pc, pg_partition pp, pg_namespace n1
-    where  pp.parrelid = pc.oid and pc.relnamespace = n1.oid and pc.relhasoids
-    '''
-    try:
-        curs = db.query(qry)
-        err = []
-        for row in curs.dictresult():
-            err.append([GV.cfg[1], ('nspname', 'relname', 'oid'), row])
-
-        if not err:
-            logger.info('[OK] partition with oids check')
-        else:
-            GV.checkStatus = False
-            setError(ERROR_NOREPAIR)
-            logger.info('[FAIL] partition with oids check')
-            logger.error('partition with oids check found %d issue(s)' % len(err))
-            logger.error(qry)
-            for e in err[0:100]:
-                row = e[2]
-                logger.error(" table %s.%s oid %s" %
-                             (row['nspname'], row['relname'], row['oid']))
-            if len(err) > 100:
-                logger.error("...")
-    except Exception, e:
-        setError(ERROR_NOREPAIR)
-        myprint('[ERROR] executing test: checkPartitionIntegrity')
-        myprint('  Execution error: ' + str(e))
-
-        # TODO: add repair script
 
     # MPP-11120: check for child partitions with different
-    # distribution policies The complexity of this query is due to
-    # having to account for the possibility of partitions with "holes"
-    # which would make similar distribution policies appear different
-    # in gp_distribution_policy.  This is handled by unnesting both
-    # distribution
+    # distribution policies.
     qry = '''
-    select
-      parrelid,
-      parchildrelid,
-      d1.attrnums as parpolicy,
-      d2.attrnums as parchildpolicy
-    from
-      (
-        select distinct
-          coalesce(p1.parrelid, p2.parrelid)::regclass as parrelid,
-          coalesce(p1.parchildrelid, p2.parchildrelid)::regclass as parchildrelid
-        from
-          (
-            select parrelid, parchildrelid, g1.attname, g1.index
-            from   pg_partition_rule pr
-                   join pg_partition p on (pr.paroid = p.oid)
-                   join (
-                     select localoid, attname, index
-                     from (
-                       select
-                         localoid,
-                         unnest(attrnums) as offset,
-                         generate_series(1, array_upper(attrnums, 1)) as index
-                       from
-                         gp_distribution_policy
-                      ) d
-                      join pg_attribute a on (a.attrelid = d.localoid and a.attnum = d.offset)
-                   ) g1 on (parrelid = g1.localoid)
-            where  parchildrelid != 0
-          ) p1
-          full outer join
-          (
-            select parrelid, parchildrelid, g2.attname, g2.index
-            from   pg_partition_rule pr
-                   join pg_partition p on (pr.paroid = p.oid)
-                   join (
-                     select localoid, attname, index
-                     from (
-                       select
-                         localoid,
-                         unnest(attrnums) as offset,
-                         generate_series(1, array_upper(attrnums, 1)) as index
-                       from
-                         gp_distribution_policy
-                      ) d
-                      join pg_attribute a on (a.attrelid = d.localoid and a.attnum = d.offset)
-                   ) g2 on (parchildrelid = g2.localoid)
-            where  parchildrelid != 0
-          ) p2
-          on (p1.parrelid = p2.parrelid and
-              p1.parchildrelid = p2.parchildrelid and
-              p1.index = p2.index)
-        where p1.attname is distinct from p2.attname
-      ) p
-    join gp_distribution_policy d1 on (d1.localoid = p.parrelid)
-    join gp_distribution_policy d2 on (d2.localoid = p.parchildrelid)
-    where d2.attrnums is not null
+    select inhparent::regclass, inhrelid::regclass,
+           pg_get_table_distributedby(inhparent) as dby_parent,
+           pg_get_table_distributedby(inhrelid) as dby_child
+    from pg_inherits inner join pg_partitioned_table on (pg_inherits.inhparent = pg_partitioned_table.partrelid)
+    where pg_get_table_distributedby(inhrelid) is distinct from pg_get_table_distributedby(inhparent)
+          and not (pg_get_table_distributedby(inhparent) = 'DISTRIBUTED RANDOMLY' and pg_get_table_distributedby(inhrelid) = '');
     '''
     try:
         curs = db.query(qry)
-        cols = ('parrelid', 'parchildrelid', 'parpolicy', 'parchildpolicy')
+        cols = ('inhparent', 'inhrelid', 'dby_parent', 'dby_child')
+        col_names = {
+            'inhparent': 'table',
+            'inhrelid': 'affected child',
+            'dby_parent': 'table distribution key',
+            'dby_child': 'child distribution key',
+        }
 
         err = []
         for row in curs.dictresult():
-            err.append([GV.cfg[1], cols, row])
+            err.append([GV.cfg[GV.coordinator_dbid], cols, row])
 
         if not err:
             logger.info('[OK] partition distribution policy check')
@@ -698,14 +586,22 @@ def checkPartitionIntegrity():
             if len(err) > 100:
                 logger.error(qry)
 
+            myprint(
+                '[ERROR]: child partition(s) are distributed differently from '
+                'the root partition, and must be manually redistributed, for '
+                'some tables. Check the gpcheckcat log for details.'
+            )
+            logger.error('The following tables must be manually redistributed:')
+
             count = 0
             for e in err:
                 cfg = e[0]
                 col = e[1]
                 row = e[2]
 
-                # generate repair script for this row
-                distributeRandomly(row['parchildrelid'])
+                # TODO: generate a repair script for this row. This is
+                # difficult, since we can't redistribute child partitions
+                # directly.
 
                 # report at most 100 rows, for brevity
                 if count == 100:
@@ -716,13 +612,19 @@ def checkPartitionIntegrity():
 
                 if count == 0:
                     logger.error("--------")
-                    logger.error("  " + " | ".join(map(str, col)))
-                    logger.error("  " + "-+-".join(['-' * len(x) for x in col]))
+                    logger.error("  " + " | ".join(map(col_names.get, col)))
+                    logger.error("  " + "-+-".join(['-' * len(col_names[x]) for x in col]))
 
                 logger.error("  " + " | ".join([str(row[x]) for x in col]))
                 count += 1
 
-    except Exception, e:
+            logger.error(
+                'Execute an ALTER TABLE ... SET DISTRIBUTED BY statement, with '
+                'the desired distribution key, on the partition root for each '
+                'affected table.'
+            )
+
+    except Exception as e:
         setError(ERROR_NOREPAIR)
         myprint('[ERROR] executing test: checkPartitionIntegrity')
         myprint('  Execution error: ' + str(e))
@@ -732,1124 +634,6 @@ def checkPartitionIntegrity():
     checkPoliciesRepair()
 
 #############
-# A dictionary of SQL statements for checkPartitionRegularity()
-
-partitionRegularityChecks = {
-    # Query: irreg_user_constraint
-    #
-    #     A row represents an irregular user-defined constraint.
-    #
-    #     This view just filters ptable_user_con_info so that it returns no rows
-    #     if no irregular user-defined constraints exist.
-    #
-    #     An irregular user-constraint is a constraint whose definition (DDL expression
-    #     format) appears on the root table of a partitioned table, and doesn't appear
-    #     on every part table of the partitioned table.  It is possible to construct
-    #     these using sequences of DDL operations on release prior to Rio.  In Rio,
-    #     it is possible to construct them with FOREIGN KEY constraints, but not with
-    #     other constraint types.
-    #
-    # tableid:  pg_class.oid of the partitioned table
-    # conname:  name of the constraint on the partitioned table
-    # contype:  type of constraint (same on part and table)
-    # condef:  specification of constraint (same on part and table)
-    # numexpected:  number of constraint occurrences expected (incl table)
-    # numactual:  number of constraint occurrences observed (incl table)
-    'irreg_user_constraint':
-        """select
-            tableid,
-            tableconname,
-            contype,
-            condef,
-            numexpected,
-            numactual
-        from
-            (
-                select
-                    c.tableid,
-                    c.tableconname,
-                    c.contype,
-                    c.condef,
-                    i.tableparts + 1,
-                    count(c.partid),
-                    count(distinct c.partconname)
-                from
-                    (
-                        select
-                            u.tableid,
-                            u.conname,
-                            u.contype,
-                            u.condef,
-                            p.partid,
-                            p.conid,
-                            coalesce(p.conname)
-                        from
-                            (
-                                select
-                                    p.tableid,
-                                    c.conname,
-                                    c.contype,
-                                    pg_get_constraintdef(c.oid) as condef
-                                from
-                                    (
-                                        select
-                                            parrelid::regclass,
-                                            max(parlevel)+1
-                                        from
-                                            pg_partition
-                                        group by parrelid
-                                    ) as p(tableid, tabledepth) ,
-                                    pg_constraint c
-                                where
-                                    p.tableid = c.conrelid
-                            ) as u(tableid, conname, contype, condef)
-                                join
-                            (
-                                select
-                                    x.tableid::regclass as tableid,
-                                    c.conrelid::regclass as partid,
-                                    c.oid as conid,
-                                    c.conname,
-                                    c.contype,
-                                    pg_get_constraintdef(c.oid) as condef
-                                from
-                                    pg_constraint c,
-                                    (
-                                        select
-                                            tableid,
-                                            tabledepth,
-                                            tableid::regclass partid,
-                                            0 as partdepth,
-                                            0 as partordinal,
-                                            'r'::char as partstatus
-                                        from
-                                            (
-                                                select
-                                                    parrelid::regclass,
-                                                    max(parlevel)+1
-                                                from
-                                                    pg_partition
-                                                group by parrelid
-                                            ) as ptable(tableid, tabledepth)
-                                        union all
-                                        select
-                                            parrelid::regclass as tableid,
-                                            t.tabledepth as tabledepth,
-                                            r.parchildrelid::regclass partid,
-                                            p.parlevel + 1 as partdepth,
-                                            r.parruleord as partordinal,
-                                            case
-                                                when t.tabledepth = p.parlevel + 1 then 'l'::char
-                                                else 'i'::char
-                                            end as partstatus
-                                        from
-                                            pg_partition p,
-                                            pg_partition_rule r,
-                                             (
-                                                select
-                                                    parrelid::regclass,
-                                                    max(parlevel)+1
-                                                from
-                                                    pg_partition
-                                                group by parrelid
-                                            ) as t(tableid, tabledepth)
-                                        where
-                                            p.oid = r.paroid
-                                            and not p.paristemplate
-                                            and p.parrelid = t.tableid
-                                    ) as x(tableid, tabledepth, partid, partdepth, partordinal, partstatus)
-                                where
-                                    x.partid = c.conrelid
-                            ) as p(tableid, partid, conid, conname, contype, condef)
-                                on (
-                                    u.tableid = p.tableid and
-                                    u.contype = p.contype and
-                                    u.condef = p.condef
-                                    )
-                    ) as c(tableid, tableconname, contype, condef, partid, partconid, partconname) ,
-                    (
-                        select
-                            t.tableid,
-                            t.tabledepth,
-                            n.nparts as tableparts,
-                            r.nspname,
-                            r.relname
-                        from
-                            (
-                                select
-                                    parrelid::regclass,
-                                    max(parlevel)+1
-                                from
-                                    pg_partition
-                                group by parrelid
-                            ) as t(tableid, tabledepth) ,
-                            (
-                                select
-                                    c.oid::regclass as relid,
-                                    n.nspname,
-                                    c.relname,
-                                    c.relkind
-                                from
-                                    pg_class c,
-                                    pg_namespace n
-                                where
-                                    c.relnamespace = n.oid
-                            ) as r(relid, nspname, relname, relkind) ,
-                            (
-                                select tableid, count(*)
-                                from (
-                                        select
-                                            t.tableid::regclass,
-                                            p.parchildrelid::regclass as partid
-                                        from
-                                            (
-                                                select pg_partition.parrelid, pg_partition.oid
-                                                from pg_partition
-                                                where not pg_partition.paristemplate
-                                            ) t(tableid, partid),
-                                            pg_partition_rule p
-                                        where p.paroid = t.partid
-                                    ) as contains_part(tableid, partid)
-                                group by tableid
-                            ) n(tableid, nparts)
-                        where
-                            t.tableid = r.relid and
-                            t.tableid = n.tableid
-                    ) as i(tableid, tabledepth, tableparts, nspname, relname)
-                where
-                    c.tableid = i.tableid
-                group by
-                    c.tableid,
-                    c.tableconname,
-                    c.contype,
-                    c.condef,
-                    i.tableparts
-            ) as ptable_user_con_info(tableid, tableconname, contype, condef, numexpected, numactual, numnames)
-        where
-            contype != 'f' and -- no FK consistency in Rio
-            numexpected != numactual""",
-
-    # Query: irreg_sys_constraint
-    #
-    #     A row represents an irregular system-defined constraint.
-    #
-    #     An irregular system constraint is a constraint whose definition (DDL
-    #     expression format) appears on some part tables and that is not a system-
-    #     defined partition constraint.
-    #
-    #     This view doesn't actually test this.  Instead, it checks for an
-    #     expected pattern of system-defined constraints.
-    #     1. The constraints checked are those that don't appear on the root.
-    #     2. Each part has as many constraints as its depth in the partition
-    #        less any default parts on its path.
-    #     Violators are listed as results.
-    #
-    # tableid:  pg_class.oid of the partitioned table
-    # partid:  pg_class.oid of the (constrained) part table
-    # expected:  number of constraint occurrences expected
-    # actual:  number of constraint occurrences observed
-    'irreg_sys_constraint':
-        """select
-            coalesce(x.partid, a.partid) as partid,
-            x.tableid,
-            x.expected,
-            coalesce(a.actual, 0) as actual
-        from
-            (
-            {expected}
-            ) x
-              full join
-            (
-            {actual}
-            ) a
-              on (x.partid = a.partid)
-        where
-            x.expected != a.actual or
-            x.expected is null or
-            x.expected != coalesce(a.actual,0);""",
-
-    # Query based on view: unenforced_constraint_info
-    #
-    #     a row represents an unenforced unique constraint to be fixed.
-    #
-    # tableid
-    # partid
-    # indexid
-    # partoid
-    # indexoid
-    # contype
-    # conname
-    # refobjid
-
-    'unenforced_constraint_info':
-        """select
-            c.tableid,
-            c.partid,
-            b.indexid,
-            c.partid::int as partoid,
-            b.indexid::int as indexoid,
-            b.contype,
-            b.conname,
-            b.refobjid
-        from
-            (
-                select
-                    k.tableid,
-                    k.distkey,
-                    k.partkey,
-                    c.conid,
-                    c.conname,
-                    c.contype,
-                    i.indrelid::regclass,
-                    i.indkey::smallint[]
-                from
-                    pg_index i,
-                    (
-                        select
-                            k.tableid,
-                            d.attrcnt,
-                            d.attrnums,
-                            sum(k.partkeylen),
-                            array_agg(k.partkey[g.g])
-                        from
-                            (
-                                select
-                                    p.parrelid::regclass,
-                                    t.tabledepth,
-                                    p.parlevel,
-                                    p.parnatts,
-                                    p.paratts
-                                from
-                                    pg_partition p,
-                                    (
-                                        select
-                                            parrelid::regclass,
-                                            max(parlevel)+1
-                                        from
-                                            pg_partition
-                                        group by parrelid
-                                    ) as t(tableid, tabledepth)
-                                where
-                                    p.parrelid = t.tableid and
-                                    p.paristemplate is false
-                            ) as k(tableid, tabledepth, partdepth, partkeylen, partkey) ,
-                            generate_series(0, (select max(partkeylen) from (
-                                select
-                                    p.parrelid::regclass,
-                                    t.tabledepth,
-                                    p.parlevel,
-                                    p.parnatts,
-                                    p.paratts
-                                from
-                                    pg_partition p,
-                                    (
-                                        select
-                                            parrelid::regclass,
-                                            max(parlevel)+1
-                                        from
-                                            pg_partition
-                                        group by parrelid
-                                    ) as t(tableid, tabledepth)
-                                where
-                                    p.parrelid = t.tableid and
-                                    p.paristemplate is false
-                            ) as partition_level(tableid, tabledepth, partdepth, partkeylen, partkey) )-1) g(g),
-                            (
-                                select
-                                    localoid::regclass,
-                                    attrnums,
-                                    coalesce(1+array_upper(attrnums,1)-array_lower(attrnums,1),0)
-                                from
-                                    gp_distribution_policy
-                            ) as d(relid, attrnums, attrcnt)
-                        where
-                            g.g < k.partkeylen and
-                            k.tableid = d.relid
-                        group by
-                            k.tableid,
-                            d.attrcnt,
-                            d.attrnums
-                    ) as k(tableid, distkeylen, distkey, partkeylen, partkey) ,
-                    (
-                        select
-                            relid,
-                            conid,
-                            conname,
-                            contype,
-                            indexid
-                        from
-                            (
-                                select
-                                    r.oid::regclass as relid,
-                                    c.oid as conid,
-                                    c.conname,
-                                    c.contype,
-                                    c.consrc,
-                                    pg_get_constraintdef(c.oid) as condef,
-                                    d.objid::regclass as indexid
-                                from
-                                    (
-                                        pg_class r
-                                            join
-                                            pg_constraint c
-                                            on
-                                                r.oid = c.conrelid
-                                                and r.relkind = 'r'
-                                    )
-                                        left join
-                                        pg_depend d
-                                        on
-                                            d.refobjid = c.oid
-                                            and d.classid = 'pg_class'::regclass
-                                            and d.refclassid = 'pg_constraint'::regclass
-                                            and d.deptype = 'i'
-                                ) as relconstraint(relid, conid, conname, contype, consrc, condef, indexid)
-                        where
-                            indexid is not null
-                            or contype in ('p', 'u')
-                    ) as c(relid, conid, conname, contype, indexid)
-                where
-                    c.relid = k.tableid and
-                    i.indrelid = k.tableid and
-                    i.indexrelid = c.indexid and
-                    not i.indkey::smallint[] @> array_cat(k.distkey, k.partkey)
-            ) as x(tableid, distkey, partkey, conid, conname, contype, indrelid, indkey) ,
-            (
-                select
-                    tableid,
-                    tabledepth,
-                    tableid::regclass partid,
-                    0 as partdepth,
-                    0 as partordinal,
-                    'r'::char as partstatus
-                from
-                    (
-                        select
-                            parrelid::regclass,
-                            max(parlevel)+1
-                        from
-                            pg_partition
-                        group by parrelid
-                    ) as ptable(tableid, tabledepth)
-                union all
-                select
-                    parrelid::regclass as tableid,
-                    t.tabledepth as tabledepth,
-                    r.parchildrelid::regclass partid,
-                    p.parlevel + 1 as partdepth,
-                    r.parruleord as partordinal,
-                    case
-                        when t.tabledepth = p.parlevel + 1 then 'l'::char
-                        else 'i'::char
-                    end as partstatus
-                from
-                    pg_partition p,
-                    pg_partition_rule r,
-                     (
-                        select
-                            parrelid::regclass,
-                            max(parlevel)+1
-                        from
-                            pg_partition
-                        group by parrelid
-                    ) as t(tableid, tabledepth)
-                where
-                    p.oid = r.paroid
-                    and not p.paristemplate
-                    and p.parrelid = t.tableid
-            ) as c(tableid, tabledepth, partid, partdepth, partordinal, partstatus) ,
-            (
-                select
-                    r.oid::regclass as relid,
-                    i.oid::regclass as indexid,
-                    c.oid as conid,
-                    c.contype,
-                    c.conname,
-                    pg_get_constraintdef(c.oid) as condef,
-                    d.classid,
-                    d.objid,
-                    d.objsubid,
-                    d.refclassid,
-                    d.refobjid,
-                    d.refobjsubid,
-                    d.deptype
-                from
-                    pg_constraint c,
-                    pg_class i,
-                    pg_depend d,
-                    pg_index x,
-                    pg_class r
-                where
-                    d.classid = 'pg_class'::regclass and
-                    d.objid = i.oid and
-                    d.objsubid = 0 and
-                    d.refclassid = 'pg_constraint'::regclass and
-                    d.refobjid = c.oid and
-                    d.refobjsubid = 0 and
-                    d.deptype = 'i' and
-                    i.relkind = 'i' and
-                    i.oid = x.indexrelid and
-                    r.oid = x.indrelid
-            ) as b(relid, indexid, conid, contype, conname, condef, classid, objid, objsubid, refclassid, refobjid, refobjsubid, deptype)
-        where
-            x.tableid = c.tableid and
-            c.partid = b.relid and
-            b.classid = 'pg_class'::regclass and
-            b.objsubid = 0 and
-            b.refclassid = 'pg_constraint'::regclass and
-            b.refobjsubid = 0 and
-            b.deptype = 'i'""",
-
-    # Repair sequence for issues identified by unenforced_constraint_info.
-    # Must substitute values from a row of that query, before running.
-
-    'unenforced_constraint_repairs':
-        """--Demote type-{contype} constraint {conname} on part {partid}
---of partitioned table {tableid} to simple unique index.
-
---Disconnect index {indexid} from constraint {conname}
-delete
-from
-    pg_depend
-where
-    (classid, objid, objsubid, refclassid, refobjid, refobjsubid, deptype) =
-    (
-        select
-            d.classid,
-            d.objid,
-            d.objsubid,
-            d.refclassid,
-            d.refobjid,
-            d.refobjsubid,
-            d.deptype
-        from
-            pg_index i,
-            pg_depend d
-        where
-            i.indexrelid = {indexoid} and
-            d.classid = 'pg_class'::regclass and
-            d.objid = i.indexrelid and
-            d.objsubid = 0 and
-            d.refclassid = 'pg_constraint'::regclass and
-            d.refobjid = (
-                select oid
-                from pg_constraint
-                where
-                   conrelid = {partoid} and
-                   conname = {quoted_conname} and
-                   contypid = 0 and
-                   contype = {quoted_contype}
-            ) and
-            d.refobjsubid = 0 and
-            d.deptype = 'i'
-    );
---Replace dependency of constraint {conname} on table columns of {partid}
---with dependency of index {indexoid} on same.
-update
-    pg_depend
-set
-    classid = 'pg_class'::regclass,
-    objid = {indexoid}
-where
-    classid = 'pg_constraint'::regclass and
-    objid = (
-             select oid
-               from pg_constraint
-              where
-                    conrelid = {partoid} and
-                    conname = {quoted_conname} and
-                    contypid = 0 and
-                    contype = {quoted_contype}
-         ) and
-    objsubid = 0 and
-    refclassid = 'pg_class'::regclass and
-    refobjid = {partoid} and
-    refobjsubid <> 0 and
-    deptype = 'a';
---Delete constraint {conname} leaving its index {indexid}
-delete
-from
-    pg_constraint
-where
-    conrelid = {partoid} and
-    conname = {quoted_conname} and
-    contypid = 0 and
-    contype = {quoted_contype};""",
-
-    # Query: fix_ill_named_constraint
-    #
-    #     a row represents the data for a fixup of an ill-named constraint
-    #
-    # tableid:  pg_class.oid of the partitioned table as regclass
-    # tableconname:  pg_constraint.conname on the partitioned table
-    # partid:  pg_class.oid of the part table as regclass
-    # partrelid:  pg_class.oid of the part table as int
-    # partconname:  pg_constraint.conname on the part or partitioned table
-
-    'fix_ill_named_constraint':
-        """select
-            tableid,
-            tableconname,
-            partid,
-            partid::int as partrelid,
-            partconname
-        from (
-                select
-                    u.tableid,
-                    u.conname,
-                    u.contype,
-                    u.condef,
-                    p.partid,
-                    p.conid,
-                    coalesce(p.conname)
-                from
-                    (
-                        select
-                            p.tableid,
-                            c.conname,
-                            c.contype,
-                            pg_get_constraintdef(c.oid) as condef
-                        from
-                            (
-                                select
-                                    parrelid::regclass,
-                                    max(parlevel)+1
-                                from
-                                    pg_partition
-                                group by parrelid
-                            ) as p(tableid, tabledepth) ,
-                            pg_constraint c
-                        where
-                            p.tableid = c.conrelid
-                    ) as u(tableid, conname, contype, condef)
-                        join
-                    (
-                        select
-                            x.tableid::regclass as tableid,
-                            c.conrelid::regclass as partid,
-                            c.oid as conid,
-                            c.conname,
-                            c.contype,
-                            pg_get_constraintdef(c.oid) as condef
-                        from
-                            pg_constraint c,
-                            (
-                                select
-                                    tableid,
-                                    tabledepth,
-                                    tableid::regclass partid,
-                                    0 as partdepth,
-                                    0 as partordinal,
-                                    'r'::char as partstatus
-                                from
-                                    (
-                                        select
-                                            parrelid::regclass,
-                                            max(parlevel)+1
-                                        from
-                                            pg_partition
-                                        group by parrelid
-                                    ) as ptable(tableid, tabledepth)
-                                union all
-                                select
-                                    parrelid::regclass as tableid,
-                                    t.tabledepth as tabledepth,
-                                    r.parchildrelid::regclass partid,
-                                    p.parlevel + 1 as partdepth,
-                                    r.parruleord as partordinal,
-                                    case
-                                        when t.tabledepth = p.parlevel + 1 then 'l'::char
-                                        else 'i'::char
-                                    end as partstatus
-                                from
-                                    pg_partition p,
-                                    pg_partition_rule r,
-                                     (
-                                        select
-                                            parrelid::regclass,
-                                            max(parlevel)+1
-                                        from
-                                            pg_partition
-                                        group by parrelid
-                                    ) as t(tableid, tabledepth)
-                                where
-                                    p.oid = r.paroid
-                                    and not p.paristemplate
-                                    and p.parrelid = t.tableid
-                            ) as x(tableid, tabledepth, partid, partdepth, partordinal, partstatus)
-                        where
-                            x.partid = c.conrelid
-                    ) as p(tableid, partid, conid, conname, contype, condef)
-                        on (
-                            u.tableid = p.tableid and
-                            u.contype = p.contype and
-                            u.condef = p.condef
-                            )
-            ) as part_user_constraint(tableid, tableconname, contype, condef, partid, partconid, partconname)
-        where partconname != tableconname""",
-
-    # Query based on view: part_sys_actual
-    # tableid
-    # partid
-    # actual observed number of system-constraints
-
-    "actual_part_con_query":
-        """select
-            tableid,
-            partid,
-            count(*) as actual
-        from (
-                select
-                    tableid,
-                    partid,
-                    conid,
-                    conname,
-                    contype,
-                    condef
-                from (
-                        select
-                            x.tableid::regclass as tableid,
-                            c.conrelid::regclass as partid,
-                            c.oid as conid,
-                            c.conname,
-                            c.contype,
-                            pg_get_constraintdef(c.oid) as condef
-                        from
-                            pg_constraint c,
-                            (
-                                select
-                                    tableid,
-                                    tabledepth,
-                                    tableid::regclass partid,
-                                    0 as partdepth,
-                                    0 as partordinal,
-                                    'r'::char as partstatus
-                                from
-                                    (
-                                        select
-                                            parrelid::regclass,
-                                            max(parlevel)+1
-                                        from
-                                            pg_partition
-                                        group by parrelid
-                                    ) as ptable(tableid, tabledepth)
-                                union all
-                                select
-                                    parrelid::regclass as tableid,
-                                    t.tabledepth as tabledepth,
-                                    r.parchildrelid::regclass partid,
-                                    p.parlevel + 1 as partdepth,
-                                    r.parruleord as partordinal,
-                                    case
-                                        when t.tabledepth = p.parlevel + 1 then 'l'::char
-                                        else 'i'::char
-                                    end as partstatus
-                                from
-                                    pg_partition p,
-                                    pg_partition_rule r,
-                                     (
-                                        select
-                                            parrelid::regclass,
-                                            max(parlevel)+1
-                                        from
-                                            pg_partition
-                                        group by parrelid
-                                    ) as t(tableid, tabledepth)
-                                where
-                                    p.oid = r.paroid
-                                    and not p.paristemplate
-                                    and p.parrelid = t.tableid
-                            ) as x(tableid, tabledepth, partid, partdepth, partordinal, partstatus)
-                        where
-                            x.partid = c.conrelid
-                    ) as part_constraint(tableid, partid, conid, conname, contype, condef)
-                where
-                    (partid, condef) not in
-                        (
-                            select partid, condef
-                            from (
-                                select
-                                    u.tableid,
-                                    u.conname,
-                                    u.contype,
-                                    u.condef,
-                                    p.partid,
-                                    p.conid,
-                                    coalesce(p.conname)
-                                from
-                                    (
-                                        select
-                                            p.tableid,
-                                            c.conname,
-                                            c.contype,
-                                            pg_get_constraintdef(c.oid) as condef
-                                        from
-                                            (
-                                                select
-                                                    parrelid::regclass,
-                                                    max(parlevel)+1
-                                                from
-                                                    pg_partition
-                                                group by parrelid
-                                            ) as p(tableid, tabledepth) ,
-                                            pg_constraint c
-                                        where
-                                            p.tableid = c.conrelid
-                                    ) as u(tableid, conname, contype, condef)
-                                        join
-                                    (
-                                        select
-                                            x.tableid::regclass as tableid,
-                                            c.conrelid::regclass as partid,
-                                            c.oid as conid,
-                                            c.conname,
-                                            c.contype,
-                                            pg_get_constraintdef(c.oid) as condef
-                                        from
-                                            pg_constraint c,
-                                            (
-                                                select
-                                                    tableid,
-                                                    tabledepth,
-                                                    tableid::regclass partid,
-                                                    0 as partdepth,
-                                                    0 as partordinal,
-                                                    'r'::char as partstatus
-                                                from
-                                                    (
-                                                        select
-                                                            parrelid::regclass,
-                                                            max(parlevel)+1
-                                                        from
-                                                            pg_partition
-                                                        group by parrelid
-                                                    ) as ptable(tableid, tabledepth)
-                                                union all
-                                                select
-                                                    parrelid::regclass as tableid,
-                                                    t.tabledepth as tabledepth,
-                                                    r.parchildrelid::regclass partid,
-                                                    p.parlevel + 1 as partdepth,
-                                                    r.parruleord as partordinal,
-                                                    case
-                                                        when t.tabledepth = p.parlevel + 1 then 'l'::char
-                                                        else 'i'::char
-                                                    end as partstatus
-                                                from
-                                                    pg_partition p,
-                                                    pg_partition_rule r,
-                                                     (
-                                                        select
-                                                            parrelid::regclass,
-                                                            max(parlevel)+1
-                                                        from
-                                                            pg_partition
-                                                        group by parrelid
-                                                    ) as t(tableid, tabledepth)
-                                                where
-                                                    p.oid = r.paroid
-                                                    and not p.paristemplate
-                                                    and p.parrelid = t.tableid
-                                            ) as x(tableid, tabledepth, partid, partdepth, partordinal, partstatus)
-                                        where
-                                            x.partid = c.conrelid
-                                    ) as p(tableid, partid, conid, conname, contype, condef)
-                                        on (
-                                            u.tableid = p.tableid and
-                                            u.contype = p.contype and
-                                            u.condef = p.condef
-                                            )
-                            ) as part_user_constraint(tableid, tableconname, contype, condef, partid, partconid, partconname)
-                        )
-            ) as part_sys_constraint(tableid, partid, conid, conname, contype, condef)
-        group by tableid, partid""",
-
-    # Query contains_directly has a row per step along a path from
-    # root to leaf.  The columns are
-    # tableid - pg_class.oid of the partitioned table.
-    # parentid - pg_class.oid of the "from" table.
-    # childid - pg_class.oid of the "to" table, the target of the step.
-    # npcon - constraint count for this step: 0 if "to" is default, else 1.
-    #
-
-    'contains_directly':
-        """(
-            select
-                r.parrelid::regclass as tableid,
-                coalesce(p.parchildrelid, r.parrelid)::regclass as parentid,
-                c.parchildrelid::regclass as childid,
-                case when c.parisdefault then 0 else 1 end as npcon
-            from
-                pg_partition r,
-                pg_partition_rule c
-                    left join pg_partition_rule p on (c.parparentrule = p.oid)
-            where
-                not r.paristemplate and
-                not c.parchildrelid = 0 and
-                c.paroid = r.oid
-            ) {alias}""",
-
-    # The base case is the length 1 path from root or branch to branch
-    # or leaf. This is always the first union term.
-
-    'base_query':
-        """select
-            start.tableid,
-            start.parentid,
-            start.childid,
-            start.npcon
-        from
-            {contains_directly_start}""",
-
-    # A union term is an N-way self join of contains_directly and
-    # identifies paths of length N.  Note that the length of a path
-    # to a part at depth N+1 is N.
-
-    'union_term':
-        """select
-            start.tableid,
-            start.parentid,
-            stop.childid,
-            start.npcon -- stop.npcon
-        from
-            {contains_directly_start},
-            {contains_directly_stop}{intermediate_path_from}
-        where
-            start.childid {intermediate_path_where}
-            = stop.parentid""",
-
-    #
-
-    'union_query':
-        """select tableid, childid as partid, sum(npcon) as expected
-        from (
-            {open_union}
-            ) r
-        group by tableid, childid"""
-
-}
-
-
-#############
-
-# For partitionRegularityChecks.
-def make_union_term(depth):
-    assert depth > 0
-
-    union_term = partitionRegularityChecks['union_term']
-    contains_directly = partitionRegularityChecks['contains_directly']
-
-    path_from = []
-    path_where = []
-
-    if depth > 1:  # for later .join()
-        path_from.append('')
-        path_where.append('')
-
-    for i in range(1, depth):
-        path_alias = "path%d" % i
-        path_from.append(contains_directly.format(alias=path_alias))
-        path_where.append("    = %s.parentid and %s.childid"
-                          % (path_alias, path_alias))
-
-    return union_term.format(
-        contains_directly_start=contains_directly.format(alias='start'),
-        contains_directly_stop=contains_directly.format(alias='stop'),
-        intermediate_path_from=",\n    ".join(path_from),
-        intermediate_path_where="\n".join(path_where)
-    )
-
-
-# For partitionRegularityChecks.
-def expected_part_con_query(maxdepth):
-    cds = partitionRegularityChecks['contains_directly'].format(alias='start')
-    base_query = partitionRegularityChecks['base_query']
-    terms = [base_query.format(contains_directly_start=cds)]
-
-    for depth in range(1, maxdepth + 1):
-        terms.append(make_union_term(depth))
-
-    return partitionRegularityChecks['union_query'].format(
-        open_union='\n\nunion all\n\n'.join(terms))
-
-
-# For partitionRegularityChecks.
-def make_irregular_sys_con_query(maxdepth):
-    expected = expected_part_con_query(maxdepth)
-    actual = partitionRegularityChecks['actual_part_con_query']
-    qry = partitionRegularityChecks['irreg_sys_constraint']
-    return qry.format(expected=expected, actual=actual)
-
-
-#############
-def checkPartitionRegularity():
-    #
-    # Rio partitioning changes introduce new regularity requirements for constraints
-    # on partitioned tables.  These are the checks.
-    #
-    okayToRun = GV.missingEntryStatus and GV.inconsistentEntryStatus and GV.foreignKeyStatus
-    irregular = False
-
-    logger.info('-----------------------------------')
-    logger.info('Checking pg_partition/pg_constraint regularity ...')
-
-    if not okayToRun:
-        logger.warn('unable to run pg_partition/pg_constraint regularity checks')
-        logger.warn('prerequisite tests failed or not run')
-        return
-
-    db = connect()
-
-    checkname = 'user-defined constraint regularity on partitioned tables'
-
-    qry = partitionRegularityChecks['irreg_user_constraint']
-    err = []
-
-    try:
-        curs = db.query(qry)
-
-        for row in curs.dictresult():
-            err.append((row['tableconname'], row['tableid'], row['numactual'], row['numexpected']))
-
-        if not err:
-            logger.info('[OK]  %s' % checkname)
-        else:
-            irregular = True
-            GV.checkStatus = False
-            setError(ERROR_NOREPAIR)
-            logger.info('[FAIL]  %s' % checkname)
-            logger.error(' %s test has %d issue(s)' % (checkname, len(err)) )
-            efmt = '  Constraint "%s" of partitioned table "%s" occurs %d times, %d expected.'
-            for e in err:
-                logger.error(efmt % e)
-
-    except Exception, e:
-        setError(ERROR_NOREPAIR)
-        myprint('[ERROR] executing test: %s' % checkname)
-        myprint('  Execution error: ' + str(e))
-
-    checkname = 'system-defined partition constraint regularity on partitioned tables'
-
-    # Determine maximum number of partitioning levels in this database
-    try:
-        qry = """select max(parlevel)+1 as maxdepth from pg_partition;"""
-        curs = db.query(qry)
-        assert len(curs.dictresult()) == 1  # scalar aggregation!
-        maxdepth = curs.dictresult()[0]['maxdepth']
-
-        err = []
-        if isinstance(maxdepth, int):
-            qry = make_irregular_sys_con_query(maxdepth)
-            curs = db.query(qry)
-            for row in curs.dictresult():
-                err.append((row['partid'], row['tableid'], row['actual'], row['expected']))
-
-        if not err:
-            logger.info('[OK]  %s' % checkname)
-        else:
-            irregular = True
-            GV.checkStatus = False
-            setError(ERROR_NOREPAIR)
-            logger.info('[FAIL]  %s' % checkname)
-            logger.error(' %s test has %d issue(s)' % ( checkname, len(err)) )
-            efmt = '  Part table "%s" of partitioned table "%s" has %d system-defined constraints, %d expected.'
-            for e in err:
-                logger.error(efmt % e)
-
-    except Exception, e:
-        setError(ERROR_NOREPAIR)
-        myprint('[ERROR] executing test: %s' % checkname)
-        myprint('  Execution error: ' + str(e))
-
-    checkname = 'unenforced unique constraints on partitioned tables'
-
-    if irregular:
-        logger.warn('skipping check %s due to constraint irregularities' % checkname)
-    elif GV.Remove:
-        logger.warn('skipping check %s due to required removals' % checkname)
-    else:
-        qry = partitionRegularityChecks['unenforced_constraint_info']
-        err = []
-        try:
-            curs = db.query(qry)
-            for row in curs.dictresult():
-                row['con_type_phrase'] = 'primary key' if row['contype'] == 'p' else 'unique'
-                row['quoted_conname'] = quote_value(row['conname'])
-                row['quoted_contype'] = quote_value(row['contype'])
-                err.append(row)
-
-            if not err:
-                logger.info('[OK]  %s' % checkname)
-            else:
-                GV.checkStatus = False
-                setError(ERROR_REMOVE)
-                logger.info('[FAIL]  %s' % checkname)
-                logger.error(' %s test has %d issue(s)' % ( checkname, len(err) ) )
-                efmt = '  partitioned table "{tableid}" has unenforced {con_type_phrase} constraint: "{partid}"'
-                repair_fmt = partitionRegularityChecks['unenforced_constraint_repairs']
-                n = 0
-                for e in err:
-                    n = n + 1
-                    if n <= 100:
-                        logger.error(efmt.format(**e))
-                    repair_sequence = repair_fmt.format(**e)
-                    for dbid in GV.cfg:
-                        addDemoteConstraint(dbid, repair_sequence)
-                    if len(err) > 100:
-                        logger.error("...")
-
-        except Exception, e:
-            setError(ERROR_NOREPAIR)
-            myprint('[ERROR] executing test: %s' % checkname)
-            myprint('  Execution error: ' + str(e))
-
-    checkname = 'inconsistently named constraint in partitioned table'
-
-    if irregular:
-        logger.warn('skipping check %s due to constraint irregularities' % checkname)
-    elif GV.Remove:
-        logger.warn('skipping check %s due to required removals' % checkname)
-    elif GV.DemoteConstraint:
-        logger.warn('skipping check %s due to unenforced constraint removals' % checkname)
-    else:
-        qry = partitionRegularityChecks['fix_ill_named_constraint']
-        err = []
-        try:
-            curs = db.query(qry)
-            for row in curs.dictresult():
-                err.append(row)
-
-            if not err:
-                logger.info('[OK]  %s' % checkname)
-            else:
-                GV.checkStatus = False
-                setError(ERROR_REMOVE)
-                logger.info('[FAIL]  %s' % checkname)
-                logger.error(' %s test has %d issue(s)' % ( checkname, len(err) ) )
-                efmt = '  part table "%s" has constraint named "%s"; should be "%s"'
-                n = 0
-                for e in err:
-                    n = n + 1
-                    if n <= 100:
-                        # part name, wrong constraint name, right constraint name
-                        logger.error(efmt % (e['partid'], e['partconname'], e['tableconname']))
-                    for dbid in GV.cfg:
-                        buildAdjustConname(
-                            dbid, e['tableid'], int(e['partrelid']),
-                            quote_value(e['partconname']),
-                            quote_value(e['tableconname']))
-                if len(err) > 100:
-                    logger.error("...")
-
-        except Exception, e:
-            setError(ERROR_NOREPAIR)
-            myprint('[ERROR] executing test: %s' % checkname)
-            myprint('  Execution error: ' + str(e))
-
-    db.close()
-
-
-#############
 def checkPGClass():
     logger.info('-----------------------------------')
     logger.info('Checking pg_class ...')
@@ -1857,7 +641,7 @@ def checkPGClass():
     SELECT relname, relkind, tc.oid as oid
     FROM   pg_class tc left outer join
            pg_attribute ta on (tc.oid = ta.attrelid)
-    WHERE  ta.attrelid is NULL
+    WHERE  ta.attrelid is NULL and tc.relnatts != 0
     '''
     err = connect2run(qry, ('relname', 'relkind', 'oid'))
     if not err:
@@ -1917,7 +701,7 @@ def removeFastSequence(db):
     '''
     MPP-14758: gp_fastsequence does not get cleanup after a failed transaction (AO/CO)
     Note: this is slightly different from the normal foreign key check
-          because it streches the cross reference across segments.
+          because it stretches the cross reference across segments.
           This makes it safe in the event of cross consistency issues with pg_class,
           but may not repair some issues when there are cross consistency problems
     '''
@@ -1941,13 +725,13 @@ def removeFastSequence(db):
               """
         curs = db.query(qry)
         for row in curs.dictresult():
-            seg = row['dbid']  # dbid of targetted segment
+            seg = row['dbid']  # dbid of targeted segment
             name = 'gp_fastsequence tuple'  # for comment purposes
             table = 'gp_fastsequence'  # table name
             cols = {'objid': row['objid']}  # column name and value
             objname = 'gp_fastsequence'  # for comment purposes
             buildRemove(seg, name, table, cols, objname)
-    except Exception, e:
+    except Exception as e:
         logger.error('removeFastSequence: ' + str(e))
 
 
@@ -1956,10 +740,6 @@ def removeFastSequence(db):
 def removeIndexConstraint(nspname, relname, constraint):
     GV.Constraints.append('ALTER TABLE "%s"."%s" DROP CONSTRAINT "%s" CASCADE;' % \
                           (nspname, relname, constraint))
-
-
-def distributeRandomly(rel):
-    GV.Policies.append('ALTER TABLE %s SET DISTRIBUTED RANDOMLY;' % rel)
 
 
 def buildRemove(seg, name, table, cols, objname):
@@ -1978,7 +758,7 @@ def buildRemove(seg, name, table, cols, objname):
 
 
 def addRemove(seg, line):
-    if not GV.Remove.has_key(seg):
+    if not seg in GV.Remove:
         GV.Remove[seg] = []
     GV.Remove[seg].append(line)
 
@@ -1996,13 +776,13 @@ def buildAdjustConname(seg, relname, relid, oldconname, newconname):
 
 
 def addAdjustConname(seg, stmt):
-    if not GV.AdjustConname.has_key(seg):
+    if not seg in GV.AdjustConname:
         GV.AdjustConname[seg] = []
     GV.AdjustConname[seg].append(stmt)
 
 
 def addDemoteConstraint(seg, repair_sequence):
-    if not GV.DemoteConstraint.has_key(seg):
+    if not seg in GV.DemoteConstraint:
         GV.DemoteConstraint[seg] = []
     GV.DemoteConstraint[seg].append(repair_sequence)
 
@@ -2021,7 +801,7 @@ def drop_leaked_schemas(leaked_schema_dropper, dbname):
             logger.info('[FAIL] temporary schemas')
             myprint("Found and dropped %d unbound temporary schemas" % len(dropped_schemas))
             logger.error('Dropped leaked schemas \'%s\' in the database \'%s\'' % (dropped_schemas, dbname))
-    except Exception, e:
+    except Exception as e:
         setError(ERROR_NOREPAIR)
         myprint('  Execution error: ' + str(e))
     finally:
@@ -2032,10 +812,15 @@ def checkDepend():
     logger.info('-----------------------------------')
     logger.info('Checking Object Dependencies')
 
-    db = connect2(GV.cfg[1], utilityMode=False)
+    db = connect2(GV.cfg[GV.coordinator_dbid], utilityMode=False)
 
     # Catalogs that link up to pg_depend/pg_shdepend
-    qry = "select relname from pg_class where relnamespace=%d and relhasoids" % PG_CATALOG_OID
+    qry = """
+             select relname from pg_class c
+              where relkind='r'
+                and relnamespace=%d
+                and exists (select 1 from pg_attribute a where attname = 'oid' and a.attrelid = c.oid)
+          """ % PG_CATALOG_OID
     curs = db.query(qry)
     catalogs = []
     for row in curs.getresult():
@@ -2095,7 +880,7 @@ def checkDependJoinCatalog(catalogs):
                 issue = CatDependencyIssue(row['catalog'], row['objid'], config['content'])
                 gpObj.addDependencyIssue(issue)
 
-    except Exception, e:
+    except Exception as e:
         setError(ERROR_NOREPAIR)
         myprint("[ERROR] executing test: extra object dependencies")
         myprint("  Execution error: " + str(e))
@@ -2116,7 +901,7 @@ def checkCatalogJoinDepend(catalogs):
             # linger after the language is dropped. Extensions (which
             # do drop their proclang handler functions) will be
             # replacing language so this exclusion should be fine.
-            if cat == 'pg_proc':
+            if str(cat) == 'pg_proc':
                 qry += """
                 AND pronamespace != {oid}
                 """.format(oid=PG_CATALOG_OID)
@@ -2155,7 +940,7 @@ def checkCatalogJoinDepend(catalogs):
                 issue = CatDependencyIssue(row['catalog'], row['objid'], config['content'])
                 gpObj.addDependencyIssue(issue)
 
-    except Exception, e:
+    except Exception as e:
         setError(ERROR_NOREPAIR)
         myprint("[ERROR] executing test: missing object dependencies")
         myprint("  Execution error: " + str(e))
@@ -2181,7 +966,7 @@ def checkOwners():
 
     # Check owners in pg_class
     #
-    #  - Report each table that has an inconsistency with the master database,
+    #  - Report each table that has an inconsistency with the coordinator database,
     #    this can be on the table directly, or on one of the table subobjects
     #    (pg_toast, pg_aoseg, etc)
     #
@@ -2194,10 +979,10 @@ def checkOwners():
     #
     #  - Between 3.3 and 4.0 the ao segment columns migrated from pg_class
     #    to pg_appendonly.
-    db = connect2(GV.cfg[1], utilityMode=False)
+    db = connect2(GV.cfg[GV.coordinator_dbid], utilityMode=False)
     qry = '''
     select distinct n.nspname, coalesce(o.relname, c.relname) as relname,
-                    a.rolname, m.rolname as master_rolname
+                    a.rolname, m.rolname as coordinator_rolname
     from gp_dist_random('pg_class') r
       join pg_class c on (c.oid = r.oid)
       left join pg_appendonly ao on (c.oid = ao.segrelid or
@@ -2228,29 +1013,29 @@ def checkOwners():
             for row in rows[0:100]:
                 logger.error('  %s.%s relowner %s != %s'
                              % (row['nspname'], row['relname'], row['rolname'],
-                                row['master_rolname']))
+                                row['coordinator_rolname']))
             if len(rows) > 100:
                 logger.error("...")
             for row in rows:
                 fixupowners(row['nspname'], row['relname'], row['rolname'],
-                            row['master_rolname'])
-    except Exception, e:
+                            row['coordinator_rolname'])
+    except Exception as e:
         setError(ERROR_NOREPAIR)
         myprint("[ERROR] executing: check table ownership")
         myprint("  Execution error: " + str(e))
         myprint(qry)
 
     # TODO: add a check that subobject owners agree with the main object owner.
-    # (The above checks only compare master vs segment)
+    # (The above checks only compare coordinator vs segment)
 
 
     # Check owners in pg_type
     #  - Ignore implementation types of pg_class entries - they should be
     #    in the check above since ALTER TABLE is required to fix them, not
     #    ALTER TYPE.
-    db = connect2(GV.cfg[1], utilityMode=False)
+    db = connect2(GV.cfg[GV.coordinator_dbid], utilityMode=False)
     qry = '''
-    select distinct n.nspname, t.typname, a.rolname, m.rolname as master_rolname
+    select distinct n.nspname, t.typname, a.rolname, m.rolname as coordinator_rolname
     from gp_dist_random('pg_type') r
       join pg_type t on (t.oid = r.oid)
       join pg_namespace n on (n.oid = t.typnamespace)
@@ -2276,11 +1061,11 @@ def checkOwners():
             for row in rows[0:100]:
                 logger.error('  %s.%s typeowner %s != %s'
                              % (row['nspname'], row['typname'], row['rolname'],
-                                row['master_rolname']))
+                                row['coordinator_rolname']))
             if len(rows) > 100:
                 logger.error("...")
 
-    except Exception, e:
+    except Exception as e:
         setError(ERROR_NOREPAIR)
         myprint("[ERROR] executing test: check type ownership")
         myprint("  Execution error: " + str(e))
@@ -2303,7 +1088,7 @@ def checkOwners():
 
 
 def closeDbs():
-    for key, conns in GV.db.iteritems():
+    for key, conns in GV.db.items():
         db = conns[0]
         db.close()
     GV.db = {}  # remove everything
@@ -2311,10 +1096,10 @@ def closeDbs():
 
 # -------------------------------------------------------------------------------
 def getCatObj(namestr):
-    db = connect2(GV.cfg[1], utilityMode=False)
+    db = connect2(GV.cfg[GV.coordinator_dbid], utilityMode=False)
     try:
         cat = GV.catalog.getCatalogTable(namestr)
-    except Exception, e:
+    except Exception as e:
         myprint("No such catalog table: %s\n" % str(namestr))
         raise
     return cat
@@ -2328,7 +1113,7 @@ def checkACL():
     # looks up information in the catalog:
     tables = GV.catalog.getCatalogTables()
 
-    for cat in sorted(tables):
+    for cat in tables:
         checkTableACL(cat)
 # -------------------------------------------------------------------------------
 
@@ -2336,18 +1121,18 @@ def checkACL():
 def checkTableACL(cat):
     catname = cat.getTableName()
     pkey = cat.getPrimaryKey()
-    master = cat.isMasterOnly()
+    coordinator = cat.isCoordinatorOnly()
     isShared = cat.isShared()
     acl = cat.getTableAcl()
 
-    if GV.aclStatus == None:
+    if GV.aclStatus is None:
         GV.aclStatus = True
 
     # Skip:
-    #   - master only tables
+    #   - coordinator only tables
     #   - tables without a primary key
     #   - tables without acls
-    if master or pkey == [] or acl == None:
+    if coordinator or pkey == [] or acl is None:
         return
 
     # skip shared/non-shared tables
@@ -2367,7 +1152,7 @@ def checkTableACL(cat):
 
     qry = """
     SELECT s.gp_segment_id as segid, {mPkey},
-           m.{acl} as master_acl, s.{acl} as segment_acl
+           m.{acl} as coordinator_acl, s.{acl} as segment_acl
     FROM {catalog} m
     JOIN gp_dist_random('{catalog}') s using ({primary_key})
     WHERE  not (m.{acl} @> s.{acl} and s.{acl} @> m.{acl}) or
@@ -2381,7 +1166,7 @@ def checkTableACL(cat):
 
     # Execute the query
     try:
-        db = connect2(GV.cfg[1], utilityMode=False)
+        db = connect2(GV.cfg[GV.coordinator_dbid], utilityMode=False)
         curs = db.query(qry)
         nrows = curs.ntuples()
 
@@ -2395,12 +1180,12 @@ def checkTableACL(cat):
             logger.error('  %s acl check has %d issue(s)' % (catname, nrows))
 
             fields = curs.listfields()
-            log_literal(logger, logging.ERROR, "    " + " | ".join(fields))
+            gplog.log_literal(logger, logging.ERROR, "    " + " | ".join(fields))
             for row in curs.getresult():
-                log_literal(logger, logging.ERROR, "    " + " | ".join(map(str, row)))
+                gplog.log_literal(logger, logging.ERROR, "    " + " | ".join(map(str, row)))
             processACLResult(catname, fields, curs.getresult())
 
-    except Exception, e:
+    except Exception as e:
         setError(ERROR_NOREPAIR)
         GV.aclStatus = False
         myprint('[ERROR] executing: Cross consistency check for ' + catname)
@@ -2413,21 +1198,21 @@ def checkForeignKey(cat_tables=None):
     logger.info('-----------------------------------')
     logger.info('Performing foreign key tests')
 
-    if GV.foreignKeyStatus == None:
+    if GV.foreignKeyStatus is None:
         GV.foreignKeyStatus = True
 
     # looks up information in the catalog:
     if not cat_tables:
         cat_tables = GV.catalog.getCatalogTables()
 
-    db_connection = connect2(GV.cfg[1], utilityMode=False)
+    db_connection = connect2(GV.cfg[GV.coordinator_dbid], utilityMode=False)
     try:
         foreign_key_check = ForeignKeyCheck(db_connection, logger, GV.opt['-S'], autoCast)
         foreign_key_issues = foreign_key_check.runCheck(cat_tables)
         if foreign_key_issues:
             GV.checkStatus = False
 
-        for catname, tuples in foreign_key_issues.iteritems():
+        for catname, tuples in foreign_key_issues.items():
                 for pkcatname, fields, results in tuples:
                     processForeignKeyResult(catname, pkcatname, fields, results)
                     if catname == 'gp_fastsequence' and pkcatname == 'pg_class':
@@ -2435,7 +1220,7 @@ def checkForeignKey(cat_tables=None):
                         removeFastSequence(db_connection)
                     else:
                         setError(ERROR_NOREPAIR)
-    except Exception, ex:
+    except Exception as ex:
         setError(ERROR_NOREPAIR)
         GV.foreignKeyStatus = False
         myprint('  Execution error: ' + str(ex))
@@ -2446,7 +1231,7 @@ def checkMissingEntry():
     logger.info('-----------------------------------')
     logger.info('Performing cross consistency tests: check for missing or extraneous issues')
 
-    if GV.missingEntryStatus == None:
+    if GV.missingEntryStatus is None:
         GV.missingEntryStatus = True
 
     catalog_issues = _checkAllTablesForMissingEntries()
@@ -2463,7 +1248,7 @@ def checkMissingEntry():
 def _checkAllTablesForMissingEntries():
     catalog_issues = {}
     tables = GV.catalog.getCatalogTables()
-    for catalog_table_obj in sorted(tables):
+    for catalog_table_obj in tables:
         issues = checkTableMissingEntry(catalog_table_obj)
         if not issues:
             continue
@@ -2478,12 +1263,12 @@ def _checkAllTablesForMissingEntries():
 def checkTableMissingEntry(cat):
     catname = cat.getTableName()
     pkey = cat.getPrimaryKey()
-    master = cat.isMasterOnly()
+    coordinator = cat.isCoordinatorOnly()
     isShared = cat.isShared()
     coltypes = cat.getTableColtypes()
 
-    # Skip master only tables
-    if master:
+    # Skip coordinator only tables
+    if coordinator:
         return
 
     # skip shared/non-shared tables
@@ -2495,7 +1280,7 @@ def checkTableMissingEntry(cat):
 
     # Skip catalogs without primary key
     if len(pkey) == 0:
-        logger.warn("[WARN] Skipped missing/extra entry check for %s" % catname)
+        logger.warning("[WARN] Skipped missing/extra entry check for %s" % catname)
         return
 
     castedPkey = cat.getPrimaryKey()
@@ -2508,9 +1293,15 @@ def checkTableMissingEntry(cat):
 
     # Execute the query
     try:
-        db = connect2(GV.cfg[1], utilityMode=False)
+        db = connect2(GV.cfg[GV.coordinator_dbid], utilityMode=False)
         curs = db.query(qry)
         nrows = curs.ntuples()
+        results = curs.getresult()
+        fields = curs.listfields()
+
+        if nrows != 0:
+            results = filterSpuriousFailures(catname, fields, results)
+            nrows = len(results)
 
         if nrows == 0:
             logger.info('[OK] Checking for missing or extraneous entries for ' + catname)
@@ -2527,24 +1318,106 @@ def checkTableMissingEntry(cat):
             logger.info(('[%s] Checking for missing or extraneous entries for ' + catname) %
                         ('WARNING' if log_level == logging.WARNING else 'FAIL'))
             logger_with_level('  %s has %d issue(s)' % (catname, nrows))
-            fields = curs.listfields()
-            log_literal(logger, log_level, "    " + " | ".join(fields))
-            results = curs.getresult()
+            gplog.log_literal(logger, log_level, "    " + " | ".join(fields))
             for row in results:
-                log_literal(logger, log_level, "    " + " | ".join(map(str, row)))
+                gplog.log_literal(logger, log_level, "    " + " | ".join(map(str, row)))
             processMissingDuplicateEntryResult(catname, fields, results, "missing")
             if catname == 'pg_type':
                 generateVerifyFile(catname, fields, results, 'missing_extraneous')
 
             return results
 
-    except Exception, e:
+    except Exception as e:
         setError(ERROR_NOREPAIR)
         GV.missingEntryStatus = False
         myprint('[ERROR] executing: Missing or extraneous entries check for ' + catname)
         myprint('  Execution error: ' + str(e))
         myprint(qry)
 
+
+class checkAOSegVpinfoThread(execThread):
+    def __init__(self, cfg, db):
+        execThread.__init__(self, cfg, db, None)
+
+    def run(self):
+        aoseg_query = """
+           SELECT a.relname, a.relid, a.segrelid, cl.relname
+           FROM (SELECT p.relid, p.segrelid, c.relname FROM pg_appendonly p LEFT JOIN pg_class c ON p.relid = c.oid WHERE p.columnstore = true) a
+           LEFT JOIN pg_class cl ON a.segrelid = cl.oid;
+        """
+
+        try:
+            # Read the list of aoseg tables from the database
+            curs = self.db.query(aoseg_query)
+
+            for relname, relid, segrelid, segrelname in curs.getresult():
+                qry = "SELECT count(*) FROM pg_attribute WHERE attrelid=%d AND attnum > 0;" % (relid)
+                attr_count = self.db.query(qry).getresult()[0][0]
+
+                qry = "SELECT distinct(length(vpinfo)) FROM pg_aoseg.%s where state = 1;" % (segrelname)
+                vpinfo_curs = self.db.query(qry)
+                nrows = vpinfo_curs.ntuples()
+                if nrows == 0:
+                    continue
+                elif nrows > 1:
+                    GV.checkStatus = False
+                    setError(ERROR_NOREPAIR)
+                    logger.info('[FAIL] inconsistent vpinfo')
+                    logger.error("found {nrows} vpinfo(s) with different length in 'pg_aoseg.{segrelname}' of table '{relname}' on segment {content}"
+                                 .format(nrows = nrows,
+                                         segrelname = segrelname,
+                                         relname = relname,
+                                         content = self.cfg['content']))
+                    logger.error(qry)
+                    continue
+
+                vpinfo_length = vpinfo_curs.getresult()[0][0]
+
+                # vpinfo is bytea type, the length of the first 3 fields is 12 bytes, and the size of AOCSVPInfoEntry is 16
+                # typedef struct AOCSVPInfo
+                # {
+                # 	int32		_len;
+                # 	int32		version;
+                # 	int32		nEntry;
+                #
+                # 	AOCSVPInfoEntry entry[1];
+                # } AOCSVPInfo;
+                vpinfo_attr_count = (vpinfo_length - 12) / 16
+                if vpinfo_attr_count != attr_count:
+                    GV.checkStatus = False
+                    setError(ERROR_NOREPAIR)
+                    logger.info('[FAIL] inconsistent vpinfo')
+                    logger.error("vpinfo in 'pg_aoseg.{segrelname}' of table '{relname}' contains {vpinfo_attr_count} attributes, while pg_attribute has {attr_count} attributes on segment {content}"
+                                 .format(segrelname = segrelname,
+                                         relname = relname,
+                                         vpinfo_attr_count = vpinfo_attr_count,
+                                         attr_count = attr_count,
+                                         content = self.cfg['content']))
+                    logger.error(qry)
+        except Exception as e:
+            GV.checkStatus = False
+            self.error = e
+
+def checkAOSegVpinfo():
+    threads = []
+    i = 1
+    # parallelise check
+    for dbid in GV.cfg:
+        cfg = GV.cfg[dbid]
+        db_connection = connect2(cfg)
+        thread = checkAOSegVpinfoThread(cfg, db_connection)
+        thread.start()
+        logger.debug('launching check thread %s for dbid %i' %
+                     (thread.getName(), dbid))
+        threads.append(thread)
+
+        if (i % GV.opt['-B']) == 0:
+            processThread(threads)
+            threads = []
+
+        i += 1
+
+    processThread(threads)
 
 # -------------------------------------------------------------------------------
 
@@ -2563,19 +1436,19 @@ def missingEntryQuery(max_content, catname, pkey, castedPkey):
     #
     # Full outer join
     #
-    # (Fetch all entries in master)
+    # (Fetch all entries in coordinator)
     #
     #
     # The WHERE clause at the bottom filters out all the boring rows, leaving
-    # only rows that are missing from one of the segments, or from the master.
+    # only rows that are missing from one of the segments, or from the coordinator.
 
     catalog_exclude = MISSING_ENTRY_EXCLUDE.get(catname, "")
 
     qry = """
           SELECT {primary_key},
-                 case when master is null then segids
-                      when segids is null then array[master.segid]
-                      else master.segid || segids end as segids
+                 case when coordinator is null then segids
+                      when segids is null then array[coordinator.segid]
+                      else coordinator.segid || segids end as segids
           FROM
           (
             SELECT {primary_key}, array_agg(gp_segment_id order by gp_segment_id) as segids
@@ -2584,16 +1457,14 @@ def missingEntryQuery(max_content, catname, pkey, castedPkey):
           FULL OUTER JOIN
           (
             SELECT gp_segment_id as segid, {primary_key} FROM {catalog} {catalog_exclude}
-          ) as master
+          ) as coordinator
           USING ({primary_key})
-          WHERE master.segid is null
+          WHERE coordinator.segid is null
              OR segids is null
              OR NOT segids @> (select array_agg(content::int4) from gp_segment_configuration WHERE content >= 0)
-          """.format(oidcasted_pk=','.join(castedPkey),
-                     primary_key=','.join(pkey),
+          """.format(primary_key=','.join(pkey),
                      catalog=catname,
-                     catalog_exclude=catalog_exclude,
-                     max_content=max_content)
+                     catalog_exclude=catalog_exclude)
 
     return qry
 
@@ -2604,11 +1475,14 @@ def transformTextArrayCols(catname, columns, colnames, coltypes):
     #
     # We should fix the text[] hash expression issue, but
     # for this script, this seems like a reasonable workaround.
+    #
+    # GPDB_12_MERGE_FIXME: was this fixed by the hashing changes
+    # in GPDB 6?
 
     transformed = []
     for i in range(len(columns)):
         if coltypes[colnames[i]] == '_text':
-            transformed.append("array_to_string(" + columns[i] + ", ',')")
+            transformed.append("array_to_string(" + columns[i] + ", ',') AS " + columns[i])
         else:
             transformed.append(columns[i])
 
@@ -2620,13 +1494,13 @@ def checkInconsistentEntry():
     logger.info('-----------------------------------')
     logger.info('Performing cross consistency test: check for inconsistent entries')
 
-    if GV.inconsistentEntryStatus == None:
+    if GV.inconsistentEntryStatus is None:
         GV.inconsistentEntryStatus = True
 
     # looks up information in the catalog:
     tables = GV.catalog.getCatalogTables()
 
-    for cat in sorted(tables):
+    for cat in tables:
         checkTableInconsistentEntry(cat)
 
 
@@ -2634,13 +1508,13 @@ def checkInconsistentEntry():
 def checkTableInconsistentEntry(cat):
     catname = cat.getTableName()
     pkey = cat.getPrimaryKey()
-    master = cat.isMasterOnly()
+    coordinator = cat.isCoordinatorOnly()
     isShared = cat.isShared()
     columns = cat.getTableColumns(with_acl=False)
     coltypes = cat.getTableColtypes()
 
-    # Skip master only tables
-    if master:
+    # Skip coordinator only tables
+    if coordinator:
         return
 
     # skip shared/non-shared tables
@@ -2652,7 +1526,7 @@ def checkTableInconsistentEntry(cat):
 
     # Skip catalogs without primary key
     if pkey == []:
-        logger.warn("[WARN] Skipped cross consistency check for %s" %
+        logger.warning("[WARN] Skipped cross consistency check for %s" %
                     catname)
         return
 
@@ -2662,7 +1536,19 @@ def checkTableInconsistentEntry(cat):
 
     # transform text[] cols for sure. See comments on transformTextArrayCols
     castcols = transformTextArrayCols(catname, castcols, columns, cat.getTableColtypes())
-    castcols = [castcols[i] + ' AS ' + columns[i] for i in range(len(columns))]
+
+    # pg_attribute.attmissingval has pseudo-type 'any', which doesn't allow
+    # much operations on it. Cast it to text, by replacing it with
+    # "attmissingval::text" in the columns list.
+    columns = list(map(lambda b: b.replace("attmissingval","attmissingval::text"), columns))
+    castcols = list(map(lambda b: b.replace("attmissingval","attmissingval::text"), castcols))
+
+    # pg_dependencies and pg_mcv_list disallow inputs, convert to text for the query
+    columns = list(map(lambda b: b.replace("stxddependencies","stxddependencies::text"), columns))
+    castcols = list(map(lambda b: b.replace("stxddependencies","stxddependencies::text"), castcols))
+    columns = list(map(lambda b: b.replace("stxdmcv","stxdmcv::text"), columns))
+    castcols = list(map(lambda b: b.replace("stxdmcv","stxdmcv::text"), castcols))
+
     if cat.tableHasConsistentOids():
         qry = inconsistentEntryQuery(GV.max_content, catname, ['oid'], columns, castcols)
     else:
@@ -2670,7 +1556,7 @@ def checkTableInconsistentEntry(cat):
 
     # Execute the query
     try:
-        db = connect2(GV.cfg[1], utilityMode=False)
+        db = connect2(GV.cfg[GV.coordinator_dbid], utilityMode=False)
         curs = db.query(qry)
         nrows = curs.ntuples()
 
@@ -2684,16 +1570,16 @@ def checkTableInconsistentEntry(cat):
             logger.error('  %s has %d issue(s)' % (catname, nrows))
 
             fields = curs.listfields()
-            log_literal(logger, logging.ERROR, "    " + " | ".join(fields))
+            gplog.log_literal(logger, logging.ERROR, "    " + " | ".join(fields))
             for row in curs.getresult():
-                log_literal(logger, logging.ERROR, "    " + " | ".join(map(str, row)))
+                gplog.log_literal(logger, logging.ERROR, "    " + " | ".join(map(str, row)))
             results = curs.getresult()
             processInconsistentEntryResult(catname, pkey, fields, results)
             if catname == 'pg_type':
                 generateVerifyFile(catname, fields, results, 'duplicate')
 
 
-    except Exception, e:
+    except Exception as e:
         setError(ERROR_NOREPAIR)
         GV.inconsistentEntryStatus = False
         myprint('[ERROR] executing: Inconsistent entries check for ' + catname)
@@ -2719,17 +1605,13 @@ def inconsistentEntryQuery(max_content, catname, pkey, columns, castcols):
     # --   the majority individually.
     # --
     # --   Majority gets reported with gp_segment_id == null
-    # --
-    # -- SET GUC due to MPP-14531:
 
     qry = """
               SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;
 
-              SET gp_enable_mk_sort=off;
-
-              -- distribute catalog table from master, so that we can avoid to gather
-              CREATE TEMPORARY TABLE _tmp_master ON COMMIT DROP AS
-                  SELECT gp_segment_id segid, {columns} FROM {catalog};
+              -- distribute catalog table from coordinator, so that we can avoid to gather
+              CREATE TEMPORARY TABLE _tmp_coordinator ON COMMIT DROP AS
+                  SELECT gp_segment_id AS segid, {columns} FROM {catalog} DISTRIBUTED BY (segid);
               SELECT {columns}, array_agg(gp_segment_id order by gp_segment_id) as segids
               FROM
               (
@@ -2741,7 +1623,7 @@ def inconsistentEntryQuery(max_content, catname, pkey, columns, castcols):
                           count(*) over (partition by {pkey}) as pcount,
                           gp_segment_id, {columns}
                    from (
-                     select segid gp_segment_id, {castcols} from _tmp_master
+                     select segid gp_segment_id, {castcols} from _tmp_coordinator
                      union all
                      select gp_segment_id, {castcols}
                      from   gp_dist_random('{catalog}')
@@ -2769,9 +1651,9 @@ def checkDuplicateEntry():
     # looks up information in the catalog:
     tables = GV.catalog.getCatalogTables()
 
-    for cat in sorted(tables):
+    for cat in tables:
         ## pg_depend does not care about duplicates at the moment
-        if cat == 'pg_depend':
+        if str(cat) == 'pg_depend':
             continue
         checkTableDuplicateEntry(cat)
 
@@ -2780,13 +1662,13 @@ def checkDuplicateEntry():
 def checkTableDuplicateEntry(cat):
     catname = cat.getTableName()
     pkey = cat.getPrimaryKey()
-    master = cat.isMasterOnly()
+    coordinator = cat.isCoordinatorOnly()
     isShared = cat.isShared()
     columns = cat.getTableColumns(with_acl=False)
     coltypes = cat.getTableColtypes()
 
-    # Skip master only tables
-    if master:
+    # Skip coordinator only tables
+    if coordinator:
         return
 
     # skip shared/non-shared tables
@@ -2798,7 +1680,7 @@ def checkTableDuplicateEntry(cat):
 
     # Skip catalogs without primary key
     if pkey == []:
-        logger.warn("[WARN] Skipped duplicate check for %s" %
+        logger.warning("[WARN] Skipped duplicate check for %s" %
                     catname)
         return
 
@@ -2810,7 +1692,7 @@ def checkTableDuplicateEntry(cat):
 
     # Execute the query
     try:
-        db = connect2(GV.cfg[1], utilityMode=False)
+        db = connect2(GV.cfg[GV.coordinator_dbid], utilityMode=False)
         curs = db.query(qry)
         nrows = curs.ntuples()
 
@@ -2823,14 +1705,14 @@ def checkTableDuplicateEntry(cat):
             logger.error('  %s has %d issue(s)' % (catname, nrows))
 
             fields = curs.listfields()
-            log_literal(logger, logging.ERROR, "    " + " | ".join(fields))
+            gplog.log_literal(logger, logging.ERROR, "    " + " | ".join(fields))
             results = curs.getresult()
             for row in results:
-                log_literal(logger, logging.ERROR, "    " + " | ".join(map(str, row)))
+                gplog.log_literal(logger, logging.ERROR, "    " + " | ".join(map(str, row)))
             processMissingDuplicateEntryResult(catname, fields, results, "duplicate")
             if catname == 'pg_type':
                 generateVerifyFile(catname, fields, results, 'duplicate')
-    except Exception, e:
+    except Exception as e:
         setError(ERROR_NOREPAIR)
         myprint('[ERROR] executing: duplicate entries check for ' + catname)
         myprint('  Execution error: ' + str(e))
@@ -2848,14 +1730,14 @@ def duplicateEntryQuery(catname, pkey):
     qry = """
           SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;
 
-          -- distribute catalog table from master, so that we can avoid to gather
-          CREATE TEMPORARY TABLE _tmp_master ON COMMIT DROP AS
-              SELECT gp_segment_id segid, {pkey} FROM {catalog};
+          -- distribute catalog table from coordinator, so that we can avoid to gather
+          CREATE TEMPORARY TABLE _tmp_coordinator ON COMMIT DROP AS
+              SELECT gp_segment_id AS segid, {pkey} FROM {catalog} DISTRIBUTED BY (segid);
           SELECT {pkey}, total, array_agg(segid order by segid) as segids
           FROM (
               SELECT segid, {pkey}, count(*) as total
               FROM (
-                   select segid, {pkey} FROM _tmp_master
+                   select segid, {pkey} FROM _tmp_coordinator
                    union all
                    select gp_segment_id as segid, {pkey} FROM gp_dist_random('{catalog}')
               ) all_segments
@@ -2873,7 +1755,7 @@ def duplicateEntryQuery(catname, pkey):
 def checkUniqueIndexViolation():
     logger.info('-----------------------------------')
     logger.info('Performing check: checking for violated unique indexes')
-    db_connection = connect2(GV.cfg[1], utilityMode=False)
+    db_connection = connect2(GV.cfg[GV.coordinator_dbid], utilityMode=False)
 
     violations = UniqueIndexViolationCheck().runCheck(db_connection)
 
@@ -2905,6 +1787,59 @@ def log_unique_index_violations(violations):
             ))
 
     logger.error('\n'.join(log_output))
+
+
+# -------------------------------------------------------------------------------
+def checkOrphanedToastTables():
+    logger.info('-----------------------------------')
+    logger.info('Performing check: checking for orphaned TOAST tables')
+
+    db_connection = connect2(GV.cfg[GV.coordinator_dbid], utilityMode=False)
+    checker = OrphanedToastTablesCheck()
+    check_passed = checker.runCheck(db_connection)
+
+    checkname = 'orphaned toast table(s)'
+    if check_passed:
+        logger.info('[OK]  %s' % checkname)
+    else:
+        logger.info('[FAIL]  %s' % checkname)
+        GV.checkStatus = False
+        setError(ERROR_REMOVE)
+
+        # log raw orphan toast table query results only to the log file
+        log_output = ['Orphan toast tables detected for the following scenarios:']
+        for issue_type in checker.issue_types():
+            log_output.append('\n' + issue_type.header)
+            log_output.append('content_id | toast_table_oid | toast_table_name | expected_table_oid | expected_table_name | dependent_table_oid | dependent_table_name')
+            log_output.append('-----------+-----------------+------------------+--------------------+---------------------+---------------------+---------------------')
+            for row in checker.rows_of_type(issue_type):
+                log_output.append('{} | {} | {} | {} | {} | {} | {}'.format(
+                    row['content_id'],
+                    row['toast_table_oid'],
+                    row['toast_table_name'],
+                    row['expected_table_oid'],
+                    row['expected_table_name'],
+                    row['dependent_table_oid'],
+                    row['dependent_table_name']))
+        log_output = '\n'.join(log_output)
+        log_output = log_output + '\n'
+        logger.error(log_output)
+
+        # log fix instructions for the orphaned toast tables to stdout and log file
+        gplog.log_literal(logger, logging.CRITICAL, checker.get_fix_text())
+
+        # log per-orphan table issue and cause to stdout and log file
+        for issue, segments in checker.iterate_issues():
+            cat_issue_obj = CatOrphanToastTableIssue(issue.table.oid,
+                                                     issue.table.catname,
+                                                     issue,
+                                                     segments)
+            error_object = getGPObject(issue.table.oid, issue.table.catname)
+            error_object.addOrphanToastTableIssue(cat_issue_obj)
+
+        do_repair_for_segments(segments_to_repair_statements=checker.add_repair_statements(GV.cfg),
+                               issue_type="orphaned_toast_tables",
+                               description='Repairing orphaned TOAST tables')
 
 
 ############################################################################
@@ -2953,7 +1888,7 @@ all_checks = {
         },
     "inconsistent":
         {
-            "description": "Cross consistency check for master segment inconsistency",
+            "description": "Cross consistency check for coordinator segment inconsistency",
             "fn": lambda: checkInconsistentEntry(),
             "version": 'main',
             "order": 4,
@@ -3009,7 +1944,7 @@ all_checks = {
         },
     "owner":
         {
-            "description": "Check table ownership that is inconsistent with the master database",
+            "description": "Check table ownership that is inconsistent with the coordinator database",
             "fn": lambda: checkOwners(),
             "version": 'main',
             "order": 11,
@@ -3023,14 +1958,22 @@ all_checks = {
             "order": 12,
             "online": True
         },
-    "part_constraint":
+    "orphaned_toast_tables":
         {
-            "description": "Check constraints on partitioned tables",
-            "fn": lambda: checkPartitionRegularity(),
+            "description": "Check pg_class and pg_depend for orphaned TOAST tables",
+            "fn": checkOrphanedToastTables,
             "version": 'main',
             "order": 13,
             "online": True
         },
+    "aoseg_table":
+        {
+            "description": "Check that vpinfo in aoseg table is consistent with pg_attribute",
+            "fn": lambda: checkAOSegVpinfo(),
+            "version": 'main',
+            "order": 15,
+            "online": False
+        }
 }
 
 
@@ -3069,7 +2012,7 @@ def runCheckCatname(catalog_table_obj):
 #-------------------------------------------------------------------------------
 def runOneCheck(name):
 
-    if not all_checks.has_key(name):
+    if not name in all_checks:
         logger.info("'%s' is not a valid test" % (name))
         raise LookupError
     if GV.opt['-O'] and not all_checks[name]["online"]:
@@ -3119,7 +2062,7 @@ def runAllChecks():
         if len(GV.ReSync):
             maybeRemove = "# "
 
-        # use the per-dbid loop for removal and for contraint
+        # use the per-dbid loop for removal and for constraint
         # name adjustments
 
         dbids = set(GV.Remove.keys())
@@ -3136,11 +2079,12 @@ def runAllChecks():
         print_repair_issues(repair_dir_path)
 
     if GV.retcode >= ERROR_NOREPAIR:
-        logger.warn('[WARN]: unable to generate repairs for some issues')
+        logger.warning('[WARN]: unable to generate repairs for some issues')
     logger.info("Check complete")
 
 
 def do_repair(sql_repair_contents, issue_type, description):
+    logger.info("Starting repair of %s with %d issues" % (description, len(sql_repair_contents)))
     if len(sql_repair_contents) == 0:
         return
 
@@ -3148,7 +2092,19 @@ def do_repair(sql_repair_contents, issue_type, description):
     try:
         repair_obj = Repair(context=GV, issue_type=issue_type, desc=description)
         repair_dir_path = repair_obj.create_repair(sql_repair_contents=sql_repair_contents)
-    except Exception, ex:
+    except Exception as ex:
+        logger.fatal(str(ex))
+
+    print_repair_issues(repair_dir_path)
+
+def do_repair_for_segments(segments_to_repair_statements, issue_type, description):
+    logger.info("Starting repair of %s" % description)
+
+    repair_dir_path = ""
+    try:
+        repair_obj = Repair(context=GV, issue_type=issue_type, desc=description)
+        repair_dir_path = repair_obj.create_segment_repair_scripts(segments_to_repair_statements)
+    except Exception as ex:
         logger.fatal(str(ex))
 
     print_repair_issues(repair_dir_path)
@@ -3157,13 +2113,14 @@ def do_repair(sql_repair_contents, issue_type, description):
 def do_repair_for_extra(catalog_issues):
     setError(ERROR_REMOVE)
     repair_dir_path = ""
-    for (catalog_table_obj, pk_name), issues in catalog_issues.iteritems():
+    for (catalog_table_obj, pk_name), issues in catalog_issues.items():
         try:
             repair_obj = Repair(context=GV, issue_type="extra", desc="Removing extra entries")
             repair_dir_path = repair_obj.create_repair_for_extra_missing(catalog_table_obj=catalog_table_obj,
                                                                          issues=issues,
-                                                                         pk_name=pk_name)
-        except Exception, ex:
+                                                                         pk_name=pk_name,
+                                                                         segments=GV.cfg)
+        except Exception as ex:
             logger.fatal(str(ex))
 
     print_repair_issues(repair_dir_path)
@@ -3178,11 +2135,11 @@ def print_repair_issues(repair_dir_path):
 def checkReindexRepair():
     if len(GV.Reindex) > 0:
         # dbname.type.timestamp.sql
-        filename = '%s.%s.%s.sql' % (GV.dbname, "reindex", Repair.TIMESTAMP)
+        filename = '%s.%s.%s.sql' % (GV.dbname, "reindex", GV.timestamp)
         fullpath = '%s/%s' % (GV.opt['-g'], filename)
         try:
             file = open(fullpath, 'w')
-        except Exception, e:
+        except Exception as e:
             logger.fatal('Unable to create file "%s": %s' % (fullpath, str(e)))
             sys.exit(1)
 
@@ -3210,22 +2167,22 @@ def checkPoliciesRepair():
 def checkSegmentRepair(maybeRemove, catmod_guc, seg):
     # dbid.host.port.dbname.timestamp.sql
     c = GV.cfg[seg]
-    filename = '%i.%s.%i.%s.%s.sql' % (seg, c['hostname'], c['port'], GV.dbname, Repair.TIMESTAMP)
+    filename = '%i.%s.%i.%s.%s.sql' % (seg, c['hostname'], c['port'], GV.dbname, GV.timestamp)
     filename = filename.replace(' ', '_')
     fullpath = '%s/%s' % (GV.opt['-g'], filename)
     try:
         file = open(fullpath, 'w')
-    except Exception, e:
+    except Exception as e:
         logger.fatal('Unable to create file "%s": %s' % (fullpath, str(e)))
         sys.exit(1)
 
     # unique
     lines = set()
-    if GV.Remove.has_key(seg):#foreign_key check
+    if seg in GV.Remove:#foreign_key check
         lines = lines.union(GV.Remove[seg])
-    if GV.AdjustConname.has_key(seg):#part_constraint
+    if seg in GV.AdjustConname:#part_constraint
         lines = lines.union(GV.AdjustConname[seg])
-    if GV.DemoteConstraint.has_key(seg):
+    if seg in GV.DemoteConstraint:
         lines = lines.union(GV.DemoteConstraint[seg])
 
     # make sure it is sorted
@@ -3237,7 +2194,7 @@ def checkSegmentRepair(maybeRemove, catmod_guc, seg):
     file.write('COMMIT;\n')
     file.close()
 
-    run_psql_script = '''{maybe}env PGOPTIONS="-c gp_session_role=utility {guc}" psql -X -a -h {hostname} -p {port} -f {fname} "{dbname}" > {fname}.out'''.format(
+    run_psql_script = '''{maybe}env PGOPTIONS="-c gp_role=utility {guc}" psql -X -a -h {hostname} -p {port} -f {fname} "{dbname}" > {fname}.out'''.format(
         maybe=maybeRemove, guc=catmod_guc,
         hostname=c['hostname'],
         port=c['port'],
@@ -3249,15 +2206,15 @@ def checkSegmentRepair(maybeRemove, catmod_guc, seg):
 
 # -------------------------------------------------------------------------------
 def getCatalog():
-    # Establish a connection to the master & looks up info in the catalog
-    db = connect2(GV.cfg[1], utilityMode=False)
+    # Establish a connection to the coordinator & looks up info in the catalog
+    db = connect2(GV.cfg[GV.coordinator_dbid], utilityMode=False)
     return GPCatalog(db)
 
 
 # -------------------------------------------------------------------------------
 def getReportConfiguration():
     cfg = {}
-    for _, each in GV.cfg.iteritems():
+    for _, each in GV.cfg.items():
         cfg[each['content']] = {'segname': "content " + str(each['content']),
                                 'hostname': each['hostname'],
                                 'port': each['port']}
@@ -3279,26 +2236,25 @@ GPObjectGraph = {}  # key = GPObject, value=[GPObject]
 # -------------------------------------------------------------------------------
 TableMainColumn = {}
 # Table with no OID
+TableMainColumn['gp_distribution_policy'] = ['localoid', 'pg_class']
 TableMainColumn['gp_version_at_initdb'] = ['schemaversion', 'gp_version_at_initdb']
 TableMainColumn['pg_aggregate'] = ['aggfnoid', 'pg_proc']
-TableMainColumn['pg_amop'] = ['amopclaid', 'pg_opclass']
-TableMainColumn['pg_amproc'] = ['amopclaid', 'pg_opclass']
 TableMainColumn['pg_appendonly'] = ['relid', 'pg_class']
 TableMainColumn['pg_attribute'] = ['attrelid', 'pg_class']
 TableMainColumn['pg_attribute_encoding'] = ['attrelid', 'pg_class']
 TableMainColumn['pg_auth_members'] = ['roleid', 'pg_authid']
 TableMainColumn['pg_autovacuum'] = ['vacrelid', 'pg_class']
+TableMainColumn['pg_compression'] = ['compname', 'pg_compression']
 TableMainColumn['pg_depend'] = ['objid', 'pg_class']
-TableMainColumn['pg_exttable'] = ['reloid', 'pg_class']
-TableMainColumn['pg_foreign_table'] = ['reloid', 'pg_class']
+TableMainColumn['pg_foreign_table'] = ['ftrelid', 'pg_class']
 TableMainColumn['pg_index'] = ['indexrelid', 'pg_class']
 TableMainColumn['pg_inherits'] = ['inhrelid', 'pg_class']
 TableMainColumn['pg_largeobject'] = ['loid', 'pg_largeobject']
 TableMainColumn['pg_pltemplate'] = ['tmplname', 'pg_pltemplate']
 TableMainColumn['pg_proc_callback'] = ['profnoid', 'pg_proc']
+TableMainColumn['pg_statistic_ext_data'] = ['stxoid', 'pg_statistic_ext']
 TableMainColumn['pg_type_encoding'] = ['typid', 'pg_type']
 TableMainColumn['pg_window'] = ['winfnoid', 'pg_proc']
-TableMainColumn['gp_distribution_policy'] = ['localoid', 'pg_class']
 
 # Table with OID (special case), these OIDs are known to be inconsistent
 TableMainColumn['pg_attrdef'] = ['adrelid', 'pg_class']
@@ -3339,7 +2295,7 @@ def getGPObject(oid, catname):
 # -------------------------------------------------------------------------------
 def getOidFromPK(catname, pkeys):
     # pkeys: name-value pair
-    pkeystrList = ["%s='%s'" % (key, value) for key, value in pkeys.iteritems()]
+    pkeystrList = ["%s='%s'" % (key, value) for key, value in pkeys.items()]
     pkeystr = ' and '.join(pkeystrList)
 
     qry = """
@@ -3357,14 +2313,14 @@ def getOidFromPK(catname, pkeys):
                      pkeystr=pkeystr)
 
     try:
-        db = connect2(GV.cfg[1], utilityMode=False)
+        db = connect2(GV.cfg[GV.coordinator_dbid], utilityMode=False)
         curs = db.query(qry)
         if (len(curs.dictresult()) == 0):
             raise QueryException("No such entry '%s' in %s" % (pkeystr, catname))
 
         return curs.dictresult().pop()['oid']
 
-    except Exception, e:
+    except Exception as e:
         setError(ERROR_NOREPAIR)
         myprint('  Execution error: ' + str(e))
         myprint(qry)
@@ -3376,9 +2332,9 @@ def getClassOidForRelfilenode(relfilenode):
     try:
         dburl = dbconn.DbURL(hostname=GV.opt['-h'], port=GV.opt['-p'], dbname=GV.dbname)
         conn = dbconn.connect(dburl)
-        oid = dbconn.execSQLForSingletonRow(conn, qry)[0]
+        oid = dbconn.queryRow(conn, qry)[0]
         return oid
-    except Exception, e:
+    except Exception as e:
         setError(ERROR_NOREPAIR)
         myprint('  Execution error: ' + str(e))
 
@@ -3401,9 +2357,31 @@ def getResourceTypeOid(oid):
         curs = db.query(qry)
         if len(curs.dictresult()) == 0: return 0
         return curs.dictresult().pop()['oid']
-    except Exception, e:
+    except Exception as e:
         setError(ERROR_NOREPAIR)
         myprint('  Execution error: ' + str(e))
+
+
+def filterSpuriousFailures(catname, colnames, results):
+    if catname == 'pg_depend':
+        # Catalog tables having content only on coordinator
+        # (e.g. pg_statistic*) should be excluded from pg_depend
+        # comparisons between coordinator and segments.
+        legitFailures = []
+        coordinatorOnlyOids = list(map(lambda cat: cat._oid,
+                             filter(lambda cat: cat.isCoordinatorOnly(),
+                                    GV.catalog.getCatalogTables())))
+        for row in results:
+            legit = True
+            if row[colnames.index('classid')] in coordinatorOnlyOids:
+                logger.info('excluding coordinator-only entry from missing_pg_depend: %s' % str(row))
+                legit = False
+            if legit:
+                legitFailures.append(row)
+    else:
+        legitFailures = results
+
+    return legitFailures
 
 
 #-------------------------------------------------------------------------------
@@ -3438,7 +2416,8 @@ def processMissingDuplicateEntryResult(catname, colname, allValues, type):
     # Process entries
     for row in allValues:
         rowObjName = gpObjName
-        segids = row[-1]
+        # pygresql 4 to 5 update means that this segid is now a list of int (i.e. [-1, 0, 1]) instead of a string like "{-1,0,1}"
+        segids = "{" + ",".join(str(i) for i in row[-1]) + "}"
         pkeys = dict((pk, row[colname.index(pk)]) for pk in pknames)
 
         if gpColName != None:
@@ -3456,7 +2435,7 @@ def processMissingDuplicateEntryResult(catname, colname, allValues, type):
 
         if type == "missing":
 
-            # In how many segments (counting master as segment -1) was the
+            # In how many segments (counting coordinator as segment -1) was the
             # entry present?
             #
             # If it was present in half or more, then report the ones that
@@ -3491,12 +2470,12 @@ def processMissingDuplicateEntryResult(catname, colname, allValues, type):
 def processInconsistentEntryResult(catname, pknames, colname, allValues):
     # If tableHasInconsistentOid, columns does not have oid
     '''
-    17365 | test10 | 2200 | 17366 | 0 | 0 | 17366 | 0 | 0 | 0 | f | r | h | 3 | 0 | 0 | 0 | 0 | 0 | f | f | f | f | None | {0}     -- row1
-    17365 | test10 | 2200 | 17366 | 0 | 0 | 0     | 0 | 0 | 0 | f | r | h | 2 | 0 | 0 | 0 | 0 | 0 | f | f | f | f | None | {NULL}  -- row2
+    17365 | test10 | 2200 | 17366 | 0 | 0 | 17366 | 0 | 0 | 0 | f | r | h | 3 | 0 | 0 | 0 | 0 | 0 | f | f | f | f | None | [0]     -- row1
+    17365 | test10 | 2200 | 17366 | 0 | 0 | 0     | 0 | 0 | 0 | f | r | h | 2 | 0 | 0 | 0 | 0 | 0 | f | f | f | f | None | [None]  -- row2
 
-    176954 | test1 | 2200 | 176955 | 0 | 0 | 176956 | 0 | 0 | 0 | f | r | h | 4 | 0 | 0 | 0 | 0 | 0 | f | f | f | f | None | {-1}
-    176954 | test1 | 2200 | 176955 | 0 | 0 | 176956 | 0 | 0 | 0 | f | r | h | 2 | 0 | 0 | 0 | 0 | 0 | f | f | f | f | None | {0,1}
-    176954 | test1 | 2200 | 176955 | 0 | 0 | 176956 | 0 | 0 | 0 | f | r | h | 3 | 0 | 0 | 0 | 0 | 0 | f | f | f | f | None | {2,3}
+    176954 | test1 | 2200 | 176955 | 0 | 0 | 176956 | 0 | 0 | 0 | f | r | h | 4 | 0 | 0 | 0 | 0 | 0 | f | f | f | f | None | [-1]
+    176954 | test1 | 2200 | 176955 | 0 | 0 | 176956 | 0 | 0 | 0 | f | r | h | 2 | 0 | 0 | 0 | 0 | 0 | f | f | f | f | None | [0,1]
+    176954 | test1 | 2200 | 176955 | 0 | 0 | 176956 | 0 | 0 | 0 | f | r | h | 3 | 0 | 0 | 0 | 0 | 0 | f | f | f | f | None | [2,3]
     '''
 
     # Group allValues rows by its key (oid or primary key) into a dictionary:
@@ -3522,7 +2501,7 @@ def processInconsistentEntryResult(catname, pknames, colname, allValues):
     elif 'oid' in colname:
         gpColName = 'oid'
 
-    for keys, values in groupedValues.iteritems():
+    for keys, values in groupedValues.items():
         rowObjName = gpObjName
         pkeys = dict((n, values[0][colname.index(n)]) for n in pknames)
 
@@ -3555,7 +2534,7 @@ def processForeignKeyResult(catname, pkcatname, colname, allValues):
     fkeytab = catname
     # The foreign keys are all entries except the last 4
     # NOTE: We can't assume the first few rows are the expected issues anymore...
-    fkeylist = [name.rsplit('_', 1)[1] for name in colname[:-4]]
+    fkeylist = [name.rsplit(catname+'_', 1)[1] for name in colname[:-4]]
 
     # This catname may not be a GPObject (e.g. pg_attribute)
     #    1. pg_attrdef(adrelid) referencing pg_attribute(attrelid)
@@ -3620,7 +2599,7 @@ def getPrimaryKeyColumn(catname, pknames):
 # -------------------------------------------------------------------------------
 def processACLResult(catname, colname, allValues):
     '''
-    colname:	segid | datname | master_acl | segment_acl
+    colname:	segid | datname | coordinator_acl | segment_acl
     allValues:		2 | acldb | {=Tc/nmiller,nmiller=CTc/nmiller,person1=C/nmiller} | {=Tc/nmiller,nmiller=CTc/nmiller}
     				1 | gptest | None | {=Tc/nmiller,nmiller=CTc/nmiller,person2=CTc/nmiller}
     '''
@@ -3640,8 +2619,8 @@ def processACLResult(catname, colname, allValues):
             oid = getOidFromPK(catname, pkeys)
             pkeys = {'oid': oid}
 
-        macl = row[-2][1:-1].split(',') if row[-2] != None else []
-        sacl = row[-1][1:-1].split(',') if row[-1] != None else []
+        macl = row[-2] if row[-2] != None else []
+        sacl = row[-1] if row[-1] != None else []
         macl_only = list(set(macl).difference(sacl))
         sacl_only = list(set(sacl).difference(macl))
 
@@ -3661,10 +2640,10 @@ class CatInconsistentIssue:
     def report(self):
 
         def format_segids(segids):
-            if segids == '{NULL}':
+            if segids == [None]:
                 idstr = 'all other segments'
             else:
-                ids = [int(i) for i in segids[1:-1].split(',')]
+                ids =  segids
                 idstr = ''
                 for i in ids:
                     idstr += '%s (%s:%d) ' % \
@@ -3673,7 +2652,7 @@ class CatInconsistentIssue:
             return idstr
 
         for i in range(0, len(self.columns) - 1):
-            colset = set(j[i] for j in self.rows)
+            colset = set(str(j[i]) for j in self.rows)
             if len(colset) > 1:
                 for row in self.rows:
                     myprint("%20s is '%s' on %s" % (self.columns[i], row[i], format_segids(row[-1])))
@@ -3691,7 +2670,7 @@ class CatForeignKeyIssue:
 
     def report(self):
 
-        ids = [int(i) for i in self.segids[1:-1].split(',')]
+        ids = self.segids
         idstr = ''
         if len(ids) == len(GV.report_cfg):
             idstr = 'all segments'
@@ -3759,23 +2738,23 @@ class CatACLIssue:
         self.catname = catname
         self.pkeys = pkeys  # string of pkey=xxxx or oid=xxxx
         self.segid = segid  # the affected segid
-        self.macl_only = macl_only  # acl appears only on master
+        self.macl_only = macl_only  # acl appears only on coordinator
         self.sacl_only = sacl_only  # acl appears only on segment
 
     def report(self):
-        """ Master (host:port) and seg# (host:port) have different ACL:
-                Exist(s) on master only: [...........]
-                Exist(s) on   seg# only: [...........]
+        """ Coordinator (host:port) and seg# (host:port) have different ACL:
+                Exist(s) on coordinator only: [...........]
+                Exist(s) on        seg# only: [...........]
         """
-        mstr = 'Master (%s:%s)' % (GV.report_cfg[-1]['hostname'], GV.report_cfg[-1]['port'])
+        mstr = 'Coordinator (%s:%s)' % (GV.report_cfg[-1]['hostname'], GV.report_cfg[-1]['port'])
         sstr = '%s (%s:%s)' % (GV.report_cfg[self.segid]['segname'],
                                GV.report_cfg[self.segid]['hostname'],
                                GV.report_cfg[self.segid]['port'])
         myprint('        %s and %s have different ACLs:' % (mstr, sstr))
         if len(self.macl_only) > 0:
-            myprint('            Exist(s) on master only: %s' % (self.macl_only))
+            myprint('            Exist(s) on coordinator only: %s' % (self.macl_only))
         if len(self.sacl_only) > 0:
-            myprint('            Exist(s) on %s only: %s ' % \
+            myprint('            Exist(s) on      %s only: %s ' % \
                     (GV.report_cfg[self.segid]['segname'], self.sacl_only))
 
 # -------------------------------------------------------------------------------
@@ -3803,6 +2782,18 @@ class CatDependencyIssue:
         )
 
 # -------------------------------------------------------------------------------
+class CatOrphanToastTableIssue:
+    def __init__(self, oid, catname, issue, segments):
+        self.oid = oid
+        self.catname = catname
+        self.issue = issue
+        self.segments = segments
+
+    def report(self):
+        myprint('%s' % self.issue.description)
+        myprint('''On segment(s) %s table '%s' (oid: %s) %s''' % (', '.join(map(str, sorted(self.segments))), self.catname, self.oid, self.issue.cause))
+
+# -------------------------------------------------------------------------------
 class GPObject:
     def __init__(self, oid, catname):
         self.oid = oid
@@ -3813,6 +2804,7 @@ class GPObject:
         self.aclIssues = {}  # key=issue.catname, value=list of catACLIssue
         self.foreignkeyIssues = {}  # key=issue.catname, value=list of catForeignKeyIssue
         self.dependencyIssues = {} # key=issue.catname, value=list of catDependencyIssue
+        self.orphanToastTableIssues = {} # key=issue.catname, value=list of orphanToastTableIssues
 
     def addDependencyIssue(self, issue):
         if issue.catname in self.dependencyIssues:
@@ -3850,6 +2842,12 @@ class GPObject:
         else:
             self.foreignkeyIssues[issue.catname] = [issue]
 
+    def addOrphanToastTableIssue(self, issue):
+        if issue.catname in self.orphanToastTableIssues:
+            self.orphanToastTableIssues[issue.catname].append(issue)
+        else:
+            self.orphanToastTableIssues[issue.catname] = [issue]
+
     def isTopLevel(self):
         return True
 
@@ -3879,7 +2877,7 @@ class GPObject:
 
         # Report dependency issues
         if len(self.dependencyIssues):
-            for catname, issues in self.dependencyIssues.iteritems():
+            for catname, issues in self.dependencyIssues.items():
                 myprint('    Name of test which found this issue: dependency_%s' % catname)
                 for each in issues:
                     each.report()
@@ -3887,7 +2885,7 @@ class GPObject:
 
         # Report inconsistent issues
         if len(self.inconsistentIssues):
-            for catname, issues in self.inconsistentIssues.iteritems():
+            for catname, issues in self.inconsistentIssues.items():
                 myprint('    Name of test which found this issue: inconsistent_%s' % catname)
                 for each in issues:
                     each.report()
@@ -3904,13 +2902,13 @@ class GPObject:
                 for each in self.missingIssues['pg_class']:
                     each.report()
 
-                for catname, issues in self.missingIssues.iteritems():
+                for catname, issues in self.missingIssues.items():
                     if catname != 'pg_class' and catname not in omitlist:
                         myprint('    Name of test which found this issue: missing_extraneous_%s' % catname)
                         for each in issues:
                             each.report()
             else:
-                for catname, issues in self.missingIssues.iteritems():
+                for catname, issues in self.missingIssues.items():
                     myprint('    Name of test which found this issue: missing_extraneous_%s' % catname)
                     for each in issues:
                         each.report()
@@ -3920,7 +2918,7 @@ class GPObject:
 
         # Report foreign key issues
         if len(self.foreignkeyIssues):
-            for catname, issues in self.foreignkeyIssues.iteritems():
+            for catname, issues in self.foreignkeyIssues.items():
                 myprint('    Name of test which found this issue: foreign_key_%s' % catname)
                 for each in issues:
                     each.report()
@@ -3928,7 +2926,7 @@ class GPObject:
 
         # Report duplicate issues
         if len(self.duplicateIssues):
-            for catname, issues in self.duplicateIssues.iteritems():
+            for catname, issues in self.duplicateIssues.items():
                 myprint('    Name of test which found this issue: duplicate_%s' % catname)
                 for each in issues:
                     each.report()
@@ -3936,8 +2934,15 @@ class GPObject:
 
         # Report ACL issues
         if len(self.aclIssues):
-            for catname, issues in self.aclIssues.iteritems():
+            for catname, issues in self.aclIssues.items():
                 myprint('    Name of test which found this issue: acl_%s' % catname)
+                for each in issues:
+                    each.report()
+            myprint('')
+
+        # Report Orphan Toast Table issues
+        if len(self.orphanToastTableIssues):
+            for catname, issues in self.orphanToastTableIssues.items():
                 for each in issues:
                     each.report()
             myprint('')
@@ -3946,7 +2951,7 @@ class GPObject:
 
         # Collect all tables with missing issues for later reporting
         if len(self.missingIssues):
-            db = connect2(GV.cfg[1], utilityMode=False)
+            db = connect2(GV.cfg[GV.coordinator_dbid], utilityMode=False)
             oid_query = "select (select nspname from pg_namespace where oid=relnamespace) || '.' || relname from pg_class where oid=%d"
             type_query = "select (select nspname from pg_namespace where oid=relnamespace) || '.' || relname from pg_class where reltype=%d"
             for issues in self.missingIssues.values() :
@@ -3989,7 +2994,7 @@ class RelationObject(GPObject):
         self.paroid = None
 
     def reportAllIssues(self):
-        oid = 'N/A' if self.oid is None else self.oid
+        oid = 'N/A' if self.oid is None else str(self.oid)
         nspname = 'N/A' if self.nspname is None else self.nspname
         relname = 'N/A' if self.relname is None else self.relname
 
@@ -3998,14 +3003,14 @@ class RelationObject(GPObject):
             myprint('----------------------------------------------------')
 
             objname = 'Type' if self.relkind == 'c' else 'Relation'
-            myprint('%s oid: %d' % (objname, oid))
+            myprint('%s oid: %s' % (objname, oid))
             myprint('%s schema: %s' % (objname, nspname))
             myprint('%s name: %s' % (objname, relname))
 
         else:
             myprint('    Sub-object: ')
             myprint('    ----------------------------------------------------')
-            myprint('    Relation oid: %d' % oid)
+            myprint('    Relation oid: %s' % oid)
             myprint('    Relation schema: %s' % nspname)
             myprint('    Relation name: %s' % relname)
         myprint('')
@@ -4115,13 +3120,13 @@ def getRelInfo(objects):
           """.format(oids=','.join(map(str, oids)))
 
     try:
-        db = connect2(GV.cfg[1], utilityMode=False)
+        db = connect2(GV.cfg[GV.coordinator_dbid], utilityMode=False)
         curs = db.query(qry)
         for row in curs.getresult():
             (oid, relname, nspname, relkind, paroid) = row
             objects[oid, 'pg_class'].setRelInfo(relname, nspname, relkind, paroid)
 
-    except Exception, e:
+    except Exception as e:
         setError(ERROR_NOREPAIR)
         myprint('  Execution error: ' + str(e))
         myprint(qry)
@@ -4133,7 +3138,7 @@ def buildGraph():
         if objects == {}: return
         getRelInfo(objects)
         localObjects = {}
-        for (oid, catname), obj in objects.iteritems():
+        for (oid, catname), obj in objects.items():
             # Top level object, add to graph
             if obj.isTopLevel():
                 if obj not in graph:
@@ -4163,13 +3168,13 @@ def checkcatReport():
         par.reportAllIssues()
         if par not in graph:
             return
-        for child in sorted(graph[par]):
+        for child in graph[par]:
             reportAllIssuesRecursive(child, graph)
 
     buildGraph()
-    reportedCheck = ['duplicate','missing_extraneous','inconsistent','foreign_key','acl']
+    reportedCheck = ['duplicate','missing_extraneous','inconsistent','foreign_key','acl', 'orphaned_toast_tables']
     myprint('')
-    myprint('SUMMARY REPORT')
+    myprint('SUMMARY REPORT: %s' % ('FAILED' if len(GV.failedChecks) else 'PASSED'))
     myprint('===================================================================')
     elapsed = datetime.timedelta(seconds=int(GV.elapsedTime))
     endTime = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -4178,6 +3183,7 @@ def checkcatReport():
 
     if len(GPObjectGraph) == 0 and len(GV.failedChecks) == 0:
         myprint('Found no catalog issue\n')
+        assert(GV.retcode == SUCCESS)
         return
 
     if len(GPObjectGraph) > 0:
@@ -4187,11 +3193,11 @@ def checkcatReport():
         if total == 0:
             myprint('Found no catalog issue\n')
             if par.catname in ['pg_constraint']:
-                myprint('Warnings were generated, see %s for detail\n' % get_logfile())
+                myprint('Warnings were generated, see %s for detail\n' % gplog.get_logfile())
         else:
             myprint('Found a total of %d issue(s)' % total)
 
-        for par in sorted(GPObjectGraph):
+        for par in GPObjectGraph:
             if par.isTopLevel():
                 reportAllIssuesRecursive(par, GPObjectGraph)
         myprint('')
@@ -4199,31 +3205,19 @@ def checkcatReport():
         # Report tables with missing attributes in a more usable format
         if len(GV.missing_attr_tables) or len(GV.extra_attr_tables):
             # Expand partition tables
-            db = connect2(GV.cfg[1], utilityMode=False)
-            parent_tables = [t[0] for t in db.query("SELECT DISTINCT (schemaname || '.' || tablename) FROM pg_partitions").getresult()]
-            partition_leaves_sql = """
-            SELECT x.partitionschemaname || '.' || x.partitiontablename
-            FROM (
-                 SELECT distinct schemaname, tablename, partitionschemaname, partitiontablename, partitionlevel
-                 FROM pg_partitions
-                 WHERE schemaname || '.' || tablename in (%s)
-                 ) as X,
-            (SELECT schemaname, tablename maxtable, max(partitionlevel) maxlevel
-             FROM pg_partitions
-             group by (tablename, schemaname)
-            ) as Y
-            WHERE x.schemaname = y.schemaname and x.tablename = Y.maxtable and x.partitionlevel = Y.maxlevel;
-            """ % ("'" + "', '".join([pg.escape_string(t) for t in parent_tables]) + "'")
+            db = connect2(GV.cfg[GV.coordinator_dbid], utilityMode=False)
+
+            # GPDB_12_MERGE_FIXME: We used to have a query here, to fetch
+            # some extra informationa about partitioned tables. I (Heikki)
+            # didn't understand what it did. I ripped it out, and in the
+            # limited tests I did, I got the same result without it.
+            # What was it for? Do we need to put something back?
 
             GV.missing_attr_tables = list(set(GV.missing_attr_tables))
             if len(GV.missing_attr_tables) > 0:
                 myprint('----------------------------------------------------')
                 myprint("    Tables with missing issues:")
                 myprint("        Format [database name].[schema name].[table name].[segment id]:")
-                for table, segids in GV.missing_attr_tables:
-                    if table in parent_tables:
-                        for part_table in db.query(partition_leaves_sql).getresult():
-                            GV.missing_attr_tables.append( (part_table[0], segids) )
                 for table, segids in sorted(GV.missing_attr_tables):
                     for id in segids[1:-1].split(','):
                         myprint("        Table %s.%s.%s" % (GV.dbname, table, id))
@@ -4234,10 +3228,6 @@ def checkcatReport():
                 myprint('----------------------------------------------------')
                 myprint("    Tables with extra issues:")
                 myprint("        Format [database name].[schema name].[table name].[segment id]:")
-                for table, segids in GV.extra_attr_tables:
-                    if table in parent_tables:
-                        for part_table in db.query(partition_leaves_sql).getresult():
-                            GV.extra_attr_tables.append( (part_table[0], segids) )
                 for table, segids in sorted(GV.extra_attr_tables):
                     for id in segids[1:-1].split(','):
                         myprint("        Table %s.%s.%s" % (GV.dbname, table, id))
@@ -4247,11 +3237,11 @@ def checkcatReport():
     notReported = set(GV.failedChecks).difference(reportedCheck)
     if len(notReported) > 0:
         myprint('Failed test(s) that are not reported here: %s' % (', '.join(notReported)))
-        myprint('See %s for detail\n' % get_logfile())
+        myprint('See %s for detail\n' % gplog.get_logfile())
 
 
 def _myprint(str, level=logging.CRITICAL):
-    log_literal(logger, level, str)
+    gplog.log_literal(logger, level, str)
 
 
 myprint = _myprint
@@ -4267,7 +3257,7 @@ def generateVerifyFile(catname, fields, results, checkname):
           ) alltyprelids
           GROUP BY relname, oid ORDER BY count(*) desc
     '''.format(in_clause=in_clause)
-    filename = 'gpcheckcat.verify.%s.%s.%s.%s.sql' % (GV.dbname, catname, checkname, Repair.TIMESTAMP)
+    filename = 'gpcheckcat.verify.%s.%s.%s.%s.sql' % (GV.dbname, catname, checkname, GV.timestamp)
     try:
         with open(filename, 'w') as fp:
             fp.write(verify_sql + '\n')
@@ -4279,6 +3269,13 @@ def truncate_batch_size(primaries):
         GV.opt['-B'] = primaries
         myprint("Truncated batch size to number of primaries: %d" % primaries)
 
+def check_gpexpand():
+    check_result, msg = conflict_with_gpexpand("gpcheckcat",
+                                               refuse_phase1=True,
+                                               refuse_phase2=False)
+    if not check_result:
+        myprint(msg)
+        sys.exit(1)
 
 def main():
     parseCommandLine()
@@ -4291,11 +3288,25 @@ def main():
         myprint("Error: only Greenplum database version >= 4.0 are supported\n")
         sys.exit(GV.retcode)
 
+    # gpcheckcat should check gpexpand running status
+    check_gpexpand()
+
     GV.cfg = getGPConfiguration()
     truncate_batch_size(len(GV.cfg.keys()))
 
     GV.report_cfg = getReportConfiguration()
     GV.max_content = max([GV.cfg[dbid]['content'] for dbid in GV.cfg])
+
+    for dbid in GV.cfg:
+        if (GV.cfg[dbid]['content'] == -1):
+            GV.coordinator_dbid = dbid
+            break
+
+    if GV.coordinator_dbid is None:
+        myprint("Error: coordinator configuration info not found in gp_segment_configuration\n")
+        setError(ERROR_NOREPAIR)
+        sys.exit(GV.retcode)
+
     GV.catalog = getCatalog()
     leaked_schema_dropper = LeakedSchemaDropper()
 
@@ -4318,7 +3329,7 @@ def main():
             name = GV.opt['-R']
             try:
                 runOneCheck(name)
-            except LookupError, e:
+            except LookupError as e:
                 myprint("'%s' is not a valid test\n\n" % (name))
                 setError(ERROR_NOREPAIR)
                 sys.exit(GV.retcode)
@@ -4327,7 +3338,7 @@ def main():
             try:
                 catalog_table_obj = getCatObj(namestr)
                 runCheckCatname(catalog_table_obj)
-            except Exception, e:
+            except Exception as e:
                 setError(ERROR_NOREPAIR)
                 sys.exit(GV.retcode)
         else:

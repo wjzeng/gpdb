@@ -4,7 +4,7 @@
  *	  Commands for manipulating resource queues.
  *
  * Portions Copyright (c) 2006-2010, Greenplum inc.
- * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
  * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
@@ -40,6 +40,7 @@
 #include "utils/formatting.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
+#include "utils/resource_manager.h"
 #include "executor/execdesc.h"
 #include "utils/resscheduler.h"
 #include "utils/syscache.h"
@@ -52,8 +53,6 @@
  * Establish a lower bound on what memory limit may be set on a queue.
  */
 #define MIN_RESOURCEQUEUE_MEMORY_LIMIT_KB (10 * 1024L)
-
-static char *GetResqueueCapability(Oid queueOid, int capabilityIndex);
 
 /* MPP-6923: 
  * GetResourceTypeByName: find the named resource in pg_resourcetype
@@ -79,7 +78,7 @@ GetResourceTypeByName(char *pNameIn, int *pTypeOut, Oid *pOidOut)
 	 * XXX XXX: maybe should be share lock, ie remove FOR UPDATE ?
 	 * XXX XXX: only one
 	 */
-	pg_resourcetype = heap_open(ResourceTypeRelationId, RowExclusiveLock);
+	pg_resourcetype = table_open(ResourceTypeRelationId, RowExclusiveLock);
 
 	ScanKeyInit(&scankey,
 				Anum_pg_resourcetype_resname,
@@ -91,13 +90,14 @@ GetResourceTypeByName(char *pNameIn, int *pTypeOut, Oid *pOidOut)
 	tuple = systable_getnext(sscan);
 	if (HeapTupleIsValid(tuple))
 	{
-		*pOidOut = HeapTupleGetOid(tuple);
-		*pTypeOut =
-				((Form_pg_resourcetype) GETSTRUCT(tuple))->restypid;
+		Form_pg_resourcetype rtype = (Form_pg_resourcetype) GETSTRUCT(tuple);
+
+		*pOidOut = rtype->oid;
+		*pTypeOut = rtype->restypid;
 		bStat = true;
 	}
 	systable_endscan(sscan);
-	heap_close(pg_resourcetype, RowExclusiveLock);
+	table_close(pg_resourcetype, RowExclusiveLock);
 
 	return (bStat);
 } /* end GetResourceTypeByName */
@@ -257,15 +257,13 @@ AddUpdResqueueCapabilityEntryInternal(
 									  RelationGetDescr(resqueuecap_rel),
 									  values, isnull, new_record_repl);
 
-		simple_heap_update(resqueuecap_rel, &old_tuple->t_self, new_tuple);
-		CatalogUpdateIndexes(resqueuecap_rel, new_tuple);
+		CatalogTupleUpdate(resqueuecap_rel, &old_tuple->t_self, new_tuple);
 	}
 	else
 	{
 		new_tuple = heap_form_tuple(RelationGetDescr(resqueuecap_rel), values, isnull);
 
-		simple_heap_insert(resqueuecap_rel, new_tuple);
-		CatalogUpdateIndexes(resqueuecap_rel, new_tuple);
+		CatalogTupleInsert(resqueuecap_rel, new_tuple);
 	}
 
 	if (HeapTupleIsValid(old_tuple))
@@ -648,6 +646,8 @@ GetResqueueCapabilityEntry(Oid  queueid)
 	Relation	 rel;
 	TupleDesc	 tupdesc;
 
+	Assert(IsTransactionState());
+
 	/* SELECT * FROM pg_resqueuecapability WHERE resqueueid = :1 */
 	rel = heap_open(ResQueueCapabilityRelationId, AccessShareLock);
 
@@ -910,14 +910,16 @@ CreateQueue(CreateQueueStmt *stmt)
 	new_record[Anum_pg_resqueue_rsqignorecostlimit - 1] = 
 		Float4GetDatum(ignorelimit);
 
+	queueid = GetNewOidForResQueue(pg_resqueue_rel, ResQueueOidIndexId, Anum_pg_resqueue_oid,
+								   stmt->queue);
+	new_record[Anum_pg_resqueue_oid - 1] = queueid;
 
 	tuple = heap_form_tuple(pg_resqueue_dsc, new_record, new_record_nulls);
 
 	/*
 	 * Insert new record in the pg_resqueue table
 	 */
-	queueid = simple_heap_insert(pg_resqueue_rel, tuple);
-	CatalogUpdateIndexes(pg_resqueue_rel, tuple);
+	CatalogTupleInsert(pg_resqueue_rel, tuple);
 
 	/* process the remainder of the WITH (...) list items */
 	if (bWith)
@@ -1049,7 +1051,8 @@ AlterQueue(AlterQueueStmt *stmt)
 				dactivelimit = 
 						makeDefElem("active_statements", 
 									(Node *)
-									makeFloat(INVALID_RES_LIMIT_STRING));
+									makeFloat(INVALID_RES_LIMIT_STRING),
+									-1);
 
 			numopts++; alter_subtype = defel->defname;
 		}
@@ -1065,7 +1068,8 @@ AlterQueue(AlterQueueStmt *stmt)
 				dcostlimit = 
 						makeDefElem("max_cost", 
 									(Node *)
-									makeInteger(costlimit));
+									makeInteger(costlimit),
+									-1);
 
 			numopts++; alter_subtype = defel->defname;
 		}
@@ -1081,7 +1085,8 @@ AlterQueue(AlterQueueStmt *stmt)
 				dovercommit = 
 						makeDefElem("cost_overcommit", 
 									(Node *)
-									makeInteger(overcommit));
+									makeInteger(overcommit),
+									-1);
 
 			numopts++; alter_subtype = defel->defname;
 		}
@@ -1097,7 +1102,8 @@ AlterQueue(AlterQueueStmt *stmt)
 				dignorelimit = 
 						makeDefElem("min_cost", 
 									(Node *)
-									makeFloat("0")); /* MPP-7817 */
+									makeFloat("0"), /* MPP-7817 */
+									-1);
 
 			numopts++; alter_subtype = defel->defname;
 
@@ -1244,8 +1250,7 @@ AlterQueue(AlterQueueStmt *stmt)
 	 * Remember the Oid and current thresholds, for updating the in-memory
 	 * queue later.
 	 */
-	queueid = HeapTupleGetOid(tuple);
-
+	queueid = ((Form_pg_resqueue) GETSTRUCT(tuple))->oid;
 	thresholds[RES_COUNT_LIMIT] = 
 		((Form_pg_resqueue) GETSTRUCT(tuple))->rsqcountlimit;
 	thresholds[RES_COST_LIMIT] = 
@@ -1319,8 +1324,7 @@ AlterQueue(AlterQueueStmt *stmt)
 	new_tuple = heap_modify_tuple(tuple, pg_resqueue_dsc, new_record,
 									new_record_nulls, new_record_repl);
 
-	simple_heap_update(pg_resqueue_rel, &tuple->t_self, new_tuple);
-	CatalogUpdateIndexes(pg_resqueue_rel, new_tuple);
+	CatalogTupleUpdate(pg_resqueue_rel, &tuple->t_self, new_tuple);
 
 	systable_endscan(sscan);
 
@@ -1457,7 +1461,7 @@ DropQueue(DropQueueStmt *stmt)
 	 * Remember the Oid, for destroying the in-memory
 	 * queue later.
 	 */
-	queueid = HeapTupleGetOid(tuple);
+	queueid = ((Form_pg_resqueue) GETSTRUCT(tuple))->oid;
 
 	/*
 	 * Check to see if any roles are in this queue.
@@ -1577,7 +1581,7 @@ get_resqueue_oid(const char *queuename, bool missing_ok)
 	tuple = systable_getnext(scan);
 
 	if (HeapTupleIsValid(tuple))
-		oid = HeapTupleGetOid(tuple);
+		oid = ((Form_pg_resqueue) GETSTRUCT(tuple))->oid;
 	else
 		oid = InvalidOid;
 
@@ -1591,94 +1595,4 @@ get_resqueue_oid(const char *queuename, bool missing_ok)
 						queuename)));
 
 	return oid;
-}
-
-/*
- * Given a queue id, return its name
- */
-char *
-GetResqueueName(Oid resqueueOid)
-{
-	Relation	rel;
-	ScanKeyData scankey;
-	SysScanDesc sscan;
-	HeapTuple	tuple;
-	char	   *result;
-
-	if (resqueueOid == InvalidOid)
-		return pstrdup("Unknown");
-
-	/* SELECT rsqname FROM pg_resqueue WHERE oid = :1 */
-	rel = heap_open(ResQueueRelationId, AccessShareLock);
-
-	ScanKeyInit(&scankey, ObjectIdAttributeNumber,
-				BTEqualStrategyNumber, F_OIDEQ,
-				ObjectIdGetDatum(resqueueOid));
-
-	sscan = systable_beginscan(rel, ResQueueOidIndexId, true,
-							   NULL, 1, &scankey);
-
-	tuple = systable_getnext(sscan);
-
-	/* If we cannot find a resource queue id for any reason */
-	if (!tuple)
-		result = pstrdup("Unknown");
-	else
-	{
-		FormData_pg_resqueue *rqform = (FormData_pg_resqueue *) GETSTRUCT(tuple);
-		result = pstrdup(NameStr(rqform->rsqname));
-	}
-
-	systable_endscan(sscan);
-	heap_close(rel, AccessShareLock);
-
-	return result;
-}
-
-/**
- * Given a resource queue id, get its priority in text form
- */
-char *GetResqueuePriority(Oid queueId)
-{
-	if (queueId == InvalidOid)
-		return pstrdup("Unknown");
-	else
-		return GetResqueueCapability(queueId, PG_RESRCTYPE_PRIORITY);
-}
-
-/**
- * Given a queueid and a capability index, return the capability value as a string.
- * Returns NULL if entry is not found.
- * Input:
- * 	queueOid - oid of resource queue
- * 	capabilityIndex - see pg_resqueue.h for values (e.g. PG_RESRCTYPE_PRIORITY)
- */
-static char *GetResqueueCapability(Oid queueOid, int capabilityIndex)
-{
-	/* Update this assert if we add more capabilities */
-	Assert(capabilityIndex <= PG_RESRCTYPE_MEMORY_LIMIT);
-	Assert(queueOid != InvalidOid);
-
-	ListCell *le = NULL;
-	char *result = NULL;
-
-	List *capabilitiesList = GetResqueueCapabilityEntry(queueOid); /* This is a list of lists */
-
-	foreach(le, capabilitiesList)
-	{
-		Value *key = NULL;
-		List *entry = (List *) lfirst(le);
-		Assert(entry);
-		key = (Value *) linitial(entry);
-		Assert(IsA(key,Integer)); /* This is resource type id */
-		if (intVal(key) == capabilityIndex)
-		{
-			Value *val = lsecond(entry);
-			Assert(IsA(val,String));
-			result = pstrdup(strVal(val));
-		}
-	}
-
-	list_free(capabilitiesList);
-	return result;
 }

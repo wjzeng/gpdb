@@ -29,17 +29,15 @@
       <ul id="ul_ojr_rvj_2p">
         <li id="nr157373">You can identify the KDC server you use for Kerberos
           authentication and the Kerberos realm for your Greenplum Database
-            system.<ul id="ul_cn2_nfc_c2b">
-            <li>If you plan to use an MIT Kerberos KDC server but have not yet
-              configured it, see <xref href="#task_setup_kdc" format="dita"/>
-              for example instructions.</li>
-            <li>If you are using an existing Active Directory KDC server, also
+          system. If you have not yet configured your MIT Kerberos KDC server, 
+          see <xref href="#task_setup_kdc" format="dita"/> for example
+          instructions.</li>
+        <!-- li>If you are using an existing Active Directory KDC server, also
               ensure that you have:<ul id="ul_oq5_tfc_c2b">
                 <li>Installed all Active Directory service roles on your AD KDC
                   server.</li>
                 <li>Enabled the LDAP service.</li>
-              </ul></li>
-          </ul></li>
+              </ul></li -->
         <li>System time on the Kerberos Key Distribution Center (KDC) server and
           Greenplum Database master is synchronized. (For example, install the
             <codeph>ntp</codeph> package on both servers.) </li>
@@ -61,10 +59,9 @@
         <li id="nr165111"><xref href="#topic7" format="dita"/></li>
         <li><xref href="#topic_kmr_gws_d2b" format="dita"/></li>
         <li><xref href="#topic9" format="dita"/></li>
-        <li><xref href="kerberos-win-client.xml#topic_vjg_d5m_sv" format="dita"
+        <li><xref href="kerberos-lin-client.xml#topic_j1d_4qz_rz" format="dita"
           /></li>
-        <li><xref href="kerberos-win-client.xml#topic_uzb_t5m_sv" format="dita"
-          /></li>
+        <li><xref href="kerberos-win-client.xml#topic1" format="dita" /></li>
       </ul>
     </section>
   </body>
@@ -163,9 +160,9 @@ $ chmod 400 /home/gpadmin/gpdb-kerberos.keytab</codeblock>
               <codeph>include_realm</codeph> option to <codeph>0</codeph>
             excludes the realm name from the authenticated user name. For
             information about the <codeph>pg_hba.conf</codeph> file, see <xref
-              href="https://www.postgresql.org/docs/8.4/static/auth-pg-hba-conf.html"
+              href="https://www.postgresql.org/docs/9.4/auth-pg-hba-conf.html"
               scope="external" format="html">The pg_hba.conf file</xref> in the
-            Postgres documentation.</p>
+            PostgreSQL documentation.</p>
         </li>
         <li>Restart Greenplum Database after updating the
               <codeph>krb_server_keyfile</codeph> parameter and the
@@ -201,7 +198,7 @@ Valid starting       Expires              Service principal
         </li>
         <li id="nr166158">As a test, log in to the postgres database with the
             <codeph>gpadmin/admin</codeph> role: <codeblock>$ psql -U "gpadmin/admin" -h mdw postgres
-psql (8.3.23)
+psql (9.4.20)
 Type "help" for help.
 
 postgres=# select current_user;
@@ -249,12 +246,12 @@ postgres=# select current_user;
         <li>If the <codeph>map=&lt;map-name></codeph> option is specified, the
           Kerberos principal name is compared to entries labeled with the
           specified <codeph>&lt;map-name></codeph> in the
-            <codeph>$MASTER_DATA_DIRECTORY/pg_ident.conf</codeph> file and
+            <codeph>$COORDINATOR_DATA_DIRECTORY/pg_ident.conf</codeph> file and
           replaced with the Greenplum Database role name specified in the first
           matching entry.</li>
       </ul>
       <p>A user name map is defined in the
-          <codeph>$MASTER_DATA_DIRECTORY/pg_ident.conf</codeph> configuration
+          <codeph>$COORDINATOR_DATA_DIRECTORY/pg_ident.conf</codeph> configuration
         file. This example defines a map named <codeph>mymap</codeph> with two
         entries.</p>
       <p>
@@ -277,7 +274,7 @@ mymap       /^(.*)_gp)@GPDB.KRB$   \1</codeblock>
           <codeph>pg_ident.conf</codeph> file, so the order of entries is
         significant.</p>
       <p>For more information about using username maps see <xref
-          href="https://www.postgresql.org/docs/8.4/static/auth-username-maps.html"
+          href="https://www.postgresql.org/docs/9.4/auth-username-maps.html"
           scope="external" format="html">Username maps</xref> in the PostgreSQL
         documentation.</p>
     </body>

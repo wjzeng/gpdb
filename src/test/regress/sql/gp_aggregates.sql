@@ -35,6 +35,8 @@ SELECT * FROM mpp2687v;
 select case when ten < 5 then ten else ten * 2 end, count(distinct two), count(distinct four) from tenk1 group by 1;
 select ten, ten, count(distinct two), count(distinct four) from tenk1 group by 1,2;
 
+select case when ten < 5 then ten else ten * 2 end, count(distinct two) from tenk1 group by 1;
+
 --MPP-20151: distinct is transformed to a group-by
 select distinct two from tenk1 order by two;
 select distinct two, four from tenk1 order by two, four;
@@ -117,7 +119,13 @@ create aggregate mysum_prefunc(int4) (
   stype=bigint,
   prefunc=int8pl_with_notice
 );
+
+-- tweak settings to force multistage agg to be used
+set gp_motion_cost_per_row = 1000;
+set optimizer_force_multistage_agg = on;
 select mysum_prefunc(a::int4) from aggtest;
+reset gp_motion_cost_per_row;
+reset optimizer_force_multistage_agg;
 
 
 -- Test an aggregate with 'internal' transition type, and a combine function,
@@ -134,3 +142,27 @@ CREATE AGGREGATE my_numeric_avg(numeric) (
 create temp table numerictesttab as select g::numeric as n from generate_series(1,10) g;
 
 select my_numeric_avg(n) from numerictesttab;
+
+--- Test distinct on UDF which EXECUTE ON ALL SEGMENTS
+CREATE FUNCTION distinct_test() RETURNS SETOF boolean EXECUTE ON ALL SEGMENTS
+    LANGUAGE plpgsql AS $$
+BEGIN
+    RETURN QUERY SELECT true;
+END
+$$;
+
+SELECT DISTINCT distinct_test();
+
+DROP FUNCTION distinct_test();
+
+-- Test multi-phase aggregate with subquery scan
+create table multiagg_with_subquery (i int, j int, k int, m int) distributed by (i);
+insert into multiagg_with_subquery select i, i+1, i+2, i+3 from generate_series(1, 10)i;
+analyze multiagg_with_subquery;
+explain (costs off)
+select count(distinct j), count(distinct k), count(distinct m) from (select j,k,m from multiagg_with_subquery group by j,k,m ) sub group by j;
+select count(distinct j), count(distinct k), count(distinct m) from (select j,k,m from multiagg_with_subquery group by j,k,m ) sub group by j;
+drop table multiagg_with_subquery;
+
+-- Unique node numGroups > 0 assertion
+SELECT DISTINCT avg(c1) FROM generate_series(1,2) c1;

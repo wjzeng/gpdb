@@ -96,7 +96,7 @@ SELECT SUM(length(long_tval)) AS sum_len_tval
             JOIN (SELECT * FROM small_table ORDER BY dkey LIMIT 500) bar USING(jkey);
 
 -- Gather motion (Window function)
-SELECT dkey % 30 AS dkey2, MIN(rank) AS min_rank, AVG(foo.rval) AS avg_rval
+SELECT dkey % 30 AS dkey2, MIN(rank) AS min_rank, to_char(AVG(foo.rval), '99.9999999999999') AS avg_rval
   FROM (SELECT RANK() OVER(ORDER BY rval DESC) AS rank, jkey, rval
         FROM small_table) foo
     JOIN small_table USING(jkey)
@@ -293,21 +293,6 @@ DROP FUNCTION system_call_fault_injection_test();
 -- Improve code coverage by disable fault injection
 SET gp_udpic_fault_inject_percent = 40;
 SET gp_udpic_fault_inject_bitmap = 0;
-SELECT ROUND(foo.rval * foo.rval)::INT % 30 AS rval2, COUNT(*) AS count, SUM(length(foo.tval)) AS sum_len_tval
-  FROM (SELECT 5001 AS jkey, rval, tval FROM small_table ORDER BY dkey LIMIT 3000) foo
-    JOIN small_table USING(jkey)
-  GROUP BY rval2
-  ORDER BY rval2;
-
--- connection hash table rehash
-SET gp_interconnect_hash_multiplier = 64;
-SELECT ROUND(foo.rval * foo.rval)::INT % 30 AS rval2, COUNT(*) AS count, SUM(length(foo.tval)) AS sum_len_tval
-  FROM (SELECT 5001 AS jkey, rval, tval FROM small_table ORDER BY dkey LIMIT 3000) foo
-    JOIN small_table USING(jkey)
-  GROUP BY rval2
-  ORDER BY rval2;
-
-SET gp_interconnect_hash_multiplier = 2;
 SELECT ROUND(foo.rval * foo.rval)::INT % 30 AS rval2, COUNT(*) AS count, SUM(length(foo.tval)) AS sum_len_tval
   FROM (SELECT 5001 AS jkey, rval, tval FROM small_table ORDER BY dkey LIMIT 3000) foo
     JOIN small_table USING(jkey)

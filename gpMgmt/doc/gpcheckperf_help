@@ -140,7 +140,7 @@ page size. The maximum block size is 1 MB.
 -f <hostfile_gpchecknet>
 
  For the network performance test, all entries in the host file must be 
- for host adresses within the same subnet. If your segment hosts have 
+ for host addresses within the same subnet. If your segment hosts have
  multiple network interfaces configured on different subnets, run the 
  network test once for each subnet. For example (a host file containing 
  segment host address names for interconnect subnet 1):
@@ -161,7 +161,7 @@ page size. The maximum block size is 1 MB.
  Specifies that the netperf binary should be used to perform the 
  network test instead of the Greenplum network test. To use this 
  option, you must download netperf from www.netperf.org and install 
- it into $GPHOME/bin/lib on all Greenplum hosts (master and segments).
+ it into $GPHOME/bin/lib on all Greenplum hosts (coordinator and segments).
 
 
 -r ds{n|N|M}
@@ -175,7 +175,7 @@ page size. The maximum block size is 1 MB.
    (N) mode, you must run the test on an even number of hosts. If you 
    would rather use netperf (www.netperf.org) instead of the 
    Greenplum network test, you can download it and install it into 
-   $GPHOME/bin/lib on all Greenplum hosts (master and segments). 
+   $GPHOME/bin/lib on all Greenplum hosts (coordinator and segments). 
    You would then specify the optional --netperf option to use the 
    netperf binary instead of the default gpnetbench* utilities.
 
@@ -246,5 +246,5 @@ $ gpcheckperf -f hostfile_gpchecknet_ic2 -r N --netperf -d /tmp
 SEE ALSO
 *****************************************************
 
-gpssh, gpscp, gpcheck
+gpssh, gpscp
 

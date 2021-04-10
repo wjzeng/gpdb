@@ -26,8 +26,8 @@
         expression—an expression that computes a table. Greenplum Database allows this type only as
         an argument to a user-defined function. See <xref href="#topic_ig2_1pc_qfb" format="dita"/>
         for more about the <i>anytable</i> pseudo-type.</p>
-      <p>For more information about pseudo-types, see the Postgres documentation about <xref
-          href="https://www.postgresql.org/docs/8.3/static/datatype-pseudo.html" format="html"
+      <p>For more information about pseudo-types, see the PostgreSQL documentation about <xref
+          href="https://www.postgresql.org/docs/9.4/datatype-pseudo.html" format="html"
           scope="external">Pseudo-Types</xref>.</p>
     </body>
     <topic id="topic_dbn_bpc_qfb">
@@ -74,8 +74,8 @@
           last parameter is declared as <codeph>VARIADIC <i>anyarray</i></codeph>. For purposes of
           argument matching and determining the actual result type, such a function behaves the same
           as if you had declared the appropriate number of <i>anynonarray</i> parameters.</p>
-        <p>For more information about polymorphic types, see the Postgres documentation about <xref
-            href="https://www.postgresql.org/docs/8.3/static/xfunc-c.html#AEN41553" format="html"
+        <p>For more information about polymorphic types, see the PostgreSQL documentation about <xref
+            href="https://www.postgresql.org/docs/9.4/xfunc-c.html#AEN56822" format="html"
             scope="external">Polymorphic Arguments and Return Types</xref>.</p>
       </body>
     </topic>
@@ -99,7 +99,7 @@
           languages. The body of the function can access the table using the Greenplum Database
           Server Programming Interface (SPI) or the Greenplum Partner Connector (GPPC) API. </p>
         <p otherprops="pivotal">The <i>anytable</i> type is used in some user-defined functions in
-          the Pivotal GPText API. The following GPText example uses the <codeph>TABLE</codeph>
+          the Tanzu Greenplum Text API. The following GPText example uses the <codeph>TABLE</codeph>
           function with the <codeph>SCATTER BY</codeph> clause in the GPText function
             <codeph>gptext.index()</codeph> to populate the index
             <codeph>mydb.mytest.articles</codeph> with data from the messages
@@ -107,7 +107,7 @@
           SCATTER BY distrib_id), 'mydb.mytest.messages');
         </codeblock></p>
         <p otherprops="pivotal">For information about the function <codeph>gptext.index()</codeph>,
-          see the Pivotal GPText documentation.</p>
+          see the Tanzu Greenplum Text documentation.</p>
       </body>
     </topic>
   </topic>

@@ -18,7 +18,7 @@
  * be sure which distributed transaction we are looking at.
  *
  * Portions Copyright (c) 2007-2008, Greenplum inc
- * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
  *
  *
  * IDENTIFICATION
@@ -37,36 +37,27 @@
  */
 typedef struct DistributedLogEntry
 {
-	DistributedTransactionTimeStamp distribTimeStamp;
 	DistributedTransactionId distribXid;
 
 } DistributedLogEntry;
 
-/* Number of SLRU buffers to use for the distributed log */
-#define NUM_DISTRIBUTEDLOG_BUFFERS	8
-
 extern void DistributedLog_SetCommittedTree(TransactionId xid, int nxids, TransactionId *xids,
-								DistributedTransactionTimeStamp	distribTimeStamp,
 								DistributedTransactionId distribXid,
 								bool isRedo);
 extern bool DistributedLog_CommittedCheck(
 							  TransactionId localXid,
-							  DistributedTransactionTimeStamp *dtxStartTime,
 							  DistributedTransactionId *distribXid);
 extern bool DistributedLog_ScanForPrevCommitted(
 									TransactionId *indexXid,
-									DistributedTransactionTimeStamp *distribTimeStamp,
 									DistributedTransactionId *distribXid);
 extern TransactionId DistributedLog_AdvanceOldestXmin(TransactionId oldestInProgressLocalXid,
-								 DistributedTransactionTimeStamp distribTimeStamp,
 								 DistributedTransactionId oldestDistribXid);
-extern void DistributedLog_AdvanceOldestXminOnQD(TransactionId oldestLocalXmin);
 extern TransactionId DistributedLog_GetOldestXmin(TransactionId oldestLocalXmin);
 
+extern Size DistributedLog_ShmemBuffers(void);
 extern Size DistributedLog_ShmemSize(void);
 extern void DistributedLog_ShmemInit(void);
 extern void DistributedLog_BootStrap(void);
-extern bool DistributedLog_UpgradeCheck(bool inRecovery);
 extern void DistributedLog_Startup(
 					   TransactionId oldestActiveXid,
 					   TransactionId nextXid);
@@ -75,12 +66,17 @@ extern void DistributedLog_CheckPoint(void);
 extern void DistributedLog_Extend(TransactionId newestXid);
 extern bool DistributedLog_GetLowWaterXid(
 							  TransactionId *lowWaterXid);
+extern void DistributedLog_InitOldestXmin(void);
 
 /* XLOG stuff */
 #define DISTRIBUTEDLOG_ZEROPAGE		0x00
 #define DISTRIBUTEDLOG_TRUNCATE		0x10
 
-extern void DistributedLog_redo(XLogRecPtr beginLoc, XLogRecPtr lsn, XLogRecord *record);
-extern void DistributedLog_desc(StringInfo buf, XLogRecord *record);
+extern void DistributedLog_redo(XLogReaderState *record);
+extern void DistributedLog_desc(StringInfo buf, XLogReaderState *record);
+extern const char *DistributedLog_identify(uint8 info);
+extern void DistributedLog_GetDistributedXid(
+				TransactionId 						localXid,
+				DistributedTransactionId 			*distribXid);
 
 #endif							/* DISTRIBUTEDLOG_H */

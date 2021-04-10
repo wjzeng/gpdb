@@ -1,14 +1,15 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 #
 # Copyright (c) Greenplum Inc 2008. All Rights Reserved. 
 #
 
 import os
+import pipes
 
 from gppylib.gplog import *
 from gppylib.gparray import *
-from base import *
-from unix import *
+from .base import *
+from .unix import *
 from gppylib.commands.base import *
 
 logger = get_default_logger()
@@ -160,7 +161,7 @@ class PgControlData(Command):
 
     def get_value(self, name):
         if not self.results:
-            raise Exception, 'Command not yet executed'
+            raise Exception('Command not yet executed')
         if not self.data:
             self.data = {}
             for l in self.results.stdout.split('\n'):
@@ -172,11 +173,11 @@ class PgControlData(Command):
     def get_datadir(self):
         return self.datadir
 
+
 class PgBaseBackup(Command):
-    def __init__(self, pgdata, host, port, excludePaths=[], ctxt=LOCAL, remoteHost=None, forceoverwrite=False):
-        cmd_tokens = ['pg_basebackup',
-                           '-x', '-R',
-                           '-c', 'fast']
+    def __init__(self, pgdata, host, port, create_slot=False, replication_slot_name=None, excludePaths=[], ctxt=LOCAL, remoteHost=None, forceoverwrite=False, target_gp_dbid=0, logfile=None,
+                 recovery_mode=True):
+        cmd_tokens = ['pg_basebackup', '-c', 'fast']
         cmd_tokens.append('-D')
         cmd_tokens.append(pgdata)
         cmd_tokens.append('-h')
@@ -184,8 +185,26 @@ class PgBaseBackup(Command):
         cmd_tokens.append('-p')
         cmd_tokens.append(port)
 
+        if create_slot:
+            cmd_tokens.append('--create-slot')
+
+        cmd_tokens.extend(self._xlog_arguments(replication_slot_name))
+
+        # GPDB_12_MERGE_FIXME: avoid checking checksum for heap tables
+        # till we code logic to skip/verify checksum for
+        # appendoptimized tables. Enabling this results in basebackup
+        # failures with appendoptimized tables.
+        cmd_tokens.append('--no-verify-checksums')
+
         if forceoverwrite:
             cmd_tokens.append('--force-overwrite')
+
+        if recovery_mode:
+            cmd_tokens.append('--write-recovery-conf')
+
+        # This is needed to handle Greenplum tablespaces
+        cmd_tokens.append('--target-gp-dbid')
+        cmd_tokens.append(str(target_gp_dbid))
 
         # We exclude certain unnecessary directories from being copied as they will greatly
         # slow down the speed of gpinitstandby if containing a lot of data
@@ -193,17 +212,27 @@ class PgBaseBackup(Command):
             cmd_tokens.append('-E')
             cmd_tokens.append('./db_dumps')
             cmd_tokens.append('-E')
-            cmd_tokens.append('./gpperfmon/data')
-            cmd_tokens.append('-E')
-            cmd_tokens.append('./gpperfmon/logs')
-            cmd_tokens.append('-E')
             cmd_tokens.append('./promote')
-            cmd_tokens.append('-E')
-            cmd_tokens.append('./gp_dbid')
         else:
             for path in excludePaths:
                 cmd_tokens.append('-E')
                 cmd_tokens.append(path)
 
+        cmd_tokens.append('--progress')
+        cmd_tokens.append('--verbose')
+
+        if logfile:
+            cmd_tokens.append('> %s 2>&1' % pipes.quote(logfile))
+
         cmd_str = ' '.join(cmd_tokens)
+
+        self.command_tokens = cmd_tokens
+
         Command.__init__(self, 'pg_basebackup', cmd_str, ctxt=ctxt, remoteHost=remoteHost)
+
+    @staticmethod
+    def _xlog_arguments(replication_slot_name):
+        if replication_slot_name:
+            return ["--slot", replication_slot_name, "--wal-method", "stream"]
+        else:
+            return ["--wal-method", "fetch"]

@@ -11,9 +11,10 @@ gpexpand
       | -i <input_file> [-B <batch_size>] [-V] [-t segment_tar_dir] [-S]
       | {-d <hh:mm:ss> | -e '<YYYY-MM-DD hh:mm:ss>'} 
         [-analyze] [-n <parallel_processes>]
+      | --hba-hostnames
       | --rollback
       | --clean
-[-D <database_name>][--verbose] [--silent]
+[--verbose] [--silent]
 
 gpexpand -? | -h | --help 
 
@@ -38,7 +39,7 @@ PREREQUISITES
   copy of your largest table. 
 * When redistributing data, Greenplum Database must be running in 
   production mode. Greenplum Database cannot be restricted mode or in 
-  master mode. The gpstart options -R or -m cannot be specified to start 
+  coordinator mode. The gpstart options -R or -m cannot be specified to start 
   Greenplum Database. 
   
   
@@ -110,13 +111,6 @@ OPTIONS
  Duration of the expansion session from beginning to end.
 
 
--D <database_name>
- Specifies the database in which to create the expansion schema 
- and tables. If this option is not given, the setting for the 
- environment variable PGDATABASE is used. The database templates 
- template1 and template0 cannot be used.
-
-
 -e | --end '<YYYY-MM-DD hh:mm:ss>'
  Ending date and time for the expansion session.
 
@@ -130,11 +124,15 @@ OPTIONS
  are configured with multiple network interfaces.
 
 
+--hba-hostnames
+ Optional. use hostnames instead of CIDR in pg_hba.conf
+
+
 -i | --input <input_file>
  Specifies the name of the expansion configuration file, which contains 
  one line for each segment to be added in the format of:
 
-  <hostname>:<address>:<port>:<datadir>:<dbid>:<content>:<preferred_role>
+  <hostname>|<address>|<port>|<datadir>|<dbid>|<content>|<preferred_role>
 
   ...
 
@@ -149,9 +147,7 @@ OPTIONS
 
 
 -r | --rollback
- Roll back a failed expansion setup operation. If the rollback command 
- fails, attempt again using the -D option to specify the database that 
- contains the expansion schema for the operation that you want to roll back.
+ Roll back a failed expansion setup operation.
 
 
 -s | --silent

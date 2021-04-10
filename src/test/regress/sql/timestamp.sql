@@ -44,16 +44,12 @@ SELECT pg_sleep(0.1);
 SELECT count(*) AS two FROM TIMESTAMP_TBL WHERE d1 = timestamp(2) without time zone 'now';
 COMMIT;
 
-DELETE FROM TIMESTAMP_TBL;
+TRUNCATE TIMESTAMP_TBL;
 
 -- Special values
 INSERT INTO TIMESTAMP_TBL VALUES ('-infinity');
 INSERT INTO TIMESTAMP_TBL VALUES ('infinity');
 INSERT INTO TIMESTAMP_TBL VALUES ('epoch');
--- Obsolete special values
-INSERT INTO TIMESTAMP_TBL VALUES ('invalid');
-INSERT INTO TIMESTAMP_TBL VALUES ('undefined');
-INSERT INTO TIMESTAMP_TBL VALUES ('current');
 
 -- Postgres v6.0 standard output format
 INSERT INTO TIMESTAMP_TBL VALUES ('Mon Feb 10 17:32:01 1997 PST');
@@ -142,6 +138,11 @@ INSERT INTO TIMESTAMP_TBL VALUES ('Feb 16 17:32:01 -0097');
 INSERT INTO TIMESTAMP_TBL VALUES ('Feb 16 17:32:01 5097 BC');
 
 SELECT '' AS "64", d1 FROM TIMESTAMP_TBL;
+
+-- Check behavior at the lower boundary of the timestamp range
+SELECT '4714-11-24 00:00:00 BC'::timestamp;
+SELECT '4714-11-23 23:59:59 BC'::timestamp;  -- out of range
+-- The upper boundary differs between integer and float timestamps, so no check
 
 -- Demonstrate functions and operators
 SELECT '' AS "48", d1 FROM TIMESTAMP_TBL
@@ -275,12 +276,3 @@ SET DateStyle TO DEFAULT;
 
 -- Make sure timeofdate() and current_time() are doing roughly the same thing
 select timeofday()::date = current_timestamp::date;
-
---MPP-5665
-select '20081225130000.123456'::timestamp;
-select '20081225130000'::timestamp;
-select '20081225130000.000000000000000000000'::timestamp;
-select '20090625123002.111111111111'::timestamp;
--- should error out
-select '2009062512300.111111111111'::timestamp;
-select '200906251230021.111111111111'::timestamp;

@@ -8,7 +8,7 @@
  * of the Datum.  (We do it this way because in most situations the caller
  * can look up the info just once and use it for many per-datum operations.)
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/utils/datum.h
@@ -24,18 +24,18 @@
 extern Size datumGetSize(Datum value, bool typByVal, int typLen);
 
 /*
- * datumCopy - make a copy of a datum.
+ * datumCopy - make a copy of a non-NULL datum.
  *
  * If the datatype is pass-by-reference, memory is obtained with palloc().
  */
 extern Datum datumCopy(Datum value, bool typByVal, int typLen);
 
 /*
- * datumFree - free a datum previously allocated by datumCopy, if any.
+ * datumTransfer - transfer a non-NULL datum into the current memory context.
  *
- * Does nothing if datatype is pass-by-value.
+ * Differs from datumCopy() in its handling of read-write expanded objects.
  */
-extern void datumFree(Datum value, bool typByVal, int typLen);
+extern Datum datumTransfer(Datum value, bool typByVal, int typLen);
 
 /*
  * datumIsEqual
@@ -44,6 +44,25 @@ extern void datumFree(Datum value, bool typByVal, int typLen);
  * XXX : See comments in the code for restrictions!
  */
 extern bool datumIsEqual(Datum value1, Datum value2,
-			 bool typByVal, int typLen);
+						 bool typByVal, int typLen);
 
-#endif   /* DATUM_H */
+/*
+ * datum_image_eq
+ *
+ * Compares two datums for identical contents, based on byte images.  Return
+ * true if the two datums are equal, false otherwise.
+ */
+extern bool datum_image_eq(Datum value1, Datum value2,
+						   bool typByVal, int typLen);
+
+/*
+ * Serialize and restore datums so that we can transfer them to parallel
+ * workers.
+ */
+extern Size datumEstimateSpace(Datum value, bool isnull, bool typByVal,
+							   int typLen);
+extern void datumSerialize(Datum value, bool isnull, bool typByVal,
+						   int typLen, char **start_address);
+extern Datum datumRestore(char **start_address, bool *isnull);
+
+#endif							/* DATUM_H */

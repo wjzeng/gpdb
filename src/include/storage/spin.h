@@ -19,21 +19,16 @@
  *		Unlock a previously acquired lock.
  *
  *	bool SpinLockFree(slock_t *lock)
- *		Tests if the lock is free. Returns TRUE if free, FALSE if locked.
+ *		Tests if the lock is free. Returns true if free, false if locked.
  *		This does *not* change the state of the lock.
  *
  *	Callers must beware that the macro argument may be evaluated multiple
  *	times!
  *
- *	CAUTION: Care must be taken to ensure that loads and stores of
- *	shared memory values are not rearranged around spinlock acquire
- *	and release. This is done using the "volatile" qualifier: the C
- *	standard states that loads and stores of volatile objects cannot
- *	be rearranged *with respect to other volatile objects*. The
- *	spinlock is always written through a volatile pointer by the
- *	spinlock macros, but this is not sufficient by itself: code that
- *	protects shared data with a spinlock MUST reference that shared
- *	data through a volatile pointer.
+ *	Load and store operations in calling code are guaranteed not to be
+ *	reordered with respect to these operations, because they include a
+ *	compiler barrier.  (Before PostgreSQL 9.5, callers needed to use a
+ *	volatile qualifier to access data protected by spinlocks.)
  *
  *	Keep in mind the coding rule that spinlocks must not be held for more
  *	than a few instructions.  In particular, we assume it is not possible
@@ -46,7 +41,7 @@
  *	be again.
  *
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/storage/spin.h
@@ -75,8 +70,8 @@ extern int	SpinlockSemas(void);
 extern Size SpinlockSemaSize(void);
 
 #ifndef HAVE_SPINLOCKS
-extern void SpinlockSemaInit(PGSemaphore);
-extern PGSemaphore SpinlockSemaArray;
+extern void SpinlockSemaInit(void);
+extern PGSemaphore *SpinlockSemaArray;
 #endif
 
-#endif   /* SPIN_H */
+#endif							/* SPIN_H */

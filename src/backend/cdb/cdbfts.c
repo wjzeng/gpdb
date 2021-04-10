@@ -4,7 +4,7 @@
  *	  Provides fault tolerance service routines for mpp.
  *
  * Portions Copyright (c) 2003-2008, Greenplum inc
- * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
  *
  *
  * IDENTIFICATION
@@ -34,7 +34,6 @@
 #include "executor/spi.h"
 
 #include "postmaster/fts.h"
-#include "utils/faultinjection.h"
 
 #include "utils/fmgroids.h"
 #include "catalog/pg_authid.h"
@@ -43,7 +42,8 @@
 #define MASTER_SEGMENT_ID -1
 
 volatile FtsProbeInfo *ftsProbeInfo = NULL;	/* Probe process updates this structure */
-static LWLockId ftsControlLock;
+
+extern volatile pid_t *shmFtsProbePID;
 
 /*
  * get fts share memory size
@@ -51,12 +51,6 @@ static LWLockId ftsControlLock;
 int
 FtsShmemSize(void)
 {
-	/*
-	 * this shared memory block doesn't even need to *exist* on the QEs!
-	 */
-	if ((Gp_role != GP_ROLE_DISPATCH) && (Gp_role != GP_ROLE_UTILITY))
-		return 0;
-
 	return MAXALIGN(sizeof(FtsControlBlock));
 }
 
@@ -66,50 +60,67 @@ FtsShmemInit(void)
 	bool		found;
 	FtsControlBlock *shared;
 
-	shared = (FtsControlBlock *) ShmemInitStruct("Fault Tolerance manager", FtsShmemSize(), &found);
+	shared = (FtsControlBlock *) ShmemInitStruct("Fault Tolerance manager", sizeof(FtsControlBlock), &found);
 	if (!shared)
 		elog(FATAL, "FTS: could not initialize fault tolerance manager share memory");
 
-	/* Initialize locks and shared memory area */
-	ftsControlLock = shared->ControlLock;
+	/* Initialize shared memory area */
 	ftsProbeInfo = &shared->fts_probe_info;
+	shmFtsProbePID = &shared->fts_probe_pid;
+	*shmFtsProbePID = 0;
 
 	if (!IsUnderPostmaster)
-	{
-		shared->ControlLock = LWLockAssign();
-		ftsControlLock = shared->ControlLock;
-
-		shared->fts_probe_info.fts_statusVersion = 0;
-	}
+		shared->fts_probe_info.status_version = 0;
 }
 
-void
-ftsLock(void)
-{
-	LWLockAcquire(ftsControlLock, LW_EXCLUSIVE);
-}
-
-void
-ftsUnlock(void)
-{
-	LWLockRelease(ftsControlLock);
-}
-
+/* see src/backend/fts/README */
 void
 FtsNotifyProber(void)
 {
 	Assert(Gp_role == GP_ROLE_DISPATCH);
-	uint8 probeTick = ftsProbeInfo->probeTick;
+	int32			initial_started;
+	int32			started;
+	int32			done;
 
-	/* signal fts-probe */
+	if (am_ftsprobe)
+		return;
+
+	SpinLockAcquire(&ftsProbeInfo->lock);
+	initial_started = ftsProbeInfo->start_count;
+	SpinLockRelease(&ftsProbeInfo->lock);
+
 	SendPostmasterSignal(PMSIGNAL_WAKEN_FTS);
 
-	/* sit and spin */
-	while (probeTick == ftsProbeInfo->probeTick)
+	SIMPLE_FAULT_INJECTOR("ftsNotify_before");
+
+	/* Wait for a new fts probe to start. */
+	for (;;)
 	{
-		pg_usleep(50000);
+		SpinLockAcquire(&ftsProbeInfo->lock);
+		started = ftsProbeInfo->start_count;
+		SpinLockRelease(&ftsProbeInfo->lock);
+
+		if (started != initial_started)
+			break;
+
 		CHECK_FOR_INTERRUPTS();
+		pg_usleep(50000);
 	}
+
+	/* Wait until current probe in progress is completed */
+	for (;;)
+	{
+		SpinLockAcquire(&ftsProbeInfo->lock);
+		done = ftsProbeInfo->done_count;
+		SpinLockRelease(&ftsProbeInfo->lock);
+
+		if (done - started >= 0)
+			break;
+
+		CHECK_FOR_INTERRUPTS();
+		pg_usleep(50000);
+	}
+
 }
 
 /*
@@ -120,10 +131,10 @@ bool
 FtsIsSegmentDown(CdbComponentDatabaseInfo *dBInfo)
 {
 	/* master is always reported as alive */
-	if (dBInfo->segindex == MASTER_SEGMENT_ID)
+	if (dBInfo->config->segindex == MASTER_SEGMENT_ID)
 		return false;
 
-	return FTS_STATUS_IS_DOWN(ftsProbeInfo->fts_status[dBInfo->dbid]);
+	return FTS_STATUS_IS_DOWN(ftsProbeInfo->status[dBInfo->config->dbid]);
 }
 
 /*
@@ -140,12 +151,12 @@ FtsTestSegmentDBIsDown(SegmentDatabaseDescriptor **segdbDesc, int size)
 	{
 		CdbComponentDatabaseInfo *segInfo = segdbDesc[i]->segment_database_info;
 
-		elog(DEBUG2, "FtsTestSegmentDBIsDown: looking for real fault on segment dbid %d", (int) segInfo->dbid);
+		elog(DEBUG2, "FtsTestSegmentDBIsDown: looking for real fault on segment dbid %d", (int) segInfo->config->dbid);
 
 		if (FtsIsSegmentDown(segInfo))
 		{
 			ereport(LOG, (errmsg_internal("FTS: found fault with segment dbid %d. "
-										  "Reconfiguration is in progress", (int) segInfo->dbid)));
+										  "Reconfiguration is in progress", (int) segInfo->config->dbid)));
 			return true;
 		}
 	}
@@ -156,5 +167,5 @@ FtsTestSegmentDBIsDown(SegmentDatabaseDescriptor **segdbDesc, int size)
 uint8
 getFtsVersion(void)
 {
-	return ftsProbeInfo->fts_statusVersion;
+	return ftsProbeInfo->status_version;
 }

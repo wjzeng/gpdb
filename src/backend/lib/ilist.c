@@ -3,7 +3,7 @@
  * ilist.c
  *	  support for integrated/inline doubly- and singly- linked lists
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -17,9 +17,6 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
-
-/* See ilist.h */
-#define ILIST_INCLUDE_DEFINITIONS
 
 #include "lib/ilist.h"
 
@@ -35,7 +32,7 @@ slist_delete(slist_head *head, slist_node *node)
 {
 	slist_node *last = &head->head;
 	slist_node *cur;
-	bool found	PG_USED_FOR_ASSERTS_ONLY = false;
+	bool		found PG_USED_FOR_ASSERTS_ONLY = false;
 
 	while ((cur = last->next) != NULL)
 	{
@@ -111,4 +108,4 @@ slist_check(slist_head *head)
 		;
 }
 
-#endif   /* ILIST_DEBUG */
+#endif							/* ILIST_DEBUG */

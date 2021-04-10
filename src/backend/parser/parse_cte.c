@@ -3,7 +3,7 @@
  * parse_cte.c
  *	  handle CTEs (common table expressions) in parser
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -16,6 +16,7 @@
 
 #include "catalog/pg_collation.h"
 #include "catalog/pg_type.h"
+#include "cdb/cdbvars.h"
 #include "nodes/nodeFuncs.h"
 #include "parser/analyze.h"
 #include "parser/parse_cte.h"
@@ -113,6 +114,16 @@ transformWithClause(ParseState *pstate, WithClause *withClause)
 	Assert(pstate->p_future_ctes == NIL);
 
 	/*
+	 * WITH RECURSIVE is disabled if gp_recursive_cte is not set
+	 * to allow recursive CTEs.
+	 */
+	if (withClause->recursive && !gp_recursive_cte)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("RECURSIVE clauses in WITH queries are currently disabled"),
+				 errhint("In order to use recursive CTEs, \"gp_recursive_cte\" must be turned on.")));
+
+	/*
 	 * For either type of WITH, there must not be duplicate CTE names in the
 	 * list.  Check this right away so we needn't worry later.
 	 *
@@ -131,8 +142,8 @@ transformWithClause(ParseState *pstate, WithClause *withClause)
 			if (strcmp(cte->ctename, cte2->ctename) == 0)
 				ereport(ERROR,
 						(errcode(ERRCODE_DUPLICATE_ALIAS),
-					errmsg("WITH query name \"%s\" specified more than once",
-						   cte2->ctename),
+						 errmsg("WITH query name \"%s\" specified more than once",
+								cte2->ctename),
 						 parser_errposition(pstate, cte2->location)));
 		}
 
@@ -145,6 +156,19 @@ transformWithClause(ParseState *pstate, WithClause *withClause)
 			Assert(IsA(cte->ctequery, InsertStmt) ||
 				   IsA(cte->ctequery, UpdateStmt) ||
 				   IsA(cte->ctequery, DeleteStmt));
+
+
+			/*
+			 * Since GPDB currently only support a single writer gang, only one
+			 * writable clause is permitted per CTE. Once we get flexible gangs
+			 * with more than one writer gang we can lift this restriction.
+			 */
+			if (pstate->p_hasModifyingCTE)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("only one modifying WITH clause allowed per query"),
+						 errdetail("Greenplum Database currently only support CTEs with one writable clause."),
+						 errhint("Rewrite the query to only include one writable CTE clause.")));
 
 			pstate->p_hasModifyingCTE = true;
 		}
@@ -243,7 +267,7 @@ analyzeCTE(ParseState *pstate, CommonTableExpr *cte)
 	/* Analysis not done already */
 	Assert(!IsA(cte->ctequery, Query));
 
-	query = parse_sub_analyze(cte->ctequery, pstate, cte, NULL);
+	query = parse_sub_analyze(cte->ctequery, pstate, cte, NULL, true);
 	cte->ctequery = (Node *) query;
 
 	/*
@@ -315,7 +339,7 @@ analyzeCTE(ParseState *pstate, CommonTableExpr *cte)
 						 errmsg("recursive query \"%s\" column %d has type %s in non-recursive term but type %s overall",
 								cte->ctename, varattno,
 								format_type_with_typemod(lfirst_oid(lctyp),
-													   lfirst_int(lctypmod)),
+														 lfirst_int(lctypmod)),
 								format_type_with_typemod(exprType(texpr),
 														 exprTypmod(texpr))),
 						 errhint("Cast the output of the non-recursive term to the correct type."),
@@ -333,43 +357,8 @@ analyzeCTE(ParseState *pstate, CommonTableExpr *cte)
 			lctypmod = lnext(lctypmod);
 			lccoll = lnext(lccoll);
 		}
-		if (lctyp != NULL || lctypmod != NULL || lccoll != NULL)		/* shouldn't happen */
+		if (lctyp != NULL || lctypmod != NULL || lccoll != NULL)	/* shouldn't happen */
 			elog(ERROR, "wrong number of output columns in WITH");
-	}
-}
-
-/*
- * reportDuplicateNames
- *    Report error when a given list of names (in String) contain duplicate values for a given
- * query name.
- */
-static void
-reportDuplicateNames(const char *queryName, List *names)
-{
-	if (names == NULL)
-		return;
-
-	ListCell *lc;
-	foreach (lc, names)
-	{
-		Value *string = (Value *)lfirst(lc);
-		Assert(IsA(string, String));
-
-		ListCell *rest;
-		for_each_cell(rest, lnext(lc))
-		{
-			Value *string2 = (Value *)lfirst(rest);
-			Assert(IsA(string, String));
-			
-			if (strcmp(strVal(string), strVal(string2)) == 0)
-			{
-				ereport(ERROR,
-						(errcode(ERRCODE_SYNTAX_ERROR),
-						 errmsg("WITH query \"%s\" must not have duplicate column name: %s",
-								queryName, strVal(string)),
-						 errhint("Specify a column list without duplicate names")));
-			}
-		}
 	}
 }
 
@@ -430,11 +419,10 @@ analyzeCTETargetList(ParseState *pstate, CommonTableExpr *cte, List *tlist)
 
 		/*
 		 * If the CTE is recursive, force the exposed column type of any
-		 * "unknown" column to "text".  This corresponds to the fact that
-		 * SELECT 'foo' UNION SELECT 'bar' will ultimately produce text. We
-		 * might see "unknown" as a result of an untyped literal in the
-		 * non-recursive term's select list, and if we don't convert to text
-		 * then we'll have a mismatch against the UNION result.
+		 * "unknown" column to "text".  We must deal with this here because
+		 * we're called on the non-recursive term before there's been any
+		 * attempt to force unknown output columns to some other type.  We
+		 * have to resolve unknowns before looking at the recursive term.
 		 *
 		 * The column might contain 'foo' COLLATE "bar", so don't override
 		 * collation if it's already set.
@@ -456,8 +444,6 @@ analyzeCTETargetList(ParseState *pstate, CommonTableExpr *cte, List *tlist)
 				 errmsg("WITH query \"%s\" has %d columns available but %d columns specified",
 						cte->ctename, varattno, numaliases),
 				 parser_errposition(pstate, cte->location)));
-
-	reportDuplicateNames(cte->ctename, cte->ctecolnames);
 }
 
 
@@ -635,7 +621,7 @@ TopologicalSort(ParseState *pstate, CteItem *items, int numitems)
 		if (j >= numitems)
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			errmsg("mutual recursion between WITH items is not implemented"),
+					 errmsg("mutual recursion between WITH items is not implemented"),
 					 parser_errposition(pstate, items[i].cte->location)));
 
 		/*
@@ -677,7 +663,7 @@ checkWellFormedRecursion(CteState *cstate)
 		CommonTableExpr *cte = cstate->items[i].cte;
 		SelectStmt *stmt = (SelectStmt *) cte->ctequery;
 
-		Assert(!IsA(stmt, Query));		/* not analyzed yet */
+		Assert(!IsA(stmt, Query));	/* not analyzed yet */
 
 		/* Ignore items that weren't found to be recursive */
 		if (!cte->cterecursive)
@@ -739,9 +725,9 @@ checkWellFormedRecursion(CteState *cstate)
 		if (stmt->sortClause)
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				  errmsg("ORDER BY in a recursive query is not implemented"),
+					 errmsg("ORDER BY in a recursive query is not implemented"),
 					 parser_errposition(cstate->pstate,
-								  exprLocation((Node *) stmt->sortClause))));
+										exprLocation((Node *) stmt->sortClause))));
 		if (stmt->limitOffset)
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -759,7 +745,7 @@ checkWellFormedRecursion(CteState *cstate)
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("FOR UPDATE/SHARE in a recursive query is not implemented"),
 					 parser_errposition(cstate->pstate,
-							   exprLocation((Node *) stmt->lockingClause))));
+										exprLocation((Node *) stmt->lockingClause))));
 	}
 }
 
@@ -1089,7 +1075,7 @@ checkWindowFuncInRecursiveTerm(SelectStmt *stmt, CteState *cstate)
 				{
 					ereport(ERROR,
 							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-							 errmsg("Window Functions in a recursive query is not implemented"),
+							 errmsg("window functions in a recursive query is not implemented"),
 							 parser_errposition(cstate->pstate,
 												exprLocation((Node *) fc))));
 				}

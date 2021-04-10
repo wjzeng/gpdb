@@ -8,6 +8,7 @@
 subdir = src/backend/gpopt
 top_builddir = ../../..
 include $(top_builddir)/src/Makefile.global
+include $(srcdir)/gpopt.mk
 
 SUBDIRS = config translate relcache utils
 

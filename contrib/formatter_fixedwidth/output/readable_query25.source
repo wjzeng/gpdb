@@ -13,7 +13,7 @@ FORMAT 'CUSTOM' (formatter='fixedwidth_in', s1='10',
 LOG ERRORS
 SEGMENT REJECT LIMIT 5 ROWS;
 SELECT * FROM tbl_ext_fixedwidth ORDER BY s1;
-NOTICE:  Found 4 data formatting errors (4 or more input rows). Rejected related input data.
+NOTICE:  found 4 data formatting errors (4 or more input rows), rejected related input data
      s1     |  s2  |   s3   |         dt          | n1 | n2  |   n3   |  n4   |   n5    |   n6    |     n7     
 ------------+------+--------+---------------------+----+-----+--------+-------+---------+---------+------------
  aaa        | twoa | shpits | 2011-06-01 12:30:30 | 23 | 732 | 834567 | 45.67 | 789.123 | 7.12345 | 123.456789
@@ -25,11 +25,11 @@ NOTICE:  Found 4 data formatting errors (4 or more input rows). Rejected related
 (6 rows)
 
 SELECT relname,linenum,errmsg FROM gp_read_error_log('tbl_ext_fixedwidth') ORDER BY linenum;
-      relname       | linenum |                 errmsg                  
---------------------+---------+-----------------------------------------
- tbl_ext_fixedwidth |       3 | invalid input syntax for integer: "s32"
- tbl_ext_fixedwidth |       4 | invalid input syntax for integer: "7v2"
- tbl_ext_fixedwidth |       5 | invalid input syntax for integer: "y32"
- tbl_ext_fixedwidth |       6 | invalid input syntax for integer: "7d2"
+      relname       | linenum |                    errmsg                    
+--------------------+---------+----------------------------------------------
+ tbl_ext_fixedwidth |       3 | invalid input syntax for type integer: "s32"
+ tbl_ext_fixedwidth |       4 | invalid input syntax for type integer: "7v2"
+ tbl_ext_fixedwidth |       5 | invalid input syntax for type integer: "y32"
+ tbl_ext_fixedwidth |       6 | invalid input syntax for type integer: "7d2"
 (4 rows)
 

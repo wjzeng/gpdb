@@ -2,7 +2,7 @@
 #
 # Makefile for src/bin/pg_controldata
 #
-# Copyright (c) 1998-2014, PostgreSQL Global Development Group
+# Copyright (c) 1998-2019, PostgreSQL Global Development Group
 #
 # src/bin/pg_controldata/Makefile
 #
@@ -14,11 +14,6 @@ PGAPPICON=win32
 subdir = src/bin/pg_controldata
 top_builddir = ../../..
 include $(top_builddir)/src/Makefile.global
-
-# The frontend doesn't need everything that's in LIBS, some are backend only
-LIBS := $(filter-out -lresolv -lbz2, $(LIBS))
-# This program isn't interactive, so doesn't need these
-LIBS := $(filter-out -lreadline -ledit -ltermcap -lncurses -lcurses -lcurl -lssl -lcrypto -lz, $(LIBS))
 
 OBJS= pg_controldata.o $(WIN32RES)
 
@@ -40,7 +35,7 @@ clean distclean maintainer-clean:
 	rm -f pg_controldata$(X) $(OBJS)
 	rm -rf tmp_check
 
-check: all
+check:
 	$(prove_check)
 
 installcheck:

@@ -3,7 +3,7 @@
  * cdbdtxcontextinfo.c
  *
  * Portions Copyright (c) 2007-2008, Greenplum inc
- * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
  *
  *
  * IDENTIFICATION
@@ -22,7 +22,7 @@
 #include "cdb/cdbtm.h"
 #include "access/xact.h"
 #include "utils/guc.h"
-#include "utils/tqual.h"
+#include "utils/session_state.h"
 
 /*
  * process local cache used to identify "dispatch units"
@@ -32,16 +32,9 @@
  *
  */
 static uint32 syncCount = 1;
-static DistributedTransactionId syncCacheXid = InvalidDistributedTransactionId;
 
 void
-DtxContextInfo_RewindSegmateSync(void)
-{
-	syncCount--;
-}
-
-void
-DtxContextInfo_CreateOnMaster(DtxContextInfo *dtxContextInfo,
+DtxContextInfo_CreateOnMaster(DtxContextInfo *dtxContextInfo, bool inCursor,
 							  int txnOptions, Snapshot snapshot)
 {
 	int			i;
@@ -53,36 +46,30 @@ DtxContextInfo_CreateOnMaster(DtxContextInfo *dtxContextInfo,
 	DtxContextInfo_Reset(dtxContextInfo);
 
 	dtxContextInfo->distributedXid = getDistributedTransactionId();
-
 	if (dtxContextInfo->distributedXid != InvalidDistributedTransactionId)
-	{
-		if (syncCacheXid == dtxContextInfo->distributedXid)
-			dtxContextInfo->segmateSync = ++syncCount;
-		else
-		{
-			syncCacheXid = dtxContextInfo->distributedXid;
-			dtxContextInfo->segmateSync = syncCount = 1;
-		}
-
-		dtxContextInfo->distributedTimeStamp = getDtxStartTime();
-
-		getDistributedTransactionIdentifier(dtxContextInfo->distributedId);
 		dtxContextInfo->curcid = curcid;
-	}
-	else
-	{
-		elog((Debug_print_full_dtm ? LOG : DEBUG5),
-			 "DtxContextInfo_CreateOnMaster Gp_role is DISPATCH and distributed transaction is InvalidDistributedTransactionId");
 
-		syncCacheXid = dtxContextInfo->distributedXid;
-		dtxContextInfo->segmateSync = syncCount = 1;
-	}
+	/*
+	 * When this is an extended query, all the dispatchs will go to
+	 * the reader gangs, don't increase 'syncCount' so that all the
+	 * dispatch could share the same snapshot created by 'gp_write_shared_snapshot'.
+	 */
+	dtxContextInfo->segmateSync = inCursor ? syncCount : ++syncCount;
+	if (dtxContextInfo->segmateSync == (~(uint32)0))
+		ereport(FATAL,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("cannot have more than 2^32-2 commands in a session")));
 
+	AssertImply(inCursor,
+				dtxContextInfo->distributedXid != InvalidDistributedTransactionId &&
+				gp_command_count == MySessionState->latestCursorCommandId);
+
+	dtxContextInfo->cursorContext = inCursor;
 	dtxContextInfo->nestingLevel = GetCurrentTransactionNestLevel();
 
 	elog((Debug_print_full_dtm ? LOG : DEBUG5),
-		 "DtxContextInfo_CreateOnMaster: created dtxcontext with dxid %u/%u nestingLevel %d segmateSync %u/%u (current/cached)",
-		 dtxContextInfo->distributedXid, syncCacheXid, dtxContextInfo->nestingLevel,
+		 "DtxContextInfo_CreateOnMaster: created dtxcontext with dxid "UINT64_FORMAT" nestingLevel %d segmateSync %u/%u (current/cached)",
+		 dtxContextInfo->distributedXid, dtxContextInfo->nestingLevel,
 		 dtxContextInfo->segmateSync, syncCount);
 
 	dtxContextInfo->haveDistributedSnapshot = false;
@@ -104,23 +91,20 @@ DtxContextInfo_CreateOnMaster(DtxContextInfo *dtxContextInfo,
 			memcpy(gid, "<empty>", 8);
 
 		elog((Debug_print_full_dtm ? LOG : DEBUG5),
-			 "DtxContextInfo_CreateOnMaster Gp_role is DISPATCH and have currentGxact = %s, gxid = %u --> have distributed snapshot",
-			 gid,
-			 getDistributedTransactionId());
+			 "DtxContextInfo_CreateOnMaster Gp_role is DISPATCH and have gid = %s --> have distributed snapshot", gid);
 		elog((Debug_print_full_dtm ? LOG : DEBUG5),
-			 "DtxContextInfo_CreateOnMaster distributedXid = %u, "
-			 "distributedSnapshotHeader (xminAllDistributedSnapshots %u, xmin = %u, xmax = %u, count = %d, maxCount %d)",
+			 "DtxContextInfo_CreateOnMaster distributedXid = "UINT64_FORMAT", "
+			 "distributedSnapshotHeader (xminAllDistributedSnapshots "UINT64_FORMAT", xmin = "UINT64_FORMAT", xmax = "UINT64_FORMAT", count = %d)",
 			 dtxContextInfo->distributedXid,
 			 ds->xminAllDistributedSnapshots,
 			 ds->xmin,
 			 ds->xmax,
-			 ds->count,
-			 ds->maxCount);
+			 ds->count);
 
 		for (i = 0; i < ds->count; i++)
 		{
 			elog((Debug_print_full_dtm ? LOG : DEBUG5),
-				 "....    distributedSnapshotData->xip[%d] = %u",
+				 "....    distributedSnapshotData->xip[%d] = "UINT64_FORMAT,
 				 i, ds->inProgressXidArray[i]);
 		}
 		elog((Debug_print_full_dtm ? LOG : DEBUG5),
@@ -128,9 +112,9 @@ DtxContextInfo_CreateOnMaster(DtxContextInfo *dtxContextInfo,
 			 dtxContextInfo->curcid);
 
 		elog((Debug_print_full_dtm ? LOG : DEBUG5),
-			 "DtxContextInfo_CreateOnMaster txnOptions = 0x%x, needTwoPhase = %s, explicitBegin = %s, isoLevel = %s, readOnly = %s.",
+			 "DtxContextInfo_CreateOnMaster txnOptions = 0x%x, needDtx = %s, explicitBegin = %s, isoLevel = %s, readOnly = %s.",
 			 txnOptions,
-			 (isMppTxOptions_NeedTwoPhase(txnOptions) ? "true" : "false"),
+			 (isMppTxOptions_NeedDtx(txnOptions) ? "true" : "false"),
 			 (isMppTxOptions_ExplicitBegin(txnOptions) ? "true" : "false"),
 			 IsoLevelAsUpperString(mppTxOptions_IsoLevel(txnOptions)),
 			 (isMppTxOptions_ReadOnly(txnOptions) ? "true" : "false"));
@@ -146,7 +130,6 @@ DtxContextInfo_SerializeSize(DtxContextInfo *dtxContextInfo)
 
 	if (dtxContextInfo->distributedXid != InvalidDistributedTransactionId)
 	{
-		size += sizeof(DistributedTransactionTimeStamp);
 		size += TMGIDSIZE;		/* distributedId */
 		size += sizeof(CommandId);	/* curcid */
 	}
@@ -182,13 +165,6 @@ DtxContextInfo_Serialize(char *buffer, DtxContextInfo *dtxContextInfo)
 	p += sizeof(DistributedTransactionId);
 	if (dtxContextInfo->distributedXid != InvalidDistributedTransactionId)
 	{
-		memcpy(p, &dtxContextInfo->distributedTimeStamp, sizeof(DistributedTransactionTimeStamp));
-		p += sizeof(DistributedTransactionTimeStamp);
-		if (strlen(dtxContextInfo->distributedId) >= TMGIDSIZE)
-			elog(PANIC, "Distribute transaction identifier too long (%d)",
-				 (int) strlen(dtxContextInfo->distributedId));
-		memcpy(p, dtxContextInfo->distributedId, TMGIDSIZE);
-		p += TMGIDSIZE;
 		memcpy(p, &dtxContextInfo->curcid, sizeof(CommandId));
 		p += sizeof(CommandId);
 	}
@@ -199,8 +175,8 @@ DtxContextInfo_Serialize(char *buffer, DtxContextInfo *dtxContextInfo)
 	}
 
 	elog((Debug_print_full_dtm ? LOG : DEBUG3),
-		 "DtxContextInfo_Serialize distributedTimeStamp %u, distributedXid = %u, curcid %d nestingLevel %d segmateSync %u",
-		 dtxContextInfo->distributedTimeStamp, dtxContextInfo->distributedXid,
+		 "DtxContextInfo_Serialize distributedXid = "UINT64_FORMAT", curcid %d nestingLevel %d segmateSync %u",
+		 dtxContextInfo->distributedXid,
 		 dtxContextInfo->curcid, dtxContextInfo->nestingLevel, dtxContextInfo->segmateSync);
 
 	memcpy(p, &dtxContextInfo->segmateSync, sizeof(uint32));
@@ -228,29 +204,27 @@ DtxContextInfo_Serialize(char *buffer, DtxContextInfo *dtxContextInfo)
 	if (DEBUG5 >= log_min_messages || Debug_print_full_dtm || Debug_print_snapshot_dtm)
 	{
 		elog((Debug_print_full_dtm ? LOG : DEBUG5),
-			 "DtxContextInfo_Serialize distributedTimeStamp %u, distributedXid = %u, "
+			 "DtxContextInfo_Serialize distributedXid = "UINT64_FORMAT", "
 			 "curcid %d",
-			 dtxContextInfo->distributedTimeStamp,
 			 dtxContextInfo->distributedXid,
 			 dtxContextInfo->curcid);
 
 		if (dtxContextInfo->haveDistributedSnapshot)
 		{
 			elog((Debug_print_full_dtm ? LOG : DEBUG5),
-				 "distributedSnapshotHeader (xminAllDistributedSnapshots %u, xmin = %u, xmax = %u, count = %d, maxCount = %d)",
+				 "distributedSnapshotHeader (xminAllDistributedSnapshots "UINT64_FORMAT", xmin = "UINT64_FORMAT", xmax = "UINT64_FORMAT", count = %d)",
 				 ds->xminAllDistributedSnapshots,
 				 ds->xmin,
 				 ds->xmax,
-				 ds->count,
-				 ds->maxCount);
+				 ds->count);
 			for (i = 0; i < ds->count; i++)
 			{
 				elog((Debug_print_full_dtm ? LOG : DEBUG5),
-					 "....    inProgressXidArray[%d] = %u",
+					 "....    inProgressXidArray[%d] = "UINT64_FORMAT,
 					 i, ds->inProgressXidArray[i]);
 			}
 			elog((Debug_print_snapshot_dtm ? LOG : DEBUG5),
-				 "[Distributed Snapshot #%u] *Serialize* currcid = %d (gxid = %u, '%s')",
+				 "[Distributed Snapshot #%u] *Serialize* currcid = %d (gxid = "UINT64_FORMAT", '%s')",
 				 ds->distribSnapshotId,
 				 dtxContextInfo->curcid,
 				 getDistributedTransactionId(),
@@ -264,10 +238,7 @@ DtxContextInfo_Serialize(char *buffer, DtxContextInfo *dtxContextInfo)
 void
 DtxContextInfo_Reset(DtxContextInfo *dtxContextInfo)
 {
-	dtxContextInfo->distributedTimeStamp = 0;
 	dtxContextInfo->distributedXid = InvalidDistributedTransactionId;
-	memcpy(dtxContextInfo->distributedId, TmGid_Init, TMGIDSIZE);
-	Assert(strlen(dtxContextInfo->distributedId) < TMGIDSIZE);
 
 	dtxContextInfo->curcid = 0;
 	dtxContextInfo->segmateSync = 0;
@@ -287,14 +258,7 @@ DtxContextInfo_Copy(
 {
 	DtxContextInfo_Reset(target);
 
-	target->distributedTimeStamp = source->distributedTimeStamp;
 	target->distributedXid = source->distributedXid;
-	Assert(strlen(source->distributedId) < TMGIDSIZE);
-	memcpy(
-		   target->distributedId,
-		   source->distributedId,
-		   TMGIDSIZE);
-
 	target->segmateSync = source->segmateSync;
 	target->nestingLevel = source->nestingLevel;
 
@@ -310,18 +274,15 @@ DtxContextInfo_Copy(
 	target->distributedTxnOptions = source->distributedTxnOptions;
 
 	elog((Debug_print_full_dtm ? LOG : DEBUG5),
-		 "DtxContextInfo_Copy distributed {timestamp %u, xid %u}, id = %s, "
+		 "DtxContextInfo_Copy distributed {xid "UINT64_FORMAT"}, "
 		 "command id %d",
-		 target->distributedTimeStamp,
 		 target->distributedXid,
-		 target->distributedId,
 		 target->curcid);
 
 	if (target->haveDistributedSnapshot)
 		elog((Debug_print_full_dtm ? LOG : DEBUG5),
-			 "distributed snapshot {timestamp %u, xminAllDistributedSnapshots %u, snapshot id %d, "
-			 "xmin %u, count %d, xmax %u}",
-			 target->distributedSnapshot.distribTransactionTimeStamp,
+			 "distributed snapshot {xminAllDistributedSnapshots "UINT64_FORMAT", snapshot id %d, "
+			 "xmin "UINT64_FORMAT", count %d, xmax "UINT64_FORMAT"}",
 			 target->distributedSnapshot.xminAllDistributedSnapshots,
 			 target->distributedSnapshot.distribSnapshotId,
 			 target->distributedSnapshot.xmin,
@@ -353,13 +314,6 @@ DtxContextInfo_Deserialize(const char *serializedDtxContextInfo,
 
 		if (dtxContextInfo->distributedXid != InvalidDistributedTransactionId)
 		{
-			memcpy(&dtxContextInfo->distributedTimeStamp, p, sizeof(DistributedTransactionTimeStamp));
-			p += sizeof(DistributedTransactionTimeStamp);
-			memcpy(dtxContextInfo->distributedId, p, TMGIDSIZE);
-			if (strlen(dtxContextInfo->distributedId) >= TMGIDSIZE)
-				elog(PANIC, "Distribute transaction identifier too long (%d)",
-					 (int) strlen(dtxContextInfo->distributedId));
-			p += TMGIDSIZE;
 			memcpy(&dtxContextInfo->curcid, p, sizeof(CommandId));
 			p += sizeof(CommandId);
 		}
@@ -380,8 +334,8 @@ DtxContextInfo_Deserialize(const char *serializedDtxContextInfo,
 		p += sizeof(bool);
 
 		elog((Debug_print_full_dtm ? LOG : DEBUG3),
-			 "DtxContextInfo_Deserialize distributedTimeStamp %u, distributedXid = %u, curcid %d nestingLevel %d segmateSync %u as %s",
-			 dtxContextInfo->distributedTimeStamp, dtxContextInfo->distributedXid,
+			 "DtxContextInfo_Deserialize distributedXid = "UINT64_FORMAT", curcid %d nestingLevel %d segmateSync %u as %s",
+			 dtxContextInfo->distributedXid,
 			 dtxContextInfo->curcid, dtxContextInfo->nestingLevel,
 			 dtxContextInfo->segmateSync, (Gp_is_writer ? "WRITER" : "READER"));
 
@@ -401,31 +355,27 @@ DtxContextInfo_Deserialize(const char *serializedDtxContextInfo,
 		if (DEBUG5 >= log_min_messages || Debug_print_full_dtm)
 		{
 			elog((Debug_print_full_dtm ? LOG : DEBUG5),
-				 "DtxContextInfo_Deserialize distributedTimeStamp %u, distributedXid = %u, "
-				 "distributedId = %s",
-				 dtxContextInfo->distributedTimeStamp,
-				 dtxContextInfo->distributedXid,
-				 dtxContextInfo->distributedId);
+				 "DtxContextInfo_Deserialize distributedXid = "UINT64_FORMAT,
+				 dtxContextInfo->distributedXid);
 
 			if (dtxContextInfo->haveDistributedSnapshot)
 			{
 				elog((Debug_print_full_dtm ? LOG : DEBUG5),
-					 "distributedSnapshotHeader (xminAllDistributedSnapshots %u, xmin = %u, xmax = %u, count = %d, maxCount = %d)",
+					 "distributedSnapshotHeader (xminAllDistributedSnapshots "UINT64_FORMAT", xmin = "UINT64_FORMAT", xmax = "UINT64_FORMAT", count = %d)",
 					 ds->xminAllDistributedSnapshots,
 					 ds->xmin,
 					 ds->xmax,
-					 ds->count,
-					 ds->maxCount);
+					 ds->count);
 
 				for (i = 0; i < ds->count; i++)
 				{
 					elog((Debug_print_full_dtm ? LOG : DEBUG5),
-						 "....    inProgressXidArray[%d] = %u",
+						 "....    inProgressXidArray[%d] = "UINT64_FORMAT,
 						 i, ds->inProgressXidArray[i]);
 				}
 
 				elog((Debug_print_snapshot_dtm ? LOG : DEBUG5),
-					 "[Distributed Snapshot #%u] *Deserialize* currcid = %d (gxid = %u, '%s')",
+					 "[Distributed Snapshot #%u] *Deserialize* currcid = %d (gxid = "UINT64_FORMAT", '%s')",
 					 ds->distribSnapshotId,
 					 dtxContextInfo->curcid,
 					 getDistributedTransactionId(),

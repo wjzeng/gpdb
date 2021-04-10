@@ -5,8 +5,8 @@
  *
  *
  * Portions Copyright (c) 2006-2009, Greenplum inc
- * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/optimizer/var.h
@@ -18,19 +18,16 @@
 
 #include "nodes/relation.h"
 
-typedef enum
-{
-	PVC_REJECT_AGGREGATES,		/* throw error if Aggref found */
-	PVC_INCLUDE_AGGREGATES,		/* include Aggrefs in output list */
-	PVC_RECURSE_AGGREGATES		/* recurse into Aggref arguments */
-} PVCAggregateBehavior;
+/* Bits that can be OR'd into the flags argument of pull_var_clause() */
+#define PVC_INCLUDE_AGGREGATES	0x0001	/* include Aggrefs in output list */
+#define PVC_RECURSE_AGGREGATES	0x0002	/* recurse into Aggref arguments */
+#define PVC_INCLUDE_WINDOWFUNCS 0x0004	/* include WindowFuncs in output list */
+#define PVC_RECURSE_WINDOWFUNCS 0x0008	/* recurse into WindowFunc arguments */
+#define PVC_INCLUDE_PLACEHOLDERS	0x0010		/* include PlaceHolderVars in
+												 * output list */
+#define PVC_RECURSE_PLACEHOLDERS	0x0020		/* recurse into PlaceHolderVar
+												 * arguments */
 
-typedef enum
-{
-	PVC_REJECT_PLACEHOLDERS,	/* throw error if PlaceHolderVar found */
-	PVC_INCLUDE_PLACEHOLDERS,	/* include PlaceHolderVars in output list */
-	PVC_RECURSE_PLACEHOLDERS	/* recurse into PlaceHolderVar arguments */
-} PVCPlaceHolderBehavior;
 
 typedef bool (*Cdb_walk_vars_callback_Aggref)(Aggref *aggref, void *context, int sublevelsup);
 typedef bool (*Cdb_walk_vars_callback_Var)(Var *var, void *context, int sublevelsup);
@@ -50,13 +47,11 @@ extern Relids pull_upper_varnos(Node *node);
 
 extern void pull_varattnos(Node *node, Index varno, Bitmapset **varattnos);
 extern List *pull_vars_of_level(Node *node, int levelsup);
-extern bool contain_ctid_var_reference(Scan *scan);
 extern bool contain_var_clause(Node *node);
 extern bool contain_vars_of_level(Node *node, int levelsup);
 extern bool contain_vars_of_level_or_above(Node *node, int levelsup);
 extern int	locate_var_of_level(Node *node, int levelsup);
-extern List *pull_var_clause(Node *node, PVCAggregateBehavior aggbehavior,
-				PVCPlaceHolderBehavior phbehavior);
+extern List *pull_var_clause(Node *node, int flags);
 extern Node *flatten_join_alias_vars(PlannerInfo *root, Node *node);
 bool contain_vars_of_level_or_above_cbPlaceHolderVar(PlaceHolderVar *placeholdervar, void *unused, int sublevelsup);
 

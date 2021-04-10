@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 import os
 import tarfile
@@ -21,7 +21,7 @@ class MuckWithInternalsTestCase(GppkgTestCase):
     """
     def test00_delete_package_from_archive_and_install(self):
         """
-        Delete a package from the archive on the master
+        Delete a package from the archive on the coordinator
         and try to install the gppkg again.
         """
         gppkg_file = self.build(self.alpha_spec, self.A_spec)
@@ -35,7 +35,7 @@ class MuckWithInternalsTestCase(GppkgTestCase):
     @unittest.expectedFailure
     def test01_delete_package_from_archive_and_uninstall(self):
         """
-        Delete a package from the archive on the master 
+        Delete a package from the archive on the coordinator 
         and try to uninstall the gppkg.  
         Known issue: MPP-15737
         """
@@ -49,13 +49,13 @@ class MuckWithInternalsTestCase(GppkgTestCase):
 
         try:
             self.remove(self.alpha_spec.get_filename())
-        except ExecutionError, e:
+        except ExecutionError as e:
             shutil.copy(gppkg_file, os.path.join(ARCHIVE_PATH, gppkg_file))
             self.fail("Execution Error %s" % e)
 
     def test02_delete_rpm_and_install(self):
         """
-        Delete the main comprising rpm from the master
+        Delete the main comprising rpm from the coordinator
         and try to install the gppkg again.
         """
         #Use gppkg from previous test
@@ -68,7 +68,7 @@ class MuckWithInternalsTestCase(GppkgTestCase):
 
     def test03_delete_rpm_and_uninstall(self):
         """
-        Delete the main comprising rpm from the master
+        Delete the main comprising rpm from the coordinator
         and try to install the gppkg again.
         """
         #Use gppkg from previous test
@@ -81,7 +81,7 @@ class MuckWithInternalsTestCase(GppkgTestCase):
 
     def test04_install_rpm_and_install(self):
         """
-        Install the main comprising rpm on the master
+        Install the main comprising rpm on the coordinator
         and try to install a gppkg.
         """
         with closing(tarfile.open(self.alpha_spec.get_filename())) as tf:
@@ -96,7 +96,7 @@ class MuckWithInternalsTestCase(GppkgTestCase):
     @unittest.expectedFailure
     def test05_install_rpm_and_uninstall(self):
         """
-        Install the main comprising rpm on the master and 
+        Install the main comprising rpm on the coordinator and 
         try to uninstall a gppkg.
         """
         with closing(tarfile.open(self.alpha_spec.get_filename())) as tf:
@@ -107,7 +107,7 @@ class MuckWithInternalsTestCase(GppkgTestCase):
       
         try: 
             self.remove(gppkg_file)
-        except ExecutionError, e:
+        except ExecutionError as e:
             run_command("rpm -e %s --dbpath %s" % (self.A_spec.get_package_name(), RPM_DATABASE))
             os.remove(self.A_spec.get_filename())
             self.fail("ExecutionError %s" % e)
@@ -131,7 +131,7 @@ class MuckWithInternalsTestCase(GppkgTestCase):
 
         try:
             self.install(gppkg_file)
-        except ExecutionError, e:
+        except ExecutionError as e:
             Scp(name = "copy gppkg to segment",
                 srcFile = gppkg_file, 
                 dstFile = archive_file, 
@@ -158,7 +158,7 @@ class MuckWithInternalsTestCase(GppkgTestCase):
 
         try:
             self.remove(gppkg_file)
-        except ExecutionError, e:
+        except ExecutionError as e:
             GpScp(source_path = gppkg_file,
                   target_path = archive_file,
                   host_list = segment_host_list).run()
@@ -183,7 +183,7 @@ class MuckWithInternalsTestCase(GppkgTestCase):
 
         try:
             self.install(gppkg_file) 
-        except ExecutionError, e:
+        except ExecutionError as e:
             #Install the rpm 
             with closing(tarfile.open(self.alpha_spec.get_filename())) as tf:
                 tf.extract(self.A_spec.get_filename())
@@ -265,7 +265,7 @@ class MuckWithInternalsTestCase(GppkgTestCase):
 
         try:
             self.remove(gppkg_file)
-        except ExecutionError, e:
+        except ExecutionError as e:
             self.uninstall_rpm_remotely(self.A_spec.get_filename(), host)
             os.remove(self.A_spec.get_filename())
             RemoveRemoteFile(self.A_spec.get_filename(), host).run()

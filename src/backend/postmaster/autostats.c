@@ -6,7 +6,7 @@
  *
  *
  * Portions Copyright (c) 2005-2015, Greenplum inc
- * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
  * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
@@ -20,15 +20,16 @@
 
 #include "catalog/catalog.h"
 #include "cdb/cdbvars.h"
-#include "cdb/cdbpartition.h"
 #include "commands/vacuum.h"
 #include "executor/execdesc.h"
 #include "executor/executor.h"
+#include "foreign/foreign.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "nodes/plannodes.h"
 #include "parser/parsetree.h"
 #include "postmaster/autostats.h"
+#include "postmaster/autovacuum.h"
 #include "utils/acl.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
@@ -48,8 +49,9 @@ static bool autostats_on_no_stats_check(AutoStatsCmdType cmdType, Oid relationOi
 static void
 autostats_issue_analyze(Oid relationOid)
 {
-	VacuumStmt *analyzeStmt = NULL;
-	RangeVar   *relation = NULL;
+	VacuumStmt *analyzeStmt;
+	VacuumRelation *relation;
+	ParseState *pstate;
 
 	/*
 	 * If this user does not own the table, then auto-stats will not issue the
@@ -64,14 +66,19 @@ autostats_issue_analyze(Oid relationOid)
 		return;
 	}
 
-	relation = makeRangeVar(get_namespace_name(get_rel_namespace(relationOid)), get_rel_name(relationOid), -1);
+	/* Set up an ANALYZE command */
+	relation = makeVacuumRelation(NULL, relationOid, NIL);
 	analyzeStmt = makeNode(VacuumStmt);
-	/* Set up command parameters */
-	analyzeStmt->options = VACOPT_ANALYZE;
-	analyzeStmt->freeze_min_age = -1;
-	analyzeStmt->relation = relation;	/* not used since we pass relids list */
-	analyzeStmt->va_cols = NIL;
-	vacuum(analyzeStmt, InvalidOid, false, NULL, false, false);
+	analyzeStmt->options = NIL;
+	analyzeStmt->rels = list_make1(relation);
+	analyzeStmt->is_vacuumcmd = false;
+
+	pstate = make_parsestate(NULL);
+	pstate->p_sourcetext = NULL;
+
+	ExecVacuum(pstate, analyzeStmt, false);
+
+	free_parsestate(pstate);
 	pfree(analyzeStmt);
 }
 
@@ -147,7 +154,27 @@ autostats_on_no_stats_check(AutoStatsCmdType cmdType, Oid relationOid)
 			 classForm->relpages,
 			 classForm->reltuples);
 
-		result = (classForm->relpages == 0 && classForm->reltuples < 1);
+		if (classForm->relkind == RELKIND_FOREIGN_TABLE &&
+			rel_is_external_table(relationOid))
+		{
+			/*
+			 * To keep the behaviour the same as in GPDB 6, don't try to
+			 * auto-analyze external tables. In GPDB 6, we used to populate
+			 * pg_class.relpages with a constant at CREATE EXTERNAL TABLE.
+			 * We don't do that anymore, for consistency with foreign tables,
+			 * but without this special case here, we would then try to
+			 * auto-analyze external tables. External tables don't have
+			 * an ANALYZE callback, so it wouldn't do anything, but it would
+			 * print an annoying "cannot analyze this foreign table" warning
+			 * every time you inserted to an external table.
+			 *
+			 * All foreign tables without an analyze callback have the same
+			 * problem, really, but we're not concerned about that right now.
+			 */
+			result = false;
+		}
+		else
+			result = (classForm->relpages == 0 && classForm->reltuples < 1);
 		ReleaseSysCache(tuple);
 		return result;
 	}
@@ -204,6 +231,10 @@ autostats_get_cmdtype(QueryDesc *queryDesc, AutoStatsCmdType * pcmdType, Oid *pr
 				relationOid = GetIntoRelOid(queryDesc);
 				cmdType = AUTOSTATS_CMDTYPE_CTAS;
 			}
+			else if (stmt->copyIntoClause != NULL)
+			{
+				cmdType = AUTOSTATS_CMDTYPE_COPY;
+			}
 			break;
 
 		case CMD_INSERT:
@@ -253,20 +284,30 @@ autostats_get_cmdtype(QueryDesc *queryDesc, AutoStatsCmdType * pcmdType, Oid *pr
 void
 auto_stats(AutoStatsCmdType cmdType, Oid relationOid, uint64 ntuples, bool inFunction)
 {
+	char		relkind;
+
 	TimestampTz start;
 	bool		policyCheck = false;
 
 	start = GetCurrentTimestamp();
 
-	if (Gp_role != GP_ROLE_DISPATCH || relationOid == InvalidOid
-		|| rel_is_partitioned(relationOid)
-		/* Updates on views are possible via triggers, but we can't analyze views. */
-		|| get_rel_relkind(relationOid) == RELKIND_VIEW)
-	{
+	if (Gp_role != GP_ROLE_DISPATCH)
 		return;
-	}
 
-	Assert(relationOid != InvalidOid);
+	if (relationOid == InvalidOid)
+		return;
+
+	relkind = get_rel_relkind(relationOid);
+	if (relkind == '\0')
+		return; /* relation not found */
+
+	/* Updates on views are possible via triggers, but we can't analyze views. */
+	if (relkind == RELKIND_VIEW)
+		return;
+
+	if (relkind == RELKIND_PARTITIONED_TABLE)
+		return;
+
 	Assert(cmdType >= 0 && cmdType <= AUTOSTATS_CMDTYPE_SENTINEL);		/* it is a valid command
 																		 * as per auto-stats */
 

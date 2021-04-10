@@ -4,10 +4,10 @@
 <topic id="topic1"><title id="bh20941">CLUSTER</title><body><p id="sql_command_desc">Physically reorders a heap storage table on disk according to an index.
 Not a recommended operation in Greenplum Database.</p><section id="section2"><title>Synopsis</title><codeblock id="sql_command_synopsis">CLUSTER <varname>indexname</varname> ON <varname>tablename</varname>
 
-CLUSTER <varname>tablename</varname>
+CLUSTER [VERBOSE] <varname>tablename</varname>
 
-CLUSTER</codeblock></section><section id="section3"><title>Description</title><p><codeph>CLUSTER</codeph> orders a heap storage table based on an index.
-<codeph>CLUSTER</codeph> is not supported on append-optmized storage
+CLUSTER [VERBOSE]</codeblock></section><section id="section3"><title>Description</title><p><codeph>CLUSTER</codeph> orders a heap storage table based on an index.
+<codeph>CLUSTER</codeph> on non-B-tree indexes is not supported on append-optmized storage
 tables. Clustering an index means that the records are physically ordered
 on disk according to the index information. If the records you need are
 distributed randomly on disk, then the database has to seek across the
@@ -15,19 +15,33 @@ disk to get the records requested. If those records are stored more closely
 together, then the fetching from disk is more sequential. A good example
 for a clustered index is on a date column where the data is ordered sequentially
 by date. A query against a specific date range will result in an ordered
-fetch from the disk, which leverages faster sequential access.</p><p>Clustering is a one-time operation: when the table is subsequently
-updated, the changes are not clustered. That is, no attempt is made to
-store new or updated rows according to their index order. If one wishes,
-one can periodically recluster by issuing the command again. </p><p>When a table is clustered using this command, Greenplum Database remembers
-on which index it was clustered. The form <codeph>CLUSTER</codeph> <varname>tablename</varname>
-reclusters the table on the same index that it was clustered before.
-<codeph>CLUSTER</codeph> without any parameter reclusters all previously
-clustered tables in the current database that the calling user owns,
-or all tables if called by a superuser. This form of <codeph>CLUSTER</codeph>
-cannot be executed inside a transaction block.</p><p>When a table is being clustered, an <codeph>ACCESS EXCLUSIVE</codeph>
+fetch from the disk, which leverages faster sequential access.</p><p>Clustering is a one-time operation: when the table is subsequently updated, the changes are not
+clustered. That is, no attempt is made to store new or updated rows
+according to their index order. If you wish, you can periodically
+recluster by issuing the command again. Setting the table's <codeph>FILLFACTOR</codeph> storage parameter to less than
+        100% can aid in preserving cluster ordering during updates, because updated
+        rows are kept on the same page if enough space is available there.
+</p><p>When a table is clustered using this command, Greenplum Database remembers on which index it was
+                                clustered. The form <codeph>CLUSTER</codeph>
+                                <varname>tablename</varname> reclusters the table on the same index
+                                that it was clustered before. You can use the
+                                        <codeph>CLUSTER</codeph> or <codeph>SET WITHOUT
+                                        CLUSTER</codeph> forms of <codeph><xref
+                                                href="ALTER_TABLE.xml#topic1">ALTER
+                                        TABLE</xref></codeph> to set the index to use for future
+                                cluster operations, or to clear any previous setting.
+                                        <codeph>CLUSTER</codeph> without any parameter reclusters
+                                all previously clustered tables in the current database that the
+                                calling user owns, or all tables if called by a superuser. This form
+                                of <codeph>CLUSTER</codeph> cannot be executed inside a transaction
+                                block.</p><p>When a table is being clustered, an <codeph>ACCESS EXCLUSIVE</codeph>
 lock is acquired on it. This prevents any other database operations (both
 reads and writes) from operating on the table until the <codeph>CLUSTER</codeph>
-is finished.</p></section><section id="section4"><title>Parameters</title><parml><plentry><pt><varname>indexname</varname></pt><pd>The name of an index. </pd></plentry><plentry><pt><varname>tablename</varname></pt><pd>The name (optionally schema-qualified) of a table. </pd></plentry></parml></section><section id="section5"><title>Notes</title><p>In cases where you are accessing single rows randomly within a table,
+is finished.</p></section><section id="section4"><title>Parameters</title><parml><plentry><pt><varname>indexname</varname></pt><pd>The name of an index. </pd></plentry>
+                                <plentry>
+                                        <pt><codeph>VERBOSE</codeph></pt>
+                                        <pd>Prints a progress report as each table is clustered.</pd>
+                                </plentry><plentry><pt><varname>tablename</varname></pt><pd>The name (optionally schema-qualified) of a table. </pd></plentry></parml></section><section id="section5"><title>Notes</title><p>In cases where you are accessing single rows randomly within a table,
 the actual order of the data in the table is unimportant. However, if
 you tend to access some data more than others, and there is an index
 that groups them together, you will benefit from using <codeph>CLUSTER</codeph>.
@@ -36,29 +50,38 @@ indexed value that has multiple rows that match, <codeph>CLUSTER</codeph>
 will help because once the index identifies the table page for the first
 row that matches, all other rows that match are probably already on the
 same table page, and so you save disk accesses and speed up the query.
-</p><p>During the cluster operation, a temporary copy of the table is created
-that contains the table data in the index order. Temporary copies of
-each index on the table are created as well. Therefore, you need free
-space on disk at least equal to the sum of the table size and the index
-sizes. </p><p>Because the query optimizer records statistics about the ordering of tables, it is advisable to
+                                </p>
+                        <p><codeph>CLUSTER</codeph> can re-sort the table using either an index scan
+                                on the specified index, or (if the index is a b-tree) a sequential
+                                scan followed by sorting. It will attempt to choose the method that
+                                will be faster, based on planner cost parameters and available
+                                statistical information. </p>
+                        <p> When an index scan is used, a temporary copy of the table is created
+                                that contains the table data in the index order. Temporary copies of
+                                each index on the table are created as well. Therefore, you need
+                                free space on disk at least equal to the sum of the table size and
+                                the index sizes. </p>
+                        <p> When a sequential scan and sort is used, a temporary sort file is also
+                                created, so that the peak temporary space requirement is as much as
+                                double the table size, plus the index sizes. This method is often
+                                faster than the index scan method, but if the disk space requirement
+                                is intolerable, you can disable this choice by temporarily setting
+                                the <xref href="../config_params/guc-list.xml#enable_sort"
+                                        >enable_sort</xref> configuration parameter to
+                                        <codeph>off</codeph>. </p>
+                        <p> It is advisable to set <xref
+                                        href="../config_params/guc-list.xml#maintenance_work_mem"/>
+                                configuration parameter to a reasonably large value (but not more
+                                than the amount of RAM you can dedicate to the
+                                        <codeph>CLUSTER</codeph> operation) before clustering. </p>
+                                        <p>Because the query optimizer records statistics about the ordering of tables, it is advisable to
         run <codeph>ANALYZE</codeph> on the newly clustered table. Otherwise, the planner may make
-        poor choices of query plans. </p><p>There is another way to cluster data. The <codeph>CLUSTER</codeph>
-command reorders the original table by scanning it using the index you
-specify. This can be slow on large tables because the rows are fetched
-from the table in index order, and if the table is disordered, the entries
-are on random pages, so there is one disk page retrieved for every row
-moved. (Greenplum Database has a cache, but the majority of a big table
-will not fit in the cache.) The other way to cluster a table is to use
-a statement such as:</p><codeblock>CREATE TABLE newtable AS SELECT * FROM table ORDER BY column;</codeblock><p>This uses the Greenplum Database sorting code to produce the desired
-order, which is usually much faster than an index scan for disordered
-data. Then you drop the old table, use <codeph>ALTER TABLE ... RENAME</codeph>
-to rename <varname>newtable</varname> to the old name, and recreate the table's
-indexes. The big disadvantage of this approach is that it does not preserve
-OIDs, constraints, granted privileges, and other ancillary properties
-of the table — all such items must be manually recreated. Another disadvantage
-is that this way requires a sort temporary file about the same size as
-the table itself, so peak disk usage is about three times the table size
-instead of twice the table size.</p><note><codeph>CLUSTER</codeph> is not supported with append-optimized tables.</note></section><section id="section6"><title>Examples</title><p>Cluster the table <codeph>employees</codeph> on the basis of its index
+                                                poor choices of query plans. </p>
+                        <p>Because <codeph>CLUSTER</codeph> remembers which indexes are clustered,
+                                you can cluster the tables you want clustered manually the first
+                                time, then set up a periodic maintenance script that executes
+                                        <codeph>CLUSTER</codeph> without any parameters, so that the
+                                desired tables are periodically reclustered.</p><note><codeph>CLUSTER</codeph> on non-B-tree indexes is not supported with append-optimized tables.</note></section><section id="section6"><title>Examples</title><p>Cluster the table <codeph>employees</codeph> on the basis of its index
         <codeph>emp_ind</codeph>:</p><codeblock>CLUSTER emp_ind ON emp;</codeblock><p>Cluster a large table by recreating it and loading it in the correct index
 order:</p><codeblock>CREATE TABLE newtable AS SELECT * FROM table ORDER BY column;
 DROP table;

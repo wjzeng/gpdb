@@ -8,7 +8,7 @@
  *	 cleanup is finished, the runaway cleaner also informs the red zone handler
  *	 so that a new runaway session can be chosen if necessary.
  *
- * Copyright (c) 2014-Present Pivotal Software, Inc.
+ * Copyright (c) 2014-Present VMware, Inc. or its affiliates.
  *
  *
  * IDENTIFICATION
@@ -24,6 +24,8 @@
 #include "miscadmin.h"
 #include "port/atomics.h"
 #include "utils/faultinjector.h"
+#include "utils/resgroup.h"
+#include "utils/resource_manager.h"
 #include "utils/session_state.h"
 #include "utils/vmem_tracker.h"
 
@@ -182,9 +184,20 @@ RunawayCleaner_StartCleanup()
 
 		if (RunawayCleaner_ShouldCancelQuery())
 		{
-			SIMPLE_FAULT_INJECTOR(RunawayCleanup);
+			SIMPLE_FAULT_INJECTOR("runaway_cleanup");
 
-			ereport(ERROR, (errmsg("Canceling query because of high VMEM usage. Used: %dMB, available %dMB, red zone: %dMB",
+			if (IsResGroupEnabled())
+			{
+				StringInfoData    str;
+				initStringInfo(&str);
+			
+				LWLockAcquire(ResGroupLock, LW_SHARED);
+				ResGroupGetMemoryRunawayInfo(&str);
+				LWLockRelease(ResGroupLock);
+				ereport(ERROR, (errmsg("Canceling query because of high VMEM usage. %s", str.data)));
+			}
+			else
+				ereport(ERROR, (errmsg("Canceling query because of high VMEM usage. Used: %dMB, available %dMB, red zone: %dMB",
 					VmemTracker_ConvertVmemChunksToMB(MySessionState->sessionVmem), VmemTracker_GetAvailableVmemMB(),
 					RedZoneHandler_GetRedZoneLimitMB()), errprintstack(true)));
 		}
@@ -319,7 +332,6 @@ RunawayCleaner_RunawayCleanupDoneForProcess(bool ignoredCleanup)
 	 * Now, we have some head room to actually record our usage.
 	 */
 	write_stderr("Logging memory usage because of runaway cleanup. Note, this is a post-cleanup logging and may be incomplete.");
-	MemoryAccounting_SaveToLog();
 	MemoryContextStats(TopMemoryContext);
 }
 

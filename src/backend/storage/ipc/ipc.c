@@ -8,7 +8,7 @@
  * exit-time cleanup for either a postmaster or a backend.
  *
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -41,6 +41,11 @@
  * of the exit procedure.  We do NOT want to go back to the idle loop...
  */
 bool		proc_exit_inprogress = false;
+
+/*
+ * Set when shmem_exit() is in progress.
+ */
+bool		shmem_exit_inprogress = false;
 
 /*
  * This flag tracks whether we've called atexit() in the current process
@@ -134,6 +139,10 @@ proc_exit(int code)
 		else
 			snprintf(gprofDirName, 32, "gprof/%d", (int) getpid());
 
+		/*
+		 * Use mkdir() instead of MakePGDirectory() since we aren't making a
+		 * PG directory here.
+		 */
 		mkdir("gprof", S_IRWXU | S_IRWXG | S_IRWXO);
 		mkdir(gprofDirName, S_IRWXU | S_IRWXG | S_IRWXO);
 		chdir(gprofDirName);
@@ -177,8 +186,6 @@ proc_exit_prepare(int code)
 	InterruptPending = false;
 	ProcDiePending = false;
 	QueryCancelPending = false;
-	/* And let's just make *sure* we're not interrupted ... */
-	ImmediateInterruptOK = false;
 	InterruptHoldoffCount = 1;
 	CritSectionCount = 0;
 
@@ -226,8 +233,8 @@ proc_exit_prepare(int code)
 	 * possible.
 	 */
 	while (--on_proc_exit_index >= 0)
-		(*on_proc_exit_list[on_proc_exit_index].function) (code,
-								  on_proc_exit_list[on_proc_exit_index].arg);
+		on_proc_exit_list[on_proc_exit_index].function(code,
+													   on_proc_exit_list[on_proc_exit_index].arg);
 
 	on_proc_exit_index = 0;
 }
@@ -243,6 +250,8 @@ proc_exit_prepare(int code)
 void
 shmem_exit(int code)
 {
+	shmem_exit_inprogress = true;
+
 	/*
 	 * Call before_shmem_exit callbacks.
 	 *
@@ -254,8 +263,8 @@ shmem_exit(int code)
 	elog(DEBUG3, "shmem_exit(%d): %d before_shmem_exit callbacks to make",
 		 code, before_shmem_exit_index);
 	while (--before_shmem_exit_index >= 0)
-		(*before_shmem_exit_list[before_shmem_exit_index].function) (code,
-						before_shmem_exit_list[before_shmem_exit_index].arg);
+		before_shmem_exit_list[before_shmem_exit_index].function(code,
+																 before_shmem_exit_list[before_shmem_exit_index].arg);
 	before_shmem_exit_index = 0;
 
 	/*
@@ -287,9 +296,11 @@ shmem_exit(int code)
 	elog(DEBUG3, "shmem_exit(%d): %d on_shmem_exit callbacks to make",
 		 code, on_shmem_exit_index);
 	while (--on_shmem_exit_index >= 0)
-		(*on_shmem_exit_list[on_shmem_exit_index].function) (code,
-								on_shmem_exit_list[on_shmem_exit_index].arg);
+		on_shmem_exit_list[on_shmem_exit_index].function(code,
+														 on_shmem_exit_list[on_shmem_exit_index].arg);
 	on_shmem_exit_index = 0;
+
+	shmem_exit_inprogress = false;
 }
 
 /* ----------------------------------------------------------------
@@ -396,7 +407,7 @@ on_shmem_exit(pg_on_exit_callback function, Datum arg)
 /* ----------------------------------------------------------------
  *		cancel_before_shmem_exit
  *
- *		this function removes a previously-registed before_shmem_exit
+ *		this function removes a previously-registered before_shmem_exit
  *		callback.  For simplicity, only the latest entry can be
  *		removed.  (We could work harder but there is no need for
  *		current uses.)

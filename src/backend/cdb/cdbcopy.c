@@ -42,7 +42,7 @@
  * When you're done, call cdbCopyEnd().
  *
  * Portions Copyright (c) 2005-2008, Greenplum inc
- * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
  *
  *
  * IDENTIFICATION
@@ -55,6 +55,7 @@
 #include "miscadmin.h"
 #include "libpq-fe.h"
 #include "libpq-int.h"
+#include "access/xact.h"
 #include "cdb/cdbconn.h"
 #include "cdb/cdbcopy.h"
 #include "cdb/cdbdisp_query.h"
@@ -64,6 +65,10 @@
 #include "cdb/cdbtm.h"
 #include "cdb/cdbvars.h"
 #include "commands/copy.h"
+#include "commands/defrem.h"
+#include "mb/pg_wchar.h"
+#include "nodes/makefuncs.h"
+#include "pgstat.h"
 #include "storage/pmsignal.h"
 #include "tcop/tcopprot.h"
 #include "utils/faultinjector.h"
@@ -89,36 +94,43 @@ getCdbCopyPrimaryGang(CdbCopy *c)
  * information and state needed by the backend COPY.
  */
 CdbCopy *
-makeCdbCopy(bool is_copy_in)
+makeCdbCopy(CopyState cstate, bool is_copy_in)
 {
-	CdbCopy    *c;
+	CdbCopy		*c;
+	GpPolicy	*policy;
+
+	policy = cstate->rel->rd_cdbpolicy;
+	Assert(policy);
 
 	c = palloc0(sizeof(CdbCopy));
 
 	/* fresh start */
 	c->total_segs = 0;
-	c->mirror_map = NULL;
 	c->copy_in = is_copy_in;
-	c->skip_ext_partition = false;
-	c->outseglist = NIL;
-	c->partitions = NULL;
-	c->ao_segnos = NIL;
-	c->hasReplicatedTable = false;
+	c->seglist = NIL;
 	c->dispatcherState = NULL;
 	initStringInfo(&(c->copy_out_buf));
 
-	/* init total_segs */
-	c->total_segs = getgpsegmentCount();
-	c->aotupcounts = NULL;
-
-	/* init seg list for copy out */
-	if (!c->copy_in)
+	/*
+	 * COPY replicated table TO file, pick only one replica, otherwise, duplicate
+	 * rows will be copied.
+	 */
+	if (!is_copy_in && GpPolicyIsReplicated(policy) && !cstate->on_segment)
+	{
+		c->total_segs = 1;
+		c->seglist = list_make1_int(gp_session_id % c->total_segs);
+	}
+	else
 	{
 		int			i;
 
+		c->total_segs = policy->numsegments;
+
 		for (i = 0; i < c->total_segs; i++)
-			c->outseglist = lappend_int(c->outseglist, i);
+			c->seglist = lappend_int(c->seglist, i);
 	}
+
+	cstate->cdbCopy = c;
 
 	return c;
 }
@@ -130,27 +142,57 @@ makeCdbCopy(bool is_copy_in)
  * may pg_throw via elog/ereport.
  */
 void
-cdbCopyStart(CdbCopy *c, CopyStmt *stmt, struct GpPolicy *policy)
+cdbCopyStart(CdbCopy *c, CopyStmt *stmt, int file_encoding)
 {
 	int			flags;
 
 	stmt = copyObject(stmt);
 
-	/* add in partitions for dispatch */
-	stmt->partitions = c->partitions;
-
-	/* add in AO segno map for dispatch */
-	stmt->ao_segnos = c->ao_segnos;
-
-	stmt->skip_ext_partition = c->skip_ext_partition;
-
-	if (policy)
+	/*
+	 * If the output needs to be in a different encoding, tell the segment.
+	 * Normally, when we run normal queries, we keep the segment connections
+	 * in database encoding, and do the encoding conversions in the QD, just
+	 * before sending results to the client. But in COPY TO, we don't do
+	 * any conversions to the data we receive from the segments, so they
+	 * must produce the output in the correct encoding.
+	 *
+	 * We do this by adding "ENCODING 'xxx'" option to the options list of
+	 * the CopyStmt that we dispatch.
+	 */
+	if (file_encoding != GetDatabaseEncoding())
 	{
-		stmt->policy = GpPolicyCopy(policy);
-	}
-	else
-	{
-		stmt->policy = createRandomPartitionedPolicy(GP_POLICY_ALL_NUMSEGMENTS);
+		bool		found;
+		ListCell   *option;
+
+		/*
+		 * But first check if the encoding option is already in the options
+		 * list (i.e the user specified it explicitly in the COPY command)
+		 */
+		found = false;
+		foreach(option, stmt->options)
+		{
+			DefElem    *defel = (DefElem *) lfirst(option);
+
+			if (strcmp(defel->defname, "encoding") == 0)
+			{
+				/*
+				 * The 'file_encoding' came from the options, so they should match, but
+				 * let's sanity-check.
+				 */
+				if (pg_char_to_encoding(defGetString(defel)) != file_encoding)
+					elog(ERROR, "encoding option in original COPY command does not match encoding being dispatched");
+				found = true;
+			}
+		}
+
+		if (!found)
+		{
+			const char *encname = pg_encoding_to_char(file_encoding);
+
+			stmt->options = lappend(stmt->options,
+									makeDefElem("encoding",
+												(Node *) makeString(pstrdup(encname)), -1));
+		}
 	}
 
 	flags = DF_WITH_SNAPSHOT | DF_CANCEL_ON_ERROR;
@@ -159,7 +201,7 @@ cdbCopyStart(CdbCopy *c, CopyStmt *stmt, struct GpPolicy *policy)
 
 	CdbDispatchCopyStart(c, (Node *) stmt, flags);
 
-	SIMPLE_FAULT_INJECTOR(CdbCopyStartAfterDispatch);
+	SIMPLE_FAULT_INJECTOR("cdb_copy_start_after_dispatch");
 }
 
 /*
@@ -250,7 +292,7 @@ cdbCopyGetData(CdbCopy *c, bool copy_cancel, uint64 *rows_processed)
 		ListCell   *cur;
 
 		/* iterate through all the segments that still have data to give */
-		foreach(cur, c->outseglist)
+		foreach(cur, c->seglist)
 		{
 			int			source_seg = lfirst_int(cur);
 
@@ -270,7 +312,7 @@ cdbCopyGetData(CdbCopy *c, bool copy_cancel, uint64 *rows_processed)
 		ListCell   *cur;
 
 		/* iterate through all the segments that still have data to give */
-		foreach(cur, c->outseglist)
+		foreach(cur, c->seglist)
 		{
 			int			source_seg = lfirst_int(cur);
 			char	   *buffer;
@@ -308,9 +350,9 @@ cdbCopyGetData(CdbCopy *c, bool copy_cancel, uint64 *rows_processed)
 			 */
 			else if (nbytes == -1)
 			{
-				c->outseglist = list_delete_int(c->outseglist, source_seg);
+				c->seglist = list_delete_int(c->seglist, source_seg);
 
-				if (list_length(c->outseglist) == 0)
+				if (list_length(c->seglist) == 0)
 					return true;	/* all segments are done */
 
 				/* start over from first seg as we just changed the seg list */
@@ -396,6 +438,8 @@ cdbCopyEndInternal(CdbCopy *c, char *abort_msg,
 	struct pollfd	*pollRead;
 	bool		io_errors = false;
 	StringInfoData io_err_msg;
+	Bitmapset	   *oidMap = NULL;
+	int				nest_level;
 
 	initStringInfo(&io_err_msg);
 
@@ -452,11 +496,13 @@ cdbCopyEndInternal(CdbCopy *c, char *abort_msg,
 				 */
 				appendStringInfo(&io_err_msg,
 								 "primary segment %d, dbid %d, attempt blocked\n",
-								 seg, q->segment_database_info->dbid);
+								 seg, q->segment_database_info->config->dbid);
 				io_errors = true;
 			}
 		}
 	}
+
+	nest_level = GetCurrentTransactionNestLevel();
 
 	pollRead = (struct pollfd *) palloc(sizeof(struct pollfd));
 	for (seg = 0; seg < gp->size; seg++)
@@ -484,6 +530,8 @@ cdbCopyEndInternal(CdbCopy *c, char *abort_msg,
 			}
 		}
 
+		forwardQENotices();
+
 		/*
 		 * Fetch any error status existing on completion of the COPY command.
 		 * It is critical that for any connection that had an asynchronous
@@ -496,6 +544,9 @@ cdbCopyEndInternal(CdbCopy *c, char *abort_msg,
 		{
 			elog(DEBUG1, "PQgetResult got status %d seg %d    ",
 				 PQresultStatus(res), q->segindex);
+
+			forwardQENotices();
+
 			/* if the COPY command had a data error */
 			if (PQresultStatus(res) == PGRES_FATAL_ERROR)
 			{
@@ -512,6 +563,8 @@ cdbCopyEndInternal(CdbCopy *c, char *abort_msg,
 				if (!first_error)
 					first_error = cdbdisp_get_PQerror(res);
 			}
+
+			pgstat_combine_one_qe_result(&oidMap, res, nest_level, q->segindex);
 
 			/*
 			 * If we are still in copy mode, tell QE to stop it.  COPY_IN
@@ -567,6 +620,8 @@ cdbCopyEndInternal(CdbCopy *c, char *abort_msg,
 						break;
 					}
 				}
+				if (buffer)
+					PQfreemem(buffer);
 			}
 
 			/* in SREH mode, check if this seg rejected (how many) rows */
@@ -580,9 +635,6 @@ cdbCopyEndInternal(CdbCopy *c, char *abort_msg,
 			if (res->numCompleted > 0)
 				segment_rows_completed = res->numCompleted;
 
-			/* Get AO tuple counts */
-			c->aotupcounts = PQprocessAoTupCounts(c->partitions, c->aotupcounts,
-												  res->aotupcounts, res->naotupcounts);
 			/* free the PGresult object */
 			PQclear(res);
 		}
@@ -604,7 +656,7 @@ cdbCopyEndInternal(CdbCopy *c, char *abort_msg,
 			io_errors = true;
 			appendStringInfo(&io_err_msg,
 							 "Primary segment %d, dbid %d, with error: %s\n",
-							 seg, q->segment_database_info->dbid,
+							 seg, q->segment_database_info->config->dbid,
 							 PQerrorMessage(q->conn));
 
 			/* Free the PGconn object. */
@@ -630,8 +682,7 @@ cdbCopyEndInternal(CdbCopy *c, char *abort_msg,
 		ereport(ERROR,
 				(errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
 				 (errmsg("MPP detected %d segment failures, system is reconnected",
-						 num_bad_connections),
-				  errSendAlert(true))));
+						 num_bad_connections))));
 	}
 
 	/*
@@ -641,7 +692,10 @@ cdbCopyEndInternal(CdbCopy *c, char *abort_msg,
 	{
 		/* errors reported by the segments */
 		if (first_error)
+		{
+			FlushErrorState();
 			ReThrowError(first_error);
+		}
 
 		/* errors that occurred in the COPY itself */
 		if (io_errors)

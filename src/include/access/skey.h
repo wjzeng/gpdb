@@ -4,7 +4,7 @@
  *	  POSTGRES scan key definitions.
  *
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/access/skey.h
@@ -15,29 +15,8 @@
 #define SKEY_H
 
 #include "access/attnum.h"
+#include "access/stratnum.h"
 #include "fmgr.h"
-
-
-/*
- * Strategy numbers identify the semantics that particular operators have
- * with respect to particular operator classes.  In some cases a strategy
- * subtype (an OID) is used as further information.
- */
-typedef uint16 StrategyNumber;
-
-#define InvalidStrategy ((StrategyNumber) 0)
-
-/*
- * We define the strategy numbers for B-tree indexes here, to avoid having
- * to import access/nbtree.h into a lot of places that shouldn't need it.
- */
-#define BTLessStrategyNumber			1
-#define BTLessEqualStrategyNumber		2
-#define BTEqualStrategyNumber			3
-#define BTGreaterEqualStrategyNumber	4
-#define BTGreaterStrategyNumber			5
-
-#define BTMaxStrategyNumber				5
 
 
 /*
@@ -133,41 +112,40 @@ typedef ScanKeyData *ScanKey;
  * bits should be defined here).  Bits 16-31 are reserved for use within
  * individual index access methods.
  */
-#define SK_ISNULL			0x0001		/* sk_argument is NULL */
-#define SK_UNARY			0x0002		/* unary operator (not supported!) */
-#define SK_ROW_HEADER		0x0004		/* row comparison header (see above) */
-#define SK_ROW_MEMBER		0x0008		/* row comparison member (see above) */
-#define SK_ROW_END			0x0010		/* last row comparison member */
-#define SK_SEARCHARRAY		0x0020		/* scankey represents ScalarArrayOp */
-#define SK_SEARCHNULL		0x0040		/* scankey represents "col IS NULL" */
-#define SK_SEARCHNOTNULL	0x0080		/* scankey represents "col IS NOT
-										 * NULL" */
-#define SK_ORDER_BY			0x0100		/* scankey is for ORDER BY op */
+#define SK_ISNULL			0x0001	/* sk_argument is NULL */
+#define SK_UNARY			0x0002	/* unary operator (not supported!) */
+#define SK_ROW_HEADER		0x0004	/* row comparison header (see above) */
+#define SK_ROW_MEMBER		0x0008	/* row comparison member (see above) */
+#define SK_ROW_END			0x0010	/* last row comparison member */
+#define SK_SEARCHARRAY		0x0020	/* scankey represents ScalarArrayOp */
+#define SK_SEARCHNULL		0x0040	/* scankey represents "col IS NULL" */
+#define SK_SEARCHNOTNULL	0x0080	/* scankey represents "col IS NOT NULL" */
+#define SK_ORDER_BY			0x0100	/* scankey is for ORDER BY op */
 
 
 /*
  * prototypes for functions in access/common/scankey.c
  */
 extern void ScanKeyInit(ScanKey entry,
-			AttrNumber attributeNumber,
-			StrategyNumber strategy,
-			RegProcedure procedure,
-			Datum argument);
+						AttrNumber attributeNumber,
+						StrategyNumber strategy,
+						RegProcedure procedure,
+						Datum argument);
 extern void ScanKeyEntryInitialize(ScanKey entry,
-					   int flags,
-					   AttrNumber attributeNumber,
-					   StrategyNumber strategy,
-					   Oid subtype,
-					   Oid collation,
-					   RegProcedure procedure,
-					   Datum argument);
+								   int flags,
+								   AttrNumber attributeNumber,
+								   StrategyNumber strategy,
+								   Oid subtype,
+								   Oid collation,
+								   RegProcedure procedure,
+								   Datum argument);
 extern void ScanKeyEntryInitializeWithInfo(ScanKey entry,
-							   int flags,
-							   AttrNumber attributeNumber,
-							   StrategyNumber strategy,
-							   Oid subtype,
-							   Oid collation,
-							   FmgrInfo *finfo,
-							   Datum argument);
+										   int flags,
+										   AttrNumber attributeNumber,
+										   StrategyNumber strategy,
+										   Oid subtype,
+										   Oid collation,
+										   FmgrInfo *finfo,
+										   Datum argument);
 
-#endif   /* SKEY_H */
+#endif							/* SKEY_H */

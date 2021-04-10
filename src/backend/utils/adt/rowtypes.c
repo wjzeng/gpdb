@@ -3,7 +3,7 @@
  * rowtypes.c
  *	  I/O and comparison functions for generic composite types.
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -21,7 +21,9 @@
 #include "catalog/pg_type.h"
 #include "funcapi.h"
 #include "libpq/pqformat.h"
+#include "miscadmin.h"
 #include "utils/builtins.h"
+#include "utils/datum.h"
 #include "utils/lsyscache.h"
 #include "utils/typcache.h"
 
@@ -43,7 +45,7 @@ typedef struct RecordIOData
 	Oid			record_type;
 	int32		record_typmod;
 	int			ncolumns;
-	ColumnIOData columns[1];	/* VARIABLE LENGTH ARRAY */
+	ColumnIOData columns[FLEXIBLE_ARRAY_MEMBER];
 } RecordIOData;
 
 /*
@@ -61,7 +63,7 @@ typedef struct RecordCompareData
 	int32		record1_typmod;
 	Oid			record2_type;
 	int32		record2_typmod;
-	ColumnCompareData columns[1];		/* VARIABLE LENGTH ARRAY */
+	ColumnCompareData columns[FLEXIBLE_ARRAY_MEMBER];
 } RecordCompareData;
 
 
@@ -73,12 +75,8 @@ record_in(PG_FUNCTION_ARGS)
 {
 	char	   *string = PG_GETARG_CSTRING(0);
 	Oid			tupType = PG_GETARG_OID(1);
-
-#ifdef NOT_USED
-	int32		typmod = PG_GETARG_INT32(2);
-#endif
+	int32		tupTypmod = PG_GETARG_INT32(2);
 	HeapTupleHeader result;
-	int32		tupTypmod;
 	TupleDesc	tupdesc;
 	HeapTuple	tuple;
 	RecordIOData *my_extra;
@@ -90,17 +88,20 @@ record_in(PG_FUNCTION_ARGS)
 	bool	   *nulls;
 	StringInfoData buf;
 
+	check_stack_depth();		/* recurses for record-type columns */
+
 	/*
-	 * Use the passed type unless it's RECORD; we can't support input of
-	 * anonymous types, mainly because there's no good way to figure out which
-	 * anonymous type is wanted.  Note that for RECORD, what we'll probably
-	 * actually get is RECORD's typelem, ie, zero.
+	 * Give a friendly error message if we did not get enough info to identify
+	 * the target record type.  (lookup_rowtype_tupdesc would fail anyway, but
+	 * with a non-user-friendly message.)  In ordinary SQL usage, we'll get -1
+	 * for typmod, since composite types and RECORD have no type modifiers at
+	 * the SQL level, and thus must fail for RECORD.  However some callers can
+	 * supply a valid typmod, and then we can do something useful for RECORD.
 	 */
-	if (tupType == InvalidOid || tupType == RECORDOID)
+	if (tupType == RECORDOID && tupTypmod < 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-		   errmsg("input of anonymous composite types is not implemented")));
-	tupTypmod = -1;				/* for all non-anonymous types */
+				 errmsg("input of anonymous composite types is not implemented")));
 
 	/*
 	 * This comes from the composite type's pg_type.oid and stores system oids
@@ -120,8 +121,8 @@ record_in(PG_FUNCTION_ARGS)
 	{
 		fcinfo->flinfo->fn_extra =
 			MemoryContextAlloc(fcinfo->flinfo->fn_mcxt,
-							   sizeof(RecordIOData) - sizeof(ColumnIOData)
-							   + ncolumns * sizeof(ColumnIOData));
+							   offsetof(RecordIOData, columns) +
+							   ncolumns * sizeof(ColumnIOData));
 		my_extra = (RecordIOData *) fcinfo->flinfo->fn_extra;
 		my_extra->record_type = InvalidOid;
 		my_extra->record_typmod = 0;
@@ -131,8 +132,8 @@ record_in(PG_FUNCTION_ARGS)
 		my_extra->record_typmod != tupTypmod)
 	{
 		MemSet(my_extra, 0,
-			   sizeof(RecordIOData) - sizeof(ColumnIOData)
-			   + ncolumns * sizeof(ColumnIOData));
+			   offsetof(RecordIOData, columns) +
+			   ncolumns * sizeof(ColumnIOData));
 		my_extra->record_type = tupType;
 		my_extra->record_typmod = tupTypmod;
 		my_extra->ncolumns = ncolumns;
@@ -155,19 +156,20 @@ record_in(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 				 errmsg("malformed record literal: \"%s\"", string),
-				 errdetail("Missing left parenthesis.")));		
+				 errdetail("Missing left parenthesis.")));
 	}
 
 	initStringInfo(&buf);
 
 	for (i = 0; i < ncolumns; i++)
 	{
+		Form_pg_attribute att = TupleDescAttr(tupdesc, i);
 		ColumnIOData *column_info = &my_extra->columns[i];
-		Oid			column_type = tupdesc->attrs[i]->atttypid;
+		Oid			column_type = att->atttypid;
 		char	   *column_data;
 
 		/* Ignore dropped columns in datatype, but fill with nulls */
-		if (tupdesc->attrs[i]->attisdropped)
+		if (att->attisdropped)
 		{
 			values[i] = (Datum) 0;
 			nulls[i] = true;
@@ -213,7 +215,7 @@ record_in(PG_FUNCTION_ARGS)
 							(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 							 errmsg("malformed record literal: \"%s\"",
 									string),
-							 errdetail("Unexpected end of input.")));					
+							 errdetail("Unexpected end of input.")));
 				}
 				if (ch == '\\')
 				{
@@ -228,11 +230,11 @@ record_in(PG_FUNCTION_ARGS)
 					}
 					appendStringInfoChar(&buf, *ptr++);
 				}
-				else if (ch == '\"')
+				else if (ch == '"')
 				{
 					if (!inquote)
 						inquote = true;
-					else if (*ptr == '\"')
+					else if (*ptr == '"')
 					{
 						/* doubled quote within quote sequence */
 						appendStringInfoChar(&buf, *ptr++);
@@ -264,7 +266,7 @@ record_in(PG_FUNCTION_ARGS)
 		values[i] = InputFunctionCall(&column_info->proc,
 									  column_data,
 									  column_info->typioparam,
-									  tupdesc->attrs[i]->atttypmod);
+									  att->atttypmod);
 
 		/*
 		 * Prep for next column
@@ -330,6 +332,8 @@ record_out(PG_FUNCTION_ARGS)
 	bool	   *nulls;
 	StringInfoData buf;
 
+	check_stack_depth();		/* recurses for record-type columns */
+
 	/* Extract type info from the tuple itself */
 	tupType = HeapTupleHeaderGetTypeId(rec);
 	tupTypmod = HeapTupleHeaderGetTypMod(rec);
@@ -339,6 +343,7 @@ record_out(PG_FUNCTION_ARGS)
 	/* Build a temporary HeapTuple control structure */
 	tuple.t_len = HeapTupleHeaderGetDatumLength(rec);
 	ItemPointerSetInvalid(&(tuple.t_self));
+	tuple.t_tableOid = InvalidOid;
 	tuple.t_data = rec;
 
 	/*
@@ -351,8 +356,8 @@ record_out(PG_FUNCTION_ARGS)
 	{
 		fcinfo->flinfo->fn_extra =
 			MemoryContextAlloc(fcinfo->flinfo->fn_mcxt,
-							   sizeof(RecordIOData) - sizeof(ColumnIOData)
-							   + ncolumns * sizeof(ColumnIOData));
+							   offsetof(RecordIOData, columns) +
+							   ncolumns * sizeof(ColumnIOData));
 		my_extra = (RecordIOData *) fcinfo->flinfo->fn_extra;
 		my_extra->record_type = InvalidOid;
 		my_extra->record_typmod = 0;
@@ -362,8 +367,8 @@ record_out(PG_FUNCTION_ARGS)
 		my_extra->record_typmod != tupTypmod)
 	{
 		MemSet(my_extra, 0,
-			   sizeof(RecordIOData) - sizeof(ColumnIOData)
-			   + ncolumns * sizeof(ColumnIOData));
+			   offsetof(RecordIOData, columns) +
+			   ncolumns * sizeof(ColumnIOData));
 		my_extra->record_type = tupType;
 		my_extra->record_typmod = tupTypmod;
 		my_extra->ncolumns = ncolumns;
@@ -382,15 +387,16 @@ record_out(PG_FUNCTION_ARGS)
 
 	for (i = 0; i < ncolumns; i++)
 	{
+		Form_pg_attribute att = TupleDescAttr(tupdesc, i);
 		ColumnIOData *column_info = &my_extra->columns[i];
-		Oid			column_type = tupdesc->attrs[i]->atttypid;
+		Oid			column_type = att->atttypid;
 		Datum		attr;
 		char	   *value;
 		char	   *tmp;
 		bool		nq;
 
 		/* Ignore dropped columns in datatype */
-		if (tupdesc->attrs[i]->attisdropped)
+		if (att->attisdropped)
 			continue;
 
 		if (needComma)
@@ -466,12 +472,8 @@ record_recv(PG_FUNCTION_ARGS)
 {
 	StringInfo	buf = (StringInfo) PG_GETARG_POINTER(0);
 	Oid			tupType = PG_GETARG_OID(1);
-
-#ifdef NOT_USED
-	int32		typmod = PG_GETARG_INT32(2);
-#endif
+	int32		tupTypmod = PG_GETARG_INT32(2);
 	HeapTupleHeader result;
-	int32		tupTypmod;
 	TupleDesc	tupdesc;
 	HeapTuple	tuple;
 	RecordIOData *my_extra;
@@ -482,17 +484,21 @@ record_recv(PG_FUNCTION_ARGS)
 	Datum	   *values;
 	bool	   *nulls;
 
+	check_stack_depth();		/* recurses for record-type columns */
+
 	/*
-	 * Use the passed type unless it's RECORD; we can't support input of
-	 * anonymous types, mainly because there's no good way to figure out which
-	 * anonymous type is wanted.  Note that for RECORD, what we'll probably
-	 * actually get is RECORD's typelem, ie, zero.
+	 * Give a friendly error message if we did not get enough info to identify
+	 * the target record type.  (lookup_rowtype_tupdesc would fail anyway, but
+	 * with a non-user-friendly message.)  In ordinary SQL usage, we'll get -1
+	 * for typmod, since composite types and RECORD have no type modifiers at
+	 * the SQL level, and thus must fail for RECORD.  However some callers can
+	 * supply a valid typmod, and then we can do something useful for RECORD.
 	 */
-	if (tupType == InvalidOid || tupType == RECORDOID)
+	if (tupType == RECORDOID && tupTypmod < 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-		   errmsg("input of anonymous composite types is not implemented")));
-	tupTypmod = -1;				/* for all non-anonymous types */
+				 errmsg("input of anonymous composite types is not implemented")));
+
 	tupdesc = lookup_rowtype_tupdesc(tupType, tupTypmod);
 	ncolumns = tupdesc->natts;
 
@@ -506,8 +512,8 @@ record_recv(PG_FUNCTION_ARGS)
 	{
 		fcinfo->flinfo->fn_extra =
 			MemoryContextAlloc(fcinfo->flinfo->fn_mcxt,
-							   sizeof(RecordIOData) - sizeof(ColumnIOData)
-							   + ncolumns * sizeof(ColumnIOData));
+							   offsetof(RecordIOData, columns) +
+							   ncolumns * sizeof(ColumnIOData));
 		my_extra = (RecordIOData *) fcinfo->flinfo->fn_extra;
 		my_extra->record_type = InvalidOid;
 		my_extra->record_typmod = 0;
@@ -517,8 +523,8 @@ record_recv(PG_FUNCTION_ARGS)
 		my_extra->record_typmod != tupTypmod)
 	{
 		MemSet(my_extra, 0,
-			   sizeof(RecordIOData) - sizeof(ColumnIOData)
-			   + ncolumns * sizeof(ColumnIOData));
+			   offsetof(RecordIOData, columns) +
+			   ncolumns * sizeof(ColumnIOData));
 		my_extra->record_type = tupType;
 		my_extra->record_typmod = tupTypmod;
 		my_extra->ncolumns = ncolumns;
@@ -534,7 +540,7 @@ record_recv(PG_FUNCTION_ARGS)
 	validcols = 0;
 	for (i = 0; i < ncolumns; i++)
 	{
-		if (!tupdesc->attrs[i]->attisdropped)
+		if (!TupleDescAttr(tupdesc, i)->attisdropped)
 			validcols++;
 	}
 	if (usercols != validcols)
@@ -546,8 +552,9 @@ record_recv(PG_FUNCTION_ARGS)
 	/* Process each column */
 	for (i = 0; i < ncolumns; i++)
 	{
+		Form_pg_attribute att = TupleDescAttr(tupdesc, i);
 		ColumnIOData *column_info = &my_extra->columns[i];
-		Oid			column_type = tupdesc->attrs[i]->atttypid;
+		Oid			column_type = att->atttypid;
 		Oid			coltypoid;
 		int			itemlen;
 		StringInfoData item_buf;
@@ -555,7 +562,7 @@ record_recv(PG_FUNCTION_ARGS)
 		char		csave;
 
 		/* Ignore dropped columns in datatype, but fill with nulls */
-		if (tupdesc->attrs[i]->attisdropped)
+		if (att->attisdropped)
 		{
 			values[i] = (Datum) 0;
 			nulls[i] = true;
@@ -620,7 +627,7 @@ record_recv(PG_FUNCTION_ARGS)
 		values[i] = ReceiveFunctionCall(&column_info->proc,
 										bufptr,
 										column_info->typioparam,
-										tupdesc->attrs[i]->atttypmod);
+										att->atttypmod);
 
 		if (bufptr)
 		{
@@ -672,6 +679,8 @@ record_send(PG_FUNCTION_ARGS)
 	bool	   *nulls;
 	StringInfoData buf;
 
+	check_stack_depth();		/* recurses for record-type columns */
+
 	/* Extract type info from the tuple itself */
 	tupType = HeapTupleHeaderGetTypeId(rec);
 	tupTypmod = HeapTupleHeaderGetTypMod(rec);
@@ -681,6 +690,7 @@ record_send(PG_FUNCTION_ARGS)
 	/* Build a temporary HeapTuple control structure */
 	tuple.t_len = HeapTupleHeaderGetDatumLength(rec);
 	ItemPointerSetInvalid(&(tuple.t_self));
+	tuple.t_tableOid = InvalidOid;
 	tuple.t_data = rec;
 
 	/*
@@ -693,8 +703,8 @@ record_send(PG_FUNCTION_ARGS)
 	{
 		fcinfo->flinfo->fn_extra =
 			MemoryContextAlloc(fcinfo->flinfo->fn_mcxt,
-							   sizeof(RecordIOData) - sizeof(ColumnIOData)
-							   + ncolumns * sizeof(ColumnIOData));
+							   offsetof(RecordIOData, columns) +
+							   ncolumns * sizeof(ColumnIOData));
 		my_extra = (RecordIOData *) fcinfo->flinfo->fn_extra;
 		my_extra->record_type = InvalidOid;
 		my_extra->record_typmod = 0;
@@ -704,8 +714,8 @@ record_send(PG_FUNCTION_ARGS)
 		my_extra->record_typmod != tupTypmod)
 	{
 		MemSet(my_extra, 0,
-			   sizeof(RecordIOData) - sizeof(ColumnIOData)
-			   + ncolumns * sizeof(ColumnIOData));
+			   offsetof(RecordIOData, columns) +
+			   ncolumns * sizeof(ColumnIOData));
 		my_extra->record_type = tupType;
 		my_extra->record_typmod = tupTypmod;
 		my_extra->ncolumns = ncolumns;
@@ -724,28 +734,29 @@ record_send(PG_FUNCTION_ARGS)
 	validcols = 0;
 	for (i = 0; i < ncolumns; i++)
 	{
-		if (!tupdesc->attrs[i]->attisdropped)
+		if (!TupleDescAttr(tupdesc, i)->attisdropped)
 			validcols++;
 	}
-	pq_sendint(&buf, validcols, 4);
+	pq_sendint32(&buf, validcols);
 
 	for (i = 0; i < ncolumns; i++)
 	{
+		Form_pg_attribute att = TupleDescAttr(tupdesc, i);
 		ColumnIOData *column_info = &my_extra->columns[i];
-		Oid			column_type = tupdesc->attrs[i]->atttypid;
+		Oid			column_type = att->atttypid;
 		Datum		attr;
 		bytea	   *outputbytes;
 
 		/* Ignore dropped columns in datatype */
-		if (tupdesc->attrs[i]->attisdropped)
+		if (att->attisdropped)
 			continue;
 
-		pq_sendint(&buf, column_type, sizeof(Oid));
+		pq_sendint32(&buf, column_type);
 
 		if (nulls[i])
 		{
 			/* emit -1 data length to signify a NULL */
-			pq_sendint(&buf, -1, 4);
+			pq_sendint32(&buf, -1);
 			continue;
 		}
 
@@ -764,7 +775,7 @@ record_send(PG_FUNCTION_ARGS)
 
 		attr = values[i];
 		outputbytes = SendFunctionCall(&column_info->proc, attr);
-		pq_sendint(&buf, VARSIZE(outputbytes) - VARHDRSZ, 4);
+		pq_sendint32(&buf, VARSIZE(outputbytes) - VARHDRSZ);
 		pq_sendbytes(&buf, VARDATA(outputbytes),
 					 VARSIZE(outputbytes) - VARHDRSZ);
 	}
@@ -814,6 +825,8 @@ record_cmp(FunctionCallInfo fcinfo)
 	int			i2;
 	int			j;
 
+	check_stack_depth();		/* recurses for record-type columns */
+
 	/* Extract type info from the tuples */
 	tupType1 = HeapTupleHeaderGetTypeId(record1);
 	tupTypmod1 = HeapTupleHeaderGetTypMod(record1);
@@ -827,9 +840,11 @@ record_cmp(FunctionCallInfo fcinfo)
 	/* Build temporary HeapTuple control structures */
 	tuple1.t_len = HeapTupleHeaderGetDatumLength(record1);
 	ItemPointerSetInvalid(&(tuple1.t_self));
+	tuple1.t_tableOid = InvalidOid;
 	tuple1.t_data = record1;
 	tuple2.t_len = HeapTupleHeaderGetDatumLength(record2);
 	ItemPointerSetInvalid(&(tuple2.t_self));
+	tuple2.t_tableOid = InvalidOid;
 	tuple2.t_data = record2;
 
 	/*
@@ -843,8 +858,8 @@ record_cmp(FunctionCallInfo fcinfo)
 	{
 		fcinfo->flinfo->fn_extra =
 			MemoryContextAlloc(fcinfo->flinfo->fn_mcxt,
-						sizeof(RecordCompareData) - sizeof(ColumnCompareData)
-							   + ncols * sizeof(ColumnCompareData));
+							   offsetof(RecordCompareData, columns) +
+							   ncols * sizeof(ColumnCompareData));
 		my_extra = (RecordCompareData *) fcinfo->flinfo->fn_extra;
 		my_extra->ncolumns = ncols;
 		my_extra->record1_type = InvalidOid;
@@ -881,18 +896,20 @@ record_cmp(FunctionCallInfo fcinfo)
 	i1 = i2 = j = 0;
 	while (i1 < ncolumns1 || i2 < ncolumns2)
 	{
+		Form_pg_attribute att1;
+		Form_pg_attribute att2;
 		TypeCacheEntry *typentry;
 		Oid			collation;
 
 		/*
 		 * Skip dropped columns
 		 */
-		if (i1 < ncolumns1 && tupdesc1->attrs[i1]->attisdropped)
+		if (i1 < ncolumns1 && TupleDescAttr(tupdesc1, i1)->attisdropped)
 		{
 			i1++;
 			continue;
 		}
-		if (i2 < ncolumns2 && tupdesc2->attrs[i2]->attisdropped)
+		if (i2 < ncolumns2 && TupleDescAttr(tupdesc2, i2)->attisdropped)
 		{
 			i2++;
 			continue;
@@ -900,24 +917,26 @@ record_cmp(FunctionCallInfo fcinfo)
 		if (i1 >= ncolumns1 || i2 >= ncolumns2)
 			break;				/* we'll deal with mismatch below loop */
 
+		att1 = TupleDescAttr(tupdesc1, i1);
+		att2 = TupleDescAttr(tupdesc2, i2);
+
 		/*
 		 * Have two matching columns, they must be same type
 		 */
-		if (tupdesc1->attrs[i1]->atttypid !=
-			tupdesc2->attrs[i2]->atttypid)
+		if (att1->atttypid != att2->atttypid)
 			ereport(ERROR,
 					(errcode(ERRCODE_DATATYPE_MISMATCH),
 					 errmsg("cannot compare dissimilar column types %s and %s at record column %d",
-							format_type_be(tupdesc1->attrs[i1]->atttypid),
-							format_type_be(tupdesc2->attrs[i2]->atttypid),
+							format_type_be(att1->atttypid),
+							format_type_be(att2->atttypid),
 							j + 1)));
 
 		/*
 		 * If they're not same collation, we don't complain here, but the
 		 * comparison function might.
 		 */
-		collation = tupdesc1->attrs[i1]->attcollation;
-		if (collation != tupdesc2->attrs[i2]->attcollation)
+		collation = att1->attcollation;
+		if (collation != att2->attcollation)
 			collation = InvalidOid;
 
 		/*
@@ -925,15 +944,15 @@ record_cmp(FunctionCallInfo fcinfo)
 		 */
 		typentry = my_extra->columns[j].typentry;
 		if (typentry == NULL ||
-			typentry->type_id != tupdesc1->attrs[i1]->atttypid)
+			typentry->type_id != att1->atttypid)
 		{
-			typentry = lookup_type_cache(tupdesc1->attrs[i1]->atttypid,
+			typentry = lookup_type_cache(att1->atttypid,
 										 TYPECACHE_CMP_PROC_FINFO);
 			if (!OidIsValid(typentry->cmp_proc_finfo.fn_oid))
 				ereport(ERROR,
 						(errcode(ERRCODE_UNDEFINED_FUNCTION),
-				errmsg("could not identify a comparison function for type %s",
-					   format_type_be(typentry->type_id))));
+						 errmsg("could not identify a comparison function for type %s",
+								format_type_be(typentry->type_id))));
 			my_extra->columns[j].typentry = typentry;
 		}
 
@@ -942,7 +961,7 @@ record_cmp(FunctionCallInfo fcinfo)
 		 */
 		if (!nulls1[i1] || !nulls2[i2])
 		{
-			FunctionCallInfoData locfcinfo;
+			LOCAL_FCINFO(locfcinfo, 2);
 			int32		cmpresult;
 
 			if (nulls1[i1])
@@ -959,14 +978,14 @@ record_cmp(FunctionCallInfo fcinfo)
 			}
 
 			/* Compare the pair of elements */
-			InitFunctionCallInfoData(locfcinfo, &typentry->cmp_proc_finfo, 2,
+			InitFunctionCallInfoData(*locfcinfo, &typentry->cmp_proc_finfo, 2,
 									 collation, NULL, NULL);
-			locfcinfo.arg[0] = values1[i1];
-			locfcinfo.arg[1] = values2[i2];
-			locfcinfo.argnull[0] = false;
-			locfcinfo.argnull[1] = false;
-			locfcinfo.isnull = false;
-			cmpresult = DatumGetInt32(FunctionCallInvoke(&locfcinfo));
+			locfcinfo->args[0].value = values1[i1];
+			locfcinfo->args[0].isnull = false;
+			locfcinfo->args[1].value = values2[i2];
+			locfcinfo->args[1].isnull = false;
+			locfcinfo->isnull = false;
+			cmpresult = DatumGetInt32(FunctionCallInvoke(locfcinfo));
 
 			if (cmpresult < 0)
 			{
@@ -1048,6 +1067,8 @@ record_eq(PG_FUNCTION_ARGS)
 	int			i2;
 	int			j;
 
+	check_stack_depth();		/* recurses for record-type columns */
+
 	/* Extract type info from the tuples */
 	tupType1 = HeapTupleHeaderGetTypeId(record1);
 	tupTypmod1 = HeapTupleHeaderGetTypMod(record1);
@@ -1061,9 +1082,11 @@ record_eq(PG_FUNCTION_ARGS)
 	/* Build temporary HeapTuple control structures */
 	tuple1.t_len = HeapTupleHeaderGetDatumLength(record1);
 	ItemPointerSetInvalid(&(tuple1.t_self));
+	tuple1.t_tableOid = InvalidOid;
 	tuple1.t_data = record1;
 	tuple2.t_len = HeapTupleHeaderGetDatumLength(record2);
 	ItemPointerSetInvalid(&(tuple2.t_self));
+	tuple2.t_tableOid = InvalidOid;
 	tuple2.t_data = record2;
 
 	/*
@@ -1077,8 +1100,8 @@ record_eq(PG_FUNCTION_ARGS)
 	{
 		fcinfo->flinfo->fn_extra =
 			MemoryContextAlloc(fcinfo->flinfo->fn_mcxt,
-						sizeof(RecordCompareData) - sizeof(ColumnCompareData)
-							   + ncols * sizeof(ColumnCompareData));
+							   offsetof(RecordCompareData, columns) +
+							   ncols * sizeof(ColumnCompareData));
 		my_extra = (RecordCompareData *) fcinfo->flinfo->fn_extra;
 		my_extra->ncolumns = ncols;
 		my_extra->record1_type = InvalidOid;
@@ -1115,20 +1138,22 @@ record_eq(PG_FUNCTION_ARGS)
 	i1 = i2 = j = 0;
 	while (i1 < ncolumns1 || i2 < ncolumns2)
 	{
+		LOCAL_FCINFO(locfcinfo, 2);
+		Form_pg_attribute att1;
+		Form_pg_attribute att2;
 		TypeCacheEntry *typentry;
 		Oid			collation;
-		FunctionCallInfoData locfcinfo;
 		bool		oprresult;
 
 		/*
 		 * Skip dropped columns
 		 */
-		if (i1 < ncolumns1 && tupdesc1->attrs[i1]->attisdropped)
+		if (i1 < ncolumns1 && TupleDescAttr(tupdesc1, i1)->attisdropped)
 		{
 			i1++;
 			continue;
 		}
-		if (i2 < ncolumns2 && tupdesc2->attrs[i2]->attisdropped)
+		if (i2 < ncolumns2 && TupleDescAttr(tupdesc2, i2)->attisdropped)
 		{
 			i2++;
 			continue;
@@ -1136,24 +1161,26 @@ record_eq(PG_FUNCTION_ARGS)
 		if (i1 >= ncolumns1 || i2 >= ncolumns2)
 			break;				/* we'll deal with mismatch below loop */
 
+		att1 = TupleDescAttr(tupdesc1, i1);
+		att2 = TupleDescAttr(tupdesc2, i2);
+
 		/*
 		 * Have two matching columns, they must be same type
 		 */
-		if (tupdesc1->attrs[i1]->atttypid !=
-			tupdesc2->attrs[i2]->atttypid)
+		if (att1->atttypid != att2->atttypid)
 			ereport(ERROR,
 					(errcode(ERRCODE_DATATYPE_MISMATCH),
 					 errmsg("cannot compare dissimilar column types %s and %s at record column %d",
-							format_type_be(tupdesc1->attrs[i1]->atttypid),
-							format_type_be(tupdesc2->attrs[i2]->atttypid),
+							format_type_be(att1->atttypid),
+							format_type_be(att2->atttypid),
 							j + 1)));
 
 		/*
 		 * If they're not same collation, we don't complain here, but the
 		 * equality function might.
 		 */
-		collation = tupdesc1->attrs[i1]->attcollation;
-		if (collation != tupdesc2->attrs[i2]->attcollation)
+		collation = att1->attcollation;
+		if (collation != att2->attcollation)
 			collation = InvalidOid;
 
 		/*
@@ -1161,15 +1188,15 @@ record_eq(PG_FUNCTION_ARGS)
 		 */
 		typentry = my_extra->columns[j].typentry;
 		if (typentry == NULL ||
-			typentry->type_id != tupdesc1->attrs[i1]->atttypid)
+			typentry->type_id != att1->atttypid)
 		{
-			typentry = lookup_type_cache(tupdesc1->attrs[i1]->atttypid,
+			typentry = lookup_type_cache(att1->atttypid,
 										 TYPECACHE_EQ_OPR_FINFO);
 			if (!OidIsValid(typentry->eq_opr_finfo.fn_oid))
 				ereport(ERROR,
 						(errcode(ERRCODE_UNDEFINED_FUNCTION),
-				errmsg("could not identify an equality operator for type %s",
-					   format_type_be(typentry->type_id))));
+						 errmsg("could not identify an equality operator for type %s",
+								format_type_be(typentry->type_id))));
 			my_extra->columns[j].typentry = typentry;
 		}
 
@@ -1185,14 +1212,14 @@ record_eq(PG_FUNCTION_ARGS)
 			}
 
 			/* Compare the pair of elements */
-			InitFunctionCallInfoData(locfcinfo, &typentry->eq_opr_finfo, 2,
+			InitFunctionCallInfoData(*locfcinfo, &typentry->eq_opr_finfo, 2,
 									 collation, NULL, NULL);
-			locfcinfo.arg[0] = values1[i1];
-			locfcinfo.arg[1] = values2[i2];
-			locfcinfo.argnull[0] = false;
-			locfcinfo.argnull[1] = false;
-			locfcinfo.isnull = false;
-			oprresult = DatumGetBool(FunctionCallInvoke(&locfcinfo));
+			locfcinfo->args[0].value = values1[i1];
+			locfcinfo->args[0].isnull = false;
+			locfcinfo->args[1].value = values2[i2];
+			locfcinfo->args[1].isnull = false;
+			locfcinfo->isnull = false;
+			oprresult = DatumGetBool(FunctionCallInvoke(locfcinfo));
 			if (!oprresult)
 			{
 				result = false;
@@ -1318,15 +1345,11 @@ record_image_cmp(FunctionCallInfo fcinfo)
 	/* Build temporary HeapTuple control structures */
 	tuple1.t_len = HeapTupleHeaderGetDatumLength(record1);
 	ItemPointerSetInvalid(&(tuple1.t_self));
-#if 0
 	tuple1.t_tableOid = InvalidOid;
-#endif
 	tuple1.t_data = record1;
 	tuple2.t_len = HeapTupleHeaderGetDatumLength(record2);
 	ItemPointerSetInvalid(&(tuple2.t_self));
-#if 0
 	tuple2.t_tableOid = InvalidOid;
-#endif
 	tuple2.t_data = record2;
 
 	/*
@@ -1340,8 +1363,8 @@ record_image_cmp(FunctionCallInfo fcinfo)
 	{
 		fcinfo->flinfo->fn_extra =
 			MemoryContextAlloc(fcinfo->flinfo->fn_mcxt,
-						sizeof(RecordCompareData) - sizeof(ColumnCompareData)
-							   + ncols * sizeof(ColumnCompareData));
+							   offsetof(RecordCompareData, columns) +
+							   ncols * sizeof(ColumnCompareData));
 		my_extra = (RecordCompareData *) fcinfo->flinfo->fn_extra;
 		my_extra->ncolumns = ncols;
 		my_extra->record1_type = InvalidOid;
@@ -1378,15 +1401,18 @@ record_image_cmp(FunctionCallInfo fcinfo)
 	i1 = i2 = j = 0;
 	while (i1 < ncolumns1 || i2 < ncolumns2)
 	{
+		Form_pg_attribute att1;
+		Form_pg_attribute att2;
+
 		/*
 		 * Skip dropped columns
 		 */
-		if (i1 < ncolumns1 && tupdesc1->attrs[i1]->attisdropped)
+		if (i1 < ncolumns1 && TupleDescAttr(tupdesc1, i1)->attisdropped)
 		{
 			i1++;
 			continue;
 		}
-		if (i2 < ncolumns2 && tupdesc2->attrs[i2]->attisdropped)
+		if (i2 < ncolumns2 && TupleDescAttr(tupdesc2, i2)->attisdropped)
 		{
 			i2++;
 			continue;
@@ -1394,24 +1420,25 @@ record_image_cmp(FunctionCallInfo fcinfo)
 		if (i1 >= ncolumns1 || i2 >= ncolumns2)
 			break;				/* we'll deal with mismatch below loop */
 
+		att1 = TupleDescAttr(tupdesc1, i1);
+		att2 = TupleDescAttr(tupdesc2, i2);
+
 		/*
 		 * Have two matching columns, they must be same type
 		 */
-		if (tupdesc1->attrs[i1]->atttypid !=
-			tupdesc2->attrs[i2]->atttypid)
+		if (att1->atttypid != att2->atttypid)
 			ereport(ERROR,
 					(errcode(ERRCODE_DATATYPE_MISMATCH),
 					 errmsg("cannot compare dissimilar column types %s and %s at record column %d",
-							format_type_be(tupdesc1->attrs[i1]->atttypid),
-							format_type_be(tupdesc2->attrs[i2]->atttypid),
+							format_type_be(att1->atttypid),
+							format_type_be(att2->atttypid),
 							j + 1)));
 
 		/*
 		 * The same type should have the same length (or both should be
 		 * variable).
 		 */
-		Assert(tupdesc1->attrs[i1]->attlen ==
-			   tupdesc2->attrs[i2]->attlen);
+		Assert(att1->attlen == att2->attlen);
 
 		/*
 		 * We consider two NULLs equal; NULL > not-NULL.
@@ -1434,7 +1461,7 @@ record_image_cmp(FunctionCallInfo fcinfo)
 			}
 
 			/* Compare the pair of elements */
-			if (tupdesc1->attrs[i1]->attlen == -1)
+			if (att1->attlen == -1)
 			{
 				Size		len1,
 							len2;
@@ -1457,53 +1484,16 @@ record_image_cmp(FunctionCallInfo fcinfo)
 				if ((Pointer) arg2val != (Pointer) values2[i2])
 					pfree(arg2val);
 			}
-			else if (tupdesc1->attrs[i1]->attbyval)
+			else if (att1->attbyval)
 			{
-				switch (tupdesc1->attrs[i1]->attlen)
-				{
-					case 1:
-						if (GET_1_BYTE(values1[i1]) !=
-							GET_1_BYTE(values2[i2]))
-						{
-							cmpresult = (GET_1_BYTE(values1[i1]) <
-										 GET_1_BYTE(values2[i2])) ? -1 : 1;
-						}
-						break;
-					case 2:
-						if (GET_2_BYTES(values1[i1]) !=
-							GET_2_BYTES(values2[i2]))
-						{
-							cmpresult = (GET_2_BYTES(values1[i1]) <
-										 GET_2_BYTES(values2[i2])) ? -1 : 1;
-						}
-						break;
-					case 4:
-						if (GET_4_BYTES(values1[i1]) !=
-							GET_4_BYTES(values2[i2]))
-						{
-							cmpresult = (GET_4_BYTES(values1[i1]) <
-										 GET_4_BYTES(values2[i2])) ? -1 : 1;
-						}
-						break;
-#if SIZEOF_DATUM == 8
-					case 8:
-						if (GET_8_BYTES(values1[i1]) !=
-							GET_8_BYTES(values2[i2]))
-						{
-							cmpresult = (GET_8_BYTES(values1[i1]) <
-										 GET_8_BYTES(values2[i2])) ? -1 : 1;
-						}
-						break;
-#endif
-					default:
-						Assert(false);	/* cannot happen */
-				}
+				if (values1[i1] != values2[i2])
+					cmpresult = (values1[i1] < values2[i2]) ? -1 : 1;
 			}
 			else
 			{
 				cmpresult = memcmp(DatumGetPointer(values1[i1]),
 								   DatumGetPointer(values2[i2]),
-								   tupdesc1->attrs[i1]->attlen);
+								   att1->attlen);
 			}
 
 			if (cmpresult < 0)
@@ -1599,15 +1589,11 @@ record_image_eq(PG_FUNCTION_ARGS)
 	/* Build temporary HeapTuple control structures */
 	tuple1.t_len = HeapTupleHeaderGetDatumLength(record1);
 	ItemPointerSetInvalid(&(tuple1.t_self));
-#if 0
 	tuple1.t_tableOid = InvalidOid;
-#endif
 	tuple1.t_data = record1;
 	tuple2.t_len = HeapTupleHeaderGetDatumLength(record2);
 	ItemPointerSetInvalid(&(tuple2.t_self));
-#if 0
 	tuple2.t_tableOid = InvalidOid;
-#endif
 	tuple2.t_data = record2;
 
 	/*
@@ -1621,8 +1607,8 @@ record_image_eq(PG_FUNCTION_ARGS)
 	{
 		fcinfo->flinfo->fn_extra =
 			MemoryContextAlloc(fcinfo->flinfo->fn_mcxt,
-						sizeof(RecordCompareData) - sizeof(ColumnCompareData)
-							   + ncols * sizeof(ColumnCompareData));
+							   offsetof(RecordCompareData, columns) +
+							   ncols * sizeof(ColumnCompareData));
 		my_extra = (RecordCompareData *) fcinfo->flinfo->fn_extra;
 		my_extra->ncolumns = ncols;
 		my_extra->record1_type = InvalidOid;
@@ -1659,15 +1645,18 @@ record_image_eq(PG_FUNCTION_ARGS)
 	i1 = i2 = j = 0;
 	while (i1 < ncolumns1 || i2 < ncolumns2)
 	{
+		Form_pg_attribute att1;
+		Form_pg_attribute att2;
+
 		/*
 		 * Skip dropped columns
 		 */
-		if (i1 < ncolumns1 && tupdesc1->attrs[i1]->attisdropped)
+		if (i1 < ncolumns1 && TupleDescAttr(tupdesc1, i1)->attisdropped)
 		{
 			i1++;
 			continue;
 		}
-		if (i2 < ncolumns2 && tupdesc2->attrs[i2]->attisdropped)
+		if (i2 < ncolumns2 && TupleDescAttr(tupdesc2, i2)->attisdropped)
 		{
 			i2++;
 			continue;
@@ -1675,16 +1664,18 @@ record_image_eq(PG_FUNCTION_ARGS)
 		if (i1 >= ncolumns1 || i2 >= ncolumns2)
 			break;				/* we'll deal with mismatch below loop */
 
+		att1 = TupleDescAttr(tupdesc1, i1);
+		att2 = TupleDescAttr(tupdesc2, i2);
+
 		/*
 		 * Have two matching columns, they must be same type
 		 */
-		if (tupdesc1->attrs[i1]->atttypid !=
-			tupdesc2->attrs[i2]->atttypid)
+		if (att1->atttypid != att2->atttypid)
 			ereport(ERROR,
 					(errcode(ERRCODE_DATATYPE_MISMATCH),
 					 errmsg("cannot compare dissimilar column types %s and %s at record column %d",
-							format_type_be(tupdesc1->attrs[i1]->atttypid),
-							format_type_be(tupdesc2->attrs[i2]->atttypid),
+							format_type_be(att1->atttypid),
+							format_type_be(att2->atttypid),
 							j + 1)));
 
 		/*
@@ -1699,67 +1690,7 @@ record_image_eq(PG_FUNCTION_ARGS)
 			}
 
 			/* Compare the pair of elements */
-			if (tupdesc1->attrs[i1]->attlen == -1)
-			{
-				Size		len1,
-							len2;
-
-				len1 = toast_raw_datum_size(values1[i1]);
-				len2 = toast_raw_datum_size(values2[i2]);
-				/* No need to de-toast if lengths don't match. */
-				if (len1 != len2)
-					result = false;
-				else
-				{
-					struct varlena *arg1val;
-					struct varlena *arg2val;
-
-					arg1val = PG_DETOAST_DATUM_PACKED(values1[i1]);
-					arg2val = PG_DETOAST_DATUM_PACKED(values2[i2]);
-
-					result = (memcmp(VARDATA_ANY(arg1val),
-									 VARDATA_ANY(arg2val),
-									 len1 - VARHDRSZ) == 0);
-
-					/* Only free memory if it's a copy made here. */
-					if ((Pointer) arg1val != (Pointer) values1[i1])
-						pfree(arg1val);
-					if ((Pointer) arg2val != (Pointer) values2[i2])
-						pfree(arg2val);
-				}
-			}
-			else if (tupdesc1->attrs[i1]->attbyval)
-			{
-				switch (tupdesc1->attrs[i1]->attlen)
-				{
-					case 1:
-						result = (GET_1_BYTE(values1[i1]) ==
-								  GET_1_BYTE(values2[i2]));
-						break;
-					case 2:
-						result = (GET_2_BYTES(values1[i1]) ==
-								  GET_2_BYTES(values2[i2]));
-						break;
-					case 4:
-						result = (GET_4_BYTES(values1[i1]) ==
-								  GET_4_BYTES(values2[i2]));
-						break;
-#if SIZEOF_DATUM == 8
-					case 8:
-						result = (GET_8_BYTES(values1[i1]) ==
-								  GET_8_BYTES(values2[i2]));
-						break;
-#endif
-					default:
-						Assert(false);	/* cannot happen */
-				}
-			}
-			else
-			{
-				result = (memcmp(DatumGetPointer(values1[i1]),
-								 DatumGetPointer(values2[i2]),
-								 tupdesc1->attrs[i1]->attlen) == 0);
-			}
+			result = datum_image_eq(values1[i1], values2[i2], att1->attbyval, att2->attlen);
 			if (!result)
 				break;
 		}

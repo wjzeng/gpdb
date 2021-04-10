@@ -1,7 +1,7 @@
 # contrib/pgcrypto/Makefile
 
-INT_SRCS = md5.c sha1.c sha2.c internal.c internal-sha2.c blf.c rijndael.c \
-		fortuna.c random.c pgp-mpi-internal.c imath.c
+INT_SRCS = md5.c sha1.c internal.c internal-sha2.c blf.c rijndael.c \
+		pgp-mpi-internal.c imath.c
 INT_TESTS = sha2
 
 OSSL_SRCS = openssl.c pgp-mpi-openssl.c
@@ -23,10 +23,12 @@ SRCS		= pgcrypto.c px.c px-hmac.c px-crypt.c \
 		pgp-pgsql.c
 
 MODULE_big	= pgcrypto
-OBJS		= $(SRCS:.c=.o)
+OBJS		= $(SRCS:.c=.o) $(WIN32RES)
 
 EXTENSION = pgcrypto
-DATA = pgcrypto--1.1.sql pgcrypto--1.0--1.1.sql pgcrypto--unpackaged--1.0.sql
+DATA = pgcrypto--1.3.sql pgcrypto--1.2--1.3.sql pgcrypto--1.1--1.2.sql \
+	pgcrypto--1.0--1.1.sql pgcrypto--unpackaged--1.0.sql
+PGFILEDESC = "pgcrypto - cryptographic functions"
 
 REGRESS_OPTS = --dbname=$(CONTRIB_TESTDB) --init-file=$(top_builddir)/src/test/regress/init_file 
 
@@ -56,8 +58,11 @@ SHLIB_LINK += $(filter -lcrypto -lz, $(LIBS))
 ifeq ($(PORTNAME), win32)
 SHLIB_LINK += $(filter -leay32, $(LIBS))
 # those must be at the end
-SHLIB_LINK += -lwsock32 -lws2_32
+SHLIB_LINK += -lws2_32
 endif
+
+# Upstream uses a larger subset of C99.
+imath.o: CFLAGS+=$(PERMIT_DECLARATION_AFTER_STATEMENT)
 
 rijndael.o: rijndael.tbl
 

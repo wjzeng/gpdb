@@ -11,7 +11,7 @@
  * PG_TRY if necessary.
  *
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -35,17 +35,17 @@
 
 static bool validateTzEntry(tzEntry *tzentry);
 static bool splitTzLine(const char *filename, int lineno,
-			char *line, tzEntry *tzentry);
-static int addToArray(tzEntry **base, int *arraysize, int n,
-		   tzEntry *entry, bool override);
-static int ParseTzFile(const char *filename, int depth,
-			tzEntry **base, int *arraysize, int n);
+						char *line, tzEntry *tzentry);
+static int	addToArray(tzEntry **base, int *arraysize, int n,
+					   tzEntry *entry, bool override);
+static int	ParseTzFile(const char *filename, int depth,
+						tzEntry **base, int *arraysize, int n);
 
 
 /*
  * Apply additional validation checks to a tzEntry
  *
- * Returns TRUE if OK, else false
+ * Returns true if OK, else false
  */
 static bool
 validateTzEntry(tzEntry *tzentry)
@@ -60,13 +60,6 @@ validateTzEntry(tzEntry *tzentry)
 	{
 		GUC_check_errmsg("time zone abbreviation \"%s\" is too long (maximum %d characters) in time zone file \"%s\", line %d",
 						 tzentry->abbrev, TOKMAXLEN,
-						 tzentry->filename, tzentry->lineno);
-		return false;
-	}
-	if (tzentry->offset % 900 != 0)
-	{
-		GUC_check_errmsg("time zone offset %d is not a multiple of 900 sec (15 min) in time zone file \"%s\", line %d",
-						 tzentry->offset,
 						 tzentry->filename, tzentry->lineno);
 		return false;
 	}
@@ -93,9 +86,13 @@ validateTzEntry(tzEntry *tzentry)
 }
 
 /*
- * Attempt to parse the line as a timezone abbrev spec (name, offset, dst)
+ * Attempt to parse the line as a timezone abbrev spec
  *
- * Returns TRUE if OK, else false; data is stored in *tzentry
+ * Valid formats are:
+ *	name  zone
+ *	name  offset  dst
+ *
+ * Returns true if OK, else false; data is stored in *tzentry
  */
 static bool
 splitTzLine(const char *filename, int lineno, char *line, tzEntry *tzentry)
@@ -183,7 +180,7 @@ splitTzLine(const char *filename, int lineno, char *line, tzEntry *tzentry)
  * *arraysize: allocated length of array (changeable if must enlarge array)
  * n: current number of valid elements in array
  * entry: new data to insert
- * override: TRUE if OK to override
+ * override: true if OK to override
  *
  * Returns the new array length (new value for n), or -1 if error
  */
@@ -219,8 +216,11 @@ addToArray(tzEntry **base, int *arraysize, int n,
 			/*
 			 * Found a duplicate entry; complain unless it's the same.
 			 */
-			if (midptr->offset == entry->offset &&
-				midptr->is_dst == entry->is_dst)
+			if ((midptr->zone == NULL && entry->zone == NULL &&
+				 midptr->offset == entry->offset &&
+				 midptr->is_dst == entry->is_dst) ||
+				(midptr->zone != NULL && entry->zone != NULL &&
+				 strcmp(midptr->zone, entry->zone) == 0))
 			{
 				/* return unchanged array */
 				return n;
@@ -228,6 +228,7 @@ addToArray(tzEntry **base, int *arraysize, int n,
 			if (override)
 			{
 				/* same abbrev but something is different, override */
+				midptr->zone = entry->zone;
 				midptr->offset = entry->offset;
 				midptr->is_dst = entry->is_dst;
 				return n;
@@ -449,9 +450,7 @@ load_tzoffsets(const char *filename)
 	 */
 	tmpContext = AllocSetContextCreate(CurrentMemoryContext,
 									   "TZParserMemory",
-									   ALLOCSET_SMALL_MINSIZE,
-									   ALLOCSET_SMALL_INITSIZE,
-									   ALLOCSET_SMALL_MAXSIZE);
+									   ALLOCSET_SMALL_SIZES);
 	oldContext = MemoryContextSwitchTo(tmpContext);
 
 	/* Initialize array at a reasonable size */
@@ -461,15 +460,12 @@ load_tzoffsets(const char *filename)
 	/* Parse the file(s) */
 	n = ParseTzFile(filename, 0, &array, &arraysize, 0);
 
-	/* If no errors so far, allocate result and let datetime.c convert data */
+	/* If no errors so far, let datetime.c allocate memory & convert format */
 	if (n >= 0)
 	{
-		result = malloc(offsetof(TimeZoneAbbrevTable, abbrevs) +
-						n * sizeof(datetkn));
+		result = ConvertTimeZoneAbbrevs(array, n);
 		if (!result)
 			GUC_check_errmsg("out of memory");
-		else
-			ConvertTimeZoneAbbrevs(result, array, n);
 	}
 
 	/* Clean up */

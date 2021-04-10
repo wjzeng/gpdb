@@ -7,11 +7,11 @@
 -- 'gpfdists' protocol
 -- --------------------------------------
 CREATE EXTERNAL WEB TABLE gpfdist_ssl_start (x text)
-execute E'((@bindir@/gpfdist -p 7070 -d @abs_srcdir@/data --ssl @abs_srcdir@/data/gpfdist_ssl/certs_matching </dev/null >/dev/null 2>&1 &); sleep 1; echo "starting...") '
+execute E'((@bindir@/gpfdist -p 7070 -d @abs_srcdir@/data --ssl @abs_srcdir@/data/gpfdist_ssl/certs_matching -l /tmp/gpfdist_certs_matching.log </dev/null >/dev/null 2>&1 &);  sleep 5;  ps -A -o pid,comm |grep [g]pfdist |grep -v postgres:) '
 on SEGMENT 0
 FORMAT 'text' (delimiter '|');
 CREATE EXTERNAL WEB TABLE gpfdist_ssl_not_matching_start (x text)
-execute E'((@bindir@/gpfdist -p 7070 -d @abs_srcdir@/data --ssl @abs_srcdir@/data/gpfdist_ssl/certs_not_matching </dev/null >/dev/null 2>&1 &); sleep 1; echo "starting...") '
+execute E'((@bindir@/gpfdist -p 7070 -d @abs_srcdir@/data --ssl @abs_srcdir@/data/gpfdist_ssl/certs_not_matching -l /tmp/gpfdist_certs_not_matching.log </dev/null >/dev/null 2>&1 &);  sleep 5;  ps -A -o pid,comm |grep [g]pfdist |grep -v postgres:) '
 on SEGMENT 0
 FORMAT 'text' (delimiter '|');
 CREATE EXTERNAL WEB TABLE gpfdist_ssl_stop (x text)
@@ -26,15 +26,15 @@ select * from gpfdist_ssl_stop;
 (1 row)
 
 select * from gpfdist_ssl_start;
-      x      
--------------
- starting...
+       x       
+---------------
+  9796 gpfdist
 (1 row)
 
 -- end_ignore
 -- Helper to remove the output file
 DROP EXTERNAL WEB TABLE IF EXISTS clean_out_file;
-NOTICE:  table "clean_out_file" does not exist, skipping
+NOTICE:  foreign table "clean_out_file" does not exist, skipping
 CREATE EXTERNAL WEB TABLE clean_out_file (x text)
 EXECUTE E'(rm -f @abs_srcdir@/data/gpfdist_ssl/tbl2.tbl)'
 on SEGMENT 0
@@ -59,7 +59,7 @@ INSERT INTO tbl_on_heap VALUES
 ('bbb','twob','shpits','2011-06-01 12:30:30',23,732,834567,45.67,789.123,7.12345,123.456789),
 ('ccc','twoc','shpits','2011-06-01 12:30:30',23,732,834567,45.67,789.123,7.12345,123.456789 );
 DROP EXTERNAL TABLE IF EXISTS tbl;
-NOTICE:  table "tbl" does not exist, skipping
+NOTICE:  foreign table "tbl" does not exist, skipping
 CREATE WRITABLE EXTERNAL TABLE tbl (s1 text, s2 text, s3 text, dt timestamp,n1 smallint, n2 integer, n3 bigint, n4 decimal, n5 numeric, n6 real, n7 double precision)
 LOCATION ('gpfdists://127.0.0.1:7070/gpfdist_ssl/tbl2.tbl')
 FORMAT 'TEXT' (DELIMITER '|' );
@@ -82,7 +82,7 @@ CREATE TABLE tbl_on_heap2 (
 NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column named 's1' as the Greenplum Database data distribution key for this table.
 HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
 DROP EXTERNAL TABLE IF EXISTS tbl2;
-NOTICE:  table "tbl2" does not exist, skipping
+NOTICE:  foreign table "tbl2" does not exist, skipping
 CREATE EXTERNAL TABLE tbl2 (s1 text, s2 text, s3 text, dt timestamp,n1 smallint, n2 integer, n3 bigint, n4 decimal, n5 numeric, n6 real, n7 double precision)
 LOCATION ('gpfdists://127.0.0.1:7070/gpfdist_ssl/tbl2.tbl')
 FORMAT 'TEXT' (DELIMITER '|' );
@@ -159,7 +159,7 @@ CREATE EXTERNAL TABLE tbl (s1 text, s2 text, s3 text, dt timestamp,n1 smallint, 
 LOCATION ('gpfdists://127.0.0.1:7070/gpfdist_ssl/tbl1.tbl','gpfdist://127.0.0.1:7070/gpfdist_ssl/tbl1.tbl')
 FORMAT 'TEXT' (DELIMITER '|' );
 ERROR:  URI protocols must be the same for all data sources
-HINT:  Available protocols are 'http', 'file', 'gphdfs', 'gpfdist' and 'gpfdists'
+HINT:  Available protocols are 'http', 'file', 'gpfdist' and 'gpfdists'
 DROP TABLE IF EXISTS tbl_on_heap;
 -- start_ignore
 select * from gpfdist_ssl_stop;
@@ -169,15 +169,15 @@ select * from gpfdist_ssl_stop;
 (1 row)
 
 select * from gpfdist_ssl_not_matching_start;
-      x      
--------------
- starting...
+       x       
+---------------
+ 10000 gpfdist
 (1 row)
 
 -- end_ignore
 -- gpfdist_ssl case 6
 DROP EXTERNAL TABLE IF EXISTS tbl;
-NOTICE:  table "tbl" does not exist, skipping
+NOTICE:  foreign table "tbl" does not exist, skipping
 CREATE EXTERNAL TABLE tbl (s1 text, s2 text, s3 text, dt timestamp,n1 smallint, n2 integer, n3 bigint, n4 decimal, n5 numeric, n6 real, n7 double precision)
 LOCATION ('gpfdists://127.0.0.1:7070/gpfdist_ssl/tbl1.tbl')
 FORMAT 'TEXT' (DELIMITER '|' );

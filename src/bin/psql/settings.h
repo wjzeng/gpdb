@@ -1,7 +1,7 @@
 /*
  * psql - the PostgreSQL interactive terminal
  *
- * Copyright (c) 2000-2014, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2019, PostgreSQL Global Development Group
  *
  * src/bin/psql/settings.h
  */
@@ -10,8 +10,9 @@
 
 
 #include "variables.h"
-#include "print.h"
+#include "fe_utils/print.h"
 
+#define DEFAULT_CSV_FIELD_SEP ','
 #define DEFAULT_FIELD_SEP "|"
 #define DEFAULT_RECORD_SEP "\n"
 
@@ -27,10 +28,16 @@
 #define DEFAULT_PROMPT2 "%/%R%# "
 #define DEFAULT_PROMPT3 ">> "
 
+/*
+ * Note: these enums should generally be chosen so that zero corresponds
+ * to the default behavior.
+ */
+
 typedef enum
 {
 	PSQL_ECHO_NONE,
 	PSQL_ECHO_QUERIES,
+	PSQL_ECHO_ERRORS,
 	PSQL_ECHO_ALL
 } PSQL_ECHO;
 
@@ -47,6 +54,14 @@ typedef enum
 	PSQL_ERROR_ROLLBACK_INTERACTIVE,
 	PSQL_ERROR_ROLLBACK_ON
 } PSQL_ERROR_ROLLBACK;
+
+typedef enum
+{
+	PSQL_COMP_CASE_PRESERVE_UPPER,
+	PSQL_COMP_CASE_PRESERVE_LOWER,
+	PSQL_COMP_CASE_UPPER,
+	PSQL_COMP_CASE_LOWER
+} PSQL_COMP_CASE;
 
 typedef enum
 {
@@ -72,10 +87,17 @@ typedef struct _psqlSettings
 
 	FILE	   *copyStream;		/* Stream to read/write for \copy command */
 
+	PGresult   *last_error_result;	/* most recent error result, if any */
+
 	printQueryOpt popt;
 
 	char	   *gfname;			/* one-shot file output argument for \g */
+	bool		g_expanded;		/* one-shot expanded output requested via \gx */
 	char	   *gset_prefix;	/* one-shot prefix argument for \gset */
+	bool		gdesc_flag;		/* one-shot request to describe query results */
+	bool		gexec_flag;		/* one-shot request to execute query results */
+	bool		crosstab_flag;	/* one-shot request to crosstab results */
+	char	   *ctv_args[4];	/* \crosstabview arguments */
 
 	bool		notty;			/* stdin or stdout is not a tty (as determined
 								 * on startup) */
@@ -87,6 +109,7 @@ typedef struct _psqlSettings
 	const char *progname;		/* in case you renamed psql */
 	char	   *inputfile;		/* file being currently processed, if any */
 	uint64		lineno;			/* also for error reporting */
+	uint64		stmt_lineno;	/* line number inside the current statement */
 
 	bool		timing;			/* enable timing of all queries */
 
@@ -104,15 +127,20 @@ typedef struct _psqlSettings
 	bool		quiet;
 	bool		singleline;
 	bool		singlestep;
+	bool		hide_tableam;
 	int			fetch_count;
+	int			histsize;
+	int			ignoreeof;
 	PSQL_ECHO	echo;
 	PSQL_ECHO_HIDDEN echo_hidden;
 	PSQL_ERROR_ROLLBACK on_error_rollback;
+	PSQL_COMP_CASE comp_case;
 	HistControl histcontrol;
 	const char *prompt1;
 	const char *prompt2;
 	const char *prompt3;
 	PGVerbosity verbosity;		/* current error verbosity level */
+	PGContextVisibility show_context;	/* current context display level */
 } PsqlSettings;
 
 extern PsqlSettings pset;

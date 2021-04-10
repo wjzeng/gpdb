@@ -31,7 +31,7 @@ SELECT '' AS five, * FROM DEFAULT_TBL;
       |   3 |        |       1
 (5 rows)
 
-CREATE SEQUENCE DEFAULT_SEQ;
+CREATE SEQUENCE DEFAULT_SEQ CACHE 1;
 CREATE TABLE DEFAULTEXPR_TBL (i1 int DEFAULT 100 + (200-199) * 2,
 	i2 int DEFAULT nextval('default_seq'));
 INSERT INTO DEFAULTEXPR_TBL VALUES (-1, -2);
@@ -88,7 +88,7 @@ SELECT '' AS three, * FROM CHECK_TBL;
        | 6
 (3 rows)
 
-CREATE SEQUENCE CHECK_SEQ;
+CREATE SEQUENCE CHECK_SEQ CACHE 1;
 CREATE TABLE CHECK2_TBL (x int, y text, z int,
 	CONSTRAINT SEQUENCE_CON
 	CHECK (x > 3 and y <> 'check failed' and z < 8));
@@ -116,14 +116,14 @@ SELECT '' AS two, * from CHECK2_TBL;
 --
 -- Check constraints on INSERT
 --
-CREATE SEQUENCE INSERT_SEQ;
+CREATE SEQUENCE INSERT_SEQ CACHE 1;
 CREATE TABLE INSERT_TBL (x INT DEFAULT nextval('insert_seq'),
 	y TEXT DEFAULT '-NULL-',
 	z INT DEFAULT -1 * (nextval('insert_seq')-1),
-	CONSTRAINT INSERT_CON CHECK (x >= 3 AND y <> 'check failed' AND x < 8),
+	CONSTRAINT INSERT_TBL_CON CHECK (x >= 3 AND y <> 'check failed' AND x < 8),
 	CHECK (x + z = 0)) DISTRIBUTED BY(y);
 INSERT INTO INSERT_TBL(x,z) VALUES (2, -2);
-ERROR:  new row for relation "insert_tbl" violates check constraint "insert_con"
+ERROR:  new row for relation "insert_tbl" violates check constraint "insert_tbl_con"
 DETAIL:  Failing row contains (2, -NULL-, -2).
 SELECT '' AS zero, * FROM INSERT_TBL;
  zero | x | y | z 
@@ -137,7 +137,7 @@ SELECT 'one' AS one, nextval('insert_seq');
 (1 row)
 
 INSERT INTO INSERT_TBL(y) VALUES ('Y');
-ERROR:  new row for relation "insert_tbl" violates check constraint "insert_con"
+ERROR:  new row for relation "insert_tbl" violates check constraint "insert_tbl_con"
 DETAIL:  Failing row contains (2, Y, -2).
 INSERT INTO INSERT_TBL(y) VALUES ('Y');
 INSERT INTO INSERT_TBL(x,z) VALUES (1, -2);
@@ -145,7 +145,7 @@ ERROR:  new row for relation "insert_tbl" violates check constraint "insert_tbl_
 DETAIL:  Failing row contains (1, -NULL-, -2).
 INSERT INTO INSERT_TBL(z,x) VALUES (-7,  7);
 INSERT INTO INSERT_TBL VALUES (5, 'check failed', -5);
-ERROR:  new row for relation "insert_tbl" violates check constraint "insert_con"
+ERROR:  new row for relation "insert_tbl" violates check constraint "insert_tbl_con"
 DETAIL:  Failing row contains (5, check failed, -5).
 INSERT INTO INSERT_TBL VALUES (7, '!check failed', -7);
 INSERT INTO INSERT_TBL(y) VALUES ('-!NULL-');
@@ -176,7 +176,7 @@ INSERT INTO INSERT_TBL(x,y) VALUES (5, '!check failed');
 ERROR:  new row for relation "insert_tbl" violates check constraint "insert_tbl_check"
 DETAIL:  Failing row contains (5, !check failed, -9).
 INSERT INTO INSERT_TBL(y) VALUES ('-!NULL-');
-ERROR:  new row for relation "insert_tbl" violates check constraint "insert_con"
+ERROR:  new row for relation "insert_tbl" violates check constraint "insert_tbl_con"
 DETAIL:  Failing row contains (11, -!NULL-, -11).
 -- GPDB: fix the table contents to match upstream again, so that the subsequent
 -- tests start with the same state as in upstream.
@@ -201,7 +201,7 @@ SELECT 'seven' AS one, nextval('insert_seq');
 (1 row)
 
 INSERT INTO INSERT_TBL(y) VALUES ('Y');
-ERROR:  new row for relation "insert_tbl" violates check constraint "insert_con"
+ERROR:  new row for relation "insert_tbl" violates check constraint "insert_tbl_con"
 DETAIL:  Failing row contains (14, Y, -14).
 SELECT 'eight' AS one, nextval('insert_seq');
   one  | nextval 
@@ -228,11 +228,20 @@ SELECT '' AS nine, * FROM INSERT_TBL;
 --
 -- Check constraints on system columns
 --
--- GPDB: tableoid is allowed in upstream, but not in GPDB.
 CREATE TABLE SYS_COL_CHECK_TBL (city text, state text, is_capital bool,
                   altitude int,
                   CHECK (NOT (is_capital AND tableoid::regclass::text = 'sys_col_check_tbl')));
-ERROR:  system column "tableoid" reference in check constraint is invalid
+INSERT INTO SYS_COL_CHECK_TBL VALUES ('Seattle', 'Washington', false, 100);
+INSERT INTO SYS_COL_CHECK_TBL VALUES ('Olympia', 'Washington', true, 100);
+ERROR:  new row for relation "sys_col_check_tbl" violates check constraint "sys_col_check_tbl_check"
+DETAIL:  Failing row contains (Olympia, Washington, t, 100).
+SELECT *, tableoid::regclass::text FROM SYS_COL_CHECK_TBL;
+  city   |   state    | is_capital | altitude |     tableoid      
+---------+------------+------------+----------+-------------------
+ Seattle | Washington | f          |      100 | sys_col_check_tbl
+(1 row)
+
+DROP TABLE SYS_COL_CHECK_TBL;
 --
 -- Check constraints on system columns other then TableOid should return error
 --
@@ -240,6 +249,8 @@ CREATE TABLE SYS_COL_CHECK_TBL (city text, state text, is_capital bool,
                   altitude int,
 				  CHECK (NOT (is_capital AND ctid::text = 'sys_col_check_tbl')));
 ERROR:  system column "ctid" reference in check constraint is invalid
+LINE 3:       CHECK (NOT (is_capital AND ctid::text = 'sys_col_check...
+                                         ^
 --
 -- Check inheritance of defaults and constraints
 --
@@ -254,7 +265,7 @@ INSERT INTO INSERT_CHILD(x,z,cy) VALUES (6,-7,7);
 ERROR:  new row for relation "insert_child" violates check constraint "insert_tbl_check"
 DETAIL:  Failing row contains (6, -NULL-, -7, 42, 7).
 INSERT INTO INSERT_CHILD(x,y,z,cy) VALUES (6,'check failed',-6,7);
-ERROR:  new row for relation "insert_child" violates check constraint "insert_con"
+ERROR:  new row for relation "insert_child" violates check constraint "insert_tbl_con"
 DETAIL:  Failing row contains (6, check failed, -6, 42, 7).
 SELECT * FROM INSERT_CHILD;
  x |   y    | z  | cx | cy 
@@ -301,7 +312,7 @@ NOTICE:  drop cascades to table atacc2
 --
 DELETE FROM INSERT_TBL;
 ALTER SEQUENCE INSERT_SEQ RESTART WITH 4;
-CREATE TABLE tmp (xd INT, yd TEXT, zd INT) distributed by (xd);
+CREATE TEMP TABLE tmp (xd INT, yd TEXT, zd INT);
 INSERT INTO tmp VALUES (null, 'Y', null);
 INSERT INTO tmp VALUES (5, '!check failed', null);
 INSERT INTO tmp VALUES (null, 'try again', null);
@@ -348,7 +359,7 @@ UPDATE INSERT_TBL SET x = NULL WHERE x = 5;
 UPDATE INSERT_TBL SET x = 6 WHERE x = 6;
 UPDATE INSERT_TBL SET x = -z, z = -x;
 UPDATE INSERT_TBL SET x = z, z = x;
-ERROR:  new row for relation "insert_tbl" violates check constraint "insert_con"  (seg0 172.17.0.2:25432 pid=308523)
+ERROR:  new row for relation "insert_tbl" violates check constraint "insert_tbl_con"  (seg0 172.17.0.2:25432 pid=308523)
 DETAIL:  Failing row contains (-4, Y, 4).
 SELECT * FROM INSERT_TBL;
  x |       y       | z  
@@ -389,7 +400,7 @@ SELECT * FROM COPY_TBL;
 --
 -- Primary keys
 --
-CREATE TABLE PRIMARY_TBL (i int PRIMARY KEY, t text) DISTRIBUTED BY (i);
+CREATE TABLE PRIMARY_TBL (i int PRIMARY KEY, t text);
 INSERT INTO PRIMARY_TBL VALUES (1, 'one');
 INSERT INTO PRIMARY_TBL VALUES (2, 'two');
 INSERT INTO PRIMARY_TBL VALUES (1, 'three');
@@ -411,7 +422,7 @@ SELECT '' AS four, * FROM PRIMARY_TBL;
 
 DROP TABLE PRIMARY_TBL;
 CREATE TABLE PRIMARY_TBL (i int, t text,
-	PRIMARY KEY(i,t)) DISTRIBUTED BY (i);
+	PRIMARY KEY(i,t));
 INSERT INTO PRIMARY_TBL VALUES (1, 'one');
 INSERT INTO PRIMARY_TBL VALUES (2, 'two');
 INSERT INTO PRIMARY_TBL VALUES (1, 'three');
@@ -434,7 +445,7 @@ DROP TABLE PRIMARY_TBL;
 --
 -- Unique keys
 --
-CREATE TABLE UNIQUE_TBL (i int UNIQUE, t text) DISTRIBUTED BY (i);
+CREATE TABLE UNIQUE_TBL (i int UNIQUE, t text);
 INSERT INTO UNIQUE_TBL VALUES (1, 'one');
 INSERT INTO UNIQUE_TBL VALUES (2, 'two');
 INSERT INTO UNIQUE_TBL VALUES (1, 'three');
@@ -444,20 +455,27 @@ INSERT INTO UNIQUE_TBL VALUES (4, 'four');
 INSERT INTO UNIQUE_TBL VALUES (5, 'one');
 INSERT INTO UNIQUE_TBL (t) VALUES ('six');
 INSERT INTO UNIQUE_TBL (t) VALUES ('seven');
+INSERT INTO UNIQUE_TBL VALUES (5, 'five-upsert-insert') ON CONFLICT (i) DO UPDATE SET t = 'five-upsert-update';
+INSERT INTO UNIQUE_TBL VALUES (6, 'six-upsert-insert') ON CONFLICT (i) DO UPDATE SET t = 'six-upsert-update';
+-- should fail
+INSERT INTO UNIQUE_TBL VALUES (1, 'a'), (2, 'b'), (2, 'b') ON CONFLICT (i) DO UPDATE SET t = 'fails';
+ERROR:  ON CONFLICT DO UPDATE command cannot affect row a second time
+HINT:  Ensure that no rows proposed for insertion within the same command have duplicate constrained values.
 SELECT '' AS five, * FROM UNIQUE_TBL;
- five | i |   t   
-------+---+-------
+ five | i |         t          
+------+---+--------------------
       | 1 | one
       | 2 | two
       | 4 | four
-      | 5 | one
       |   | six
       |   | seven
-(6 rows)
+      | 5 | five-upsert-update
+      | 6 | six-upsert-insert
+(7 rows)
 
 DROP TABLE UNIQUE_TBL;
 CREATE TABLE UNIQUE_TBL (i int, t text,
-	UNIQUE(i,t)) DISTRIBUTED BY (i);
+	UNIQUE(i,t));
 INSERT INTO UNIQUE_TBL VALUES (1, 'one');
 INSERT INTO UNIQUE_TBL VALUES (2, 'two');
 INSERT INTO UNIQUE_TBL VALUES (1, 'three');
@@ -574,6 +592,32 @@ SET CONSTRAINTS ALL IMMEDIATE; -- should fail
 ERROR:  duplicate key value violates unique constraint "unique_tbl_i_key"
 DETAIL:  Key (i)=(3) already exists.
 COMMIT;
+-- test deferrable UNIQUE with a partitioned table
+CREATE TABLE parted_uniq_tbl (i int UNIQUE DEFERRABLE) partition by range (i);
+CREATE TABLE parted_uniq_tbl_1 PARTITION OF parted_uniq_tbl FOR VALUES FROM (0) TO (10);
+CREATE TABLE parted_uniq_tbl_2 PARTITION OF parted_uniq_tbl FOR VALUES FROM (20) TO (30);
+SELECT conname, conrelid::regclass FROM pg_constraint
+  WHERE conname LIKE 'parted_uniq%' ORDER BY conname;
+         conname         |     conrelid      
+-------------------------+-------------------
+ parted_uniq_tbl_1_i_key | parted_uniq_tbl_1
+ parted_uniq_tbl_2_i_key | parted_uniq_tbl_2
+ parted_uniq_tbl_i_key   | parted_uniq_tbl
+(3 rows)
+
+BEGIN;
+INSERT INTO parted_uniq_tbl VALUES (1);
+SAVEPOINT f;
+INSERT INTO parted_uniq_tbl VALUES (1);	-- unique violation
+ERROR:  duplicate key value violates unique constraint "parted_uniq_tbl_1_i_key"
+DETAIL:  Key (i)=(1) already exists.
+ROLLBACK TO f;
+SET CONSTRAINTS parted_uniq_tbl_i_key DEFERRED;
+INSERT INTO parted_uniq_tbl VALUES (1);	-- OK now, fail at commit
+COMMIT;
+ERROR:  duplicate key value violates unique constraint "parted_uniq_tbl_1_i_key"
+DETAIL:  Key (i)=(1) already exists.
+DROP TABLE parted_uniq_tbl;
 -- test a HOT update that invalidates the conflicting tuple.
 -- the trigger should still fire and catch the violation
 BEGIN;
@@ -629,95 +673,109 @@ CREATE TABLE circles (
   EXCLUDE USING gist
     (c1 WITH &&, (c2::circle) WITH &&)
     WHERE (circle_center(c1) <> '(0,0)')
-);
+) DISTRIBUTED REPLICATED;
 -- these should succeed because they don't match the index predicate
 INSERT INTO circles VALUES('<(0,0), 5>', '<(0,0), 5>');
--- In the original version of the postgres test, they create a different set of
--- tuples for this. In Greenplum, we cannot support unique constraints on
--- non-distribution keys, and the version of the tuples from postgres end up on a
--- different segment, so we have to modify the original query here in order to
--- test these constraints. Alternatively, we could have set the distribution key
--- to be (c1, c2), but we don't support using CIRCLE type as a distribution key. 
-INSERT INTO circles VALUES('<(0,0), 5>', '<(0,0), 5>');
+INSERT INTO circles VALUES('<(0,0), 5>', '<(0,0), 4>');
 -- succeed
 INSERT INTO circles VALUES('<(10,10), 10>', '<(0,0), 5>');
 -- fail, overlaps
-INSERT INTO circles VALUES('<(20,20), 10>', '<(0,0), 5>');
+INSERT INTO circles VALUES('<(20,20), 10>', '<(0,0), 4>');
 ERROR:  conflicting key value violates exclusion constraint "circles_c1_c2_excl"
-DETAIL:  Key (c1, (c2::circle))=(<(20,20),10>, <(0,0),5>) conflicts with existing key (c1, (c2::circle))=(<(10,10),10>, <(0,0),5>).
+DETAIL:  Key (c1, (c2::circle))=(<(20,20),10>, <(0,0),4>) conflicts with existing key (c1, (c2::circle))=(<(10,10),10>, <(0,0),5>).
+-- succeed, because violation is ignored
+INSERT INTO circles VALUES('<(20,20), 10>', '<(0,0), 4>')
+  ON CONFLICT ON CONSTRAINT circles_c1_c2_excl DO NOTHING;
+-- fail, because DO UPDATE variant requires unique index
+INSERT INTO circles VALUES('<(20,20), 10>', '<(0,0), 4>')
+  ON CONFLICT ON CONSTRAINT circles_c1_c2_excl DO UPDATE SET c2 = EXCLUDED.c2;
+ERROR:  ON CONFLICT DO UPDATE not supported with exclusion constraints
 -- succeed because c1 doesn't overlap
 INSERT INTO circles VALUES('<(20,20), 1>', '<(0,0), 5>');
--- succeed because c2 is not the same
-INSERT INTO circles VALUES('<(20,20), 10>', '<(1,1), 5>');
+-- succeed because c2 doesn't overlap
+INSERT INTO circles VALUES('<(20,20), 10>', '<(10,10), 5>');
 -- should fail on existing data without the WHERE clause
 ALTER TABLE circles ADD EXCLUDE USING gist
-  (c1 WITH &&, (c2::circle) WITH ~=);
+  (c1 WITH &&, (c2::circle) WITH &&);
 ERROR:  could not create exclusion constraint "circles_c1_c2_excl1"
-DETAIL:  Key (c1, (c2::circle))=(<(0,0),5>, <(0,0),5>) conflicts with key (c1, (c2::circle))=(<(0,0),5>, <(0,0),5>).
+DETAIL:  Key (c1, (c2::circle))=(<(0,0),5>, <(0,0),5>) conflicts with key (c1, (c2::circle))=(<(0,0),5>, <(0,0),4>).
 -- try reindexing an existing constraint
 REINDEX INDEX circles_c1_c2_excl;
 DROP TABLE circles;
 -- Check deferred exclusion constraint
 CREATE TABLE deferred_excl (
   f1 int,
+  f2 int,
   CONSTRAINT deferred_excl_con EXCLUDE (f1 WITH =) INITIALLY DEFERRED
 );
 INSERT INTO deferred_excl VALUES(1);
 INSERT INTO deferred_excl VALUES(2);
 INSERT INTO deferred_excl VALUES(1); -- fail
-ERROR:  conflicting key value violates exclusion constraint "deferred_excl_f1_excl"
+ERROR:  conflicting key value violates exclusion constraint "deferred_excl_con"
 DETAIL:  Key (f1)=(1) conflicts with existing key (f1)=(1).
+INSERT INTO deferred_excl VALUES(1) ON CONFLICT ON CONSTRAINT deferred_excl_con DO NOTHING; -- fail
+ERROR:  ON CONFLICT does not support deferrable unique constraints/exclusion constraints as arbiters
 BEGIN;
 INSERT INTO deferred_excl VALUES(2); -- no fail here
 COMMIT; -- should fail here
-ERROR:  conflicting key value violates exclusion constraint "deferred_excl_f1_excl"
+ERROR:  conflicting key value violates exclusion constraint "deferred_excl_con"
 DETAIL:  Key (f1)=(2) conflicts with existing key (f1)=(2).
 BEGIN;
 INSERT INTO deferred_excl VALUES(3);
 INSERT INTO deferred_excl VALUES(3); -- no fail here
 COMMIT; -- should fail here
-ERROR:  conflicting key value violates exclusion constraint "deferred_excl_f1_excl"
+ERROR:  conflicting key value violates exclusion constraint "deferred_excl_con"
 DETAIL:  Key (f1)=(3) conflicts with existing key (f1)=(3).
+-- bug #13148: deferred constraint versus HOT update
+BEGIN;
+INSERT INTO deferred_excl VALUES(2, 1); -- no fail here
+DELETE FROM deferred_excl WHERE f1 = 2 AND f2 IS NULL; -- remove old row
+UPDATE deferred_excl SET f2 = 2 WHERE f1 = 2;
+COMMIT; -- should not fail
+SELECT * FROM deferred_excl;
+ f1 | f2 
+----+----
+  1 |   
+  2 |  2
+(2 rows)
+
 ALTER TABLE deferred_excl DROP CONSTRAINT deferred_excl_con;
 -- This should fail, but worth testing because of HOT updates
 UPDATE deferred_excl SET f1 = 3;
--- In the original postgres test, both the tuples in this table will be updated
--- (probably by HOT update) in the previous statement, and would now be equal. In
--- greenplum, the planner does not support updating distribution keys, so we need
--- to add in these tuples manually to make the next queries in this test valid.
--- ORCA actually DOES support updating the distribution key of tables, so if using
--- the optimizer, this is technically not necessary.  
-INSERT INTO deferred_excl VALUES(3);
-INSERT INTO deferred_excl VALUES(3);
 ALTER TABLE deferred_excl ADD EXCLUDE (f1 WITH =);
 ERROR:  could not create exclusion constraint "deferred_excl_f1_excl"
 DETAIL:  Key (f1)=(3) conflicts with key (f1)=(3).
 DROP TABLE deferred_excl;
---
--- Test foreign key constraints
---
-BEGIN;
--- Test with two heap tables
-CREATE TABLE fkc_primary_table1(a int PRIMARY KEY, b text) DISTRIBUTED BY (a);
-CREATE TABLE fkc_foreign_table1(a int REFERENCES fkc_primary_table1 ON DELETE RESTRICT ON UPDATE RESTRICT, b text) DISTRIBUTED BY (a);
--- the following should succeed
-INSERT INTO fkc_primary_table1 VALUES (1, 'bar');
-INSERT INTO fkc_primary_table1 VALUES (2, 'bar');
-INSERT INTO fkc_foreign_table1 VALUES (1, 'bar');
-INSERT INTO fkc_foreign_table1 VALUES (2, 'bar');
-UPDATE fkc_foreign_table1 SET b = 'foo';
-DELETE FROM fkc_primary_table1 WHERE a = 1;
-COMMIT;
-BEGIN;
--- Test with an ao table and heap table
-CREATE TABLE fkc_primary_table2(a int PRIMARY KEY, b text) DISTRIBUTED BY (a);
-CREATE TABLE fkc_foreign_table2(a int REFERENCES fkc_primary_table2 ON DELETE RESTRICT ON UPDATE RESTRICT,
-                                b text) WITH (APPENDONLY=TRUE) DISTRIBUTED BY (a);
--- the following should succeed
-INSERT INTO fkc_primary_table2 VALUES (1, 'bar');
-INSERT INTO fkc_primary_table2 VALUES (2, 'bar');
-INSERT INTO fkc_foreign_table2 VALUES (1, 'bar');
-INSERT INTO fkc_foreign_table2 VALUES (2, 'bar');
-UPDATE fkc_foreign_table2 SET b = 'foo';
-DELETE FROM fkc_primary_table2 WHERE a = 1;
-COMMIT;
+-- Comments
+-- Setup a low-level role to enforce non-superuser checks.
+CREATE ROLE regress_constraint_comments;
+SET SESSION AUTHORIZATION regress_constraint_comments;
+CREATE TABLE constraint_comments_tbl (a int CONSTRAINT the_constraint CHECK (a > 0));
+CREATE DOMAIN constraint_comments_dom AS int CONSTRAINT the_constraint CHECK (value > 0);
+COMMENT ON CONSTRAINT the_constraint ON constraint_comments_tbl IS 'yes, the comment';
+COMMENT ON CONSTRAINT the_constraint ON DOMAIN constraint_comments_dom IS 'yes, another comment';
+-- no such constraint
+COMMENT ON CONSTRAINT no_constraint ON constraint_comments_tbl IS 'yes, the comment';
+ERROR:  constraint "no_constraint" for table "constraint_comments_tbl" does not exist
+COMMENT ON CONSTRAINT no_constraint ON DOMAIN constraint_comments_dom IS 'yes, another comment';
+ERROR:  constraint "no_constraint" for domain constraint_comments_dom does not exist
+-- no such table/domain
+COMMENT ON CONSTRAINT the_constraint ON no_comments_tbl IS 'bad comment';
+ERROR:  relation "no_comments_tbl" does not exist
+COMMENT ON CONSTRAINT the_constraint ON DOMAIN no_comments_dom IS 'another bad comment';
+ERROR:  type "no_comments_dom" does not exist
+COMMENT ON CONSTRAINT the_constraint ON constraint_comments_tbl IS NULL;
+COMMENT ON CONSTRAINT the_constraint ON DOMAIN constraint_comments_dom IS NULL;
+-- unauthorized user
+RESET SESSION AUTHORIZATION;
+CREATE ROLE regress_constraint_comments_noaccess;
+SET SESSION AUTHORIZATION regress_constraint_comments_noaccess;
+COMMENT ON CONSTRAINT the_constraint ON constraint_comments_tbl IS 'no, the comment';
+ERROR:  must be owner of relation constraint_comments_tbl
+COMMENT ON CONSTRAINT the_constraint ON DOMAIN constraint_comments_dom IS 'no, another comment';
+ERROR:  must be owner of type constraint_comments_dom
+RESET SESSION AUTHORIZATION;
+DROP TABLE constraint_comments_tbl;
+DROP DOMAIN constraint_comments_dom;
+DROP ROLE regress_constraint_comments;
+DROP ROLE regress_constraint_comments_noaccess;

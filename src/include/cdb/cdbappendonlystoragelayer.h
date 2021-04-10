@@ -3,7 +3,7 @@
  * cdbappendonlystoragelayer.h
  *
  * Portions Copyright (c) 2007-2009, Greenplum inc
- * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
  *
  *
  * IDENTIFICATION
@@ -13,8 +13,6 @@
  */
 #ifndef CDBAPPENDONLYSTORAGELAYER_H
 #define CDBAPPENDONLYSTORAGELAYER_H
-
-#include "storage/gp_compress.h"
 
 /*
  *

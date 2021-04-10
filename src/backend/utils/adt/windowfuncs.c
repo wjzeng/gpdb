@@ -3,7 +3,7 @@
  * windowfuncs.c
  *	  Standard window functions defined in SQL spec.
  *
- * Portions Copyright (c) 2000-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2000-2019, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
@@ -37,7 +37,7 @@ typedef struct
 
 static bool rank_up(WindowObject winobj);
 static Datum leadlag_common(FunctionCallInfo fcinfo,
-			   bool forward, bool withoffset, bool withdefault);
+							bool forward, bool withoffset, bool withdefault);
 
 
 /*
@@ -67,7 +67,7 @@ rank_up(WindowObject winobj)
 			up = true;
 	}
 
-	/* We can advance the mark, but only *after* acccess to prior row */
+	/* We can advance the mark, but only *after* access to prior row */
 	WinSetMarkPosition(winobj, curpos);
 
 	return up;
@@ -342,7 +342,7 @@ window_lag(PG_FUNCTION_ARGS)
 
 /*
  * lag_with_offset
- * returns the value of VE evelulated on a row that is OFFSET
+ * returns the value of VE evaluated on a row that is OFFSET
  * rows before the current row within a partition,
  * per spec.
  */

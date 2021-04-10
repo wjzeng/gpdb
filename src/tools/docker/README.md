@@ -3,37 +3,39 @@
 
 ## Build locally
 ```
-# Centos 6 (include dependencies for building GPDB)
+# Centos 6 (includes dependencies for building GPDB)
 docker build -t local/gpdb-dev:centos6 centos6
-# Add gpadmin user to Centos 6 (gpdb cannot run as root)
-docker build --build-arg REPO_OWNER=local -t local/gpdb-dev:centos6-gpadmin centos6-gpadmin
 
-# Centos 7 (include dependencies for building GPDB)
+# Centos 7 (includes dependencies for building GPDB)
 docker build -t local/gpdb-dev:centos7 centos7
-# Add gpadmin user to Centos 7 (gpdb cannot run as root)
-docker build --build-arg REPO_OWNER=local -t local/gpdb-dev:centos7-gpadmin centos7-gpadmin
+
+# Ubuntu (includes dependencies for building GPDB)
+docker build --build-arg BASE_IMAGE=ubuntu:16.04 -t local/gpdb-dev:ubuntu16 ubuntu
+docker build --build-arg BASE_IMAGE=ubuntu:18.04 -t local/gpdb-dev:ubuntu18 ubuntu
 ```
 
 OR
 ## Download from docker hub
 ```
-docker pull pivotaldata/gpdb-dev:centos6-admin
-docker pull pivotaldata/gpdb-dev:centos7-admin
+docker pull pivotaldata/gpdb-dev:centos6
+docker pull pivotaldata/gpdb-dev:centos7
+docker pull pivotaldata/gpdb-dev:ubuntu16
+docker pull pivotaldata/gpdb-dev:ubuntu18
 ```
 
 # Build GPDB code with Docker
 
-### Clone GPDB repo
+Clone GPDB repo
 ```
 git clone https://github.com/greenplum-db/gpdb.git
 cd gpdb
 ```
-### Use docker image based on gpdb/src/tools/docker/centos7-gpadmin
+Use docker image based on gpdb/src/tools/docker/centos7
 ```
-docker run -w /home/build/gpdb -v ${PWD}:/home/build/gpdb:cached -it pivotaldata/gpdb-dev:centos7-gpadmin /bin/bash
+docker run -w /home/build/gpdb -v ${PWD}:/home/build/gpdb:cached -it pivotaldata/gpdb-dev:centos7 /bin/bash
 ```
 
-### Inside docker
+Inside docker
 (Total time to build and run ~ 15-20 min)
 ```
 # ORCA is disabled here to keep the instructions simple
@@ -44,7 +46,6 @@ make -j4
 make install
 
 # Create a single node demo cluster with three segments
-# PGPORT is set to 15432
 source /usr/local/gpdb/greenplum_path.sh
 make create-demo-cluster
 source ./gpAux/gpdemo/gpdemo-env.sh
@@ -54,6 +55,6 @@ createdb greenplum
 psql -d greenplum
 ```
 
-# Docker container with GPDB database running
-For more information follow the [link](ubuntu-16.04/README.md)
+# Docker container with Open source version of GPDB database running
+For more information follow the [link](ubuntu16_ppa/README.md)
 

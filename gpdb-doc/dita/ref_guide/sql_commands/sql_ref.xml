@@ -2,7 +2,7 @@
 <!DOCTYPE topic
   PUBLIC "-//OASIS//DTD DITA Composite//EN" "ditabase.dtd">
 <topic id="topic1">
-  <title id="ad143465">SQL Command Reference</title>
+  <title id="ad143465">SQL Commands</title>
   <body>
     <p>The following SQL commands are available in Greenplum Database:</p>
     <ul otherprops="op-print">
@@ -12,12 +12,16 @@
       <li id="ad139888">
         <xref href="./ALTER_AGGREGATE.xml#topic1" type="topic" format="dita"/>
       </li>
+      <li id="li_i3p_pv3_sgb">
+        <xref href="./ALTER_COLLATION.xml#topic1" type="topic" format="dita"/>
+      </li>
       <li id="ad139889">
         <xref href="./ALTER_CONVERSION.xml#topic1" type="topic" format="dita"/>
       </li>
       <li id="ad139890">
         <xref href="./ALTER_DATABASE.xml#topic1" type="topic" format="dita"/>
       </li>
+      <li><xref href="ALTER_DEFAULT_PRIVILEGES.xml#topic1"/></li>
       <li id="ad139891">
         <xref href="./ALTER_DOMAIN.xml#topic1" type="topic" format="dita"/>
       </li>
@@ -60,6 +64,9 @@
       </li>
       <li id="ad139898">
         <xref href="./ALTER_ROLE.xml#topic1" type="topic" format="dita"/>
+      </li>
+      <li id="li_fkx_kfy_xgb">
+        <xref href="./ALTER_RULE.xml#topic1" type="topic" format="dita"/>
       </li>
       <li id="ad140296">
         <xref href="./ALTER_SCHEMA.xml#topic1" type="topic" format="dita"/>
@@ -125,6 +132,9 @@
       </li>
       <li id="ad139916">
         <xref href="./CREATE_CAST.xml#topic1" type="topic" format="dita"/>
+      </li>
+      <li id="ad239918">
+        <xref href="./CREATE_COLLATION.xml#topic1" type="topic" format="dita"/>
       </li>
       <li id="ad139918">
         <xref href="./CREATE_CONVERSION.xml#topic1" type="topic" format="dita"/>
@@ -233,6 +243,9 @@
       </li>
       <li id="ad140603">
         <xref href="./DROP_CAST.xml#topic1" type="topic" format="dita"/>
+      </li>
+      <li id="ad179918">
+        <xref href="./DROP_COLLATION.xml#topic1" type="topic" format="dita"/>
       </li>
       <li id="ad140607">
         <xref href="./DROP_CONVERSION.xml#topic1" type="topic" format="dita"/>
@@ -384,6 +397,9 @@
       </li>
       <li id="ad139987">
         <xref href="./SET.xml#topic1" type="topic" format="dita"/>
+      </li>
+      <li>
+        <xref href="./SET_CONSTRAINTS.xml#topic1" type="topic" format="dita"/>
       </li>
       <li id="ad139989">
         <xref href="./SET_ROLE.xml#topic1" type="topic" format="dita"/>

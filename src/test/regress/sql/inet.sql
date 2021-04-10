@@ -5,8 +5,9 @@
 -- prepare the table...
 
 DROP TABLE INET_TBL;
-CREATE TABLE INET_TBL (c cidr, i inet);
+CREATE TABLE INET_TBL (c cidr, i inet) distributed by (i);
 INSERT INTO INET_TBL (c, i) VALUES ('192.168.1', '192.168.1.226/24');
+ANALYZE INET_TBL;
 INSERT INTO INET_TBL (c, i) VALUES ('192.168.1.0/26', '192.168.1.226');
 INSERT INTO INET_TBL (c, i) VALUES ('192.168.1', '192.168.1.0/24');
 INSERT INTO INET_TBL (c, i) VALUES ('192.168.1', '192.168.1.0/25');
@@ -56,14 +57,27 @@ SELECT '' AS ten, i, c,
   i && c AS ovr
   FROM INET_TBL;
 
+SELECT max(i) AS max, min(i) AS min FROM INET_TBL;
+SELECT max(c) AS max, min(c) AS min FROM INET_TBL;
+
 -- check the conversion to/from text and set_netmask
 SELECT '' AS ten, set_masklen(inet(text(i)), 24) FROM INET_TBL;
 
 -- check that btree index works correctly
 CREATE INDEX inet_idx1 ON inet_tbl(i);
 SET enable_seqscan TO off;
+EXPLAIN (COSTS OFF)
 SELECT * FROM inet_tbl WHERE i<<'192.168.1.0/24'::cidr;
+SELECT * FROM inet_tbl WHERE i<<'192.168.1.0/24'::cidr;
+EXPLAIN (COSTS OFF)
 SELECT * FROM inet_tbl WHERE i<<='192.168.1.0/24'::cidr;
+SELECT * FROM inet_tbl WHERE i<<='192.168.1.0/24'::cidr;
+EXPLAIN (COSTS OFF)
+SELECT * FROM inet_tbl WHERE '192.168.1.0/24'::cidr >>= i;
+SELECT * FROM inet_tbl WHERE '192.168.1.0/24'::cidr >>= i;
+EXPLAIN (COSTS OFF)
+SELECT * FROM inet_tbl WHERE '192.168.1.0/24'::cidr >> i;
+SELECT * FROM inet_tbl WHERE '192.168.1.0/24'::cidr >> i;
 SET enable_seqscan TO on;
 DROP INDEX inet_idx1;
 
@@ -81,8 +95,37 @@ SELECT * FROM inet_tbl WHERE i = '192.168.1.0/24'::cidr ORDER BY i,c;
 SELECT * FROM inet_tbl WHERE i >= '192.168.1.0/24'::cidr ORDER BY i,c;
 SELECT * FROM inet_tbl WHERE i > '192.168.1.0/24'::cidr ORDER BY i,c;
 SELECT * FROM inet_tbl WHERE i <> '192.168.1.0/24'::cidr ORDER BY i,c;
+
+-- test index-only scans
+EXPLAIN (COSTS OFF)
+SELECT i FROM inet_tbl WHERE i << '192.168.1.0/24'::cidr ORDER BY i;
+SELECT i FROM inet_tbl WHERE i << '192.168.1.0/24'::cidr ORDER BY i;
+
 SET enable_seqscan TO on;
 DROP INDEX inet_idx2;
+
+-- check that spgist index works correctly
+CREATE INDEX inet_idx3 ON inet_tbl using spgist (i);
+SET enable_seqscan TO off;
+SELECT * FROM inet_tbl WHERE i << '192.168.1.0/24'::cidr ORDER BY i;
+SELECT * FROM inet_tbl WHERE i <<= '192.168.1.0/24'::cidr ORDER BY i;
+SELECT * FROM inet_tbl WHERE i && '192.168.1.0/24'::cidr ORDER BY i;
+SELECT * FROM inet_tbl WHERE i >>= '192.168.1.0/24'::cidr ORDER BY i;
+SELECT * FROM inet_tbl WHERE i >> '192.168.1.0/24'::cidr ORDER BY i;
+SELECT * FROM inet_tbl WHERE i < '192.168.1.0/24'::cidr ORDER BY i;
+SELECT * FROM inet_tbl WHERE i <= '192.168.1.0/24'::cidr ORDER BY i;
+SELECT * FROM inet_tbl WHERE i = '192.168.1.0/24'::cidr ORDER BY i;
+SELECT * FROM inet_tbl WHERE i >= '192.168.1.0/24'::cidr ORDER BY i;
+SELECT * FROM inet_tbl WHERE i > '192.168.1.0/24'::cidr ORDER BY i;
+SELECT * FROM inet_tbl WHERE i <> '192.168.1.0/24'::cidr ORDER BY i;
+
+-- test index-only scans
+EXPLAIN (COSTS OFF)
+SELECT i FROM inet_tbl WHERE i << '192.168.1.0/24'::cidr ORDER BY i;
+SELECT i FROM inet_tbl WHERE i << '192.168.1.0/24'::cidr ORDER BY i;
+
+SET enable_seqscan TO on;
+DROP INDEX inet_idx3;
 
 -- simple tests of inet boolean and arithmetic operators
 SELECT i, ~i AS "~i" FROM inet_tbl;
@@ -107,3 +150,10 @@ SELECT '127::1'::inet - '126::2'::inet;
 -- but not these
 SELECT '127::1'::inet + 10000000000;
 SELECT '127::1'::inet - '127::2'::inet;
+
+-- insert one more row with addressed from different families
+INSERT INTO INET_TBL (c, i) VALUES ('10', '10::/8');
+-- now, this one should fail
+SELECT inet_merge(c, i) FROM INET_TBL;
+-- fix it by inet_same_family() condition
+SELECT inet_merge(c, i) FROM INET_TBL WHERE inet_same_family(c, i);

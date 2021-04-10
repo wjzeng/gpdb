@@ -7,26 +7,22 @@
 -- s/Executor memory: (\d+)\w bytes avg x \d+ workers, \d+\w bytes max \(seg\d+\)\./Executor memory: ####K bytes avg x #### workers, ####K bytes max (seg#)./
 -- m/Work_mem: \d+\w bytes max\./
 -- s/Work_mem: \d+\w bytes max\. */Work_mem: ###K bytes max./
--- m/Execution time: \d+\.\d+ ms/
--- s/Execution time: \d+\.\d+ ms/Execution time: ##.### ms/
--- m/Planning time: \d+\.\d+ ms/
--- s/Planning time: \d+\.\d+ ms/Planning time: ##.### ms/
+-- m/Execution Time: \d+\.\d+ ms/
+-- s/Execution Time: \d+\.\d+ ms/Execution Time: ##.### ms/
+-- m/Planning Time: \d+\.\d+ ms/
+-- s/Planning Time: \d+\.\d+ ms/Planning Time: ##.### ms/
 -- m/cost=\d+\.\d+\.\.\d+\.\d+ rows=\d+ width=\d+/
 -- s/\(cost=\d+\.\d+\.\.\d+\.\d+ rows=\d+ width=\d+\)/(cost=##.###..##.### rows=### width=###)/
--- m/Peak memory: \d+\w? bytes\./
--- s/Peak memory: \d+\w? bytes\./Peak memory: ### bytes./
--- m/Peak memory: \d+\w? bytes avg x \d+ workers, \d+\w? bytes max \(seg\d+\)./
--- s/Peak memory: \d+\w? bytes avg x \d+ workers, \d+\w? bytes max \(seg\d+\)\./Peak memory: ### bytes avg x # workers, ### bytes max (seg#)./
--- m/Vmem reserved: \d+\w? bytes\./
--- s/Vmem reserved: \d+\w? bytes\./Vmem reserved: ### bytes./
--- m/Vmem reserved: \d+\w? bytes avg x \d+ workers, \d+\w? bytes max \(seg\d+\)/
--- s/Vmem reserved: \d+\w? bytes avg x \d+ workers, \d+\w? bytes max \(seg\d+\)/Vmem reserved: ### bytes avg x # workers, ### bytes max (seg#)/
--- m/Total memory used across slices: \d+\w bytes./
--- s/Total memory used across slices: \d+\w bytes./Total memory used across slices: ### bytes./
 -- m/Memory used:  \d+\w?B/
 -- s/Memory used:  \d+\w?B/Memory used: ###B/
--- m/ORCA Memory used: peak \d+\w?B  allocated \d+\w?B  freed \d+\w?B/
--- s/ORCA Memory used: peak \d+\w?B  allocated \d+\w?B  freed \d+\w?B/ORCA Memory used: peak ##B  allocated ##B  freed ##B/
+-- m/Memory Usage: \d+\w?B/
+-- s/Memory Usage: \d+\w?B/Memory Usage: ###B/
+-- m/Peak Memory Usage: \d+/
+-- s/Peak Memory Usage: \d+/Peak Memory Usage: ###/
+-- m/Buckets: \d+/
+-- s/Buckets: \d+/Buckets: ###/
+-- m/Batches: \d+/
+-- s/Batches: \d+/Batches: ###/
 -- end_matchsubs
 --
 -- DEFAULT syntax
@@ -34,9 +30,6 @@ CREATE TABLE apples(id int PRIMARY KEY, type text);
 INSERT INTO apples(id) SELECT generate_series(1, 100000);
 CREATE TABLE box_locations(id int PRIMARY KEY, address text);
 CREATE TABLE boxes(id int PRIMARY KEY, apple_id int REFERENCES apples(id), location_id int REFERENCES box_locations(id));
-
--- Activate GUC that will show more memory information
-SET explain_memory_verbosity = 'summary';
 
 --- Check Explain Text format output
 -- explain_processing_off
@@ -70,14 +63,12 @@ EXPLAIN (ANALYZE) SELECT * from boxes LEFT JOIN apples ON apples.id = boxes.appl
 -- s/Execution Time: \d+\.\d+/Execution Time: ##.###/
 -- m/Segments: \d+/
 -- s/Segments: \d+/Segments: #/
--- m/PQO version \d+\.\d+\.\d+",?/
--- s/PQO version \d+\.\d+\.\d+",?/PQO version ##.##.##"/
+-- m/Pivotal Optimizer \(GPORCA\) version \d+\.\d+\.\d+",?/
+-- s/Pivotal Optimizer \(GPORCA\) version \d+\.\d+\.\d+",?/Pivotal Optimizer \(GPORCA\)"/
 -- m/ Memory: \d+/
 -- s/ Memory: \d+/ Memory: ###/
 -- m/Maximum Memory Used: \d+/
 -- s/Maximum Memory Used: \d+/Maximum Memory Used: ###/
--- m/Work Maximum Memory: \d+/
--- s/Work Maximum Memory: \d+/Work Maximum Memory: ###/
 -- m/Workers: \d+/
 -- s/Workers: \d+/Workers: ##/
 -- m/Average: \d+/
@@ -86,8 +77,6 @@ EXPLAIN (ANALYZE) SELECT * from boxes LEFT JOIN apples ON apples.id = boxes.appl
 -- s/Total memory used across slices: \d+\s*/Total memory used across slices: ###/
 -- m/Memory used: \d+/
 -- s/Memory used: \d+/Memory used: ###/
--- m/ORCA Memory Used \w+: \d+/
--- s/ORCA Memory Used (\w+): \d+\s+/ORCA Memory Used $1: ##/
 -- end_matchsubs
 -- Check Explain YAML output
 EXPLAIN (FORMAT YAML) SELECT * from boxes LEFT JOIN apples ON apples.id = boxes.apple_id LEFT JOIN box_locations ON box_locations.id = boxes.location_id;
@@ -106,16 +95,23 @@ EXPLAIN (ANALYZE, FORMAT YAML) SELECT * from boxes LEFT JOIN apples ON apples.id
 -- Check JSON format
 --
 -- start_matchsubs
--- m/PQO version \d+\.\d+\.\d+/
--- s/PQO version \d+\.\d+\.\d+/PQO version ##.##.##/
+-- m/Pivotal Optimizer \(GPORCA\) version \d+\.\d+\.\d+/
+-- s/Pivotal Optimizer \(GPORCA\) version \d+\.\d+\.\d+/Pivotal Optimizer \(GPORCA\)/
 -- end_matchsubs
 -- explain_processing_off
 EXPLAIN (FORMAT JSON, COSTS OFF) SELECT * FROM generate_series(1, 10);
 
 EXPLAIN (FORMAT XML, COSTS OFF) SELECT * FROM generate_series(1, 10);
+
+-- Test for an old bug in printing Sequence nodes in JSON/XML format
+-- (https://github.com/greenplum-db/gpdb/issues/9410)
+CREATE TABLE jsonexplaintest (i int4) PARTITION BY RANGE (i) (START(1) END(3) EVERY(1));
+EXPLAIN (FORMAT JSON, COSTS OFF) SELECT * FROM jsonexplaintest WHERE i = 2;
+
 -- explain_processing_on
 
 -- Cleanup
 DROP TABLE boxes;
 DROP TABLE apples;
 DROP TABLE box_locations;
+DROP TABLE jsonexplaintest;

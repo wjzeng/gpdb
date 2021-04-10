@@ -10,13 +10,15 @@ include $(top_srcdir)/src/Makefile.mock
 override CPPFLAGS+= -I$(top_srcdir)/src/backend/libpq \
 					-I$(libpq_srcdir) \
 					-I$(top_srcdir)/src/backend/postmaster \
+					-I$(top_srcdir)/src/test/unit/mock/ \
 					-I. -I$(top_builddir)/src/port \
 					-DDLSUFFIX=$(DLSUFFIX) \
+					-DUNITTEST \
 					-I$(top_srcdir)/src/backend/utils/stat
 
 # TODO: add ldl for quick hack; we need to figure out why
 # postgres in src/backend/Makefile doesn't need this and -pthread.
-MOCK_LIBS := -ldl $(filter-out -ledit, $(LIBS)) $(LDAP_LIBS_BE)
+MOCK_LIBS := -ldl $(filter-out -ledit, $(LIBS)) $(LDAP_LIBS_BE) $(ICU_LIBS) $(ZSTD_LIBS)
 
 # These files are not linked into test programs.
 EXCL_OBJS=\
@@ -28,6 +30,7 @@ EXCL_OBJS=\
 	src/backend/gpopt/relcache/%.o \
 	src/backend/gpopt/translate/%.o \
 	src/backend/gpopt/utils/%.o \
+	src/backend/gporca/%.o \
 
 # More files that are not linked into test programs. There's no particular
 # reason these couldn't be linked into, if necessary, but currently none of
@@ -48,7 +51,6 @@ EXCL_OBJS+=\
 	src/backend/utils/adt/jsonfuncs.o \
 	src/backend/utils/adt/like.o \
 	src/backend/utils/adt/like_match.o \
-	src/backend/utils/adt/lockfuncs.o \
 	src/backend/utils/adt/mac.o \
 	src/backend/utils/adt/matrix.o \
 	src/backend/utils/adt/oracle_compat.o \
@@ -120,7 +122,7 @@ WRAP_FUNCS=$(addprefix $(WRAP_FLAGS), \
 
 # The test target depends on $(OBJFILES) which would update files including mocks.
 %.t: $(OBJFILES) $(CMOCKERY_OBJS) $(MOCK_OBJS) %_test.o
-	$(CC) $(CFLAGS) $(LDFLAGS) $(call WRAP_FUNCS, $(top_srcdir)/$(subdir)/test/$*_test.c) $(call BACKEND_OBJS, $(top_srcdir)/$(subdir)/$*.o $(patsubst $(MOCK_DIR)/%_mock.o,$(top_builddir)/src/%.o, $^)) $(filter-out %/objfiles.txt, $^) $(MOCK_LIBS) -o $@
+	$(CXX) $(CFLAGS) $(LDFLAGS) $(call WRAP_FUNCS, $(top_srcdir)/$(subdir)/test/$*_test.c) $(call BACKEND_OBJS, $(top_srcdir)/$(subdir)/$*.o $(patsubst $(MOCK_DIR)/%_mock.o,$(top_builddir)/src/%.o, $^)) $(filter-out %/objfiles.txt, $^) $(MOCK_LIBS) -o $@
 
 # We'd like to call only src/backend, but it seems we should build src/port and
 # src/timezone before src/backend.  This is not the case when main build has finished,

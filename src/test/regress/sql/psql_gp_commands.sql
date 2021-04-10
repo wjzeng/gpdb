@@ -1,15 +1,9 @@
 --
 -- Test \dx and \dx+, to display extensions.
 --
--- We just use gp_inject_fault as an example of an extension here. We don't
--- inject any faults.
--- start_ignore
-CREATE EXTENSION IF NOT EXISTS gp_inject_fault;
--- end_ignore
-
-\dx gp_inject*
-\dx+ gp_inject*
-
+-- We just use plpgsql as an example of an extension here.
+\dx plpgsql
+\dx+ plpgsql
 
 --
 -- Test extended \du flags
@@ -59,17 +53,6 @@ CREATE ROLE test_psql_du_e6 WITH SUPERUSER CREATEEXTTABLE (type = 'writable', pr
 DROP ROLE test_psql_du_e6;
 
 
--- pg_catalog.pg_roles.rolcreaterexthdfs
-CREATE ROLE test_psql_du_e7 WITH SUPERUSER CREATEEXTTABLE (type = 'readable', protocol = 'gphdfs');
-\du test_psql_du_e7
-DROP ROLE test_psql_du_e7;
-
-
--- pg_catalog.pg_roles.rolcreatewexthdfs
-CREATE ROLE test_psql_du_e8 WITH SUPERUSER CREATEEXTTABLE (type = 'writable', protocol = 'gphdfs');
-\du test_psql_du_e8
-DROP ROLE test_psql_du_e8;
-
 -- Test replication and verbose. GPDB specific attributes are mixed with PG attributes.
 -- Our role describe code is easy to be buggy when we merge with PG upstream code.
 -- The tests here are used to double-confirm the correctness of our role describe code.
@@ -81,24 +64,63 @@ DROP ROLE test_psql_du_e9;
 
 
 --
--- Test that \dE displays both external and foreign tables
+-- Test \d commands.
 --
+-- Create a test schema, with different kinds of relations. To make the
+-- expected output insensitive to the current username, change the owner.
+CREATE ROLE test_psql_de_role;
+
 CREATE FOREIGN DATA WRAPPER dummy_wrapper;
 COMMENT ON FOREIGN DATA WRAPPER dummy_wrapper IS 'useless';
 CREATE SERVER dummy_server FOREIGN DATA WRAPPER dummy_wrapper;
+
+CREATE SCHEMA test_psql_schema;
+GRANT CREATE, USAGE ON SCHEMA test_psql_schema TO test_psql_de_role;
+SET search_path = 'test_psql_schema';
+SET ROLE test_psql_de_role;
+
+CREATE TABLE d_heap (i int4) with (appendonly = false);
+CREATE TABLE d_ao (i int4) with (appendonly = true, orientation = row);
+CREATE TABLE d_aocs (i int4) with (appendonly = true, orientation = column);
+CREATE VIEW d_view as SELECT 123;
+CREATE INDEX d_index on d_heap(i);
+
+-- Only superuser can create external or foreign tables.
+RESET ROLE;
+
 CREATE FOREIGN TABLE "dE_foreign_table" (c1 integer)
   SERVER dummy_server;
+ALTER FOREIGN TABLE "dE_foreign_table" OWNER TO test_psql_de_role;
 
 CREATE EXTERNAL TABLE "dE_external_table"  (c1 integer)
   LOCATION ('file://localhost/dummy') FORMAT 'text';
-
--- Change the owner, so that the expected output is not sensitive to current
--- username.
-CREATE ROLE test_psql_de_role;
-ALTER FOREIGN TABLE "dE_foreign_table" OWNER TO test_psql_de_role;
 ALTER EXTERNAL TABLE "dE_external_table" OWNER TO test_psql_de_role;
 
+-- There's a GPDB-specific Storage column.
+\d
+\d+
+
+-- The Storage column is not interesting for indexes, so it's omitted with
+-- \di
+\di
+\di+
+
+-- But if tables are shown, too, then it's interesting again.
+\dti
+
+-- \dE should display both external and foreign tables
 \dE "dE"*
+\dE
+
+-- \dd should list objects having comments
+\dd
+create rule dd_notify as on update to d_heap do also notify d_heap;
+comment on rule dd_notify on d_heap is 'this is a rule';
+alter table d_heap add constraint dd_ichk check (i>20);
+comment on constraint dd_ichk on d_heap is 'this is a constraint';
+create operator family dd_opfamily using btree;
+comment on operator family dd_opfamily using btree is 'this is an operator family';
+\dd
 
 -- Clean up
 DROP OWNED BY test_psql_de_role;

@@ -1,6 +1,6 @@
 /*
  * Encoding names and routines for work with it. All
- * in this file is shared bedween FE and BE.
+ * in this file is shared between FE and BE.
  *
  * src/backend/utils/mb/encnames.c
  */
@@ -344,7 +344,7 @@ const pg_enc2name pg_enc2name_tbl[] =
 	DEF_ENC2NAME(SJIS, 932),
 	DEF_ENC2NAME(BIG5, 950),
 	DEF_ENC2NAME(GBK, 936),
-	DEF_ENC2NAME(UHC, 0),
+	DEF_ENC2NAME(UHC, 949),
 	DEF_ENC2NAME(GB18030, 54936),
 	DEF_ENC2NAME(JOHAB, 0),
 	DEF_ENC2NAME(SHIFT_JIS_2004, 932)
@@ -401,6 +401,82 @@ const pg_enc2gettext pg_enc2gettext_tbl[] =
 	{PG_SHIFT_JIS_2004, "SHIFT_JISX0213"},
 	{0, NULL}
 };
+
+
+#ifndef FRONTEND
+
+/*
+ * Table of encoding names for ICU
+ *
+ * Reference: <https://ssl.icu-project.org/icu-bin/convexp>
+ *
+ * NULL entries are not supported by ICU, or their mapping is unclear.
+ */
+static const char *const pg_enc2icu_tbl[] =
+{
+	NULL,						/* PG_SQL_ASCII */
+	"EUC-JP",					/* PG_EUC_JP */
+	"EUC-CN",					/* PG_EUC_CN */
+	"EUC-KR",					/* PG_EUC_KR */
+	"EUC-TW",					/* PG_EUC_TW */
+	NULL,						/* PG_EUC_JIS_2004 */
+	"UTF-8",					/* PG_UTF8 */
+	NULL,						/* PG_MULE_INTERNAL */
+	"ISO-8859-1",				/* PG_LATIN1 */
+	"ISO-8859-2",				/* PG_LATIN2 */
+	"ISO-8859-3",				/* PG_LATIN3 */
+	"ISO-8859-4",				/* PG_LATIN4 */
+	"ISO-8859-9",				/* PG_LATIN5 */
+	"ISO-8859-10",				/* PG_LATIN6 */
+	"ISO-8859-13",				/* PG_LATIN7 */
+	"ISO-8859-14",				/* PG_LATIN8 */
+	"ISO-8859-15",				/* PG_LATIN9 */
+	NULL,						/* PG_LATIN10 */
+	"CP1256",					/* PG_WIN1256 */
+	"CP1258",					/* PG_WIN1258 */
+	"CP866",					/* PG_WIN866 */
+	NULL,						/* PG_WIN874 */
+	"KOI8-R",					/* PG_KOI8R */
+	"CP1251",					/* PG_WIN1251 */
+	"CP1252",					/* PG_WIN1252 */
+	"ISO-8859-5",				/* PG_ISO_8859_5 */
+	"ISO-8859-6",				/* PG_ISO_8859_6 */
+	"ISO-8859-7",				/* PG_ISO_8859_7 */
+	"ISO-8859-8",				/* PG_ISO_8859_8 */
+	"CP1250",					/* PG_WIN1250 */
+	"CP1253",					/* PG_WIN1253 */
+	"CP1254",					/* PG_WIN1254 */
+	"CP1255",					/* PG_WIN1255 */
+	"CP1257",					/* PG_WIN1257 */
+	"KOI8-U",					/* PG_KOI8U */
+};
+
+bool
+is_encoding_supported_by_icu(int encoding)
+{
+	return (pg_enc2icu_tbl[encoding] != NULL);
+}
+
+const char *
+get_encoding_name_for_icu(int encoding)
+{
+	const char *icu_encoding_name;
+
+	StaticAssertStmt(lengthof(pg_enc2icu_tbl) == PG_ENCODING_BE_LAST + 1,
+					 "pg_enc2icu_tbl incomplete");
+
+	icu_encoding_name = pg_enc2icu_tbl[encoding];
+
+	if (!icu_encoding_name)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("encoding \"%s\" not supported by ICU",
+						pg_encoding_to_char(encoding))));
+
+	return icu_encoding_name;
+}
+
+#endif							/* not FRONTEND */
 
 
 /* ----------

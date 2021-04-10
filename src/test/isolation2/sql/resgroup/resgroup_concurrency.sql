@@ -19,7 +19,7 @@ SELECT r.rsgname, num_running, num_queueing, num_queued, num_executed FROM gp_to
 
 -- new transaction will be blocked when the concurrency limit of the resource group is reached.
 SELECT r.rsgname, num_running, num_queueing, num_queued, num_executed FROM gp_toolkit.gp_resgroup_status s, pg_resgroup r WHERE s.groupid=r.oid AND r.rsgname='rg_concurrency_test';
-SELECT waiting_reason, rsgqueueduration > '0'::interval as time from pg_stat_activity where query = 'BEGIN;' and state = 'active' and rsgname = 'rg_concurrency_test';
+SELECT wait_event from pg_stat_activity where query = 'BEGIN;' and state = 'active' and rsgname = 'rg_concurrency_test' and wait_event_type='ResourceGroup';
 2:END;
 3:END;
 4<:
@@ -33,7 +33,7 @@ DROP RESOURCE GROUP rg_concurrency_test;
 
 -- test2: test alter concurrency
 -- Create a resource group with concurrency=2. Prepare 2 running transactions and 1 queueing transactions.
--- Alter concurrency 2->3, the queueing transaction will be woken up, the 'value' and 'proposed' of pg_resgroupcapability will be set to 3.
+-- Alter concurrency 2->3, the queueing transaction will be woken up, the 'value' of pg_resgroupcapability will be set to 3.
 DROP ROLE IF EXISTS role_concurrency_test;
 -- start_ignore
 DROP RESOURCE GROUP rg_concurrency_test;
@@ -47,10 +47,10 @@ CREATE ROLE role_concurrency_test RESOURCE GROUP rg_concurrency_test;
 14:SET ROLE role_concurrency_test;
 14&:BEGIN;
 SELECT r.rsgname, num_running, num_queueing, num_queued, num_executed FROM gp_toolkit.gp_resgroup_status s, pg_resgroup r WHERE s.groupid=r.oid AND r.rsgname='rg_concurrency_test';
-SELECT concurrency,proposed_concurrency FROM gp_toolkit.gp_resgroup_config WHERE groupname='rg_concurrency_test';
+SELECT concurrency FROM gp_toolkit.gp_resgroup_config WHERE groupname='rg_concurrency_test';
 ALTER RESOURCE GROUP rg_concurrency_test SET CONCURRENCY 3;
 SELECT r.rsgname, num_running, num_queueing, num_queued, num_executed FROM gp_toolkit.gp_resgroup_status s, pg_resgroup r WHERE s.groupid=r.oid AND r.rsgname='rg_concurrency_test';
-SELECT concurrency,proposed_concurrency FROM gp_toolkit.gp_resgroup_config WHERE groupname='rg_concurrency_test';
+SELECT concurrency FROM gp_toolkit.gp_resgroup_config WHERE groupname='rg_concurrency_test';
 12:END;
 13:END;
 14<:
@@ -78,10 +78,10 @@ CREATE ROLE role_concurrency_test RESOURCE GROUP rg_concurrency_test;
 25:SET ROLE role_concurrency_test;
 25&:BEGIN;
 SELECT r.rsgname, num_running, num_queueing, num_queued, num_executed FROM gp_toolkit.gp_resgroup_status s, pg_resgroup r WHERE s.groupid=r.oid AND r.rsgname='rg_concurrency_test';
-SELECT concurrency,proposed_concurrency FROM gp_toolkit.gp_resgroup_config WHERE groupname='rg_concurrency_test';
--- Alter concurrency 3->2, the 'proposed' of pg_resgroupcapability will be set to 2.
+SELECT concurrency FROM gp_toolkit.gp_resgroup_config WHERE groupname='rg_concurrency_test';
+-- Alter concurrency 3->2, the 'value' of pg_resgroupcapability will be set to 2.
 ALTER RESOURCE GROUP rg_concurrency_test SET CONCURRENCY 2;
-SELECT concurrency,proposed_concurrency FROM gp_toolkit.gp_resgroup_config WHERE groupname='rg_concurrency_test';
+SELECT concurrency FROM gp_toolkit.gp_resgroup_config WHERE groupname='rg_concurrency_test';
 -- When one transaction is finished, queueing transaction won't be woken up. There're 2 running transactions and 1 queueing transaction.
 24:END;
 SELECT r.rsgname, num_running, num_queueing, num_queued, num_executed FROM gp_toolkit.gp_resgroup_status s, pg_resgroup r WHERE s.groupid=r.oid AND r.rsgname='rg_concurrency_test';
@@ -91,9 +91,9 @@ SELECT r.rsgname, num_running, num_queueing, num_queued, num_executed FROM gp_to
 -- Finish another transaction, one queueing transaction will be woken up, there're 2 running transactions and 1 queueing transaction.
 22:END;
 SELECT r.rsgname, num_running, num_queueing, num_queued, num_executed FROM gp_toolkit.gp_resgroup_status s, pg_resgroup r WHERE s.groupid=r.oid AND r.rsgname='rg_concurrency_test';
--- Alter concurrency 2->2, the 'value' and 'proposed' of pg_resgroupcapability will be set to 2.
+-- Alter concurrency 2->2, the 'value' of pg_resgroupcapability will be set to 2.
 ALTER RESOURCE GROUP rg_concurrency_test SET CONCURRENCY 2;
-SELECT concurrency,proposed_concurrency FROM gp_toolkit.gp_resgroup_config WHERE groupname='rg_concurrency_test';
+SELECT concurrency FROM gp_toolkit.gp_resgroup_config WHERE groupname='rg_concurrency_test';
 -- Finish another transaction, one queueing transaction will be woken up, there're 2 running transactions and 0 queueing transaction.
 23:END;
 SELECT r.rsgname, num_running, num_queueing, num_queued, num_executed FROM gp_toolkit.gp_resgroup_status s, pg_resgroup r WHERE s.groupid=r.oid AND r.rsgname='rg_concurrency_test';
@@ -139,10 +139,10 @@ CREATE ROLE role_concurrency_test RESOURCE GROUP rg_concurrency_test;
 51:BEGIN;
 52:SET ROLE role_concurrency_test;
 52&:BEGIN;
-SELECT pg_cancel_backend(pid) FROM pg_stat_activity WHERE waiting_reason='resgroup' AND rsgname='rg_concurrency_test';
+SELECT pg_cancel_backend(pid) FROM pg_stat_activity WHERE wait_event_type='ResourceGroup' AND rsgname='rg_concurrency_test';
 52<:
 52&:BEGIN;
-SELECT pg_cancel_backend(pid) FROM pg_stat_activity WHERE waiting_reason='resgroup' AND rsgname='rg_concurrency_test';
+SELECT pg_cancel_backend(pid) FROM pg_stat_activity WHERE wait_event_type='ResourceGroup' AND rsgname='rg_concurrency_test';
 52<:
 51q:
 52q:
@@ -180,7 +180,7 @@ CREATE ROLE role_concurrency_test RESOURCE GROUP rg_concurrency_test;
 61:BEGIN;
 62:SET ROLE role_concurrency_test;
 62&:BEGIN;
-SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE waiting_reason='resgroup' AND rsgname='rg_concurrency_test';
+SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE wait_event_type='ResourceGroup' AND rsgname='rg_concurrency_test';
 62<:
 61q:
 62q:
@@ -197,7 +197,7 @@ CREATE RESOURCE GROUP rg_concurrency_test WITH (concurrency=0, cpu_rate_limit=20
 CREATE ROLE role_concurrency_test RESOURCE GROUP rg_concurrency_test;
 61:SET ROLE role_concurrency_test;
 61&:BEGIN;
-SELECT pg_cancel_backend(pid) FROM pg_stat_activity WHERE waiting_reason='resgroup' AND rsgname='rg_concurrency_test';
+SELECT pg_cancel_backend(pid) FROM pg_stat_activity WHERE wait_event_type='ResourceGroup' AND rsgname='rg_concurrency_test';
 61<:
 61q:
 DROP ROLE role_concurrency_test;

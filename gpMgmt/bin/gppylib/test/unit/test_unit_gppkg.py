@@ -1,5 +1,5 @@
 from mock import *
-from gp_unittest import *
+from .gp_unittest import *
 from gppylib.programs.gppkg import GpPkgProgram
 
 import sys
@@ -31,7 +31,7 @@ class GpPkgProgramTestCase(GpTestCase):
 
         parser = GpPkgProgram.create_parser()
         options, args = parser.parse_args()
-        with self.assertRaisesRegexp(Exception, "Package sample has not been installed"):
+        with self.assertRaisesRegex(Exception, "Package sample has not been installed"):
             self.subject = GpPkgProgram(options, args)
             self.subject.run()
 
@@ -51,7 +51,7 @@ class GpPkgProgramTestCase(GpTestCase):
         self.subject = GpPkgProgram(options, args)
         self.subject.run()
 
-        self.mock_listdir.assert_called_once()
+        self.mock_listdir.assert_called()
         self.mock_uninstall_package.run.assert_called_once()
 
     def test__input_matches_multiple_packages(self):
@@ -68,7 +68,7 @@ class GpPkgProgramTestCase(GpTestCase):
         parser = GpPkgProgram.create_parser()
         options, args = parser.parse_args()
         self.subject = GpPkgProgram(options, args)
-        with self.assertRaisesRegexp(Exception, "Remove request 'sampl' too broad. "
+        with self.assertRaisesRegex(Exception, "Remove request 'sampl' too broad. "
                                                 "Multiple packages match remove request: \( sample.gppkg, sample2.gppkg \)."):
             self.subject.run()
 
@@ -91,5 +91,5 @@ class GpPkgProgramTestCase(GpTestCase):
 
         self.subject.run()
 
-        self.mock_listdir.assert_called_once()
+        self.mock_listdir.assert_called()
         self.mock_uninstall_package.run.assert_called_once()

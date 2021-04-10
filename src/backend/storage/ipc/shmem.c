@@ -3,7 +3,7 @@
  * shmem.c
  *	  create shared memory and initialize shared memory data structures.
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -80,7 +80,7 @@
 
 /* shared memory global variables */
 
-static PGShmemHeader *ShmemSegHdr;		/* shared mem segment header */
+static PGShmemHeader *ShmemSegHdr;	/* shared mem segment header */
 
 static void *ShmemBase;			/* start address of shared memory */
 
@@ -118,6 +118,7 @@ void
 InitShmemAllocation(void)
 {
 	PGShmemHeader *shmhdr = ShmemSegHdr;
+	char	   *aligned;
 
 	Assert(shmhdr != NULL);
 
@@ -134,30 +135,21 @@ InitShmemAllocation(void)
 			errmsg("invalid page size %d; must be a power of two and not an error", ShmemSystemPageSize)));
 	}
 	/*
-	 * If spinlocks are disabled, initialize emulation layer.  We have to do
-	 * the space allocation the hard way, since obviously ShmemAlloc can't be
-	 * called yet.
+	 * Initialize the spinlock used by ShmemAlloc.  We must use
+	 * ShmemAllocUnlocked, since obviously ShmemAlloc can't be called yet.
 	 */
-#ifndef HAVE_SPINLOCKS
-	{
-		PGSemaphore spinsemas;
-
-		spinsemas = (PGSemaphore) (((char *) shmhdr) + shmhdr->freeoffset);
-		shmhdr->freeoffset += MAXALIGN(SpinlockSemaSize());
-		SpinlockSemaInit(spinsemas);
-		Assert(shmhdr->freeoffset <= shmhdr->totalsize);
-	}
-#endif
-
-	/*
-	 * Initialize the spinlock used by ShmemAlloc; we have to do this the hard
-	 * way, too, for the same reasons as above.
-	 */
-	ShmemLock = (slock_t *) (((char *) shmhdr) + shmhdr->freeoffset);
-	shmhdr->freeoffset += MAXALIGN(sizeof(slock_t));
-	Assert(shmhdr->freeoffset <= shmhdr->totalsize);
+	ShmemLock = (slock_t *) ShmemAllocUnlocked(sizeof(slock_t));
 
 	SpinLockInit(ShmemLock);
+
+	/*
+	 * Allocations after this point should go through ShmemAlloc, which
+	 * expects to allocate everything on cache line boundaries.  Make sure the
+	 * first allocation begins on a cache line boundary.
+	 */
+	aligned = (char *)
+		(CACHELINEALIGN((((char *) shmhdr) + shmhdr->freeoffset)));
+	shmhdr->freeoffset = aligned - (char *) shmhdr;
 
 	/* ShmemIndex can't be set up yet (need LWLocks first) */
 	shmhdr->index = NULL;
@@ -175,32 +167,61 @@ InitShmemAllocation(void)
 /*
  * ShmemAlloc -- allocate max-aligned chunk from shared memory
  *
- * Assumes ShmemLock and ShmemSegHdr are initialized.
+ * Throws error if request cannot be satisfied.
  *
- * Returns: real pointer to memory or NULL if we are out
- *		of space.  Has to return a real pointer in order
- *		to be compatible with malloc().
+ * Assumes ShmemLock and ShmemSegHdr are initialized.
  */
 void *
 ShmemAlloc(Size size)
+{
+	void	   *newSpace;
+
+	newSpace = ShmemAllocNoError(size);
+	if (!newSpace)
+		ereport(ERROR,
+				(errcode(ERRCODE_OUT_OF_MEMORY),
+				 errmsg("out of shared memory (%zu bytes requested)",
+						size)));
+	return newSpace;
+}
+
+/*
+ * ShmemAllocNoError -- allocate max-aligned chunk from shared memory
+ *
+ * As ShmemAlloc, but returns NULL if out of space, rather than erroring.
+ */
+void *
+ShmemAllocNoError(Size size)
 {
 	Size		newStart;
 	Size		newFree;
 	void	   *newSpace;
 
-	/* use volatile pointer to prevent code rearrangement */
-	volatile PGShmemHeader *shmemseghdr = ShmemSegHdr;
+	/*
+	 * Better to return NULL for this else caller could still use memory that
+	 * does not belong to it.
+	 */
+	if (size == 0)
+		return NULL;
 
 	/*
-	 * ensure all space is adequately aligned.
+	 * Ensure all space is adequately aligned.  We used to only MAXALIGN this
+	 * space but experience has proved that on modern systems that is not good
+	 * enough.  Many parts of the system are very sensitive to critical data
+	 * structures getting split across cache line boundaries.  To avoid that,
+	 * attempt to align the beginning of the allocation to a cache line
+	 * boundary.  The calling code will still need to be careful about how it
+	 * uses the allocated space - e.g. by padding each element in an array of
+	 * structures out to a power-of-two size - but without this, even that
+	 * won't be sufficient.
 	 */
-	size = MAXALIGN(size);
+	size = CACHELINEALIGN(size);
 
-	Assert(shmemseghdr != NULL);
+	Assert(ShmemSegHdr != NULL);
 
 	SpinLockAcquire(ShmemLock);
 
-	newStart = shmemseghdr->freeoffset;
+	newStart = ShmemSegHdr->freeoffset;
 
 	/*
 	 * Extra alignment for large requests, since they are probably buffers.
@@ -213,20 +234,57 @@ ShmemAlloc(Size size)
 	}
 
 	newFree = newStart + size;
-	if (newFree <= shmemseghdr->totalsize)
+	if (newFree <= ShmemSegHdr->totalsize)
 	{
 		newSpace = (void *) ((char *) ShmemBase + newStart);
-		shmemseghdr->freeoffset = newFree;
+		ShmemSegHdr->freeoffset = newFree;
 	}
 	else
 		newSpace = NULL;
 
 	SpinLockRelease(ShmemLock);
 
-	if (!newSpace)
-		ereport(WARNING,
+	/* note this assert is okay with newSpace == NULL */
+	Assert(newSpace == (void *) CACHELINEALIGN(newSpace));
+
+	return newSpace;
+}
+
+/*
+ * ShmemAllocUnlocked -- allocate max-aligned chunk from shared memory
+ *
+ * Allocate space without locking ShmemLock.  This should be used for,
+ * and only for, allocations that must happen before ShmemLock is ready.
+ *
+ * We consider maxalign, rather than cachealign, sufficient here.
+ */
+void *
+ShmemAllocUnlocked(Size size)
+{
+	Size		newStart;
+	Size		newFree;
+	void	   *newSpace;
+
+	/*
+	 * Ensure allocated space is adequately aligned.
+	 */
+	size = MAXALIGN(size);
+
+	Assert(ShmemSegHdr != NULL);
+
+	newStart = ShmemSegHdr->freeoffset;
+
+	newFree = newStart + size;
+	if (newFree > ShmemSegHdr->totalsize)
+		ereport(ERROR,
 				(errcode(ERRCODE_OUT_OF_MEMORY),
-				 errmsg("out of shared memory")));
+				 errmsg("out of shared memory (%zu bytes requested)",
+						size)));
+	ShmemSegHdr->freeoffset = newFree;
+
+	newSpace = (void *) ((char *) ShmemBase + newStart);
+
+	Assert(newSpace == (void *) MAXALIGN(newSpace));
 
 	return newSpace;
 }
@@ -234,7 +292,7 @@ ShmemAlloc(Size size)
 /*
  * ShmemAddrIsValid -- test if an address refers to shared memory
  *
- * Returns TRUE if the pointer points within the shared memory segment.
+ * Returns true if the pointer points within the shared memory segment.
  */
 bool
 ShmemAddrIsValid(const void *addr)
@@ -291,7 +349,7 @@ InitShmemIndex(void)
  * for NULL.
  */
 HTAB *
-ShmemInitHash(const char *name, /* table string name for shmem index */
+ShmemInitHash(const char *name,		/* table string name for shmem index */
 			  long init_size,	/* initial table size */
 			  long max_size,	/* max size of the table */
 			  HASHCTL *infoP,	/* info about key and bucket size */
@@ -308,7 +366,7 @@ ShmemInitHash(const char *name, /* table string name for shmem index */
 	 * The shared memory allocator must be specified too.
 	 */
 	infoP->dsize = infoP->max_dsize = hash_select_dirsize(max_size);
-	infoP->alloc = ShmemAlloc;
+	infoP->alloc = ShmemAllocNoError;
 	hash_flags |= HASH_SHARED_MEM | HASH_ALLOC | HASH_DIRSIZE;
 
 	/* look it up in the shmem index */
@@ -338,7 +396,7 @@ ShmemInitHash(const char *name, /* table string name for shmem index */
  *		for it.  If it exists already, a pointer to the existing
  *		structure is returned.
  *
- *	Returns: pointer to the object.  *foundPtr is set TRUE if the object was
+ *	Returns: pointer to the object.  *foundPtr is set true if the object was
  *		already in the shmem index (hence, already initialized).
  *
  *	Note: before Postgres 9.0, this function returned NULL for some failure
@@ -365,7 +423,7 @@ ShmemInitStruct(const char *name, Size size, bool *foundPtr)
 			/* Must be initializing a (non-standalone) backend */
 			Assert(shmemseghdr->index != NULL);
 			structPtr = shmemseghdr->index;
-			*foundPtr = TRUE;
+			*foundPtr = true;
 		}
 		else
 		{
@@ -379,14 +437,8 @@ ShmemInitStruct(const char *name, Size size, bool *foundPtr)
 			 */
 			Assert(shmemseghdr->index == NULL);
 			structPtr = ShmemAlloc(size);
-			if (structPtr == NULL)
-				ereport(ERROR,
-						(errcode(ERRCODE_OUT_OF_MEMORY),
-						 errmsg("not enough shared memory for data structure"
-								" \"%s\" (%zu bytes requested)",
-								name, size)));
 			shmemseghdr->index = structPtr;
-			*foundPtr = FALSE;
+			*foundPtr = false;
 		}
 		LWLockRelease(ShmemIndexLock);
 		return structPtr;
@@ -401,8 +453,8 @@ ShmemInitStruct(const char *name, Size size, bool *foundPtr)
 		LWLockRelease(ShmemIndexLock);
 		ereport(ERROR,
 				(errcode(ERRCODE_OUT_OF_MEMORY),
-		errmsg("could not create ShmemIndex entry for data structure \"%s\"",
-			   name)));
+				 errmsg("could not create ShmemIndex entry for data structure \"%s\"",
+						name)));
 	}
 
 	if (*foundPtr)
@@ -416,16 +468,16 @@ ShmemInitStruct(const char *name, Size size, bool *foundPtr)
 		{
 			LWLockRelease(ShmemIndexLock);
 			ereport(ERROR,
-				  (errmsg("ShmemIndex entry size is wrong for data structure"
-						  " \"%s\": expected %zu, actual %zu",
-						  name, size, result->size)));
+					(errmsg("ShmemIndex entry size is wrong for data structure"
+							" \"%s\": expected %zu, actual %zu",
+							name, size, result->size)));
 		}
 		structPtr = result->location;
 	}
 	else
 	{
 		/* It isn't in the table yet. allocate and initialize it */
-		structPtr = ShmemAlloc(size);
+		structPtr = ShmemAllocNoError(size);
 		if (structPtr == NULL)
 		{
 			/* out of memory; remove the failed ShmemIndex entry */
@@ -444,6 +496,9 @@ ShmemInitStruct(const char *name, Size size, bool *foundPtr)
 	LWLockRelease(ShmemIndexLock);
 
 	Assert(ShmemAddrIsValid(structPtr));
+
+	Assert(structPtr == (void *) CACHELINEALIGN(structPtr));
+
 	return structPtr;
 }
 

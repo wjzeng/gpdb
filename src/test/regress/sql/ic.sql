@@ -4,10 +4,6 @@
  * Parameter combination tests
  * Improve code coverage tests
  */
--- start_ignore
-CREATE EXTENSION IF NOT EXISTS gp_inject_fault;
--- end_ignore
-
 CREATE SCHEMA ic_udp_test;
 SET search_path = ic_udp_test;
 
@@ -205,15 +201,29 @@ drop table ic_test_1;
 
 /*
  * If message queue of connection is failed to be allocated in
- * SetupUDPIFCInterconnect_Internal() , it should be handled properly
+ * SetupUDPIFCInterconnect_Internal(), it should be handled properly
  * in TeardownUDPIFCInterconnect_Internal().
  */
 CREATE TABLE a (i INT, j INT) DISTRIBUTED BY (i);
 INSERT INTO a (SELECT i, i * i FROM generate_series(1, 10) as i);
 SELECT gp_inject_fault('interconnect_setup_palloc', 'error', 1);
 SELECT * FROM a;
-DROP TABLE a;
 SELECT gp_inject_fault('interconnect_setup_palloc', 'reset', 1);
+
+-- The same, but the fault happens while dispatching an Init Plan.
+SELECT gp_inject_fault('interconnect_setup_palloc', 'error', 1);
+SELECT * FROM generate_series(1, 5) g WHERE g < (SELECT max(a.j) FROM a);
+SELECT gp_inject_fault('interconnect_setup_palloc', 'reset', 1);
+
+DROP TABLE a;
+
+-- Test sender QE errors out when setup outgoing connection, the receiver QE is waiting,
+-- at this time, QD should be able to process the error and cancel the receiver QE.
+CREATE TABLE test_ic_error(a INT, b int);
+SELECT gp_inject_fault('interconnect_setup_palloc', 'error', 2);
+SELECT * FROM test_ic_error t1, test_ic_error t2 where t1.a=t2.b;
+SELECT gp_inject_fault('interconnect_setup_palloc', 'reset', 2);
+DROP TABLE test_ic_error;
 
 -- Use WITH RECURSIVE to construct a one-time filter result node that executed
 -- on QD, meanwhile, let the result node has a outer node which contain motion.
@@ -226,12 +236,39 @@ CREATE TABLE recursive_table_ic (a INT) DISTRIBUTED BY (a);
 INSERT INTO recursive_table_ic SELECT * FROM generate_series(20, 30000);
 WITH RECURSIVE
 r(i) AS (
-	SELECT 1
+       SELECT 1
 ),
 y(i) AS (
-	SELECT 1
-	UNION ALL
-	SELECT i + 1 FROM y, recursive_table_ic WHERE NOT EXISTS (SELECT * FROM r LIMIT 10)
+       SELECT 1
+       UNION ALL
+       SELECT i + 1 FROM y, recursive_table_ic WHERE NOT EXISTS (SELECT * FROM r LIMIT 10)
 )
 SELECT * FROM y LIMIT 10;
 DROP TABLE recursive_table_ic;
+
+-- Test QD can notice the errors in QEs for initplan
+CREATE TABLE qe_errors_ic (a INT, b INT);
+INSERT INTO qe_errors_ic SELECT i, i FROM generate_series(1, 10) i;
+SELECT count(*) FROM qe_errors_ic
+GROUP BY a, b
+HAVING sum(a) > (SELECT max(a) FROM qe_errors_ic WHERE a/0 > 1);
+
+-- Test QD can notice the errors in QEs for cursors
+-- In past, bellow DECLARE and FETCH commands had chances to report
+-- no errors, it was not expected, we expect either DECLARE or FETCH
+-- to report 'division by zero' errors.
+--
+-- In TCP interconnect mode, DECLARE or FETCH all have chance to
+-- report 'division by zero' errors, it depends on the speed of QD
+-- and QEs to set up interconnect, so ignore the output of DECLARE
+-- and FETCH, we verify the test case by checking the fact that the
+-- following commands in the transaction will failed.
+BEGIN;
+--start_ignore
+DECLARE qe_errors_cursor CURSOR FOR SELECT * FROM qe_errors_ic WHERE qe_errors_ic.b / 0 >1;
+FETCH ALL FROM qe_errors_cursor;
+--end_ignore
+select 1;
+ROLLBACK;
+
+DROP TABLE qe_errors_ic;

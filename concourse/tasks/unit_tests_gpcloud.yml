@@ -1,9 +1,9 @@
 platform: linux
 image_resource:
-  type: docker-image
+  type: registry-image
   source:
-    repository: pivotaldata/centos-gpdb-dev
-    tag: '6-gcc6.2-llvm3.7'
+    repository: pivotaldata/centos7-test
+    tag: gpdb7-latest
     username:
     password:
 inputs:

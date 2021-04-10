@@ -3,6 +3,7 @@
 --
 -- start_ignore
 set optimizer_log=on;
+set optimizer_force_multistage_agg=on;
 -- end_ignore
 
 set test_print_direct_dispatch_info=on; 
@@ -25,15 +26,15 @@ insert into dd_multicol_2 values(null, null);
 insert into dd_multicol_2 values(1, null);
 insert into dd_multicol_2 values(null, 1);
 
--- negative cases: composite distr key
+-- composite distr key
 
-select * from dd_multicol_1 where a in (1,3) and b in (1,3);
+select * from dd_multicol_1 where a in (1,3) and b in (1,2);
 
-select * from dd_multicol_1 where a = 1 and b in (1,3);
+select * from dd_multicol_1 where a = 1 and b in (1,2);
 
-select * from dd_multicol_1 where (a=1 and b=1) or (a=3 and b=3);
+select * from dd_multicol_1 where (a=1 and b=1) or (a=2 and b=2);
 
-select * from dd_multicol_1 where (a=1 or a=3) and (b=1 or b=3);
+select * from dd_multicol_1 where (a=1 or a=3) and (b=1 or b=2);
 
 select * from dd_multicol_1 where a is null or a=1;
 
@@ -41,9 +42,9 @@ select * from dd_multicol_1 where (a is null or a=1) and b=2;
 
 select * from dd_multicol_1 where (a,b) in ((1,2),(3,4)); 
 
--- negative cases: composite distr key: projections 
+-- composite distr key: projections
 
-select b from dd_multicol_1 where (a=1 or a=3) and (b=1 or b=3);
+select b from dd_multicol_1 where (a=1 or a=3) and (b=1 or b=2);
 
 select count(*) from dd_multicol_1;
 select count(*) from dd_multicol_2;
@@ -90,3 +91,4 @@ select * from dd_multicol_1 where a>80 and b=1;
 
 select * from dd_multicol_1 where a<=5 and b>0;
 
+reset optimizer_force_multistage_agg;

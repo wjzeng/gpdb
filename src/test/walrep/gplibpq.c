@@ -8,6 +8,7 @@
 #include "fmgr.h"
 #include "miscadmin.h"
 #include "access/xlog_internal.h"
+#include "access/xlogrecord.h"
 #include "replication/walreceiver.h"
 #include "cdb/cdbappendonlyam.h"
 #include "cdb/cdbappendonlyxlog.h"
@@ -50,17 +51,17 @@ void _PG_init(void);
 
 Datum test_connect(PG_FUNCTION_ARGS);
 Datum test_disconnect(PG_FUNCTION_ARGS);
-Datum test_receive(PG_FUNCTION_ARGS);
 Datum test_send(PG_FUNCTION_ARGS);
 Datum test_receive_and_verify(PG_FUNCTION_ARGS);
 Datum test_xlog_ao(PG_FUNCTION_ARGS);
 
 PG_FUNCTION_INFO_V1(test_connect);
 PG_FUNCTION_INFO_V1(test_disconnect);
-PG_FUNCTION_INFO_V1(test_receive);
 PG_FUNCTION_INFO_V1(test_send);
 PG_FUNCTION_INFO_V1(test_receive_and_verify);
 PG_FUNCTION_INFO_V1(test_xlog_ao);
+
+static WalReceiverConn *test_connection = NULL;
 
 /*
  * Module load callback.
@@ -79,33 +80,32 @@ Datum
 test_connect(PG_FUNCTION_ARGS)
 {
 	char *conninfo = TextDatumGetCString(PG_GETARG_DATUM(0));
+	char	   *err;
+	MemoryContext oldcxt;
 
-	walrcv_connect(conninfo);
+	oldcxt = MemoryContextSwitchTo(TopMemoryContext);
+	test_connection = walrcv_connect(conninfo, false, "walrcv_test", &err);
+	MemoryContextSwitchTo(oldcxt);
+
 	PG_RETURN_BOOL(true);
 }
 
 Datum
 test_disconnect(PG_FUNCTION_ARGS)
 {
-	walrcv_disconnect();
+	if (!test_connection)
+		elog(ERROR, "not connected");
+	walrcv_disconnect(test_connection);
+	test_connection = NULL;
 
 	PG_RETURN_BOOL(true);
 }
 
 Datum
-test_receive(PG_FUNCTION_ARGS)
-{
-	int		result;
-	char	   *buf;
-
-	result = walrcv_receive(NAPTIME_PER_CYCLE, &buf);
-
-	PG_RETURN_INT32(result);
-}
-
-Datum
 test_send(PG_FUNCTION_ARGS)
 {
+	if (!test_connection)
+		elog(ERROR, "not connected");
 	test_XLogWalRcvSendReply();
 
 	PG_RETURN_BOOL(true);
@@ -119,16 +119,24 @@ test_receive_and_verify(PG_FUNCTION_ARGS)
 	XLogRecPtr startpoint = PG_GETARG_LSN(0);
 	XLogRecPtr endpoint = PG_GETARG_LSN(1);
 	char   *buf;
+	pgsocket wait_fd;
 	int     len;
-	TimeLineID  startpointTLI;
+	WalRcvStreamOptions options;
 
-	/* For now hard-coding it to 1 */
-	startpointTLI = 1;
-	walrcv_startstreaming(startpointTLI, startpoint, NULL);
+	if (!test_connection)
+		elog(ERROR, "not connected");
+
+	memset(&options, 0, sizeof(options));
+	options.logical = false;
+	options.slotname = NULL;
+	options.startpoint = startpoint;
+	/* for now hard-coding it to 1 */
+	options.proto.physical.startpointTLI = 1;
+	walrcv_startstreaming(test_connection, &options);
 
 	for (int i=0; i < NUM_RETRIES; i++)
 	{
-		len = walrcv_receive(NAPTIME_PER_CYCLE, &buf);
+		len = walrcv_receive(test_connection, &buf, &wait_fd);
 		if (len > 0)
 		{
 			XLogRecPtr logStreamStart = InvalidXLogRecPtr;
@@ -136,7 +144,7 @@ test_receive_and_verify(PG_FUNCTION_ARGS)
 			/* Accept the received data, and process it */
 			test_XLogWalRcvProcessMsg(buf[0], &buf[1], len-1, &logStreamStart);
 
-			/* Compare received everthing from start */
+			/* Compare received everything from start */
 			if (startpoint != logStreamStart)
 			{
 				elog(ERROR, "Start point (%X/%X) differs from expected (%X/%X)",
@@ -156,6 +164,7 @@ test_receive_and_verify(PG_FUNCTION_ARGS)
 		}
 
 		elog(LOG, "walrcv_receive didn't return anything, retry...%d", i);
+		pg_usleep(NAPTIME_PER_CYCLE * 1000);
 	}
 
 	PG_RETURN_BOOL(false);
@@ -182,15 +191,13 @@ test_XLogWalRcvProcessMsg(unsigned char type, char *buf, Size len,
 				if (len < hdrlen)
 					ereport(ERROR,
 							(errcode(ERRCODE_PROTOCOL_VIOLATION),
-							 errmsg_internal("invalid WAL message received from primary"),
-							 errSendAlert(true)));
+							 errmsg_internal("invalid WAL message received from primary")));
 				appendBinaryStringInfo(&incoming_message, buf, hdrlen);
 
 				/* read the fields */
 				dataStart = pq_getmsgint64(&incoming_message);
 				walEnd = pq_getmsgint64(&incoming_message);
-				sendTime = IntegerTimestampToTimestampTz(
-										  pq_getmsgint64(&incoming_message));
+				sendTime = pq_getmsgint64(&incoming_message);
 				*logStreamStart = dataStart;
 
 				test_PrintLog("wal start records", dataStart, sendTime);
@@ -208,14 +215,12 @@ test_XLogWalRcvProcessMsg(unsigned char type, char *buf, Size len,
 				if (len != hdrlen)
 					ereport(ERROR,
 							(errcode(ERRCODE_PROTOCOL_VIOLATION),
-							 errmsg_internal("invalid keepalive message received from primary"),
-							 errSendAlert(true)));
+							 errmsg_internal("invalid keepalive message received from primary")));
 				appendBinaryStringInfo(&incoming_message, buf, hdrlen);
 
 				/* read the fields */
 				walEnd = pq_getmsgint64(&incoming_message);
-				sendTime = IntegerTimestampToTimestampTz(
-										  pq_getmsgint64(&incoming_message));
+				sendTime = pq_getmsgint64(&incoming_message);
 				replyRequested = pq_getmsgbyte(&incoming_message);
 
 				elog(INFO, "keep alive: %X/%X at %s",
@@ -229,7 +234,7 @@ test_XLogWalRcvProcessMsg(unsigned char type, char *buf, Size len,
 			ereport(ERROR,
 					(errcode(ERRCODE_PROTOCOL_VIOLATION),
 					 errmsg_internal("invalid replication message type %d",
-									 type),	errSendAlert(true)));
+									 type)));
 	}
 }
 
@@ -246,10 +251,10 @@ test_XLogWalRcvWrite(char *buf, Size nbytes, XLogRecPtr recptr)
 	{
 		int			segbytes;
 
-		startoff = recptr % XLogSegSize;
+		startoff = recptr % wal_segment_size;
 
-		if (startoff + nbytes > XLogSegSize)
-			segbytes = XLogSegSize - startoff;
+		if (startoff + nbytes > wal_segment_size)
+			segbytes = wal_segment_size - startoff;
 		else
 			segbytes = nbytes;
 
@@ -276,10 +281,10 @@ test_XLogWalRcvSendReply(void)
 	pq_sendint64(&reply_message, LogstreamResult.Write);
 	pq_sendint64(&reply_message, LogstreamResult.Flush);
 	pq_sendint64(&reply_message, LogstreamResult.Flush);
-	pq_sendint64(&reply_message, GetCurrentIntegerTimestamp());
+	pq_sendint64(&reply_message, GetCurrentTimestamp());
 	pq_sendbyte(&reply_message, false);
 
-	walrcv_send(reply_message.data, reply_message.len);
+	walrcv_send(test_connection, reply_message.data, reply_message.len);
 }
 
 /*
@@ -313,6 +318,7 @@ test_xlog_ao(PG_FUNCTION_ARGS)
 	{
 		TupleDesc	tupdesc;
 		MemoryContext oldcontext;
+		WalReceiverConn *conn;
 
 		/* create a function context for cross-call persistence */
 		funcctx = SRF_FIRSTCALL_INIT();
@@ -322,7 +328,7 @@ test_xlog_ao(PG_FUNCTION_ARGS)
 		*/
 		oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
 
-		tupdesc = CreateTemplateTupleDesc(nattr, false);
+		tupdesc = CreateTemplateTupleDesc(nattr);
 		TupleDescInitEntry(tupdesc, (AttrNumber) 1, "recordlen", INT4OID, -1, 0);
 		TupleDescInitEntry(tupdesc, (AttrNumber) 2, "record_type", TEXTOID, -1, 0);
 		TupleDescInitEntry(tupdesc, (AttrNumber) 3, "recordlen", INT4OID, -1, 0);
@@ -341,19 +347,28 @@ test_xlog_ao(PG_FUNCTION_ARGS)
 		XLogRecPtr    startpoint = PG_GETARG_LSN(1);
 		TimeLineID  startpointTLI;
 		char         *buf;
+		pgsocket	  wait_fd;
 		int           len;
 		uint32        xrecoff;
+		char	   *err;
+		WalRcvStreamOptions options;
 
 		xrecoff = (uint32)startpoint;
 
-		walrcv_connect(conninfo);
-		/* For now hard-coding it to 1 */
-		startpointTLI = 1;
-		walrcv_startstreaming(startpointTLI, startpoint, NULL);
+		conn = walrcv_connect(conninfo, false, "walrcv_test_ao_xlog", &err);
+		/* Get current timeline ID */
+		walrcv_identify_system(conn, &startpointTLI);
+
+		memset(&options, 0, sizeof(options));
+		options.logical = false;
+		options.slotname = NULL;
+		options.startpoint = startpoint;
+		options.proto.physical.startpointTLI = startpointTLI;
+		walrcv_startstreaming(conn, &options);
 
 		for (int i = 0; i < NUM_RETRIES; i++)
 		{
-			len = walrcv_receive(NAPTIME_PER_CYCLE, &buf);
+			len = walrcv_receive(conn, &buf, &wait_fd);
 			if (len > 0)
 			{
 				funcctx->max_calls = check_ao_record_present(buf[0], &buf[1],
@@ -362,10 +377,13 @@ test_xlog_ao(PG_FUNCTION_ARGS)
 				break;
 			}
 			else
+			{
 				elog(LOG, "walrcv_receive didn't return anything, retry...%d", i);
+				pg_usleep(NAPTIME_PER_CYCLE * 1000);
+			}
 		}
 
-		walrcv_disconnect();
+		walrcv_disconnect(conn);
 
 		MemoryContextSwitchTo(oldcontext);
 	}
@@ -407,7 +425,6 @@ static uint32
 check_ao_record_present(unsigned char type, char *buf, Size len,
 						uint32 xrecoff,	CheckAoRecordResult *aorecordresults)
 {
-	uint32               i = 0;
 	int                  num_found = 0;
 	XLogRecPtr  dataStart;
 	XLogRecPtr  walEnd;
@@ -416,6 +433,9 @@ check_ao_record_present(unsigned char type, char *buf, Size len,
 	int         hdrlen = sizeof(int64) + sizeof(int64) + sizeof(int64);
 	StringInfoData incoming_message;
 	initStringInfo(&incoming_message);
+
+	XLogReaderState *xlogreader;
+	char	   *errormsg;
 
 	if (type != 'w')
 		return num_found;
@@ -431,125 +451,51 @@ check_ao_record_present(unsigned char type, char *buf, Size len,
 	/* read the fields */
 	dataStart = pq_getmsgint64(&incoming_message);
 	walEnd = pq_getmsgint64(&incoming_message);
-	sendTime = IntegerTimestampToTimestampTz(
-		pq_getmsgint64(&incoming_message));
+	sendTime = pq_getmsgint64(&incoming_message);
 	buf += hdrlen;
 	len -= hdrlen;
 
 	test_PrintLog("wal start record", dataStart, sendTime);
 	test_PrintLog("wal end record", walEnd, sendTime);
 
+	xlogreader = XLogReaderAllocate(wal_segment_size, &read_local_xlog_page, NULL);
+
+	/*
+	 * Find the first valid record at or after the given starting point.
+	 *
+	 * XLogReadRecord() trips an assertion if it's given an invalid location,
+	 * and in the tests, we might be given a WAL position that points to the
+	 * beginning of a page, rather than a valid record.
+	 */
+	dataStart = XLogFindNextRecord(xlogreader, dataStart);
+	if (dataStart == InvalidXLogRecPtr)
+		return 0;
+
 	/* process the xlog records one at a time and check if it is an AO/AOCO record */
-	while (i < len)
+	do
 	{
-		XLogRecord 		   *xlrec = (XLogRecord *)(buf + i);
-		XLogPageHeaderData *hdr = (XLogPageHeaderData *)xlrec;
-		uint8	            info = xlrec->xl_info & ~XLR_INFO_MASK;
-		uint32 			    avail_in_block = XLOG_BLCKSZ - ((xrecoff + i) % XLOG_BLCKSZ);
-
-		elog(DEBUG1, "len/offset:%u/%u, avail_in_block = %u",
-			 xlrec->xl_tot_len, i, avail_in_block);
-
-		if (hdr->xlp_magic == XLOG_PAGE_MAGIC)
+		if (XLogReadRecord(xlogreader, dataStart, &errormsg))
 		{
-			/*
-			 * If we encounter a page header, check if it is a continuation
-			 * record and skip the page header and the remaining data to move
-			 * on to the next xlog record. If it is not a continuation record,
-			 * skip only the page header and move on to the next record.
-			 */
-			if (hdr->xlp_info & XLP_FIRST_IS_CONTRECORD)
+			if (XLogRecGetRmid(xlogreader) == RM_APPEND_ONLY_ID)
 			{
-				elog(DEBUG1, "remaining length of record = %u", hdr->xlp_rem_len);
-				i += MAXALIGN(XLogPageHeaderSize(hdr) + hdr->xlp_rem_len);
+				CheckAoRecordResult *aorecordresult = &aorecordresults[num_found];
+				xl_ao_target *xlaorecord = (xl_ao_target*) XLogRecGetData(xlogreader);
+
+				aorecordresult->xrecoff = xlogreader->ReadRecPtr;
+				aorecordresult->target.node.spcNode = xlaorecord->node.spcNode;
+				aorecordresult->target.node.dbNode = xlaorecord->node.dbNode;
+				aorecordresult->target.node.relNode = xlaorecord->node.relNode;
+				aorecordresult->target.segment_filenum = xlaorecord->segment_filenum;
+				aorecordresult->target.offset = xlaorecord->offset;
+				aorecordresult->len = XLogRecGetDataLen(xlogreader);
+				aorecordresult->ao_xlog_record_type = XLogRecGetInfo(xlogreader) & ~XLR_INFO_MASK;
+
+				num_found++;
 			}
-			else
-			{
-				i += XLogPageHeaderSize(hdr);
-				elog(DEBUG1, "XLOG_PAGE_MAGIC else, i:%u", i);
-			}
-		}
-		else if (xlrec->xl_rmid == RM_APPEND_ONLY_ID)
-		{
-			CheckAoRecordResult *aorecordresult = &aorecordresults[num_found];
-			aorecordresult->xrecoff = xrecoff + i;
-
-			if (xlrec->xl_tot_len > avail_in_block)
-			{
-				Assert(avail_in_block >= sizeof(xl_ao_target));
-
-				/*
-				 * The AO record has been split across two pages. Create a
-				 * temporary buffer to combine the split record back.
-				 */
-				char *tmpbuffer = (char *) palloc(xlrec->xl_tot_len);
-				memcpy(tmpbuffer, buf + i, avail_in_block);
-
-				/* Move on to the continuation record on the next page */
-				i += avail_in_block;
-				elog(DEBUG1, "AO record split found, i: %u, avail_in_block: %u", i, avail_in_block);
-
-				/* Construct the continuation record to get the remaining length */
-				XLogPageHeaderData *hdr_cont = (XLogPageHeaderData *)(buf + i);
-				elog(DEBUG1, "combining AO record split with XLogContRecord xl_rem_len %u",
-					 hdr_cont->xlp_rem_len);
-
-				/*
-				 * Move on to the second part of the split AO record and copy
-				 * the second part into the temporary buffer. The second part
-				 * does not contain a header and is directly after the
-				 * continuation record (no MAXALIGN padding).
-				 */
-				i += XLogPageHeaderSize(hdr_cont);
-				memcpy(tmpbuffer + avail_in_block,
-					   buf + i,
-					   hdr_cont->xlp_rem_len);
-
-				/*
-				 * Our split AO record is now combined back. Set the i to the
-				 * next XLog record (may need MAXALIGN padding).
-				 */
-				xlrec = (XLogRecord *) tmpbuffer;
-				i = MAXALIGN(i + hdr_cont->xlp_rem_len);
-			}
-			else
-			{
-				i += MAXALIGN(xlrec->xl_tot_len);
-				elog(DEBUG1, "RM_APPEND_ONLY_ID, else, i: %u", i);
-			}
-
-			xl_ao_target *xlaorecord = (xl_ao_target*) XLogRecGetData(xlrec);
-
-			aorecordresult->target.node.spcNode = xlaorecord->node.spcNode;
-			aorecordresult->target.node.dbNode = xlaorecord->node.dbNode;
-			aorecordresult->target.node.relNode = xlaorecord->node.relNode;
-			aorecordresult->target.segment_filenum = xlaorecord->segment_filenum;
-			aorecordresult->target.offset = xlaorecord->offset;
-			aorecordresult->len = xlrec->xl_len;
-			aorecordresult->ao_xlog_record_type = info;
-
-			num_found++;
-
+			dataStart = InvalidXLogRecPtr;
 		}
 		else
-		{
-			/*
-			 * Either the entire record is too long to fit into the current
-			 * page or there is not enough space remaining in the current page
-			 * to write the XLogHeader. So skip the remaining bytes to move
-			 * onto the next page.
-			 */
-			if (xlrec->xl_tot_len > avail_in_block || avail_in_block < SizeOfXLogRecord)
-			{
-				i += avail_in_block;
-				elog(DEBUG1, "record too long, i: %u, avail_in_block: %u, xlrec->xl_tot_len: %u", i, avail_in_block, xlrec->xl_tot_len);
-			}
-			else
-			{
-				i += MAXALIGN(xlrec->xl_tot_len);
-				elog(DEBUG1, "default, else, i: %u, xlrec->xl_tot_len: %u", i, xlrec->xl_tot_len);
-			}
-		}
-	}
+			break;
+	} while (xlogreader->ReadRecPtr + XLogRecGetTotalLen(xlogreader) + SizeOfXLogRecord < walEnd);
 	return num_found;
 }

@@ -47,7 +47,7 @@ SET datestyle = 'MDY';
 SHOW datestyle;
 SELECT '2006-08-13 12:34:56'::timestamptz;
 SAVEPOINT first_sp;
-SET vacuum_cost_delay TO 80;
+SET vacuum_cost_delay TO 80.1;
 SHOW vacuum_cost_delay;
 SET datestyle = 'German, DMY';
 SHOW datestyle;
@@ -56,7 +56,7 @@ ROLLBACK TO first_sp;
 SHOW datestyle;
 SELECT '2006-08-13 12:34:56'::timestamptz;
 SAVEPOINT second_sp;
-SET vacuum_cost_delay TO 90;
+SET vacuum_cost_delay TO '900us';
 SET datestyle = 'SQL, YMD';
 SHOW datestyle;
 SELECT '2006-08-13 12:34:56'::timestamptz;
@@ -144,6 +144,10 @@ RESET datestyle;
 SHOW datestyle;
 SELECT '2006-08-13 12:34:56'::timestamptz;
 
+-- Test some simple error cases
+SET seq_page_cost TO 'NaN';
+SET vacuum_cost_delay TO '10s';
+
 --
 -- Test DISCARD TEMP
 --
@@ -162,15 +166,15 @@ PREPARE foo AS SELECT 1;
 LISTEN foo_event;
 SET vacuum_cost_delay = 13;
 CREATE TEMP TABLE tmp_foo (data text) ON COMMIT DELETE ROWS;
-CREATE ROLE temp_reset_user;
-SET SESSION AUTHORIZATION temp_reset_user;
+CREATE ROLE regress_guc_user;
+SET SESSION AUTHORIZATION regress_guc_user;
 -- look changes
 SELECT pg_listening_channels();
 SELECT name FROM pg_prepared_statements;
 SELECT name FROM pg_cursors;
 SHOW vacuum_cost_delay;
 SELECT relname from pg_class where relname = 'tmp_foo';
-SELECT current_user = 'temp_reset_user';
+SELECT current_user = 'regress_guc_user';
 -- discard everything
 DISCARD ALL;
 -- look again
@@ -179,8 +183,8 @@ SELECT name FROM pg_prepared_statements;
 SELECT name FROM pg_cursors;
 SHOW vacuum_cost_delay;
 SELECT relname from pg_class where relname = 'tmp_foo';
-SELECT current_user = 'temp_reset_user';
-DROP ROLE temp_reset_user;
+SELECT current_user = 'regress_guc_user';
+DROP ROLE regress_guc_user;
 
 --
 -- search_path should react to changes in pg_namespace
@@ -258,6 +262,19 @@ select myfunc(0);
 select current_setting('work_mem');
 select myfunc(1), current_setting('work_mem');
 
+-- check current_setting()'s behavior with invalid setting name
+
+select current_setting('nosuch.setting');  -- FAIL
+select current_setting('nosuch.setting', false);  -- FAIL
+select current_setting('nosuch.setting', true) is null;
+
+-- after this, all three cases should yield 'nada'
+set nosuch.setting = 'nada';
+
+select current_setting('nosuch.setting');
+select current_setting('nosuch.setting', false);
+select current_setting('nosuch.setting', true);
+
 -- Normally, CREATE FUNCTION should complain about invalid values in
 -- function SET options; but not if check_function_bodies is off,
 -- because that creates ordering hazards for pg_dump
@@ -275,3 +292,40 @@ set default_text_search_config = no_such_config;
 select func_with_bad_set();
 
 reset check_function_bodies;
+
+set default_with_oids to f;
+-- Should not allow to set it to true.
+set default_with_oids to t;
+
+SET "request.header.user-agent" = 'curl/7.29.0';
+SHOW "request.header.user-agent";
+
+-- Test function with SET search_path
+create schema n1;
+create type ty1 as (i int);
+
+CREATE OR REPLACE FUNCTION n1.drop_table(v_schema character varying, v_table character varying) RETURNS text
+AS $$
+BEGIN
+    EXECUTE 'DROP TABLE IF EXISTS ' || quote_ident(v_schema) || '.' || quote_ident(v_table) || ';';
+    RETURN '0';
+EXCEPTION
+    WHEN OTHERS THEN
+        RETURN SQLSTATE;
+END;
+$$ LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = n1, pg_temp;
+
+-- Destroy the QD-QE libpq connections.
+select cleanupAllGangs();
+
+select n1.drop_table('public','t1');
+
+-- After funtion drop table, public schema is still in search_path
+create table public.t1(i ty1);
+
+drop table public.t1;
+drop type public.ty1;
+drop function n1.drop_table(v_schema character varying, v_table character varying);
+drop schema n1;

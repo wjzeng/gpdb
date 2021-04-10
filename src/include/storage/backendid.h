@@ -4,7 +4,7 @@
  *	  POSTGRES backend id communication definitions
  *
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/storage/backendid.h
@@ -42,6 +42,17 @@ typedef int BackendId;			/* unique currently active backend identifier */
  */
 #define TempRelBackendId		(-2)
 
-extern PGDLLIMPORT BackendId MyBackendId;		/* backend id of this backend */
+extern PGDLLIMPORT BackendId MyBackendId;	/* backend id of this backend */
 
-#endif   /* BACKENDID_H */
+/* backend id of our parallel session leader, or InvalidBackendId if none */
+extern PGDLLIMPORT BackendId ParallelMasterBackendId;
+
+/*
+ * The BackendId to use for our session's temp relations is normally our own,
+ * but parallel workers should use their leader's ID.
+ *
+ * In GPDB, we use TempRelBackendId for everything.
+ */
+#define BackendIdForTempRelations() TempRelBackendId
+
+#endif							/* BACKENDID_H */

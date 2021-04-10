@@ -1,4 +1,12 @@
 CREATE EXTENSION hstore;
+-- Check whether any of our opclasses fail amvalidate
+SELECT amname, opcname
+FROM pg_opclass opc LEFT JOIN pg_am am ON am.oid = opcmethod
+WHERE opc.oid >= 16384 AND NOT amvalidate(opc.oid);
+ amname | opcname 
+--------+---------
+(0 rows)
+
 set escape_string_warning=off;
 --hstore;
 select ''::hstore;
@@ -1265,7 +1273,8 @@ select 'a=>b, b=>1, c=>NULL'::hstore @> 'a=>b, c=>q';
 (1 row)
 
 CREATE TABLE testhstore (h hstore);
-NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause, and no column type is suitable for a distribution key. Creating a NULL policy entry.
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column named 'h' as the Greenplum Database data distribution key for this table.
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
 \copy testhstore from 'data/hstore.data'
 select count(*) from testhstore where h @> 'wait=>NULL';
  count 
@@ -1471,10 +1480,10 @@ select cast( hstore  '"a key" =>1, b => t, c => null, d=> 12345, e => 012345, f=
  {"b": "t", "c": null, "d": "12345", "e": "012345", "f": "1.234", "g": "2.345e+4", "a key": "1"}
 (1 row)
 
-select hstore_to_json_loose('"a key" =>1, b => t, c => null, d=> 12345, e => 012345, f=> 1.234, g=> 2.345e+4');
-                                   hstore_to_json_loose                                   
-------------------------------------------------------------------------------------------
- {"b": true, "c": null, "d": 12345, "e": "012345", "f": 1.234, "g": 2.345e+4, "a key": 1}
+select hstore_to_json_loose('"a key" =>1, b => t, c => null, d=> 12345, e => 012345, f=> 1.234, g=> 2.345e+4, h=> "2016-01-01"');
+                                            hstore_to_json_loose                                             
+-------------------------------------------------------------------------------------------------------------
+ {"b": true, "c": null, "d": 12345, "e": "012345", "f": 1.234, "g": 2.345e+4, "h": "2016-01-01", "a key": 1}
 (1 row)
 
 select hstore_to_jsonb('"a key" =>1, b => t, c => null, d=> 12345, e => 012345, f=> 1.234, g=> 2.345e+4');
@@ -1489,10 +1498,10 @@ select cast( hstore  '"a key" =>1, b => t, c => null, d=> 12345, e => 012345, f=
  {"b": "t", "c": null, "d": "12345", "e": "012345", "f": "1.234", "g": "2.345e+4", "a key": "1"}
 (1 row)
 
-select hstore_to_jsonb_loose('"a key" =>1, b => t, c => null, d=> 12345, e => 012345, f=> 1.234, g=> 2.345e+4');
-                                 hstore_to_jsonb_loose                                 
----------------------------------------------------------------------------------------
- {"b": true, "c": null, "d": 12345, "e": "012345", "f": 1.234, "g": 23450, "a key": 1}
+select hstore_to_jsonb_loose('"a key" =>1, b => t, c => null, d=> 12345, e => 012345, f=> 1.234, g=> 2.345e+4, h=> "2016-01-01"');
+                                          hstore_to_jsonb_loose                                           
+----------------------------------------------------------------------------------------------------------
+ {"b": true, "c": null, "d": 12345, "e": "012345", "f": 1.234, "g": 23450, "h": "2016-01-01", "a key": 1}
 (1 row)
 
 -- GPDB: use a replicated table, so that the json_agg() below will see the
@@ -1516,4 +1525,16 @@ select json_agg(q) from (select f1, hstore_to_json_loose(f2) as f2 from test_jso
  [{"f1":"rec1","f2":{"b": true, "c": null, "d": 12345, "e": "012345", "f": 1.234, "g": 2.345e+4, "a key": 1}},       +
   {"f1":"rec2","f2":{"b": false, "c": "null", "d": -12345, "e": "012345.6", "f": -1.234, "g": 0.345e-4, "a key": 2}}]
 (1 row)
+
+-- Check the hstore_hash() and hstore_hash_extended() function explicitly.
+SELECT v as value, hstore_hash(v)::bit(32) as standard,
+       hstore_hash_extended(v, 0)::bit(32) as extended0,
+       hstore_hash_extended(v, 1)::bit(32) as extended1
+FROM   (VALUES (NULL::hstore), (''), ('"a key" =>1'), ('c => null'),
+       ('e => 012345'), ('g => 2.345e+4')) x(v)
+WHERE  hstore_hash(v)::bit(32) != hstore_hash_extended(v, 0)::bit(32)
+       OR hstore_hash(v)::bit(32) = hstore_hash_extended(v, 1)::bit(32);
+ value | standard | extended0 | extended1 
+-------+----------+-----------+-----------
+(0 rows)
 

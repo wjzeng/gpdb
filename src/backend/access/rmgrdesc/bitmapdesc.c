@@ -15,6 +15,9 @@
 #include "postgres.h"
 
 #include "access/bitmap.h"
+#include "access/bitmap_xlog.h"
+#include "access/xlogreader.h"
+#include "storage/relfilenode.h"
 
 static void
 out_target(StringInfo buf, RelFileNode *node)
@@ -24,9 +27,9 @@ out_target(StringInfo buf, RelFileNode *node)
 }
 
 void
-bitmap_desc(StringInfo buf, XLogRecord *record)
+bitmap_desc(StringInfo buf, XLogReaderState *record)
 {
-	uint8		info = record->xl_info & ~XLR_INFO_MASK;
+	uint8		info = XLogRecGetInfo(record) & ~XLR_INFO_MASK;
 	char		*rec = XLogRecGetData(record);
 
 	switch (info)
@@ -86,4 +89,34 @@ bitmap_desc(StringInfo buf, XLogRecord *record)
 			appendStringInfo(buf, "UNKNOWN");
 			break;
 	}
+}
+
+const char *
+bitmap_identify(uint8 info)
+{
+	const char *id = NULL;
+
+	switch (info & ~XLR_INFO_MASK)
+	{
+		case XLOG_BITMAP_INSERT_LOVITEM:
+			id = "BITMAP_INSERT_LOVITEM";
+			break;
+		case XLOG_BITMAP_INSERT_META:
+			id = "BITMAP_INSERT_META";
+			break;
+		case XLOG_BITMAP_INSERT_BITMAP_LASTWORDS:
+			id = "BITMAP_INSERT_BITMAP_LASTWORDS";
+			break;
+		case XLOG_BITMAP_INSERT_WORDS:
+			id = "BITMAP_INSERT_WORDS";
+			break;
+		case XLOG_BITMAP_UPDATEWORD:
+			id = "BITMAP_UPDATEWORD";
+			break;
+		case XLOG_BITMAP_UPDATEWORDS:
+			id = "BITMAP_UPDATEWORDS";
+			break;
+	}
+
+	return id;
 }

@@ -266,6 +266,11 @@ select * from numrange_test where nr = '[1.1, 2.2)';
  [1.1,2.2)
 (1 row)
 
+select * from numrange_test where nr < 'empty';
+ nr 
+----
+(0 rows)
+
 select * from numrange_test where nr < numrange(-1000.0, -1000.0,'[]');
   nr   
 -------
@@ -292,6 +297,33 @@ select * from numrange_test where nr < numrange(1000.0, 1001.0,'[]');
  empty
  [1.7,1.7]
 (6 rows)
+
+select * from numrange_test where nr <= 'empty';
+  nr   
+-------
+ empty
+(1 row)
+
+select * from numrange_test where nr >= 'empty';
+    nr     
+-----------
+ (,)
+ [3,)
+ (,5)
+ [1.1,2.2)
+ empty
+ [1.7,1.7]
+(6 rows)
+
+select * from numrange_test where nr > 'empty';
+    nr     
+-----------
+ (,)
+ [3,)
+ (,5)
+ [1.1,2.2)
+ [1.7,1.7]
+(5 rows)
 
 select * from numrange_test where nr > numrange(-1001.0, -1000.0,'[]');
     nr     
@@ -454,8 +486,26 @@ select numrange(1.0, 2.0) + numrange(1.5, 3.0);
  [1.0,3.0)
 (1 row)
 
-select numrange(1.0, 2.0) + numrange(2.5, 3.0);
+select numrange(1.0, 2.0) + numrange(2.5, 3.0); -- should fail
 ERROR:  result of range union would not be contiguous
+select range_merge(numrange(1.0, 2.0), numrange(2.0, 3.0));
+ range_merge 
+-------------
+ [1.0,3.0)
+(1 row)
+
+select range_merge(numrange(1.0, 2.0), numrange(1.5, 3.0));
+ range_merge 
+-------------
+ [1.0,3.0)
+(1 row)
+
+select range_merge(numrange(1.0, 2.0), numrange(2.5, 3.0)); -- shouldn't fail
+ range_merge 
+-------------
+ [1.0,3.0)
+(1 row)
+
 select numrange(1.0, 2.0) * numrange(2.0, 3.0);
  ?column? 
 ----------
@@ -1046,6 +1096,28 @@ select count(*) from test_range_spgist where ir -|- int4range(100,500);
      5
 (1 row)
 
+-- test index-only scans
+explain (costs off)
+select ir from test_range_spgist where ir -|- int4range(10,20) order by ir;
+                                  QUERY PLAN                                  
+------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Merge Key: ir
+   ->  Sort
+         Sort Key: ir
+         ->  Index Only Scan using test_range_spgist_idx on test_range_spgist
+               Index Cond: (ir -|- '[10,20)'::int4range)
+ Optimizer: Postgres query optimizer
+(7 rows)
+
+select ir from test_range_spgist where ir -|- int4range(10,20) order by ir;
+     ir     
+------------
+ [20,30)
+ [20,30)
+ [20,10020)
+(3 rows)
+
 RESET enable_seqscan;
 RESET enable_indexscan;
 RESET enable_bitmapscan;
@@ -1072,7 +1144,7 @@ create table test_range_excl(
   during tsrange,
   exclude using gist (room with =, during with &&),
   exclude using gist (speaker with =, during with &&)
-) DISTRIBUTED BY (id);
+) DISTRIBUTED REPLICATED;
 insert into test_range_excl
   values(1, int4range(123, 123, '[]'), int4range(1, 1, '[]'), '[2010-01-02 10:00, 2010-01-02 11:00)');
 insert into test_range_excl
@@ -1274,6 +1346,38 @@ select array[1,3] <@ arrayrange(array[1,2], array[2,1]);
  t
 (1 row)
 
+-- start_ignore
+-- GPDB_94_MERGE_FIXME: orca can not run the test green.
+--
+-- Check behavior when subtype lacks a hash function
+--
+create type cashrange as range (subtype = money);
+set enable_sort = off;  -- try to make it pick a hash setop implementation
+select '(2,5)'::cashrange except select '(5,6)'::cashrange;
+   cashrange   
+---------------
+ ($2.00,$5.00)
+(1 row)
+
+reset enable_sort;
+-- end_ignore
+--
+-- Ranges of composites
+--
+create type two_ints as (a int, b int);
+create type two_ints_range as range (subtype = two_ints);
+-- with force_parallel_mode on, this exercises tqueue.c's range remapping
+select *, row_to_json(upper(t)) as u from
+  (values (two_ints_range(row(1,2), row(3,4))),
+          (two_ints_range(row(5,6), row(7,8)))) v(t);
+         t         |       u       
+-------------------+---------------
+ ["(1,2)","(3,4)") | {"a":3,"b":4}
+ ["(5,6)","(7,8)") | {"a":7,"b":8}
+(2 rows)
+
+drop type two_ints cascade;
+NOTICE:  drop cascades to type two_ints_range
 --
 -- OUT/INOUT/TABLE functions
 --

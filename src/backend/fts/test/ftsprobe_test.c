@@ -10,12 +10,12 @@
 
 static int poll_expected_return_value;
 static int poll_expected_revents;
-static const char true_value = 1;
-static const char false_value = 0;
 
 #define poll poll_mock
 static struct pollfd *PollFds;
-int poll_mock (struct pollfd * p1, nfds_t p2, int p3)
+
+static int
+poll_mock (struct pollfd * p1, nfds_t p2, int p3)
 {
 	int i;
 	for (i = 0; i < poll_expected_return_value; i++)
@@ -57,7 +57,7 @@ static void poll_will_return(int expected_return_value, int revents)
  * using this and then modify the same as per needs to mock different
  * scenarios like mirror down, primary down, etc...
  */
-CdbComponentDatabases *
+static CdbComponentDatabases *
 InitTestCdb(int segCnt, bool has_mirrors, char default_mode)
 {
 	int			i = 0;
@@ -72,9 +72,6 @@ InitTestCdb(int segCnt, bool has_mirrors, char default_mode)
 	cdb->total_entry_dbs = 1;
 	cdb->total_segment_dbs = segCnt * mirror_multiplier;	/* with mirror? */
 	cdb->total_segments = segCnt;
-	cdb->my_dbid = 1;
-	cdb->my_segindex = -1;
-	cdb->my_isprimary = true;
 	cdb->entry_db_info = palloc(
 		sizeof(CdbComponentDatabaseInfo) * cdb->total_entry_dbs);
 	cdb->segment_db_info = palloc(
@@ -84,41 +81,43 @@ InitTestCdb(int segCnt, bool has_mirrors, char default_mode)
 	/* create the master entry_db_info */
 	CdbComponentDatabaseInfo *cdbinfo = &cdb->entry_db_info[0];
 
-	cdbinfo->dbid = 1;
-	cdbinfo->segindex = '-1';
+	cdbinfo->config = (GpSegConfigEntry*)palloc(sizeof(GpSegConfigEntry));
+	cdbinfo->config->dbid = 1;
+	cdbinfo->config->segindex = -1;
 
-	cdbinfo->role = GP_SEGMENT_CONFIGURATION_ROLE_PRIMARY;
-	cdbinfo->preferred_role = GP_SEGMENT_CONFIGURATION_ROLE_PRIMARY;
-	cdbinfo->status = GP_SEGMENT_CONFIGURATION_STATUS_UP;
+	cdbinfo->config->role = GP_SEGMENT_CONFIGURATION_ROLE_PRIMARY;
+	cdbinfo->config->preferred_role = GP_SEGMENT_CONFIGURATION_ROLE_PRIMARY;
+	cdbinfo->config->status = GP_SEGMENT_CONFIGURATION_STATUS_UP;
 
 	/* create the segment_db_info entries */
 	for (i = 0; i < cdb->total_segment_dbs; i++)
 	{
 		CdbComponentDatabaseInfo *cdbinfo = &cdb->segment_db_info[i];
+		cdbinfo->config = (GpSegConfigEntry*)palloc(sizeof(GpSegConfigEntry));
 
-		cdbinfo->dbid = i + 2;
-		cdbinfo->segindex = i / 2;
-		cdbinfo->hostip = palloc(4);
-		snprintf(cdbinfo->hostip, 4, "%d", cdbinfo->dbid);
-		cdbinfo->port = cdbinfo->dbid;
+		cdbinfo->config->dbid = i + 2;
+		cdbinfo->config->segindex = i / 2;
+		cdbinfo->config->hostip = palloc(4);
+		snprintf(cdbinfo->config->hostip, 4, "%d", cdbinfo->config->dbid);
+		cdbinfo->config->port = cdbinfo->config->dbid;
 
 		if (has_mirrors)
 		{
-			cdbinfo->role = i % 2 ?
+			cdbinfo->config->role = i % 2 ?
 				GP_SEGMENT_CONFIGURATION_ROLE_MIRROR :
 				GP_SEGMENT_CONFIGURATION_ROLE_PRIMARY;
 
-			cdbinfo->preferred_role = i % 2 ?
+			cdbinfo->config->preferred_role = i % 2 ?
 				GP_SEGMENT_CONFIGURATION_ROLE_MIRROR :
 				GP_SEGMENT_CONFIGURATION_ROLE_PRIMARY;
 		}
 		else
 		{
-			cdbinfo->role = GP_SEGMENT_CONFIGURATION_ROLE_PRIMARY;
-			cdbinfo->preferred_role = GP_SEGMENT_CONFIGURATION_ROLE_PRIMARY;
+			cdbinfo->config->role = GP_SEGMENT_CONFIGURATION_ROLE_PRIMARY;
+			cdbinfo->config->preferred_role = GP_SEGMENT_CONFIGURATION_ROLE_PRIMARY;
 		}
-		cdbinfo->status = GP_SEGMENT_CONFIGURATION_STATUS_UP;
-		cdbinfo->mode = default_mode;
+		cdbinfo->config->status = GP_SEGMENT_CONFIGURATION_STATUS_UP;
+		cdbinfo->config->mode = default_mode;
 	}
 
 	return cdb;
@@ -146,7 +145,7 @@ GetSegmentFromCdbComponentDatabases(CdbComponentDatabases *dbs,
 	for (i = 0; i < dbs->total_segment_dbs; i++)
 	{
 		CdbComponentDatabaseInfo *cdb = &dbs->segment_db_info[i];
-		if (cdb->segindex == segindex && cdb->role == role)
+		if (cdb->config->segindex == segindex && cdb->config->role == role)
 			return cdb;
 	}
 	return NULL;
@@ -166,8 +165,8 @@ ExpectedPrimaryAndMirrorConfiguration(CdbComponentDatabaseInfo *primary,
 	/* mock probeWalRepUpdateConfig */
 	if (willUpdatePrimary)
 	{
-		expect_value(probeWalRepUpdateConfig, dbid, primary->dbid);
-		expect_value(probeWalRepUpdateConfig, segindex, primary->segindex);
+		expect_value(probeWalRepUpdateConfig, dbid, primary->config->dbid);
+		expect_value(probeWalRepUpdateConfig, segindex, primary->config->segindex);
 		expect_value(probeWalRepUpdateConfig, role, newPrimaryRole);
 		expect_value(probeWalRepUpdateConfig, IsSegmentAlive,
 					 primaryStatus == GP_SEGMENT_CONFIGURATION_STATUS_UP ? true : false);
@@ -178,8 +177,8 @@ ExpectedPrimaryAndMirrorConfiguration(CdbComponentDatabaseInfo *primary,
 
 	if (willUpdateMirror)
 	{
-		expect_value(probeWalRepUpdateConfig, dbid, mirror->dbid);
-		expect_value(probeWalRepUpdateConfig, segindex, mirror->segindex);
+		expect_value(probeWalRepUpdateConfig, dbid, mirror->config->dbid);
+		expect_value(probeWalRepUpdateConfig, segindex, mirror->config->segindex);
 		expect_value(probeWalRepUpdateConfig, role, newMirrorRole);
 		expect_value(probeWalRepUpdateConfig, IsSegmentAlive,
 					 mirrorStatus == GP_SEGMENT_CONFIGURATION_STATUS_UP ? true : false);
@@ -195,14 +194,12 @@ PrimaryOrMirrorWillBeUpdated(int count)
 	will_be_called_count(StartTransactionCommand, count);
 	will_be_called_count(GetTransactionSnapshot, count);
 	will_be_called_count(CommitTransactionCommand, count);
-	will_be_called_count(ftsLock, count);
-	will_be_called_count(ftsUnlock, count);
 }
 
 /*
  * One primary segment, connection starts successfully from initial state.
  */
-void
+static void
 test_ftsConnect_FTS_PROBE_SEGMENT(void **state)
 {
 	CdbComponentDatabases *cdbs = InitTestCdb(
@@ -219,7 +216,7 @@ test_ftsConnect_FTS_PROBE_SEGMENT(void **state)
 	pgconn->status = CONNECTION_STARTED;
 	pgconn->sock = 11;
 	snprintf(primary_conninfo, 1024, "host=%s port=%d gpconntype=%s",
-			 ftsInfo->primary_cdbinfo->hostip, ftsInfo->primary_cdbinfo->port,
+			 ftsInfo->primary_cdbinfo->config->hostip, ftsInfo->primary_cdbinfo->config->port,
 			 GPCONN_TYPE_FTS);
 	expect_string(PQconnectStart, conninfo, primary_conninfo);
 	will_return(PQconnectStart, pgconn);
@@ -237,7 +234,7 @@ test_ftsConnect_FTS_PROBE_SEGMENT(void **state)
  * returning CONNECTION_BAD.  Connection for the other is in FTS_PROBE_SEGMENT
  * and advances to the next libpq state.
  */
-void
+static void
 test_ftsConnect_one_failure_one_success(void **state)
 {
 	CdbComponentDatabases *cdbs = InitTestCdb(
@@ -261,8 +258,8 @@ test_ftsConnect_one_failure_one_success(void **state)
 	failure_resp->conn = NULL;
 	char primary_conninfo_failure[1024];
 	snprintf(primary_conninfo_failure, 1024, "host=%s port=%d gpconntype=%s",
-			 failure_resp->primary_cdbinfo->hostip,
-			 failure_resp->primary_cdbinfo->port,
+			 failure_resp->primary_cdbinfo->config->hostip,
+			 failure_resp->primary_cdbinfo->config->port,
 			 GPCONN_TYPE_FTS);
 	expect_string(PQconnectStart, conninfo, primary_conninfo_failure);
 	PGconn *failure_pgconn = palloc(sizeof(PGconn));
@@ -287,7 +284,7 @@ test_ftsConnect_one_failure_one_success(void **state)
  * Starting with one content (primary-mirrror pair) in FTS_PROBE_SEGMENT, test
  * ftsConnect() followed by ftsPoll().
  */
-void
+static void
 test_ftsConnect_ftsPoll(void **state)
 {
 	CdbComponentDatabases *cdbs = InitTestCdb(
@@ -304,7 +301,7 @@ test_ftsConnect_ftsPoll(void **state)
 	pgconn->status = CONNECTION_STARTED;
 	pgconn->sock = 11;
 	snprintf(primary_conninfo, 1024, "host=%s port=%d gpconntype=%s",
-			 ftsInfo->primary_cdbinfo->hostip, ftsInfo->primary_cdbinfo->port,
+			 ftsInfo->primary_cdbinfo->config->hostip, ftsInfo->primary_cdbinfo->config->port,
 			 GPCONN_TYPE_FTS);
 	expect_string(PQconnectStart, conninfo, primary_conninfo);
 	will_return(PQconnectStart, pgconn);
@@ -339,9 +336,10 @@ test_ftsConnect_ftsPoll(void **state)
 /*
  * 1 primary-mirror pair, send successful
  */
-void
+static void
 test_ftsSend_success(void **state)
 {
+	char message[FTS_MSG_MAX_LEN];
 	CdbComponentDatabases *cdbs = InitTestCdb(
 		1, true, GP_SEGMENT_CONFIGURATION_MODE_INSYNC);
 	fts_context context;
@@ -350,10 +348,16 @@ test_ftsSend_success(void **state)
 	fts_segment_info *ftsInfo = &context.perSegInfos[0];
 	ftsInfo->conn->asyncStatus = PGASYNC_IDLE;
 	ftsInfo->poll_revents = POLLOUT;
+
+	snprintf(message, FTS_MSG_MAX_LEN, FTS_MSG_FORMAT,
+			 FTS_MSG_PROBE,
+			 ftsInfo->primary_cdbinfo->config->dbid,
+			 ftsInfo->primary_cdbinfo->config->segindex);
+
 	expect_value(PQstatus, conn, ftsInfo->conn);
 	will_return(PQstatus, CONNECTION_OK);
 	expect_value(PQsendQuery, conn, ftsInfo->conn);
-	expect_string(PQsendQuery, query, FTS_MSG_PROBE);
+	expect_string(PQsendQuery, query, message);
 	will_return(PQsendQuery, 1);
 
 	ftsSend(&context);
@@ -364,7 +368,7 @@ test_ftsSend_success(void **state)
 /*
  * Receive a response to probe message from one primary segment.
  */
-void
+static void
 test_ftsReceive_success(void **state)
 {
 	CdbComponentDatabases *cdbs = InitTestCdb(
@@ -446,7 +450,7 @@ test_ftsReceive_success(void **state)
  * Scenario: if primary responds FATAL to FTS probe, ftsReceive on master
  * should fail due to PQconsumeInput() failed
  */
-void
+static void
 test_ftsReceive_when_fts_handler_FATAL(void **state)
 {
 	CdbComponentDatabases *cdbs = InitTestCdb(
@@ -479,7 +483,7 @@ test_ftsReceive_when_fts_handler_FATAL(void **state)
  * Scenario: if primary response ERROR to FTS probe, ftsReceive on master
  * should fail due to PQresultStatus(lastResult) returned PGRES_FATAL_ERROR
  */
-void
+static void
 test_ftsReceive_when_fts_handler_ERROR(void **state)
 {
 	CdbComponentDatabases *cdbs = InitTestCdb(
@@ -517,7 +521,7 @@ test_ftsReceive_when_fts_handler_ERROR(void **state)
 	expect_value(PQresultStatus, res, result);
 	will_return(PQresultStatus, PGRES_FATAL_ERROR);
 	expect_value(PQresultErrorMessage, res, result);
-	will_be_called(PQresultErrorMessage);
+	will_return(PQresultErrorMessage, "");
 
 	expect_value(PQclear, res, result);
 	will_be_called(PQclear);
@@ -535,7 +539,7 @@ test_ftsReceive_when_fts_handler_ERROR(void **state)
  * syncrep_off message failed to get a response from the other primary.
  * Another attempt must be made in both cases after waiting for 1 second.
  */
-void
+static void
 test_processRetry_wait_before_retry(void **state)
 {
 	/* Start with a failure state and retry_count = 0. */
@@ -600,7 +604,7 @@ test_processRetry_wait_before_retry(void **state)
 
 
 /* 0 segments, is_updated is always false */
-void
+static void
 test_processResponse_for_zero_segment(void **state)
 {
 	fts_context context;
@@ -615,7 +619,7 @@ test_processResponse_for_zero_segment(void **state)
 /*
  * 1 segment, is_updated is false, because FtsIsActive failed
  */
-void
+static void
 test_processResponse_for_FtsIsActive_false(void **state)
 {
 
@@ -641,7 +645,7 @@ test_processResponse_for_FtsIsActive_false(void **state)
  * 2 segments, is_updated is false, because neither primary nor mirror
  * state changed.
  */
-void
+static void
 test_PrimayUpMirrorUpNotInSync_to_PrimayUpMirrorUpNotInSync(void **state)
 {
 	CdbComponentDatabases *cdbs = InitTestCdb(
@@ -679,7 +683,7 @@ test_PrimayUpMirrorUpNotInSync_to_PrimayUpMirrorUpNotInSync(void **state)
  * primary and mirror are not in sync hence cannot promote mirror, hence
  * current primary needs to stay marked as up.
  */
-void
+static void
 test_PrimayUpMirrorUpNotInSync_to_PrimaryDown(void **state)
 {
 	CdbComponentDatabases *cdbs = InitTestCdb(
@@ -716,7 +720,7 @@ test_PrimayUpMirrorUpNotInSync_to_PrimaryDown(void **state)
 /*
  * 2 segments, is_updated is true, because content 0 mirror is updated
  */
-void
+static void
 test_PrimayUpMirrorUpNotInSync_to_PrimaryUpMirrorDownNotInSync(void **state)
 {
 	CdbComponentDatabases *cdbs = InitTestCdb(
@@ -769,7 +773,7 @@ test_PrimayUpMirrorUpNotInSync_to_PrimaryUpMirrorDownNotInSync(void **state)
  * 3 segments, is_updated is true, because content 0 mirror is down and
  * probe response is up
  */
-void
+static void
 test_PrimaryUpMirrorDownNotInSync_to_PrimayUpMirrorUpNotInSync(void **state)
 {
 	CdbComponentDatabases *cdbs = InitTestCdb(
@@ -785,7 +789,7 @@ test_PrimaryUpMirrorDownNotInSync_to_PrimayUpMirrorUpNotInSync(void **state)
 		GetSegmentFromCdbComponentDatabases(
 			cdbs, 0, GP_SEGMENT_CONFIGURATION_ROLE_MIRROR);
 
-	cdbinfo->status = GP_SEGMENT_CONFIGURATION_STATUS_DOWN;
+	cdbinfo->config->status = GP_SEGMENT_CONFIGURATION_STATUS_DOWN;
 
 	/*
 	 * Response received from all three segments, DOWN mirror is reported UP
@@ -844,7 +848,7 @@ test_PrimaryUpMirrorDownNotInSync_to_PrimayUpMirrorUpNotInSync(void **state)
  * segment pairs.  This test also validates that sync-rep off and promotion
  * messages are not blocked by primary retry requests.
  */
-void
+static void
 test_processResponse_multiple_segments(void **state)
 {
 	CdbComponentDatabases *cdbs = InitTestCdb(
@@ -863,7 +867,7 @@ test_processResponse_multiple_segments(void **state)
 		GetSegmentFromCdbComponentDatabases(
 			cdbs, 0, GP_SEGMENT_CONFIGURATION_ROLE_MIRROR);
 
-	cdbinfo->status = GP_SEGMENT_CONFIGURATION_STATUS_DOWN;
+	cdbinfo->config->status = GP_SEGMENT_CONFIGURATION_STATUS_DOWN;
 
 	/* First segment DOWN mirror, now reported UP */
 	context.perSegInfos[0].result.isPrimaryAlive = true;
@@ -876,10 +880,10 @@ test_processResponse_multiple_segments(void **state)
 	 */
 	cdbinfo = GetSegmentFromCdbComponentDatabases(
 		cdbs, 1, GP_SEGMENT_CONFIGURATION_ROLE_PRIMARY);
-	cdbinfo->mode = GP_SEGMENT_CONFIGURATION_MODE_INSYNC;
+	cdbinfo->config->mode = GP_SEGMENT_CONFIGURATION_MODE_INSYNC;
 	cdbinfo = GetSegmentFromCdbComponentDatabases(
 		cdbs, 1, GP_SEGMENT_CONFIGURATION_ROLE_MIRROR);
-	cdbinfo->mode = GP_SEGMENT_CONFIGURATION_MODE_INSYNC;
+	cdbinfo->config->mode = GP_SEGMENT_CONFIGURATION_MODE_INSYNC;
 
 	/* Second segment no response received, mirror will be promoted */
 	context.perSegInfos[1].state = FTS_PROBE_FAILED;
@@ -973,7 +977,7 @@ test_processResponse_multiple_segments(void **state)
  * 1 segment, is_updated is true, because primary and mirror will be
  * marked not in sync
  */
-void
+static void
 test_PrimayUpMirrorUpSync_to_PrimaryUpMirrorUpNotInSync(void **state)
 {
 	CdbComponentDatabases *cdbs = InitTestCdb(
@@ -1019,7 +1023,7 @@ test_PrimayUpMirrorUpSync_to_PrimaryUpMirrorUpNotInSync(void **state)
  * 2 segments, is_updated is true, because mirror will be marked down and
  * both will be marked not in sync for first primary mirror pair
  */
-void
+static void
 test_PrimayUpMirrorUpSync_to_PrimaryUpMirrorDownNotInSync(void **state)
 {
 	CdbComponentDatabases *cdbs = InitTestCdb(
@@ -1078,7 +1082,7 @@ test_PrimayUpMirrorUpSync_to_PrimaryUpMirrorDownNotInSync(void **state)
  * 1 segment, is_updated is true, because FTS found primary goes down and
  * both will be marked not in sync, then FTS promote mirror
  */
-void
+static void
 test_PrimayUpMirrorUpSync_to_PrimaryDown_to_MirrorPromote(void **state)
 {
 	CdbComponentDatabases *cdbs = InitTestCdb(
@@ -1118,7 +1122,7 @@ test_PrimayUpMirrorUpSync_to_PrimaryDown_to_MirrorPromote(void **state)
 	assert_true(is_updated);
 	/* the mirror must be marked for promotion */
 	assert_true(context.perSegInfos[0].state == FTS_PROMOTE_SEGMENT);
-	assert_int_equal(context.perSegInfos[0].primary_cdbinfo->dbid, mirror->dbid);
+	assert_int_equal(context.perSegInfos[0].primary_cdbinfo->config->dbid, mirror->config->dbid);
 	assert_true(context.perSegInfos[0].conn == NULL);
 }
 
@@ -1126,7 +1130,7 @@ test_PrimayUpMirrorUpSync_to_PrimaryDown_to_MirrorPromote(void **state)
  * 1 segment, is_updated is true, because primary and mirror will be
  * marked in sync
  */
-void
+static void
 test_PrimayUpMirrorUpNotInSync_to_PrimayUpMirrorUpSync(void **state)
 {
 	CdbComponentDatabases *cdbs = InitTestCdb(
@@ -1172,7 +1176,7 @@ test_PrimayUpMirrorUpNotInSync_to_PrimayUpMirrorUpSync(void **state)
  * 1 segment, is_updated is true, because mirror will be marked UP and
  * both primary and mirror should get updated to SYNC
  */
-void
+static void
 test_PrimaryUpMirrorDownNotInSync_to_PrimayUpMirrorUpSync(void **state)
 {
 	CdbComponentDatabases *cdbs = InitTestCdb(
@@ -1188,7 +1192,7 @@ test_PrimaryUpMirrorDownNotInSync_to_PrimayUpMirrorUpSync(void **state)
 		GetSegmentFromCdbComponentDatabases(
 			cdbs, 0, GP_SEGMENT_CONFIGURATION_ROLE_MIRROR);
 
-	cdbinfo->status = GP_SEGMENT_CONFIGURATION_STATUS_DOWN;
+	cdbinfo->config->status = GP_SEGMENT_CONFIGURATION_STATUS_DOWN;
 
 	/* Probe responded with Mirror Up and SYNC */
 	context.perSegInfos[0].result.isPrimaryAlive = true;
@@ -1224,7 +1228,7 @@ test_PrimaryUpMirrorDownNotInSync_to_PrimayUpMirrorUpSync(void **state)
 /*
  * 1 segment, is_updated is false, because there is no status or mode change.
  */
-void
+static void
 test_PrimaryUpMirrorDownNotInSync_to_PrimayUpMirrorDownNotInSync(void **state)
 {
 	CdbComponentDatabases *cdbs = InitTestCdb(
@@ -1240,7 +1244,7 @@ test_PrimaryUpMirrorDownNotInSync_to_PrimayUpMirrorDownNotInSync(void **state)
 		GetSegmentFromCdbComponentDatabases(
 			cdbs, 0, GP_SEGMENT_CONFIGURATION_ROLE_MIRROR);
 
-	cdbinfo->status = GP_SEGMENT_CONFIGURATION_STATUS_DOWN;
+	cdbinfo->config->status = GP_SEGMENT_CONFIGURATION_STATUS_DOWN;
 
 	/* Probe responded with Mirror Up and SYNC */
 	context.perSegInfos[0].result.isPrimaryAlive = true;
@@ -1261,7 +1265,7 @@ test_PrimaryUpMirrorDownNotInSync_to_PrimayUpMirrorDownNotInSync(void **state)
  * 2 segments, is_updated is false, because content 0 mirror is already
  * down and probe response fails. Means double fault scenario.
  */
-void
+static void
 test_PrimaryUpMirrorDownNotInSync_to_PrimaryDown(void **state)
 {
 	CdbComponentDatabases *cdbs = InitTestCdb(
@@ -1277,7 +1281,7 @@ test_PrimaryUpMirrorDownNotInSync_to_PrimaryDown(void **state)
 		GetSegmentFromCdbComponentDatabases(
 			cdbs, 0, GP_SEGMENT_CONFIGURATION_ROLE_MIRROR);
 
-	cdbinfo->status = GP_SEGMENT_CONFIGURATION_STATUS_DOWN;
+	cdbinfo->config->status = GP_SEGMENT_CONFIGURATION_STATUS_DOWN;
 
 	/* No response received from segment 1 (content 0 primary) */
 	context.perSegInfos[0].state = FTS_PROBE_FAILED;
@@ -1306,7 +1310,7 @@ test_PrimaryUpMirrorDownNotInSync_to_PrimaryDown(void **state)
 /*
  * 1 segment, probe times out.
  */
-void
+static void
 test_probeTimeout(void **state)
 {
 	CdbComponentDatabases *cdbs = InitTestCdb(
@@ -1328,7 +1332,7 @@ test_probeTimeout(void **state)
 	assert_true(context.perSegInfos[0].retry_count == 0);
 }
 
-void
+static void
 test_FtsWalRepInitProbeContext_initial_state(void **state)
 {
 	fts_context context;
@@ -1348,7 +1352,7 @@ test_FtsWalRepInitProbeContext_initial_state(void **state)
 		assert_true(context.perSegInfos[i].conn == NULL);
 		assert_true(context.perSegInfos[i].probe_errno == 0);
 		assert_true(context.perSegInfos[i].result.dbid ==
-					context.perSegInfos[i].primary_cdbinfo->dbid);
+					context.perSegInfos[i].primary_cdbinfo->config->dbid);
 		assert_false(context.perSegInfos[i].result.isPrimaryAlive);
 		assert_false(context.perSegInfos[i].result.isMirrorAlive);
 		assert_false(context.perSegInfos[i].result.isInSync);

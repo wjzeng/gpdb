@@ -4,7 +4,7 @@
  *	  Helper functions for gpexpand.
  *
  *
- * Copyright (c) 2018-Present Pivotal Software, Inc.
+ * Copyright (c) 2018-Present VMware, Inc. or its affiliates.
  *
  * src/backend/utils/misc/gpexpand.c
  *
@@ -17,9 +17,6 @@
 #include "catalog/pg_auth_time_constraint.h"
 #include "catalog/pg_description.h"
 #include "catalog/pg_namespace.h"
-#include "catalog/pg_partition.h"
-#include "catalog/pg_partition_encoding.h"
-#include "catalog/pg_partition_rule.h"
 #include "catalog/pg_shdescription.h"
 #include "catalog/pg_stat_last_operation.h"
 #include "catalog/pg_stat_last_shoperation.h"
@@ -95,7 +92,7 @@ gp_expand_bump_version(PG_FUNCTION_ARGS)
 Datum
 gp_expand_lock_catalog(PG_FUNCTION_ARGS)
 {
-	LockAcquire(&gp_expand_locktag, AccessExclusiveLock, false, false);
+	(void) LockAcquire(&gp_expand_locktag, AccessExclusiveLock, false, false);
 
 	PG_RETURN_VOID();
 }
@@ -127,13 +124,10 @@ gp_expand_protect_catalog_changes(Relation relation)
 		case GpSegmentConfigRelationId:
 		case GpConfigHistoryRelationId:
 		case DescriptionRelationId:
-		case PartitionRelationId:
-		case PartitionRuleRelationId:
 		case SharedDescriptionRelationId:
 		case StatLastOpRelationId:
 		case StatLastShOpRelationId:
 		case StatisticRelationId:
-		case PartitionEncodingRelationId:
 		case AuthTimeConstraintRelationId:
 			/* these catalog tables are only meaningful on qd */
 			return;
@@ -154,12 +148,12 @@ gp_expand_protect_catalog_changes(Relation relation)
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("gpexpand in progress, catalog changes are disallowed.")));
 
-	oldVersion = cdbcomponent_getCdbComponents(true)->expand_version;
+	oldVersion = cdbcomponent_getCdbComponents()->expand_version;
 	newVersion = GetGpExpandVersion();
 	if (oldVersion != newVersion)
 		ereport(FATAL,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 errmsg("cluster is expaneded from version %d to %d, "
+				 errmsg("cluster is expanded from version %d to %d, "
 						"catalog changes are disallowed",
 						oldVersion, newVersion)));
 }

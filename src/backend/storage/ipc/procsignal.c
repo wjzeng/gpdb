@@ -4,7 +4,7 @@
  *	  Routines for interprocess signalling
  *
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -17,16 +17,20 @@
 #include <signal.h>
 #include <unistd.h>
 
-#include "cdb/cdbvars.h"
+#include "access/parallel.h"
 #include "commands/async.h"
 #include "miscadmin.h"
+#include "replication/walsender.h"
+#include "storage/latch.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
 #include "storage/proc.h"
 #include "storage/shmem.h"
 #include "storage/sinval.h"
 #include "tcop/tcopprot.h"
+#include "utils/resgroup.h"
 
+#include "cdb/cdbvars.h"
 
 /*
  * The SIGUSR1 signal is multiplexed to support signalling multiple event
@@ -57,19 +61,10 @@ typedef struct
  * possible auxiliary process type.  (This scheme assumes there is not
  * more than one of any auxiliary process type at a time.)
  */
-#define NumProcSignalSlots	(MaxBackends + NUM_AUXILIARY_PROCS)
-
-/*
- * If this flag is set, the process latch will be set whenever SIGUSR1
- * is received.  This is useful when waiting for a signal from the postmaster.
- * Spurious wakeups must be expected.  Make sure that the flag is cleared
- * in the error path.
- */
-bool		set_latch_on_sigusr1;
+#define NumProcSignalSlots	(MaxBackends + NUM_AUXPROCTYPES)
 
 static ProcSignalSlot *ProcSignalSlots = NULL;
 static volatile ProcSignalSlot *MyProcSignalSlot = NULL;
-static volatile bool InSIGUSR1Handler = false;
 
 static bool CheckProcSignal(ProcSignalReason reason);
 static void CleanupProcSignalState(int status, Datum arg);
@@ -262,12 +257,6 @@ CheckProcSignal(ProcSignalReason reason)
 	return false;
 }
 
-bool
-AmIInSIGUSR1Handler(void)
-{
-	return InSIGUSR1Handler;
-}
-
 /*
  * Query-finish signal from QD.  The executor will deliverately try
  * to finish execution as quickly as possible.
@@ -292,25 +281,23 @@ procsignal_sigusr1_handler(SIGNAL_ARGS)
 {
 	int			save_errno = errno;
 
-	PG_TRY();
-	{
-		InSIGUSR1Handler = true;
+	if (CheckProcSignal(PROCSIG_CATCHUP_INTERRUPT))
+		HandleCatchupInterrupt();
 
-		if (CheckProcSignal(PROCSIG_CATCHUP_INTERRUPT))
-			HandleCatchupInterrupt();
+	if (CheckProcSignal(PROCSIG_NOTIFY_INTERRUPT))
+		HandleNotifyInterrupt();
 
-		if (CheckProcSignal(PROCSIG_QUERY_FINISH))
-			QueryFinishHandler();
+	if (CheckProcSignal(PROCSIG_QUERY_FINISH))
+		QueryFinishHandler();
 
-		latch_sigusr1_handler();
-		InSIGUSR1Handler = false;
-	}
-	PG_CATCH();
-	{
-		InSIGUSR1Handler = false;
-		PG_RE_THROW();
-	}
-	PG_END_TRY();
+	if (CheckProcSignal(PROCSIG_WALSND_INIT_STOPPING))
+		HandleWalSndInitStopping();
+
+	if (CheckProcSignal(PROCSIG_PARALLEL_MESSAGE))
+		HandleParallelMessageInterrupt();
+
+	if (CheckProcSignal(PROCSIG_WALSND_INIT_STOPPING))
+		HandleWalSndInitStopping();
 
 	if (CheckProcSignal(PROCSIG_RECOVERY_CONFLICT_DATABASE))
 		RecoveryConflictInterrupt(PROCSIG_RECOVERY_CONFLICT_DATABASE);
@@ -330,8 +317,10 @@ procsignal_sigusr1_handler(SIGNAL_ARGS)
 	if (CheckProcSignal(PROCSIG_RECOVERY_CONFLICT_BUFFERPIN))
 		RecoveryConflictInterrupt(PROCSIG_RECOVERY_CONFLICT_BUFFERPIN);
 
-	if (set_latch_on_sigusr1 && MyProc != NULL)
-		SetLatch(&MyProc->procLatch);
+	if (CheckProcSignal(PROCSIG_RESOURCE_GROUP_MOVE_QUERY))
+		HandleMoveResourceGroup();
+
+	SetLatch(MyLatch);
 
 	latch_sigusr1_handler();
 

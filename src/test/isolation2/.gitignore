@@ -2,17 +2,16 @@ regression.diffs
 regression.out
 */dummy.sql
 */dummy.out
-sql/ao_upgrade.sql
-expected/ao_upgrade.out
-expected/ao_upgrade_optimizer.out
 
 # Local binaries and symbolic links
+/extended_protocol_test
 /pg_isolation2_regress
 /atmsort.pm
 /explain.pm
 /GPTest.pm
 /gpdiff.pl
 /gpstringsubs.pl
+/data
 
 # Generated subdirectories
 /results/

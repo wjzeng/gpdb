@@ -5,7 +5,7 @@
  *
  *
  * Portions Copyright (c) 2006-2008, Greenplum inc.
- * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
  * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
@@ -17,6 +17,7 @@
  */
 #include "postgres.h"
 
+#include <math.h>
 #include <time.h>
 
 #include "pgstat.h"
@@ -40,6 +41,7 @@
 #include "utils/portal.h"
 #include "utils/ps_status.h"
 #include "utils/resowner.h"
+#include "utils/resource_manager.h"
 #include "utils/resscheduler.h"
 #include "cdb/memquota.h"
 #include "commands/queue.h"
@@ -164,9 +166,12 @@ ResLockAcquire(LOCKTAG *locktag, ResPortalIncrement *incrementSet)
 		locallock->lock = NULL;
 		locallock->proclock = NULL;
 		locallock->hashcode = LockTagHashCode(&(localtag.lock));
+		locallock->istemptable = false;
 		locallock->nLocks = 0;
 		locallock->numLockOwners = 0;
 		locallock->maxLockOwners = 8;
+		locallock->holdsStrongLockCount = false;
+		locallock->lockCleared = false;
 		locallock->lockOwners = NULL;
 		locallock->lockOwners = (LOCALLOCKOWNER *)
 			MemoryContextAlloc(TopMemoryContext, locallock->maxLockOwners * sizeof(LOCALLOCKOWNER));
@@ -267,6 +272,15 @@ ResLockAcquire(LOCKTAG *locktag, ResPortalIncrement *incrementSet)
 	 */
 	if (!found)
 	{
+		/*
+		 * Resource queues don't participate in "group locking", used to share
+		 * locks between leader process and parallel worker processes in
+		 * PostgreSQL. But we better still set 'groupLeader', it is assumed
+		 * to be valid on all PROCLOCKs, and is accessed e.g. by
+		 * GetLockStatusData().
+		 */
+		proclock->groupLeader = MyProc->lockGroupLeader != NULL ?
+			MyProc->lockGroupLeader : MyProc;
 		proclock->holdMask = 0;
 		proclock->releaseMask = 0;
 		/* Add proclock to appropriate lists */
@@ -303,6 +317,8 @@ ResLockAcquire(LOCKTAG *locktag, ResPortalIncrement *incrementSet)
 		 * Something wrong happened - our RQ is gone. Release all locks and
 		 * clean out
 		 */
+		lock->nRequested--;
+		lock->requested[lockmode]--;
 		LWLockReleaseAll();
 		PG_RE_THROW();
 	}
@@ -342,6 +358,8 @@ ResLockAcquire(LOCKTAG *locktag, ResPortalIncrement *incrementSet)
 	incrementSet = ResIncrementAdd(incrementSet, proclock, owner);
 	if (!incrementSet)
 	{
+		lock->nRequested--;
+		lock->requested[lockmode]--;
 		LWLockRelease(ResQueueLock);
 		LWLockRelease(partitionLock);
 		ereport(ERROR,
@@ -428,14 +446,6 @@ ResLockAcquire(LOCKTAG *locktag, ResPortalIncrement *incrementSet)
 								locktag->locktag_field1);
 		pgstat_record_start_queue_wait(incrementSet->portalId,
 									   locktag->locktag_field1);
-
-		/*
-		 * Free/destroy idle gangs as we are going to sleep.
-		 */
-		if (ResourceCleanupIdleGangs)
-		{
-			cdbcomponent_cleanupIdleQEs(false);
-		}
 
 		/*
 		 * Sleep till someone wakes me up.
@@ -559,6 +569,7 @@ ResLockRelease(LOCKTAG *locktag, uint32 resPortalId)
 		LWLockRelease(partitionLock);
 		elog(DEBUG1, "Resource queue %d: proclock not held", locktag->locktag_field1);
 		RemoveLocalLock(locallock);
+		ResCleanUpLock(lock, proclock, hashcode, false);
 
 		return false;
 	}
@@ -661,7 +672,7 @@ ResLockCheckLimit(LOCK *lock, PROCLOCK *proclock, ResPortalIncrement *incrementS
 	Cost		increment_amt;
 	int			i;
 
-	Assert(LWLockHeldExclusiveByMe(ResQueueLock));
+	Assert(LWLockHeldByMeInMode(ResQueueLock, LW_EXCLUSIVE));
 
 	/* Get the queue for this lock. */
 	queue = GetResQueueFromLock(lock);
@@ -805,7 +816,7 @@ ResLockUpdateLimit(LOCK *lock, PROCLOCK *proclock, ResPortalIncrement *increment
 	Cost		increment_amt;
 	int			i;
 
-	Assert(LWLockHeldExclusiveByMe(ResQueueLock));
+	Assert(LWLockHeldByMeInMode(ResQueueLock, LW_EXCLUSIVE));
 
 	/* Get the queue for this lock. */
 	queue = GetResQueueFromLock(lock);
@@ -864,7 +875,7 @@ ResLockUpdateLimit(LOCK *lock, PROCLOCK *proclock, ResPortalIncrement *increment
 ResQueue
 GetResQueueFromLock(LOCK *lock)
 {
-	Assert(LWLockHeldExclusiveByMe(ResQueueLock));
+	Assert(LWLockHeldByMeInMode(ResQueueLock, LW_EXCLUSIVE));
 
 	ResQueue	queue = ResQueueHashFind(GET_RESOURCE_QUEUEID_FOR_LOCK(lock));
 
@@ -964,7 +975,7 @@ ResUnGrantLock(LOCK *lock, PROCLOCK *proclock)
 static void
 ResCleanUpLock(LOCK *lock, PROCLOCK *proclock, uint32 hashcode, bool wakeupNeeded)
 {
-	Assert(LWLockHeldExclusiveByMe(ResQueueLock));
+	Assert(LWLockHeldByMeInMode(ResQueueLock, LW_EXCLUSIVE));
 
 	/*
 	 * If this was my last hold on this lock, delete my entry in the proclock
@@ -1035,7 +1046,7 @@ ResWaitOnLock(LOCALLOCK *locallock, ResourceOwner owner, ResPortalIncrement *inc
 		set_ps_display(new_status, false);		/* truncate off " queuing" */
 		new_status[len] = '\0';
 	}
-	gpstat_report_waiting(PGBE_WAITING_LOCK);
+	pgstat_report_wait_start(PG_WAIT_RESOURCE_QUEUE);
 
 	awaitedLock = locallock;
 	awaitedOwner = owner;
@@ -1053,6 +1064,7 @@ ResWaitOnLock(LOCALLOCK *locallock, ResourceOwner owner, ResPortalIncrement *inc
 		LWLockRelease(partitionLock);
 		DeadLockReport();
 	}
+	pgstat_report_wait_end();
 
 	awaitedLock = NULL;
 
@@ -1062,7 +1074,6 @@ ResWaitOnLock(LOCALLOCK *locallock, ResourceOwner owner, ResPortalIncrement *inc
 		set_ps_display(new_status, false);
 		pfree(new_status);
 	}
-	gpstat_report_waiting(PGBE_WAITING_NONE);
 
 	return;
 }
@@ -1087,7 +1098,7 @@ ResProcLockRemoveSelfAndWakeup(LOCK *lock)
 
 	int			status;
 
-	Assert(LWLockHeldExclusiveByMe(ResQueueLock));
+	Assert(LWLockHeldByMeInMode(ResQueueLock, LW_EXCLUSIVE));
 
 	/*
 	 * XXX: This code is ugly and hard to read -- it should be a lot simpler,
@@ -1144,11 +1155,11 @@ ResProcLockRemoveSelfAndWakeup(LOCK *lock)
 		 * See if it is ok to wake this guy. (note that the wakeup writes to
 		 * the wait list, and gives back a *new* next proc).
 		 */
-		status = ResLockCheckLimit(lock, (PROCLOCK *) proc->waitProcLock, incrementSet, true);
+		status = ResLockCheckLimit(lock, proc->waitProcLock, incrementSet, true);
 		if (status == STATUS_OK)
 		{
-			ResGrantLock(lock, (PROCLOCK *) proc->waitProcLock);
-			ResLockUpdateLimit(lock, (PROCLOCK *) proc->waitProcLock, incrementSet, true, false);
+			ResGrantLock(lock, proc->waitProcLock);
+			ResLockUpdateLimit(lock, proc->waitProcLock, incrementSet, true, false);
 
 			proc = ResProcWakeup(proc, STATUS_OK);
 		}
@@ -1193,7 +1204,7 @@ ResProcWakeup(PGPROC *proc, int waitStatus)
 	proc->waitStatus = waitStatus;
 
 	/* And awaken it */
-	PGSemaphoreUnlock(&proc->sem);
+	PGSemaphoreUnlock(proc->sem);
 
 	return retProc;
 }
@@ -1259,7 +1270,7 @@ ResRemoveFromWaitQueue(PGPROC *proc, uint32 hashcode)
 	 * LockRelease expects there to be no remaining proclocks.) Then see if
 	 * any other waiters for the lock can be woken up now.
 	 */
-	ResCleanUpLock(waitLock, (PROCLOCK *) proclock, hashcode, true);
+	ResCleanUpLock(waitLock, proclock, hashcode, true);
 	LWLockRelease(ResQueueLock);
 
 }
@@ -1367,7 +1378,7 @@ ResCheckSelfDeadLock(LOCK *lock, PROCLOCK *proclock, ResPortalIncrement *increme
 		if (lock->nRequested > lock->nGranted)
 		{
 			/* we're no longer waiting. */
-			gpstat_report_waiting(PGBE_WAITING_NONE);
+			pgstat_report_wait_end();
 			ResGrantLock(lock, proclock);
 			ResLockUpdateLimit(lock, proclock, incrementSet, true, true);
 		}
@@ -1437,7 +1448,7 @@ ResIncrementAdd(ResPortalIncrement *incSet, PROCLOCK *proclock, ResourceOwner ow
 	int			i;
 	bool		found;
 
-	Assert(LWLockHeldExclusiveByMe(ResQueueLock));
+	Assert(LWLockHeldByMeInMode(ResQueueLock, LW_EXCLUSIVE));
 
 	/* Set up the key. */
 	MemSet(&portaltag, 0, sizeof(ResPortalTag));
@@ -1469,7 +1480,7 @@ ResIncrementAdd(ResPortalIncrement *incSet, PROCLOCK *proclock, ResourceOwner ow
 	else
 	{
 		/* We have added this portId before - something has gone wrong! */
-
+		ResIncrementRemove(&portaltag);
 		elog(WARNING, "duplicate portal id %u for proc %d", incSet->portalId, incSet->pid);
 		incrementSet = NULL;
 	}
@@ -1493,7 +1504,7 @@ ResIncrementFind(ResPortalTag *portaltag)
 	ResPortalIncrement *incrementSet;
 	bool		found;
 
-	Assert(LWLockHeldExclusiveByMe(ResQueueLock));
+	Assert(LWLockHeldByMeInMode(ResQueueLock, LW_EXCLUSIVE));
 
 	incrementSet = (ResPortalIncrement *)
 		hash_search(ResPortalIncrementHash, (void *) portaltag, HASH_FIND, &found);
@@ -1520,7 +1531,7 @@ ResIncrementRemove(ResPortalTag *portaltag)
 	ResPortalIncrement *incrementSet;
 	bool		found;
 
-	Assert(LWLockHeldExclusiveByMe(ResQueueLock));
+	Assert(LWLockHeldByMeInMode(ResQueueLock, LW_EXCLUSIVE));
 
 	incrementSet = (ResPortalIncrement *)
 		hash_search(ResPortalIncrementHash, (void *) portaltag, HASH_REMOVE, &found);
@@ -1584,7 +1595,7 @@ ResQueueHashNew(Oid queueid)
 	bool		found;
 	ResQueueData *queue;
 
-	Assert(LWLockHeldExclusiveByMe(ResQueueLock));
+	Assert(LWLockHeldByMeInMode(ResQueueLock, LW_EXCLUSIVE));
 
 	queue = (ResQueueData *)
 		hash_search(ResQueueHash, (void *) &queueid, HASH_ENTER_NULL, &found);
@@ -1611,7 +1622,7 @@ ResQueueHashFind(Oid queueid)
 	bool		found;
 	ResQueueData *queue;
 
-	Assert(LWLockHeldExclusiveByMe(ResQueueLock));
+	Assert(LWLockHeldByMeInMode(ResQueueLock, LW_EXCLUSIVE));
 
 	queue = (ResQueueData *)
 		hash_search(ResQueueHash, (void *) &queueid, HASH_FIND, &found);
@@ -1636,7 +1647,7 @@ ResQueueHashRemove(Oid queueid)
 	bool		found;
 	void	   *queue;
 
-	Assert(LWLockHeldExclusiveByMe(ResQueueLock));
+	Assert(LWLockHeldByMeInMode(ResQueueLock, LW_EXCLUSIVE));
 
 	queue = hash_search(ResQueueHash, (void *) &queueid, HASH_REMOVE, &found);
 	if (!queue)
@@ -1681,7 +1692,7 @@ pg_resqueue_status(PG_FUNCTION_ARGS)
 		funcctx->user_fctx = fctx;
 
 		/* Construct a tuple descriptor for the result rows. */
-		TupleDesc	tupledesc = CreateTemplateTupleDesc(PG_RESQUEUE_STATUS_COLUMNS, false);
+		TupleDesc	tupledesc = CreateTemplateTupleDesc(PG_RESQUEUE_STATUS_COLUMNS);
 
 		TupleDescInitEntry(tupledesc, (AttrNumber) 1, "queueid", OIDOID, -1, 0);
 		TupleDescInitEntry(tupledesc, (AttrNumber) 2, "queuecountvalue", FLOAT4OID, -1, 0);
@@ -1912,7 +1923,7 @@ pg_resqueue_status_kv(PG_FUNCTION_ARGS)
 		funcctx->user_fctx = fctx;
 
 		/* Construct a tuple descriptor for the result rows. */
-		TupleDesc	tupledesc = CreateTemplateTupleDesc(PG_RESQUEUE_STATUS_KV_COLUMNS, false);
+		TupleDesc	tupledesc = CreateTemplateTupleDesc(PG_RESQUEUE_STATUS_KV_COLUMNS);
 
 		TupleDescInitEntry(tupledesc, (AttrNumber) 1, "queueid", OIDOID, -1, 0);
 		TupleDescInitEntry(tupledesc, (AttrNumber) 2, "key", TEXTOID, -1, 0);
@@ -2040,7 +2051,8 @@ int64 ResourceQueueGetMemoryLimitInCatalog(Oid queueId)
 
 #ifdef USE_ASSERT_CHECKING
 			bool result =
-
+#else
+			(void)
 #endif
 					parse_int(strVal(val), &memoryLimitKB, GUC_UNIT_KB, NULL);
 
@@ -2095,7 +2107,7 @@ uint64 ResourceQueueGetQueryMemoryLimit(PlannedStmt *stmt, Oid queueId)
 		return 0;
 
 	/** Assert that I do not hold lwlock */
-	Assert(!LWLockHeldExclusiveByMe(ResQueueLock));
+	Assert(!LWLockHeldByMeInMode(ResQueueLock, LW_EXCLUSIVE));
 
 	int64 resqLimitBytes = ResourceQueueGetMemoryLimit(queueId);
 

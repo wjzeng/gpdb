@@ -36,8 +36,8 @@ FILES IN src/include/nodes/
 	nodes.h		- define node tags (NodeTag)
 	primnodes.h	- primitive nodes
 	parsenodes.h	- parse tree nodes
+	pathnodes.h	- path tree nodes and planner internal structures
 	plannodes.h	- plan tree nodes
-	relation.h	- planner internal nodes
 	execnodes.h	- executor nodes
 	memnodes.h	- memory nodes
 	pg_list.h	- generic list
@@ -46,7 +46,7 @@ FILES IN src/include/nodes/
 Steps to Add a Node
 -------------------
 
-Suppose you wanna define a node Foo:
+Suppose you want to define a node Foo:
 
 1. Add a tag (T_Foo) to the enum NodeTag in nodes.h.  (If you insert the
    tag in a way that moves the numbers associated with existing tags,

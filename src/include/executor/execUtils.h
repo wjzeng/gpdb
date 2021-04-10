@@ -3,7 +3,7 @@
  * execUtils.h
  *
  * Portions Copyright (c) 2005-2008, Greenplum inc
- * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
  *
  *
  * IDENTIFICATION
@@ -20,22 +20,20 @@ struct EState;
 struct QueryDesc;
 struct CdbDispatcherState;
 
-extern void InitSliceTable(struct EState *estate, int nMotions, int nSubplans);
-extern Slice *getCurrentSlice(struct EState *estate, int sliceIndex);
-extern bool sliceRunsOnQD(Slice *slice);
-extern bool sliceRunsOnQE(Slice *slice);
-extern int sliceCalculateNumSendingProcesses(Slice *slice);
+extern SliceTable *InitSliceTable(struct EState *estate, PlannedStmt *plannedstmt);
+extern ExecSlice *getCurrentSlice(struct EState *estate, int sliceIndex);
+extern bool sliceRunsOnQD(ExecSlice *slice);
+extern bool sliceRunsOnQE(ExecSlice *slice);
 
 extern void AssignGangs(struct CdbDispatcherState *ds, QueryDesc *queryDesc);
 
 extern Motion *findSenderMotion(PlannedStmt *plannedstmt, int sliceIndex);
 extern Bitmapset *getLocallyExecutableSubplans(PlannedStmt *plannedstmt, Plan *root);
-extern void ExtractParamsFromInitPlans(PlannedStmt *plannedstmt, Plan *root, EState *estate);
-extern void AssignParentMotionToPlanNodes(PlannedStmt *plannedstmt);
+extern void InstallDispatchedExecParams(QueryDispatchDesc *ddesc, EState *estate);
 
 #ifdef USE_ASSERT_CHECKING
 struct PlannedStmt;
-extern void AssertSliceTableIsValid(SliceTable *st, struct PlannedStmt *pstmt);
+extern void AssertSliceTableIsValid(SliceTable *st);
 #endif
 
 #endif

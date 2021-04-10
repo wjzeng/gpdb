@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 """
 multidd - run multiple dd concurrently to determine disk throughput
 
@@ -23,7 +23,7 @@ import sys
 
 
 def usage(exitarg):
-    print __doc__
+    print(__doc__)
     sys.exit(exitarg)
 
 
@@ -46,8 +46,6 @@ def getPlatform():
         return 'linux'
     if sys.platform.find('darwin') >= 0:
         return 'darwin'
-    if sys.platform.find('sunos5') >= 0:
-        return 'sunos5'
     return '?'
 
 
@@ -70,17 +68,6 @@ def getMemory():
         mem_string_list = out.strip().split(' ')
         val = int(mem_string_list[1])
         return val
-
-    if getPlatform() == 'sunos5':
-        ok, out = run("sh -c \"/usr/sbin/prtconf | awk '/^Memory/{print}'\"")
-        if not ok:
-            return '?'
-        mem_string_list = out.strip().split(' ')
-        val = int(mem_string_list[2])
-        factor = mem_string_list[3]
-        if factor == 'Megabytes':
-            return val * 1024 * 1024
-        return '?'
 
     return '?'
 
@@ -145,20 +132,20 @@ pfile = []
 blocksz = opt['-B']
 cnt = int(math.ceil(opt['-S'] / blocksz))
 totalBytes = 0
-for i in xrange(len(opt['-i'])):
+for i in range(len(opt['-i'])):
     ifile = opt['-i'][i]
     ofile = opt['-o'][i]
     cmd.append('dd if=%s of=%s count=%d bs=%d' % (ifile, ofile, cnt, blocksz))
     totalBytes += cnt * blocksz
 
 for c in cmd:
-    print c
+    print(c)
     pfile.append(os.popen(c))
 
 for f in pfile:
     ok = False
     try:
-        print f.read()
+        print(f.read())
         ok = not f.close()
         f = None
     except:
@@ -170,4 +157,4 @@ for f in pfile:
         sys.exit(1)
 
 os.system('sync')
-print 'multidd total bytes ', totalBytes
+print('multidd total bytes ', totalBytes)

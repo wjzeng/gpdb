@@ -1,3 +1,8 @@
+-- start_matchsubs
+-- m/((Mon|Tue|Wed|Thu|Fri|Sat|Sun) (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) (0[1-9]|[12][0-9]|3[01]) ([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](.[0-9]+)? (?!0000)[0-9]{4}.*)+(['"])/
+-- s/((Mon|Tue|Wed|Thu|Fri|Sat|Sun) (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) (0[1-9]|[12][0-9]|3[01]) ([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](.[0-9]+)? (?!0000)[0-9]{4}.*)+(['"])/xxx xx xx xx:xx:xx xxxx"/
+-- end_matchsubs
+
 create schema bfv_partition_plans;
 set search_path=bfv_partition_plans;
 
@@ -5,7 +10,7 @@ set search_path=bfv_partition_plans;
 -- Initial setup for all the partitioning test for this suite
 --
 -- start_ignore
-create language plpythonu;
+create language plpython3u;
 -- end_ignore
 
 create or replace function count_operator(query text, operator text) returns int as
@@ -19,7 +24,7 @@ for i in range(len(rv)):
         result = result+1
 return result
 $$
-language plpythonu;
+language plpython3u;
 
 create or replace function find_operator(query text, operator_name text) returns text as
 $$
@@ -33,7 +38,7 @@ for i in range(len(rv)):
         break
 return result
 $$
-language plpythonu;
+language plpython3u;
 
 
 -- Test UPDATE that moves row from one partition to another. The partitioning
@@ -41,6 +46,7 @@ language plpythonu;
 create table mpp3061 (i int) partition by range(i) (start(1) end(5) every(1));
 insert into mpp3061 values(1);
 update mpp3061 set i = 2 where i = 1;
+select tableoid::regclass, * from mpp3061 where i = 2;
 drop table mpp3061;
 
 --
@@ -135,13 +141,11 @@ select find_operator('analyze select * from mpp21834_t2,mpp21834_t1 where mpp218
 select find_operator('analyze select * from mpp21834_t2,mpp21834_t1 where mpp21834_t2.i < mpp21834_t1.i;','Nested Loop');
 
 -- CLEANUP
--- start_ignore
 drop index index_2;
 drop index index_1;
 drop table if exists mpp21834_t2;
 drop table if exists mpp21834_t1;
 reset optimizer_enable_hashjoin;
--- end_ignore
 
 
 --
@@ -158,8 +162,8 @@ create table mpp23288(a int, b int)
   partition by range (a)
   (
       PARTITION pfirst  END(5) INCLUSIVE,
-      PARTITION pinter  START(5) EXCLUSIVE END (10) INCLUSIVE,
-      PARTITION plast   START (10) EXCLUSIVE
+      PARTITION pinter  START(6) END (10) INCLUSIVE,
+      PARTITION plast   START (11)
   );
 
 insert into mpp23288(a) select generate_series(1,20);
@@ -167,13 +171,13 @@ insert into mpp23288(a) select generate_series(1,20);
 analyze mpp23288;
 
 -- TEST
-select count_operator('select t2.a, t1.a from mpp23288 as t1 join mpp23288 as t2 on (t1.a < t2.a and t2.a =10) order by t2.a, t1.a;','Dynamic Table Scan');
+select count_operator('select t2.a, t1.a from mpp23288 as t1 join mpp23288 as t2 on (t1.a < t2.a and t2.a =10) order by t2.a, t1.a;','Dynamic Seq Scan');
 select t2.a, t1.a from mpp23288 as t1 join mpp23288 as t2 on (t1.a < t2.a and t2.a =10) order by t2.a, t1.a;
 
-select count_operator('select t2.a, t1.a from mpp23288 as t1 join mpp23288 as t2 on (t1.a < t2.a and (t2.a = 10 or t2.a = 5 or t2.a = 12)) order by t2.a, t1.a;','Dynamic Table Scan');
+select count_operator('select t2.a, t1.a from mpp23288 as t1 join mpp23288 as t2 on (t1.a < t2.a and (t2.a = 10 or t2.a = 5 or t2.a = 12)) order by t2.a, t1.a;','Dynamic Seq Scan');
 select t2.a, t1.a from mpp23288 as t1 join mpp23288 as t2 on (t1.a < t2.a and (t2.a = 10 or t2.a = 5 or t2.a = 12)) order by t2.a, t1.a;
 
-select count_operator('select t2.a, t1.a from mpp23288 as t1 join mpp23288 as t2 on t1.a < t2.a and t2.a = 1 or t2.a < 10 order by t2.a, t1.a;','Dynamic Table Scan');
+select count_operator('select t2.a, t1.a from mpp23288 as t1 join mpp23288 as t2 on t1.a < t2.a and t2.a = 1 or t2.a < 10 order by t2.a, t1.a;','Dynamic Seq Scan');
 select t2.a, t1.a from mpp23288 as t1 join mpp23288 as t2 on t1.a < t2.a and t2.a = 1 or t2.a < 10 order by t2.a, t1.a;
 
 -- CLEANUP
@@ -214,17 +218,18 @@ analyze mpp24151_t;
 -- TEST
 set optimizer_enable_dynamictablescan = off;
 
-select count_operator('select * from mpp24151_t, mpp24151_pt where tid = ptid and pt1 = E''hello0'';','Result');
+-- GPDB_12_MERGE_FIXME: With the big refactoring t how Partition Selectors are
+-- implemented during the v12 merge, I'm not sure if this test is testing anything
+-- useful anymore. And/or it redundant with the tests in 'dpe'?
+select count_operator('select * from mpp24151_t, mpp24151_pt where tid = ptid and pt1 = E''hello0'';','->  Partition Selector');
 select * from mpp24151_t, mpp24151_pt where tid = ptid and pt1 = 'hello0';
 
 -- CLEANUP
--- start_ignore
 drop index ptid_idx;
 drop index pt1_idx;
 drop table if exists mpp24151_t;
 drop table if exists mpp24151_pt;
 reset optimizer_enable_dynamictablescan;
--- end_ignore
 
 
 --
@@ -312,7 +317,7 @@ create index dbs_index on dbs using bitmap(c3);
 
 
 -- TEST
-select find_operator('(select * from dts where c2 = 1) union (select * from dts where c2 = 2) union (select * from dts where c2 = 3) union (select * from dts where c2 = 4) union (select * from dts where c2 = 5) union (select * from dts where c2 = 6) union (select * from dts where c2 = 7) union (select * from dts where c2 = 8) union (select * from dts where c2 = 9) union (select * from dts where c2 = 10);', 'Dynamic Table Scan');
+select find_operator('(select * from dts where c2 = 1) union (select * from dts where c2 = 2) union (select * from dts where c2 = 3) union (select * from dts where c2 = 4) union (select * from dts where c2 = 5) union (select * from dts where c2 = 6) union (select * from dts where c2 = 7) union (select * from dts where c2 = 8) union (select * from dts where c2 = 9) union (select * from dts where c2 = 10);', 'Dynamic Seq Scan');
 
 (select * from dts where c2 = 1) union
 (select * from dts where c2 = 2) union
@@ -339,19 +344,17 @@ select find_operator('(select * from dis where c3 = 1) union (select * from dis 
 (select * from dis where c3 = 9) union
 (select * from dis where c3 = 10);
 
-select find_operator('select * from dbs where c2= 15 and c3 = 5;', 'Bitmap Table Scan');
+select find_operator('select * from dbs where c2= 15 and c3 = 5;', 'Bitmap Heap Scan');
 
 select * from dbs where c2= 15 and c3 = 5;
 
 -- CLEANUP
--- start_ignore
 drop index dbs_index;
 drop table if exists dbs;
 drop index dis_index;
 drop table if exists dis;
 drop table if exists dts;
 reset optimizer_enable_dynamictablescan;
--- end_ignore
 
 --
 -- Partition elimination for heterogenous DynamicIndexScans

@@ -3,8 +3,8 @@
  * fe-exec.c
  *	  functions related to sending a query down to the backend
  *
- * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -25,6 +25,7 @@
 
 #include <ctype.h>
 #include <fcntl.h>
+#include <limits.h>
 
 #include "libpq-fe.h"
 #include "libpq-int.h"
@@ -59,23 +60,24 @@ static int	static_client_encoding = PG_SQL_ASCII;
 static bool static_std_strings = false;
 
 
-static PGEvent *dupEvents(PGEvent *events, int count);
-static bool pqAddTuple(PGresult *res, PGresAttValue *tup);
-static int PQsendQueryGuts(PGconn *conn,
-				const char *command,
-				const char *stmtName,
-				int nParams,
-				const Oid *paramTypes,
-				const char *const * paramValues,
-				const int *paramLengths,
-				const int *paramFormats,
-				int resultFormat);
+static PGEvent *dupEvents(PGEvent *events, int count, size_t *memSize);
+static bool pqAddTuple(PGresult *res, PGresAttValue *tup,
+					   const char **errmsgp);
+static int	PQsendQueryGuts(PGconn *conn,
+							const char *command,
+							const char *stmtName,
+							int nParams,
+							const Oid *paramTypes,
+							const char *const *paramValues,
+							const int *paramLengths,
+							const int *paramFormats,
+							int resultFormat);
 static void parseInput(PGconn *conn);
 static PGresult *getCopyResult(PGconn *conn, ExecStatusType copytype);
 static bool PQexecStart(PGconn *conn);
 static PGresult *PQexecFinish(PGconn *conn);
-static int PQsendDescribe(PGconn *conn, char desc_type,
-			   const char *desc_target);
+static int	PQsendDescribe(PGconn *conn, char desc_type,
+						   const char *desc_target);
 static int	check_field_number(const PGresult *res, int field_num);
 
 
@@ -133,7 +135,7 @@ static int	check_field_number(const PGresult *res, int field_num);
  */
 
 #define PGRESULT_DATA_BLOCKSIZE		2048
-#define PGRESULT_ALIGN_BOUNDARY		MAXIMUM_ALIGNOF		/* from configure */
+#define PGRESULT_ALIGN_BOUNDARY		MAXIMUM_ALIGNOF /* from configure */
 #define PGRESULT_BLOCK_OVERHEAD		Max(sizeof(PGresult_data), PGRESULT_ALIGN_BOUNDARY)
 #define PGRESULT_SEP_ALLOC_THRESHOLD	(PGRESULT_DATA_BLOCKSIZE / 2)
 
@@ -167,19 +169,23 @@ PQmakeEmptyPGresult(PGconn *conn, ExecStatusType status)
 	result->nEvents = 0;
 	result->errMsg = NULL;
 	result->errFields = NULL;
+	result->errQuery = NULL;
 	result->null_field[0] = '\0';
 	result->curBlock = NULL;
 	result->curOffset = 0;
 	result->spaceLeft = 0;
+	result->memorySize = sizeof(PGresult);
+
 	result->cdbstats = NULL;            /*CDB*/
 
 	result->extras = NULL;
 	result->extraslen = 0;
+	result->extraType = PGExtraTypeNone;
 
 	result->numRejected = 0;
 	result->numCompleted = 0;
-	result->naotupcounts = 0;
-	result->aotupcounts = NULL;
+	result->nWaits = 0;
+	result->waitGxids = NULL;
 
 	if (conn)
 	{
@@ -207,7 +213,8 @@ PQmakeEmptyPGresult(PGconn *conn, ExecStatusType status)
 		/* copy events last; result must be valid if we need to PQclear */
 		if (conn->nEvents > 0)
 		{
-			result->events = dupEvents(conn->events, conn->nEvents);
+			result->events = dupEvents(conn->events, conn->nEvents,
+									   &result->memorySize);
 			if (!result->events)
 			{
 				PQclear(result);
@@ -245,17 +252,17 @@ PQsetResultAttrs(PGresult *res, int numAttributes, PGresAttDesc *attDescs)
 
 	/* If attrs already exist, they cannot be overwritten. */
 	if (!res || res->numAttributes > 0)
-		return FALSE;
+		return false;
 
 	/* ignore no-op request */
 	if (numAttributes <= 0 || !attDescs)
-		return TRUE;
+		return true;
 
 	res->attDescs = (PGresAttDesc *)
 		PQresultAlloc(res, numAttributes * sizeof(PGresAttDesc));
 
 	if (!res->attDescs)
-		return FALSE;
+		return false;
 
 	res->numAttributes = numAttributes;
 	memcpy(res->attDescs, attDescs, numAttributes * sizeof(PGresAttDesc));
@@ -270,13 +277,13 @@ PQsetResultAttrs(PGresult *res, int numAttributes, PGresAttDesc *attDescs)
 			res->attDescs[i].name = res->null_field;
 
 		if (!res->attDescs[i].name)
-			return FALSE;
+			return false;
 
 		if (res->attDescs[i].format == 0)
 			res->binary = 0;
 	}
 
-	return TRUE;
+	return true;
 }
 
 /*
@@ -358,7 +365,8 @@ PQcopyResult(const PGresult *src, int flags)
 	/* Wants to copy PGEvents? */
 	if ((flags & PG_COPYRES_EVENTS) && src->nEvents > 0)
 	{
-		dest->events = dupEvents(src->events, src->nEvents);
+		dest->events = dupEvents(src->events, src->nEvents,
+								 &dest->memorySize);
 		if (!dest->events)
 		{
 			PQclear(dest);
@@ -382,7 +390,7 @@ PQcopyResult(const PGresult *src, int flags)
 				PQclear(dest);
 				return NULL;
 			}
-			dest->events[i].resultInitialized = TRUE;
+			dest->events[i].resultInitialized = true;
 		}
 	}
 
@@ -393,17 +401,20 @@ PQcopyResult(const PGresult *src, int flags)
  * Copy an array of PGEvents (with no extra space for more).
  * Does not duplicate the event instance data, sets this to NULL.
  * Also, the resultInitialized flags are all cleared.
+ * The total space allocated is added to *memSize.
  */
 static PGEvent *
-dupEvents(PGEvent *events, int count)
+dupEvents(PGEvent *events, int count, size_t *memSize)
 {
 	PGEvent    *newEvents;
+	size_t		msize;
 	int			i;
 
 	if (!events || count <= 0)
 		return NULL;
 
-	newEvents = (PGEvent *) malloc(count * sizeof(PGEvent));
+	msize = count * sizeof(PGEvent);
+	newEvents = (PGEvent *) malloc(msize);
 	if (!newEvents)
 		return NULL;
 
@@ -412,7 +423,7 @@ dupEvents(PGEvent *events, int count)
 		newEvents[i].proc = events[i].proc;
 		newEvents[i].passThrough = events[i].passThrough;
 		newEvents[i].data = NULL;
-		newEvents[i].resultInitialized = FALSE;
+		newEvents[i].resultInitialized = false;
 		newEvents[i].name = strdup(events[i].name);
 		if (!newEvents[i].name)
 		{
@@ -421,8 +432,10 @@ dupEvents(PGEvent *events, int count)
 			free(newEvents);
 			return NULL;
 		}
+		msize += strlen(events[i].name) + 1;
 	}
 
+	*memSize += msize;
 	return newEvents;
 }
 
@@ -432,18 +445,26 @@ dupEvents(PGEvent *events, int count)
  * equal to PQntuples(res).  If it is equal, a new tuple is created and
  * added to the result.
  * Returns a non-zero value for success and zero for failure.
+ * (On failure, we report the specific problem via pqInternalNotice.)
  */
 int
 PQsetvalue(PGresult *res, int tup_num, int field_num, char *value, int len)
 {
 	PGresAttValue *attval;
+	const char *errmsg = NULL;
 
+	/* Note that this check also protects us against null "res" */
 	if (!check_field_number(res, field_num))
-		return FALSE;
+		return false;
 
 	/* Invalid tup_num, must be <= ntups */
 	if (tup_num < 0 || tup_num > res->ntups)
-		return FALSE;
+	{
+		pqInternalNotice(&res->noticeHooks,
+						 "row number %d is out of range 0..%d",
+						 tup_num, res->ntups);
+		return false;
+	}
 
 	/* need to allocate a new tuple? */
 	if (tup_num == res->ntups)
@@ -453,10 +474,10 @@ PQsetvalue(PGresult *res, int tup_num, int field_num, char *value, int len)
 
 		tup = (PGresAttValue *)
 			pqResultAlloc(res, res->numAttributes * sizeof(PGresAttValue),
-						  TRUE);
+						  true);
 
 		if (!tup)
-			return FALSE;
+			goto fail;
 
 		/* initialize each column to NULL */
 		for (i = 0; i < res->numAttributes; i++)
@@ -466,8 +487,8 @@ PQsetvalue(PGresult *res, int tup_num, int field_num, char *value, int len)
 		}
 
 		/* add it to the array */
-		if (!pqAddTuple(res, tup))
-			return FALSE;
+		if (!pqAddTuple(res, tup, &errmsg))
+			goto fail;
 	}
 
 	attval = &res->tuples[tup_num][field_num];
@@ -485,15 +506,26 @@ PQsetvalue(PGresult *res, int tup_num, int field_num, char *value, int len)
 	}
 	else
 	{
-		attval->value = (char *) pqResultAlloc(res, len + 1, TRUE);
+		attval->value = (char *) pqResultAlloc(res, len + 1, true);
 		if (!attval->value)
-			return FALSE;
+			goto fail;
 		attval->len = len;
 		memcpy(attval->value, value, len);
 		attval->value[len] = '\0';
 	}
 
-	return TRUE;
+	return true;
+
+	/*
+	 * Report failure via pqInternalNotice.  If preceding code didn't provide
+	 * an error message, assume "out of memory" was meant.
+	 */
+fail:
+	if (!errmsg)
+		errmsg = libpq_gettext("out of memory");
+	pqInternalNotice(&res->noticeHooks, "%s", errmsg);
+
+	return false;
 }
 
 /*
@@ -505,7 +537,7 @@ PQsetvalue(PGresult *res, int tup_num, int field_num, char *value, int len)
 void *
 PQresultAlloc(PGresult *res, size_t nBytes)
 {
-	return pqResultAlloc(res, nBytes, TRUE);
+	return pqResultAlloc(res, nBytes, true);
 }
 
 /*
@@ -562,9 +594,12 @@ pqResultAlloc(PGresult *res, size_t nBytes, bool isBinary)
 	 */
 	if (nBytes >= PGRESULT_SEP_ALLOC_THRESHOLD)
 	{
-		block = (PGresult_data *) malloc(nBytes + PGRESULT_BLOCK_OVERHEAD);
+		size_t		alloc_size = nBytes + PGRESULT_BLOCK_OVERHEAD;
+
+		block = (PGresult_data *) malloc(alloc_size);
 		if (!block)
 			return NULL;
+		res->memorySize += alloc_size;
 		space = block->space + PGRESULT_BLOCK_OVERHEAD;
 		if (res->curBlock)
 		{
@@ -589,6 +624,7 @@ pqResultAlloc(PGresult *res, size_t nBytes, bool isBinary)
 	block = (PGresult_data *) malloc(PGRESULT_DATA_BLOCKSIZE);
 	if (!block)
 		return NULL;
+	res->memorySize += PGRESULT_DATA_BLOCKSIZE;
 	block->next = res->curBlock;
 	res->curBlock = block;
 	if (isBinary)
@@ -611,13 +647,25 @@ pqResultAlloc(PGresult *res, size_t nBytes, bool isBinary)
 }
 
 /*
+ * PQresultMemorySize -
+ *		Returns total space allocated for the PGresult.
+ */
+size_t
+PQresultMemorySize(const PGresult *res)
+{
+	if (!res)
+		return 0;
+	return res->memorySize;
+}
+
+/*
  * pqResultStrdup -
  *		Like strdup, but the space is subsidiary PGresult space.
  */
 char *
 pqResultStrdup(PGresult *res, const char *str)
 {
-	char	   *space = (char *) pqResultAlloc(res, strlen(str) + 1, FALSE);
+	char	   *space = (char *) pqResultAlloc(res, strlen(str) + 1, false);
 
 	if (space)
 		strcpy(space, str);
@@ -712,10 +760,12 @@ PQclear(PGresult *res)
 		free(res->extras);
 	res->extraslen = 0;
 	res->extras = NULL;
+	res->extraType = PGExtraTypeNone;
 
-	if (res->aotupcounts)
-		free(res->aotupcounts);
-	res->naotupcounts = 0;
+	if (res->waitGxids)
+		free(res->waitGxids);
+	res->waitGxids = NULL;
+	res->nWaits = 0;
 
 	/* Free the PGresult structure itself */
 	free(res);
@@ -768,6 +818,32 @@ pqSaveErrorResult(PGconn *conn)
 		/* Else, concatenate error message to existing async result. */
 		pqCatenateResultError(conn->result, conn->errorMessage.data);
 	}
+}
+
+/*
+ * As above, and append conn->write_err_msg to whatever other error we have.
+ * This is used when we've detected a write failure and have exhausted our
+ * chances of reporting something else instead.
+ */
+static void
+pqSaveWriteError(PGconn *conn)
+{
+	/*
+	 * Ensure conn->result is an error result, and add anything in
+	 * conn->errorMessage to it.
+	 */
+	pqSaveErrorResult(conn);
+
+	/*
+	 * Now append write_err_msg to that.  If it's null because of previous
+	 * strdup failure, do what we can.  (It's likely our machinations here are
+	 * all getting OOM failures as well, but ...)
+	 */
+	if (conn->write_err_msg && conn->write_err_msg[0] != '\0')
+		pqCatenateResultError(conn->result, conn->write_err_msg);
+	else
+		pqCatenateResultError(conn->result,
+							  libpq_gettext("write to server failed\n"));
 }
 
 /*
@@ -849,13 +925,14 @@ pqInternalNotice(const PGNoticeHooks *hooks, const char *fmt,...)
 	 */
 	pqSaveMessageField(res, PG_DIAG_MESSAGE_PRIMARY, msgBuf);
 	pqSaveMessageField(res, PG_DIAG_SEVERITY, libpq_gettext("NOTICE"));
+	pqSaveMessageField(res, PG_DIAG_SEVERITY_NONLOCALIZED, "NOTICE");
 	/* XXX should provide a SQLSTATE too? */
 
 	/*
 	 * Result text is always just the primary message + newline. If we can't
 	 * allocate it, don't bother invoking the receiver.
 	 */
-	res->errMsg = (char *) pqResultAlloc(res, strlen(msgBuf) + 2, FALSE);
+	res->errMsg = (char *) pqResultAlloc(res, strlen(msgBuf) + 2, false);
 	if (res->errMsg)
 	{
 		sprintf(res->errMsg, "%s\n", msgBuf);
@@ -863,7 +940,7 @@ pqInternalNotice(const PGNoticeHooks *hooks, const char *fmt,...)
 		/*
 		 * Pass to receiver, then free it.
 		 */
-		(*res->noticeHooks.noticeRec) (res->noticeHooks.noticeRecArg, res);
+		res->noticeHooks.noticeRec(res->noticeHooks.noticeRecArg, res);
 	}
 	PQclear(res);
 }
@@ -871,10 +948,13 @@ pqInternalNotice(const PGNoticeHooks *hooks, const char *fmt,...)
 /*
  * pqAddTuple
  *	  add a row pointer to the PGresult structure, growing it if necessary
- *	  Returns TRUE if OK, FALSE if not enough memory to add the row
+ *	  Returns true if OK, false if an error prevented adding the row
+ *
+ * On error, *errmsgp can be set to an error string to be returned.
+ * If it is left NULL, the error is presumed to be "out of memory".
  */
 static bool
-pqAddTuple(PGresult *res, PGresAttValue *tup)
+pqAddTuple(PGresult *res, PGresAttValue *tup, const char **errmsgp)
 {
 	if (res->ntups >= res->tupArrSize)
 	{
@@ -889,8 +969,35 @@ pqAddTuple(PGresult *res, PGresAttValue *tup)
 		 * existing allocation. Note that the positions beyond res->ntups are
 		 * garbage, not necessarily NULL.
 		 */
-		int			newSize = (res->tupArrSize > 0) ? res->tupArrSize * 2 : 128;
+		int			newSize;
 		PGresAttValue **newTuples;
+
+		/*
+		 * Since we use integers for row numbers, we can't support more than
+		 * INT_MAX rows.  Make sure we allow that many, though.
+		 */
+		if (res->tupArrSize <= INT_MAX / 2)
+			newSize = (res->tupArrSize > 0) ? res->tupArrSize * 2 : 128;
+		else if (res->tupArrSize < INT_MAX)
+			newSize = INT_MAX;
+		else
+		{
+			*errmsgp = libpq_gettext("PGresult cannot support more than INT_MAX tuples");
+			return false;
+		}
+
+		/*
+		 * Also, on 32-bit platforms we could, in theory, overflow size_t even
+		 * before newSize gets to INT_MAX.  (In practice we'd doubtless hit
+		 * OOM long before that, but let's check.)
+		 */
+#if INT_MAX >= (SIZE_MAX / 2)
+		if (newSize > SIZE_MAX / sizeof(PGresAttValue *))
+		{
+			*errmsgp = libpq_gettext("size_t overflow");
+			return false;
+		}
+#endif
 
 		if (res->tuples == NULL)
 			newTuples = (PGresAttValue **)
@@ -899,13 +1006,15 @@ pqAddTuple(PGresult *res, PGresAttValue *tup)
 			newTuples = (PGresAttValue **)
 				realloc(res->tuples, newSize * sizeof(PGresAttValue *));
 		if (!newTuples)
-			return FALSE;		/* malloc or realloc failed */
+			return false;		/* malloc or realloc failed */
+		res->memorySize +=
+			(newSize - res->tupArrSize) * sizeof(PGresAttValue *);
 		res->tupArrSize = newSize;
 		res->tuples = newTuples;
 	}
 	res->tuples[res->ntups] = tup;
 	res->ntups++;
-	return TRUE;
+	return true;
 }
 
 /*
@@ -918,8 +1027,9 @@ pqSaveMessageField(PGresult *res, char code, const char *value)
 
 	pfield = (PGMessageField *)
 		pqResultAlloc(res,
-					  sizeof(PGMessageField) + strlen(value),
-					  TRUE);
+					  offsetof(PGMessageField, contents) +
+					  strlen(value) + 1,
+					  true);
 	if (!pfield)
 		return;					/* out of memory? */
 	pfield->code = code;
@@ -963,7 +1073,7 @@ pqSaveParameterStatus(PGconn *conn, const char *name, const char *value)
 	 * Store new info as a single malloc block
 	 */
 	pstatus = (pgParameterStatus *) malloc(sizeof(pgParameterStatus) +
-										   strlen(name) +strlen(value) + 2);
+										   strlen(name) + strlen(value) + 2);
 	if (pstatus)
 	{
 		char	   *ptr;
@@ -1083,7 +1193,7 @@ pqRowProcessor(PGconn *conn, const char **errmsgp)
 	 * memory for gettext() to do anything.
 	 */
 	tup = (PGresAttValue *)
-			pqResultAlloc(res, nfields * sizeof(PGresAttValue), TRUE);
+		pqResultAlloc(res, nfields * sizeof(PGresAttValue), true);
 	if (tup == NULL)
 		goto fail;
 
@@ -1116,7 +1226,7 @@ pqRowProcessor(PGconn *conn, const char **errmsgp)
 	}
 
 	/* And add the tuple to the PGresult's tuple array */
-	if (!pqAddTuple(res, tup))
+	if (!pqAddTuple(res, tup, errmsgp))
 		goto fail;
 
 	/*
@@ -1160,7 +1270,7 @@ PQsendQuery(PGconn *conn, const char *query)
 	if (!query)
 	{
 		printfPQExpBuffer(&conn->errorMessage,
-						libpq_gettext("command string is a null pointer\n"));
+						  libpq_gettext("command string is a null pointer\n"));
 		return 0;
 	}
 
@@ -1169,7 +1279,7 @@ PQsendQuery(PGconn *conn, const char *query)
 		pqPuts(query, conn) < 0 ||
 		pqPutMsgEnd(conn) < 0)
 	{
-		pqHandleSendFailure(conn);
+		/* error message should be set up already */
 		return 0;
 	}
 
@@ -1188,7 +1298,7 @@ PQsendQuery(PGconn *conn, const char *query)
 	 */
 	if (pqFlush(conn) < 0)
 	{
-		pqHandleSendFailure(conn);
+		/* error message should be set up already */
 		return 0;
 	}
 
@@ -1206,7 +1316,7 @@ PQsendQueryParams(PGconn *conn,
 				  const char *command,
 				  int nParams,
 				  const Oid *paramTypes,
-				  const char *const * paramValues,
+				  const char *const *paramValues,
 				  const int *paramLengths,
 				  const int *paramFormats,
 				  int resultFormat)
@@ -1218,13 +1328,13 @@ PQsendQueryParams(PGconn *conn,
 	if (!command)
 	{
 		printfPQExpBuffer(&conn->errorMessage,
-						libpq_gettext("command string is a null pointer\n"));
+						  libpq_gettext("command string is a null pointer\n"));
 		return 0;
 	}
 	if (nParams < 0 || nParams > 65535)
 	{
 		printfPQExpBuffer(&conn->errorMessage,
-		libpq_gettext("number of parameters must be between 0 and 65535\n"));
+						  libpq_gettext("number of parameters must be between 0 and 65535\n"));
 		return 0;
 	}
 
@@ -1258,19 +1368,19 @@ PQsendPrepare(PGconn *conn,
 	if (!stmtName)
 	{
 		printfPQExpBuffer(&conn->errorMessage,
-						libpq_gettext("statement name is a null pointer\n"));
+						  libpq_gettext("statement name is a null pointer\n"));
 		return 0;
 	}
 	if (!query)
 	{
 		printfPQExpBuffer(&conn->errorMessage,
-						libpq_gettext("command string is a null pointer\n"));
+						  libpq_gettext("command string is a null pointer\n"));
 		return 0;
 	}
 	if (nParams < 0 || nParams > 65535)
 	{
 		printfPQExpBuffer(&conn->errorMessage,
-		libpq_gettext("number of parameters must be between 0 and 65535\n"));
+						  libpq_gettext("number of parameters must be between 0 and 65535\n"));
 		return 0;
 	}
 
@@ -1278,7 +1388,7 @@ PQsendPrepare(PGconn *conn,
 	if (PG_PROTOCOL_MAJOR(conn->pversion) < 3)
 	{
 		printfPQExpBuffer(&conn->errorMessage,
-		 libpq_gettext("function requires at least protocol version 3.0\n"));
+						  libpq_gettext("function requires at least protocol version 3.0\n"));
 		return 0;
 	}
 
@@ -1334,7 +1444,7 @@ PQsendPrepare(PGconn *conn,
 	return 1;
 
 sendFailed:
-	pqHandleSendFailure(conn);
+	/* error message should be set up already */
 	return 0;
 }
 
@@ -1347,7 +1457,7 @@ int
 PQsendQueryPrepared(PGconn *conn,
 					const char *stmtName,
 					int nParams,
-					const char *const * paramValues,
+					const char *const *paramValues,
 					const int *paramLengths,
 					const int *paramFormats,
 					int resultFormat)
@@ -1359,13 +1469,13 @@ PQsendQueryPrepared(PGconn *conn,
 	if (!stmtName)
 	{
 		printfPQExpBuffer(&conn->errorMessage,
-						libpq_gettext("statement name is a null pointer\n"));
+						  libpq_gettext("statement name is a null pointer\n"));
 		return 0;
 	}
 	if (nParams < 0 || nParams > 65535)
 	{
 		printfPQExpBuffer(&conn->errorMessage,
-		libpq_gettext("number of parameters must be between 0 and 65535\n"));
+						  libpq_gettext("number of parameters must be between 0 and 65535\n"));
 		return 0;
 	}
 
@@ -1403,13 +1513,12 @@ PQsendQueryStart(PGconn *conn)
 	if (conn->asyncStatus != PGASYNC_IDLE)
 	{
 		printfPQExpBuffer(&conn->errorMessage,
-				  libpq_gettext("another command is already in progress\n"));
+						  libpq_gettext("another command is already in progress\n"));
 		return false;
 	}
 
 	/* initialize async result-accumulation state */
-	conn->result = NULL;
-	conn->next_result = NULL;
+	pqClearAsyncResult(conn);
 
 	/* reset single-row processing mode */
 	conn->singleRowMode = false;
@@ -1431,7 +1540,7 @@ PQsendQueryGuts(PGconn *conn,
 				const char *stmtName,
 				int nParams,
 				const Oid *paramTypes,
-				const char *const * paramValues,
+				const char *const *paramValues,
 				const int *paramLengths,
 				const int *paramFormats,
 				int resultFormat)
@@ -1442,7 +1551,7 @@ PQsendQueryGuts(PGconn *conn,
 	if (PG_PROTOCOL_MAJOR(conn->pversion) < 3)
 	{
 		printfPQExpBuffer(&conn->errorMessage,
-		 libpq_gettext("function requires at least protocol version 3.0\n"));
+						  libpq_gettext("function requires at least protocol version 3.0\n"));
 		return 0;
 	}
 
@@ -1587,34 +1696,8 @@ PQsendQueryGuts(PGconn *conn,
 	return 1;
 
 sendFailed:
-	pqHandleSendFailure(conn);
+	/* error message should be set up already */
 	return 0;
-}
-
-/*
- * pqHandleSendFailure: try to clean up after failure to send command.
- *
- * Primarily, what we want to accomplish here is to process an async
- * NOTICE message that the backend might have sent just before it died.
- *
- * NOTE: this routine should only be called in PGASYNC_IDLE state.
- */
-void
-pqHandleSendFailure(PGconn *conn)
-{
-	/*
-	 * Accept any available input data, ignoring errors.  Note that if
-	 * pqReadData decides the backend has closed the channel, it will close
-	 * our side of the socket --- that's just what we want here.
-	 */
-	while (pqReadData(conn) > 0)
-		 /* loop until no more data readable */ ;
-
-	/*
-	 * Parse any available input messages.  Since we are in PGASYNC_IDLE
-	 * state, only NOTICE and NOTIFY messages will be eaten.
-	 */
-	parseInput(conn);
 }
 
 /*
@@ -1694,20 +1777,23 @@ parseInput(PGconn *conn)
 
 /*
  * PQisBusy
- *	 Return TRUE if PQgetResult would block waiting for input.
+ *	 Return true if PQgetResult would block waiting for input.
  */
 
 int
 PQisBusy(PGconn *conn)
 {
 	if (!conn)
-		return FALSE;
+		return false;
 
 	/* Parse any available data, if our state permits. */
 	parseInput(conn);
 
-	/* PQgetResult will return immediately in all states except BUSY. */
-	return conn->asyncStatus == PGASYNC_BUSY;
+	/*
+	 * PQgetResult will return immediately in all states except BUSY, or if we
+	 * had a write failure.
+	 */
+	return conn->asyncStatus == PGASYNC_BUSY || conn->write_failed;
 }
 
 
@@ -1740,16 +1826,22 @@ PQgetResult(PGconn *conn)
 		 */
 		while ((flushResult = pqFlush(conn)) > 0)
 		{
-			if (pqWait(FALSE, TRUE, conn))
+			if (pqWait(false, true, conn))
 			{
 				flushResult = -1;
 				break;
 			}
 		}
 
-		/* Wait for some more data, and load it. */
+		/*
+		 * Wait for some more data, and load it.  (Note: if the connection has
+		 * been lost, pqWait should return immediately because the socket
+		 * should be read-ready, either with the last server data or with an
+		 * EOF indication.  We expect therefore that this won't result in any
+		 * undue delay in reporting a previous write failure.)
+		 */
 		if (flushResult ||
-			pqWait(TRUE, FALSE, conn) ||
+			pqWait(true, false, conn) ||
 			pqReadData(conn) < 0)
 		{
 			/*
@@ -1763,6 +1855,17 @@ PQgetResult(PGconn *conn)
 
 		/* Parse it. */
 		parseInput(conn);
+
+		/*
+		 * If we had a write error, but nothing above obtained a query result
+		 * or detected a read error, report the write error.
+		 */
+		if (conn->write_failed && conn->asyncStatus == PGASYNC_BUSY)
+		{
+			pqSaveWriteError(conn);
+			conn->asyncStatus = PGASYNC_IDLE;
+			return pqPrepareAsyncResult(conn);
+		}
 	}
 
 	/* Return the appropriate thing. */
@@ -1813,7 +1916,7 @@ PQgetResult(PGconn *conn)
 				res->resultStatus = PGRES_FATAL_ERROR;
 				break;
 			}
-			res->events[i].resultInitialized = TRUE;
+			res->events[i].resultInitialized = true;
 		}
 	}
 
@@ -1881,7 +1984,7 @@ PQexecParams(PGconn *conn,
 			 const char *command,
 			 int nParams,
 			 const Oid *paramTypes,
-			 const char *const * paramValues,
+			 const char *const *paramValues,
 			 const int *paramLengths,
 			 const int *paramFormats,
 			 int resultFormat)
@@ -1927,7 +2030,7 @@ PGresult *
 PQexecPrepared(PGconn *conn,
 			   const char *stmtName,
 			   int nParams,
-			   const char *const * paramValues,
+			   const char *const *paramValues,
 			   const int *paramLengths,
 			   const int *paramFormats,
 			   int resultFormat)
@@ -1967,7 +2070,7 @@ PQexecStart(PGconn *conn)
 			{
 				/* In protocol 3, we can get out of a COPY IN state */
 				if (PQputCopyEnd(conn,
-						 libpq_gettext("COPY terminated by new PQexec")) < 0)
+								 libpq_gettext("COPY terminated by new PQexec")) < 0)
 					return false;
 				/* keep waiting to swallow the copy's failure message */
 			}
@@ -1975,7 +2078,7 @@ PQexecStart(PGconn *conn)
 			{
 				/* In older protocols we have to punt */
 				printfPQExpBuffer(&conn->errorMessage,
-				  libpq_gettext("COPY IN state must be terminated first\n"));
+								  libpq_gettext("COPY IN state must be terminated first\n"));
 				return false;
 			}
 		}
@@ -1995,7 +2098,7 @@ PQexecStart(PGconn *conn)
 			{
 				/* In older protocols we have to punt */
 				printfPQExpBuffer(&conn->errorMessage,
-				 libpq_gettext("COPY OUT state must be terminated first\n"));
+								  libpq_gettext("COPY OUT state must be terminated first\n"));
 				return false;
 			}
 		}
@@ -2003,7 +2106,7 @@ PQexecStart(PGconn *conn)
 		{
 			/* We don't allow PQexec during COPY BOTH */
 			printfPQExpBuffer(&conn->errorMessage,
-					 libpq_gettext("PQexec not allowed during COPY BOTH\n"));
+							  libpq_gettext("PQexec not allowed during COPY BOTH\n"));
 			return false;
 		}
 		/* check for loss of connection, too */
@@ -2157,7 +2260,7 @@ PQsendDescribe(PGconn *conn, char desc_type, const char *desc_target)
 	if (PG_PROTOCOL_MAJOR(conn->pversion) < 3)
 	{
 		printfPQExpBuffer(&conn->errorMessage,
-		 libpq_gettext("function requires at least protocol version 3.0\n"));
+						  libpq_gettext("function requires at least protocol version 3.0\n"));
 		return 0;
 	}
 
@@ -2195,7 +2298,7 @@ PQsendDescribe(PGconn *conn, char desc_type, const char *desc_target)
 	return 1;
 
 sendFailed:
-	pqHandleSendFailure(conn);
+	/* error message should be set up already */
 	return 0;
 }
 
@@ -2208,6 +2311,9 @@ sendFailed:
  * no unhandled async notification from the backend
  *
  * the CALLER is responsible for FREE'ing the structure returned
+ *
+ * Note that this function does not read any new data from the socket;
+ * so usually, caller should call PQconsumeInput() first.
  */
 PGnotify *
 PQnotifies(PGconn *conn)
@@ -2354,7 +2460,7 @@ PQputCopyEnd(PGconn *conn, const char *errormsg)
 	{
 		if (errormsg)
 		{
-			/* Ooops, no way to do this in 2.0 */
+			/* Oops, no way to do this in 2.0 */
 			printfPQExpBuffer(&conn->errorMessage,
 							  libpq_gettext("function requires at least protocol version 3.0\n"));
 			return -1;
@@ -2555,20 +2661,18 @@ PQendcopy(PGconn *conn)
  *		PQfn -	Send a function call to the POSTGRES backend.
  *
  *		conn			: backend connection
- *		fnid			: function id
- *		result_buf		: pointer to result buffer (&int if integer)
- *		result_len		: length of return value.
- *		actual_result_len: actual length returned. (differs from result_len
- *						  for varlena structures.)
- *		result_type		: If the result is an integer, this must be 1,
+ *		fnid			: OID of function to be called
+ *		result_buf		: pointer to result buffer
+ *		result_len		: actual length of result is returned here
+ *		result_is_int	: If the result is an integer, this must be 1,
  *						  otherwise this should be 0
- *		args			: pointer to an array of function arguments.
+ *		args			: pointer to an array of function arguments
  *						  (each has length, if integer, and value/pointer)
  *		nargs			: # of arguments in args array.
  *
  * RETURNS
  *		PGresult with status = PGRES_COMMAND_OK if successful.
- *			*actual_result_len is > 0 if there is a return value, 0 if not.
+ *			*result_len is > 0 if there is a return value, 0 if not.
  *		PGresult with status = PGRES_FATAL_ERROR if backend returns an error.
  *		NULL on communications failure.  conn->errorMessage will be set.
  * ----------------
@@ -2578,12 +2682,12 @@ PGresult *
 PQfn(PGconn *conn,
 	 int fnid,
 	 int *result_buf,
-	 int *actual_result_len,
+	 int *result_len,
 	 int result_is_int,
 	 const PQArgBlock *args,
 	 int nargs)
 {
-	*actual_result_len = 0;
+	*result_len = 0;
 
 	if (!conn)
 		return NULL;
@@ -2601,12 +2705,12 @@ PQfn(PGconn *conn,
 
 	if (PG_PROTOCOL_MAJOR(conn->pversion) >= 3)
 		return pqFunctionCall3(conn, fnid,
-							   result_buf, actual_result_len,
+							   result_buf, result_len,
 							   result_is_int,
 							   args, nargs);
 	else
 		return pqFunctionCall2(conn, fnid,
-							   result_buf, actual_result_len,
+							   result_buf, result_len,
 							   result_is_int,
 							   args, nargs);
 }
@@ -2636,6 +2740,44 @@ PQresultErrorMessage(const PGresult *res)
 	if (!res || !res->errMsg)
 		return "";
 	return res->errMsg;
+}
+
+char *
+PQresultVerboseErrorMessage(const PGresult *res,
+							PGVerbosity verbosity,
+							PGContextVisibility show_context)
+{
+	PQExpBufferData workBuf;
+
+	/*
+	 * Because the caller is expected to free the result string, we must
+	 * strdup any constant result.  We use plain strdup and document that
+	 * callers should expect NULL if out-of-memory.
+	 */
+	if (!res ||
+		(res->resultStatus != PGRES_FATAL_ERROR &&
+		 res->resultStatus != PGRES_NONFATAL_ERROR))
+		return strdup(libpq_gettext("PGresult is not an error result\n"));
+
+	initPQExpBuffer(&workBuf);
+
+	/*
+	 * Currently, we pass this off to fe-protocol3.c in all cases; it will
+	 * behave reasonably sanely with an error reported by fe-protocol2.c as
+	 * well.  If necessary, we could record the protocol version in PGresults
+	 * so as to be able to invoke a version-specific message formatter, but
+	 * for now there's no need.
+	 */
+	pqBuildErrorMessage3(&workBuf, res, verbosity, show_context);
+
+	/* If insufficient memory to format the message, fail cleanly */
+	if (PQExpBufferDataBroken(workBuf))
+	{
+		termPQExpBuffer(&workBuf);
+		return strdup(libpq_gettext("out of memory\n"));
+	}
+
+	return workBuf.data;
 }
 
 char *
@@ -2679,22 +2821,22 @@ PQbinaryTuples(const PGresult *res)
 
 /*
  * Helper routines to range-check field numbers and tuple numbers.
- * Return TRUE if OK, FALSE if not
+ * Return true if OK, false if not
  */
 
 static int
 check_field_number(const PGresult *res, int field_num)
 {
 	if (!res)
-		return FALSE;			/* no way to display error message... */
+		return false;			/* no way to display error message... */
 	if (field_num < 0 || field_num >= res->numAttributes)
 	{
 		pqInternalNotice(&res->noticeHooks,
 						 "column number %d is out of range 0..%d",
 						 field_num, res->numAttributes - 1);
-		return FALSE;
+		return false;
 	}
-	return TRUE;
+	return true;
 }
 
 static int
@@ -2702,38 +2844,38 @@ check_tuple_field_number(const PGresult *res,
 						 int tup_num, int field_num)
 {
 	if (!res)
-		return FALSE;			/* no way to display error message... */
+		return false;			/* no way to display error message... */
 	if (tup_num < 0 || tup_num >= res->ntups)
 	{
 		pqInternalNotice(&res->noticeHooks,
 						 "row number %d is out of range 0..%d",
 						 tup_num, res->ntups - 1);
-		return FALSE;
+		return false;
 	}
 	if (field_num < 0 || field_num >= res->numAttributes)
 	{
 		pqInternalNotice(&res->noticeHooks,
 						 "column number %d is out of range 0..%d",
 						 field_num, res->numAttributes - 1);
-		return FALSE;
+		return false;
 	}
-	return TRUE;
+	return true;
 }
 
 static int
 check_param_number(const PGresult *res, int param_num)
 {
 	if (!res)
-		return FALSE;			/* no way to display error message... */
+		return false;			/* no way to display error message... */
 	if (param_num < 0 || param_num >= res->numParameters)
 	{
 		pqInternalNotice(&res->noticeHooks,
 						 "parameter number %d is out of range 0..%d",
 						 param_num, res->numParameters - 1);
-		return FALSE;
+		return false;
 	}
 
-	return TRUE;
+	return true;
 }
 
 /*
@@ -2952,9 +3094,9 @@ PQoidStatus(const PGresult *res)
 		return "";
 
 	len = strspn(res->cmdStatus + 7, "0123456789");
-	if (len > 23)
-		len = 23;
-	strncpy(buf, res->cmdStatus + 7, len);
+	if (len > sizeof(buf) - 1)
+		len = sizeof(buf) - 1;
+	memcpy(buf, res->cmdStatus + 7, len);
 	buf[len] = '\0';
 
 	return buf;
@@ -3010,7 +3152,7 @@ PQcmdTuples(PGresult *res)
 		while (*p && *p != ' ')
 			p++;
 		if (*p == 0)
-			goto interpret_error;		/* no space? */
+			goto interpret_error;	/* no space? */
 		p++;
 	}
 	else if (strncmp(res->cmdStatus, "SELECT ", 7) == 0 ||
@@ -3110,8 +3252,8 @@ PQparamtype(const PGresult *res, int param_num)
 
 
 /* PQsetnonblocking:
- *	sets the PGconn's database connection non-blocking if the arg is TRUE
- *	or makes it blocking if the arg is FALSE, this will not protect
+ *	sets the PGconn's database connection non-blocking if the arg is true
+ *	or makes it blocking if the arg is false, this will not protect
  *	you from PQexec(), you'll only be safe when using the non-blocking API.
  *	Needs to be called only on a connected database connection.
  */
@@ -3123,7 +3265,7 @@ PQsetnonblocking(PGconn *conn, int arg)
 	if (!conn || conn->status == CONNECTION_BAD)
 		return -1;
 
-	barg = (arg ? TRUE : FALSE);
+	barg = (arg ? true : false);
 
 	/* early out if the socket is already in the state requested */
 	if (barg == conn->nonblocking)
@@ -3146,7 +3288,7 @@ PQsetnonblocking(PGconn *conn, int arg)
 
 /*
  * return the blocking status of the database connection
- *		TRUE == nonblocking, FALSE == blocking
+ *		true == nonblocking, false == blocking
  */
 int
 PQisnonblocking(const PGconn *conn)
@@ -3277,7 +3419,7 @@ PQescapeStringInternal(PGconn *conn,
 				*error = 1;
 			if (conn)
 				printfPQExpBuffer(&conn->errorMessage,
-						  libpq_gettext("incomplete multibyte character\n"));
+								  libpq_gettext("incomplete multibyte character\n"));
 			for (; i < len; i++)
 			{
 				if (((size_t) (target - to)) / 2 >= length)
@@ -3361,7 +3503,7 @@ PQescapeInternal(PGconn *conn, const char *str, size_t len, bool as_ident)
 			if ((s - str) + charlen > len || memchr(s, 0, charlen) != NULL)
 			{
 				printfPQExpBuffer(&conn->errorMessage,
-						  libpq_gettext("incomplete multibyte character\n"));
+								  libpq_gettext("incomplete multibyte character\n"));
 				return NULL;
 			}
 

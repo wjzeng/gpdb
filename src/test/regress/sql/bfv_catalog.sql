@@ -3,7 +3,7 @@ set search_path=bfv_catalog;
 
 -- count number of certain operators in a given plan
 -- start_ignore
-create language plpythonu;
+create language plpython3u;
 -- end_ignore
 
 create or replace function count_operator(query text, operator text) returns int as
@@ -17,7 +17,7 @@ for i in range(len(rv)):
         result = result+1
 return result
 $$
-language plpythonu;
+language plpython3u;
 
 --
 -- Testing queries with subqueries with nested scalar functions
@@ -709,3 +709,28 @@ $function$;
 -- Check that it's detoasted correctly when it's sent to the client, in
 -- printtup()
 select prosrc from pg_proc where proname = 'function_with_long_body';
+
+
+--
+-- Check for assertion failure that happened in VACUUM FULL of
+-- pg_stat_last_operation. The VACUUM FULL of reindexing its indexes
+-- inserted an entry to pg_stat_last_operation, but there's an assertion
+-- that you don't try to insert into an index that's currently being
+-- reindexed, or pending reindexing. This no longer happens, because
+-- pg_stat_last_operation now only has one index, so that there is no
+-- pending indexes left for it after indexing the first one.
+--
+
+-- first, delete all existing entries on pg_stat_last_operation, for the
+-- table and its indexes. Otherwise, the update might be a HOT update,
+-- and not touch the indexes.
+set allow_system_table_mods=on;
+delete from pg_stat_last_operation
+  where classid='pg_class'::regclass and objid::regclass::text like 'pg_stat%last%';
+set allow_system_table_mods=off;
+
+-- VACUUM FULL should insert an entry, for building the index after rebuilding
+-- the heap.
+vacuum full pg_stat_last_operation;
+select classid::regclass, objid::regclass, staactionname, stasubtype from pg_stat_last_operation
+  where classid='pg_class'::regclass and objid::regclass::text like 'pg_stat%last%' and stasubtype != 'AUTO';

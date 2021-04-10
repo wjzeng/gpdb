@@ -5,7 +5,7 @@
  *
  *
  * Portions Copyright (c) 2006-2017, Greenplum inc.
- * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
  *
  *
  * IDENTIFICATION
@@ -18,6 +18,7 @@
 
 #include "cdb/memquota.h"
 #include "catalog/pg_resgroup.h"
+#include "utils/session_state.h"
 
 /*
  * The max number of resource groups.
@@ -33,6 +34,20 @@
  * Default value of cpuset
  */
 #define DefaultCpuset "-1"
+
+/*
+ * When setting memory_limit to 0 the group will has no reserved quota, all the
+ * memory need to be acquired from the global shared memory.
+ */
+#define RESGROUP_UNLIMITED_MEMORY_LIMIT		(0)
+
+/*
+ * When setting memory_spill_ratio to 0 the statement_mem will be used to
+ * decide the operator memory, this is called the fallback mode, the benefit is
+ * statement_mem can be set in absolute values such as "128 MB" which is easier
+ * to understand.
+ */
+#define RESGROUP_FALLBACK_MEMORY_SPILL_RATIO		(0)
 
 /*
  * Resource group capability.
@@ -68,18 +83,26 @@ typedef struct ResGroupCaps
 	char			cpuset[MaxCpuSetLength];
 } ResGroupCaps;
 
+/* Set 'cpuset' to an empty string, and reset all other fields to zero */
+#define ClearResGroupCaps(caps) \
+	MemSet((caps), 0, offsetof(ResGroupCaps, cpuset) + 1)
+
+
 /*
  * GUC variables.
  */
 extern bool						gp_log_resgroup_memory;
 extern int						gp_resgroup_memory_policy_auto_fixed_mem;
 extern bool						gp_resgroup_print_operator_memory_limits;
+extern bool						gp_resgroup_debug_wait_queue;
 extern int						memory_spill_ratio;
 
 extern int gp_resource_group_cpu_priority;
 extern double gp_resource_group_cpu_limit;
+extern bool gp_resource_group_cpu_ceiling_enforcement;
 extern double gp_resource_group_memory_limit;
 extern bool gp_resource_group_bypass;
+extern int gp_resource_group_queuing_timeout;
 
 /*
  * Non-GUC global variables.
@@ -142,7 +165,7 @@ extern void DeserializeResGroupInfo(struct ResGroupCaps *capsOut,
 extern bool ShouldAssignResGroupOnMaster(void);
 extern bool ShouldUnassignResGroup(void);
 extern void AssignResGroupOnMaster(void);
-extern void UnassignResGroup(void);
+extern void UnassignResGroup(bool releaseSlot);
 extern void SwitchResGroupOnSegment(const char *buf, int len);
 
 extern bool ResGroupIsAssigned(void);
@@ -163,6 +186,15 @@ extern void ResGroupCreateOnAbort(const ResourceGroupCallbackContext *callbackCt
 extern void ResGroupAlterOnCommit(const ResourceGroupCallbackContext *callbackCtx);
 extern void ResGroupCheckForDrop(Oid groupId, char *name);
 
+/*
+ * Get resource group id of my proc.
+ *
+ * This function is not dead code although there is no consumer in the gpdb
+ * code tree.  Some extensions require this to get the internal resource group
+ * information.
+ */
+extern Oid GetMyResGroupId(void);
+
 extern int32 ResGroupGetVmemLimitChunks(void);
 extern int32 ResGroupGetVmemChunkSizeInBits(void);
 extern int32 ResGroupGetMaxChunksPerQuery(void);
@@ -181,12 +213,20 @@ extern Bitmapset *CpusetToBitset(const char *cpuset,
 extern void BitsetToCpuset(const Bitmapset *bms,
 							char *cpuset,
 							int cpusetSize);
-extern int GetMinCore(const char *bitset, size_t size);
 extern void CpusetUnion(char *cpuset1, const char *cpuset2, int len);
 extern void CpusetDifference(char *cpuset1, const char *cpuset2, int len);
 extern bool CpusetIsEmpty(const char *cpuset);
 extern void SetCpusetEmpty(char *cpuset, int cpusetSize);
 extern bool EnsureCpusetIsAvailable(int elevel);
+extern bool IsGroupInRedZone(void);
+extern void ResGroupGetMemoryRunawayInfo(StringInfo str);
+extern Oid SessionGetResGroupId(SessionState *session);
+extern int32 SessionGetResGroupGlobalShareMemUsage(SessionState *session);
+extern void HandleMoveResourceGroup(void);
+extern void ResGroupMoveQuery(int sessionId, Oid groupId, const char *groupName);
+extern int32 ResGroupGetSessionMemUsage(int sessionId);
+extern int32 ResGroupGetGroupAvailableMem(Oid groupId);
+extern Oid ResGroupGetGroupIdBySessionId(int sessionId);
 
 #define LOG_RESGROUP_DEBUG(...) \
 	do {if (Debug_resource_group) elog(__VA_ARGS__); } while(false);

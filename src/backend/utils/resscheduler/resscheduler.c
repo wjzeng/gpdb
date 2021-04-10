@@ -5,7 +5,7 @@
  *
  *
  * Portions Copyright (c) 2006-2010, Greenplum inc.
- * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
  * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
@@ -17,6 +17,8 @@
 -------------------------------------------------------------------------
  */
 #include "postgres.h"
+
+#include <math.h>
 
 #include "access/genam.h"
 #include "access/heapam.h"
@@ -43,10 +45,10 @@
 #include "utils/guc.h"
 #include "utils/fmgroids.h"
 #include "utils/memutils.h"
+#include "utils/resource_manager.h"
 #include "utils/resscheduler.h"
 #include "utils/syscache.h"
 #include "utils/metrics_utils.h"
-#include "utils/tqual.h"
 
 /*
  * GUC variables.
@@ -231,7 +233,7 @@ InitResQueues(void)
 
 		queueform = (Form_pg_resqueue) GETSTRUCT(tuple);
 
-		queueid = HeapTupleGetOid(tuple);
+		queueid = queueform->oid;
 		queuename = NameStr(queueform->rsqname);
 		thresholds[RES_COUNT_LIMIT] = queueform->rsqcountlimit;
 		thresholds[RES_COST_LIMIT] = queueform->rsqcostlimit;
@@ -281,7 +283,7 @@ ResCreateQueue(Oid queueid, Cost limits[NUM_RES_LIMIT_TYPES], bool overcommit,
 	ResQueue		queue;
 	int				i;
 
-	Assert(LWLockHeldExclusiveByMe(ResQueueLock));
+	Assert(LWLockHeldByMeInMode(ResQueueLock, LW_EXCLUSIVE));
 	
 	/* If the new queue pointer is NULL, then we are out of queues. */
 	if (ResScheduler->num_queues >= MaxResourceQueues)
@@ -292,7 +294,11 @@ ResCreateQueue(Oid queueid, Cost limits[NUM_RES_LIMIT_TYPES], bool overcommit,
 	 */
 	
 	queue = ResQueueHashNew(queueid);
-	Assert(queue != NULL);
+	if (!queue)
+		ereport(ERROR,
+				(errcode(ERRCODE_OUT_OF_MEMORY),
+				 errmsg("out of shared memory"),
+				 errhint("You may need to increase max_resource_queues.")));
 	
 	/* Set queue oid and offset in the scheduler array */
 	queue->queueid = queueid;
@@ -414,7 +420,7 @@ ResAlterQueue(Oid queueid, Cost limits[NUM_RES_LIMIT_TYPES], bool overcommit,
 	}
 
 	/*
-	 * If threshold and overcommit alterations are all ok, do the the changes.
+	 * If threshold and overcommit alterations are all ok, do the changes.
 	 */
 	if (result == ALTERQUEUE_OK)
 	{
@@ -573,6 +579,7 @@ ResLockPortal(Portal portal, QueryDesc *qDesc)
 					break;
 				}
 			}
+			/* fallthrough */
 
 
 			case T_SelectStmt:
@@ -688,8 +695,6 @@ ResLockPortal(Portal portal, QueryDesc *qDesc)
 				 */
 				ResLockWaitCancel();
 		
-				/* Change status to no longer waiting for lock */
-				gpstat_report_waiting(PGBE_WAITING_NONE);
 
 				/* If we had acquired the resource queue lock, release it and clean up */	
 				ResLockRelease(&tag, portal->portalId);
@@ -697,17 +702,6 @@ ResLockPortal(Portal portal, QueryDesc *qDesc)
 				/* GPDB hook for collecting query info */
 				if (query_info_collect_hook)
 					(*query_info_collect_hook)(METRICS_QUERY_ERROR, qDesc);
-
-				/*
-				 * Perfmon related stuff: clean up if we got cancelled
-				 * while waiting.
-				 */
-				if (gp_enable_gpperfmon && qDesc->gpmon_pkt)
-				{			
-					gpmon_qlog_query_error(qDesc->gpmon_pkt);
-					pfree(qDesc->gpmon_pkt);
-					qDesc->gpmon_pkt = NULL;
-				}
 
 				portal->queueId = InvalidOid;
 				portal->portalId = INVALID_PORTALID;
@@ -799,15 +793,11 @@ ResLockUtilityPortal(Portal portal, float4 ignoreCostLimit)
 			 */
 			ResLockWaitCancel();
 
-			/* Change status to no longer waiting for lock */
-			gpstat_report_waiting(PGBE_WAITING_NONE);
-
 			/* If we had acquired the resource queue lock, release it and clean up */
 			ResLockRelease(&tag, portal->portalId);
 
 			/*
-			 * Perfmon related stuff: clean up if we got cancelled
-			 * while waiting.
+			 * Clean up if we got cancelled while waiting.
 			 */
 
 			portal->queueId = InvalidOid;
@@ -955,7 +945,7 @@ GetResQueueIdForName(char	*name)
 
 	tuple = systable_getnext(scan);
 	if (tuple)
-		queueid = HeapTupleGetOid(tuple);
+		queueid = ((Form_pg_resqueue) GETSTRUCT(tuple))->oid;
 	else
 		queueid = InvalidOid;
 
@@ -1077,7 +1067,7 @@ ResHandleUtilityStmt(Portal portal, Node *stmt)
 		&& (!ResourceSelectOnly)
 		&& !superuser())
 	{
-		Assert(!LWLockHeldExclusiveByMe(ResQueueLock));
+		Assert(!LWLockHeldByMeInMode(ResQueueLock, LW_EXCLUSIVE));
 		LWLockAcquire(ResQueueLock, LW_EXCLUSIVE);
 		ResQueue resQueue = ResQueueHashFind(portal->queueId);
 		LWLockRelease(ResQueueLock);

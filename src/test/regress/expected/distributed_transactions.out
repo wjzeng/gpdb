@@ -10,9 +10,6 @@
 -- m/(ERROR|WARNING|CONTEXT|NOTICE):.*The previous session was reset because its gang was disconnected/
 -- s/session id \=\s*\d+/session id \= DUMMY/gm
 --
--- m/NOTICE:  exchanged partition .*/
--- s/pg_temp_\d+/pg_temp_DUMMY/gm
---
 -- end_matchsubs
 --
 --
@@ -99,7 +96,8 @@ SET debug_dtm_action = "fail_begin_command";
 SET debug_dtm_action_target = "protocol";
 SET debug_dtm_action_protocol = "commit_prepared";
 COMMIT;
-WARNING:  the distributed transaction 'Commit Prepared' broadcast failed to one or more segments for gid = 1477546849-0000000071.  Retrying ... try 1
+WARNING:  the distributed transaction 'Commit Prepared' broadcast failed to one or more segments. Retrying ... try 1
+DETAIL:  gid=66802167, state=Retry Commit Prepared
 NOTICE:  Releasing segworker group to retry broadcast.
 SELECT * FROM distxact1_3;
  a  
@@ -137,7 +135,8 @@ SET debug_dtm_action = "fail_begin_command";
 SET debug_dtm_action_target = "protocol";
 SET debug_dtm_action_protocol = "abort_prepared";
 COMMIT;
-WARNING:  the distributed transaction 'Abort Prepared' broadcast failed to one or more segments for gid = 1539036319-0000000288.  Retrying ... try 0
+WARNING:  the distributed transaction broadcast failed to one or more segments
+DETAIL:  gid=66802193, state=Notifying Abort Prepared
 ERROR:  Raise an error as directed by Debug_abort_after_distributed_prepared
 SELECT * FROM distxact1_4;
  a 
@@ -362,12 +361,12 @@ HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sur
 DROP TABLE
 -- Test two phase commit for extended query
 \! ./twophase_pqexecparams dbname=regression
-WARNING:  the distributed transaction 'Commit Prepared' broadcast failed to one or more segments for gid DUMMY
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column named 'i' as the Greenplum Database data distribution key for this table.
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
+WARNING:  the distributed transaction 'Commit Prepared' broadcast failed to one or more segments. Retrying ... try 1
+DETAIL:  gid=66802449, state=Retry Commit Prepared
 NOTICE:  Releasing segworker group to retry broadcast.
-tuple 0: got
- i = (4 bytes) 1
- t = (11 bytes) 'joe's place'
-
+result: INSERT 0 2
 --
 -- Subtransactions with partition table DDLs.
 --
@@ -380,14 +379,9 @@ Create table subt_alter_part_tab_ao1 (
  (partition p1 start(1) end(5),
   partition p2 start(5) end(8),
   partition p3 start(8) end(10));
-NOTICE:  CREATE TABLE will create partition "subt_alter_part_tab_ao1_1_prt_p1" for table "subt_alter_part_tab_ao1"
-NOTICE:  CREATE TABLE will create partition "subt_alter_part_tab_ao1_1_prt_p2" for table "subt_alter_part_tab_ao1"
-NOTICE:  CREATE TABLE will create partition "subt_alter_part_tab_ao1_1_prt_p3" for table "subt_alter_part_tab_ao1"
 Savepoint sp1;
 Alter table subt_alter_part_tab_ao1 add partition p4 start(10) end(14);
-NOTICE:  CREATE TABLE will create partition "subt_alter_part_tab_ao1_1_prt_p4" for table "subt_alter_part_tab_ao1"
 Alter table subt_alter_part_tab_ao1 add default partition def_part;
-NOTICE:  CREATE TABLE will create partition "subt_alter_part_tab_ao1_1_prt_def_part" for table "subt_alter_part_tab_ao1"
 Insert into subt_alter_part_tab_ao1 values(
  generate_series(1,15), 'create table with subtransactions', 's',
  'subtransaction table', '12-11-2012', 3, '2012-10-09 10:23:54',
@@ -415,7 +409,6 @@ select count(*) = 0 as passed from subt_alter_part_tab_ao1
 
 Savepoint sp3; -- child of sp2
 Alter table subt_alter_part_tab_ao1 drop default partition;
-NOTICE:  dropped partition "def_part" for relation "subt_alter_part_tab_ao1"
 release savepoint sp3; -- commit sp3
 Select count(*) from subt_alter_part_tab_ao1;
  count 
@@ -454,10 +447,6 @@ select count(*) > 1 as passed from subt_alter_part_tab_ao1
 
 Alter table subt_alter_part_tab_ao1 split partition p4 at (13) into
  (partition splita,partition splitb);
-NOTICE:  exchanged partition "p4" of relation "subt_alter_part_tab_ao1" with relation "pg_temp_DUMMY"
-NOTICE:  dropped partition "p4" for relation "subt_alter_part_tab_ao1"
-NOTICE:  CREATE TABLE will create partition "subt_alter_part_tab_ao1_1_prt_splita" for table "subt_alter_part_tab_ao1"
-NOTICE:  CREATE TABLE will create partition "subt_alter_part_tab_ao1_1_prt_splitb" for table "subt_alter_part_tab_ao1"
 select count(*) from subt_alter_part_tab_ao1;
  count 
 -------
@@ -809,3 +798,74 @@ reindex table pg_class;
 ERROR:  REINDEX of a catalog table cannot run inside a transaction block
 commit;
 \c regression
+--
+-- Check that committing a subtransaction releases the lock on the
+-- subtransaction's XID.
+--
+-- It's not too bad if it doesn't, because if anyone wants to wait for the
+-- subtransaction and sees that it's been committed already, they will wait
+-- for the top transaction XID instead. So even though the lock on the sub-XID
+-- is released at RELEASE SAVEPOINT, logically it's held until the end of
+-- the top transaction anyway. But releasing the lock early saves space in
+-- the lock table. (We had a silly bug once upon a time in GPDB where we failed
+-- to release the lock.)
+--
+BEGIN;
+CREATE TEMPORARY TABLE foo (i integer);
+DO $$
+declare
+  i int;
+begin
+  for i in 1..100 loop
+    begin
+      insert into foo values (i);
+    exception
+      when others then raise 'got error';
+    end;
+  end loop;
+end;
+$$;
+SELECT CASE WHEN count(*) < 50 THEN 'not many XID locks'
+            ELSE 'lots of XID locks: ' || count(*) END
+FROM pg_locks WHERE locktype='transactionid';
+        case        
+--------------------
+ not many XID locks
+(1 row)
+
+ROLLBACK;
+-- Test that exported snapshots are cleared upon abort.  In Greenplum,
+-- exported snapshots are cleared earlier than PostgreSQL during
+-- abort.
+begin;
+select count(1) = 1 from pg_catalog.pg_export_snapshot();
+ ?column? 
+----------
+ t
+(1 row)
+
+select pg_cancel_backend(pg_backend_pid());
+ERROR:  canceling statement due to user request
+rollback;
+-- Test a bug that a two-phase subtransaction is considered as one-phase.
+set optimizer = off; -- orca optimizes value scan so the output is different between orca and postgres optimizer.
+truncate distxact1_4;
+set test_print_direct_dispatch_info = true;
+begin;
+savepoint sp1;
+insert into distxact1_4 values (2),(1);
+INFO:  (slice 0) Dispatch command to ALL contents: 0 1 2
+INFO:  (slice 1) Dispatch command to SINGLE content
+release sp1;
+end;
+INFO:  Distributed transaction command 'Distributed Prepare' to ALL contents: 0 1 2
+INFO:  Distributed transaction command 'Distributed Commit Prepared' to ALL contents: 0 1 2
+reset test_print_direct_dispatch_info;
+reset optimizer;
+select count(gp_segment_id) from distxact1_4 group by gp_segment_id; -- sanity check: tuples should be in > 1 segments
+ count 
+-------
+     1
+     1
+(2 rows)
+

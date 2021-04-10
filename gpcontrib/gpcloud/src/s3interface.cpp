@@ -31,6 +31,7 @@ S3InterfaceService::~S3InterfaceService() {
 
 Response S3InterfaceService::getResponseWithRetries(const string &url, HTTPHeaders &headers,
                                                     uint64_t retries) {
+    string code;
     string message;
     uint64_t retry = retries;
 
@@ -43,6 +44,14 @@ Response S3InterfaceService::getResponseWithRetries(const string &url, HTTPHeade
                 S3_DIE(S3QueryAbort, "Downloading is interrupted");
             }
             S3WARN("Failed to get a good response in GET from '%s', retrying ...", url.c_str());
+        } catch (S3LogicError &e) {
+            code = e.getCode();
+            if (code == "NoSuchKey") {
+                sleep(1);
+                continue;
+            } else {
+                throw e;
+            }
         }
     };
 
@@ -344,6 +353,11 @@ uint64_t S3InterfaceService::fetchData(uint64_t offset, S3VectorUInt8 &data, uin
 }
 
 S3CompressionType S3InterfaceService::checkCompressionType(const S3Url &s3Url) {
+    string ext = s3Url.getExtension();
+    if (ext == ".deflate") {
+        return S3_COMPRESSION_DEFLATE;
+    }
+
     HTTPHeaders headers;
 
     char rangeBuf[S3_RANGE_HEADER_STRING_LEN] = {0};

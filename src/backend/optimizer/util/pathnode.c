@@ -4,8 +4,8 @@
  *	  Routines to manipulate pathlists and create path nodes
  *
  * Portions Copyright (c) 2005-2008, Greenplum inc
- * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -18,27 +18,36 @@
 
 #include <math.h>
 
-#include "catalog/pg_operator.h"
-#include "catalog/pg_proc.h"
-#include "executor/executor.h"
-#include "executor/nodeHash.h"
-#include "foreign/fdwapi.h"
 #include "miscadmin.h"
+#include "foreign/fdwapi.h"
+#include "nodes/extensible.h"
 #include "nodes/nodeFuncs.h"
+#include "optimizer/appendinfo.h"
 #include "optimizer/clauses.h"
 #include "optimizer/cost.h"
+#include "optimizer/optimizer.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
+#include "optimizer/planmain.h"
+#include "optimizer/prep.h"
 #include "optimizer/restrictinfo.h"
 #include "optimizer/tlist.h"
 #include "parser/parsetree.h"
+#include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/selfuncs.h"
-#include "utils/lsyscache.h"
-#include "utils/selfuncs.h"
+#include "optimizer/tlist.h"
 
+#include "catalog/pg_operator.h"
+#include "catalog/pg_proc.h"
+#include "cdb/cdbhash.h"        /* cdb_default_distribution_opfamily_for_type() */
+#include "cdb/cdbmutate.h"
 #include "cdb/cdbpath.h"        /* cdb_create_motion_path() etc */
+#include "cdb/cdbpathlocus.h"
 #include "cdb/cdbutil.h"		/* getgpsegmentCount() */
+#include "cdb/cdbvars.h"
+#include "executor/nodeHash.h"
+#include "utils/guc.h"
 
 typedef enum
 {
@@ -48,183 +57,26 @@ typedef enum
 	COSTS_DIFFERENT				/* neither path dominates the other on cost */
 } PathCostComparison;
 
+/*
+ * STD_FUZZ_FACTOR is the normal fuzz factor for compare_path_costs_fuzzily.
+ * XXX is it worth making this user-controllable?  It provides a tradeoff
+ * between planner runtime and the accuracy of path cost comparisons.
+ */
+#define STD_FUZZ_FACTOR 1.01
+
 static List *translate_sub_tlist(List *tlist, int relid);
-static bool query_is_distinct_for(Query *query, List *colnos, List *opids);
-static Oid	distinct_col_search(int colno, List *colnos, List *opids);
+static int	append_total_cost_compare(const void *a, const void *b);
+static int	append_startup_cost_compare(const void *a, const void *b);
+static List *reparameterize_pathlist_by_child(PlannerInfo *root,
+											  List *pathlist,
+											  RelOptInfo *child_rel);
 
 static void set_append_path_locus(PlannerInfo *root, Path *pathnode, RelOptInfo *rel,
 					  List *pathkeys);
-
-static CdbVisitOpt pathnode_walk_list(List *pathlist,
-				   CdbVisitOpt (*walker)(Path *path, void *context),
-				   void *context);
-static CdbVisitOpt pathnode_walk_kids(Path *path,
-				   CdbVisitOpt (*walker)(Path *path, void *context),
-				   void *context);
-
-/*
- * pathnode_walk_node
- *    Calls a 'walker' function for the given Path node; or returns
- *    CdbVisit_Walk if 'path' is NULL.
- *
- *    If 'walker' returns CdbVisit_Walk, then this function calls
- *    pathnode_walk_kids() to visit the node's children, and returns
- *    the result.
- *
- *    If 'walker' returns CdbVisit_Skip, then this function immediately
- *    returns CdbVisit_Walk and does not visit the node's children.
- *
- *    If 'walker' returns CdbVisit_Stop or another value, then this function
- *    immediately returns that value and does not visit the node's children.
- *
- * pathnode_walk_list
- *    Calls pathnode_walk_node() for each Path node in the given List.
- *
- *    Quits if the result of pathnode_walk_node() is CdbVisit_Stop or another
- *    value other than CdbVisit_Walk, and returns that result without visiting
- *    any more nodes.
- *
- *    Returns CdbVisit_Walk if all of the subtrees return CdbVisit_Walk, or
- *    if the list is empty.
- *
- *    Note that this function never returns CdbVisit_Skip to its caller.
- *    Only the 'walker' can return CdbVisit_Skip.
- *
- * pathnode_walk_kids
- *    Calls pathnode_walk_node() for each child of the given Path node.
- *
- *    Quits if the result of pathnode_walk_node() is CdbVisit_Stop or another
- *    value other than CdbVisit_Walk, and returns that result without visiting
- *    any more nodes.
- *
- *    Returns CdbVisit_Walk if all of the children return CdbVisit_Walk, or
- *    if there are no children.
- *
- *    Note that this function never returns CdbVisit_Skip to its caller.
- *    Only the 'walker' can return CdbVisit_Skip.
- *
- * NB: All CdbVisitOpt values other than CdbVisit_Walk or CdbVisit_Skip are
- * treated as equivalent to CdbVisit_Stop.  Thus the walker can break out
- * of a traversal and at the same time return a smidgen of information to the
- * caller, perhaps to indicate the reason for termination.  For convenience,
- * a couple of alternative stopping codes are predefined for walkers to use at
- * their discretion: CdbVisit_Failure and CdbVisit_Success.
- */
-CdbVisitOpt
-pathnode_walk_node(Path            *path,
-			       CdbVisitOpt    (*walker)(Path *path, void *context),
-			       void            *context)
-{
-	CdbVisitOpt whatnext;
-
-	if (path == NULL)
-		whatnext = CdbVisit_Walk;
-	else
-	{
-		whatnext = walker(path, context);
-		if (whatnext == CdbVisit_Walk)
-			whatnext = pathnode_walk_kids(path, walker, context);
-		else if (whatnext == CdbVisit_Skip)
-			whatnext = CdbVisit_Walk;
-	}
-	Assert(whatnext != CdbVisit_Skip);
-	return whatnext;
-}	                            /* pathnode_walk_node */
-
-static CdbVisitOpt
-pathnode_walk_list(List            *pathlist,
-			       CdbVisitOpt    (*walker)(Path *path, void *context),
-			       void            *context)
-{
-	ListCell   *cell;
-	Path	   *path;
-	CdbVisitOpt v = CdbVisit_Walk;
-
-	foreach(cell, pathlist)
-	{
-		path = (Path *)lfirst(cell);
-		v = pathnode_walk_node(path, walker, context);
-		if (v != CdbVisit_Walk) /* stop */
-			break;
-	}
-	return v;
-}	                            /* pathnode_walk_list */
-
-static CdbVisitOpt
-pathnode_walk_kids(Path            *path,
-			       CdbVisitOpt    (*walker)(Path *path, void *context),
-			       void            *context)
-{
-	CdbVisitOpt v;
-
-	Assert(path != NULL);
-
-	switch (path->pathtype)
-	{
-		case T_SeqScan:
-		case T_ExternalScan:
-		case T_ForeignScan:
-		case T_IndexScan:
-		case T_IndexOnlyScan:
-		case T_TidScan:
-		case T_SubqueryScan:
-		case T_FunctionScan:
-		case T_ValuesScan:
-		case T_CteScan:
-		case T_WorkTableScan:
-		case T_TableFunctionScan:
-		case T_Result:
-			return CdbVisit_Walk;
-		case T_BitmapHeapScan:
-			v = pathnode_walk_node(((BitmapHeapPath *)path)->bitmapqual, walker, context);
-			break;
-		case T_BitmapAppendOnlyScan:
-			v = pathnode_walk_node(((BitmapAppendOnlyPath *)path)->bitmapqual, walker, context);
-			break;
-		case T_BitmapAnd:
-			v = pathnode_walk_list(((BitmapAndPath *)path)->bitmapquals, walker, context);
-			break;
-		case T_BitmapOr:
-			v = pathnode_walk_list(((BitmapOrPath *)path)->bitmapquals, walker, context);
-			break;
-		case T_HashJoin:
-		case T_MergeJoin:
-			v = pathnode_walk_node(((JoinPath *)path)->outerjoinpath, walker, context);
-			if (v != CdbVisit_Walk)     /* stop */
-				break;
-			v = pathnode_walk_node(((JoinPath *)path)->innerjoinpath, walker, context);
-			break;
-		case T_NestLoop:
-			{
-				NestPath   *nestpath = (NestPath *)path;
-
-				v = pathnode_walk_node(nestpath->outerjoinpath, walker, context);
-				if (v != CdbVisit_Walk)     /* stop */
-					break;
-				v = pathnode_walk_node(nestpath->innerjoinpath, walker, context);
-				if (v != CdbVisit_Walk)     /* stop */
-					break;
-			}
-			break;
-		case T_Append:
-			v = pathnode_walk_list(((AppendPath *)path)->subpaths, walker, context);
-			break;
-		case T_Material:
-			v = pathnode_walk_node(((MaterialPath *)path)->subpath, walker, context);
-			break;
-		case T_Unique:
-			v = pathnode_walk_node(((UniquePath *)path)->subpath, walker, context);
-			break;
-		case T_Motion:
-			v = pathnode_walk_node(((CdbMotionPath *)path)->subpath, walker, context);
-			break;
-		default:
-			v = CdbVisit_Walk;  /* keep compiler quiet */
-			elog(ERROR, "unrecognized path type: %d", (int)path->pathtype);
-	}
-	return v;
-}	                            /* pathnode_walk_kids */
-
+static CdbPathLocus
+adjust_modifytable_subpaths(PlannerInfo *root, CmdType operation,
+							List *resultRelations, List *subpaths,
+							List *is_split_updates);
 
 /*****************************************************************************
  *		MISC. PATH UTILITIES
@@ -323,19 +175,19 @@ compare_fractional_path_costs(Path *path1, Path *path2,
  * total cost, we just say that their costs are "different", since neither
  * dominates the other across the whole performance spectrum.
  *
- * If consider_startup is false, then we don't care about keeping paths with
- * good startup cost, so we'll never return COSTS_DIFFERENT.
- *
- * This function also includes special hacks to support a policy enforced
- * by its sole caller, add_path(): paths that have any parameterization
- * cannot win comparisons on the grounds of having cheaper startup cost,
- * since we deem only total cost to be of interest for a parameterized path.
- * (Unparameterized paths are more common, so we check for this case last.)
+ * This function also enforces a policy rule that paths for which the relevant
+ * one of parent->consider_startup and parent->consider_param_startup is false
+ * cannot survive comparisons solely on the grounds of good startup cost, so
+ * we never return COSTS_DIFFERENT when that is true for the total-cost loser.
+ * (But if total costs are fuzzily equal, we compare startup costs anyway,
+ * in hopes of eliminating one path or the other.)
  */
 static PathCostComparison
-compare_path_costs_fuzzily(Path *path1, Path *path2, double fuzz_factor,
-						   bool consider_startup)
+compare_path_costs_fuzzily(Path *path1, Path *path2, double fuzz_factor)
 {
+#define CONSIDER_PATH_STARTUP_COST(p)  \
+	((p)->param_info == NULL ? (p)->parent->consider_startup : (p)->parent->consider_param_startup)
+
 	/*
 	 * Check total cost first since it's more likely to be different; many
 	 * paths have zero startup cost.
@@ -343,9 +195,8 @@ compare_path_costs_fuzzily(Path *path1, Path *path2, double fuzz_factor,
 	if (path1->total_cost > path2->total_cost * fuzz_factor)
 	{
 		/* path1 fuzzily worse on total cost */
-		if (consider_startup &&
-			path2->startup_cost > path1->startup_cost * fuzz_factor &&
-			path1->param_info == NULL)
+		if (CONSIDER_PATH_STARTUP_COST(path1) &&
+			path2->startup_cost > path1->startup_cost * fuzz_factor)
 		{
 			/* ... but path2 fuzzily worse on startup, so DIFFERENT */
 			return COSTS_DIFFERENT;
@@ -356,9 +207,8 @@ compare_path_costs_fuzzily(Path *path1, Path *path2, double fuzz_factor,
 	if (path2->total_cost > path1->total_cost * fuzz_factor)
 	{
 		/* path2 fuzzily worse on total cost */
-		if (consider_startup &&
-			path1->startup_cost > path2->startup_cost * fuzz_factor &&
-			path2->param_info == NULL)
+		if (CONSIDER_PATH_STARTUP_COST(path2) &&
+			path1->startup_cost > path2->startup_cost * fuzz_factor)
 		{
 			/* ... but path1 fuzzily worse on startup, so DIFFERENT */
 			return COSTS_DIFFERENT;
@@ -366,22 +216,21 @@ compare_path_costs_fuzzily(Path *path1, Path *path2, double fuzz_factor,
 		/* else path1 dominates */
 		return COSTS_BETTER1;
 	}
-	/* fuzzily the same on total cost */
-	/* (so we may as well compare startup cost, even if !consider_startup) */
-	if (path1->startup_cost > path2->startup_cost * fuzz_factor &&
-		path2->param_info == NULL)
+	/* fuzzily the same on total cost ... */
+	if (path1->startup_cost > path2->startup_cost * fuzz_factor)
 	{
 		/* ... but path1 fuzzily worse on startup, so path2 wins */
 		return COSTS_BETTER2;
 	}
-	if (path2->startup_cost > path1->startup_cost * fuzz_factor &&
-		path1->param_info == NULL)
+	if (path2->startup_cost > path1->startup_cost * fuzz_factor)
 	{
 		/* ... but path2 fuzzily worse on startup, so path1 wins */
 		return COSTS_BETTER1;
 	}
 	/* fuzzily the same on both costs */
 	return COSTS_EQUAL;
+
+#undef CONSIDER_PATH_STARTUP_COST
 }
 
 /*
@@ -397,11 +246,16 @@ compare_path_costs_fuzzily(Path *path1, Path *path2, double fuzz_factor,
  *
  * The cheapest_parameterized_paths list collects all parameterized paths
  * that have survived the add_path() tournament for this relation.  (Since
- * add_path ignores pathkeys and startup cost for a parameterized path,
- * these will be paths that have best total cost or best row count for their
- * parameterization.)  cheapest_parameterized_paths always includes the
- * cheapest-total unparameterized path, too, if there is one; the users of
- * that list find it more convenient if that's included.
+ * add_path ignores pathkeys for a parameterized path, these will be paths
+ * that have best cost or best row count for their parameterization.  We
+ * may also have both a parallel-safe and a non-parallel-safe path in some
+ * cases for the same parameterization in some cases, but this should be
+ * relatively rare since, most typically, all paths for the same relation
+ * will be parallel-safe or none of them will.)
+ *
+ * cheapest_parameterized_paths always includes the cheapest-total
+ * unparameterized path, too, if there is one; the users of that list find
+ * it more convenient if that's included.
  *
  * This is normally called only after we've finished constructing the path
  * list for the rel node.
@@ -533,11 +387,12 @@ set_cheapest(RelOptInfo *parent_rel)
  *	  A path is worthy if it has a better sort order (better pathkeys) or
  *	  cheaper cost (on either dimension), or generates fewer rows, than any
  *	  existing path that has the same or superset parameterization rels.
+ *	  We also consider parallel-safe paths more worthy than others.
  *
  *	  We also remove from the rel's pathlist any old paths that are dominated
  *	  by new_path --- that is, new_path is cheaper, at least as well ordered,
- *	  generates no more rows, and requires no outer rels not required by the
- *	  old path.
+ *	  generates no more rows, requires no outer rels not required by the old
+ *	  path, and is no less parallel-safe.
  *
  *	  In most cases, a path with a superset parameterization will generate
  *	  fewer rows (since it has more join clauses to apply), so that those two
@@ -546,14 +401,15 @@ set_cheapest(RelOptInfo *parent_rel)
  *	  cases do arise, so we make the full set of checks anyway.
  *
  *	  There are two policy decisions embedded in this function, along with
- *	  its sibling add_path_precheck: we treat all parameterized paths as
- *	  having NIL pathkeys, and we ignore their startup costs, so that they
- *	  compete only on parameterization, total cost and rowcount.  This is to
- *	  reduce the number of parameterized paths that are kept.  See discussion
- *	  in src/backend/optimizer/README.
+ *	  its sibling add_path_precheck.  First, we treat all parameterized paths
+ *	  as having NIL pathkeys, so that they cannot win comparisons on the
+ *	  basis of sort order.  This is to reduce the number of parameterized
+ *	  paths that are kept; see discussion in src/backend/optimizer/README.
  *
- *	  Another policy that is enforced here is that we only consider cheap
- *	  startup cost to be interesting if parent_rel->consider_startup is true.
+ *	  Second, we only consider cheap startup cost to be interesting if
+ *	  parent_rel->consider_startup is true for an unparameterized path, or
+ *	  parent_rel->consider_param_startup is true for a parameterized one.
+ *	  Again, this allows discarding useless paths sooner.
  *
  *	  The pathlist is kept sorted by total_cost, with cheaper paths
  *	  at the front.  Within this routine, that's simply a speed hack:
@@ -574,8 +430,14 @@ set_cheapest(RelOptInfo *parent_rel)
  *	  to add_path() must not be shared as a subpath of any other Path of the
  *	  same join level.
  *
- *	  BUT: we do not pfree IndexPath objects, since they may be referenced as
- *	  children of BitmapHeapPaths as well as being paths in their own right.
+ *	  As noted in optimizer/README, deleting a previously-accepted Path is
+ *	  safe because we know that Paths of this rel cannot yet be referenced
+ *	  from any other rel, such as a higher-level join.  However, in some cases
+ *	  it is possible that a Path is referenced by another Path for its own
+ *	  rel; we must not delete such a Path, even if it is dominated by the new
+ *	  Path.  Currently this occurs only for IndexPath objects, which may be
+ *	  referenced as children of BitmapHeapPaths as well as being paths in
+ *	  their own right.  Hence, we don't pfree IndexPaths when rejecting them.
  *
  * 'parent_rel' is the relation entry to which the path corresponds.
  * 'new_path' is a potential path for parent_rel.
@@ -585,7 +447,7 @@ set_cheapest(RelOptInfo *parent_rel)
 void
 add_path(RelOptInfo *parent_rel, Path *new_path)
 {
-	bool		accept_new = true;		/* unless we find a superior old path */
+	bool		accept_new = true;	/* unless we find a superior old path */
 	ListCell   *insert_after = NULL;	/* where to insert new item */
 	List	   *new_path_pathkeys;
 	ListCell   *p1;
@@ -601,6 +463,13 @@ add_path(RelOptInfo *parent_rel, Path *new_path)
 	if (!new_path)
 		return;
 
+	/*
+	 * GPDB: Check that the correct locus has been determined for the Path.
+	 * This can easily be missing from upstream code that construct Paths
+	 * that haven't been modified in GPDB to set the locus correctly.
+	 */
+	if (!CdbLocusType_IsValid(new_path->locus.locustype))
+		elog(ERROR, "path of type %u is missing distribution locus", new_path->pathtype);
 	Assert(cdbpathlocus_is_valid(new_path->locus));
 
 	/* Pretend parameterized paths have no pathkeys, per comment above */
@@ -626,11 +495,10 @@ add_path(RelOptInfo *parent_rel, Path *new_path)
 		p1_next = lnext(p1);
 
 		/*
-		 * Do a fuzzy cost comparison with 1% fuzziness limit.  (XXX does this
-		 * percentage need to be user-configurable?)
+		 * Do a fuzzy cost comparison with standard fuzziness limit.
 		 */
-		costcmp = compare_path_costs_fuzzily(new_path, old_path, 1.01,
-											 parent_rel->consider_startup);
+		costcmp = compare_path_costs_fuzzily(new_path, old_path,
+											 STD_FUZZ_FACTOR);
 
 		/*
 		 * If the two paths compare differently for startup and total cost,
@@ -651,26 +519,58 @@ add_path(RelOptInfo *parent_rel, Path *new_path)
 			old_path_pathkeys = old_path->param_info ? NIL : old_path->pathkeys;
 			keyscmp = compare_pathkeys(new_path_pathkeys,
 									   old_path_pathkeys);
+
+			/*
+			 * GPDB: If the new path has different locus than the other path,
+			 * keep it, like we keep paths with different pathkeys. We can
+			 * avoid the (Gather) Motion at the top of the plan, if we choose
+			 * a plan that produces the result at the right locus to begin
+			 * with. In particular, if it's a two-stage aggregate plan, it might
+			 * be cheaper to perform the Finalize Aggregate stage in the QD than
+			 * redistribute it to all segments, if that avoids a Gather Motion
+			 * at the top.
+			 *
+			 * Only do this for the "upper rels". The join planning code hasn't
+			 * been updated to consider plans with multiple loci. Keeping extra
+			 * paths might be a win, but it might also lead to erratic behavior.
+			 * For example, a Hash Join only considers the cheapest input paths,
+			 * but a Merge Join would consider all paths with sorted input. A
+			 * path with a suitable locus migh therefore win with a Merge Join
+			 * but not even be considered a Hash Join, even though the Hash Join
+			 * path would be cheaper.
+			 *
+			 * Parts of the upper planner functions could have similar issues,
+			 * but it seems more limited in scope.
+			 */
+			if (keyscmp != PATHKEYS_DIFFERENT &&
+				parent_rel->reloptkind == RELOPT_UPPER_REL &&
+				!cdbpathlocus_equal(new_path->locus, old_path->locus))
+			{
+				keyscmp = PATHKEYS_DIFFERENT;
+			}
+
 			if (keyscmp != PATHKEYS_DIFFERENT)
 			{
 				switch (costcmp)
 				{
 					case COSTS_EQUAL:
 						outercmp = bms_subset_compare(PATH_REQ_OUTER(new_path),
-												   PATH_REQ_OUTER(old_path));
+													  PATH_REQ_OUTER(old_path));
 						if (keyscmp == PATHKEYS_BETTER1)
 						{
 							if ((outercmp == BMS_EQUAL ||
 								 outercmp == BMS_SUBSET1) &&
-								new_path->rows <= old_path->rows)
-								remove_old = true;		/* new dominates old */
+								new_path->rows <= old_path->rows &&
+								new_path->parallel_safe >= old_path->parallel_safe)
+								remove_old = true;	/* new dominates old */
 						}
 						else if (keyscmp == PATHKEYS_BETTER2)
 						{
 							if ((outercmp == BMS_EQUAL ||
 								 outercmp == BMS_SUBSET2) &&
-								new_path->rows >= old_path->rows)
-								accept_new = false;		/* old dominates new */
+								new_path->rows >= old_path->rows &&
+								new_path->parallel_safe <= old_path->parallel_safe)
+								accept_new = false; /* old dominates new */
 						}
 						else	/* keyscmp == PATHKEYS_EQUAL */
 						{
@@ -679,37 +579,44 @@ add_path(RelOptInfo *parent_rel, Path *new_path)
 								/*
 								 * Same pathkeys and outer rels, and fuzzily
 								 * the same cost, so keep just one; to decide
-								 * which, first check rows and then do a fuzzy
-								 * cost comparison with very small fuzz limit.
-								 * (We used to do an exact cost comparison,
-								 * but that results in annoying
-								 * platform-specific plan variations due to
-								 * roundoff in the cost estimates.)  If things
-								 * are still tied, arbitrarily keep only the
-								 * old path.  Notice that we will keep only
-								 * the old path even if the less-fuzzy
-								 * comparison decides the startup and total
-								 * costs compare differently.
+								 * which, first check parallel-safety, then
+								 * rows, then do a fuzzy cost comparison with
+								 * very small fuzz limit.  (We used to do an
+								 * exact cost comparison, but that results in
+								 * annoying platform-specific plan variations
+								 * due to roundoff in the cost estimates.)	If
+								 * things are still tied, arbitrarily keep
+								 * only the old path.  Notice that we will
+								 * keep only the old path even if the
+								 * less-fuzzy comparison decides the startup
+								 * and total costs compare differently.
 								 */
-								if (new_path->rows < old_path->rows)
+								if (new_path->parallel_safe >
+									old_path->parallel_safe)
+									remove_old = true;	/* new dominates old */
+								else if (new_path->parallel_safe <
+										 old_path->parallel_safe)
+									accept_new = false; /* old dominates new */
+								else if (new_path->rows < old_path->rows)
 									remove_old = true;	/* new dominates old */
 								else if (new_path->rows > old_path->rows)
 									accept_new = false; /* old dominates new */
 								else if (compare_path_costs_fuzzily(new_path,
 																	old_path,
-																1.0000000001,
-																	parent_rel->consider_startup) == COSTS_BETTER1)
+																	1.0000000001) == COSTS_BETTER1)
 									remove_old = true;	/* new dominates old */
 								else
 									accept_new = false; /* old equals or
 														 * dominates new */
 							}
 							else if (outercmp == BMS_SUBSET1 &&
-									 new_path->rows <= old_path->rows)
-								remove_old = true;		/* new dominates old */
+									 new_path->rows <= old_path->rows &&
+									 new_path->parallel_safe >= old_path->parallel_safe)
+								remove_old = true;	/* new dominates old */
 							else if (outercmp == BMS_SUBSET2 &&
-									 new_path->rows >= old_path->rows)
-								accept_new = false;		/* old dominates new */
+									 new_path->rows >= old_path->rows &&
+									 new_path->parallel_safe <= old_path->parallel_safe)
+								accept_new = false; /* old dominates new */
 							/* else different parameterizations, keep both */
 						}
 						break;
@@ -717,22 +624,24 @@ add_path(RelOptInfo *parent_rel, Path *new_path)
 						if (keyscmp != PATHKEYS_BETTER2)
 						{
 							outercmp = bms_subset_compare(PATH_REQ_OUTER(new_path),
-												   PATH_REQ_OUTER(old_path));
+														  PATH_REQ_OUTER(old_path));
 							if ((outercmp == BMS_EQUAL ||
 								 outercmp == BMS_SUBSET1) &&
-								new_path->rows <= old_path->rows)
-								remove_old = true;		/* new dominates old */
+								new_path->rows <= old_path->rows &&
+								new_path->parallel_safe >= old_path->parallel_safe)
+								remove_old = true;	/* new dominates old */
 						}
 						break;
 					case COSTS_BETTER2:
 						if (keyscmp != PATHKEYS_BETTER1)
 						{
 							outercmp = bms_subset_compare(PATH_REQ_OUTER(new_path),
-												   PATH_REQ_OUTER(old_path));
+														  PATH_REQ_OUTER(old_path));
 							if ((outercmp == BMS_EQUAL ||
 								 outercmp == BMS_SUBSET2) &&
-								new_path->rows >= old_path->rows)
-								accept_new = false;		/* old dominates new */
+								new_path->rows >= old_path->rows &&
+								new_path->parallel_safe <= old_path->parallel_safe)
+								accept_new = false; /* old dominates new */
 						}
 						break;
 					case COSTS_DIFFERENT:
@@ -795,63 +704,6 @@ add_path(RelOptInfo *parent_rel, Path *new_path)
 	}
 }                               /* add_path */
 
-
-/*
- * Wrapper around add_path(), for join paths.
- *
- * If the join was originally a semi-join, that's been implemented as an
- * inner-join, followed by removing duplicates, adds the UniquePath on
- * top of the join. Otherwise, just passes through the Path to add_path().
- */
-void
-cdb_add_join_path(PlannerInfo *root, RelOptInfo *parent_rel, JoinType orig_jointype,
-				  Relids required_outer, JoinPath *new_path)
-{
-	Path	   *path = (Path *) new_path;
-
-	if (!new_path)
-		return;
-
-	if (orig_jointype == JOIN_DEDUP_SEMI)
-	{
-		Assert(new_path->jointype == JOIN_INNER);
-
-		/*
-		 * Skip rowid unique path if distinct rels are replicated tables
-		 * The reason is ctid + gp_segment_id can not identify a logical
-		 * row of replicated table.
-		 *
-		 * TODO: add a motion on top of segmentGeneral node to support
-		 * rowid unique.
-		 */
-		if (CdbPathLocus_IsPartitioned(path->locus) &&
-		    CdbPathLocus_IsSegmentGeneral(((JoinPath *)path)->outerjoinpath->locus))
-			return;
-
-		path = (Path *) create_unique_rowid_path(root,
-												 parent_rel,
-												 (Path *) new_path,
-												 new_path->outerjoinpath->parent->relids,
-												 required_outer);
-	}
-	else if (orig_jointype == JOIN_DEDUP_SEMI_REVERSE)
-	{
-		Assert(new_path->jointype == JOIN_INNER);
-
-		if (CdbPathLocus_IsPartitioned(path->locus) &&
-		    CdbPathLocus_IsSegmentGeneral(((JoinPath *)path)->innerjoinpath->locus))
-			return;
-
-		path = (Path *) create_unique_rowid_path(root,
-												 parent_rel,
-												 (Path *) new_path,
-												 new_path->innerjoinpath->parent->relids,
-												 required_outer);
-	}
-
-	add_path(parent_rel, path);
-}
-
 /*
  * add_path_precheck
  *	  Check whether a proposed new path could possibly get accepted.
@@ -875,10 +727,14 @@ add_path_precheck(RelOptInfo *parent_rel,
 				  List *pathkeys, Relids required_outer)
 {
 	List	   *new_path_pathkeys;
+	bool		consider_startup;
 	ListCell   *p1;
 
 	/* Pretend parameterized paths have no pathkeys, per add_path policy */
 	new_path_pathkeys = required_outer ? NIL : pathkeys;
+
+	/* Decide whether new path's startup cost is interesting */
+	consider_startup = required_outer ? parent_rel->consider_param_startup : parent_rel->consider_startup;
 
 	foreach(p1, parent_rel->pathlist)
 	{
@@ -891,16 +747,15 @@ add_path_precheck(RelOptInfo *parent_rel,
 		 * pathkeys as well as both cost metrics.  If we find one, we can
 		 * reject the new path.
 		 *
-		 * For speed, we make exact rather than fuzzy cost comparisons. If an
-		 * old path dominates the new path exactly on both costs, it will
-		 * surely do so fuzzily.
+		 * Cost comparisons here should match compare_path_costs_fuzzily.
 		 */
-		if (total_cost >= old_path->total_cost)
+		if (total_cost > old_path->total_cost * STD_FUZZ_FACTOR)
 		{
-			/* can win on startup cost only if unparameterized */
-			if (startup_cost >= old_path->startup_cost || required_outer)
+			/* new path can win on startup cost only if consider_startup */
+			if (startup_cost > old_path->startup_cost * STD_FUZZ_FACTOR ||
+				!consider_startup)
 			{
-				/* new path does not win on cost, so check pathkeys... */
+				/* new path loses on cost, so check pathkeys... */
 				List	   *old_path_pathkeys;
 
 				old_path_pathkeys = old_path->param_info ? NIL : old_path->pathkeys;
@@ -932,6 +787,227 @@ add_path_precheck(RelOptInfo *parent_rel,
 	return true;
 }
 
+/*
+ * add_partial_path
+ *	  Like add_path, our goal here is to consider whether a path is worthy
+ *	  of being kept around, but the considerations here are a bit different.
+ *	  A partial path is one which can be executed in any number of workers in
+ *	  parallel such that each worker will generate a subset of the path's
+ *	  overall result.
+ *
+ *	  As in add_path, the partial_pathlist is kept sorted with the cheapest
+ *	  total path in front.  This is depended on by multiple places, which
+ *	  just take the front entry as the cheapest path without searching.
+ *
+ *	  We don't generate parameterized partial paths for several reasons.  Most
+ *	  importantly, they're not safe to execute, because there's nothing to
+ *	  make sure that a parallel scan within the parameterized portion of the
+ *	  plan is running with the same value in every worker at the same time.
+ *	  Fortunately, it seems unlikely to be worthwhile anyway, because having
+ *	  each worker scan the entire outer relation and a subset of the inner
+ *	  relation will generally be a terrible plan.  The inner (parameterized)
+ *	  side of the plan will be small anyway.  There could be rare cases where
+ *	  this wins big - e.g. if join order constraints put a 1-row relation on
+ *	  the outer side of the topmost join with a parameterized plan on the inner
+ *	  side - but we'll have to be content not to handle such cases until
+ *	  somebody builds an executor infrastructure that can cope with them.
+ *
+ *	  Because we don't consider parameterized paths here, we also don't
+ *	  need to consider the row counts as a measure of quality: every path will
+ *	  produce the same number of rows.  Neither do we need to consider startup
+ *	  costs: parallelism is only used for plans that will be run to completion.
+ *	  Therefore, this routine is much simpler than add_path: it needs to
+ *	  consider only pathkeys and total cost.
+ *
+ *	  As with add_path, we pfree paths that are found to be dominated by
+ *	  another partial path; this requires that there be no other references to
+ *	  such paths yet.  Hence, GatherPaths must not be created for a rel until
+ *	  we're done creating all partial paths for it.  Unlike add_path, we don't
+ *	  take an exception for IndexPaths as partial index paths won't be
+ *	  referenced by partial BitmapHeapPaths.
+ */
+void
+add_partial_path(RelOptInfo *parent_rel, Path *new_path)
+{
+	bool		accept_new = true;	/* unless we find a superior old path */
+	ListCell   *insert_after = NULL;	/* where to insert new item */
+	ListCell   *p1;
+	ListCell   *p1_prev;
+	ListCell   *p1_next;
+
+	/* Check for query cancel. */
+	CHECK_FOR_INTERRUPTS();
+
+	/* Path to be added must be parallel safe. */
+	Assert(new_path->parallel_safe);
+
+	/* Relation should be OK for parallelism, too. */
+	Assert(parent_rel->consider_parallel);
+
+	/*
+	 * As in add_path, throw out any paths which are dominated by the new
+	 * path, but throw out the new path if some existing path dominates it.
+	 */
+	p1_prev = NULL;
+	for (p1 = list_head(parent_rel->partial_pathlist); p1 != NULL;
+		 p1 = p1_next)
+	{
+		Path	   *old_path = (Path *) lfirst(p1);
+		bool		remove_old = false; /* unless new proves superior */
+		PathKeysComparison keyscmp;
+
+		p1_next = lnext(p1);
+
+		/* Compare pathkeys. */
+		keyscmp = compare_pathkeys(new_path->pathkeys, old_path->pathkeys);
+
+		/* Unless pathkeys are incompable, keep just one of the two paths. */
+		if (keyscmp != PATHKEYS_DIFFERENT)
+		{
+			if (new_path->total_cost > old_path->total_cost * STD_FUZZ_FACTOR)
+			{
+				/* New path costs more; keep it only if pathkeys are better. */
+				if (keyscmp != PATHKEYS_BETTER1)
+					accept_new = false;
+			}
+			else if (old_path->total_cost > new_path->total_cost
+					 * STD_FUZZ_FACTOR)
+			{
+				/* Old path costs more; keep it only if pathkeys are better. */
+				if (keyscmp != PATHKEYS_BETTER2)
+					remove_old = true;
+			}
+			else if (keyscmp == PATHKEYS_BETTER1)
+			{
+				/* Costs are about the same, new path has better pathkeys. */
+				remove_old = true;
+			}
+			else if (keyscmp == PATHKEYS_BETTER2)
+			{
+				/* Costs are about the same, old path has better pathkeys. */
+				accept_new = false;
+			}
+			else if (old_path->total_cost > new_path->total_cost * 1.0000000001)
+			{
+				/* Pathkeys are the same, and the old path costs more. */
+				remove_old = true;
+			}
+			else
+			{
+				/*
+				 * Pathkeys are the same, and new path isn't materially
+				 * cheaper.
+				 */
+				accept_new = false;
+			}
+		}
+
+		/*
+		 * Remove current element from partial_pathlist if dominated by new.
+		 */
+		if (remove_old)
+		{
+			parent_rel->partial_pathlist =
+				list_delete_cell(parent_rel->partial_pathlist, p1, p1_prev);
+			pfree(old_path);
+			/* p1_prev does not advance */
+		}
+		else
+		{
+			/* new belongs after this old path if it has cost >= old's */
+			if (new_path->total_cost >= old_path->total_cost)
+				insert_after = p1;
+			/* p1_prev advances */
+			p1_prev = p1;
+		}
+
+		/*
+		 * If we found an old path that dominates new_path, we can quit
+		 * scanning the partial_pathlist; we will not add new_path, and we
+		 * assume new_path cannot dominate any later path.
+		 */
+		if (!accept_new)
+			break;
+	}
+
+	if (accept_new)
+	{
+		/* Accept the new path: insert it at proper place */
+		if (insert_after)
+			lappend_cell(parent_rel->partial_pathlist, insert_after, new_path);
+		else
+			parent_rel->partial_pathlist =
+				lcons(new_path, parent_rel->partial_pathlist);
+	}
+	else
+	{
+		/* Reject and recycle the new path */
+		pfree(new_path);
+	}
+}
+
+/*
+ * add_partial_path_precheck
+ *	  Check whether a proposed new partial path could possibly get accepted.
+ *
+ * Unlike add_path_precheck, we can ignore startup cost and parameterization,
+ * since they don't matter for partial paths (see add_partial_path).  But
+ * we do want to make sure we don't add a partial path if there's already
+ * a complete path that dominates it, since in that case the proposed path
+ * is surely a loser.
+ */
+bool
+add_partial_path_precheck(RelOptInfo *parent_rel, Cost total_cost,
+						  List *pathkeys)
+{
+	ListCell   *p1;
+
+	/*
+	 * Our goal here is twofold.  First, we want to find out whether this path
+	 * is clearly inferior to some existing partial path.  If so, we want to
+	 * reject it immediately.  Second, we want to find out whether this path
+	 * is clearly superior to some existing partial path -- at least, modulo
+	 * final cost computations.  If so, we definitely want to consider it.
+	 *
+	 * Unlike add_path(), we always compare pathkeys here.  This is because we
+	 * expect partial_pathlist to be very short, and getting a definitive
+	 * answer at this stage avoids the need to call add_path_precheck.
+	 */
+	foreach(p1, parent_rel->partial_pathlist)
+	{
+		Path	   *old_path = (Path *) lfirst(p1);
+		PathKeysComparison keyscmp;
+
+		keyscmp = compare_pathkeys(pathkeys, old_path->pathkeys);
+		if (keyscmp != PATHKEYS_DIFFERENT)
+		{
+			if (total_cost > old_path->total_cost * STD_FUZZ_FACTOR &&
+				keyscmp != PATHKEYS_BETTER1)
+				return false;
+			if (old_path->total_cost > total_cost * STD_FUZZ_FACTOR &&
+				keyscmp != PATHKEYS_BETTER2)
+				return true;
+		}
+	}
+
+	/*
+	 * This path is neither clearly inferior to an existing partial path nor
+	 * clearly good enough that it might replace one.  Compare it to
+	 * non-parallel plans.  If it loses even before accounting for the cost of
+	 * the Gather node, we should definitely reject it.
+	 *
+	 * Note that we pass the total_cost to add_path_precheck twice.  This is
+	 * because it's never advantageous to consider the startup cost of a
+	 * partial path; the resulting plans, if run in parallel, will be run to
+	 * completion.
+	 */
+	if (!add_path_precheck(parent_rel, total_cost, total_cost, pathkeys,
+						   NULL))
+		return false;
+
+	return true;
+}
+
 
 /*****************************************************************************
  *		PATH NODE CREATION ROUTINES
@@ -943,14 +1019,19 @@ add_path_precheck(RelOptInfo *parent_rel,
  *	  pathnode.
  */
 Path *
-create_seqscan_path(PlannerInfo *root, RelOptInfo *rel, Relids required_outer)
+create_seqscan_path(PlannerInfo *root, RelOptInfo *rel,
+					Relids required_outer, int parallel_workers)
 {
 	Path	   *pathnode = makeNode(Path);
 
 	pathnode->pathtype = T_SeqScan;
 	pathnode->parent = rel;
+	pathnode->pathtarget = rel->reltarget;
 	pathnode->param_info = get_baserel_parampathinfo(root, rel,
 													 required_outer);
+	pathnode->parallel_aware = parallel_workers > 0 ? true : false;
+	pathnode->parallel_safe = rel->consider_parallel;
+	pathnode->parallel_workers = parallel_workers;
 	pathnode->pathkeys = NIL;	/* seqscan has unordered result */
 
 	pathnode->locus = cdbpathlocus_from_baserel(root, rel);
@@ -964,45 +1045,41 @@ create_seqscan_path(PlannerInfo *root, RelOptInfo *rel, Relids required_outer)
 }
 
 /*
-* Create a path for scanning an external table
+ * create_samplescan_path
+ *	  Creates a path node for a sampled table scan.
  */
-ExternalPath *
-create_external_path(PlannerInfo *root, RelOptInfo *rel, Relids required_outer)
+Path *
+create_samplescan_path(PlannerInfo *root, RelOptInfo *rel, Relids required_outer)
 {
-	ExternalPath   *pathnode = makeNode(ExternalPath);
+	Path	   *pathnode = makeNode(Path);
 
-	pathnode->path.pathtype = T_ExternalScan;
-	pathnode->path.parent = rel;
-	pathnode->path.param_info = get_baserel_parampathinfo(root, rel,
+	pathnode->pathtype = T_SampleScan;
+	pathnode->parent = rel;
+	pathnode->pathtarget = rel->reltarget;
+	pathnode->param_info = get_baserel_parampathinfo(root, rel,
 													 required_outer);
-	pathnode->path.pathkeys = NIL;	/* external scan has unordered result */
+	pathnode->parallel_aware = false;
+	pathnode->parallel_safe = rel->consider_parallel;
+	pathnode->parallel_workers = 0;
+	pathnode->pathkeys = NIL;	/* samplescan has unordered result */
 
-	pathnode->path.locus = cdbpathlocus_from_baserel(root, rel);
-	pathnode->path.motionHazard = false;
+	pathnode->locus = cdbpathlocus_from_baserel(root, rel);
+	pathnode->motionHazard = false;
+	pathnode->rescannable = true;
+	pathnode->sameslice_relids = rel->relids;
 
-	/*
-	 * Mark external tables as non-rescannable. While rescan is possible,
-	 * it can lead to surprising results if the external table produces
-	 * different results when invoked twice.
-	 */
-	pathnode->path.rescannable = false;
-	pathnode->path.sameslice_relids = rel->relids;
-
-	cost_externalscan(pathnode, root, rel, pathnode->path.param_info);
+	cost_samplescan(pathnode, root, rel, pathnode->param_info);
 
 	return pathnode;
 }
-
 
 /*
  * create_index_path
  *	  Creates a path node for an index scan.
  *
  * 'index' is a usable index.
- * 'indexclauses' is a list of RestrictInfo nodes representing clauses
- *			to be used as index qual conditions in the scan.
- * 'indexclausecols' is an integer list of index column numbers (zero based)
- *			the indexclauses can be used with.
+ * 'indexclauses' is a list of IndexClause nodes representing clauses
+ *			to be enforced as qual conditions in the scan.
  * 'indexorderbys' is a list of bare expressions (no RestrictInfos)
  *			to be used as index ordering operators in the scan.
  * 'indexorderbycols' is an integer list of index column numbers (zero based)
@@ -1015,6 +1092,7 @@ create_external_path(PlannerInfo *root, RelOptInfo *rel, Relids required_outer)
  * 'required_outer' is the set of outer relids for a parameterized path.
  * 'loop_count' is the number of repetitions of the indexscan to factor into
  *		estimates of caching behavior.
+ * 'partial_path' is true if constructing a parallel index scan path.
  *
  * Returns the new path node.
  */
@@ -1022,35 +1100,30 @@ IndexPath *
 create_index_path(PlannerInfo *root,
 				  IndexOptInfo *index,
 				  List *indexclauses,
-				  List *indexclausecols,
 				  List *indexorderbys,
 				  List *indexorderbycols,
 				  List *pathkeys,
 				  ScanDirection indexscandir,
 				  bool indexonly,
 				  Relids required_outer,
-				  double loop_count)
+				  double loop_count,
+				  bool partial_path)
 {
 	IndexPath  *pathnode = makeNode(IndexPath);
 	RelOptInfo *rel = index->rel;
-	List	   *indexquals,
-			   *indexqualcols;
 
 	pathnode->path.pathtype = indexonly ? T_IndexOnlyScan : T_IndexScan;
 	pathnode->path.parent = rel;
+	pathnode->path.pathtarget = rel->reltarget;
 	pathnode->path.param_info = get_baserel_parampathinfo(root, rel,
 														  required_outer);
+	pathnode->path.parallel_aware = false;
+	pathnode->path.parallel_safe = rel->consider_parallel;
+	pathnode->path.parallel_workers = 0;
 	pathnode->path.pathkeys = pathkeys;
 
-	/* Convert clauses to indexquals the executor can handle */
-	expand_indexqual_conditions(index, indexclauses, indexclausecols,
-								&indexquals, &indexqualcols);
-
-	/* Fill in the pathnode */
 	pathnode->indexinfo = index;
 	pathnode->indexclauses = indexclauses;
-	pathnode->indexquals = indexquals;
-	pathnode->indexqualcols = indexqualcols;
 	pathnode->indexorderbys = indexorderbys;
 	pathnode->indexorderbycols = indexorderbycols;
 	pathnode->indexscandir = indexscandir;
@@ -1061,7 +1134,7 @@ create_index_path(PlannerInfo *root,
 	pathnode->path.rescannable = true;
 	pathnode->path.sameslice_relids = rel->relids;
 
-	cost_index(pathnode, root, loop_count);
+	cost_index(pathnode, root, loop_count, partial_path);
 
 	return pathnode;
 }
@@ -1083,15 +1156,20 @@ create_bitmap_heap_path(PlannerInfo *root,
 						RelOptInfo *rel,
 						Path *bitmapqual,
 						Relids required_outer,
-						double loop_count)
+						double loop_count,
+						int parallel_degree)
 {
 	BitmapHeapPath *pathnode = makeNode(BitmapHeapPath);
 
 	pathnode->path.pathtype = T_BitmapHeapScan;
 	pathnode->path.parent = rel;
+	pathnode->path.pathtarget = rel->reltarget;
 	pathnode->path.param_info = get_baserel_parampathinfo(root, rel,
 														  required_outer);
-	pathnode->path.pathkeys = NIL;		/* always unordered */
+	pathnode->path.parallel_aware = parallel_degree > 0 ? true : false;
+	pathnode->path.parallel_safe = rel->consider_parallel;
+	pathnode->path.parallel_workers = parallel_degree;
+	pathnode->path.pathkeys = NIL;	/* always unordered */
 
 	/* Distribution is same as the base table. */
 	pathnode->path.locus = cdbpathlocus_from_baserel(root, rel);
@@ -1102,49 +1180,6 @@ create_bitmap_heap_path(PlannerInfo *root,
 	pathnode->bitmapqual = bitmapqual;
 
 	cost_bitmap_heap_scan(&pathnode->path, root, rel,
-						  pathnode->path.param_info,
-						  bitmapqual, loop_count);
-
-	return pathnode;
-}
-
-/*
- * create_bitmap_appendonly_path
- *	  Creates a path node for a bitmap Append-Only row table scan.
- *
- * 'bitmapqual' is a tree of IndexPath, BitmapAndPath, and BitmapOrPath nodes.
- *
- * If this is a join inner indexscan path, 'outer_rel' is the outer relation,
- * and all the component IndexPaths should have been costed accordingly.
- *
- * NOTE: This is mostly the same as the create_bitmap_heap_path routine.
- */
-BitmapAppendOnlyPath *
-create_bitmap_appendonly_path(PlannerInfo *root,
-							  RelOptInfo *rel,
-							  Path *bitmapqual,
-							  Relids required_outer,
-							  double loop_count,
-							  bool isAORow)
-{
-	BitmapAppendOnlyPath *pathnode = makeNode(BitmapAppendOnlyPath);
-
-	pathnode->path.pathtype = T_BitmapAppendOnlyScan;
-	pathnode->path.parent = rel;
-	pathnode->path.param_info = get_baserel_parampathinfo(root, rel,
-														  required_outer);
-	pathnode->path.pathkeys = NIL;		/* always unordered */
-
-	/* Distribution is same as the base table. */
-	pathnode->path.locus = cdbpathlocus_from_baserel(root, rel);
-	pathnode->path.motionHazard = false;
-	pathnode->path.rescannable = true;
-	pathnode->path.sameslice_relids = rel->relids;
-
-	pathnode->bitmapqual = bitmapqual;
-	pathnode->isAORow = isAORow;
-
-	cost_bitmap_appendonly_scan(&pathnode->path, root, rel,
 						  pathnode->path.param_info,
 						  bitmapqual, loop_count);
 
@@ -1164,8 +1199,20 @@ create_bitmap_and_path(PlannerInfo *root,
 
 	pathnode->path.pathtype = T_BitmapAnd;
 	pathnode->path.parent = rel;
+	pathnode->path.pathtarget = rel->reltarget;
 	pathnode->path.param_info = NULL;	/* not used in bitmap trees */
-	pathnode->path.pathkeys = NIL;		/* always unordered */
+
+	/*
+	 * Currently, a BitmapHeapPath, BitmapAndPath, or BitmapOrPath will be
+	 * parallel-safe if and only if rel->consider_parallel is set.  So, we can
+	 * set the flag for this path based only on the relation-level flag,
+	 * without actually iterating over the list of children.
+	 */
+	pathnode->path.parallel_aware = false;
+	pathnode->path.parallel_safe = rel->consider_parallel;
+	pathnode->path.parallel_workers = 0;
+
+	pathnode->path.pathkeys = NIL;	/* always unordered */
 
 	pathnode->bitmapquals = bitmapquals;
 
@@ -1188,8 +1235,20 @@ create_bitmap_or_path(PlannerInfo *root,
 
 	pathnode->path.pathtype = T_BitmapOr;
 	pathnode->path.parent = rel;
+	pathnode->path.pathtarget = rel->reltarget;
 	pathnode->path.param_info = NULL;	/* not used in bitmap trees */
-	pathnode->path.pathkeys = NIL;		/* always unordered */
+
+	/*
+	 * Currently, a BitmapHeapPath, BitmapAndPath, or BitmapOrPath will be
+	 * parallel-safe if and only if rel->consider_parallel is set.  So, we can
+	 * set the flag for this path based only on the relation-level flag,
+	 * without actually iterating over the list of children.
+	 */
+	pathnode->path.parallel_aware = false;
+	pathnode->path.parallel_safe = rel->consider_parallel;
+	pathnode->path.parallel_workers = 0;
+
+	pathnode->path.pathkeys = NIL;	/* always unordered */
 
 	pathnode->bitmapquals = bitmapquals;
 
@@ -1207,13 +1266,21 @@ TidPath *
 create_tidscan_path(PlannerInfo *root, RelOptInfo *rel, List *tidquals,
 					Relids required_outer)
 {
+
+	if (!REL_SUPPORTS_TID_SCAN(rel))
+		return NULL;
+
 	TidPath    *pathnode = makeNode(TidPath);
 
 	pathnode->path.pathtype = T_TidScan;
 	pathnode->path.parent = rel;
+	pathnode->path.pathtarget = rel->reltarget;
 	pathnode->path.param_info = get_baserel_parampathinfo(root, rel,
 														  required_outer);
-	pathnode->path.pathkeys = NIL;		/* always unordered */
+	pathnode->path.parallel_aware = false;
+	pathnode->path.parallel_safe = rel->consider_parallel;
+	pathnode->path.parallel_workers = 0;
+	pathnode->path.pathkeys = NIL;	/* always unordered */
 
 	pathnode->tidquals = tidquals;
 
@@ -1235,61 +1302,167 @@ create_tidscan_path(PlannerInfo *root, RelOptInfo *rel, List *tidquals,
  *	  pathnode.
  *
  * Note that we must handle subpaths = NIL, representing a dummy access path.
+ * Also, there are callers that pass root = NULL.
  */
 AppendPath *
-create_append_path(PlannerInfo *root, RelOptInfo *rel, List *subpaths, Relids required_outer)
+create_append_path(PlannerInfo *root,
+				   RelOptInfo *rel,
+				   List *subpaths, List *partial_subpaths,
+				   List *pathkeys, Relids required_outer,
+				   int parallel_workers, bool parallel_aware,
+				   List *partitioned_rels, double rows)
 {
-	ListCell *l;
 	AppendPath *pathnode = makeNode(AppendPath);
+	ListCell   *l;
+
+	Assert(!parallel_aware || parallel_workers > 0);
 
 	pathnode->path.pathtype = T_Append;
 	pathnode->path.parent = rel;
-	pathnode->path.param_info = get_appendrel_parampathinfo(rel,
-															required_outer);
-	pathnode->path.pathkeys = NIL;		/* result is always considered
-										 * unsorted */
-	pathnode->subpaths = subpaths;
+	pathnode->path.pathtarget = rel->reltarget;
+
+	/*
+	 * When generating an Append path for a partitioned table, there may be
+	 * parameters that are useful so we can eliminate certain partitions
+	 * during execution.  Here we'll go all the way and fully populate the
+	 * parameter info data as we do for normal base relations.  However, we
+	 * need only bother doing this for RELOPT_BASEREL rels, as
+	 * RELOPT_OTHER_MEMBER_REL's Append paths are merged into the base rel's
+	 * Append subpaths.  It would do no harm to do this, we just avoid it to
+	 * save wasting effort.
+	 */
+	if (partitioned_rels != NIL && root && rel->reloptkind == RELOPT_BASEREL)
+		pathnode->path.param_info = get_baserel_parampathinfo(root,
+															  rel,
+															  required_outer);
+	else
+		pathnode->path.param_info = get_appendrel_parampathinfo(rel,
+																required_outer);
+
+	pathnode->path.parallel_aware = parallel_aware;
+	pathnode->path.parallel_safe = rel->consider_parallel;
+	pathnode->path.parallel_workers = parallel_workers;
+	pathnode->path.pathkeys = pathkeys;
+	pathnode->partitioned_rels = list_copy(partitioned_rels);
 
 	pathnode->path.motionHazard = false;
 	pathnode->path.rescannable = true;
 
 	/*
-	 * We don't bother with inventing a cost_append(), but just do it here.
-	 *
-	 * Compute rows and costs as sums of subplan rows and costs.  We charge
-	 * nothing extra for the Append itself, which perhaps is too optimistic,
-	 * but since it doesn't do any selection or projection, it is a pretty
-	 * cheap node.  If you change this, see also make_append().
+	 * For parallel append, non-partial paths are sorted by descending total
+	 * costs. That way, the total time to finish all non-partial paths is
+	 * minimized.  Also, the partial paths are sorted by descending startup
+	 * costs.  There may be some paths that require to do startup work by a
+	 * single worker.  In such case, it's better for workers to choose the
+	 * expensive ones first, whereas the leader should choose the cheapest
+	 * startup plan.
 	 */
-	pathnode->path.rows = 0;
-	pathnode->path.startup_cost = 0;
-	pathnode->path.total_cost = 0;
-
-	set_append_path_locus(root, (Path *) pathnode, rel, NIL);
-
-	foreach(l, subpaths)
+	if (pathnode->path.parallel_aware)
 	{
-		Path       *subpath = (Path *) lfirst(l);
+		/*
+		 * We mustn't fiddle with the order of subpaths when the Append has
+		 * pathkeys.  The order they're listed in is critical to keeping the
+		 * pathkeys valid.
+		 */
+		Assert(pathkeys == NIL);
 
-		pathnode->path.rows += subpath->rows;
+		subpaths = list_qsort(subpaths, append_total_cost_compare);
+		partial_subpaths = list_qsort(partial_subpaths,
+									  append_startup_cost_compare);
+	}
+	pathnode->first_partial_path = list_length(subpaths);
+	pathnode->subpaths = list_concat(subpaths, partial_subpaths);
 
-		if (l == list_head(subpaths))   /* first node? */
-			pathnode->path.startup_cost = subpath->startup_cost;
-		pathnode->path.total_cost += subpath->total_cost;
+	/*
+	 * Apply query-wide LIMIT if known and path is for sole base relation.
+	 * (Handling this at this low level is a bit klugy.)
+	 */
+	if (root != NULL && bms_equal(rel->relids, root->all_baserels))
+		pathnode->limit_tuples = root->limit_tuples;
+	else
+		pathnode->limit_tuples = -1.0;
+
+    set_append_path_locus(root, (Path *) pathnode, rel, NIL);
+
+	foreach(l, pathnode->subpaths)
+	{
+		Path	   *subpath = (Path *) lfirst(l);
+
+		pathnode->path.parallel_safe = pathnode->path.parallel_safe &&
+			subpath->parallel_safe;
 
 		/* All child paths must have same parameterization */
 		Assert(bms_equal(PATH_REQ_OUTER(subpath), required_outer));
 	}
 
+	Assert(!parallel_aware || pathnode->path.parallel_safe);
+
 	/*
-	 * CDB: If there is exactly one subpath, its ordering is preserved.
-	 * Child rel's pathkey exprs are already expressed in terms of the
-	 * columns of the parent appendrel.  See find_usable_indexes().
+	 * If there's exactly one child path, the Append is a no-op and will be
+	 * discarded later (in setrefs.c); therefore, we can inherit the child's
+	 * size and cost, as well as its pathkeys if any (overriding whatever the
+	 * caller might've said).  Otherwise, we must do the normal costsize
+	 * calculation.
 	 */
-	if (list_length(subpaths) == 1)
-		pathnode->path.pathkeys = ((Path *) linitial(subpaths))->pathkeys;
+	if (list_length(pathnode->subpaths) == 1)
+	{
+		Path	   *child = (Path *) linitial(pathnode->subpaths);
+
+		pathnode->path.rows = child->rows;
+		pathnode->path.startup_cost = child->startup_cost;
+		pathnode->path.total_cost = child->total_cost;
+		pathnode->path.pathkeys = child->pathkeys;
+	}
+	else
+		cost_append(pathnode);
+
+	/* If the caller provided a row estimate, override the computed value. */
+	if (rows >= 0)
+		pathnode->path.rows = rows;
 
 	return pathnode;
+}
+
+/*
+ * append_total_cost_compare
+ *	  qsort comparator for sorting append child paths by total_cost descending
+ *
+ * For equal total costs, we fall back to comparing startup costs; if those
+ * are equal too, break ties using bms_compare on the paths' relids.
+ * (This is to avoid getting unpredictable results from qsort.)
+ */
+static int
+append_total_cost_compare(const void *a, const void *b)
+{
+	Path	   *path1 = (Path *) lfirst(*(ListCell **) a);
+	Path	   *path2 = (Path *) lfirst(*(ListCell **) b);
+	int			cmp;
+
+	cmp = compare_path_costs(path1, path2, TOTAL_COST);
+	if (cmp != 0)
+		return -cmp;
+	return bms_compare(path1->parent->relids, path2->parent->relids);
+}
+
+/*
+ * append_startup_cost_compare
+ *	  qsort comparator for sorting append child paths by startup_cost descending
+ *
+ * For equal startup costs, we fall back to comparing total costs; if those
+ * are equal too, break ties using bms_compare on the paths' relids.
+ * (This is to avoid getting unpredictable results from qsort.)
+ */
+static int
+append_startup_cost_compare(const void *a, const void *b)
+{
+	Path	   *path1 = (Path *) lfirst(*(ListCell **) a);
+	Path	   *path2 = (Path *) lfirst(*(ListCell **) b);
+	int			cmp;
+
+	cmp = compare_path_costs(path1, path2, STARTUP_COST);
+	if (cmp != 0)
+		return -cmp;
+	return bms_compare(path1->parent->relids, path2->parent->relids);
 }
 
 /*
@@ -1302,7 +1475,8 @@ create_merge_append_path(PlannerInfo *root,
 						 RelOptInfo *rel,
 						 List *subpaths,
 						 List *pathkeys,
-						 Relids required_outer)
+						 Relids required_outer,
+						 List *partitioned_rels)
 {
 	MergeAppendPath *pathnode = makeNode(MergeAppendPath);
 	Cost		input_startup_cost;
@@ -1311,9 +1485,14 @@ create_merge_append_path(PlannerInfo *root,
 
 	pathnode->path.pathtype = T_MergeAppend;
 	pathnode->path.parent = rel;
+	pathnode->path.pathtarget = rel->reltarget;
 	pathnode->path.param_info = get_appendrel_parampathinfo(rel,
 															required_outer);
+	pathnode->path.parallel_aware = false;
+	pathnode->path.parallel_safe = rel->consider_parallel;
+	pathnode->path.parallel_workers = 0;
 	pathnode->path.pathkeys = pathkeys;
+	pathnode->partitioned_rels = list_copy(partitioned_rels);
 	pathnode->subpaths = subpaths;
 
 	/*
@@ -1326,6 +1505,12 @@ create_merge_append_path(PlannerInfo *root,
 		pathnode->limit_tuples = -1.0;
 
 	/*
+	 * Add Motions to the child nodes as needed, and determine the locus
+	 * of the MergeAppend itself.
+	 */
+	set_append_path_locus(root, (Path *) pathnode, rel, pathkeys);
+
+	/*
 	 * Add up the sizes and costs of the input paths.
 	 */
 	pathnode->path.rows = 0;
@@ -1336,6 +1521,8 @@ create_merge_append_path(PlannerInfo *root,
 		Path	   *subpath = (Path *) lfirst(l);
 
 		pathnode->path.rows += subpath->rows;
+		pathnode->path.parallel_safe = pathnode->path.parallel_safe &&
+			subpath->parallel_safe;
 
 		if (pathkeys_contained_in(pathkeys, subpath->pathkeys))
 		{
@@ -1346,14 +1533,15 @@ create_merge_append_path(PlannerInfo *root,
 		else
 		{
 			/* We'll need to insert a Sort node, so include cost for that */
-			Path		sort_path;		/* dummy for result of cost_sort */
+			Path		sort_path;	/* dummy for result of cost_sort */
 
 			cost_sort(&sort_path,
 					  root,
 					  pathkeys,
 					  subpath->total_cost,
-					  subpath->parent->tuples,
-					  subpath->parent->width,
+					  /* GPDB: pass subpath->rows because it's been adjusted for # of segments */
+					  subpath->rows,
+					  subpath->pathtarget->width,
 					  0.0,
 					  work_mem,
 					  pathnode->limit_tuples);
@@ -1365,13 +1553,21 @@ create_merge_append_path(PlannerInfo *root,
 		Assert(bms_equal(PATH_REQ_OUTER(subpath), required_outer));
 	}
 
-	/* Now we can compute total costs of the MergeAppend */
-	cost_merge_append(&pathnode->path, root,
-					  pathkeys, list_length(subpaths),
-					  input_startup_cost, input_total_cost,
-					  rel->tuples);
-
-	set_append_path_locus(root, (Path *) pathnode, rel, pathkeys);
+	/*
+	 * Now we can compute total costs of the MergeAppend.  If there's exactly
+	 * one child path, the MergeAppend is a no-op and will be discarded later
+	 * (in setrefs.c); otherwise we do the normal cost calculation.
+	 */
+	if (list_length(subpaths) == 1)
+	{
+		pathnode->path.startup_cost = input_startup_cost;
+		pathnode->path.total_cost = input_total_cost;
+	}
+	else
+		cost_merge_append(&pathnode->path, root,
+						  pathkeys, list_length(subpaths),
+						  input_startup_cost, input_total_cost,
+						  pathnode->path.rows);
 
 	return pathnode;
 }
@@ -1386,8 +1582,9 @@ set_append_path_locus(PlannerInfo *root, Path *pathnode, RelOptInfo *rel,
 					  List *pathkeys)
 {
 	ListCell   *l;
-	bool		fIsNotPartitioned = false;
-	bool		fIsPartitionInEntry = false;
+	CdbLocusType targetlocustype;
+	CdbPathLocus targetlocus;
+	int			numsegments;
 	List	   *subpaths;
 	List	  **subpaths_out;
 	List	   *new_subpaths;
@@ -1404,138 +1601,294 @@ set_append_path_locus(PlannerInfo *root, Path *pathnode, RelOptInfo *rel,
 	/* If no subpath, any worker can execute this Append.  Result has 0 rows. */
 	if (!subpaths)
 	{
-		/* FIXME: do not hard code to ALL */
-		CdbPathLocus_MakeGeneral(&pathnode->locus,
-								 GP_POLICY_ALL_NUMSEGMENTS);
+		CdbPathLocus_MakeGeneral(&pathnode->locus);
 		return;
 	}
 
 	/*
-	 * Do a first pass over the children to determine if there's any child
-	 * which is not partitioned, i.e. is a bottleneck or replicated.
+	 * Do a first pass over the children to determine what locus the result
+	 * should have, based on the loci of the children.
+	 *
+	 * We only determine the target locus type here, the number of segments is
+	 * figured out later. We treat also all partitioned types the same for now,
+	 * using Strewn to represent them all, and figure out later if we can mark
+	 * it hashed, or if have to leave it strewn.
 	 */
+	static const struct
+	{
+		CdbLocusType a;
+		CdbLocusType b;
+		CdbLocusType result;
+	} append_locus_compatibility_table[] =
+	{
+		/*
+		 * If any of the children have 'outerquery' locus, bring all the subpaths
+		 * to the outer query's locus.
+		 */
+		{ CdbLocusType_OuterQuery, CdbLocusType_OuterQuery,     CdbLocusType_OuterQuery },
+		{ CdbLocusType_OuterQuery, CdbLocusType_Entry,          CdbLocusType_OuterQuery },
+		{ CdbLocusType_OuterQuery, CdbLocusType_SingleQE,       CdbLocusType_OuterQuery },
+		{ CdbLocusType_OuterQuery, CdbLocusType_Strewn,         CdbLocusType_OuterQuery },
+		{ CdbLocusType_OuterQuery, CdbLocusType_Replicated,     CdbLocusType_OuterQuery },
+		{ CdbLocusType_OuterQuery, CdbLocusType_SegmentGeneral, CdbLocusType_OuterQuery },
+		{ CdbLocusType_OuterQuery, CdbLocusType_General,        CdbLocusType_OuterQuery },
+		
+		/*
+		 * Similarly, if any of the children have 'entry' locus, bring all the subpaths
+		 * to the entry db.
+		 */
+		{ CdbLocusType_Entry, CdbLocusType_Entry,          CdbLocusType_Entry },
+		{ CdbLocusType_Entry, CdbLocusType_SingleQE,       CdbLocusType_Entry },
+		{ CdbLocusType_Entry, CdbLocusType_Strewn,         CdbLocusType_Entry },
+		{ CdbLocusType_Entry, CdbLocusType_Replicated,     CdbLocusType_Entry },
+		{ CdbLocusType_Entry, CdbLocusType_SegmentGeneral, CdbLocusType_Entry },
+		{ CdbLocusType_Entry, CdbLocusType_General,        CdbLocusType_Entry },
+
+		/* similarly, if there are single QE children, bring everything to a single QE */
+		{ CdbLocusType_SingleQE, CdbLocusType_SingleQE,       CdbLocusType_SingleQE },
+		{ CdbLocusType_SingleQE, CdbLocusType_Strewn,         CdbLocusType_SingleQE },
+		{ CdbLocusType_SingleQE, CdbLocusType_Replicated,     CdbLocusType_SingleQE },
+		{ CdbLocusType_SingleQE, CdbLocusType_SegmentGeneral, CdbLocusType_SingleQE },
+		{ CdbLocusType_SingleQE, CdbLocusType_General,        CdbLocusType_SingleQE },
+
+		/*
+		 * If everything is partitioned, then the result can be partitioned, too.
+		 * But if it's a mix of partitioned and replicated, then we have to bring
+		 * everything to a single QE. Otherwise, the replicated children
+		 * will contribute rows on every QE.
+		 * If it's a mix of partitioned and general, we still consider the
+		 * result as partitioned. But the general part will be restricted to
+		 * only produce rows on a single QE.
+		 */
+		{ CdbLocusType_Strewn, CdbLocusType_Strewn,         CdbLocusType_Strewn },
+		{ CdbLocusType_Strewn, CdbLocusType_Replicated,     CdbLocusType_SingleQE },
+		{ CdbLocusType_Strewn, CdbLocusType_SegmentGeneral, CdbLocusType_Strewn },
+		{ CdbLocusType_Strewn, CdbLocusType_General,        CdbLocusType_Strewn },
+
+		{ CdbLocusType_Replicated, CdbLocusType_Replicated, CdbLocusType_Replicated },
+		{ CdbLocusType_Replicated, CdbLocusType_SegmentGeneral, CdbLocusType_Replicated },
+		{ CdbLocusType_Replicated, CdbLocusType_General,        CdbLocusType_Replicated },
+
+		{ CdbLocusType_SegmentGeneral, CdbLocusType_SegmentGeneral, CdbLocusType_SegmentGeneral },
+		{ CdbLocusType_SegmentGeneral, CdbLocusType_General,        CdbLocusType_SegmentGeneral },
+
+		{ CdbLocusType_General, CdbLocusType_General,        CdbLocusType_General },
+	};
+	targetlocustype = CdbLocusType_General;
 	foreach(l, subpaths)
 	{
 		Path	   *subpath = (Path *) lfirst(l);
+		CdbLocusType subtype;
+		int			i;
 
-		/* If one of subplan is segment general, gather others to single QE */
-		if (CdbPathLocus_IsBottleneck(subpath->locus) ||
-			CdbPathLocus_IsSegmentGeneral(subpath->locus) ||
-			CdbPathLocus_IsReplicated(subpath->locus))
+		if (CdbPathLocus_IsPartitioned(subpath->locus))
+			subtype = CdbLocusType_Strewn;
+		else
+			subtype = subpath->locus.locustype;
+
+		if (l == list_head(subpaths))
 		{
-			fIsNotPartitioned = true;
-
-			/* check whether any partition is on entry db */
-			if (CdbPathLocus_IsEntry(subpath->locus))
+			targetlocustype = subtype;
+			continue;
+		}
+		for (i = 0; i < lengthof(append_locus_compatibility_table); i++)
+		{
+			if ((append_locus_compatibility_table[i].a == targetlocustype &&
+				 append_locus_compatibility_table[i].b == subtype) ||
+				(append_locus_compatibility_table[i].a == subtype &&
+				 append_locus_compatibility_table[i].b == targetlocustype))
 			{
-				fIsPartitionInEntry = true;
+				targetlocustype = append_locus_compatibility_table[i].result;
+				break;
+			}
+		}
+		if (i == lengthof(append_locus_compatibility_table))
+			elog(ERROR, "could not determine target locus for Append");
+	}
+
+	/*
+	 * Now compute the 'numsegments', and the hash keys if it's a partitioned
+	 * type.
+	 */
+	if (targetlocustype == CdbLocusType_Entry)
+	{
+		/* nothing more to do */
+		CdbPathLocus_MakeEntry(&targetlocus);
+	}
+	else if (targetlocustype == CdbLocusType_OuterQuery)
+	{
+		/* nothing more to do */
+		CdbPathLocus_MakeOuterQuery(&targetlocus);
+	}
+	else if (targetlocustype == CdbLocusType_General)
+	{
+		/* nothing more to do */
+		CdbPathLocus_MakeGeneral(&targetlocus);
+	}
+	else if (targetlocustype == CdbLocusType_SingleQE ||
+			 targetlocustype == CdbLocusType_Replicated ||
+			 targetlocustype == CdbLocusType_SegmentGeneral)
+	{
+		/* By default put Append node on all the segments */
+		numsegments = getgpsegmentCount();
+		foreach(l, subpaths)
+		{
+			Path	   *subpath = (Path *) lfirst(l);
+
+			/*
+			 * Align numsegments to be the common segments among the children.
+			 * Partitioned children will need to be motioned, so ignore them.
+			 */
+			if (CdbPathLocus_IsSingleQE(subpath->locus) ||
+				CdbPathLocus_IsSegmentGeneral(subpath->locus) ||
+				CdbPathLocus_IsReplicated(subpath->locus))
+			{
+				numsegments = Min(numsegments,
+								  CdbPathLocus_NumSegments(subpath->locus));
+			}
+		}
+		CdbPathLocus_MakeSimple(&targetlocus, targetlocustype, numsegments);
+	}
+	else if (targetlocustype == CdbLocusType_Strewn)
+	{
+		bool		isfirst = true;
+
+		/* By default put Append node on all the segments */
+		numsegments = getgpsegmentCount();
+		CdbPathLocus_MakeNull(&targetlocus);
+		foreach(l, subpaths)
+		{
+			Path	   *subpath = (Path *) lfirst(l);
+			CdbPathLocus projectedlocus;
+
+			if (CdbPathLocus_IsGeneral(subpath->locus) ||
+				CdbPathLocus_IsSegmentGeneral(subpath->locus))
+			{
+				/* Afterwards, General/SegmentGeneral will be projected as Strewn */
+				CdbPathLocus_MakeStrewn(&projectedlocus, numsegments);
+			}
+			else
+			{
+				Assert(CdbPathLocus_IsPartitioned(subpath->locus));
+				projectedlocus = subpath->locus;
+
+				/* Transform subpath locus into the appendrel's space for comparison. */
+				if (subpath->parent->reloptkind == RELOPT_OTHER_MEMBER_REL &&
+					subpath->parent != rel &&
+					(CdbPathLocus_IsHashed(subpath->locus) || CdbPathLocus_IsHashed(subpath->locus)))
+				{
+					CdbPathLocus l;
+
+					l = cdbpathlocus_pull_above_projection(root,
+						                                   subpath->locus,
+						                                   subpath->parent->relids,
+						                                   subpath->parent->reltarget->exprs,
+						                                   rel->reltarget->exprs,
+						                                   rel->relid);
+					if (CdbPathLocus_IsHashed(l) || CdbPathLocus_IsHashedOJ(l))
+						projectedlocus = l;
+				}
+			}
+
+			/*
+			 * CDB: If all the scans are distributed alike, set
+			 * the result locus to match.  Otherwise, if all are partitioned,
+			 * set it to strewn.  A mixture of partitioned and non-partitioned
+			 * scans should not occur after above correction;
+			 *
+			 * CDB TODO: When the scans are not all partitioned alike, and the
+			 * result is joined with another rel, consider pushing the join
+			 * below the Append so that child tables that are properly
+			 * distributed can be joined in place.
+			 */
+			if (isfirst)
+			{
+				targetlocus = projectedlocus;
+				isfirst = false;
+			}
+			else if (cdbpathlocus_equal(targetlocus, projectedlocus))
+			{
+				/* compatible */
+			}
+			else
+			{
+				/*
+				 * subpaths have different distributed policy, mark it as random
+				 * distributed and set the numsegments to the maximum of all
+				 * subpaths to not missing any tuples.
+				 */
+				CdbPathLocus_MakeStrewn(&targetlocus,
+										Max(CdbPathLocus_NumSegments(targetlocus),
+											CdbPathLocus_NumSegments(projectedlocus)));
 				break;
 			}
 		}
 	}
+	else
+		elog(ERROR, "unexpected Append target locus type");
 
+	/* Ok, we now know the target locus. Add Motions/Projections to any subpaths that need it */
 	new_subpaths = NIL;
 	foreach(l, subpaths)
 	{
 		Path	   *subpath = (Path *) lfirst(l);
-		CdbPathLocus projectedlocus;
 
-		/*
-		 * In case any of the children is not partitioned convert all
-		 * children to have singleQE locus
-		 */
-		if (fIsNotPartitioned)
+		if (CdbPathLocus_IsPartitioned(targetlocus))
 		{
-			/*
-			 * if any partition is on entry db, we should gather all the
-			 * partitions to QD to do the append
-			 */
-			if (fIsPartitionInEntry)
+			if (CdbPathLocus_IsGeneral(subpath->locus) ||
+				CdbPathLocus_IsSegmentGeneral(subpath->locus))
 			{
-				if (!CdbPathLocus_IsEntry(subpath->locus))
-				{
-					CdbPathLocus singleEntry;
-					CdbPathLocus_MakeEntry(&singleEntry);
+				/*
+				 * If a General/SegmentGeneral is mixed with other Strewn's,
+				 * add a projection path with cdb_restrict_clauses, so that only
+				 * a single QE will actually produce rows.
+				 */
+				RestrictInfo *restrict_info;
 
-					subpath = cdbpath_create_motion_path(root, subpath, subpath->pathkeys, false, singleEntry);
-				}
+				if (CdbPathLocus_IsGeneral(subpath->locus))
+					numsegments = targetlocus.numsegments;
+				else
+					numsegments = subpath->locus.numsegments;
+
+				restrict_info = make_restrictinfo((Expr *) makeSegmentFilterExpr(
+													  gp_session_id % numsegments),
+												  true,		/* is_pushed_down */
+												  false,	/* outerjoin_delayed */
+												  true,		/* pseudoconstant */
+												  0,		/* security_level */
+												  NULL,		/* required_relids */
+												  NULL,		/* outer_relids */
+												  NULL);	/* nullable_relids */
+
+				subpath = (Path *) create_projection_path_with_quals(
+					root,
+					subpath->parent,
+					subpath,
+					subpath->pathtarget,
+					list_make1(restrict_info),
+					false);
+
+				/*
+				 * We use the skill of Result plannode with one time filter
+				 * gp_execution_segment() = <segid> here, so we should update
+				 * direct dispatch info when creating plan.
+				 */
+				((ProjectionPath *) subpath)->direct_dispath_contentIds = list_make1_int(gp_session_id % numsegments);
+
+				CdbPathLocus_MakeStrewn(&(subpath->locus),
+				                        numsegments);
 			}
-			else /* fIsNotPartitioned true, fIsPartitionInEntry false */
-			{
-				if (!CdbPathLocus_IsSingleQE(subpath->locus))
-				{
-					CdbPathLocus    singleQE;
-					/*
-					 * It's important to ensure that all the subpaths can be
-					 * gathered to the SAME segment, we must set the same
-					 * numsegments for all the SingleQE, there are many
-					 * options:
-					 *
-					 * 1. a constant 1;
-					 * 2. Min(numsegments of all subpaths);
-					 * 3. Max(numsegments of all subpaths);
-					 * 4. ALL;
-					 *
-					 * Options 2 & 3 need to decide the value with an extra
-					 * scan, option 1 puts all the SingleQE on segment 0
-					 * which makes segment 0 a bottle neck.  So we choose
-					 * option 4, ALL helps to balance the load on all the
-					 * segments and no extra scan is needed.
-					 */
-					int			numsegments = GP_POLICY_ALL_NUMSEGMENTS;
-					CdbPathLocus_MakeSingleQE(&singleQE, numsegments);
 
-					subpath = cdbpath_create_motion_path(root, subpath, subpath->pathkeys, false, singleQE);
-				}
-			}
+			/* we already determined that all the loci are compatible */
+			Assert(CdbPathLocus_IsPartitioned(subpath->locus));
 		}
-
-		/* Transform subpath locus into the appendrel's space for comparison. */
-		if (subpath->parent == rel ||
-			subpath->parent->reloptkind != RELOPT_OTHER_MEMBER_REL)
-			projectedlocus = subpath->locus;
 		else
-			projectedlocus =
-				cdbpathlocus_pull_above_projection(root,
-												   subpath->locus,
-												   subpath->parent->relids,
-												   subpath->parent->reltargetlist,
-												   rel->reltargetlist,
-												   rel->relid);
-
-		/*
-		 * CDB: If all the scans are distributed alike, set
-		 * the result locus to match.  Otherwise, if all are partitioned,
-		 * set it to strewn.  A mixture of partitioned and non-partitioned
-		 * scans should not occur after above correction;
-		 *
-		 * CDB TODO: When the scans are not all partitioned alike, and the
-		 * result is joined with another rel, consider pushing the join
-		 * below the Append so that child tables that are properly
-		 * distributed can be joined in place.
-		 */
-		if (l == list_head(subpaths))
-			pathnode->locus = projectedlocus;
-		else if (cdbpathlocus_equal(pathnode->locus, projectedlocus))
 		{
-			/* compatible */
+			if (pathkeys_contained_in(pathkeys, subpath->pathkeys))
+				subpath = cdbpath_create_motion_path(root, subpath, pathkeys, false, targetlocus);
+			else
+				subpath = cdbpath_create_motion_path(root, subpath, NIL, false, targetlocus);
 		}
-		else if (CdbPathLocus_IsGeneral(pathnode->locus))
-		{
-			/* compatible */
-			pathnode->locus = projectedlocus;
-		}
-		else if (CdbPathLocus_IsGeneral(projectedlocus))
-		{
-			/* compatible */
-		}
-		else if (CdbPathLocus_IsPartitioned(pathnode->locus) &&
-				 CdbPathLocus_IsPartitioned(projectedlocus))
-			CdbPathLocus_MakeStrewn(&pathnode->locus,
-									CdbPathLocus_NumSegments(projectedlocus));
-		else
-			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-							errmsg_internal("cannot append paths with incompatible distribution")));
 
 		pathnode->sameslice_relids = bms_union(pathnode->sameslice_relids, subpath->sameslice_relids);
 
@@ -1547,42 +1900,62 @@ set_append_path_locus(PlannerInfo *root, Path *pathnode, RelOptInfo *rel,
 
 		new_subpaths = lappend(new_subpaths, subpath);
 	}
+	pathnode->locus = targetlocus;
 
 	*subpaths_out = new_subpaths;
 }
 
 /*
- * create_result_path
+ * create_group_result_path
  *	  Creates a path representing a Result-and-nothing-else plan.
- *	  This is only used for the case of a query with an empty jointree.
+ *
+ * This is only used for degenerate grouping cases, in which we know we
+ * need to produce one result row, possibly filtered by a HAVING qual.
  */
-ResultPath *
-create_result_path(List *quals)
+GroupResultPath *
+create_group_result_path(PlannerInfo *root, RelOptInfo *rel,
+						 PathTarget *target, List *havingqual)
 {
-	ResultPath *pathnode = makeNode(ResultPath);
+	GroupResultPath *pathnode = makeNode(GroupResultPath);
 
 	pathnode->path.pathtype = T_Result;
-	pathnode->path.parent = NULL;
+	pathnode->path.parent = rel;
+	pathnode->path.pathtarget = target;
 	pathnode->path.param_info = NULL;	/* there are no other rels... */
+	pathnode->path.parallel_aware = false;
+	pathnode->path.parallel_safe = rel->consider_parallel;
+	pathnode->path.parallel_workers = 0;
 	pathnode->path.pathkeys = NIL;
-	pathnode->quals = quals;
-
-	/* Hardly worth defining a cost_result() function ... just do it */
-	pathnode->path.rows = 1;
-	pathnode->path.startup_cost = 0;
-	pathnode->path.total_cost = cpu_tuple_cost;
-
-	/* Result can be on any segments */
-	CdbPathLocus_MakeGeneral(&pathnode->path.locus, GP_POLICY_ALL_NUMSEGMENTS);
-	pathnode->path.motionHazard = false;
-	pathnode->path.rescannable = true;
+	pathnode->quals = havingqual;
 
 	/*
-	 * In theory we should include the qual eval cost as well, but at present
-	 * that doesn't accomplish much except duplicate work that will be done
-	 * again in make_result; since this is only used for degenerate cases,
-	 * nothing interesting will be done with the path cost values...
+	 * We can't quite use cost_resultscan() because the quals we want to
+	 * account for are not baserestrict quals of the rel.  Might as well just
+	 * hack it here.
 	 */
+	pathnode->path.rows = 1;
+	pathnode->path.startup_cost = target->cost.startup;
+	pathnode->path.total_cost = target->cost.startup +
+		cpu_tuple_cost + target->cost.per_tuple;
+
+	/*
+	 * Add cost of qual, if any --- but we ignore its selectivity, since our
+	 * rowcount estimate should be 1 no matter what the qual is.
+	 */
+	if (havingqual)
+	{
+		QualCost	qual_cost;
+
+		cost_qual_eval(&qual_cost, havingqual, root);
+		/* havingqual is evaluated once at startup */
+		pathnode->path.startup_cost += qual_cost.startup + qual_cost.per_tuple;
+		pathnode->path.total_cost += qual_cost.startup + qual_cost.per_tuple;
+	}
+
+	/* Result can be on any segments */
+	CdbPathLocus_MakeGeneral(&pathnode->path.locus);
+	pathnode->path.motionHazard = false;
+	pathnode->path.rescannable = true;
 
 	return pathnode;
 }
@@ -1601,7 +1974,12 @@ create_material_path(PlannerInfo *root, RelOptInfo *rel, Path *subpath)
 
 	pathnode->path.pathtype = T_Material;
 	pathnode->path.parent = rel;
+	pathnode->path.pathtarget = rel->reltarget;
 	pathnode->path.param_info = subpath->param_info;
+	pathnode->path.parallel_aware = false;
+	pathnode->path.parallel_safe = rel->consider_parallel &&
+		subpath->parallel_safe;
+	pathnode->path.parallel_workers = subpath->parallel_workers;
 	pathnode->path.pathkeys = subpath->pathkeys;
 
 	pathnode->path.locus = subpath->locus;
@@ -1617,7 +1995,7 @@ create_material_path(PlannerInfo *root, RelOptInfo *rel, Path *subpath)
 				  subpath->startup_cost,
 				  subpath->total_cost,
 				  subpath->rows,
-				  rel->width);
+				  subpath->pathtarget->width);
 
 	return pathnode;
 }
@@ -1641,14 +2019,10 @@ create_unique_path(PlannerInfo *root, RelOptInfo *rel, Path *subpath,
 	Path		sort_path;		/* dummy for result of cost_sort */
 	Path		agg_path;		/* dummy for result of cost_agg */
 	MemoryContext oldcontext;
-	List	   *in_operators;
-	List	   *uniq_exprs;
-	bool		all_btree;
-	bool		all_hash;
 	int			numCols;
-	ListCell   *lc;
 	CdbPathLocus locus;
 	bool		add_motion = false;
+	double		numsegments;
 
 	/* Caller made a mistake if subpath isn't cheapest_total ... */
 	Assert(subpath == rel->cheapest_total_path);
@@ -1661,173 +2035,45 @@ create_unique_path(PlannerInfo *root, RelOptInfo *rel, Path *subpath,
 	if (rel->cheapest_unique_path)
 		return (UniquePath *) rel->cheapest_unique_path;
 
-	/* If we previously failed, return NULL quickly */
-	if (sjinfo->join_quals == NIL)
+	/* If it's not possible to unique-ify, return NULL */
+	if (!(sjinfo->semi_can_btree || sjinfo->semi_can_hash))
 		return NULL;
 
 	/*
-	 * We must ensure path struct and subsidiary data are allocated in main
-	 * planning context; otherwise GEQO memory management causes trouble.
+	 * When called during GEQO join planning, we are in a short-lived memory
+	 * context.  We must make sure that the path and any subsidiary data
+	 * structures created for a baserel survive the GEQO cycle, else the
+	 * baserel is trashed for future GEQO cycles.  On the other hand, when we
+	 * are creating those for a joinrel during GEQO, we don't want them to
+	 * clutter the main planning context.  Upshot is that the best solution is
+	 * to explicitly allocate memory in the same context the given RelOptInfo
+	 * is in.
 	 */
-	oldcontext = MemoryContextSwitchTo(root->planner_cxt);
-
-	/*----------
-	 * Look to see whether the semijoin's join quals consist of AND'ed
-	 * equality operators, with (only) RHS variables on only one side of
-	 * each one.  If so, we can figure out how to enforce uniqueness for
-	 * the RHS.
-	 *
-	 * Note that the input join_quals list is the list of quals that are
-	 * *syntactically* associated with the semijoin, which in practice means
-	 * the synthesized comparison list for an IN or the WHERE of an EXISTS.
-	 * Particularly in the latter case, it might contain clauses that aren't
-	 * *semantically* associated with the join, but refer to just one side or
-	 * the other.  We can ignore such clauses here, as they will just drop
-	 * down to be processed within one side or the other.  (It is okay to
-	 * consider only the syntactically-associated clauses here because for a
-	 * semijoin, no higher-level quals could refer to the RHS, and so there
-	 * can be no other quals that are semantically associated with this join.
-	 * We do things this way because it is useful to be able to run this test
-	 * before we have extracted the list of quals that are actually
-	 * semantically associated with the particular join.)
-	 *
-	 * Note that the in_operators list consists of the joinqual operators
-	 * themselves (but commuted if needed to put the RHS value on the right).
-	 * These could be cross-type operators, in which case the operator
-	 * actually needed for uniqueness is a related single-type operator.
-	 * We assume here that that operator will be available from the btree
-	 * or hash opclass when the time comes ... if not, create_unique_plan()
-	 * will fail.
-	 *----------
-	 */
-	in_operators = NIL;
-	uniq_exprs = NIL;
-	all_btree = true;
-	all_hash = enable_hashagg;	/* don't consider hash if not enabled */
-	foreach(lc, sjinfo->join_quals)
-	{
-		OpExpr	   *op = (OpExpr *) lfirst(lc);
-		Oid			opno;
-		Node	   *left_expr;
-		Node	   *right_expr;
-		Relids		left_varnos;
-		Relids		right_varnos;
-		Relids		all_varnos;
-		Oid			opinputtype;
-
-		/* Is it a binary opclause? */
-		if (!IsA(op, OpExpr) ||
-			list_length(op->args) != 2)
-		{
-			/* No, but does it reference both sides? */
-			all_varnos = pull_varnos((Node *) op);
-			if (!bms_overlap(all_varnos, sjinfo->syn_righthand) ||
-				bms_is_subset(all_varnos, sjinfo->syn_righthand))
-			{
-				/*
-				 * Clause refers to only one rel, so ignore it --- unless it
-				 * contains volatile functions, in which case we'd better
-				 * punt.
-				 */
-				if (contain_volatile_functions((Node *) op))
-					goto no_unique_path;
-				continue;
-			}
-			/* Non-operator clause referencing both sides, must punt */
-			goto no_unique_path;
-		}
-
-		/* Extract data from binary opclause */
-		opno = op->opno;
-		left_expr = linitial(op->args);
-		right_expr = lsecond(op->args);
-		left_varnos = pull_varnos(left_expr);
-		right_varnos = pull_varnos(right_expr);
-		all_varnos = bms_union(left_varnos, right_varnos);
-		opinputtype = exprType(left_expr);
-
-		/* Does it reference both sides? */
-		if (!bms_overlap(all_varnos, sjinfo->syn_righthand) ||
-			bms_is_subset(all_varnos, sjinfo->syn_righthand))
-		{
-			/*
-			 * Clause refers to only one rel, so ignore it --- unless it
-			 * contains volatile functions, in which case we'd better punt.
-			 */
-			if (contain_volatile_functions((Node *) op))
-				goto no_unique_path;
-			continue;
-		}
-
-		/* check rel membership of arguments */
-		if (!bms_is_empty(right_varnos) &&
-			bms_is_subset(right_varnos, sjinfo->syn_righthand) &&
-			!bms_overlap(left_varnos, sjinfo->syn_righthand))
-		{
-			/* typical case, right_expr is RHS variable */
-		}
-		else if (!bms_is_empty(left_varnos) &&
-				 bms_is_subset(left_varnos, sjinfo->syn_righthand) &&
-				 !bms_overlap(right_varnos, sjinfo->syn_righthand))
-		{
-			/* flipped case, left_expr is RHS variable */
-			opno = get_commutator(opno);
-			if (!OidIsValid(opno))
-				goto no_unique_path;
-			right_expr = left_expr;
-		}
-		else
-			goto no_unique_path;
-
-		/* all operators must be btree equality or hash equality */
-		if (all_btree)
-		{
-			/* oprcanmerge is considered a hint... */
-			if (!op_mergejoinable(opno, opinputtype) ||
-				get_mergejoin_opfamilies(opno) == NIL)
-				all_btree = false;
-		}
-		if (all_hash)
-		{
-			/* ... but oprcanhash had better be correct */
-			if (!op_hashjoinable(opno, opinputtype))
-				all_hash = false;
-		}
-		if (!(all_btree || all_hash))
-			goto no_unique_path;
-
-		/* so far so good, keep building lists */
-		in_operators = lappend_oid(in_operators, opno);
-		uniq_exprs = lappend(uniq_exprs, copyObject(right_expr));
-	}
-
-	/* Punt if we didn't find at least one column to unique-ify */
-	if (uniq_exprs == NIL)
-		goto no_unique_path;
-
-	/*
-	 * The expressions we'd need to unique-ify mustn't be volatile.
-	 */
-	if (contain_volatile_functions((Node *) uniq_exprs))
-		goto no_unique_path;
+	oldcontext = MemoryContextSwitchTo(GetMemoryChunkContext(rel));
 
 	/* Repartition first if duplicates might be on different QEs. */
 	if (!CdbPathLocus_IsBottleneck(subpath->locus) &&
-		!cdbpathlocus_is_hashed_on_exprs(subpath->locus, uniq_exprs))
+		!cdbpathlocus_is_hashed_on_exprs(subpath->locus, sjinfo->semi_rhs_exprs, false))
 	{
-		/*
-		 * We want to use numsegments from rel->cdbpolicy, however it might
-		 * be NULL.  Subpath is the cheapest path of rel, so it has the same
-		 * numsegments with rel.
-		 */
-		if (rel->cdbpolicy)
-		{
-			AssertEquivalent(rel->cdbpolicy->numsegments,
-							 subpath->locus.numsegments);
-		}
 		int			numsegments = CdbPathLocus_NumSegments(subpath->locus);
 
-        locus = cdbpathlocus_from_exprs(root, uniq_exprs, numsegments);
+		List	   *opfamilies = NIL;
+		List	   *sortrefs = NIL;
+		ListCell   *lc;
+
+		foreach(lc, sjinfo->semi_rhs_exprs)
+		{
+			Node	   *expr = lfirst(lc);
+			Oid			opfamily;
+
+			opfamily = cdb_default_distribution_opfamily_for_type(exprType(expr));
+			opfamilies = lappend_oid(opfamilies, opfamily);
+			sortrefs = lappend_int(sortrefs, 0);
+		}
+
+		locus = cdbpathlocus_from_exprs(root,
+										subpath->parent,
+										sjinfo->semi_rhs_exprs, opfamilies, sortrefs, numsegments);
         subpath = cdbpath_create_motion_path(root, subpath, NIL, false, locus);
 		/*
 		 * We probably add agg/sort node above the added motion node, but it is
@@ -1835,10 +2081,16 @@ create_unique_path(PlannerInfo *root, RelOptInfo *rel, Path *subpath,
 		 * which might be optimal in some cases?
 		 */
 		add_motion = true;
-        Insist(subpath);
+		if (subpath == NULL)
+			elog(ERROR, "could not create motion path");
 	}
 	else
 		locus = subpath->locus;
+
+	if (CdbPathLocus_IsPartitioned(locus))
+		numsegments = CdbPathLocus_NumSegments(locus);
+	else
+		numsegments = 1;
 
 	/*
 	 * If we get here, we can unique-ify using at least one of sorting and
@@ -1848,8 +2100,13 @@ create_unique_path(PlannerInfo *root, RelOptInfo *rel, Path *subpath,
 
 	pathnode->path.pathtype = T_Unique;
 	pathnode->path.parent = rel;
+	pathnode->path.pathtarget = rel->reltarget;
 	pathnode->path.locus = locus;
 	pathnode->path.param_info = subpath->param_info;
+	pathnode->path.parallel_aware = false;
+	pathnode->path.parallel_safe = rel->consider_parallel &&
+		subpath->parallel_safe;
+	pathnode->path.parallel_workers = subpath->parallel_workers;
 
 	/*
 	 * Assume the output is unsorted, since we don't necessarily have pathkeys
@@ -1858,18 +2115,19 @@ create_unique_path(PlannerInfo *root, RelOptInfo *rel, Path *subpath,
 	pathnode->path.pathkeys = NIL;
 
 	pathnode->subpath = subpath;
-	pathnode->in_operators = in_operators;
-	pathnode->uniq_exprs = uniq_exprs;
+	pathnode->in_operators = sjinfo->semi_operators;
+	pathnode->uniq_exprs = sjinfo->semi_rhs_exprs;
 
 	/*
 	 * If the input is a relation and it has a unique index that proves the
-	 * uniq_exprs are unique, then we don't need to do anything.  Note that
-	 * relation_has_unique_index_for automatically considers restriction
+	 * semi_rhs_exprs are unique, then we don't need to do anything.  Note
+	 * that relation_has_unique_index_for automatically considers restriction
 	 * clauses for the rel, as well.
 	 */
-	if (rel->rtekind == RTE_RELATION && all_btree &&
+	if (rel->rtekind == RTE_RELATION && sjinfo->semi_can_btree &&
 		relation_has_unique_index_for(root, rel, NIL,
-									  uniq_exprs, in_operators))
+									  sjinfo->semi_rhs_exprs,
+									  sjinfo->semi_operators))
 	{
 		/*
 		 * For UNIQUE_PATH_NOOP, it is possible that subpath could be a
@@ -1878,9 +2136,9 @@ create_unique_path(PlannerInfo *root, RelOptInfo *rel, Path *subpath,
 		 * in theory we could improve this.
 		 */
 		if (add_motion)
-			goto no_unique_path;
+			return NULL;
 		pathnode->umethod = UNIQUE_PATH_NOOP;
-		pathnode->path.rows = rel->rows;
+		pathnode->path.rows = clamp_row_est(rel->rows / numsegments);
 		pathnode->path.startup_cost = subpath->startup_cost;
 		pathnode->path.total_cost = subpath->total_cost;
 		pathnode->path.pathkeys = subpath->pathkeys;
@@ -1897,54 +2155,60 @@ create_unique_path(PlannerInfo *root, RelOptInfo *rel, Path *subpath,
 	 * don't need to do anything.  The test for uniqueness has to consider
 	 * exactly which columns we are extracting; for example "SELECT DISTINCT
 	 * x,y" doesn't guarantee that x alone is distinct. So we cannot check for
-	 * this optimization unless uniq_exprs consists only of simple Vars
+	 * this optimization unless semi_rhs_exprs consists only of simple Vars
 	 * referencing subquery outputs.  (Possibly we could do something with
 	 * expressions in the subquery outputs, too, but for now keep it simple.)
 	 */
 	if (rel->rtekind == RTE_SUBQUERY)
 	{
 		RangeTblEntry *rte = planner_rt_fetch(rel->relid, root);
-		List	   *sub_tlist_colnos;
 
-		sub_tlist_colnos = translate_sub_tlist(uniq_exprs, rel->relid);
-
-		if (sub_tlist_colnos &&
-			query_is_distinct_for(rte->subquery,
-								  sub_tlist_colnos, in_operators))
+		if (query_supports_distinctness(rte->subquery))
 		{
-			/* Subpath node could be a motion. See previous comment for details. */
-			if (add_motion)
-				goto no_unique_path;
-			pathnode->umethod = UNIQUE_PATH_NOOP;
-			pathnode->path.rows = rel->rows;
-			pathnode->path.startup_cost = subpath->startup_cost;
-			pathnode->path.total_cost = subpath->total_cost;
-			pathnode->path.pathkeys = subpath->pathkeys;
+			List	   *sub_tlist_colnos;
 
-			rel->cheapest_unique_path = (Path *) pathnode;
+			sub_tlist_colnos = translate_sub_tlist(sjinfo->semi_rhs_exprs,
+												   rel->relid);
 
-			MemoryContextSwitchTo(oldcontext);
+			if (sub_tlist_colnos &&
+				query_is_distinct_for(rte->subquery,
+									  sub_tlist_colnos,
+									  sjinfo->semi_operators))
+			{
+				/* Subpath node could be a motion. See previous comment for details. */
+				if (add_motion)
+					return NULL;
+				pathnode->umethod = UNIQUE_PATH_NOOP;
+				pathnode->path.rows = clamp_row_est(rel->rows / numsegments);
+				pathnode->path.startup_cost = subpath->startup_cost;
+				pathnode->path.total_cost = subpath->total_cost;
+				pathnode->path.pathkeys = subpath->pathkeys;
 
-			return pathnode;
+				rel->cheapest_unique_path = (Path *) pathnode;
+
+				MemoryContextSwitchTo(oldcontext);
+
+				return pathnode;
+			}
 		}
 	}
 
 	/* Estimate number of output rows */
-	pathnode->path.rows = estimate_num_groups(root, uniq_exprs, rel->rows);
-	numCols = list_length(uniq_exprs);
+	pathnode->path.rows = estimate_num_groups(root,
+											  sjinfo->semi_rhs_exprs,
+											  rel->rows,
+											  NULL);
+	numCols = list_length(sjinfo->semi_rhs_exprs);
 
-	// FIXME?
-    //subpath_rows = cdbpath_rows(root, subpath);
-
-	if (all_btree)
+	if (sjinfo->semi_can_btree)
 	{
 		/*
 		 * Estimate cost for sort+unique implementation
 		 */
 		cost_sort(&sort_path, root, NIL,
 				  subpath->total_cost,
-				  rel->rows,
-				  rel->width,
+				  rel->rows / numsegments,
+				  subpath->pathtarget->width,
 				  0.0,
 				  work_mem,
 				  -1.0);
@@ -1953,48 +2217,55 @@ create_unique_path(PlannerInfo *root, RelOptInfo *rel, Path *subpath,
 		 * Charge one cpu_operator_cost per comparison per input tuple. We
 		 * assume all columns get compared at most of the tuples. (XXX
 		 * probably this is an overestimate.)  This should agree with
-		 * make_unique.
+		 * create_upper_unique_path.
 		 */
-		sort_path.total_cost += cpu_operator_cost * rel->rows * numCols;
+		sort_path.total_cost += cpu_operator_cost * (rel->rows / numsegments) * numCols;
 	}
 
-	if (all_hash)
+	if (sjinfo->semi_can_hash)
 	{
 		/*
 		 * Estimate the overhead per hashtable entry at 64 bytes (same as in
 		 * planner.c).
 		 */
-		int			hashentrysize = rel->width + 64;
+		int			hashentrysize = subpath->pathtarget->width + 64;
 
 		if (hashentrysize * pathnode->path.rows > work_mem * 1024L)
-			all_hash = false;	/* don't try to hash */
+		{
+			/*
+			 * We should not try to hash.  Hack the SpecialJoinInfo to
+			 * remember this, in case we come through here again.
+			 */
+			sjinfo->semi_can_hash = false;
+		}
 		else
 			cost_agg(&agg_path, root,
 					 AGG_HASHED, NULL,
-					 numCols, pathnode->path.rows,
+					 numCols, pathnode->path.rows / planner_segment_count(NULL),
+					 NIL,
 					 subpath->startup_cost,
 					 subpath->total_cost,
-					 rel->rows,
-					 0, /* input_width */
-					 0, /* hash_batches */
-					 0, /* hashentry_width */
-					 false /* streaming */
-				);
+					 (rel->rows / numsegments),
+					 subpath->pathtarget->width);
 	}
 
-	if (all_btree && all_hash)
+	if (sjinfo->semi_can_btree && sjinfo->semi_can_hash)
 	{
 		if (agg_path.total_cost < sort_path.total_cost)
 			pathnode->umethod = UNIQUE_PATH_HASH;
 		else
 			pathnode->umethod = UNIQUE_PATH_SORT;
 	}
-	else if (all_btree)
+	else if (sjinfo->semi_can_btree)
 		pathnode->umethod = UNIQUE_PATH_SORT;
-	else if (all_hash)
+	else if (sjinfo->semi_can_hash)
 		pathnode->umethod = UNIQUE_PATH_HASH;
 	else
-		goto no_unique_path;
+	{
+		/* we can get here only if we abandoned hashing above */
+		MemoryContextSwitchTo(oldcontext);
+		return NULL;
+	}
 
 	if (pathnode->umethod == UNIQUE_PATH_HASH)
 	{
@@ -2035,23 +2306,13 @@ create_unique_path(PlannerInfo *root, RelOptInfo *rel, Path *subpath,
 	}
 
 	return pathnode;
-
-no_unique_path:			/* failure exit */
-
-	/* Mark the SpecialJoinInfo as not unique-able */
-	sjinfo->join_quals = NIL;
-
-	MemoryContextSwitchTo(oldcontext);
-
-	return NULL;
 }
 
 /*
  * create_unique_rowid_path (GPDB)
  *
- * Create a UniquePath to deduplicate based on the ctid and gp_segment_id,
- * or some other columns that uniquely identify a row. This is used as part
- * of implementing semi-joins (such as "x IN (SELECT ...)").
+ * Create a UniquePath to deduplicate based on a RowIdExp column. This is
+ * used as part of implementing semi-joins (such as "x IN (SELECT ...)").
  *
  * In PostgreSQL, semi-joins are implemented with JOIN_SEMI join types, or
  * by first eliminating duplicates from the inner side, and then performing
@@ -2063,24 +2324,21 @@ no_unique_path:			/* failure exit */
  * The JOIN_DEDUP_SEMI plan will look something like this:
  *
  * postgres=# explain select * from s where exists (select 1 from r where s.a = r.b);
- *                                                       QUERY PLAN                                                      
- * ----------------------------------------------------------------------------------------------------------------------
- *  Gather Motion 3:1  (slice3; segments: 3)  (cost=189.75..190.75 rows=100 width=18)
- *    ->  HashAggregate  (cost=189.75..190.75 rows=34 width=18)
- *          Group By: s.ctid::bigint, s.gp_segment_id
- *          ->  Result  (cost=11.75..189.25 rows=34 width=18)
- *                ->  Redistribute Motion 3:3  (slice2; segments: 3)  (cost=11.75..189.25 rows=34 width=18)
- *                      Hash Key: s.ctid
- *                      ->  Hash Join  (cost=11.75..187.25 rows=34 width=18)
- *                            Hash Cond: r.b = s.a
- *                            ->  Seq Scan on r  (cost=0.00..112.00 rows=3334 width=4)
- *                            ->  Hash  (cost=8.00..8.00 rows=100 width=18)
- *                                  ->  Broadcast Motion 3:3  (slice1; segments: 3)  (cost=0.00..8.00 rows=100 width=18)
- *                                        ->  Seq Scan on s  (cost=0.00..4.00 rows=34 width=18)
- *  Settings:  optimizer=off
- *  Optimizer status: legacy query optimizer
- * (14 rows)
- *
+ *                                                   QUERY PLAN                                                   
+ * ---------------------------------------------------------------------------------------------------------------
+ *  Gather Motion 3:1  (slice1; segments: 3)  (cost=153.50..155.83 rows=100 width=8)
+ *    ->  HashAggregate  (cost=153.50..153.83 rows=34 width=8)
+ *          Group Key: (RowIdExpr)
+ *          ->  Redistribute Motion 3:3  (slice2; segments: 3)  (cost=11.75..153.00 rows=34 width=8)
+ *                Hash Key: (RowIdExpr)
+ *                ->  Hash Join  (cost=11.75..151.00 rows=34 width=8)
+ *                      Hash Cond: (r.b = s.a)
+ *                      ->  Seq Scan on r  (cost=0.00..112.00 rows=3334 width=4)
+ *                      ->  Hash  (cost=8.00..8.00 rows=100 width=8)
+ *                            ->  Broadcast Motion 3:3  (slice3; segments: 3)  (cost=0.00..8.00 rows=100 width=8)
+ *                                  ->  Seq Scan on s  (cost=0.00..4.00 rows=34 width=8)
+ *  Optimizer: Postgres query optimizer
+ * (12 rows)
  *
  * In PostgreSQL, this is never better than doing a JOIN_SEMI directly.
  * But it can be a win in GPDB, if the distribution of the outer and inner
@@ -2103,7 +2361,7 @@ no_unique_path:			/* failure exit */
  *
  * The role of this function is to insert the UniquePath to represent
  * the deduplication above the join. Returns a UniquePath node representing
- * a "DISTINCT ON r1,...,rn" operator, where (r1,...,rn) represents a unique
+ * a "DISTINCT ON (RowIdExpr)" operator, where (r1,...,rn) represents a unique
  * identifier for each row of the cross product of the tables specified by
  * the 'distinct_relids' parameter.
  *
@@ -2119,9 +2377,9 @@ no_unique_path:			/* failure exit */
 UniquePath *
 create_unique_rowid_path(PlannerInfo *root,
 						 RelOptInfo *rel,
-                         Path        *subpath,
-                         Relids       distinct_relids,
-						 Relids       required_outer)
+						 Path        *subpath,
+						 Relids       required_outer,
+						 int          rowidexpr_id)
 {
 	UniquePath *pathnode;
 	CdbPathLocus locus;
@@ -2130,20 +2388,66 @@ create_unique_rowid_path(PlannerInfo *root,
 	int			numCols;
 	bool		all_btree;
 	bool		all_hash;
+	double		numsegments;
 
-    Assert(!bms_is_empty(distinct_relids));
+	Assert(rowidexpr_id > 0);
 
 	/*
 	 * For easier merging (albeit it's going to manual), keep this function
 	 * similar to create_unique_path(). In this function, we deduplicate based
-	 * on ctid and gp_segment_id, or other unique identifiers that we generate
-	 * on the fly. Sorting and hashing are both possible, but we keep these
-	 * as variables to resemble create_unique_path().
+	 * on RowIdExpr that we generate on the fly. Sorting and hashing are both
+	 * possible, but we keep these as variables to resemble
+	 * create_unique_path().
 	 */
 	all_btree = true;
-	all_hash = true;
+	all_hash = enable_hashagg;	/* don't consider hash if not enabled */
 
-	locus = subpath->locus;
+	RowIdExpr *rowidexpr = makeNode(RowIdExpr);
+	rowidexpr->rowidexpr_id = rowidexpr_id;
+
+	subpath->pathtarget = copy_pathtarget(subpath->pathtarget);
+	add_column_to_pathtarget(subpath->pathtarget, (Expr *) rowidexpr, 0);
+
+	/* Repartition first if duplicates might be on different QEs. */
+	if (!CdbPathLocus_IsBottleneck(subpath->locus))
+	{
+		int			numsegments = CdbPathLocus_NumSegments(subpath->locus);
+
+		locus = cdbpathlocus_from_exprs(root,
+										subpath->parent,
+										list_make1(rowidexpr),
+										list_make1_oid(cdb_default_distribution_opfamily_for_type(INT8OID)),
+										list_make1_int(0),
+										numsegments);
+		subpath = cdbpath_create_motion_path(root, subpath, NIL, false, locus);
+		if (!subpath)
+			return NULL;
+
+		/*
+		 * The motion path has been created correctly, but there's a little
+		 * problem with the locus. The locus has RowIdExpr as the distribution
+		 * key, but because there are no Vars in it, the EC machinery will
+		 * consider it a pseudo-constant. We don't want that, as it would
+		 * mean that all rows were considered to live on the same segment,
+		 * which is not how this works. Therefore set the locus of the Unique
+		 * path to Strewn, which doesn't have that problem. No node above the
+		 * Unique will care about the row id expresssion, so it's OK to forget
+		 * that the rows are currently hashed by the row id.
+		 */
+		CdbPathLocus_MakeStrewn(&locus, numsegments);
+	}
+	else
+	{
+		/* XXX If the join result is on a single node, a DEDUP plan probably doesn't
+		 * make sense.
+		 */
+		locus = subpath->locus;
+	}
+
+	if (CdbPathLocus_IsPartitioned(locus))
+		numsegments = CdbPathLocus_NumSegments(locus);
+	else
+		numsegments = 1;
 
 	/*
 	 * Start building the result Path object.
@@ -2152,10 +2456,14 @@ create_unique_rowid_path(PlannerInfo *root,
 
 	pathnode->path.pathtype = T_Unique;
 	pathnode->path.parent = rel;
+	pathnode->path.pathtarget = rel->reltarget;
 	pathnode->path.locus = locus;
+	pathnode->path.param_info = subpath->param_info;
+	pathnode->path.parallel_aware = false;
+	pathnode->path.parallel_safe = rel->consider_parallel &&
+		subpath->parallel_safe;
+	pathnode->path.parallel_workers = subpath->parallel_workers;
 
-	pathnode->path.param_info = get_baserel_parampathinfo(root, rel,
-													 required_outer);
 	/*
 	 * Treat the output as always unsorted, since we don't necessarily have
 	 * pathkeys to represent it.
@@ -2163,20 +2471,14 @@ create_unique_rowid_path(PlannerInfo *root,
 	pathnode->path.pathkeys = NIL;
 
 	pathnode->subpath = subpath;
-	pathnode->in_operators = NIL;
-	pathnode->uniq_exprs = NIL;
-	pathnode->distinct_on_rowid_relids = distinct_relids;
+	pathnode->in_operators = list_make1_oid(Int8EqualOperator);
+	pathnode->uniq_exprs = list_make1(rowidexpr);
 
 	/*
-	 * For cost estimation purposes, assume we'll deduplicate based on ctid and
-	 * gp_segment_id. If the outer side of the join is a join relation itself,
-	 * we'll need to deduplicate based on gp_segment_id and ctid of all the
-	 * involved base tables, or other identifiers. See cdbpath_dedup_fixup()
-	 * for the details, but here, for cost estimation purposes, just assume
-	 * it's going to be two columns.
+	 * This just removes duplicates generated by broadcasting rows earlier.
 	 */
-	numCols	= 2;
-	((Path*)pathnode)->rows = rel->rows;
+	pathnode->path.rows = clamp_row_est(rel->rows / numsegments);
+	numCols = 1;		/* the RowIdExpr */
 
 	if (all_btree)
 	{
@@ -2185,8 +2487,8 @@ create_unique_rowid_path(PlannerInfo *root,
 		 */
 		cost_sort(&sort_path, root, NIL,
 				  subpath->total_cost,
-				  rel->rows,
-				  rel->width,
+				  (rel->rows / numsegments),
+				  rel->reltarget->width,
 				  0, work_mem,
 				  -1.0);
 
@@ -2196,7 +2498,7 @@ create_unique_rowid_path(PlannerInfo *root,
 		 * probably this is an overestimate.)  This should agree with
 		 * make_unique.
 		 */
-		sort_path.total_cost += cpu_operator_cost * rel->rows * numCols;
+		sort_path.total_cost += cpu_operator_cost * (rel->rows / numsegments) * numCols;
 	}
 
 	if (all_hash)
@@ -2205,20 +2507,18 @@ create_unique_rowid_path(PlannerInfo *root,
 		 * Estimate the overhead per hashtable entry at 64 bytes (same as in
 		 * planner.c).
 		 */
-		int			hashentrysize = rel->width + 64;
+		int			hashentrysize = subpath->pathtarget->width + 64;
 
-		if (hashentrysize * ((Path*)pathnode)->rows > work_mem * 1024L)
+		if (hashentrysize * pathnode->path.rows > work_mem * 1024L)
 			all_hash = false;	/* don't try to hash */
 		else
 			cost_agg(&agg_path, root,
 					 AGG_HASHED, 0,
-					 numCols, ((Path*)pathnode)->rows,
+					 numCols, ((Path *)pathnode)->rows,
+					 NIL, /* no quals */
 					 subpath->startup_cost,
 					 subpath->total_cost,
-					 rel->rows,
-					 0, /* input_width */
-					 0, /* hash_batches */
-					 0, /* hashentry_width */
+					 (rel->rows / numsegments),
 					 false /* streaming */
 				);
 	}
@@ -2250,35 +2550,6 @@ create_unique_rowid_path(PlannerInfo *root,
 		pathnode->path.total_cost = sort_path.total_cost;
 	}
 
-    /* Add repartitioning cost if duplicates might be on different QEs. */
-    if (!CdbPathLocus_IsBottleneck(subpath->locus) &&
-        !cdbpathlocus_is_hashed_on_relids(subpath->locus, distinct_relids))
-    {
-        CdbMotionPath   motionpath;     /* dummy for cost estimate */
-        Cost            repartition_cost;
-
-        /* Tell create_unique_plan() to insert Motion operator atop subpath. */
-        pathnode->must_repartition = true;
-
-        /* Set a fake locus.  Repartitioning key won't be built until later. */
-        CdbPathLocus_MakeStrewn(&pathnode->path.locus,
-								CdbPathLocus_NumSegments(subpath->locus));
-		pathnode->path.sameslice_relids = NULL;
-
-        /* Estimate repartitioning cost. */
-        memset(&motionpath, 0, sizeof(motionpath));
-        motionpath.path.type = T_CdbMotionPath;
-        motionpath.path.parent = subpath->parent;
-        motionpath.path.locus = pathnode->path.locus;
-        motionpath.path.rows = subpath->rows;
-        motionpath.subpath = subpath;
-        cdbpath_cost_motion(root, &motionpath);
-
-        /* Add MotionPath cost to UniquePath cost. */
-        repartition_cost = motionpath.path.total_cost - subpath->total_cost;
-        pathnode->path.total_cost += repartition_cost;
-    }
-
 	/* see MPP-1140 */
 	if (pathnode->umethod == UNIQUE_PATH_HASH)
 	{
@@ -2304,6 +2575,66 @@ create_unique_rowid_path(PlannerInfo *root,
 
 	return pathnode;
 }                               /* create_unique_rowid_path */
+
+/*
+ * create_gather_merge_path
+ *
+ *	  Creates a path corresponding to a gather merge scan, returning
+ *	  the pathnode.
+ */
+GatherMergePath *
+create_gather_merge_path(PlannerInfo *root, RelOptInfo *rel, Path *subpath,
+						 PathTarget *target, List *pathkeys,
+						 Relids required_outer, double *rows)
+{
+	GatherMergePath *pathnode = makeNode(GatherMergePath);
+	Cost		input_startup_cost = 0;
+	Cost		input_total_cost = 0;
+
+	Assert(subpath->parallel_safe);
+	Assert(pathkeys);
+
+	pathnode->path.pathtype = T_GatherMerge;
+	pathnode->path.parent = rel;
+	pathnode->path.param_info = get_baserel_parampathinfo(root, rel,
+														  required_outer);
+	pathnode->path.parallel_aware = false;
+
+	pathnode->subpath = subpath;
+	pathnode->num_workers = subpath->parallel_workers;
+	pathnode->path.pathkeys = pathkeys;
+	pathnode->path.pathtarget = target ? target : rel->reltarget;
+	pathnode->path.rows += subpath->rows;
+
+	if (pathkeys_contained_in(pathkeys, subpath->pathkeys))
+	{
+		/* Subpath is adequately ordered, we won't need to sort it */
+		input_startup_cost += subpath->startup_cost;
+		input_total_cost += subpath->total_cost;
+	}
+	else
+	{
+		/* We'll need to insert a Sort node, so include cost for that */
+		Path		sort_path;	/* dummy for result of cost_sort */
+
+		cost_sort(&sort_path,
+				  root,
+				  pathkeys,
+				  subpath->total_cost,
+				  subpath->rows,
+				  subpath->pathtarget->width,
+				  0.0,
+				  work_mem,
+				  -1);
+		input_startup_cost += sort_path.startup_cost;
+		input_total_cost += sort_path.total_cost;
+	}
+
+	cost_gather_merge(pathnode, root, rel, pathnode->path.param_info,
+					  input_startup_cost, input_total_cost, rows);
+
+	return pathnode;
+}
 
 /*
  * translate_sub_tlist - get subquery column numbers represented by tlist
@@ -2336,189 +2667,79 @@ translate_sub_tlist(List *tlist, int relid)
 }
 
 /*
- * query_is_distinct_for - does query never return duplicates of the
- *		specified columns?
+ * create_gather_path
+ *	  Creates a path corresponding to a gather scan, returning the
+ *	  pathnode.
  *
- * colnos is an integer list of output column numbers (resno's).  We are
- * interested in whether rows consisting of just these columns are certain
- * to be distinct.  "Distinctness" is defined according to whether the
- * corresponding upper-level equality operators listed in opids would think
- * the values are distinct.  (Note: the opids entries could be cross-type
- * operators, and thus not exactly the equality operators that the subquery
- * would use itself.  We use equality_ops_are_compatible() to check
- * compatibility.  That looks at btree or hash opfamily membership, and so
- * should give trustworthy answers for all operators that we might need
- * to deal with here.)
+ * 'rows' may optionally be set to override row estimates from other sources.
  */
-static bool
-query_is_distinct_for(Query *query, List *colnos, List *opids)
+GatherPath *
+create_gather_path(PlannerInfo *root, RelOptInfo *rel, Path *subpath,
+				   PathTarget *target, Relids required_outer, double *rows)
 {
-	ListCell   *l;
-	Oid			opid;
+	GatherPath *pathnode = makeNode(GatherPath);
 
-	Assert(list_length(colnos) == list_length(opids));
+	Assert(subpath->parallel_safe);
 
-	/*
-	 * A set-returning function in the query's targetlist can result in
-	 * returning duplicate rows, if the SRF is evaluated after the
-	 * de-duplication step; so we play it safe and say "no" if there are any
-	 * SRFs.  (We could be certain that it's okay if SRFs appear only in the
-	 * specified columns, since those must be evaluated before de-duplication;
-	 * but it doesn't presently seem worth the complication to check that.)
-	 */
-	if (expression_returns_set((Node *) query->targetList))
-		return false;
+	pathnode->path.pathtype = T_Gather;
+	pathnode->path.parent = rel;
+	pathnode->path.pathtarget = target;
+	pathnode->path.param_info = get_baserel_parampathinfo(root, rel,
+														  required_outer);
+	pathnode->path.parallel_aware = false;
+	pathnode->path.parallel_safe = false;
+	pathnode->path.parallel_workers = 0;
+	pathnode->path.pathkeys = NIL;	/* Gather has unordered result */
 
-	/*
-	 * DISTINCT (including DISTINCT ON) guarantees uniqueness if all the
-	 * columns in the DISTINCT clause appear in colnos and operator semantics
-	 * match.
-	 */
-	if (query->distinctClause)
+	pathnode->subpath = subpath;
+	pathnode->num_workers = subpath->parallel_workers;
+	pathnode->single_copy = false;
+
+	if (pathnode->num_workers == 0)
 	{
-		foreach(l, query->distinctClause)
-		{
-			SortGroupClause *sgc = (SortGroupClause *) lfirst(l);
-			TargetEntry *tle = get_sortgroupclause_tle(sgc,
-													   query->targetList);
-
-			opid = distinct_col_search(tle->resno, colnos, opids);
-			if (!OidIsValid(opid) ||
-				!equality_ops_are_compatible(opid, sgc->eqop))
-				break;			/* exit early if no match */
-		}
-		if (l == NULL)			/* had matches for all? */
-			return true;
+		pathnode->path.pathkeys = subpath->pathkeys;
+		pathnode->num_workers = 1;
+		pathnode->single_copy = true;
 	}
 
-	/*
-	 * Similarly, GROUP BY guarantees uniqueness if all the grouped columns
-	 * appear in colnos and operator semantics match.
-	 */
-	if (query->groupClause)
-	{
-		List	   *grouptles;
-		List	   *sortops;
-		List	   *eqops;
-		ListCell   *l_eqop;
+	cost_gather(pathnode, root, rel, pathnode->path.param_info, rows);
 
-		get_sortgroupclauses_tles(query->groupClause, query->targetList,
-								  &grouptles, &sortops, &eqops);
+	/* GPDB_96_MERGE_FIXME: how do data distribution locus and parallelism work together? */
+	pathnode->path.locus = subpath->locus;
 
-		forboth(l, grouptles, l_eqop, eqops)
-		{
-			TargetEntry *tle = (TargetEntry *) lfirst(l);
-
-			opid = distinct_col_search(tle->resno, colnos, opids);
-			if (!OidIsValid(opid) ||
-				!equality_ops_are_compatible(opid, lfirst_oid(l_eqop)))
-				break;			/* exit early if no match */
-		}
-		if (l == NULL)			/* had matches for all? */
-			return true;
-	}
-	else
-	{
-		/*
-		 * If we have no GROUP BY, but do have aggregates or HAVING, then the
-		 * result is at most one row so it's surely unique, for any operators.
-		 */
-		if (query->hasAggs || query->havingQual)
-			return true;
-	}
-
-	/*
-	 * UNION, INTERSECT, EXCEPT guarantee uniqueness of the whole output row,
-	 * except with ALL.
-	 */
-	if (query->setOperations)
-	{
-		SetOperationStmt *topop = (SetOperationStmt *) query->setOperations;
-
-		Assert(IsA(topop, SetOperationStmt));
-		Assert(topop->op != SETOP_NONE);
-
-		if (!topop->all)
-		{
-			ListCell   *lg;
-
-			/* We're good if all the nonjunk output columns are in colnos */
-			lg = list_head(topop->groupClauses);
-			foreach(l, query->targetList)
-			{
-				TargetEntry *tle = (TargetEntry *) lfirst(l);
-				SortGroupClause *sgc;
-
-				if (tle->resjunk)
-					continue;	/* ignore resjunk columns */
-
-				/* non-resjunk columns should have grouping clauses */
-				Assert(lg != NULL);
-				sgc = (SortGroupClause *) lfirst(lg);
-				lg = lnext(lg);
-
-				opid = distinct_col_search(tle->resno, colnos, opids);
-				if (!OidIsValid(opid) ||
-					!equality_ops_are_compatible(opid, sgc->eqop))
-					break;		/* exit early if no match */
-			}
-			if (l == NULL)		/* had matches for all? */
-				return true;
-		}
-	}
-
-	/*
-	 * XXX Are there any other cases in which we can easily see the result
-	 * must be distinct?
-	 */
-
-	return false;
-}
-
-/*
- * distinct_col_search - subroutine for query_is_distinct_for
- *
- * If colno is in colnos, return the corresponding element of opids,
- * else return InvalidOid.  (We expect colnos does not contain duplicates,
- * so the result is well-defined.)
- */
-static Oid
-distinct_col_search(int colno, List *colnos, List *opids)
-{
-	ListCell   *lc1,
-			   *lc2;
-
-	forboth(lc1, colnos, lc2, opids)
-	{
-		if (colno == lfirst_int(lc1))
-			return lfirst_oid(lc2);
-	}
-	return InvalidOid;
+	return pathnode;
 }
 
 /*
  * create_subqueryscan_path
- *	  Creates a path corresponding to a sequential scan of a subquery,
+ *	  Creates a path corresponding to a scan of a subquery,
  *	  returning the pathnode.
  */
-Path *
-create_subqueryscan_path(PlannerInfo *root, RelOptInfo *rel,
-						 List *pathkeys, Relids required_outer)
+SubqueryScanPath *
+create_subqueryscan_path(PlannerInfo *root, RelOptInfo *rel, Path *subpath,
+						 List *pathkeys, CdbPathLocus locus, Relids required_outer)
 {
-	Path	   *pathnode = makeNode(Path);
+	SubqueryScanPath *pathnode = makeNode(SubqueryScanPath);
 
-	pathnode->pathtype = T_SubqueryScan;
-	pathnode->parent = rel;
-	pathnode->param_info = get_baserel_parampathinfo(root, rel,
-													 required_outer);
-	pathnode->pathkeys = pathkeys;
+	pathnode->path.pathtype = T_SubqueryScan;
+	pathnode->path.parent = rel;
+	pathnode->path.pathtarget = rel->reltarget;
+	pathnode->path.param_info = get_baserel_parampathinfo(root, rel,
+														  required_outer);
+	pathnode->path.parallel_aware = false;
+	pathnode->path.parallel_safe = rel->consider_parallel &&
+		subpath->parallel_safe;
+	pathnode->path.parallel_workers = subpath->parallel_workers;
+	pathnode->path.pathkeys = pathkeys;
+	pathnode->subpath = subpath;
 
-	pathnode->locus = cdbpathlocus_from_subquery(root, rel->subplan, rel->relid);
-	pathnode->motionHazard = true;          /* better safe than sorry */
-	pathnode->rescannable = false;
-	pathnode->sameslice_relids = NULL;
+	pathnode->path.locus = locus;
+	pathnode->path.motionHazard = subpath->motionHazard;
+	pathnode->path.rescannable = false;
+	pathnode->path.sameslice_relids = NULL;
 
-	cost_subqueryscan(pathnode, root, rel, pathnode->param_info);
+	pathnode->required_outer = bms_copy(required_outer);
+	cost_subqueryscan(pathnode, root, rel, pathnode->path.param_info);
 
 	return pathnode;
 }
@@ -2535,112 +2756,159 @@ create_functionscan_path(PlannerInfo *root, RelOptInfo *rel,
 {
 	Path	   *pathnode = makeNode(Path);
 	ListCell   *lc;
-	char		exec_location;
-	bool		contain_mutables = false;
 
 	pathnode->pathtype = T_FunctionScan;
 	pathnode->parent = rel;
+	pathnode->pathtarget = rel->reltarget;
 	pathnode->param_info = get_baserel_parampathinfo(root, rel,
 													 required_outer);
+	pathnode->parallel_aware = false;
+	pathnode->parallel_safe = rel->consider_parallel;
+	pathnode->parallel_workers = 0;
 	pathnode->pathkeys = pathkeys;
-
-	/*
-	 * If the function desires to run on segments, mark randomly-distributed.
-	 * If expression contains mutable functions, evaluate it on entry db.
-	 * Otherwise let it be evaluated in the same slice as its parent operator.
-	 */
-	Assert(rte->rtekind == RTE_FUNCTION);
 
 	/*
 	 * Decide where to execute the FunctionScan.
 	 */
-	contain_mutables = false;
-	exec_location = PROEXECLOCATION_ANY;
-	foreach (lc, rte->functions)
+	if (Gp_role == GP_ROLE_DISPATCH)
 	{
-		RangeTblFunction *rtfunc = (RangeTblFunction *) lfirst(lc);
+		char		exec_location = PROEXECLOCATION_ANY;
+		bool		contain_mutables = false;
+		bool		contain_outer_params = false;
 
-		if (rtfunc->funcexpr && IsA(rtfunc->funcexpr, FuncExpr))
+		/*
+		 * If the function desires to run on segments, mark randomly-distributed.
+		 * If expression contains mutable functions, evaluate it on entry db.
+		 * Otherwise let it be evaluated in the same slice as its parent operator.
+		 */
+		Assert(rte->rtekind == RTE_FUNCTION);
+
+		foreach (lc, rel->baserestrictinfo)
 		{
-			FuncExpr   *funcexpr = (FuncExpr *) rtfunc->funcexpr;
-			char		this_exec_location;
+			RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
 
-			this_exec_location = func_exec_location(funcexpr->funcid);
-
-			switch (this_exec_location)
+			if (rinfo->contain_outer_query_references)
 			{
-				case PROEXECLOCATION_ANY:
-					/*
-					 * This can be executed anywhere. Remember if it was
-					 * mutable (or contained any mutable arguments), that
-					 * will affect the decision after this loop on where
-					 * to actually execute it.
-					 */
-					if (!contain_mutables)
-						contain_mutables = contain_mutable_functions((Node *) funcexpr);
-					break;
-				case PROEXECLOCATION_MASTER:
-					/*
-					 * This function forces the execution to master.
-					 */
-					if (exec_location == PROEXECLOCATION_ALL_SEGMENTS)
-					{
-						ereport(ERROR,
-								(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-								 (errmsg("cannot mix EXECUTE ON MASTER and ALL SEGMENTS functions in same function scan"))));
-					}
-					exec_location = PROEXECLOCATION_MASTER;
-					break;
-				case PROEXECLOCATION_ALL_SEGMENTS:
-					/*
-					 * This function forces the execution to segments.
-					 */
-					if (exec_location == PROEXECLOCATION_MASTER)
-					{
-						ereport(ERROR,
-								(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-								 (errmsg("cannot mix EXECUTE ON MASTER and ALL SEGMENTS functions in same function scan"))));
-					}
-					exec_location = PROEXECLOCATION_ALL_SEGMENTS;
-					break;
-				default:
-					elog(ERROR, "unrecognized proexeclocation '%c'", exec_location);
+				contain_outer_params = true;
+				break;
 			}
 		}
-		else
+
+		foreach (lc, rte->functions)
 		{
-			/*
-			 * The expression might've been simplified into a Const. Which can
-			 * be executed anywhere.
-			 */
+			RangeTblFunction *rtfunc = (RangeTblFunction *) lfirst(lc);
+
+			if (rtfunc->funcexpr && IsA(rtfunc->funcexpr, FuncExpr))
+			{
+				FuncExpr   *funcexpr = (FuncExpr *) rtfunc->funcexpr;
+				char		this_exec_location;
+
+				this_exec_location = func_exec_location(funcexpr->funcid);
+
+				switch (this_exec_location)
+				{
+					case PROEXECLOCATION_ANY:
+						/*
+						 * This can be executed anywhere. Remember if it was
+						 * mutable (or contained any mutable arguments), that
+						 * will affect the decision after this loop on where
+						 * to actually execute it.
+						 */
+						if (!contain_mutables)
+							contain_mutables = contain_mutable_functions((Node *) funcexpr);
+						break;
+					case PROEXECLOCATION_COORDINATOR:
+						/*
+						 * This function forces the execution to master.
+						 */
+						if (exec_location == PROEXECLOCATION_ALL_SEGMENTS)
+						{
+							ereport(ERROR,
+									(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+									 (errmsg("cannot mix EXECUTE ON MASTER and ALL SEGMENTS functions in same function scan"))));
+						}
+						exec_location = PROEXECLOCATION_COORDINATOR;
+						break;
+					case PROEXECLOCATION_INITPLAN:
+						/*
+						 * This function forces the execution to master.
+						 */
+						if (exec_location == PROEXECLOCATION_ALL_SEGMENTS)
+						{
+							ereport(ERROR,
+									(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+									 (errmsg("cannot mix EXECUTE ON INITPLAN and ALL SEGMENTS functions in same function scan"))));
+						}
+						exec_location = PROEXECLOCATION_INITPLAN;
+						break;
+					case PROEXECLOCATION_ALL_SEGMENTS:
+						/*
+						 * This function forces the execution to segments.
+						 */
+						if (exec_location == PROEXECLOCATION_COORDINATOR)
+						{
+							ereport(ERROR,
+									(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+									 (errmsg("cannot mix EXECUTE ON MASTER and ALL SEGMENTS functions in same function scan"))));
+						}
+						exec_location = PROEXECLOCATION_ALL_SEGMENTS;
+						break;
+					default:
+						elog(ERROR, "unrecognized proexeclocation '%c'", exec_location);
+				}
+			}
+			else
+			{
+				/*
+				 * The expression might've been simplified into a Const. Which can
+				 * be executed anywhere.
+				 */
+			}
+
+			if (!contain_outer_params &&
+				contains_outer_params(rtfunc->funcexpr, root))
+				contain_outer_params = true;
+		}
+
+		switch (exec_location)
+		{
+			case PROEXECLOCATION_ANY:
+				/*
+				 * If all the functions are ON ANY, we presumably could execute
+				 * the function scan anywhere. However, historically, before the
+				 * EXECUTE ON syntax was introduced, we always executed
+				 * non-IMMUTABLE functions on the master. Keep that behavior
+				 * for backwards compatibility.
+				 */
+				if (contain_outer_params)
+					CdbPathLocus_MakeOuterQuery(&pathnode->locus);
+				else if (contain_mutables)
+					CdbPathLocus_MakeEntry(&pathnode->locus);
+				else
+					CdbPathLocus_MakeGeneral(&pathnode->locus);
+				break;
+			case PROEXECLOCATION_COORDINATOR:
+				if (contain_outer_params)
+					elog(ERROR, "cannot execute EXECUTE ON MASTER function in a subquery with arguments from outer query");
+				CdbPathLocus_MakeEntry(&pathnode->locus);
+				break;
+			case PROEXECLOCATION_INITPLAN:
+				if (contain_outer_params)
+					elog(ERROR, "cannot execute EXECUTE ON INITPLAN function in a subquery with arguments from outer query");
+				CdbPathLocus_MakeEntry(&pathnode->locus);
+				break;
+			case PROEXECLOCATION_ALL_SEGMENTS:
+				if (contain_outer_params)
+					elog(ERROR, "cannot execute EXECUTE ON ALL SEGMENTS function in a subquery with arguments from outer query");
+				CdbPathLocus_MakeStrewn(&pathnode->locus,
+										getgpsegmentCount());
+				break;
+			default:
+				elog(ERROR, "unrecognized proexeclocation '%c'", exec_location);
 		}
 	}
-	switch (exec_location)
-	{
-		case PROEXECLOCATION_ANY:
-			/*
-			 * If all the functions are ON ANY, we presumably could execute
-			 * the function scan anywhere. However, historically, before the
-			 * EXECUTE ON syntax was introduced, we always executed
-			 * non-IMMUTABLE functions on the master. Keep that behavior
-			 * for backwards compatibility.
-			 */
-			if (contain_mutables)
-				CdbPathLocus_MakeEntry(&pathnode->locus);
-			else
-				CdbPathLocus_MakeGeneral(&pathnode->locus,
-										 GP_POLICY_ALL_NUMSEGMENTS);
-			break;
-		case PROEXECLOCATION_MASTER:
-			CdbPathLocus_MakeEntry(&pathnode->locus);
-			break;
-		case PROEXECLOCATION_ALL_SEGMENTS:
-			CdbPathLocus_MakeStrewn(&pathnode->locus,
-									GP_POLICY_ALL_NUMSEGMENTS);
-			break;
-		default:
-			elog(ERROR, "unrecognized proexeclocation '%c'", exec_location);
-	}
+	else
+		CdbPathLocus_MakeEntry(&pathnode->locus);
 
 	pathnode->motionHazard = false;
 
@@ -2661,42 +2929,81 @@ create_functionscan_path(PlannerInfo *root, RelOptInfo *rel,
  * create_tablefunction_path
  *	  Creates a path corresponding to a sequential scan of a table function,
  *	  returning the pathnode.
+ *
+ * NB: This is a GPDB specific thing, to support this syntax:
+ *
+ *   SELECT * FROM multiset_5( TABLE( SELECT * from example) ) order by a, b;
+ *
+ * Despite the similar name, this is completely different from the upstream
+ * create_tablefuncscan_path() function below! The other function deals with
+ * XMLTABLE and similar functions.
  */
-Path *
-create_tablefunction_path(PlannerInfo *root, RelOptInfo *rel,
-						  RangeTblEntry *rte,
-						  Relids required_outer)
+TableFunctionScanPath *
+create_tablefunction_path(PlannerInfo *root, RelOptInfo *rel, Path *subpath,
+						  List *pathkeys, Relids required_outer)
 {
-	Path	   *pathnode = makeNode(Path);
-
-	Assert(rte->rtekind == RTE_TABLEFUNCTION);
+	TableFunctionScanPath *pathnode = makeNode(TableFunctionScanPath);
 
 	/* Setup the basics of the TableFunction path */
-	pathnode->pathtype	   = T_TableFunctionScan;
-	pathnode->parent	   = rel;
-	pathnode->param_info = get_baserel_parampathinfo(root, rel,
-													 required_outer);
-	pathnode->pathkeys	   = NIL;		/* no way to specify output ordering */
-	pathnode->motionHazard = true;      /* better safe than sorry */
-	pathnode->rescannable  = false;     /* better safe than sorry */
+	pathnode->path.pathtype = T_TableFunctionScan;
+	pathnode->path.parent = rel;
+	pathnode->path.pathtarget = rel->reltarget;
+	pathnode->path.param_info = get_baserel_parampathinfo(root, rel,
+														  required_outer);
+	pathnode->path.parallel_aware = false;
+	pathnode->path.parallel_safe = rel->consider_parallel &&
+		subpath->parallel_safe;
+	pathnode->path.parallel_workers = subpath->parallel_workers;
+	pathnode->path.pathkeys	   = NIL;		/* no way to specify output ordering */
+	pathnode->subpath = subpath;
+
+	pathnode->path.motionHazard = true;      /* better safe than sorry */
+	pathnode->path.rescannable  = false;     /* better safe than sorry */
 
 	/*
-	 * Inherit the locus of the input subquery.  This is necessary to handle the
+	 * Inherit the locus of the input subquery's path.  This is necessary to handle the
 	 * case of a General locus, e.g. if all the data has been concentrated to a
 	 * single segment then the output will all be on that segment, otherwise the
 	 * output must be declared as randomly distributed because we do not know
 	 * what relationship, if any, there is between the input data and the output
 	 * data.
 	 */
-	pathnode->locus = cdbpathlocus_from_subquery(root, rel->subplan, rel->relid);
+	pathnode->path.locus = subpath->locus;
 
 	/* Mark the output as random if the input is partitioned */
-	if (CdbPathLocus_IsPartitioned(pathnode->locus))
-		CdbPathLocus_MakeStrewn(&pathnode->locus,
-								CdbPathLocus_NumSegments(pathnode->locus));
-	pathnode->sameslice_relids = NULL;
+	if (CdbPathLocus_IsPartitioned(pathnode->path.locus))
+		CdbPathLocus_MakeStrewn(&pathnode->path.locus,
+								CdbPathLocus_NumSegments(pathnode->path.locus));
+	pathnode->path.sameslice_relids = NULL;
 
-	cost_tablefunction(pathnode, root, rel, pathnode->param_info);
+	cost_tablefunction(pathnode, root, rel, pathnode->path.param_info);
+
+	return pathnode;
+}
+
+/*
+ * create_tablefuncscan_path
+ *	  Creates a path corresponding to a sequential scan of a table function,
+ *	  returning the pathnode.
+ */
+Path *
+create_tablefuncscan_path(PlannerInfo *root, RelOptInfo *rel,
+						  Relids required_outer)
+{
+	Path	   *pathnode = makeNode(Path);
+
+	pathnode->pathtype = T_TableFuncScan;
+	pathnode->parent = rel;
+	pathnode->pathtarget = rel->reltarget;
+	pathnode->param_info = get_baserel_parampathinfo(root, rel,
+													 required_outer);
+	pathnode->parallel_aware = false;
+	pathnode->parallel_safe = rel->consider_parallel;
+	pathnode->parallel_workers = 0;
+	pathnode->pathkeys = NIL;	/* result is always unordered */
+	CdbPathLocus_MakeGeneral(&pathnode->locus);
+
+	cost_tablefuncscan(pathnode, root, rel, pathnode->param_info);
 
 	return pathnode;
 }
@@ -2715,8 +3022,12 @@ create_valuesscan_path(PlannerInfo *root, RelOptInfo *rel,
 
 	pathnode->pathtype = T_ValuesScan;
 	pathnode->parent = rel;
+	pathnode->pathtarget = rel->reltarget;
 	pathnode->param_info = get_baserel_parampathinfo(root, rel,
 													 required_outer);
+	pathnode->parallel_aware = false;
+	pathnode->parallel_safe = rel->consider_parallel;
+	pathnode->parallel_workers = 0;
 	pathnode->pathkeys = NIL;	/* result is always unordered */
 
 	/*
@@ -2727,10 +3038,12 @@ create_valuesscan_path(PlannerInfo *root, RelOptInfo *rel,
 	if (contain_mutable_functions((Node *)rte->values_lists))
 		CdbPathLocus_MakeEntry(&pathnode->locus);
 	else
+	{
 		/*
 		 * ValuesScan can be on any segment.
 		 */
-		CdbPathLocus_MakeGeneral(&pathnode->locus, GP_POLICY_ALL_NUMSEGMENTS);
+		CdbPathLocus_MakeGeneral(&pathnode->locus);
+	}
 
 	pathnode->motionHazard = false;
 	pathnode->rescannable = true;
@@ -2747,28 +3060,139 @@ create_valuesscan_path(PlannerInfo *root, RelOptInfo *rel,
  *	  returning the pathnode.
  */
 Path *
-create_ctescan_path(PlannerInfo *root, RelOptInfo *rel, List *pathkeys,
+create_ctescan_path(PlannerInfo *root, RelOptInfo *rel,
+					Path *subpath, CdbPathLocus locus,
+					List *pathkeys,
 					Relids required_outer)
 {
-	Path	   *pathnode = makeNode(Path);
+	CtePath	   *ctepath = makeNode(CtePath);
+	Path	   *pathnode = &ctepath->path;
 
 	pathnode->pathtype = T_CteScan;
 	pathnode->parent = rel;
+	pathnode->pathtarget = rel->reltarget;
 	pathnode->param_info = get_baserel_parampathinfo(root, rel,
 													 required_outer);
+	pathnode->parallel_aware = false;
+	pathnode->parallel_safe = rel->consider_parallel;
+	pathnode->parallel_workers = 0;
+	// GPDB_96_MERGE_FIXME: Why do we set pathkeys in GPDB, but not in Postgres?
+	// pathnode->pathkeys = NIL;	/* XXX for now, result is always unordered */
 	pathnode->pathkeys = pathkeys;
-
-	pathnode->locus = cdbpathlocus_from_subquery(root, rel->subplan, rel->relid);
+	pathnode->locus = locus;
 
 	/*
 	 * We can't extract these two values from the subplan, so we simple set
 	 * them to their worst case here.
+	 *
+	 * GPDB_96_MERGE_FIXME: we do have the subpath, at least if it's not a
+	 * shared cte
 	 */
 	pathnode->motionHazard = true;
 	pathnode->rescannable = false;
 	pathnode->sameslice_relids = NULL;
 
-	cost_ctescan(pathnode, root, rel, pathnode->param_info);
+	if (subpath)
+	{
+		/* copy the cost estimates from the subpath */
+		double		numsegments;
+
+		if (CdbPathLocus_IsPartitioned(locus))
+			numsegments = CdbPathLocus_NumSegments(locus);
+		else
+			numsegments = 1;
+
+		pathnode->rows = clamp_row_est(rel->rows / numsegments);
+		pathnode->startup_cost = subpath->startup_cost;
+		pathnode->total_cost = subpath->total_cost;
+
+		ctepath->subpath = subpath;
+	}
+	else
+	{
+		/* Shared scan. We'll use the cost estimates from the CTE rel. */
+		cost_ctescan(pathnode, root, rel, pathnode->param_info);
+	}
+
+	return pathnode;
+}
+
+/*
+ * create_namedtuplestorescan_path
+ *	  Creates a path corresponding to a scan of a named tuplestore, returning
+ *	  the pathnode.
+ */
+Path *
+create_namedtuplestorescan_path(PlannerInfo *root, RelOptInfo *rel,
+								Relids required_outer)
+{
+	Path	   *pathnode = makeNode(Path);
+
+	pathnode->pathtype = T_NamedTuplestoreScan;
+	pathnode->parent = rel;
+	pathnode->pathtarget = rel->reltarget;
+	pathnode->param_info = get_baserel_parampathinfo(root, rel,
+													 required_outer);
+	pathnode->parallel_aware = false;
+	pathnode->parallel_safe = rel->consider_parallel;
+	pathnode->parallel_workers = 0;
+	pathnode->pathkeys = NIL;	/* result is always unordered */
+
+	cost_namedtuplestorescan(pathnode, root, rel, pathnode->param_info);
+
+	/*
+	 * When this is used in triggers that run on QEs, the locus is ignored
+	 * and the scan is executed locally on the QE anyway. On QD, it's not
+	 * clear if named tuplestores are populated correctly in triggers, but if
+	 * it does work t all, Entry seems most appropriate.
+	 */
+	CdbPathLocus_MakeEntry(&pathnode->locus);
+
+	return pathnode;
+}
+
+/*
+ * create_resultscan_path
+ *	  Creates a path corresponding to a scan of an RTE_RESULT relation,
+ *	  returning the pathnode.
+ */
+Path *
+create_resultscan_path(PlannerInfo *root, RelOptInfo *rel,
+					   Relids required_outer)
+{
+	Path	   *pathnode = makeNode(Path);
+
+	pathnode->pathtype = T_Result;
+	pathnode->parent = rel;
+	pathnode->pathtarget = rel->reltarget;
+	pathnode->param_info = get_baserel_parampathinfo(root, rel,
+													 required_outer);
+	pathnode->parallel_aware = false;
+	pathnode->parallel_safe = rel->consider_parallel;
+	pathnode->parallel_workers = 0;
+	pathnode->pathkeys = NIL;	/* result is always unordered */
+
+	{
+		char		exec_location;
+
+		exec_location = check_execute_on_functions((Node *) rel->reltarget->exprs);
+
+		if (exec_location == PROEXECLOCATION_COORDINATOR)
+			CdbPathLocus_MakeEntry(&pathnode->locus);
+		else if (exec_location == PROEXECLOCATION_ALL_SEGMENTS)
+		{
+			/* GPDB_12_MERGE_FIXME: I'm not sure if this makes sense. This
+			 * would return multiple rows, one for each segment, but usually
+			 * a "SELECT func()" is expected to return just one row.
+			 */
+			CdbPathLocus_MakeStrewn(&pathnode->locus,
+									getgpsegmentCount());
+		}
+		else
+			CdbPathLocus_MakeGeneral(&pathnode->locus);
+	}
+
+	cost_resultscan(pathnode, root, rel, pathnode->param_info);
 
 	return pathnode;
 }
@@ -2780,36 +3204,22 @@ create_ctescan_path(PlannerInfo *root, RelOptInfo *rel, List *pathkeys,
  */
 Path *
 create_worktablescan_path(PlannerInfo *root, RelOptInfo *rel,
-						  CdbLocusType ctelocus,
+						  CdbPathLocus ctelocus,
 						  Relids required_outer)
 {
 	Path	   *pathnode = makeNode(Path);
-	CdbPathLocus result;
-	int			numsegments;
-
-	if (rel->cdbpolicy)
-		numsegments = rel->cdbpolicy->numsegments;
-	else
-		numsegments = GP_POLICY_ALL_NUMSEGMENTS; /* FIXME */
-
-	if (ctelocus == CdbLocusType_Entry)
-		CdbPathLocus_MakeEntry(&result);
-	else if (ctelocus == CdbLocusType_SingleQE)
-		CdbPathLocus_MakeSingleQE(&result, numsegments);
-	else if (ctelocus == CdbLocusType_General)
-		CdbPathLocus_MakeGeneral(&result, numsegments);
-	else if (ctelocus == CdbLocusType_SegmentGeneral)
-		CdbPathLocus_MakeSegmentGeneral(&result, numsegments);
-	else
-		CdbPathLocus_MakeStrewn(&result, numsegments);
 
 	pathnode->pathtype = T_WorkTableScan;
 	pathnode->parent = rel;
+	pathnode->pathtarget = rel->reltarget;
 	pathnode->param_info = get_baserel_parampathinfo(root, rel,
 													 required_outer);
+	pathnode->parallel_aware = false;
+	pathnode->parallel_safe = rel->consider_parallel;
+	pathnode->parallel_workers = 0;
 	pathnode->pathkeys = NIL;	/* result is always unordered */
 
-	pathnode->locus = result;
+	pathnode->locus = ctelocus;
 	pathnode->motionHazard = false;
 	pathnode->rescannable = true;
 	pathnode->sameslice_relids = rel->relids;
@@ -2820,10 +3230,6 @@ create_worktablescan_path(PlannerInfo *root, RelOptInfo *rel,
 	return pathnode;
 }
 
-/*
- * GPDB_92_MERGE_FIXME:Please check why isjoininner is removed.
- */
-
 bool
 path_contains_inner_index(Path *path)
 {
@@ -2831,8 +3237,6 @@ path_contains_inner_index(Path *path)
 	if (IsA(path, IndexPath))
 		return true;
 	else if (IsA(path, BitmapHeapPath))
-		return true;
-	else if (IsA(path, BitmapAppendOnlyPath))
 		return true;
 	else if (IsA(path, AppendPath))
 	{
@@ -2856,33 +3260,183 @@ path_contains_inner_index(Path *path)
 
 /*
  * create_foreignscan_path
- *	  Creates a path corresponding to a scan of a foreign table,
+ *	  Creates a path corresponding to a scan of a foreign base table,
  *	  returning the pathnode.
  *
  * This function is never called from core Postgres; rather, it's expected
  * to be called by the GetForeignPaths function of a foreign data wrapper.
- * We make the FDW supply all fields of the path, since we do not have any
- * way to calculate them in core.
+ * We make the FDW supply all fields of the path, since we do not have any way
+ * to calculate them in core.  However, there is a usually-sane default for
+ * the pathtarget (rel->reltarget), so we let a NULL for "target" select that.
  */
 ForeignPath *
 create_foreignscan_path(PlannerInfo *root, RelOptInfo *rel,
+						PathTarget *target,
 						double rows, Cost startup_cost, Cost total_cost,
 						List *pathkeys,
 						Relids required_outer,
+						Path *fdw_outerpath,
 						List *fdw_private)
 {
 	ForeignPath *pathnode = makeNode(ForeignPath);
 
+	/* Historically some FDWs were confused about when to use this */
+	Assert(IS_SIMPLE_REL(rel));
+
 	pathnode->path.pathtype = T_ForeignScan;
 	pathnode->path.parent = rel;
+	pathnode->path.pathtarget = target ? target : rel->reltarget;
 	pathnode->path.param_info = get_baserel_parampathinfo(root, rel,
 														  required_outer);
+	pathnode->path.parallel_aware = false;
+	pathnode->path.parallel_safe = rel->consider_parallel;
+	pathnode->path.parallel_workers = 0;
 	pathnode->path.rows = rows;
 	pathnode->path.startup_cost = startup_cost;
 	pathnode->path.total_cost = total_cost;
 	pathnode->path.pathkeys = pathkeys;
-	pathnode->path.locus = cdbpathlocus_from_baserel(root, rel);
 
+	switch (rel->exec_location)
+	{
+		case FTEXECLOCATION_ANY:
+			CdbPathLocus_MakeGeneral(&(pathnode->path.locus));
+			break;
+		case FTEXECLOCATION_ALL_SEGMENTS:
+			CdbPathLocus_MakeStrewn(&(pathnode->path.locus), getgpsegmentCount());
+			break;
+		case FTEXECLOCATION_COORDINATOR:
+			CdbPathLocus_MakeEntry(&(pathnode->path.locus));
+			break;
+		default:
+			elog(ERROR, "unrecognized exec_location '%c'", rel->exec_location);
+	}
+
+	pathnode->fdw_outerpath = fdw_outerpath;
+	pathnode->fdw_private = fdw_private;
+
+	return pathnode;
+}
+
+/*
+ * create_foreign_join_path
+ *	  Creates a path corresponding to a scan of a foreign join,
+ *	  returning the pathnode.
+ *
+ * This function is never called from core Postgres; rather, it's expected
+ * to be called by the GetForeignJoinPaths function of a foreign data wrapper.
+ * We make the FDW supply all fields of the path, since we do not have any way
+ * to calculate them in core.  However, there is a usually-sane default for
+ * the pathtarget (rel->reltarget), so we let a NULL for "target" select that.
+ */
+ForeignPath *
+create_foreign_join_path(PlannerInfo *root, RelOptInfo *rel,
+						 PathTarget *target,
+						 double rows, Cost startup_cost, Cost total_cost,
+						 List *pathkeys,
+						 Relids required_outer,
+						 Path *fdw_outerpath,
+						 List *fdw_private)
+{
+	ForeignPath *pathnode = makeNode(ForeignPath);
+
+	/*
+	 * We should use get_joinrel_parampathinfo to handle parameterized paths,
+	 * but the API of this function doesn't support it, and existing
+	 * extensions aren't yet trying to build such paths anyway.  For the
+	 * moment just throw an error if someone tries it; eventually we should
+	 * revisit this.
+	 */
+	if (!bms_is_empty(required_outer) || !bms_is_empty(rel->lateral_relids))
+		elog(ERROR, "parameterized foreign joins are not supported yet");
+
+	pathnode->path.pathtype = T_ForeignScan;
+	pathnode->path.parent = rel;
+	pathnode->path.pathtarget = target ? target : rel->reltarget;
+	pathnode->path.param_info = NULL;	/* XXX see above */
+	pathnode->path.parallel_aware = false;
+	pathnode->path.parallel_safe = rel->consider_parallel;
+	pathnode->path.parallel_workers = 0;
+	pathnode->path.rows = rows;
+	pathnode->path.startup_cost = startup_cost;
+	pathnode->path.total_cost = total_cost;
+	pathnode->path.pathkeys = pathkeys;
+
+	switch (rel->exec_location)
+	{
+		case FTEXECLOCATION_ANY:
+			CdbPathLocus_MakeGeneral(&(pathnode->path.locus));
+			break;
+		case FTEXECLOCATION_ALL_SEGMENTS:
+			CdbPathLocus_MakeStrewn(&(pathnode->path.locus), getgpsegmentCount());
+			break;
+		case FTEXECLOCATION_COORDINATOR:
+			CdbPathLocus_MakeEntry(&(pathnode->path.locus));
+			break;
+		default:
+			elog(ERROR, "unrecognized exec_location '%c'", rel->exec_location);
+	}
+
+	pathnode->fdw_outerpath = fdw_outerpath;
+	pathnode->fdw_private = fdw_private;
+
+	return pathnode;
+}
+
+/*
+ * create_foreign_upper_path
+ *	  Creates a path corresponding to an upper relation that's computed
+ *	  directly by an FDW, returning the pathnode.
+ *
+ * This function is never called from core Postgres; rather, it's expected to
+ * be called by the GetForeignUpperPaths function of a foreign data wrapper.
+ * We make the FDW supply all fields of the path, since we do not have any way
+ * to calculate them in core.  However, there is a usually-sane default for
+ * the pathtarget (rel->reltarget), so we let a NULL for "target" select that.
+ */
+ForeignPath *
+create_foreign_upper_path(PlannerInfo *root, RelOptInfo *rel,
+						  PathTarget *target,
+						  double rows, Cost startup_cost, Cost total_cost,
+						  List *pathkeys,
+						  Path *fdw_outerpath,
+						  List *fdw_private)
+{
+	ForeignPath *pathnode = makeNode(ForeignPath);
+
+	/*
+	 * Upper relations should never have any lateral references, since joining
+	 * is complete.
+	 */
+	Assert(bms_is_empty(rel->lateral_relids));
+
+	pathnode->path.pathtype = T_ForeignScan;
+	pathnode->path.parent = rel;
+	pathnode->path.pathtarget = target ? target : rel->reltarget;
+	pathnode->path.param_info = NULL;
+	pathnode->path.parallel_aware = false;
+	pathnode->path.parallel_safe = rel->consider_parallel;
+	pathnode->path.parallel_workers = 0;
+	pathnode->path.rows = rows;
+	pathnode->path.startup_cost = startup_cost;
+	pathnode->path.total_cost = total_cost;
+	pathnode->path.pathkeys = pathkeys;
+
+	switch (rel->exec_location)
+	{
+		case FTEXECLOCATION_ANY:
+			CdbPathLocus_MakeGeneral(&(pathnode->path.locus));
+			break;
+		case FTEXECLOCATION_ALL_SEGMENTS:
+			CdbPathLocus_MakeStrewn(&(pathnode->path.locus), getgpsegmentCount());
+			break;
+		case FTEXECLOCATION_COORDINATOR:
+			CdbPathLocus_MakeEntry(&(pathnode->path.locus));
+			break;
+		default:
+			elog(ERROR, "unrecognized exec_location '%c'", rel->exec_location);
+	}
+
+	pathnode->fdw_outerpath = fdw_outerpath;
 	pathnode->fdw_private = fdw_private;
 
 	return pathnode;
@@ -2895,14 +3449,15 @@ create_foreignscan_path(PlannerInfo *root, RelOptInfo *rel,
  * Note: result must not share storage with either input
  */
 Relids
-calc_nestloop_required_outer(Path *outer_path, Path *inner_path)
+calc_nestloop_required_outer(Relids outerrelids,
+							 Relids outer_paramrels,
+							 Relids innerrelids,
+							 Relids inner_paramrels)
 {
-	Relids		outer_paramrels = PATH_REQ_OUTER(outer_path);
-	Relids		inner_paramrels = PATH_REQ_OUTER(inner_path);
 	Relids		required_outer;
 
 	/* inner_path can require rels from outer path, but not vice versa */
-	Assert(!bms_overlap(outer_paramrels, inner_path->parent->relids));
+	Assert(!bms_overlap(outer_paramrels, innerrelids));
 	/* easy case if inner path is not parameterized */
 	if (!inner_paramrels)
 		return bms_copy(outer_paramrels);
@@ -2910,7 +3465,7 @@ calc_nestloop_required_outer(Path *outer_path, Path *inner_path)
 	required_outer = bms_union(outer_paramrels, inner_paramrels);
 	/* ... and remove any mention of now-satisfied outer rels */
 	required_outer = bms_del_members(required_outer,
-									 outer_path->parent->relids);
+									 outerrelids);
 	/* maintain invariant that required_outer is exactly NULL if empty */
 	if (bms_is_empty(required_outer))
 	{
@@ -2950,8 +3505,7 @@ calc_non_nestloop_required_outer(Path *outer_path, Path *inner_path)
  * 'joinrel' is the join relation.
  * 'jointype' is the type of join required
  * 'workspace' is the result from initial_cost_nestloop
- * 'sjinfo' is extra info about the join for selectivity estimation
- * 'semifactors' contains valid data if jointype is SEMI or ANTI
+ * 'extra' contains various information about the join
  * 'outer_path' is the outer path
  * 'inner_path' is the inner path
  * 'restrict_clauses' are the RestrictInfo nodes to apply at the join
@@ -2960,48 +3514,39 @@ calc_non_nestloop_required_outer(Path *outer_path, Path *inner_path)
  *
  * Returns the resulting path node.
  */
-NestPath *
+Path *
 create_nestloop_path(PlannerInfo *root,
 					 RelOptInfo *joinrel,
 					 JoinType jointype,
+					 JoinType orig_jointype,		/* CDB */
 					 JoinCostWorkspace *workspace,
-					 SpecialJoinInfo *sjinfo,
-					 SemiAntiJoinFactors *semifactors,
+					 JoinPathExtraData *extra,
 					 Path *outer_path,
 					 Path *inner_path,
 					 List *restrict_clauses,
-					 List *redistribution_clauses,    /*CDB*/
+					 List *redistribution_clauses,	/* CDB */
 					 List *pathkeys,
 					 Relids required_outer)
 {
 	NestPath   *pathnode;
 	CdbPathLocus join_locus;
-	bool		inner_must_be_local = false;
+	Relids		outer_req_outer = PATH_REQ_OUTER(outer_path);
+	bool		outer_must_be_local = !bms_is_empty(outer_req_outer);
 	Relids		inner_req_outer = PATH_REQ_OUTER(inner_path);
-
-	/*
-	 * CDB: Inner indexpath must execute in the same backend as the
-	 * nested join to receive input values from the outer rel.
-	 */
-	inner_must_be_local = path_contains_inner_index(inner_path);
-
-	/*
-	 * If the inner path is parameterized by the outer, we can't insert
-	 * a Motion node in between, because the parameter cannot be transferred
-	 * through the Motion
-	 */
-	if (bms_overlap(inner_req_outer, outer_path->parent->relids))
-		inner_must_be_local = true;
+	bool		inner_must_be_local = !bms_is_empty(inner_req_outer);
+	int			rowidexpr_id;
 
 	/* Add motion nodes above subpaths and decide where to join. */
 	join_locus = cdbpath_motion_for_join(root,
-										 jointype,
+										 orig_jointype,
 										 &outer_path,       /* INOUT */
 										 &inner_path,       /* INOUT */
+										 &rowidexpr_id,		/* OUT */
 										 redistribution_clauses,
+										 restrict_clauses,
 										 pathkeys,
 										 NIL,
-										 false,
+										 outer_must_be_local,
 										 inner_must_be_local);
 	if (CdbPathLocus_IsNull(join_locus))
 		return NULL;
@@ -3011,32 +3556,47 @@ create_nestloop_path(PlannerInfo *root,
 		pathkeys = NIL;
 
 	/*
+	 * If this join path is parameterized by a parameter above this path, then
+	 * this path needs to be rescannable. A NestLoop is rescannable, when both
+	 * outer and inner paths rescannable, so make them both rescannable.
+	 */
+	if (!outer_path->rescannable && !bms_is_empty(required_outer))
+	{
+		MaterialPath *matouter = create_material_path(root, outer_path->parent, outer_path);
+
+		matouter->cdb_shield_child_from_rescans = true;
+
+		outer_path = (Path *) matouter;
+	}
+
+	/*
 	 * If outer has at most one row, NJ will make at most one pass over inner.
 	 * Else materialize inner rel after motion so NJ can loop over results.
-	 * Skip if an intervening Unique operator will materialize.
 	 */
-	if (!outer_path->parent->onerow)
+	if (!inner_path->rescannable &&
+		(!outer_path->parent->onerow || !bms_is_empty(required_outer)))
 	{
-		if (!inner_path->rescannable)
-		{
-			/*
-			 * NLs potentially rescan the inner; if our inner path
-			 * isn't rescannable we have to add a materialize node
-			 */
-			inner_path = (Path *)create_material_path(root, inner_path->parent, inner_path);
+		/*
+		 * NLs potentially rescan the inner; if our inner path
+		 * isn't rescannable we have to add a materialize node
+		 */
+		MaterialPath *matinner = create_material_path(root, inner_path->parent, inner_path);
 
-			/*
-			 * If we have motion on the outer, to avoid a deadlock; we
-			 * need to set cdb_strict. In order for materialize to
-			 * fully fetch the underlying (required to avoid our
-			 * deadlock hazard) we must set cdb_strict!
-			 */
-			if (inner_path->motionHazard && outer_path->motionHazard)
-			{
-				((MaterialPath *) inner_path)->cdb_strict = true;
-				inner_path->motionHazard = false;
-			}
+		matinner->cdb_shield_child_from_rescans = true;
+
+		/*
+		 * If we have motion on the outer, to avoid a deadlock; we
+		 * need to set cdb_strict. In order for materialize to
+		 * fully fetch the underlying (required to avoid our
+		 * deadlock hazard) we must set cdb_strict!
+		 */
+		if (inner_path->motionHazard && outer_path->motionHazard)
+		{
+			matinner->cdb_strict = true;
+			matinner->path.motionHazard = false;
 		}
+
+		inner_path = (Path *) matinner;
 	}
 
 	/*
@@ -3069,16 +3629,23 @@ create_nestloop_path(PlannerInfo *root,
 	pathnode = makeNode(NestPath);
 	pathnode->path.pathtype = T_NestLoop;
 	pathnode->path.parent = joinrel;
+	pathnode->path.pathtarget = joinrel->reltarget;
 	pathnode->path.param_info =
 		get_joinrel_parampathinfo(root,
 								  joinrel,
 								  outer_path,
 								  inner_path,
-								  sjinfo,
+								  extra->sjinfo,
 								  required_outer,
 								  &restrict_clauses);
+	pathnode->path.parallel_aware = false;
+	pathnode->path.parallel_safe = joinrel->consider_parallel &&
+		outer_path->parallel_safe && inner_path->parallel_safe;
+	/* This is a foolish way to estimate parallel_workers, but for now... */
+	pathnode->path.parallel_workers = outer_path->parallel_workers;
 	pathnode->path.pathkeys = pathkeys;
 	pathnode->jointype = jointype;
+	pathnode->inner_unique = extra->inner_unique;
 	pathnode->outerjoinpath = outer_path;
 	pathnode->innerjoinpath = inner_path;
 	pathnode->joinrestrictinfo = restrict_clauses;
@@ -3097,11 +3664,40 @@ create_nestloop_path(PlannerInfo *root,
 	 */
 	initial_cost_nestloop(root, workspace, jointype,
 						  outer_path, inner_path,
-						  sjinfo, semifactors);
+						  extra);
 
-	final_cost_nestloop(root, pathnode, workspace, sjinfo, semifactors);
+	final_cost_nestloop(root, pathnode, workspace, extra);
 
-	return pathnode;
+	if (orig_jointype == JOIN_DEDUP_SEMI ||
+		orig_jointype == JOIN_DEDUP_SEMI_REVERSE)
+	{
+		return (Path *) create_unique_rowid_path(root,
+												 joinrel,
+												 (Path *) pathnode,
+												 pathnode->innerjoinpath->parent->relids,
+												 rowidexpr_id);
+	}
+
+	/*
+	 * Greenplum specific behavior:
+	 * If we find the join locus is general or segmentgeneral,
+	 * we should check the joinqual, if it contains volatile functions
+	 * we have to turn the join path to singleQE.
+	 *
+	 * NB: we do not add this logic in the above create_unique_rowid_path
+	 * code block, the reason is:
+	 *   create_unique_rowid_path is a technique to implement semi join
+	 *   using normal join, it can only happens for sublink query:
+	 *   1. if the sublink query contains volatile target list or havingQual
+	 *      it cannot be pulled up in pull_up_subquery, so it will be a
+	 *      subselect and be handled in the function set_subquery_pathlist
+	 *   2. if the sublink query contains volatile functions in joinqual
+	 *      or where clause, it will be handled in set_rel_pathlist and
+	 *      here.
+	 */
+	return turn_volatile_seggen_to_singleqe(root,
+											(Path *) pathnode,
+											(Node *) (pathnode->joinrestrictinfo));
 }
 
 /*
@@ -3112,7 +3708,7 @@ create_nestloop_path(PlannerInfo *root,
  * 'joinrel' is the join relation
  * 'jointype' is the type of join required
  * 'workspace' is the result from initial_cost_mergejoin
- * 'sjinfo' is extra info about the join for selectivity estimation
+ * 'extra' contains various information about the join
  * 'outer_path' is the outer path
  * 'inner_path' is the inner path
  * 'restrict_clauses' are the RestrictInfo nodes to apply at the join
@@ -3131,19 +3727,20 @@ create_nestloop_path(PlannerInfo *root,
  * 'innersortkeys' are the sort varkeys for the inner relation
  *      or NIL to use existing ordering
  */
-MergePath *
+Path *
 create_mergejoin_path(PlannerInfo *root,
 					  RelOptInfo *joinrel,
 					  JoinType jointype,
+					  JoinType orig_jointype,		/* CDB */
 					  JoinCostWorkspace *workspace,
-					  SpecialJoinInfo *sjinfo,
+					  JoinPathExtraData *extra,
 					  Path *outer_path,
 					  Path *inner_path,
 					  List *restrict_clauses,
 					  List *pathkeys,
 					  Relids required_outer,
 					  List *mergeclauses,
-					  List *redistribution_clauses,    /*CDB*/
+					  List *redistribution_clauses,	/* CDB */
 					  List *outersortkeys,
 					  List *innersortkeys)
 {
@@ -3153,6 +3750,7 @@ create_mergejoin_path(PlannerInfo *root,
 	List	   *innermotionkeys;
 	bool		preserve_outer_ordering;
 	bool		preserve_inner_ordering;
+	int			rowidexpr_id;
 
 	/*
 	 * GPDB_92_MERGE_FIXME: Should we keep the pathkeys_contained_in calls?
@@ -3190,11 +3788,16 @@ create_mergejoin_path(PlannerInfo *root,
 	else
 		preserve_outer_ordering = preserve_inner_ordering = false;
 
+	preserve_outer_ordering = preserve_outer_ordering || !bms_is_empty(PATH_REQ_OUTER(outer_path));
+	preserve_inner_ordering = preserve_inner_ordering || !bms_is_empty(PATH_REQ_OUTER(inner_path));
+
 	join_locus = cdbpath_motion_for_join(root,
-										 jointype,
+										 orig_jointype,
 										 &outer_path,       /* INOUT */
 										 &inner_path,       /* INOUT */
+										 &rowidexpr_id,
 										 redistribution_clauses,
+										 restrict_clauses,
 										 outermotionkeys,
 										 innermotionkeys,
 										 preserve_outer_ordering,
@@ -3215,14 +3818,20 @@ create_mergejoin_path(PlannerInfo *root,
 
 	pathnode->jpath.path.pathtype = T_MergeJoin;
 	pathnode->jpath.path.parent = joinrel;
+	pathnode->jpath.path.pathtarget = joinrel->reltarget;
 	pathnode->jpath.path.param_info =
 		get_joinrel_parampathinfo(root,
 								  joinrel,
 								  outer_path,
 								  inner_path,
-								  sjinfo,
+								  extra->sjinfo,
 								  required_outer,
 								  &restrict_clauses);
+	pathnode->jpath.path.parallel_aware = false;
+	pathnode->jpath.path.parallel_safe = joinrel->consider_parallel &&
+		outer_path->parallel_safe && inner_path->parallel_safe;
+	/* This is a foolish way to estimate parallel_workers, but for now... */
+	pathnode->jpath.path.parallel_workers = outer_path->parallel_workers;
 	pathnode->jpath.path.pathkeys = pathkeys;
 
 	pathnode->jpath.path.locus = join_locus;
@@ -3232,12 +3841,14 @@ create_mergejoin_path(PlannerInfo *root,
 	pathnode->jpath.path.sameslice_relids = bms_union(inner_path->sameslice_relids, outer_path->sameslice_relids);
 
 	pathnode->jpath.jointype = jointype;
+	pathnode->jpath.inner_unique = extra->inner_unique;
 	pathnode->jpath.outerjoinpath = outer_path;
 	pathnode->jpath.innerjoinpath = inner_path;
 	pathnode->jpath.joinrestrictinfo = restrict_clauses;
 	pathnode->path_mergeclauses = mergeclauses;
 	pathnode->outersortkeys = outersortkeys;
 	pathnode->innersortkeys = innersortkeys;
+	/* pathnode->skip_mark_restore will be set by final_cost_mergejoin */
 	/* pathnode->materialize_inner will be set by final_cost_mergejoin */
 
 	/*
@@ -3247,11 +3858,26 @@ create_mergejoin_path(PlannerInfo *root,
 	initial_cost_mergejoin(root, workspace, jointype, mergeclauses,
 						   outer_path, inner_path,
 						   outersortkeys, innersortkeys,
-						   sjinfo);
+						   extra);
 
-	final_cost_mergejoin(root, pathnode, workspace, sjinfo);
+	final_cost_mergejoin(root, pathnode, workspace, extra);
 
-	return pathnode;
+	if (orig_jointype == JOIN_DEDUP_SEMI ||
+		orig_jointype == JOIN_DEDUP_SEMI_REVERSE)
+	{
+		return (Path *) create_unique_rowid_path(root,
+												 joinrel,
+												 (Path *) pathnode,
+												 pathnode->jpath.innerjoinpath->parent->relids,
+												 rowidexpr_id);
+	}
+
+	/*
+	 * See the comments at the end of create_nestloop_path.
+	 */
+	return turn_volatile_seggen_to_singleqe(root,
+											(Path *) pathnode,
+											(Node *) (pathnode->jpath.joinrestrictinfo));
 }
 
 /*
@@ -3261,42 +3887,48 @@ create_mergejoin_path(PlannerInfo *root,
  * 'joinrel' is the join relation
  * 'jointype' is the type of join required
  * 'workspace' is the result from initial_cost_hashjoin
- * 'sjinfo' is extra info about the join for selectivity estimation
- * 'semifactors' contains valid data if jointype is SEMI or ANTI
+ * 'extra' contains various information about the join
  * 'outer_path' is the cheapest outer path
  * 'inner_path' is the cheapest inner path
+ * 'parallel_hash' to select Parallel Hash of inner path (shared hash table)
  * 'restrict_clauses' are the RestrictInfo nodes to apply at the join
  * 'required_outer' is the set of required outer rels
  * 'hashclauses' are the RestrictInfo nodes to use as hash clauses
  *		(this should be a subset of the restrict_clauses list)
  */
-HashPath *
+Path *
 create_hashjoin_path(PlannerInfo *root,
 					 RelOptInfo *joinrel,
 					 JoinType jointype,
+					 JoinType orig_jointype,		/* CDB */
 					 JoinCostWorkspace *workspace,
-					 SpecialJoinInfo *sjinfo,
-					 SemiAntiJoinFactors *semifactors,
+					 JoinPathExtraData *extra,
 					 Path *outer_path,
 					 Path *inner_path,
+					 bool parallel_hash,
 					 List *restrict_clauses,
 					 Relids required_outer,
-					 List *redistribution_clauses,    /*CDB*/
+					 List *redistribution_clauses,	/* CDB */
 					 List *hashclauses)
 {
 	HashPath   *pathnode;
 	CdbPathLocus join_locus;
+	bool		outer_must_be_local = !bms_is_empty(PATH_REQ_OUTER(outer_path));
+	bool		inner_must_be_local = !bms_is_empty(PATH_REQ_OUTER(inner_path));
+	int			rowidexpr_id;
 
 	/* Add motion nodes above subpaths and decide where to join. */
 	join_locus = cdbpath_motion_for_join(root,
-										 jointype,
+										 orig_jointype,
 										 &outer_path,       /* INOUT */
 										 &inner_path,       /* INOUT */
+										 &rowidexpr_id,
 										 redistribution_clauses,
+										 restrict_clauses,
 										 NIL,   /* don't care about ordering */
 										 NIL,
-										 false,
-										 false);
+										 outer_must_be_local,
+										 inner_must_be_local);
 	if (CdbPathLocus_IsNull(join_locus))
 		return NULL;
 
@@ -3308,15 +3940,14 @@ create_hashjoin_path(PlannerInfo *root,
 	 * the right row count, in case Broadcast Motion is inserted above an
 	 * input path.
 	 */
-	if (jointype == JOIN_INNER &&
-		root->config->gp_enable_hashjoin_size_heuristic)
+	if (jointype == JOIN_INNER && gp_enable_hashjoin_size_heuristic)
 	{
 		double		outersize;
 		double		innersize;
 
-		outersize = ExecHashRowSize(outer_path->parent->width) *
+		outersize = ExecHashRowSize(outer_path->parent->reltarget->width) *
 			outer_path->rows;
-		innersize = ExecHashRowSize(inner_path->parent->width) *
+		innersize = ExecHashRowSize(inner_path->parent->reltarget->width) *
 			inner_path->rows;
 
 		if (innersize > outersize)
@@ -3327,14 +3958,21 @@ create_hashjoin_path(PlannerInfo *root,
 
 	pathnode->jpath.path.pathtype = T_HashJoin;
 	pathnode->jpath.path.parent = joinrel;
+	pathnode->jpath.path.pathtarget = joinrel->reltarget;
 	pathnode->jpath.path.param_info =
 		get_joinrel_parampathinfo(root,
 								  joinrel,
 								  outer_path,
 								  inner_path,
-								  sjinfo,
+								  extra->sjinfo,
 								  required_outer,
 								  &restrict_clauses);
+	pathnode->jpath.path.parallel_aware =
+		joinrel->consider_parallel && parallel_hash;
+	pathnode->jpath.path.parallel_safe = joinrel->consider_parallel &&
+		outer_path->parallel_safe && inner_path->parallel_safe;
+	/* This is a foolish way to estimate parallel_workers, but for now... */
+	pathnode->jpath.path.parallel_workers = outer_path->parallel_workers;
 
 	/*
 	 * A hashjoin never has pathkeys, since its output ordering is
@@ -3351,6 +3989,7 @@ create_hashjoin_path(PlannerInfo *root,
 	pathnode->jpath.path.locus = join_locus;
 
 	pathnode->jpath.jointype = jointype;
+	pathnode->jpath.inner_unique = extra->inner_unique;
 	pathnode->jpath.outerjoinpath = outer_path;
 	pathnode->jpath.innerjoinpath = inner_path;
 	pathnode->jpath.joinrestrictinfo = restrict_clauses;
@@ -3378,12 +4017,1489 @@ create_hashjoin_path(PlannerInfo *root,
 	 */
 	initial_cost_hashjoin(root, workspace, jointype, hashclauses,
 						  outer_path, inner_path,
-						  sjinfo, semifactors);
+						  extra, parallel_hash);
 
-	final_cost_hashjoin(root, pathnode, workspace, sjinfo, semifactors);
+	final_cost_hashjoin(root, pathnode, workspace, extra);
+
+	if (orig_jointype == JOIN_DEDUP_SEMI ||
+		orig_jointype == JOIN_DEDUP_SEMI_REVERSE)
+	{
+		return (Path *) create_unique_rowid_path(root,
+												 joinrel,
+												 (Path *) pathnode,
+												 pathnode->jpath.innerjoinpath->parent->relids,
+												 rowidexpr_id);
+	}
+
+	/*
+	 * See the comments at the end of create_nestloop_path.
+	 */
+	return turn_volatile_seggen_to_singleqe(root,
+											(Path *) pathnode,
+											(Node *) (pathnode->jpath.joinrestrictinfo));
+}
+
+/*
+ * create_projection_path
+ *	  Creates a pathnode that represents performing a projection.
+ *
+ * 'rel' is the parent relation associated with the result
+ * 'subpath' is the path representing the source of data
+ * 'target' is the PathTarget to be computed
+ */
+ProjectionPath *
+create_projection_path(PlannerInfo *root,
+					   RelOptInfo *rel,
+					   Path *subpath,
+					   PathTarget *target)
+{
+	return create_projection_path_with_quals(root, rel,
+											 subpath, target,
+											 NIL, false);
+}
+
+ProjectionPath *
+create_projection_path_with_quals(PlannerInfo *root,
+								  RelOptInfo *rel,
+								  Path *subpath,
+								  PathTarget *target,
+								  List *restrict_clauses,
+								  bool need_param)
+{
+	ProjectionPath *pathnode = makeNode(ProjectionPath);
+	PathTarget *oldtarget = subpath->pathtarget;
+
+	pathnode->path.pathtype = T_Result;
+	pathnode->path.parent = rel;
+	pathnode->path.pathtarget = target;
+	pathnode->path.param_info = need_param ? subpath->param_info : NULL;
+	pathnode->path.parallel_aware = false;
+	pathnode->path.parallel_safe = rel->consider_parallel &&
+		subpath->parallel_safe &&
+		is_parallel_safe(root, (Node *) target->exprs);
+	pathnode->path.parallel_workers = subpath->parallel_workers;
+	/* Projection does not change the sort order */
+	pathnode->path.pathkeys = subpath->pathkeys;
+	pathnode->path.locus = subpath->locus;
+	pathnode->path.sameslice_relids = subpath->sameslice_relids;
+
+	pathnode->subpath = subpath;
+
+	/*
+	 * We might not need a separate Result node.  If the input plan node type
+	 * can project, we can just tell it to project something else.  Or, if it
+	 * can't project but the desired target has the same expression list as
+	 * what the input will produce anyway, we can still give it the desired
+	 * tlist (possibly changing its ressortgroupref labels, but nothing else).
+	 * Note: in the latter case, create_projection_plan has to recheck our
+	 * conclusion; see comments therein.
+	 *
+	 * GPDB: The 'restrict_clauses' is a GPDB addition. If the subpath supports
+	 * Filters, we could push them down too. But currently this is only used on
+	 * top of Material paths, which don't support it, so it doesn't matter.
+	 */
+	if (!restrict_clauses &&
+		(is_projection_capable_path(subpath) ||
+		 equal(oldtarget->exprs, target->exprs)))
+	{
+		/* No separate Result node needed */
+		pathnode->dummypp = true;
+
+		/*
+		 * Set cost of plan as subpath's cost, adjusted for tlist replacement.
+		 */
+		pathnode->path.rows = subpath->rows;
+		pathnode->path.startup_cost = subpath->startup_cost +
+			(target->cost.startup - oldtarget->cost.startup);
+		pathnode->path.total_cost = subpath->total_cost +
+			(target->cost.startup - oldtarget->cost.startup) +
+			(target->cost.per_tuple - oldtarget->cost.per_tuple) * subpath->rows;
+	}
+	else
+	{
+		/* We really do need the Result node */
+		pathnode->dummypp = false;
+
+		/*
+		 * The Result node's cost is cpu_tuple_cost per row, plus the cost of
+		 * evaluating the tlist.  There is no qual to worry about.
+		 */
+		pathnode->path.rows = subpath->rows;
+		pathnode->path.startup_cost = subpath->startup_cost +
+			target->cost.startup;
+		pathnode->path.total_cost = subpath->total_cost +
+			target->cost.startup +
+			(cpu_tuple_cost + target->cost.per_tuple) * subpath->rows;
+
+		pathnode->cdb_restrict_clauses = restrict_clauses;
+	}
 
 	return pathnode;
 }
+
+/*
+ * apply_projection_to_path
+ *	  Add a projection step, or just apply the target directly to given path.
+ *
+ * This has the same net effect as create_projection_path(), except that if
+ * a separate Result plan node isn't needed, we just replace the given path's
+ * pathtarget with the desired one.  This must be used only when the caller
+ * knows that the given path isn't referenced elsewhere and so can be modified
+ * in-place.
+ *
+ * If the input path is a GatherPath or GatherMergePath, we try to push the
+ * new target down to its input as well; this is a yet more invasive
+ * modification of the input path, which create_projection_path() can't do.
+ *
+ * Note that we mustn't change the source path's parent link; so when it is
+ * add_path'd to "rel" things will be a bit inconsistent.  So far that has
+ * not caused any trouble.
+ *
+ * 'rel' is the parent relation associated with the result
+ * 'path' is the path representing the source of data
+ * 'target' is the PathTarget to be computed
+ */
+Path *
+apply_projection_to_path(PlannerInfo *root,
+						 RelOptInfo *rel,
+						 Path *path,
+						 PathTarget *target)
+{
+	QualCost	oldcost;
+
+	/*
+	 * If given path can't project, we might need a Result node, so make a
+	 * separate ProjectionPath.
+	 */
+	if (!is_projection_capable_path(path))
+		return (Path *) create_projection_path(root, rel, path, target);
+
+	/*
+	 * We can just jam the desired tlist into the existing path, being sure to
+	 * update its cost estimates appropriately.
+	 */
+	oldcost = path->pathtarget->cost;
+	path->pathtarget = target;
+
+	path->startup_cost += target->cost.startup - oldcost.startup;
+	path->total_cost += target->cost.startup - oldcost.startup +
+		(target->cost.per_tuple - oldcost.per_tuple) * path->rows;
+
+	/*
+	 * If the path happens to be a Gather or GatherMerge path, we'd like to
+	 * arrange for the subpath to return the required target list so that
+	 * workers can help project.  But if there is something that is not
+	 * parallel-safe in the target expressions, then we can't.
+	 */
+	if ((IsA(path, GatherPath) ||IsA(path, GatherMergePath)) &&
+		is_parallel_safe(root, (Node *) target->exprs))
+	{
+		/*
+		 * We always use create_projection_path here, even if the subpath is
+		 * projection-capable, so as to avoid modifying the subpath in place.
+		 * It seems unlikely at present that there could be any other
+		 * references to the subpath, but better safe than sorry.
+		 *
+		 * Note that we don't change the parallel path's cost estimates; it
+		 * might be appropriate to do so, to reflect the fact that the bulk of
+		 * the target evaluation will happen in workers.
+		 */
+		if (IsA(path, GatherPath))
+		{
+			GatherPath *gpath = (GatherPath *) path;
+
+			gpath->subpath = (Path *)
+				create_projection_path(root,
+									   gpath->subpath->parent,
+									   gpath->subpath,
+									   target);
+		}
+		else
+		{
+			GatherMergePath *gmpath = (GatherMergePath *) path;
+
+			gmpath->subpath = (Path *)
+				create_projection_path(root,
+									   gmpath->subpath->parent,
+									   gmpath->subpath,
+									   target);
+		}
+	}
+	else if (path->parallel_safe &&
+			 !is_parallel_safe(root, (Node *) target->exprs))
+	{
+		/*
+		 * We're inserting a parallel-restricted target list into a path
+		 * currently marked parallel-safe, so we have to mark it as no longer
+		 * safe.
+		 */
+		path->parallel_safe = false;
+	}
+
+	return path;
+}
+
+/*
+ * create_set_projection_path
+ *	  Creates a pathnode that represents performing a projection that
+ *	  includes set-returning functions.
+ *
+ * 'rel' is the parent relation associated with the result
+ * 'subpath' is the path representing the source of data
+ * 'target' is the PathTarget to be computed
+ */
+ProjectSetPath *
+create_set_projection_path(PlannerInfo *root,
+						   RelOptInfo *rel,
+						   Path *subpath,
+						   PathTarget *target)
+{
+	ProjectSetPath *pathnode = makeNode(ProjectSetPath);
+	double		tlist_rows;
+	ListCell   *lc;
+
+	pathnode->path.pathtype = T_ProjectSet;
+	pathnode->path.parent = rel;
+	pathnode->path.pathtarget = target;
+	/* For now, assume we are above any joins, so no parameterization */
+	pathnode->path.param_info = NULL;
+	pathnode->path.parallel_aware = false;
+	pathnode->path.parallel_safe = rel->consider_parallel &&
+		subpath->parallel_safe &&
+		is_parallel_safe(root, (Node *) target->exprs);
+	pathnode->path.parallel_workers = subpath->parallel_workers;
+	/* Projection does not change the sort order XXX? */
+	pathnode->path.pathkeys = subpath->pathkeys;
+	pathnode->path.locus = subpath->locus;
+
+	pathnode->subpath = subpath;
+
+	/*
+	 * Estimate number of rows produced by SRFs for each row of input; if
+	 * there's more than one in this node, use the maximum.
+	 */
+	tlist_rows = 1;
+	foreach(lc, target->exprs)
+	{
+		Node	   *node = (Node *) lfirst(lc);
+		double		itemrows;
+
+		itemrows = expression_returns_set_rows(root, node);
+		if (tlist_rows < itemrows)
+			tlist_rows = itemrows;
+	}
+
+	/*
+	 * In addition to the cost of evaluating the tlist, charge cpu_tuple_cost
+	 * per input row, and half of cpu_tuple_cost for each added output row.
+	 * This is slightly bizarre maybe, but it's what 9.6 did; we may revisit
+	 * this estimate later.
+	 */
+	pathnode->path.rows = subpath->rows * tlist_rows;
+	pathnode->path.startup_cost = subpath->startup_cost +
+		target->cost.startup;
+	pathnode->path.total_cost = subpath->total_cost +
+		target->cost.startup +
+		(cpu_tuple_cost + target->cost.per_tuple) * subpath->rows +
+		(pathnode->path.rows - subpath->rows) * cpu_tuple_cost / 2;
+
+	return pathnode;
+}
+
+/*
+ * create_sort_path
+ *	  Creates a pathnode that represents performing an explicit sort.
+ *
+ * 'rel' is the parent relation associated with the result
+ * 'subpath' is the path representing the source of data
+ * 'pathkeys' represents the desired sort order
+ * 'limit_tuples' is the estimated bound on the number of output tuples,
+ *		or -1 if no LIMIT or couldn't estimate
+ */
+SortPath *
+create_sort_path(PlannerInfo *root,
+				 RelOptInfo *rel,
+				 Path *subpath,
+				 List *pathkeys,
+				 double limit_tuples)
+{
+	SortPath   *pathnode = makeNode(SortPath);
+
+	pathnode->path.pathtype = T_Sort;
+	pathnode->path.parent = rel;
+	/* Sort doesn't project, so use source path's pathtarget */
+	pathnode->path.pathtarget = subpath->pathtarget;
+	/* For now, assume we are above any joins, so no parameterization */
+	pathnode->path.param_info = NULL;
+	pathnode->path.parallel_aware = false;
+	pathnode->path.parallel_safe = rel->consider_parallel &&
+		subpath->parallel_safe;
+	pathnode->path.parallel_workers = subpath->parallel_workers;
+	pathnode->path.pathkeys = pathkeys;
+	pathnode->path.locus = subpath->locus;
+
+	pathnode->subpath = subpath;
+
+	cost_sort(&pathnode->path, root, pathkeys,
+			  subpath->total_cost,
+			  subpath->rows,
+			  subpath->pathtarget->width,
+			  0.0,				/* XXX comparison_cost shouldn't be 0? */
+			  work_mem, limit_tuples);
+
+	return pathnode;
+}
+
+#ifdef NOT_USED /* Group nodes are not used in GPDB */
+/*
+ * create_group_path
+ *	  Creates a pathnode that represents performing grouping of presorted input
+ *
+ * 'rel' is the parent relation associated with the result
+ * 'subpath' is the path representing the source of data
+ * 'target' is the PathTarget to be computed
+ * 'groupClause' is a list of SortGroupClause's representing the grouping
+ * 'qual' is the HAVING quals if any
+ * 'numGroups' is the estimated number of groups
+ */
+GroupPath *
+create_group_path(PlannerInfo *root,
+				  RelOptInfo *rel,
+				  Path *subpath,
+				  List *groupClause,
+				  List *qual,
+				  double numGroups)
+{
+	GroupPath  *pathnode = makeNode(GroupPath);
+	PathTarget *target = rel->reltarget;
+
+	pathnode->path.pathtype = T_Group;
+	pathnode->path.parent = rel;
+	pathnode->path.pathtarget = target;
+	/* For now, assume we are above any joins, so no parameterization */
+	pathnode->path.param_info = NULL;
+	pathnode->path.parallel_aware = false;
+	pathnode->path.parallel_safe = rel->consider_parallel &&
+		subpath->parallel_safe;
+	pathnode->path.parallel_workers = subpath->parallel_workers;
+	/* Group doesn't change sort ordering */
+	pathnode->path.pathkeys = subpath->pathkeys;
+
+	pathnode->subpath = subpath;
+
+	pathnode->groupClause = groupClause;
+	pathnode->qual = qual;
+
+	cost_group(&pathnode->path, root,
+			   list_length(groupClause),
+			   numGroups,
+			   qual,
+			   subpath->startup_cost, subpath->total_cost,
+			   subpath->rows);
+
+	/* add tlist eval cost for each output row */
+	pathnode->path.startup_cost += target->cost.startup;
+	pathnode->path.total_cost += target->cost.startup +
+		target->cost.per_tuple * pathnode->path.rows;
+
+	return pathnode;
+}
+#endif
+
+/*
+ * create_upper_unique_path
+ *	  Creates a pathnode that represents performing an explicit Unique step
+ *	  on presorted input.
+ *
+ * This produces a Unique plan node, but the use-case is so different from
+ * create_unique_path that it doesn't seem worth trying to merge the two.
+ *
+ * 'rel' is the parent relation associated with the result
+ * 'subpath' is the path representing the source of data
+ * 'numCols' is the number of grouping columns
+ * 'numGroups' is the estimated number of groups
+ *
+ * The input path must be sorted on the grouping columns, plus possibly
+ * additional columns; so the first numCols pathkeys are the grouping columns
+ */
+UpperUniquePath *
+create_upper_unique_path(PlannerInfo *root,
+						 RelOptInfo *rel,
+						 Path *subpath,
+						 int numCols,
+						 double numGroups)
+{
+	UpperUniquePath *pathnode = makeNode(UpperUniquePath);
+
+	pathnode->path.pathtype = T_Unique;
+	pathnode->path.parent = rel;
+	/* Unique doesn't project, so use source path's pathtarget */
+	pathnode->path.pathtarget = subpath->pathtarget;
+	/* For now, assume we are above any joins, so no parameterization */
+	pathnode->path.param_info = NULL;
+	pathnode->path.parallel_aware = false;
+	pathnode->path.parallel_safe = rel->consider_parallel &&
+		subpath->parallel_safe;
+	pathnode->path.parallel_workers = subpath->parallel_workers;
+	/* Unique doesn't change the input ordering */
+	pathnode->path.pathkeys = subpath->pathkeys;
+	pathnode->path.locus = subpath->locus;
+
+	pathnode->subpath = subpath;
+	pathnode->numkeys = numCols;
+
+	/*
+	 * Charge one cpu_operator_cost per comparison per input tuple. We assume
+	 * all columns get compared at most of the tuples.  (XXX probably this is
+	 * an overestimate.)
+	 */
+	pathnode->path.startup_cost = subpath->startup_cost;
+	pathnode->path.total_cost = subpath->total_cost +
+		cpu_operator_cost * subpath->rows * numCols;
+	pathnode->path.rows = numGroups;
+
+	return pathnode;
+}
+
+/*
+ * create_agg_path
+ *	  Creates a pathnode that represents performing aggregation/grouping
+ *
+ * 'rel' is the parent relation associated with the result
+ * 'subpath' is the path representing the source of data
+ * 'target' is the PathTarget to be computed
+ * 'aggstrategy' is the Agg node's basic implementation strategy
+ * 'aggsplit' is the Agg node's aggregate-splitting mode
+ * 'groupClause' is a list of SortGroupClause's representing the grouping
+ * 'qual' is the HAVING quals if any
+ * 'aggcosts' contains cost info about the aggregate functions to be computed
+ * 'numGroups' is the estimated number of groups (1 if not grouping)
+ */
+AggPath *
+create_agg_path(PlannerInfo *root,
+				RelOptInfo *rel,
+				Path *subpath,
+				PathTarget *target,
+				AggStrategy aggstrategy,
+				AggSplit aggsplit,
+				bool streaming,
+				List *groupClause,
+				List *qual,
+				const AggClauseCosts *aggcosts,
+				double numGroups)
+{
+	AggPath    *pathnode = makeNode(AggPath);
+
+	pathnode->path.pathtype = T_Agg;
+	pathnode->path.parent = rel;
+	pathnode->path.pathtarget = target;
+	/* For now, assume we are above any joins, so no parameterization */
+	pathnode->path.param_info = NULL;
+	pathnode->path.parallel_aware = false;
+	pathnode->path.parallel_safe = rel->consider_parallel &&
+		subpath->parallel_safe;
+	pathnode->path.parallel_workers = subpath->parallel_workers;
+	if (aggstrategy == AGG_SORTED)
+		pathnode->path.pathkeys = subpath->pathkeys;	/* preserves order */
+	else
+		pathnode->path.pathkeys = NIL;	/* output is unordered */
+	pathnode->subpath = subpath;
+	pathnode->streaming = streaming;
+
+	pathnode->aggstrategy = aggstrategy;
+	pathnode->aggsplit = aggsplit;
+	pathnode->numGroups = numGroups;
+	pathnode->groupClause = groupClause;
+	pathnode->qual = qual;
+
+	cost_agg(&pathnode->path, root,
+			 aggstrategy, aggcosts,
+			 list_length(groupClause), numGroups,
+			 qual,
+			 subpath->startup_cost, subpath->total_cost,
+			 subpath->rows, subpath->pathtarget->width);
+
+	/* add tlist eval cost for each output row */
+	pathnode->path.startup_cost += target->cost.startup;
+	pathnode->path.total_cost += target->cost.startup +
+		target->cost.per_tuple * pathnode->path.rows;
+
+	pathnode->path.locus = subpath->locus;
+
+	return pathnode;
+}
+
+/*
+ * create_tup_split_path
+ *	  Creates a pathnode that represents performing TupleSplit
+ *
+ * 'rel' is the parent relation associated with the result
+ * 'subpath' is the path representing the source of data
+ * 'target' is the PathTarget to be computed
+ * 'groupClause' is a list of SortGroupClause's representing the grouping
+ * 'numGroups' is the estimated number of groups (1 if not grouping)
+ * 'bitmapset' is the bitmap of DQA expr Index in PathTarget
+ * 'numDisDQAs' is the number of bitmapset size
+ */
+TupleSplitPath *
+create_tup_split_path(PlannerInfo *root,
+					  RelOptInfo *rel,
+					  Path *subpath,
+					  PathTarget *target,
+					  List *groupClause,
+					  List *dqa_expr_lst)
+{
+	TupleSplitPath *pathnode = makeNode(TupleSplitPath);
+
+	pathnode->path.pathtype = T_TupleSplit;
+	pathnode->path.parent = rel;
+	pathnode->path.pathtarget = target;
+
+	/* For now, assume we are above any joins, so no parameterization */
+	pathnode->path.param_info = NULL;
+	pathnode->path.parallel_aware = false;
+	pathnode->path.parallel_safe = rel->consider_parallel &&
+		subpath->parallel_safe;
+	pathnode->path.parallel_workers = subpath->parallel_workers;
+	pathnode->path.pathkeys = NIL;
+
+	pathnode->subpath = subpath;
+	pathnode->groupClause = groupClause;
+
+	pathnode->dqa_expr_lst = dqa_expr_lst;
+
+	cost_tup_split(&pathnode->path, root, list_length(dqa_expr_lst),
+				   subpath->startup_cost, subpath->total_cost,
+				   subpath->rows);
+
+	CdbPathLocus_MakeStrewn(&pathnode->path.locus,
+							subpath->locus.numsegments);
+
+	return pathnode;
+}
+
+/*
+ * create_groupingsets_path
+ *	  Creates a pathnode that represents performing GROUPING SETS aggregation
+ *
+ * GroupingSetsPath represents sorted grouping with one or more grouping sets.
+ * The input path's result must be sorted to match the last entry in
+ * rollup_groupclauses.
+ *
+ * 'rel' is the parent relation associated with the result
+ * 'subpath' is the path representing the source of data
+ * 'target' is the PathTarget to be computed
+ * 'having_qual' is the HAVING quals if any
+ * 'rollups' is a list of RollupData nodes
+ * 'agg_costs' contains cost info about the aggregate functions to be computed
+ * 'numGroups' is the estimated total number of groups
+ */
+GroupingSetsPath *
+create_groupingsets_path(PlannerInfo *root,
+						 RelOptInfo *rel,
+						 Path *subpath,
+						 AggSplit aggsplit,
+						 List *having_qual,
+						 AggStrategy aggstrategy,
+						 List *rollups,
+						 const AggClauseCosts *agg_costs,
+						 double numGroups)
+{
+	GroupingSetsPath *pathnode = makeNode(GroupingSetsPath);
+	PathTarget *target = rel->reltarget;
+	ListCell   *lc;
+	bool		is_first = true;
+	bool		is_first_sort = true;
+
+	/* The topmost generated Plan node will be an Agg */
+	pathnode->path.pathtype = T_Agg;
+	pathnode->path.parent = rel;
+	pathnode->path.pathtarget = target;
+	pathnode->path.param_info = subpath->param_info;
+	pathnode->path.parallel_aware = false;
+	pathnode->path.parallel_safe = rel->consider_parallel &&
+		subpath->parallel_safe;
+	pathnode->path.parallel_workers = subpath->parallel_workers;
+	pathnode->subpath = subpath;
+
+	/*
+	 * Simplify callers by downgrading AGG_SORTED to AGG_PLAIN, and AGG_MIXED
+	 * to AGG_HASHED, here if possible.
+	 */
+	if (aggstrategy == AGG_SORTED &&
+		list_length(rollups) == 1 &&
+		((RollupData *) linitial(rollups))->groupClause == NIL)
+		aggstrategy = AGG_PLAIN;
+
+	if (aggstrategy == AGG_MIXED &&
+		list_length(rollups) == 1)
+		aggstrategy = AGG_HASHED;
+
+	/*
+	 * Output will be in sorted order by group_pathkeys if, and only if, there
+	 * is a single rollup operation on a non-empty list of grouping
+	 * expressions.
+	 */
+	if (aggstrategy == AGG_SORTED && list_length(rollups) == 1)
+		pathnode->path.pathkeys = root->group_pathkeys;
+	else
+		pathnode->path.pathkeys = NIL;
+
+	pathnode->aggsplit = aggsplit;
+	pathnode->aggstrategy = aggstrategy;
+	pathnode->rollups = rollups;
+	pathnode->qual = having_qual;
+
+	Assert(rollups != NIL);
+	Assert(aggstrategy != AGG_PLAIN || list_length(rollups) == 1);
+	Assert(aggstrategy != AGG_MIXED || list_length(rollups) > 1);
+
+	foreach(lc, rollups)
+	{
+		RollupData *rollup = lfirst(lc);
+		List	   *gsets = rollup->gsets;
+		int			numGroupCols = list_length(linitial(gsets));
+
+		/*
+		 * In AGG_SORTED or AGG_PLAIN mode, the first rollup takes the
+		 * (already-sorted) input, and following ones do their own sort.
+		 *
+		 * In AGG_HASHED mode, there is one rollup for each grouping set.
+		 *
+		 * In AGG_MIXED mode, the first rollups are hashed, the first
+		 * non-hashed one takes the (already-sorted) input, and following ones
+		 * do their own sort.
+		 */
+		if (is_first)
+		{
+			cost_agg(&pathnode->path, root,
+					 aggstrategy,
+					 agg_costs,
+					 numGroupCols,
+					 estimate_num_groups_on_segment(rollup->numGroups,
+													subpath->rows,
+													subpath->locus),
+					 having_qual,
+					 subpath->startup_cost,
+					 subpath->total_cost,
+					 subpath->rows,
+					 subpath->pathtarget->width);
+			is_first = false;
+			if (!rollup->is_hashed)
+				is_first_sort = false;
+		}
+		else
+		{
+			Path		sort_path;	/* dummy for result of cost_sort */
+			Path		agg_path;	/* dummy for result of cost_agg */
+
+			if (rollup->is_hashed || is_first_sort)
+			{
+				/*
+				 * Account for cost of aggregation, but don't charge input
+				 * cost again
+				 */
+				cost_agg(&agg_path, root,
+						 rollup->is_hashed ? AGG_HASHED : AGG_SORTED,
+						 agg_costs,
+						 numGroupCols,
+						 estimate_num_groups_on_segment(rollup->numGroups,
+														subpath->rows,
+														subpath->locus),
+						 having_qual,
+						 0.0, 0.0,
+						 subpath->rows,
+						 subpath->pathtarget->width);
+				if (!rollup->is_hashed)
+					is_first_sort = false;
+			}
+			else
+			{
+				/* Account for cost of sort, but don't charge input cost again */
+				cost_sort(&sort_path, root, NIL,
+						  0.0,
+						  subpath->rows,
+						  subpath->pathtarget->width,
+						  0.0,
+						  work_mem,
+						  -1.0);
+
+				/* Account for cost of aggregation */
+
+				cost_agg(&agg_path, root,
+						 AGG_SORTED,
+						 agg_costs,
+						 numGroupCols,
+						 estimate_num_groups_on_segment(rollup->numGroups,
+														subpath->rows,
+														subpath->locus),
+						 having_qual,
+						 sort_path.startup_cost,
+						 sort_path.total_cost,
+						 sort_path.rows,
+						 subpath->pathtarget->width);
+			}
+
+			pathnode->path.total_cost += agg_path.total_cost;
+			pathnode->path.rows += agg_path.rows;
+		}
+	}
+
+	/* add tlist eval cost for each output row */
+	pathnode->path.startup_cost += target->cost.startup;
+	pathnode->path.total_cost += target->cost.startup +
+		target->cost.per_tuple * pathnode->path.rows;
+
+	/*
+	 * If this is a one-stage aggregate, the caller should already have
+	 * ensured that the data is distributed so that a one-stage aggregate
+	 * works, and the distribution is preserved. But if this is the first
+	 * stage of a multi-stage aggregate, if any distribution key columns
+	 * are part of rollups, they will be set to NULLs for the rolled up
+	 * rows. That breaks the distribution.
+	 */
+	if (CdbPathLocus_IsPartitioned(subpath->locus))
+		CdbPathLocus_MakeStrewn(&pathnode->path.locus,
+								CdbPathLocus_NumSegments(subpath->locus));
+	else
+		pathnode->path.locus = subpath->locus;
+
+	return pathnode;
+}
+
+/*
+ * create_minmaxagg_path
+ *	  Creates a pathnode that represents computation of MIN/MAX aggregates
+ *
+ * 'rel' is the parent relation associated with the result
+ * 'target' is the PathTarget to be computed
+ * 'mmaggregates' is a list of MinMaxAggInfo structs
+ * 'quals' is the HAVING quals if any
+ */
+MinMaxAggPath *
+create_minmaxagg_path(PlannerInfo *root,
+					  RelOptInfo *rel,
+					  PathTarget *target,
+					  List *mmaggregates,
+					  List *quals)
+{
+	MinMaxAggPath *pathnode = makeNode(MinMaxAggPath);
+	Cost		initplan_cost;
+	ListCell   *lc;
+	CdbLocusType locustype = CdbLocusType_Null;
+	int			numsegments = -1;
+
+	/* The topmost generated Plan node will be a Result */
+	pathnode->path.pathtype = T_Result;
+	pathnode->path.parent = rel;
+	pathnode->path.pathtarget = target;
+	/* For now, assume we are above any joins, so no parameterization */
+	pathnode->path.param_info = NULL;
+	pathnode->path.parallel_aware = false;
+	/* A MinMaxAggPath implies use of subplans, so cannot be parallel-safe */
+	pathnode->path.parallel_safe = false;
+	pathnode->path.parallel_workers = 0;
+	/* Result is one unordered row */
+	pathnode->path.rows = 1;
+	pathnode->path.pathkeys = NIL;
+
+	pathnode->mmaggregates = mmaggregates;
+	pathnode->quals = quals;
+
+	/* Calculate cost of all the initplans ... */
+	initplan_cost = 0;
+	foreach(lc, mmaggregates)
+	{
+		MinMaxAggInfo *mminfo = (MinMaxAggInfo *) lfirst(lc);
+
+		initplan_cost += mminfo->pathcost;
+
+		/*
+		 * All the subpaths should have SingleQE locus, if the underlying
+		 * table is partitioned, build_minmax_path() ensures that. But
+		 * double-check here.
+		 */
+		if (Gp_role == GP_ROLE_DISPATCH)
+		{
+			if (locustype == CdbLocusType_Null)
+			{
+				locustype = mminfo->path->locus.locustype;
+				numsegments = mminfo->path->locus.numsegments;
+			}
+			else if (CdbPathLocus_IsPartitioned(mminfo->path->locus))
+			{
+				elog(ERROR, "minmax path has unexpected path locus of type %d",
+					 mminfo->path->locus.locustype);
+			}
+			else if (locustype != mminfo->path->locus.locustype)
+			{
+				elog(ERROR, "minmax paths have different loci");
+			}
+		}
+	}
+
+	if (mmaggregates == NIL)
+	{
+		locustype = CdbLocusType_General;
+		numsegments = getgpsegmentCount();
+	}
+
+	/* we checked that all the child paths have compatible loci */
+	if (Gp_role == GP_ROLE_DISPATCH)
+		CdbPathLocus_MakeSimple(&pathnode->path.locus, locustype, numsegments);
+	else
+		CdbPathLocus_MakeEntry(&pathnode->path.locus);
+
+	/* add tlist eval cost for each output row, plus cpu_tuple_cost */
+	pathnode->path.startup_cost = initplan_cost + target->cost.startup;
+	pathnode->path.total_cost = initplan_cost + target->cost.startup +
+		target->cost.per_tuple + cpu_tuple_cost;
+
+	/*
+	 * Add cost of qual, if any --- but we ignore its selectivity, since our
+	 * rowcount estimate should be 1 no matter what the qual is.
+	 */
+	if (quals)
+	{
+		QualCost	qual_cost;
+
+		cost_qual_eval(&qual_cost, quals, root);
+		pathnode->path.startup_cost += qual_cost.startup;
+		pathnode->path.total_cost += qual_cost.startup + qual_cost.per_tuple;
+	}
+
+	return pathnode;
+}
+
+/*
+ * create_windowagg_path
+ *	  Creates a pathnode that represents computation of window functions
+ *
+ * 'rel' is the parent relation associated with the result
+ * 'subpath' is the path representing the source of data
+ * 'target' is the PathTarget to be computed
+ * 'windowFuncs' is a list of WindowFunc structs
+ * 'winclause' is a WindowClause that is common to all the WindowFuncs
+ *
+ * The input must be sorted according to the WindowClause's PARTITION keys
+ * plus ORDER BY keys.
+ */
+WindowAggPath *
+create_windowagg_path(PlannerInfo *root,
+					  RelOptInfo *rel,
+					  Path *subpath,
+					  PathTarget *target,
+					  List *windowFuncs,
+					  WindowClause *winclause)
+{
+	WindowAggPath *pathnode = makeNode(WindowAggPath);
+
+	pathnode->path.pathtype = T_WindowAgg;
+	pathnode->path.parent = rel;
+	pathnode->path.pathtarget = target;
+	/* For now, assume we are above any joins, so no parameterization */
+	pathnode->path.param_info = NULL;
+	pathnode->path.parallel_aware = false;
+	pathnode->path.parallel_safe = rel->consider_parallel &&
+		subpath->parallel_safe;
+	pathnode->path.parallel_workers = subpath->parallel_workers;
+	/* WindowAgg preserves the input sort order */
+	pathnode->path.pathkeys = subpath->pathkeys;
+	pathnode->path.locus = subpath->locus;
+
+	pathnode->subpath = subpath;
+	pathnode->winclause = winclause;
+
+	/*
+	 * For costing purposes, assume that there are no redundant partitioning
+	 * or ordering columns; it's not worth the trouble to deal with that
+	 * corner case here.  So we just pass the unmodified list lengths to
+	 * cost_windowagg.
+	 */
+	cost_windowagg(&pathnode->path, root,
+				   windowFuncs,
+				   list_length(winclause->partitionClause),
+				   list_length(winclause->orderClause),
+				   subpath->startup_cost,
+				   subpath->total_cost,
+				   subpath->rows);
+
+	/* add tlist eval cost for each output row */
+	pathnode->path.startup_cost += target->cost.startup;
+	pathnode->path.total_cost += target->cost.startup +
+		target->cost.per_tuple * pathnode->path.rows;
+
+	return pathnode;
+}
+
+/*
+ * create_setop_path
+ *	  Creates a pathnode that represents computation of INTERSECT or EXCEPT
+ *
+ * 'rel' is the parent relation associated with the result
+ * 'subpath' is the path representing the source of data
+ * 'cmd' is the specific semantics (INTERSECT or EXCEPT, with/without ALL)
+ * 'strategy' is the implementation strategy (sorted or hashed)
+ * 'distinctList' is a list of SortGroupClause's representing the grouping
+ * 'flagColIdx' is the column number where the flag column will be, if any
+ * 'firstFlag' is the flag value for the first input relation when hashing;
+ *		or -1 when sorting
+ * 'numGroups' is the estimated number of distinct groups
+ * 'outputRows' is the estimated number of output rows
+ */
+SetOpPath *
+create_setop_path(PlannerInfo *root,
+				  RelOptInfo *rel,
+				  Path *subpath,
+				  SetOpCmd cmd,
+				  SetOpStrategy strategy,
+				  List *distinctList,
+				  AttrNumber flagColIdx,
+				  int firstFlag,
+				  double numGroups,
+				  double outputRows)
+{
+	SetOpPath  *pathnode = makeNode(SetOpPath);
+
+	pathnode->path.pathtype = T_SetOp;
+	pathnode->path.parent = rel;
+	/* SetOp doesn't project, so use source path's pathtarget */
+	pathnode->path.pathtarget = subpath->pathtarget;
+	/* For now, assume we are above any joins, so no parameterization */
+	pathnode->path.param_info = NULL;
+	pathnode->path.parallel_aware = false;
+	pathnode->path.parallel_safe = rel->consider_parallel &&
+		subpath->parallel_safe;
+	pathnode->path.parallel_workers = subpath->parallel_workers;
+	/* SetOp preserves the input sort order if in sort mode */
+	pathnode->path.pathkeys =
+		(strategy == SETOP_SORTED) ? subpath->pathkeys : NIL;
+	pathnode->path.locus = subpath->locus;
+
+	pathnode->subpath = subpath;
+	pathnode->cmd = cmd;
+	pathnode->strategy = strategy;
+	pathnode->distinctList = distinctList;
+	pathnode->flagColIdx = flagColIdx;
+	pathnode->firstFlag = firstFlag;
+	pathnode->numGroups = numGroups;
+
+	/*
+	 * Charge one cpu_operator_cost per comparison per input tuple. We assume
+	 * all columns get compared at most of the tuples.
+	 */
+	pathnode->path.startup_cost = subpath->startup_cost;
+	pathnode->path.total_cost = subpath->total_cost +
+		cpu_operator_cost * subpath->rows * list_length(distinctList);
+	pathnode->path.rows = outputRows;
+
+	return pathnode;
+}
+
+/*
+ * create_recursiveunion_path
+ *	  Creates a pathnode that represents a recursive UNION node
+ *
+ * 'rel' is the parent relation associated with the result
+ * 'leftpath' is the source of data for the non-recursive term
+ * 'rightpath' is the source of data for the recursive term
+ * 'target' is the PathTarget to be computed
+ * 'distinctList' is a list of SortGroupClause's representing the grouping
+ * 'wtParam' is the ID of Param representing work table
+ * 'numGroups' is the estimated number of groups
+ *
+ * For recursive UNION ALL, distinctList is empty and numGroups is zero
+ */
+RecursiveUnionPath *
+create_recursiveunion_path(PlannerInfo *root,
+						   RelOptInfo *rel,
+						   Path *leftpath,
+						   Path *rightpath,
+						   PathTarget *target,
+						   List *distinctList,
+						   int wtParam,
+						   double numGroups)
+{
+	RecursiveUnionPath *pathnode = makeNode(RecursiveUnionPath);
+
+	pathnode->path.pathtype = T_RecursiveUnion;
+	pathnode->path.parent = rel;
+	pathnode->path.pathtarget = target;
+	/* For now, assume we are above any joins, so no parameterization */
+	pathnode->path.param_info = NULL;
+	pathnode->path.parallel_aware = false;
+	pathnode->path.parallel_safe = rel->consider_parallel &&
+		leftpath->parallel_safe && rightpath->parallel_safe;
+	/* Foolish, but we'll do it like joins for now: */
+	pathnode->path.parallel_workers = leftpath->parallel_workers;
+	/* RecursiveUnion result is always unsorted */
+	pathnode->path.pathkeys = NIL;
+
+	pathnode->leftpath = leftpath;
+	pathnode->rightpath = rightpath;
+	pathnode->distinctList = distinctList;
+	pathnode->wtParam = wtParam;
+	pathnode->numGroups = numGroups;
+
+	cost_recursive_union(&pathnode->path, leftpath, rightpath);
+
+	return pathnode;
+}
+
+/*
+ * create_lockrows_path
+ *	  Creates a pathnode that represents acquiring row locks
+ *
+ * 'rel' is the parent relation associated with the result
+ * 'subpath' is the path representing the source of data
+ * 'rowMarks' is a list of PlanRowMark's
+ * 'epqParam' is the ID of Param for EvalPlanQual re-eval
+ */
+LockRowsPath *
+create_lockrows_path(PlannerInfo *root, RelOptInfo *rel,
+					 Path *subpath, List *rowMarks, int epqParam)
+{
+	LockRowsPath *pathnode = makeNode(LockRowsPath);
+
+	pathnode->path.pathtype = T_LockRows;
+	pathnode->path.parent = rel;
+	/* LockRows doesn't project, so use source path's pathtarget */
+	pathnode->path.pathtarget = subpath->pathtarget;
+	/* For now, assume we are above any joins, so no parameterization */
+	pathnode->path.param_info = NULL;
+	pathnode->path.parallel_aware = false;
+	pathnode->path.parallel_safe = false;
+	pathnode->path.parallel_workers = 0;
+	pathnode->path.rows = subpath->rows;
+
+	/*
+	 * The result cannot be assumed sorted, since locking might cause the sort
+	 * key columns to be replaced with new values.
+	 */
+	pathnode->path.pathkeys = NIL;
+
+	pathnode->path.locus = subpath->locus;
+
+	pathnode->subpath = subpath;
+	pathnode->rowMarks = rowMarks;
+	pathnode->epqParam = epqParam;
+
+	/*
+	 * We should charge something extra for the costs of row locking and
+	 * possible refetches, but it's hard to say how much.  For now, use
+	 * cpu_tuple_cost per row.
+	 */
+	pathnode->path.startup_cost = subpath->startup_cost;
+	pathnode->path.total_cost = subpath->total_cost +
+		cpu_tuple_cost * subpath->rows;
+
+	return pathnode;
+}
+
+/*
+ * create_modifytable_path
+ *	  Creates a pathnode that represents performing INSERT/UPDATE/DELETE mods
+ *
+ * 'rel' is the parent relation associated with the result
+ * 'operation' is the operation type
+ * 'canSetTag' is true if we set the command tag/es_processed
+ * 'nominalRelation' is the parent RT index for use of EXPLAIN
+ * 'rootRelation' is the partitioned table root RT index, or 0 if none
+ * 'partColsUpdated' is true if any partitioning columns are being updated,
+ *		either from the target relation or a descendent partitioned table.
+ * 'resultRelations' is an integer list of actual RT indexes of target rel(s)
+ * 'subpaths' is a list of Path(s) producing source data (one per rel)
+ * 'subroots' is a list of PlannerInfo structs (one per rel)
+ * 'withCheckOptionLists' is a list of WCO lists (one per rel)
+ * 'returningLists' is a list of RETURNING tlists (one per rel)
+ * 'rowMarks' is a list of PlanRowMarks (non-locking only)
+ * 'onconflict' is the ON CONFLICT clause, or NULL
+ * 'epqParam' is the ID of Param for EvalPlanQual re-eval
+ */
+ModifyTablePath *
+create_modifytable_path(PlannerInfo *root, RelOptInfo *rel,
+						CmdType operation, bool canSetTag,
+						Index nominalRelation, Index rootRelation,
+						bool partColsUpdated,
+						List *resultRelations, List *subpaths,
+						List *subroots,
+						List *withCheckOptionLists, List *returningLists,
+						List *is_split_updates,
+						List *rowMarks, OnConflictExpr *onconflict,
+						int epqParam)
+{
+	ModifyTablePath *pathnode = makeNode(ModifyTablePath);
+	double		total_size;
+	ListCell   *lc;
+
+	Assert(list_length(resultRelations) == list_length(subpaths));
+	Assert(list_length(resultRelations) == list_length(subroots));
+	Assert(withCheckOptionLists == NIL ||
+		   list_length(resultRelations) == list_length(withCheckOptionLists));
+	Assert(returningLists == NIL ||
+		   list_length(resultRelations) == list_length(returningLists));
+	Assert(list_length(resultRelations) == list_length(is_split_updates));
+
+	pathnode->path.pathtype = T_ModifyTable;
+	pathnode->path.parent = rel;
+	/* pathtarget is not interesting, just make it minimally valid */
+	pathnode->path.pathtarget = rel->reltarget;
+	/* For now, assume we are above any joins, so no parameterization */
+	pathnode->path.param_info = NULL;
+	pathnode->path.parallel_aware = false;
+	pathnode->path.parallel_safe = false;
+	pathnode->path.parallel_workers = 0;
+	pathnode->path.pathkeys = NIL;
+
+	/*
+	 * Put Motions on top of the subpaths as needed, and set the locus of the
+	 * ModifyTable path itself.
+	 */
+	if (Gp_role == GP_ROLE_DISPATCH)
+		pathnode->path.locus =
+			adjust_modifytable_subpaths(root, operation,
+										resultRelations, subpaths,
+										is_split_updates);
+	else
+	{
+		/* don't allow split updates in utility mode. */
+		if (Gp_role == GP_ROLE_UTILITY && operation == CMD_UPDATE &&
+			list_member_int(is_split_updates, (int) true))
+		{
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("cannot update distribution key columns in utility mode")));
+		}
+
+		CdbPathLocus_MakeEntry(&pathnode->path.locus);
+	}
+
+	/*
+	 * Compute cost & rowcount as sum of subpath costs & rowcounts.
+	 *
+	 * Currently, we don't charge anything extra for the actual table
+	 * modification work, nor for the WITH CHECK OPTIONS or RETURNING
+	 * expressions if any.  It would only be window dressing, since
+	 * ModifyTable is always a top-level node and there is no way for the
+	 * costs to change any higher-level planning choices.  But we might want
+	 * to make it look better sometime.
+	 */
+	pathnode->path.startup_cost = 0;
+	pathnode->path.total_cost = 0;
+	pathnode->path.rows = 0;
+	total_size = 0;
+	foreach(lc, subpaths)
+	{
+		Path	   *subpath = (Path *) lfirst(lc);
+
+		if (lc == list_head(subpaths))	/* first node? */
+			pathnode->path.startup_cost = subpath->startup_cost;
+		pathnode->path.total_cost += subpath->total_cost;
+		pathnode->path.rows += subpath->rows;
+		total_size += subpath->pathtarget->width * subpath->rows;
+	}
+
+	/*
+	 * Set width to the average width of the subpath outputs.  XXX this is
+	 * totally wrong: we should report zero if no RETURNING, else an average
+	 * of the RETURNING tlist widths.  But it's what happened historically,
+	 * and improving it is a task for another day.
+	 */
+	if (pathnode->path.rows > 0)
+		total_size /= pathnode->path.rows;
+	pathnode->path.pathtarget->width = rint(total_size);
+
+	pathnode->operation = operation;
+	pathnode->canSetTag = canSetTag;
+	pathnode->nominalRelation = nominalRelation;
+	pathnode->rootRelation = rootRelation;
+	pathnode->partColsUpdated = partColsUpdated;
+	pathnode->resultRelations = resultRelations;
+	pathnode->is_split_updates = is_split_updates;
+	pathnode->subpaths = subpaths;
+	pathnode->subroots = subroots;
+	pathnode->withCheckOptionLists = withCheckOptionLists;
+	pathnode->returningLists = returningLists;
+	pathnode->rowMarks = rowMarks;
+	pathnode->onconflict = onconflict;
+	pathnode->epqParam = epqParam;
+
+	return pathnode;
+}
+
+
+/*
+ * Add Motions to children of a ModifyTable path, so that data
+ * is modified on the correct segments.
+ *
+ * The input to a ModifyTable node must be distributed according to the
+ * DISTRIBUTED BY of the target table. Add Motion paths to the child
+ * plans for that. Returns a locus to represent the distribution of the
+ * ModifyTable node itself.
+ */
+static CdbPathLocus
+adjust_modifytable_subpaths(PlannerInfo *root, CmdType operation,
+							List *resultRelations, List *subpaths,
+							List *is_split_updates)
+{
+	/*
+	 * The input plans must be distributed correctly.
+	 */
+	ListCell   *lcr,
+			   *lcp,
+			   *lci = NULL;
+	bool		all_subplans_entry = true,
+				all_subplans_replicated = true;
+	int			numsegments = -1;
+
+	if (operation == CMD_UPDATE)
+		lci = list_head(is_split_updates);
+
+	forboth(lcr, resultRelations, lcp, subpaths)
+	{
+		int			rti = lfirst_int(lcr);
+		Path	   *subpath = (Path *) lfirst(lcp);
+		RangeTblEntry *rte = rt_fetch(rti, root->parse->rtable);
+		GpPolicy   *targetPolicy;
+		GpPolicyType targetPolicyType;
+
+		Assert(rte->rtekind == RTE_RELATION);
+
+		targetPolicy = GpPolicyFetch(rte->relid);
+		targetPolicyType = targetPolicy->ptype;
+
+		numsegments = Max(targetPolicy->numsegments, numsegments);
+
+		if (targetPolicyType == POLICYTYPE_PARTITIONED)
+		{
+			all_subplans_entry = false;
+			all_subplans_replicated = false;
+		}
+		else if (targetPolicyType == POLICYTYPE_ENTRY)
+		{
+			/* Master-only table */
+			all_subplans_replicated = false;
+		}
+		else if (targetPolicyType == POLICYTYPE_REPLICATED)
+		{
+			all_subplans_entry = false;
+		}
+		else
+			elog(ERROR, "unrecognized policy type %u", targetPolicyType);
+
+		if (operation == CMD_INSERT)
+		{
+			subpath = create_motion_path_for_insert(root, targetPolicy, subpath);
+		}
+		else if (operation == CMD_DELETE)
+		{
+			subpath = create_motion_path_for_upddel(root, rti, targetPolicy, subpath);
+		}
+		else if (operation == CMD_UPDATE)
+		{
+			bool		is_split_update;
+
+			is_split_update = (bool) lfirst_int(lci);
+
+			if (is_split_update)
+				subpath = create_split_update_path(root, rti, targetPolicy, subpath);
+			else
+				subpath = create_motion_path_for_upddel(root, rti, targetPolicy, subpath);
+
+			lci = lnext(lci);
+		}
+		lfirst(lcp) = subpath;
+	}
+
+	/*
+	 * Set the distribution of the ModifyTable node itself. If there is only
+	 * one subplan, or all the subplans have a compatible distribution, then
+	 * we could mark the ModifyTable with the same distribution key. However,
+	 * currently, because a ModifyTable node can only be at the top of the
+	 * plan, it won't make any difference to the overall plan.
+	 *
+	 * GPDB_96_MERGE_FIXME: it might with e.g. a INSERT RETURNING in a CTE
+	 * I tried here, the locus setting is quite simple, but failed if it's not
+	 * in a CTE and the locus is General. Haven't figured out how to create
+	 * flow in that case.
+	 * Example:
+	 * CREATE TABLE cte_returning_locus(c1 int) DISTRIBUTED BY (c1);
+	 * COPY cte_returning_locus FROM PROGRAM 'seq 1 100';
+	 * EXPLAIN WITH aa AS (
+	 *        INSERT INTO cte_returning_locus SELECT generate_series(3,300) RETURNING c1
+	 * )
+	 * SELECT count(*) FROM aa,cte_returning_locus WHERE aa.c1 = cte_returning_locus.c1;
+	 *
+	 * The returning doesn't need a motion to be hash joined, works fine. But
+	 * without the WITH, what is the proper flow? FLOW_SINGLETON returns
+	 * nothing, FLOW_PARTITIONED without hashExprs(General locus has no
+	 * distkeys) returns duplication.
+	 *
+	 * GPDB_90_MERGE_FIXME: I've hacked a basic implementation of the above for
+	 * the case where all the subplans are POLICYTYPE_ENTRY, but it seems like
+	 * there should be a more general way to do this.
+	 */
+	if (all_subplans_entry)
+	{
+		CdbPathLocus resultLocus;
+
+		CdbPathLocus_MakeEntry(&resultLocus);
+		return resultLocus;
+	}
+	else if (all_subplans_replicated)
+	{
+		CdbPathLocus resultLocus;
+
+		Assert(numsegments >= 0);
+
+		CdbPathLocus_MakeReplicated(&resultLocus, numsegments);
+		return resultLocus;
+	}
+	else
+	{
+		CdbPathLocus resultLocus;
+
+		Assert(numsegments >= 0);
+
+		CdbPathLocus_MakeStrewn(&resultLocus, numsegments);
+
+		return resultLocus;
+	}
+}
+
+/*
+ * create_limit_path
+ *	  Creates a pathnode that represents performing LIMIT/OFFSET
+ *
+ * In addition to providing the actual OFFSET and LIMIT expressions,
+ * the caller must provide estimates of their values for costing purposes.
+ * The estimates are as computed by preprocess_limit(), ie, 0 represents
+ * the clause not being present, and -1 means it's present but we could
+ * not estimate its value.
+ *
+ * 'rel' is the parent relation associated with the result
+ * 'subpath' is the path representing the source of data
+ * 'limitOffset' is the actual OFFSET expression, or NULL
+ * 'limitCount' is the actual LIMIT expression, or NULL
+ * 'offset_est' is the estimated value of the OFFSET expression
+ * 'count_est' is the estimated value of the LIMIT expression
+ *
+ * Greenplum specific change: the return type is changed to Path
+ * because at the end of function, we need to check if it is
+ * segment general locus and may create other kind of path.
+ */
+Path *
+create_limit_path(PlannerInfo *root, RelOptInfo *rel,
+				  Path *subpath,
+				  Node *limitOffset, Node *limitCount,
+				  int64 offset_est, int64 count_est)
+{
+	LimitPath  *pathnode = makeNode(LimitPath);
+
+	pathnode->path.pathtype = T_Limit;
+	pathnode->path.parent = rel;
+	/* Limit doesn't project, so use source path's pathtarget */
+	pathnode->path.pathtarget = subpath->pathtarget;
+	/* For now, assume we are above any joins, so no parameterization */
+	pathnode->path.param_info = NULL;
+	pathnode->path.parallel_aware = false;
+	pathnode->path.parallel_safe = rel->consider_parallel &&
+		subpath->parallel_safe;
+	pathnode->path.parallel_workers = subpath->parallel_workers;
+	pathnode->path.rows = subpath->rows;
+	pathnode->path.startup_cost = subpath->startup_cost;
+	pathnode->path.total_cost = subpath->total_cost;
+	pathnode->path.pathkeys = subpath->pathkeys;
+	pathnode->path.locus = subpath->locus;
+	pathnode->subpath = subpath;
+	pathnode->limitOffset = limitOffset;
+	pathnode->limitCount = limitCount;
+
+	/*
+	 * Adjust the output rows count and costs according to the offset/limit.
+	 */
+	adjust_limit_rows_costs(&pathnode->path.rows,
+							&pathnode->path.startup_cost,
+							&pathnode->path.total_cost,
+							offset_est, count_est);
+
+	/*
+	 * Greenplum specific behavior:
+	 * If the limit path's locus is general or segmentgeneral
+	 * we have to make it singleQE.
+	 */
+	if (contain_volatile_functions(pathnode->limitOffset) || contain_volatile_functions(pathnode->limitCount))
+		return turn_volatile_seggen_to_singleqe(root, (Path *) pathnode, NULL);
+	else
+		return (Path *)pathnode;
+}
+
+/*
+ * adjust_limit_rows_costs
+ *	  Adjust the size and cost estimates for a LimitPath node according to the
+ *	  offset/limit.
+ *
+ * This is only a cosmetic issue if we are at top level, but if we are
+ * building a subquery then it's important to report correct info to the outer
+ * planner.
+ *
+ * When the offset or count couldn't be estimated, use 10% of the estimated
+ * number of rows emitted from the subpath.
+ *
+ * XXX we don't bother to add eval costs of the offset/limit expressions
+ * themselves to the path costs.  In theory we should, but in most cases those
+ * expressions are trivial and it's just not worth the trouble.
+ */
+void
+adjust_limit_rows_costs(double *rows,	/* in/out parameter */
+						Cost *startup_cost, /* in/out parameter */
+						Cost *total_cost,	/* in/out parameter */
+						int64 offset_est,
+						int64 count_est)
+{
+	double		input_rows = *rows;
+	Cost		input_startup_cost = *startup_cost;
+	Cost		input_total_cost = *total_cost;
+
+	if (offset_est != 0)
+	{
+		double		offset_rows;
+
+		if (offset_est > 0)
+			offset_rows = (double) offset_est;
+		else
+			offset_rows = clamp_row_est(input_rows * 0.10);
+		if (offset_rows > *rows)
+			offset_rows = *rows;
+		if (input_rows > 0)
+			*startup_cost +=
+				(input_total_cost - input_startup_cost)
+				* offset_rows / input_rows;
+		*rows -= offset_rows;
+		if (*rows < 1)
+			*rows = 1;
+	}
+
+	if (count_est != 0)
+	{
+		double		count_rows;
+
+		if (count_est > 0)
+			count_rows = (double) count_est;
+		else
+			count_rows = clamp_row_est(input_rows * 0.10);
+		if (count_rows > *rows)
+			count_rows = *rows;
+		if (input_rows > 0)
+			*total_cost = *startup_cost +
+				(input_total_cost - input_startup_cost)
+				* count_rows / input_rows;
+		*rows = count_rows;
+		if (*rows < 1)
+			*rows = 1;
+	}
+}
+
 
 /*
  * reparameterize_path
@@ -3415,7 +5531,9 @@ reparameterize_path(PlannerInfo *root, Path *path,
 	switch (path->pathtype)
 	{
 		case T_SeqScan:
-			return create_seqscan_path(root, rel, required_outer);
+			return create_seqscan_path(root, rel, required_outer, 0);
+		case T_SampleScan:
+			return (Path *) create_samplescan_path(root, rel, required_outer);
 		case T_IndexScan:
 		case T_IndexOnlyScan:
 			{
@@ -3432,7 +5550,7 @@ reparameterize_path(PlannerInfo *root, Path *path,
 				memcpy(newpath, ipath, sizeof(IndexPath));
 				newpath->path.param_info =
 					get_baserel_parampathinfo(root, rel, required_outer);
-				cost_index(newpath, root, loop_count);
+				cost_index(newpath, root, loop_count, false);
 				return (Path *) newpath;
 			}
 		case T_BitmapHeapScan:
@@ -3443,13 +5561,411 @@ reparameterize_path(PlannerInfo *root, Path *path,
 														rel,
 														bpath->bitmapqual,
 														required_outer,
-														loop_count);
+														loop_count, 0);
 			}
 		case T_SubqueryScan:
-			return create_subqueryscan_path(root, rel, path->pathkeys,
-											required_outer);
+			{
+				SubqueryScanPath *spath = (SubqueryScanPath *) path;
+
+				return (Path *) create_subqueryscan_path(root,
+														 rel,
+														 spath->subpath,
+														 spath->path.pathkeys,
+														 spath->path.locus,
+														 required_outer);
+			}
+		case T_Result:
+			/* Supported only for RTE_RESULT scan paths */
+			if (IsA(path, Path))
+				return create_resultscan_path(root, rel, required_outer);
+			break;
+		case T_Append:
+			{
+				AppendPath *apath = (AppendPath *) path;
+				List	   *childpaths = NIL;
+				List	   *partialpaths = NIL;
+				int			i;
+				ListCell   *lc;
+
+				/* Reparameterize the children */
+				i = 0;
+				foreach(lc, apath->subpaths)
+				{
+					Path	   *spath = (Path *) lfirst(lc);
+
+					spath = reparameterize_path(root, spath,
+												required_outer,
+												loop_count);
+					if (spath == NULL)
+						return NULL;
+					/* We have to re-split the regular and partial paths */
+					if (i < apath->first_partial_path)
+						childpaths = lappend(childpaths, spath);
+					else
+						partialpaths = lappend(partialpaths, spath);
+					i++;
+				}
+				return (Path *)
+					create_append_path(root, rel, childpaths, partialpaths,
+									   apath->path.pathkeys, required_outer,
+									   apath->path.parallel_workers,
+									   apath->path.parallel_aware,
+									   apath->partitioned_rels,
+									   -1);
+			}
 		default:
 			break;
 	}
 	return NULL;
+}
+
+/*
+ * reparameterize_path_by_child
+ * 		Given a path parameterized by the parent of the given child relation,
+ * 		translate the path to be parameterized by the given child relation.
+ *
+ * The function creates a new path of the same type as the given path, but
+ * parameterized by the given child relation.  Most fields from the original
+ * path can simply be flat-copied, but any expressions must be adjusted to
+ * refer to the correct varnos, and any paths must be recursively
+ * reparameterized.  Other fields that refer to specific relids also need
+ * adjustment.
+ *
+ * The cost, number of rows, width and parallel path properties depend upon
+ * path->parent, which does not change during the translation. Hence those
+ * members are copied as they are.
+ *
+ * If the given path can not be reparameterized, the function returns NULL.
+ */
+Path *
+reparameterize_path_by_child(PlannerInfo *root, Path *path,
+							 RelOptInfo *child_rel)
+{
+
+#define FLAT_COPY_PATH(newnode, node, nodetype)  \
+	( (newnode) = makeNode(nodetype), \
+	  memcpy((newnode), (node), sizeof(nodetype)) )
+
+#define ADJUST_CHILD_ATTRS(node) \
+	((node) = \
+	 (List *) adjust_appendrel_attrs_multilevel(root, (Node *) (node), \
+												child_rel->relids, \
+												child_rel->top_parent_relids))
+
+#define REPARAMETERIZE_CHILD_PATH(path) \
+do { \
+	(path) = reparameterize_path_by_child(root, (path), child_rel); \
+	if ((path) == NULL) \
+		return NULL; \
+} while(0);
+
+#define REPARAMETERIZE_CHILD_PATH_LIST(pathlist) \
+do { \
+	if ((pathlist) != NIL) \
+	{ \
+		(pathlist) = reparameterize_pathlist_by_child(root, (pathlist), \
+													  child_rel); \
+		if ((pathlist) == NIL) \
+			return NULL; \
+	} \
+} while(0);
+
+	Path	   *new_path;
+	ParamPathInfo *new_ppi;
+	ParamPathInfo *old_ppi;
+	Relids		required_outer;
+
+	/*
+	 * If the path is not parameterized by parent of the given relation, it
+	 * doesn't need reparameterization.
+	 */
+	if (!path->param_info ||
+		!bms_overlap(PATH_REQ_OUTER(path), child_rel->top_parent_relids))
+		return path;
+
+	/* Reparameterize a copy of given path. */
+	switch (nodeTag(path))
+	{
+		case T_Path:
+			FLAT_COPY_PATH(new_path, path, Path);
+			break;
+
+		case T_IndexPath:
+			{
+				IndexPath  *ipath;
+
+				FLAT_COPY_PATH(ipath, path, IndexPath);
+				ADJUST_CHILD_ATTRS(ipath->indexclauses);
+				new_path = (Path *) ipath;
+			}
+			break;
+
+		case T_BitmapHeapPath:
+			{
+				BitmapHeapPath *bhpath;
+
+				FLAT_COPY_PATH(bhpath, path, BitmapHeapPath);
+				REPARAMETERIZE_CHILD_PATH(bhpath->bitmapqual);
+				new_path = (Path *) bhpath;
+			}
+			break;
+
+		case T_BitmapAndPath:
+			{
+				BitmapAndPath *bapath;
+
+				FLAT_COPY_PATH(bapath, path, BitmapAndPath);
+				REPARAMETERIZE_CHILD_PATH_LIST(bapath->bitmapquals);
+				new_path = (Path *) bapath;
+			}
+			break;
+
+		case T_BitmapOrPath:
+			{
+				BitmapOrPath *bopath;
+
+				FLAT_COPY_PATH(bopath, path, BitmapOrPath);
+				REPARAMETERIZE_CHILD_PATH_LIST(bopath->bitmapquals);
+				new_path = (Path *) bopath;
+			}
+			break;
+
+		case T_TidPath:
+			{
+				TidPath    *tpath;
+
+				FLAT_COPY_PATH(tpath, path, TidPath);
+				ADJUST_CHILD_ATTRS(tpath->tidquals);
+				new_path = (Path *) tpath;
+			}
+			break;
+
+		case T_ForeignPath:
+			{
+				ForeignPath *fpath;
+				ReparameterizeForeignPathByChild_function rfpc_func;
+
+				FLAT_COPY_PATH(fpath, path, ForeignPath);
+				if (fpath->fdw_outerpath)
+					REPARAMETERIZE_CHILD_PATH(fpath->fdw_outerpath);
+
+				/* Hand over to FDW if needed. */
+				rfpc_func =
+					path->parent->fdwroutine->ReparameterizeForeignPathByChild;
+				if (rfpc_func)
+					fpath->fdw_private = rfpc_func(root, fpath->fdw_private,
+												   child_rel);
+				new_path = (Path *) fpath;
+			}
+			break;
+
+		case T_CustomPath:
+			{
+				CustomPath *cpath;
+
+				FLAT_COPY_PATH(cpath, path, CustomPath);
+				REPARAMETERIZE_CHILD_PATH_LIST(cpath->custom_paths);
+				if (cpath->methods &&
+					cpath->methods->ReparameterizeCustomPathByChild)
+					cpath->custom_private =
+						cpath->methods->ReparameterizeCustomPathByChild(root,
+																		cpath->custom_private,
+																		child_rel);
+				new_path = (Path *) cpath;
+			}
+			break;
+
+		case T_NestPath:
+			{
+				JoinPath   *jpath;
+
+				FLAT_COPY_PATH(jpath, path, NestPath);
+
+				REPARAMETERIZE_CHILD_PATH(jpath->outerjoinpath);
+				REPARAMETERIZE_CHILD_PATH(jpath->innerjoinpath);
+				ADJUST_CHILD_ATTRS(jpath->joinrestrictinfo);
+				new_path = (Path *) jpath;
+			}
+			break;
+
+		case T_MergePath:
+			{
+				JoinPath   *jpath;
+				MergePath  *mpath;
+
+				FLAT_COPY_PATH(mpath, path, MergePath);
+
+				jpath = (JoinPath *) mpath;
+				REPARAMETERIZE_CHILD_PATH(jpath->outerjoinpath);
+				REPARAMETERIZE_CHILD_PATH(jpath->innerjoinpath);
+				ADJUST_CHILD_ATTRS(jpath->joinrestrictinfo);
+				ADJUST_CHILD_ATTRS(mpath->path_mergeclauses);
+				new_path = (Path *) mpath;
+			}
+			break;
+
+		case T_HashPath:
+			{
+				JoinPath   *jpath;
+				HashPath   *hpath;
+
+				FLAT_COPY_PATH(hpath, path, HashPath);
+
+				jpath = (JoinPath *) hpath;
+				REPARAMETERIZE_CHILD_PATH(jpath->outerjoinpath);
+				REPARAMETERIZE_CHILD_PATH(jpath->innerjoinpath);
+				ADJUST_CHILD_ATTRS(jpath->joinrestrictinfo);
+				ADJUST_CHILD_ATTRS(hpath->path_hashclauses);
+				new_path = (Path *) hpath;
+			}
+			break;
+
+		case T_AppendPath:
+			{
+				AppendPath *apath;
+
+				FLAT_COPY_PATH(apath, path, AppendPath);
+				REPARAMETERIZE_CHILD_PATH_LIST(apath->subpaths);
+				new_path = (Path *) apath;
+			}
+			break;
+
+		case T_MergeAppendPath:
+			{
+				MergeAppendPath *mapath;
+
+				FLAT_COPY_PATH(mapath, path, MergeAppendPath);
+				REPARAMETERIZE_CHILD_PATH_LIST(mapath->subpaths);
+				new_path = (Path *) mapath;
+			}
+			break;
+
+		case T_MaterialPath:
+			{
+				MaterialPath *mpath;
+
+				FLAT_COPY_PATH(mpath, path, MaterialPath);
+				REPARAMETERIZE_CHILD_PATH(mpath->subpath);
+				new_path = (Path *) mpath;
+			}
+			break;
+
+		case T_UniquePath:
+			{
+				UniquePath *upath;
+
+				FLAT_COPY_PATH(upath, path, UniquePath);
+				REPARAMETERIZE_CHILD_PATH(upath->subpath);
+				ADJUST_CHILD_ATTRS(upath->uniq_exprs);
+				new_path = (Path *) upath;
+			}
+			break;
+
+		case T_GatherPath:
+			{
+				GatherPath *gpath;
+
+				FLAT_COPY_PATH(gpath, path, GatherPath);
+				REPARAMETERIZE_CHILD_PATH(gpath->subpath);
+				new_path = (Path *) gpath;
+			}
+			break;
+
+		case T_GatherMergePath:
+			{
+				GatherMergePath *gmpath;
+
+				FLAT_COPY_PATH(gmpath, path, GatherMergePath);
+				REPARAMETERIZE_CHILD_PATH(gmpath->subpath);
+				new_path = (Path *) gmpath;
+			}
+			break;
+
+		default:
+
+			/* We don't know how to reparameterize this path. */
+			return NULL;
+	}
+
+	/*
+	 * Adjust the parameterization information, which refers to the topmost
+	 * parent. The topmost parent can be multiple levels away from the given
+	 * child, hence use multi-level expression adjustment routines.
+	 */
+	old_ppi = new_path->param_info;
+	required_outer =
+		adjust_child_relids_multilevel(root, old_ppi->ppi_req_outer,
+									   child_rel->relids,
+									   child_rel->top_parent_relids);
+
+	/* If we already have a PPI for this parameterization, just return it */
+	new_ppi = find_param_path_info(new_path->parent, required_outer);
+
+	/*
+	 * If not, build a new one and link it to the list of PPIs. For the same
+	 * reason as explained in mark_dummy_rel(), allocate new PPI in the same
+	 * context the given RelOptInfo is in.
+	 */
+	if (new_ppi == NULL)
+	{
+		MemoryContext oldcontext;
+		RelOptInfo *rel = path->parent;
+
+		oldcontext = MemoryContextSwitchTo(GetMemoryChunkContext(rel));
+
+		new_ppi = makeNode(ParamPathInfo);
+		new_ppi->ppi_req_outer = bms_copy(required_outer);
+		new_ppi->ppi_rows = old_ppi->ppi_rows;
+		new_ppi->ppi_clauses = old_ppi->ppi_clauses;
+		ADJUST_CHILD_ATTRS(new_ppi->ppi_clauses);
+		rel->ppilist = lappend(rel->ppilist, new_ppi);
+
+		MemoryContextSwitchTo(oldcontext);
+	}
+	bms_free(required_outer);
+
+	new_path->param_info = new_ppi;
+
+	/*
+	 * Adjust the path target if the parent of the outer relation is
+	 * referenced in the targetlist. This can happen when only the parent of
+	 * outer relation is laterally referenced in this relation.
+	 */
+	if (bms_overlap(path->parent->lateral_relids,
+					child_rel->top_parent_relids))
+	{
+		new_path->pathtarget = copy_pathtarget(new_path->pathtarget);
+		ADJUST_CHILD_ATTRS(new_path->pathtarget->exprs);
+	}
+
+	return new_path;
+}
+
+/*
+ * reparameterize_pathlist_by_child
+ * 		Helper function to reparameterize a list of paths by given child rel.
+ */
+static List *
+reparameterize_pathlist_by_child(PlannerInfo *root,
+								 List *pathlist,
+								 RelOptInfo *child_rel)
+{
+	ListCell   *lc;
+	List	   *result = NIL;
+
+	foreach(lc, pathlist)
+	{
+		Path	   *path = reparameterize_path_by_child(root, lfirst(lc),
+														child_rel);
+
+		if (path == NULL)
+		{
+			list_free(result);
+			return NIL;
+		}
+
+		result = lappend(result, path);
+	}
+
+	return result;
 }

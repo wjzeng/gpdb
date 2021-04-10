@@ -32,19 +32,36 @@ class GpSegmentRebalanceOperation:
         self.logger = gplog.get_default_logger()
 
     def rebalance(self):
-        # Get the unbalanced primary segments grouped by hostname
-        # These segments are what we will shutdown.
-        self.logger.info("Getting unbalanced segments")
-        unbalanced_primary_segs = GpArray.getSegmentsByHostName(self.gpArray.get_unbalanced_primary_segdbs())
-        pool = base.WorkerPool()
-        count = 0
+        self.logger.info("Determining primary and mirror segment pairs to rebalance")
 
+        # The current implementation of rebalance calls "gprecoverseg -a" below.
+        # Thus, if another balanced pair is not synchronized, or has a down mirror
+        # that pair will be recovered as a side-effect of rebalancing.
+        unbalanced_primary_segs = []
+        for segmentPair in self.gpArray.segmentPairs:
+            if segmentPair.balanced():
+                continue
+
+            if segmentPair.up() and segmentPair.reachable() and segmentPair.synchronized():
+                unbalanced_primary_segs.append(segmentPair.primaryDB)
+            else:
+                self.logger.warning(
+                    "Not rebalancing primary segment dbid %d with its mirror dbid %d because one is either down, unreachable, or not synchronized" \
+                    % (segmentPair.primaryDB.dbid, segmentPair.mirrorDB.dbid))
+
+        if not len(unbalanced_primary_segs):
+            self.logger.info("No segments to rebalance")
+            return True
+
+        unbalanced_primary_segs = GpArray.getSegmentsByHostName(unbalanced_primary_segs)
+
+        pool = base.WorkerPool()
         try:
             # Disable ctrl-c
             signal.signal(signal.SIGINT, signal.SIG_IGN)
 
             self.logger.info("Stopping unbalanced primary segments...")
-            for hostname in unbalanced_primary_segs.keys():
+            for hostname in list(unbalanced_primary_segs.keys()):
                 cmd = GpSegStopCmd("stop unbalanced primary segs",
                                    self.gpEnv.getGpHome(),
                                    self.gpEnv.getGpVersion(),
@@ -54,9 +71,8 @@ class GpSegmentRebalanceOperation:
                                    remoteHost=hostname,
                                    timeout=600)
                 pool.addCommand(cmd)
-                count += 1
 
-            pool.wait_and_printdots(count, False)
+            base.join_and_indicate_progress(pool)
             
             failed_count = 0
             completed = pool.getCompletedItems()
@@ -85,7 +101,7 @@ class GpSegmentRebalanceOperation:
                 self.logger.info("=============================START ANOTHER RECOVER=========================================")
                 # import here because GpRecoverSegmentProgram and GpSegmentRebalanceOperation have a circular dependency
                 from gppylib.programs.clsRecoverSegment import GpRecoverSegmentProgram
-                sys.argv = ['gprecoverseg', '-aF']
+                sys.argv = ['gprecoverseg', '-a']
                 local_parser = GpRecoverSegmentProgram.createParser()
                 local_options, args = local_parser.parse_args()
                 cmd = GpRecoverSegmentProgram.createProgram(local_options, args)
@@ -95,7 +111,7 @@ class GpSegmentRebalanceOperation:
                 if e.code != 0:
                     self.logger.error("Failed to start the synchronization step of the segment rebalance.")
                     self.logger.error("Check the gprecoverseg log file, correct any problems, and re-run")
-                    self.logger.error("'gprecoverseg -aF'.")
+                    self.logger.error("'gprecoverseg -a'.")
                     raise Exception("Error synchronizing.\nError: %s" % str(e))
             finally:
                 if cmd:
@@ -103,7 +119,7 @@ class GpSegmentRebalanceOperation:
                 sys.argv = original_sys_args
                 self.logger.info("==============================END ANOTHER RECOVER==========================================")
 
-        except Exception, ex:
+        except Exception as ex:
             raise ex
         finally:
             pool.join()

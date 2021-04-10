@@ -4,7 +4,7 @@
  *	  Builtin functions for useful trigger support.
  *
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/backend/utils/adt/trigfuncs.c
@@ -66,17 +66,6 @@ suppress_redundant_updates_trigger(PG_FUNCTION_ARGS)
 	newheader = newtuple->t_data;
 	oldheader = oldtuple->t_data;
 
-	/*
-	 * We are called before the OID, if any, has been transcribed from the old
-	 * tuple to the new (in heap_update).  To avoid a bogus compare failure,
-	 * copy the OID now.  But check that someone didn't already put another
-	 * OID value into newtuple.  (That's not actually possible at present, but
-	 * maybe someday.)
-	 */
-	if (trigdata->tg_relation->rd_rel->relhasoids &&
-		!OidIsValid(HeapTupleHeaderGetOid(newheader)))
-		HeapTupleHeaderSetOid(newheader, HeapTupleHeaderGetOid(oldheader));
-
 	/* if the tuple payload is the same ... */
 	if (newtuple->t_len == oldtuple->t_len &&
 		newheader->t_hoff == oldheader->t_hoff &&
@@ -84,9 +73,9 @@ suppress_redundant_updates_trigger(PG_FUNCTION_ARGS)
 		 HeapTupleHeaderGetNatts(oldheader)) &&
 		((newheader->t_infomask & ~HEAP_XACT_MASK) ==
 		 (oldheader->t_infomask & ~HEAP_XACT_MASK)) &&
-		memcmp(((char *) newheader) + offsetof(HeapTupleHeaderData, t_bits),
-			   ((char *) oldheader) + offsetof(HeapTupleHeaderData, t_bits),
-			   newtuple->t_len - offsetof(HeapTupleHeaderData, t_bits)) == 0)
+		memcmp(((char *) newheader) + SizeofHeapTupleHeader,
+			   ((char *) oldheader) + SizeofHeapTupleHeader,
+			   newtuple->t_len - SizeofHeapTupleHeader) == 0)
 	{
 		/* ... then suppress the update */
 		rettuple = NULL;

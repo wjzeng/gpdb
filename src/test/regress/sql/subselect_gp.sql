@@ -89,6 +89,7 @@ drop table if exists mrs_t1;
 create table mrs_t1(x int) distributed by (x);
 
 insert into mrs_t1 select generate_series(1,20);
+analyze mrs_t1;
 
 explain select * from mrs_t1 where exists (select x from mrs_t1 where x < -1);
 select * from mrs_t1 where exists (select x from mrs_t1 where x < -1) order by 1;
@@ -129,10 +130,12 @@ delete from gp_distribution_policy where localoid='csq_m1'::regclass;
 reset allow_system_table_mods;
 alter table csq_m1 add column x int;
 insert into csq_m1 values(1);
+analyze csq_m1;
 
 drop table if exists csq_d1;
 create table csq_d1(x int) distributed by (x);
 insert into csq_d1 select * from csq_m1;
+analyze csq_d1;
 
 explain select array(select x from csq_m1); -- no initplan
 select array(select x from csq_m1); -- {1}
@@ -187,11 +190,13 @@ delete from gp_distribution_policy where localoid='csq_m1'::regclass;
 reset allow_system_table_mods;
 alter table csq_m1 add column x int;
 insert into csq_m1 values(1),(2),(3);
+analyze csq_m1;
 
 drop table if exists csq_d1;
 create table csq_d1(x int) distributed by (x);
 insert into csq_d1 select * from csq_m1 where x < 3;
 insert into csq_d1 values(4);
+analyze csq_d1;
 
 select * from csq_m1;
 select * from csq_d1;
@@ -286,9 +291,9 @@ SELECT * FROM csq_r WHERE a IN (SELECT csq_f FROM csq_f(csq_r.a),csq_r);
 drop table if exists csq_pullup;
 create table csq_pullup(t text, n numeric, i int, v varchar(10)) distributed by (t);
 insert into csq_pullup values ('abc',1, 2, 'xyz');
+analyze csq_pullup;
 insert into csq_pullup values ('xyz',2, 3, 'def');  
 insert into csq_pullup values ('def',3, 1, 'abc'); 
-
 --
 -- Expr CSQs to joins
 --
@@ -333,6 +338,25 @@ select * from csq_pullup t0 where 1= (select count(*) from csq_pullup t1 where t
 explain select * from csq_pullup t0 where 1= (select count(*) from csq_pullup t1 where t0.n + 1=t1.i + 1);
 
 select * from csq_pullup t0 where 1= (select count(*) from csq_pullup t1 where t0.n + 1=t1.i + 1);
+
+--
+-- Test a few cases where pulling up an aggregate subquery is not possible
+--
+
+-- subquery contains a LIMIT
+explain select * from csq_pullup t0 where 1= (select count(*) from csq_pullup t1 where t0.t=t1.t LIMIT 1);
+
+select * from csq_pullup t0 where 1= (select count(*) from csq_pullup t1 where t0.t=t1.t LIMIT 1);
+
+-- subquery contains a HAVING clause
+explain select * from csq_pullup t0 where 1= (select count(*) from csq_pullup t1 where t0.t=t1.t HAVING count(*) < 10);
+
+select * from csq_pullup t0 where 1= (select count(*) from csq_pullup t1 where t0.t=t1.t HAVING count(*) < 10);
+
+-- subquery contains quals of form 'function(outervar, innervar1) = innvervar2'
+explain select * from csq_pullup t0 where 1= (select count(*) from csq_pullup t1 where t0.n + t1.n =t1.i);
+
+select * from csq_pullup t0 where 1= (select count(*) from csq_pullup t1 where t0.n + t1.n =t1.i);
 
 
 --
@@ -621,11 +645,16 @@ create table bar(a int, b int) distributed by (a);
 with CT as (select a from foo except select a from bar)
 select * from foo
 where exists (select 1 from CT where CT.a = foo.a);
+
+drop table foo;
+drop table bar;
+
 --
--- Multiple SUBPLAN nodes must not refer to same plan_id
+-- Multiple SUBPLAN nodes referring to the same plan_id
 --
 CREATE TABLE bar_s (c integer, d character varying(10));
 INSERT INTO bar_s VALUES (9,9);
+ANALYZE bar_s;
 SELECT * FROM bar_s T1 WHERE c = (SELECT max(c) FROM bar_s T2 WHERE T2.d = T1.d GROUP BY c) AND c < 10;
 CREATE TABLE foo_s (a integer, b integer)  PARTITION BY RANGE(b)
     (PARTITION sub_one START (1) END (10),
@@ -635,7 +664,21 @@ INSERT INTO foo_s VALUES (2,9);
 SELECT bar_s.c from bar_s, foo_s WHERE foo_s.a=2 AND foo_s.b = (SELECT max(b) FROM foo_s WHERE bar_s.c = 9);
 CREATE TABLE baz_s (i int4);
 INSERT INTO baz_s VALUES (9);
+ANALYZE baz_s;
+
+-- In this query, the planner avoids using SubPlan 1 in the qual in the join,
+-- because it avoids picking SubPlans from an equivalence class, when it has
+-- other choices.
 SELECT bar_s.c FROM bar_s, foo_s WHERE foo_s.b = (SELECT max(i) FROM baz_s WHERE bar_s.c = 9) AND foo_s.b = bar_s.d::int4;
+
+-- Same as above, but with another subquery, so it must use a SubPlan. There
+-- are two references to the same SubPlan in the plan, on different slices.
+-- GPDB_96_MERGE_FIXME: this EXPLAIN output should become nicer-looking once we
+-- merge upstream commit 4d042999f9, to suppress the SubPlans from being
+-- printed twice.
+explain SELECT bar_s.c FROM bar_s, foo_s WHERE foo_s.b = (SELECT max(i) FROM baz_s WHERE bar_s.c = 9) AND foo_s.b = (select bar_s.d::int4);
+SELECT bar_s.c FROM bar_s, foo_s WHERE foo_s.b = (SELECT max(i) FROM baz_s WHERE bar_s.c = 9) AND foo_s.b = (select bar_s.d::int4);
+
 DROP TABLE bar_s;
 DROP TABLE foo_s;
 DROP TABLE baz_s;
@@ -762,15 +805,242 @@ EXPLAIN SELECT * FROM dedup_test3, dedup_test1 WHERE c = 7 AND dedup_test3.b IN 
 EXPLAIN SELECT * FROM dedup_test3, dedup_test1 WHERE c = 7 AND dedup_test3.b IN (SELECT a FROM dedup_test1);
 EXPLAIN SELECT * FROM dedup_test3, dedup_test1 WHERE c = 7 AND EXISTS (SELECT b FROM dedup_test1) AND dedup_test3.b IN (SELECT b FROM dedup_test1);
 
--- start_ignore
-DROP TABLE IF EXISTS dedup_test1;
-DROP TABLE IF EXISTS dedup_test2;
-DROP TABLE IF EXISTS dedup_test3;
--- end_ignore
 
+-- More dedup semi-join tests.
+create table dedup_tab (a int4) distributed by(a) ;
+insert into dedup_tab select g from  generate_series(1,100) g;
+analyze dedup_tab;
+
+create table dedup_reptab (a int4) distributed replicated;
+insert into dedup_reptab select generate_series(1,1);
+analyze dedup_reptab;
+
+-- Replicated table on the inner side of the join. The replicated table needs
+-- be broadcast from a single node to the others, with a unique RowIdExpr
+-- tacked on, because even though all the rows are available in all the
+-- segments, you cannot distinguish join rows generated by the same "logical"
+-- row otherwise.
+explain (costs off)
+select * from dedup_reptab r where r.a in (select t.a/10 from dedup_tab t);
+select * from dedup_reptab r where r.a in (select t.a/10 from dedup_tab t);
+
+-- Try the same with a General-locus function. In GPDB 6 and below, this
+-- generated a plan that did create the same logical row ID on each segment,
+-- on the assumption that an immutable function generates the result rows
+-- in the same order on all segments. We no longer assume that, and generate
+-- the same plan with a broadcast as the case with a replicated table.
+--
+-- We have to create a custom function for this, instead of using
+-- generate_series() directly, because the rows-estimate for generate_series()
+-- is so high that we don't get the plan we want. (After PostgreSQL v12 we
+-- could though, because the cost estimation of functions was improved.)
+create function dedup_srf() RETURNS SETOF int AS $$
+  begin
+    return query select generate_series(1, 3);
+  end;
+$$ LANGUAGE plpgsql IMMUTABLE ROWS 3;
+
+create function dedup_srf_stable() RETURNS SETOF int AS $$
+  begin
+    return query select generate_series(1, 3);
+  end;
+$$ LANGUAGE plpgsql STABLE ROWS 3;
+
+create function dedup_srf_volatile() RETURNS SETOF int AS $$
+  begin
+    return query select generate_series(1, 3);
+  end;
+$$ LANGUAGE plpgsql VOLATILE ROWS 3;
+
+explain (costs off)
+select * from dedup_srf() r(a) where r.a in (select t.a/10 from dedup_tab t);
+select * from dedup_srf() r(a) where r.a in (select t.a/10 from dedup_tab t);
+
+explain (costs off)
+select * from dedup_srf_stable() r(a) where r.a in (select t.a/10 from dedup_tab t);
+select * from dedup_srf_stable() r(a) where r.a in (select t.a/10 from dedup_tab t);
+
+explain (costs off)
+select * from dedup_srf_volatile() r(a) where r.a in (select t.a/10 from dedup_tab t);
+select * from dedup_srf_volatile() r(a) where r.a in (select t.a/10 from dedup_tab t);
+
+-- Also test it with non-SRFs. In principle, since the function returns exactly
+-- one row, no deduplication would be needed in these cases. But the planner
+-- doesn't recognize that currently, so you get the same kind of plan as with
+-- set-returning functions.
+create function dedup_func() RETURNS int AS $$
+  select 5;
+$$ LANGUAGE SQL IMMUTABLE;
+create function dedup_func_stable() RETURNS int AS $$
+  select 5;
+$$ LANGUAGE SQL STABLE;
+create function dedup_func_volatile() RETURNS int AS $$
+  select 5;
+$$ LANGUAGE SQL VOLATILE;
+
+explain (costs off)
+select * from dedup_func() r(a) where r.a in (select t.a/10 from dedup_tab t);
+select * from dedup_func() r(a) where r.a in (select t.a/10 from dedup_tab t);
+
+explain (costs off)
+select * from dedup_func_stable() r(a) where r.a in (select t.a/10 from dedup_tab t);
+select * from dedup_func_stable() r(a) where r.a in (select t.a/10 from dedup_tab t);
+
+explain (costs off)
+select * from dedup_func_volatile() r(a) where r.a in (select t.a/10 from dedup_tab t);
+select * from dedup_func_volatile() r(a) where r.a in (select t.a/10 from dedup_tab t);
+
+
+--
 -- Test init/main plan are not both parallel
+--
 create table init_main_plan_parallel (c1 int, c2 int);
 -- case 1: init plan is parallel, main plan is not.
 select relname from pg_class where exists(select * from init_main_plan_parallel);
 -- case2: init plan is not parallel, main plan is parallel
 select * from init_main_plan_parallel where exists (select * from pg_class);
+
+
+-- A subplan whose targetlist might be expanded to make sure all entries of its
+-- hashExpr are in its targetlist, test the motion node above it also updated
+-- its targetlist, otherwise, a wrong answer or a crash happens.
+DROP TABLE IF EXISTS TEST_IN;
+CREATE TABLE TEST_IN(
+    C01  FLOAT,
+    C02  NUMERIC(10,0)
+) DISTRIBUTED RANDOMLY;
+
+--insert repeatable records:
+INSERT INTO TEST_IN
+SELECT
+    ROUND(RANDOM()*1E1),ROUND(RANDOM()*1E1)
+FROM GENERATE_SERIES(1,1E4::BIGINT) I;
+
+ANALYZE TEST_IN;
+
+SELECT COUNT(*) FROM
+TEST_IN A
+WHERE A.C01 IN(SELECT C02 FROM TEST_IN);
+
+--
+-- Variant of the test in upstream 'subselect' test, for PostgreSQL bug #14924
+-- At one point, this produced wrong results on GPDB for different reasons than
+-- the original bug: we forgot to handle the VALUES list in the function to
+-- mutate a plan tree (plan_tree_mutator()).
+--
+create temp table onerowtmp as select 1;
+select val.x
+  from generate_series(1,10) as s(i),
+  lateral (
+    values ((select s.i + 1 from onerowtmp)), (s.i + 101)
+  ) as val(x)
+where s.i < 10 and val.x < 110;
+
+-- EXISTS sublink simplication
+
+drop table if exists simplify_sub;
+
+create table simplify_sub (i int) distributed by (i);
+insert into simplify_sub values (1);
+insert into simplify_sub values (2);
+analyze simplify_sub;
+
+-- limit n
+explain (costs off)
+select * from simplify_sub t1 where exists (select 1 from simplify_sub t2 where t1.i = t2.i limit 1);
+select * from simplify_sub t1 where exists (select 1 from simplify_sub t2 where t1.i = t2.i limit 1);
+
+explain (costs off)
+select * from simplify_sub t1 where not exists (select 1 from simplify_sub t2 where t1.i = t2.i limit 1);
+select * from simplify_sub t1 where not exists (select 1 from simplify_sub t2 where t1.i = t2.i limit 1);
+
+explain (costs off)
+select * from simplify_sub t1 where exists (select 1 from simplify_sub t2 where t1.i = t2.i limit 0);
+select * from simplify_sub t1 where exists (select 1 from simplify_sub t2 where t1.i = t2.i limit 0);
+
+explain (costs off)
+select * from simplify_sub t1 where not exists (select 1 from simplify_sub t2 where t1.i = t2.i limit 0);
+select * from simplify_sub t1 where not exists (select 1 from simplify_sub t2 where t1.i = t2.i limit 0);
+
+explain (costs off)
+select * from simplify_sub t1 where exists (select 1 from simplify_sub t2 where t1.i = t2.i limit all);
+select * from simplify_sub t1 where exists (select 1 from simplify_sub t2 where t1.i = t2.i limit all);
+
+explain (costs off)
+select * from simplify_sub t1 where not exists (select 1 from simplify_sub t2 where t1.i = t2.i limit all);
+select * from simplify_sub t1 where not exists (select 1 from simplify_sub t2 where t1.i = t2.i limit all);
+
+explain (costs off)
+select * from simplify_sub t1 where exists (select 1 from simplify_sub t2 where t1.i = t2.i limit NULL);
+select * from simplify_sub t1 where exists (select 1 from simplify_sub t2 where t1.i = t2.i limit NULL);
+
+explain (costs off)
+select * from simplify_sub t1 where not exists (select 1 from simplify_sub t2 where t1.i = t2.i limit NULL);
+select * from simplify_sub t1 where not exists (select 1 from simplify_sub t2 where t1.i = t2.i limit NULL);
+
+-- aggregates without GROUP BY or HAVING
+explain (costs off)
+select * from simplify_sub t1 where exists (select sum(t2.i) from simplify_sub t2 where t1.i = t2.i);
+select * from simplify_sub t1 where exists (select sum(t2.i) from simplify_sub t2 where t1.i = t2.i);
+
+explain (costs off)
+select * from simplify_sub t1 where not exists (select sum(t2.i) from simplify_sub t2 where t1.i = t2.i);
+select * from simplify_sub t1 where not exists (select sum(t2.i) from simplify_sub t2 where t1.i = t2.i);
+
+explain (costs off)
+select * from simplify_sub t1 where exists (select sum(t2.i) from simplify_sub t2 where t1.i = t2.i offset 0);
+select * from simplify_sub t1 where exists (select sum(t2.i) from simplify_sub t2 where t1.i = t2.i offset 0);
+
+explain (costs off)
+select * from simplify_sub t1 where not exists (select sum(t2.i) from simplify_sub t2 where t1.i = t2.i offset 0);
+select * from simplify_sub t1 where not exists (select sum(t2.i) from simplify_sub t2 where t1.i = t2.i offset 0);
+
+explain (costs off)
+select * from simplify_sub t1 where exists (select sum(t2.i) from simplify_sub t2 where t1.i = t2.i offset 1);
+select * from simplify_sub t1 where exists (select sum(t2.i) from simplify_sub t2 where t1.i = t2.i offset 1);
+
+explain (costs off)
+select * from simplify_sub t1 where not exists (select sum(t2.i) from simplify_sub t2 where t1.i = t2.i offset 1);
+select * from simplify_sub t1 where not exists (select sum(t2.i) from simplify_sub t2 where t1.i = t2.i offset 1);
+
+explain (costs off)
+select * from simplify_sub t1 where exists (select sum(t2.i) from simplify_sub t2 where t1.i = t2.i offset NULL);
+select * from simplify_sub t1 where exists (select sum(t2.i) from simplify_sub t2 where t1.i = t2.i offset NULL);
+
+explain (costs off)
+select * from simplify_sub t1 where not exists (select sum(t2.i) from simplify_sub t2 where t1.i = t2.i offset NULL);
+select * from simplify_sub t1 where not exists (select sum(t2.i) from simplify_sub t2 where t1.i = t2.i offset NULL);
+
+drop table if exists simplify_sub;
+
+--
+-- Test a couple of cases where a SubPlan is used in a Motion's hash key.
+--
+create table foo (i int4, j int4) distributed by (i);
+create table bar (i int4, j int4) distributed by (i);
+create table baz (i int4, j int4) distributed by (i);
+insert into foo select g, g from generate_series(1, 10) g;
+insert into bar values (1, 1);
+insert into baz select g, g from generate_series(5, 100) g;
+analyze foo;
+analyze bar;
+analyze baz;
+
+explain (verbose, costs off)
+select * from foo left outer join baz on (select bar.i from bar where bar.i = foo.i) + 1  = baz.j;
+select * from foo left outer join baz on (select bar.i from bar where bar.i = foo.i) + 1  = baz.j;
+
+-- This is a variant of a query in the upstream 'subselect' test, with the
+-- twist that baz.i is the distribution key for the table. In the plan, the
+-- CASE WHEN construct with SubPlan is used as Hash Key in the Redistribute
+-- Motion. It is a planned as a hashed SubPlan. (We had a bug at one point,
+-- where the hashed SubPlan was added to the target list twice, which
+-- caused an error at runtime when the executor tried to build the hash
+-- table twice, because the Motion in the SubPlan couldn't be rescanned.)
+explain (verbose, costs off)
+select * from foo where
+  (case when foo.i in (select a.i from baz a) then foo.i else null end) in
+  (select b.i from baz b);
+select * from foo where
+  (case when foo.i in (select a.i from baz a) then foo.i else null end) in
+  (select b.i from baz b);

@@ -4,7 +4,7 @@
  *	  support for communication destinations
  *
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -28,12 +28,14 @@
 
 #include "postgres.h"
 
+#include "access/printsimple.h"
 #include "access/printtup.h"
 #include "access/xact.h"
 #include "commands/copy.h"
 #include "commands/createas.h"
 #include "commands/matview.h"
 #include "executor/functions.h"
+#include "executor/tqueue.h"
 #include "executor/tstoreReceiver.h"
 #include "libpq/libpq.h"
 #include "libpq/pqformat.h"
@@ -46,9 +48,10 @@
  *		dummy DestReceiver functions
  * ----------------
  */
-static void
+static bool
 donothingReceive(TupleTableSlot *slot, DestReceiver *self)
 {
+	return true;
 }
 
 static void
@@ -66,24 +69,33 @@ donothingCleanup(DestReceiver *self)
  *		static DestReceiver structs for dest types needing no local state
  * ----------------
  */
-static DestReceiver donothingDR = {
+static const DestReceiver donothingDR = {
 	donothingReceive, donothingStartup, donothingCleanup, donothingCleanup,
 	DestNone
 };
 
-static DestReceiver debugtupDR = {
+static const DestReceiver debugtupDR = {
 	debugtup, debugStartup, donothingCleanup, donothingCleanup,
 	DestDebug
 };
 
-static DestReceiver spi_printtupDR = {
+static const DestReceiver printsimpleDR = {
+	printsimple, printsimple_startup, donothingCleanup, donothingCleanup,
+	DestRemoteSimple
+};
+
+static const DestReceiver spi_printtupDR = {
 	spi_printtup, spi_dest_startup, donothingCleanup, donothingCleanup,
 	DestSPI
 };
 
-/* Globally available receiver for DestNone */
-DestReceiver *None_Receiver = &donothingDR;
-
+/*
+ * Globally available receiver for DestNone.
+ *
+ * It's ok to cast the constness away as any modification of the none receiver
+ * would be a bug (which gets easier to catch this way).
+ */
+DestReceiver *None_Receiver = (DestReceiver *) &donothingDR;
 
 /* ----------------
  *		BeginCommand - initialize the destination at start of command
@@ -102,20 +114,28 @@ BeginCommand(const char *commandTag, CommandDest dest)
 DestReceiver *
 CreateDestReceiver(CommandDest dest)
 {
+	/*
+	 * It's ok to cast the constness away as any modification of the none
+	 * receiver would be a bug (which gets easier to catch this way).
+	 */
+
 	switch (dest)
 	{
 		case DestRemote:
 		case DestRemoteExecute:
 			return printtup_create_DR(dest);
 
+		case DestRemoteSimple:
+			return unconstify(DestReceiver *, &printsimpleDR);
+
 		case DestNone:
-			return &donothingDR;
+			return unconstify(DestReceiver *, &donothingDR);
 
 		case DestDebug:
-			return &debugtupDR;
+			return unconstify(DestReceiver *, &debugtupDR);
 
 		case DestSPI:
-			return &spi_printtupDR;
+			return unconstify(DestReceiver *, &spi_printtupDR);
 
 		case DestTuplestore:
 			return CreateTuplestoreDestReceiver();
@@ -130,11 +150,14 @@ CreateDestReceiver(CommandDest dest)
 			return CreateSQLFunctionDestReceiver();
 
 		case DestTransientRel:
-			return CreateTransientRelDestReceiver(InvalidOid);
+			return CreateTransientRelDestReceiver(InvalidOid, InvalidOid, false, 't', false);
+
+		case DestTupleQueue:
+			return CreateTupleQueueDestReceiver(NULL);
 	}
 
 	/* should never get here */
-	return &donothingDR;
+	pg_unreachable();
 }
 
 /* ----------------
@@ -148,6 +171,7 @@ EndCommand(const char *commandTag, CommandDest dest)
 	{
 		case DestRemote:
 		case DestRemoteExecute:
+		case DestRemoteSimple:
 
 			/*
 			 * We assume the commandTag is plain ASCII and therefore requires
@@ -164,6 +188,7 @@ EndCommand(const char *commandTag, CommandDest dest)
 		case DestCopyOut:
 		case DestSQLFunction:
 		case DestTransientRel:
+		case DestTupleQueue:
 			break;
 	}
 }
@@ -187,6 +212,7 @@ NullCommand(CommandDest dest)
 	{
 		case DestRemote:
 		case DestRemoteExecute:
+		case DestRemoteSimple:
 
 			/*
 			 * tell the fe that we saw an empty query string.  In protocols
@@ -206,6 +232,7 @@ NullCommand(CommandDest dest)
 		case DestCopyOut:
 		case DestSQLFunction:
 		case DestTransientRel:
+		case DestTupleQueue:
 			break;
 	}
 }
@@ -213,8 +240,8 @@ NullCommand(CommandDest dest)
 /* ----------------
  *		ReadyForQuery - tell dest that we are ready for a new query
  *
- *		The ReadyForQuery message is sent in protocol versions 2.0 and up
- *		so that the FE can tell when we are done processing a query string.
+ *		The ReadyForQuery message is sent so that the FE can tell when
+ *		we are done processing a query string.
  *		In versions 3.0 and up, it also carries a transaction state indicator.
  *
  *		Note that by flushing the stdio buffer here, we can avoid doing it
@@ -228,6 +255,7 @@ ReadyForQuery(CommandDest dest)
 	{
 		case DestRemote:
 		case DestRemoteExecute:
+		case DestRemoteSimple:
 			if (PG_PROTOCOL_MAJOR(FrontendProtocol) >= 3)
 			{
 				StringInfoData buf;
@@ -237,13 +265,17 @@ ReadyForQuery(CommandDest dest)
 					pq_beginmessage(&buf, 'k');
 					pq_sendint64(&buf, VmemTracker_GetMaxReservedVmemBytes());
 					pq_endmessage(&buf);
+
+					pq_beginmessage(&buf, 'x');
+					pq_sendbyte(&buf, TransactionDidWriteXLog());
+					pq_endmessage(&buf);
 				}
 
 				pq_beginmessage(&buf, 'Z');
 				pq_sendbyte(&buf, TransactionBlockStatusCode());
 				pq_endmessage(&buf);
 			}
-			else if (PG_PROTOCOL_MAJOR(FrontendProtocol) >= 2)
+			else
 				pq_putemptymessage('Z');
 			/* Flush output at end of cycle in any case. */
 			pq_flush();
@@ -257,6 +289,7 @@ ReadyForQuery(CommandDest dest)
 		case DestCopyOut:
 		case DestSQLFunction:
 		case DestTransientRel:
+		case DestTupleQueue:
 			break;
 	}
 }

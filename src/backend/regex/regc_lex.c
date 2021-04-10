@@ -67,7 +67,7 @@
  * lexstart - set up lexical stuff, scan leading options
  */
 static void
-lexstart(struct vars * v)
+lexstart(struct vars *v)
 {
 	prefixes(v);				/* may turn on new type bits etc. */
 	NOERR();
@@ -96,7 +96,7 @@ lexstart(struct vars * v)
  * prefixes - implement various special prefixes
  */
 static void
-prefixes(struct vars * v)
+prefixes(struct vars *v)
 {
 	/* literal string doesn't get any of this stuff */
 	if (v->cflags & REG_QUOTE)
@@ -200,7 +200,7 @@ prefixes(struct vars * v)
  * implicit assumptions about what sorts of strings can be subroutines.
  */
 static void
-lexnest(struct vars * v,
+lexnest(struct vars *v,
 		const chr *beginp,		/* start of interpolation */
 		const chr *endp)		/* one past end of interpolation */
 {
@@ -265,7 +265,7 @@ static const chr brbackw[] = {	/* \w within brackets */
  * Possibly ought to inquire whether there is a "word" character class.
  */
 static void
-lexword(struct vars * v)
+lexword(struct vars *v)
 {
 	lexnest(v, backw, ENDOF(backw));
 }
@@ -274,7 +274,7 @@ lexword(struct vars * v)
  * next - get next token
  */
 static int						/* 1 normal, 0 failure */
-next(struct vars * v)
+next(struct vars *v)
 {
 	chr			c;
 
@@ -384,7 +384,7 @@ next(struct vars * v)
 					else
 						FAILW(REG_BADBR);
 					break;
-				case CHR('\\'):	/* BRE bound ends with \} */
+				case CHR('\\'): /* BRE bound ends with \} */
 					if (INCON(L_BBND) && NEXT1('}'))
 					{
 						v->now++;
@@ -476,7 +476,7 @@ next(struct vars * v)
 							NOTE(REG_ULOCALE);
 							RET(CCLASS);
 							break;
-						default:		/* oops */
+						default:	/* oops */
 							v->now--;
 							RETV(PLAIN, c);
 							break;
@@ -582,12 +582,14 @@ next(struct vars * v)
 			{
 				NOTE(REG_UNONPOSIX);
 				v->now++;
+				if (ATEOS())
+					FAILW(REG_BADRPT);
 				switch (*v->now++)
 				{
-					case CHR(':'):		/* non-capturing paren */
+					case CHR(':'):	/* non-capturing paren */
 						RETV('(', 0);
 						break;
-					case CHR('#'):		/* comment */
+					case CHR('#'):	/* comment */
 						while (!ATEOS() && *v->now != CHR(')'))
 							v->now++;
 						if (!ATEOS())
@@ -595,13 +597,32 @@ next(struct vars * v)
 						assert(v->nexttype == v->lasttype);
 						return next(v);
 						break;
-					case CHR('='):		/* positive lookahead */
-						NOTE(REG_ULOOKAHEAD);
-						RETV(LACON, 1);
+					case CHR('='):	/* positive lookahead */
+						NOTE(REG_ULOOKAROUND);
+						RETV(LACON, LATYPE_AHEAD_POS);
 						break;
-					case CHR('!'):		/* negative lookahead */
-						NOTE(REG_ULOOKAHEAD);
-						RETV(LACON, 0);
+					case CHR('!'):	/* negative lookahead */
+						NOTE(REG_ULOOKAROUND);
+						RETV(LACON, LATYPE_AHEAD_NEG);
+						break;
+					case CHR('<'):
+						if (ATEOS())
+							FAILW(REG_BADRPT);
+						switch (*v->now++)
+						{
+							case CHR('='):	/* positive lookbehind */
+								NOTE(REG_ULOOKAROUND);
+								RETV(LACON, LATYPE_BEHIND_POS);
+								break;
+							case CHR('!'):	/* negative lookbehind */
+								NOTE(REG_ULOOKAROUND);
+								RETV(LACON, LATYPE_BEHIND_NEG);
+								break;
+							default:
+								FAILW(REG_BADRPT);
+								break;
+						}
+						assert(NOTREACHED);
 						break;
 					default:
 						FAILW(REG_BADRPT);
@@ -650,7 +671,7 @@ next(struct vars * v)
 		case CHR('$'):
 			RET('$');
 			break;
-		case CHR('\\'): /* mostly punt backslashes to code below */
+		case CHR('\\'):			/* mostly punt backslashes to code below */
 			if (ATEOS())
 				FAILW(REG_EESCAPE);
 			break;
@@ -713,7 +734,7 @@ next(struct vars * v)
  * Note slightly nonstandard use of the CCLASS type code.
  */
 static int						/* not actually used, but convenient for RETV */
-lexescape(struct vars * v)
+lexescape(struct vars *v)
 {
 	chr			c;
 	static const chr alert[] = {
@@ -792,13 +813,13 @@ lexescape(struct vars * v)
 			break;
 		case CHR('u'):
 			c = lexdigits(v, 16, 4, 4);
-			if (ISERR())
+			if (ISERR() || !CHR_IS_IN_RANGE(c))
 				FAILW(REG_EESCAPE);
 			RETV(PLAIN, c);
 			break;
 		case CHR('U'):
 			c = lexdigits(v, 16, 8, 8);
-			if (ISERR())
+			if (ISERR() || !CHR_IS_IN_RANGE(c))
 				FAILW(REG_EESCAPE);
 			RETV(PLAIN, c);
 			break;
@@ -815,8 +836,8 @@ lexescape(struct vars * v)
 			break;
 		case CHR('x'):
 			NOTE(REG_UUNPORT);
-			c = lexdigits(v, 16, 1, 255);		/* REs >255 long outside spec */
-			if (ISERR())
+			c = lexdigits(v, 16, 1, 255);	/* REs >255 long outside spec */
+			if (ISERR() || !CHR_IS_IN_RANGE(c))
 				FAILW(REG_EESCAPE);
 			RETV(PLAIN, c);
 			break;
@@ -842,24 +863,31 @@ lexescape(struct vars * v)
 		case CHR('9'):
 			save = v->now;
 			v->now--;			/* put first digit back */
-			c = lexdigits(v, 10, 1, 255);		/* REs >255 long outside spec */
+			c = lexdigits(v, 10, 1, 255);	/* REs >255 long outside spec */
 			if (ISERR())
 				FAILW(REG_EESCAPE);
 			/* ugly heuristic (first test is "exactly 1 digit?") */
 			if (v->now == save || ((int) c > 0 && (int) c <= v->nsubexp))
 			{
 				NOTE(REG_UBACKREF);
-				RETV(BACKREF, (chr) c);
+				RETV(BACKREF, c);
 			}
 			/* oops, doesn't look like it's a backref after all... */
 			v->now = save;
 			/* and fall through into octal number */
+			/* FALLTHROUGH */
 		case CHR('0'):
 			NOTE(REG_UUNPORT);
 			v->now--;			/* put first digit back */
 			c = lexdigits(v, 8, 1, 3);
 			if (ISERR())
 				FAILW(REG_EESCAPE);
+			if (c > 0xff)
+			{
+				/* out of range, so we handled one digit too much */
+				v->now--;
+				c >>= 3;
+			}
 			RETV(PLAIN, c);
 			break;
 		default:
@@ -872,9 +900,12 @@ lexescape(struct vars * v)
 
 /*
  * lexdigits - slurp up digits and return chr value
+ *
+ * This does not account for overflow; callers should range-check the result
+ * if maxlen is large enough to make that possible.
  */
 static chr						/* chr value; errors signalled via ERR */
-lexdigits(struct vars * v,
+lexdigits(struct vars *v,
 		  int base,
 		  int minlen,
 		  int maxlen)
@@ -955,11 +986,9 @@ lexdigits(struct vars * v,
  * context-dependency of some things.
  */
 static int						/* 1 normal, 0 failure */
-brenext(struct vars * v,
-		chr pc)
+brenext(struct vars *v,
+		chr c)
 {
-	chr			c = (chr) pc;
-
 	switch (c)
 	{
 		case CHR('*'):
@@ -1078,7 +1107,7 @@ brenext(struct vars * v,
  * skip - skip white space and comments in expanded form
  */
 static void
-skip(struct vars * v)
+skip(struct vars *v)
 {
 	const chr  *start = v->now;
 
@@ -1118,12 +1147,12 @@ newline(void)
  * use that it hardly matters.
  */
 static chr
-chrnamed(struct vars * v,
+chrnamed(struct vars *v,
 		 const chr *startp,		/* start of name */
 		 const chr *endp,		/* just past end of name */
 		 chr lastresort)		/* what to return if name lookup fails */
 {
-	celt		c;
+	chr			c;
 	int			errsave;
 	int			e;
 	struct cvec *cv;
@@ -1135,10 +1164,10 @@ chrnamed(struct vars * v,
 	v->err = errsave;
 
 	if (e != 0)
-		return (chr) lastresort;
+		return lastresort;
 
 	cv = range(v, c, c, 0);
 	if (cv->nchrs == 0)
-		return (chr) lastresort;
+		return lastresort;
 	return cv->chrs[0];
 }

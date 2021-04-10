@@ -1,28 +1,30 @@
-/*------------------------------------------------------------------------------
+/*-------------------------------------------------------------------------
  *
  * SparseData.h
  *        Declarations/definitions for "SparseData" functions.
  *
- * SparseData provides array storage for repetitive data as commonly found
- * in numerical analysis of sparse arrays and matrices.
- * Sequential duplicate values in the array are represented in an index
- * structure that stores the count of the number of times a given value
- * is duplicated.
- * All storage is allocated with palloc().
+ * SparseData provides array storage for repetitive data as commonly found in
+ * numerical analysis of sparse arrays and matrices.  Sequential duplicate
+ * values in the array are represented in an index structure that stores the
+ * count of the number of times a given value is duplicated.  All storage is
+ * allocated with palloc().
  *
- * ***NOTE***
- * The SparseData structure is an in-memory structure and so must be
- * serialized into a persisted structure like a VARLENA when leaving
- * a GP / Postgres function.  This implies a COPY from the SparseData
- * to the VARLENA.
- * ***NOTE***
+ * NOTES
+ * The SparseData structure is an in-memory structure and so must be serialized
+ * into a persisted structure like a VARLENA when leaving a GP / Postgres
+ * function.  This implies a COPY from the SparseData to the VARLENA.
  *
  * Copyright (c) 2010, Greenplum Software
+ * Portions Copyright (c) 2013-Present VMware, Inc. or its affiliates.
  *
- * $$
  *
- *------------------------------------------------------------------------------
+ * IDENTIFICATION
+ *	    gpcontrib/gp_sparse_vector/SparseData.h
+ *
+ *-------------------------------------------------------------------------
  */
+#ifndef SPARSEDATA_H
+#define SPARSEDATA_H
 
 #include <math.h>
 #include <string.h>
@@ -30,9 +32,6 @@
 #include "lib/stringinfo.h"
 #include "utils/array.h"
 #include "catalog/pg_type.h"
-
-#ifndef SPARSEDATA_H
-#define SPARSEDATA_H
 
 #define ABS(a)   (((a) < 0) ? -(a) : (a))
 #define MIN(a,b) (((a) < (b)) ? (a) : (b))
@@ -127,7 +126,6 @@ typedef SparseDataStruct *SparseData;
 
 int64 *sdata_index_to_int64arr(SparseData sdata);
 void serializeSparseData(char *target, SparseData source);
-SparseData deserializeSparseData(char *source);
 
 SparseData makeEmptySparseData(void);
 SparseData makeInplaceSparseData(char *vals, char *index,
@@ -508,8 +506,8 @@ check_sdata_dimensions(SparseData left, SparseData right)
 	if (left->total_value_count != right->total_value_count)
 	{
 		ereport(ERROR, 
-			(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-			 errmsg("Operation undefined when dimension of left and right vectors are not the same")));
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("operation undefined when dimension of left and right vectors are not the same")));
 	}
 }
 
@@ -720,8 +718,8 @@ static inline SparseData op_sdata_by_sdata(int operation,SparseData left,
 
 	if ((operation > 3)|| (operation < 0))
 		ereport(ERROR, 
-			(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-			 errmsg("Operation not in range 0-3")));
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("operation not in range 0-3")));
 
 	while (1)
 	{

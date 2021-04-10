@@ -6,7 +6,7 @@
  *	 COPY command in Greenplum Database.
  *
  * Portions Copyright (c) 2005-2008, Greenplum inc
- * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
  *
  *
  * IDENTIFICATION
@@ -24,31 +24,26 @@
 #define COPYOUT_CHUNK_SIZE 16 * 1024
 
 struct CdbDispatcherState;
+struct CopyStateData;
 
 typedef struct CdbCopy
 {
 	int			total_segs;		/* total number of segments in cdb */
-	int		   *mirror_map;		/* indicates how many db's each segment has */
 	bool		copy_in;		/* direction: true for COPY FROM false for COPY TO */
-	bool		skip_ext_partition;/* skip external partition */ 
 
 	StringInfoData	copy_out_buf;/* holds a chunk of data from the database */
 
-	List			*outseglist;    /* segs that currently take part in copy out. 
-									 * Once a segment gave away all it's data rows
-									 * it is taken out of the list */
-	PartitionNode *partitions;
-	List		  *ao_segnos;
-	HTAB		  *aotupcounts; /* hash of ao relation id to processed tuple count */
-	bool		hasReplicatedTable;
+	List		*seglist;    	/* segs that currently take part in copy.
+								 * for copy out, once a segment gave away all it's
+								 * data rows, it is taken out of the list */
 	struct CdbDispatcherState *dispatcherState;
 } CdbCopy;
 
 
 
 /* global function declarations */
-extern CdbCopy *makeCdbCopy(bool copy_in);
-extern void cdbCopyStart(CdbCopy *cdbCopy, CopyStmt *stmt, struct GpPolicy *policy);
+extern CdbCopy *makeCdbCopy(struct CopyStateData *cstate, bool copy_in);
+extern void cdbCopyStart(CdbCopy *cdbCopy, CopyStmt *stmt, int file_encoding);
 extern void cdbCopySendDataToAll(CdbCopy *c, const char *buffer, int nbytes);
 extern void cdbCopySendData(CdbCopy *c, int target_seg, const char *buffer, int nbytes);
 extern bool cdbCopyGetData(CdbCopy *c, bool cancel, uint64 *rows_processed);

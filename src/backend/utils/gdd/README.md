@@ -91,9 +91,9 @@ are automatically changed if the holder object changed, but some are not. An
 example of unchanged waiting relations is waiting for a Xid lock(it can be only
 released after the holding transaction is over). An example of changed waiting
 relations is waiting for a tuple lock(the tuple lock can be released before the
-holding transaction is over. For concrete examples, please refer the test cases.
+holding transaction is over). For concrete examples, please refer the test cases.
 
-A proper global deadlock detector must be designed with these distrbuted
+A proper global deadlock detector must be designed with these distributed
 system specific characteristics in consideration. The basic requirements are
 that if there is a deadlock then find it out and break it, and make sure don't
 make false alarms.
@@ -241,12 +241,12 @@ However `pg_locks` lack some necessary information:
 - the waiter xid;
 - the edge type: dotted or solid;
 
-So we have to create a new udf `pg_dist_wait_status` to collect all the
+So we have to create a new udf `gp_dist_wait_status` to collect all the
 necessary information, this udf is similar to `pg_locks`, but with these
 information included, an example output:
 
 ```sql
-select * from pg_dist_wait_status();
+select * from gp_dist_wait_status();
  segid | waiter_dxid | holder_dxid | holdTillEndXact
 -------+-------------+-------------+------------
     -1 |          29 |          28 | t
@@ -287,7 +287,7 @@ time.
 
 ### Edge Classifying
 
-Edge types are detected locally by `pg_dist_wait_status` on each segment, the
+Edge types are detected locally by `gp_dist_wait_status` on each segment, the
 policies are:
 - xid waitings are solid edges;
 - relation waitings that ever been closed in `NO_LOCK` mode at least once are

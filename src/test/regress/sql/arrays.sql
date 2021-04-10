@@ -89,12 +89,83 @@ SELECT a[1:3],
           d[1:1][2:2]
    FROM arrtest;
 
+SELECT b[1:1][2][2],
+       d[1:1][2]
+   FROM arrtest;
+
 INSERT INTO arrtest(a) VALUES('{1,null,3}');
 SELECT a FROM arrtest;
 UPDATE arrtest SET a[4] = NULL WHERE a[2] IS NULL;
 SELECT a FROM arrtest WHERE a[2] IS NULL;
 DELETE FROM arrtest WHERE a[2] IS NULL AND b IS NULL;
 SELECT a,b,c FROM arrtest;
+
+-- test mixed slice/scalar subscripting
+select '{{1,2,3},{4,5,6},{7,8,9}}'::int[];
+select ('{{1,2,3},{4,5,6},{7,8,9}}'::int[])[1:2][2];
+select '[0:2][0:2]={{1,2,3},{4,5,6},{7,8,9}}'::int[];
+select ('[0:2][0:2]={{1,2,3},{4,5,6},{7,8,9}}'::int[])[1:2][2];
+
+--
+-- check subscription corner cases
+--
+-- More subscripts than MAXDIMS(6)
+SELECT ('{}'::int[])[1][2][3][4][5][6][7];
+-- NULL index yields NULL when selecting
+SELECT ('{{{1},{2},{3}},{{4},{5},{6}}}'::int[])[1][NULL][1];
+SELECT ('{{{1},{2},{3}},{{4},{5},{6}}}'::int[])[1][NULL:1][1];
+SELECT ('{{{1},{2},{3}},{{4},{5},{6}}}'::int[])[1][1:NULL][1];
+-- NULL index in assignment is an error
+UPDATE arrtest
+  SET c[NULL] = '{"can''t assign"}'
+  WHERE array_dims(c) is not null;
+UPDATE arrtest
+  SET c[NULL:1] = '{"can''t assign"}'
+  WHERE array_dims(c) is not null;
+UPDATE arrtest
+  SET c[1:NULL] = '{"can''t assign"}'
+  WHERE array_dims(c) is not null;
+
+-- test slices with empty lower and/or upper index
+CREATE TEMP TABLE arrtest_s (
+  a       int2[],
+  b       int2[][]
+);
+INSERT INTO arrtest_s VALUES ('{1,2,3,4,5}', '{{1,2,3}, {4,5,6}, {7,8,9}}');
+INSERT INTO arrtest_s VALUES ('[0:4]={1,2,3,4,5}', '[0:2][0:2]={{1,2,3}, {4,5,6}, {7,8,9}}');
+
+SELECT * FROM arrtest_s;
+SELECT a[:3], b[:2][:2] FROM arrtest_s;
+SELECT a[2:], b[2:][2:] FROM arrtest_s;
+SELECT a[:], b[:] FROM arrtest_s;
+
+-- updates
+UPDATE arrtest_s SET a[:3] = '{11, 12, 13}', b[:2][:2] = '{{11,12}, {14,15}}'
+  WHERE array_lower(a,1) = 1;
+SELECT * FROM arrtest_s;
+UPDATE arrtest_s SET a[3:] = '{23, 24, 25}', b[2:][2:] = '{{25,26}, {28,29}}';
+SELECT * FROM arrtest_s;
+UPDATE arrtest_s SET a[:] = '{11, 12, 13, 14, 15}';
+SELECT * FROM arrtest_s;
+UPDATE arrtest_s SET a[:] = '{23, 24, 25}';  -- fail, too small
+INSERT INTO arrtest_s VALUES(NULL, NULL);
+UPDATE arrtest_s SET a[:] = '{11, 12, 13, 14, 15}';  -- fail, no good with null
+
+-- check with fixed-length-array type, such as point
+SELECT f1[0:1] FROM POINT_TBL;
+SELECT f1[0:] FROM POINT_TBL;
+SELECT f1[:1] FROM POINT_TBL;
+SELECT f1[:] FROM POINT_TBL;
+
+-- subscript assignments to fixed-width result in NULL if previous value is NULL
+UPDATE point_tbl SET f1[0] = 10 WHERE f1 IS NULL RETURNING *;
+INSERT INTO point_tbl(f1[0]) VALUES(0) RETURNING *;
+-- NULL assignments get ignored
+UPDATE point_tbl SET f1[0] = NULL WHERE f1::text = '(10,10)'::point::text RETURNING *;
+-- but non-NULL subscript assignments work
+UPDATE point_tbl SET f1[0] = -10, f1[1] = -10 WHERE f1::text = '(10,10)'::point::text RETURNING *;
+-- but not to expand the range
+UPDATE point_tbl SET f1[3] = 10 WHERE f1::text = '(-10,-10)'::point::text RETURNING *;
 
 --
 -- test array extension
@@ -190,6 +261,51 @@ SELECT array_cat(ARRAY[1,2], ARRAY[3,4]) AS "{1,2,3,4}";
 SELECT array_cat(ARRAY[1,2], ARRAY[[3,4],[5,6]]) AS "{{1,2},{3,4},{5,6}}";
 SELECT array_cat(ARRAY[[3,4],[5,6]], ARRAY[1,2]) AS "{{3,4},{5,6},{1,2}}";
 
+SELECT array_position(ARRAY[1,2,3,4,5], 4);
+SELECT array_position(ARRAY[5,3,4,2,1], 4);
+SELECT array_position(ARRAY[[1,2],[3,4]], 3);
+SELECT array_position(ARRAY['sun','mon','tue','wed','thu','fri','sat'], 'mon');
+SELECT array_position(ARRAY['sun','mon','tue','wed','thu','fri','sat'], 'sat');
+SELECT array_position(ARRAY['sun','mon','tue','wed','thu','fri','sat'], NULL);
+SELECT array_position(ARRAY['sun','mon','tue','wed','thu',NULL,'fri','sat'], NULL);
+SELECT array_position(ARRAY['sun','mon','tue','wed','thu',NULL,'fri','sat'], 'sat');
+
+SELECT array_positions(NULL, 10);
+SELECT array_positions(NULL, NULL::int);
+SELECT array_positions(ARRAY[1,2,3,4,5,6,1,2,3,4,5,6], 4);
+SELECT array_positions(ARRAY[[1,2],[3,4]], 4);
+SELECT array_positions(ARRAY[1,2,3,4,5,6,1,2,3,4,5,6], NULL);
+SELECT array_positions(ARRAY[1,2,3,NULL,5,6,1,2,3,NULL,5,6], NULL);
+SELECT array_length(array_positions(ARRAY(SELECT 'AAAAAAAAAAAAAAAAAAAAAAAAA'::text || i % 10
+                                          FROM generate_series(1,100) g(i)),
+                                  'AAAAAAAAAAAAAAAAAAAAAAAAA5'), 1);
+
+DO $$
+DECLARE
+  o int;
+  a int[] := ARRAY[1,2,3,2,3,1,2];
+BEGIN
+  o := array_position(a, 2);
+  WHILE o IS NOT NULL
+  LOOP
+    RAISE NOTICE '%', o;
+    o := array_position(a, 2, o + 1);
+  END LOOP;
+END
+$$ LANGUAGE plpgsql;
+
+SELECT array_position('[2:4]={1,2,3}'::int[], 1);
+SELECT array_positions('[2:4]={1,2,3}'::int[], 1);
+
+SELECT
+    array_position(ids, (1, 1)),
+    array_positions(ids, (1, 1))
+        FROM
+(VALUES
+    (ARRAY[(0, 0), (1, 1)]),
+    (ARRAY[(1, 1)])
+) AS f (ids);
+
 -- operators
 SELECT a FROM arrtest WHERE b = ARRAY[[[113,142],[1,147]]];
 SELECT NOT ARRAY[1.1,1.2,1.3] = ARRAY[1.1,1.2,1.3] AS "FALSE";
@@ -235,6 +351,7 @@ SELECT ARRAY[1,2,3]::text[]::int[]::float8[] is of (float8[]) as "TRUE";
 SELECT ARRAY[['a','bc'],['def','hijk']]::text[]::varchar[] AS "{{a,bc},{def,hijk}}";
 SELECT ARRAY[['a','bc'],['def','hijk']]::text[]::varchar[] is of (varchar[]) as "TRUE";
 SELECT CAST(ARRAY[[[[[['a','bb','ccc']]]]]] as text[]) as "{{{{{{a,bb,ccc}}}}}}";
+SELECT NULL::text[]::int[] AS "NULL";
 
 -- scalar op any/all (array)
 select 33 = any ('{1,2,3}');
@@ -260,6 +377,8 @@ select 33 = all (null::int[]);
 select null::int = all ('{1,2,3}');
 select 33 = all ('{1,null,3}');
 select 33 = all ('{33,null,33}');
+-- nulls later in the bitmap
+SELECT -1 != ALL(ARRAY(SELECT NULLIF(g.i, 900) FROM generate_series(1,1000) g(i)));
 
 -- test indexes on arrays
 create temp table arr_tbl (f1 int[] unique) DISTRIBUTED BY (f1);
@@ -275,6 +394,19 @@ set enable_seqscan to off;
 set enable_bitmapscan to off;
 select * from arr_tbl where f1 > '{1,2,3}' and f1 <= '{1,5,3}' ORDER BY 1;
 select * from arr_tbl where f1 >= '{1,2,3}' and f1 < '{1,5,3}' ORDER BY 1;
+
+-- test ON CONFLICT DO UPDATE with arrays
+create temp table arr_pk_tbl (pk int4 primary key, f1 int[]);
+insert into arr_pk_tbl values (1, '{1,2,3}');
+insert into arr_pk_tbl values (1, '{3,4,5}') on conflict (pk)
+  do update set f1[1] = excluded.f1[1], f1[3] = excluded.f1[3]
+  returning pk, f1;
+insert into arr_pk_tbl(pk, f1[1:2]) values (1, '{6,7,8}') on conflict (pk)
+  do update set f1[1] = excluded.f1[1],
+    f1[2] = excluded.f1[2],
+    f1[3] = excluded.f1[3]
+  returning pk, f1;
+
 -- note: if above selects don't produce the expected tuple order,
 -- then you didn't get an indexscan plan, and something is busted.
 reset enable_seqscan;
@@ -388,11 +520,19 @@ select array_fill(7, array[3,3],array[2,2]);
 select array_fill(7, array[3,3]);
 select array_fill('juhu'::text, array[3,3],array[2,2]);
 select array_fill('juhu'::text, array[3,3]);
+select a, a = '{}' as is_eq, array_dims(a)
+  from (select array_fill(42, array[0]) as a) ss;
+select a, a = '{}' as is_eq, array_dims(a)
+  from (select array_fill(42, '{}') as a) ss;
+select a, a = '{}' as is_eq, array_dims(a)
+  from (select array_fill(42, '{}', '{}') as a) ss;
 -- raise exception
 select array_fill(1, null, array[2,2]);
 select array_fill(1, array[2,2], null);
+select array_fill(1, array[2,2], '{}');
 select array_fill(1, array[3,3], array[1,1,1]);
 select array_fill(1, array[1,2,null]);
+select array_fill(1, array[[1,2],[3,4]]);
 
 select string_to_array('1|2|3', '|');
 select string_to_array('1|2|3|', '|');
@@ -437,6 +577,23 @@ select array_agg(ten order by ten) from (select ten from tenk1 where unique1 < 1
 select array_agg(nullif(ten, 4) order by ten) from (select ten from tenk1 where unique1 < 15 order by unique1) ss;
 select array_agg(unique1 order by unique1) from tenk1 where unique1 < -15;
 
+-- array_agg(anyarray)
+select array_agg(ar)
+  from (values ('{1,2}'::int[]), ('{3,4}'::int[])) v(ar);
+select array_agg(distinct ar order by ar desc)
+  from (select array[i / 2] from generate_series(1,10) a(i)) b(ar);
+select array_agg(ar)
+  from (select array_agg(array[i, i+1, i-1])
+        from generate_series(1,2) a(i)) b(ar);
+select array_agg(array[i+1.2, i+1.3, i+1.4]) from generate_series(1,3) g(i);
+select array_agg(array['Hello', i::text]) from generate_series(9,11) g(i);
+select array_agg(array[i, nullif(i, 3), i+1]) from generate_series(1,4) g(i);
+-- errors
+select array_agg('{}'::int[]) from generate_series(1,2);
+select array_agg(null::int[]) from generate_series(1,2);
+select array_agg(ar)
+  from (values ('{1,2}'::int[]), ('{3}'::int[])) v(ar);
+
 select unnest(array[1,2,3]);
 select * from unnest(array[1,2,3]);
 select unnest(array[1,2,3,4.5]::float8[]);
@@ -456,6 +613,10 @@ select array_replace(array[1,2,NULL,4,NULL],NULL,5);
 select array_replace(array['A','B','DD','B'],'B','CC');
 select array_replace(array[1,NULL,3],NULL,NULL);
 select array_replace(array['AB',NULL,'CDE'],NULL,'12');
+
+-- array(select array-value ...)
+select array(select array[i,i/2] from generate_series(1,5) i);
+select array(select array['Hello', i::text] from generate_series(9,11) i);
 
 -- Insert/update on a column that is array of composite
 
@@ -482,6 +643,66 @@ select length(md5((f1[1]).c2)) from dest;
 drop table dest;
 drop type textandtext;
 
+-- Tests for polymorphic-array form of width_bucket()
+-- this exercises the varwidth and float8 code paths
+SELECT
+    op,
+    width_bucket(op::numeric, ARRAY[1, 3, 5, 10.0]::numeric[]) AS wb_n1,
+    width_bucket(op::numeric, ARRAY[0, 5.5, 9.99]::numeric[]) AS wb_n2,
+    width_bucket(op::numeric, ARRAY[-6, -5, 2.0]::numeric[]) AS wb_n3,
+    width_bucket(op::float8, ARRAY[1, 3, 5, 10.0]::float8[]) AS wb_f1,
+    width_bucket(op::float8, ARRAY[0, 5.5, 9.99]::float8[]) AS wb_f2,
+    width_bucket(op::float8, ARRAY[-6, -5, 2.0]::float8[]) AS wb_f3
+FROM (VALUES
+  (-5.2),
+  (-0.0000000001),
+  (0.000000000001),
+  (1),
+  (1.99999999999999),
+  (2),
+  (2.00000000000001),
+  (3),
+  (4),
+  (4.5),
+  (5),
+  (5.5),
+  (6),
+  (7),
+  (8),
+  (9),
+  (9.99999999999999),
+  (10),
+  (10.0000000000001)
+) v(op);
+
+-- ensure float8 path handles NaN properly
+SELECT
+    op,
+    width_bucket(op, ARRAY[1, 3, 9, 'NaN', 'NaN']::float8[]) AS wb
+FROM (VALUES
+  (-5.2::float8),
+  (4::float8),
+  (77::float8),
+  ('NaN'::float8)
+) v(op);
+
+-- these exercise the generic fixed-width code path
+SELECT
+    op,
+    width_bucket(op, ARRAY[1, 3, 5, 10]) AS wb_1
+FROM generate_series(0,11) as op;
+
+SELECT width_bucket(now(),
+                    array['yesterday', 'today', 'tomorrow']::timestamptz[]);
+
+-- corner cases
+SELECT width_bucket(5, ARRAY[3]);
+SELECT width_bucket(5, '{}');
+
+-- error cases
+SELECT width_bucket('5'::text, ARRAY[3, 4]::integer[]);
+SELECT width_bucket(5, ARRAY[3, 4, NULL]);
+SELECT width_bucket(5, ARRAY[ARRAY[1, 2], ARRAY[3, 4]]);
 
 -- Suppress NOTICE messages when users/groups don't exist
 SET client_min_messages TO 'error';
@@ -564,8 +785,13 @@ GROUP BY l.id
 ORDER BY l.id;
 
 -- Array types are GPDB hashable
+-- start_ignore
+-- GPDB_12_MERGE_FIXME: Add an explicit COLLATE clause to cause ORCA to 
+-- fallback instead of adding an optimizer.out file. Re-visit and fix 
+-- when the collation work for ORCA is picked up again.
+-- end_ignore
 CREATE TEMP TABLE text_array_table (t text[]) DISTRIBUTED BY ( t );
-INSERT INTO text_array_table VALUES ('{foo}');
+INSERT INTO text_array_table VALUES ('{foo}' COLLATE "C");
 
 CREATE TEMP TABLE int2_array_table (f1 int2[]) DISTRIBUTED BY (f1);
 INSERT INTO int2_array_table VALUES ('{1,2,3}');

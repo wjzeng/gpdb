@@ -3,7 +3,7 @@
  * pg_conversion.c
  *	  routines to support manipulation of the pg_conversion relation
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -17,11 +17,12 @@
 #include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/sysattr.h"
+#include "access/tableam.h"
+#include "catalog/catalog.h"
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
 #include "catalog/objectaccess.h"
 #include "catalog/pg_conversion.h"
-#include "catalog/pg_conversion_fn.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_proc.h"
 #include "mb/pg_wchar.h"
@@ -30,14 +31,15 @@
 #include "utils/fmgroids.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
-#include "utils/tqual.h"
+
+#include "catalog/oid_dispatch.h"
 
 /*
  * ConversionCreate
  *
  * Add a new tuple to pg_conversion.
  */
-Oid
+ObjectAddress
 ConversionCreate(const char *conname, Oid connamespace,
 				 Oid conowner,
 				 int32 conforencoding, int32 contoencoding,
@@ -47,10 +49,10 @@ ConversionCreate(const char *conname, Oid connamespace,
 	Relation	rel;
 	TupleDesc	tupDesc;
 	HeapTuple	tup;
+	Oid			oid;
 	bool		nulls[Natts_pg_conversion];
 	Datum		values[Natts_pg_conversion];
 	NameData	cname;
-	Oid			oid;
 	ObjectAddress myself,
 				referenced;
 
@@ -83,7 +85,7 @@ ConversionCreate(const char *conname, Oid connamespace,
 	}
 
 	/* open pg_conversion */
-	rel = heap_open(ConversionRelationId, RowExclusiveLock);
+	rel = table_open(ConversionRelationId, RowExclusiveLock);
 	tupDesc = rel->rd_att;
 
 	/* initialize nulls and values */
@@ -95,6 +97,10 @@ ConversionCreate(const char *conname, Oid connamespace,
 
 	/* form a tuple */
 	namestrcpy(&cname, conname);
+	oid = GetNewOidForConversion(rel, ConversionOidIndexId,
+								 Anum_pg_conversion_oid,
+								 connamespace, NameStr(cname));
+	values[Anum_pg_conversion_oid - 1] = ObjectIdGetDatum(oid);
 	values[Anum_pg_conversion_conname - 1] = NameGetDatum(&cname);
 	values[Anum_pg_conversion_connamespace - 1] = ObjectIdGetDatum(connamespace);
 	values[Anum_pg_conversion_conowner - 1] = ObjectIdGetDatum(conowner);
@@ -106,14 +112,10 @@ ConversionCreate(const char *conname, Oid connamespace,
 	tup = heap_form_tuple(tupDesc, values, nulls);
 
 	/* insert a new tuple */
-	oid = simple_heap_insert(rel, tup);
-	Assert(OidIsValid(oid));
-
-	/* update the index if any */
-	CatalogUpdateIndexes(rel, tup);
+	CatalogTupleInsert(rel, tup);
 
 	myself.classId = ConversionRelationId;
-	myself.objectId = HeapTupleGetOid(tup);
+	myself.objectId = oid;
 	myself.objectSubId = 0;
 
 	/* create dependency on conversion procedure */
@@ -129,18 +131,18 @@ ConversionCreate(const char *conname, Oid connamespace,
 	recordDependencyOn(&myself, &referenced, DEPENDENCY_NORMAL);
 
 	/* create dependency on owner */
-	recordDependencyOnOwner(ConversionRelationId, HeapTupleGetOid(tup),
-							conowner);
+	recordDependencyOnOwner(ConversionRelationId, oid, conowner);
+
 	/* dependency on extension */
 	recordDependencyOnCurrentExtension(&myself, false);
 
 	/* Post creation hook for new conversion */
-	InvokeObjectPostCreateHook(ConversionRelationId, HeapTupleGetOid(tup), 0);
+	InvokeObjectPostCreateHook(ConversionRelationId, oid, 0);
 
 	heap_freetuple(tup);
-	heap_close(rel, RowExclusiveLock);
+	table_close(rel, RowExclusiveLock);
 
-	return oid;
+	return myself;
 }
 
 /*
@@ -154,26 +156,26 @@ RemoveConversionById(Oid conversionOid)
 {
 	Relation	rel;
 	HeapTuple	tuple;
-	HeapScanDesc scan;
+	TableScanDesc scan;
 	ScanKeyData scanKeyData;
 
 	ScanKeyInit(&scanKeyData,
-				ObjectIdAttributeNumber,
+				Anum_pg_conversion_oid,
 				BTEqualStrategyNumber, F_OIDEQ,
 				ObjectIdGetDatum(conversionOid));
 
 	/* open pg_conversion */
-	rel = heap_open(ConversionRelationId, RowExclusiveLock);
+	rel = table_open(ConversionRelationId, RowExclusiveLock);
 
-	scan = heap_beginscan_catalog(rel, 1, &scanKeyData);
+	scan = table_beginscan_catalog(rel, 1, &scanKeyData);
 
 	/* search for the target tuple */
 	if (HeapTupleIsValid(tuple = heap_getnext(scan, ForwardScanDirection)))
-		simple_heap_delete(rel, &tuple->t_self);
+		CatalogTupleDelete(rel, &tuple->t_self);
 	else
 		elog(ERROR, "could not find tuple for conversion %u", conversionOid);
-	heap_endscan(scan);
-	heap_close(rel, RowExclusiveLock);
+	table_endscan(scan);
+	table_close(rel, RowExclusiveLock);
 }
 
 /*

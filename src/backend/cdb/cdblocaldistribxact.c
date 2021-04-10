@@ -10,7 +10,7 @@
  * distributed log SLRU files too frequently.
  *
  * Portions Copyright (c) 2007-2008, Greenplum inc
- * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
  *
  *
  * IDENTIFICATION
@@ -20,17 +20,17 @@
  */
 
 #include "postgres.h"
-#include "miscadmin.h"
+
 #include "access/transam.h"
 #include "access/twophase.h"
 #include "cdb/cdblocaldistribxact.h"
 #include "cdb/cdbvars.h"
-#include "storage/proc.h"
-#include "utils/hsearch.h"
-#include "utils/guc.h"
+#include "lib/ilist.h"
 #include "miscadmin.h"
+#include "storage/proc.h"
+#include "utils/guc.h"
+#include "utils/hsearch.h"
 #include "utils/memutils.h"
-#include "cdb/cdbdoublylinked.h"
 
 /*  ***************************************************************************** */
 
@@ -79,7 +79,7 @@ LocalDistribXact_ChangeState(int pgprocno,
 		case LOCALDISTRIBXACT_STATE_PREPARED:
 			if (oldState != LOCALDISTRIBXACT_STATE_ACTIVE)
 				elog(PANIC,
-					 "Expected distributed transaction xid = %u to local element to be in state \"Active\" and "
+					 "Expected distributed transaction xid = "UINT64_FORMAT" to local element to be in state \"Active\" and "
 					 "found state \"%s\"",
 					 distribXid,
 					 LocalDistribXactStateToString(oldState));
@@ -88,16 +88,17 @@ LocalDistribXact_ChangeState(int pgprocno,
 		case LOCALDISTRIBXACT_STATE_COMMITTED:
 			if (oldState != LOCALDISTRIBXACT_STATE_ACTIVE)
 				elog(PANIC,
-					 "Expected distributed transaction xid = %u to local element to be in state \"Active\" or \"Commit Delivery\" and "
+					 "Expected distributed transaction xid = "UINT64_FORMAT" to local element to be in state \"Active\" or \"Commit Delivery\" and "
 					 "found state \"%s\"",
 					 distribXid,
 					 LocalDistribXactStateToString(oldState));
 			break;
 
 		case LOCALDISTRIBXACT_STATE_ABORTED:
-			if (oldState != LOCALDISTRIBXACT_STATE_ACTIVE)
+			if (oldState != LOCALDISTRIBXACT_STATE_ACTIVE &&
+				oldState != LOCALDISTRIBXACT_STATE_ABORTED)
 				elog(PANIC,
-					 "Expected distributed transaction xid = %u to local element to be in state \"Active\" or \"Abort Delivery\" and "
+					 "Expected distributed transaction xid = "UINT64_FORMAT" to local element to be in state \"Active\" or \"Abort Delivery\" and "
 					 "found state \"%s\"",
 					 distribXid,
 					 LocalDistribXactStateToString(oldState));
@@ -116,7 +117,7 @@ LocalDistribXact_ChangeState(int pgprocno,
 	proc->localDistribXactData.state = newState;
 
 	elog((Debug_print_full_dtm ? LOG : DEBUG5),
-		 "Moved distributed transaction xid = %u (local xid = %u) from \"%s\" to \"%s\"",
+		 "Moved distributed transaction xid = "UINT64_FORMAT" (local xid = %u) from \"%s\" to \"%s\"",
 		 distribXid,
 		 pgxact->xid,
 		 LocalDistribXactStateToString(oldState),
@@ -137,8 +138,7 @@ LocalDistribXact_DisplayString(int pgprocno)
 		snprintf(
 				 LocalDistribDisplayBuffer,
 				 MAX_LOCAL_DISTRIB_DISPLAY_BUFFER,
-				 "distributed transaction {timestamp %u, xid %u} for local xid %u",
-				 proc->localDistribXactData.distribTimeStamp,
+				 "distributed transaction {gxid "UINT64_FORMAT" for local xid %u",
 				 proc->localDistribXactData.distribXid,
 				 pgxact->xid);
 
@@ -174,7 +174,7 @@ typedef struct LocalDistribXactCacheEntry
 
 	int64		visits;
 
-	DoubleLinks lruDoubleLinks;
+	dlist_node	lruDoubleLinks;
 	/* list link for LRU */
 
 } LocalDistribXactCacheEntry;
@@ -186,20 +186,18 @@ static struct LocalDistribXactCache
 {
 	int32		count;
 
-	DoublyLinkedHead lruDoublyLinkedHead;
+	dlist_head	lruDoublyLinkedHead;
 
 	int64		hitCount;
 	int64		totalCount;
 	int64		addCount;
 	int64		removeCount;
 
-}			LocalDistribXactCache = {0, {NULL, NULL}, 0, 0, 0, 0};
+}			LocalDistribXactCache = {0, DLIST_STATIC_INIT(LocalDistribXactCache.lruDoublyLinkedHead), 0, 0, 0, 0};
 
 
 bool
-LocalDistribXactCache_CommittedFind(
-									TransactionId localXid,
-									DistributedTransactionTimeStamp distribTransactionTimeStamp,
+LocalDistribXactCache_CommittedFind(TransactionId localXid,
 									DistributedTransactionId *distribXid)
 {
 	LocalDistribXactCacheEntry *entry;
@@ -234,7 +232,7 @@ LocalDistribXactCache_CommittedFind(
 											HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT);
 
 		MemSet(&LocalDistribXactCache, 0, sizeof(LocalDistribXactCache));
-		DoublyLinkedHead_Init(&LocalDistribXactCache.lruDoublyLinkedHead);
+		dlist_init(&LocalDistribXactCache.lruDoublyLinkedHead);
 
 	}
 
@@ -249,14 +247,8 @@ LocalDistribXactCache_CommittedFind(
 		/*
 		 * Maintain LRU ordering.
 		 */
-		DoubleLinks_Remove(
-						   offsetof(LocalDistribXactCacheEntry, lruDoubleLinks),
-						   &LocalDistribXactCache.lruDoublyLinkedHead,
-						   entry);
-		DoublyLinkedHead_AddFirst(
-								  offsetof(LocalDistribXactCacheEntry, lruDoubleLinks),
-								  &LocalDistribXactCache.lruDoublyLinkedHead,
-								  entry);
+		dlist_delete(&entry->lruDoubleLinks);
+		dlist_push_head(&LocalDistribXactCache.lruDoublyLinkedHead, &entry->lruDoubleLinks);
 
 		*distribXid = entry->distribXid;
 
@@ -271,9 +263,7 @@ LocalDistribXactCache_CommittedFind(
 }
 
 void
-LocalDistribXactCache_AddCommitted(
-								   TransactionId localXid,
-								   DistributedTransactionTimeStamp distribTransactionTimeStamp,
+LocalDistribXactCache_AddCommitted(TransactionId localXid,
 								   DistributedTransactionId distribXid)
 {
 	LocalDistribXactCacheEntry *entry;
@@ -297,10 +287,11 @@ LocalDistribXactCache_AddCommitted(
 		 * Remove oldest.
 		 */
 		lastEntry = (LocalDistribXactCacheEntry *)
-			DoublyLinkedHead_RemoveLast(
-										offsetof(LocalDistribXactCacheEntry, lruDoubleLinks),
-										&LocalDistribXactCache.lruDoublyLinkedHead);
+			dlist_container(LocalDistribXactCacheEntry,
+							lruDoubleLinks,
+							dlist_tail_node(&LocalDistribXactCache.lruDoublyLinkedHead));
 		Assert(lastEntry != NULL);
+		dlist_delete(&lastEntry->lruDoubleLinks);
 
 		removedEntry = (LocalDistribXactCacheEntry *)
 			hash_search(LocalDistribCacheHtab, &lastEntry->localXid,
@@ -323,11 +314,8 @@ LocalDistribXactCache_AddCommitted(
 		elog(ERROR, "Add should not have found local xid = %x", localXid);
 	}
 
-	DoubleLinks_Init(&entry->lruDoubleLinks);
-	DoublyLinkedHead_AddFirst(
-							  offsetof(LocalDistribXactCacheEntry, lruDoubleLinks),
-							  &LocalDistribXactCache.lruDoublyLinkedHead,
-							  entry);
+	dlist_push_head(&LocalDistribXactCache.lruDoublyLinkedHead,
+					&entry->lruDoubleLinks);
 
 	entry->localXid = localXid;
 	entry->distribXid = distribXid;

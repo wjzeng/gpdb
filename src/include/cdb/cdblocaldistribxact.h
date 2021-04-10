@@ -3,7 +3,7 @@
  * cdblocaldistribxact.h
  *
  * Portions Copyright (c) 2007-2008, Greenplum inc
- * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
  *
  *
  * IDENTIFICATION
@@ -13,8 +13,6 @@
  */
 #ifndef CDBLOCALDISTRIBXACT_H
 #define CDBLOCALDISTRIBXACT_H
-
-#include "storage/lock.h"
 
 typedef enum
 {
@@ -37,9 +35,8 @@ typedef struct LocalDistribXactData
 	LocalDistribXactState		state;
 
 	/*
-	 * Distributed xid and the master's restart timestamp.
+	 * Distributed xid.
 	 */
-	DistributedTransactionTimeStamp	distribTimeStamp;
 	DistributedTransactionId 		distribXid;
 
 } LocalDistribXactData;
@@ -51,12 +48,10 @@ extern char* LocalDistribXact_DisplayString(int pgprocno);
 
 extern bool LocalDistribXactCache_CommittedFind(
 	TransactionId						localXid,
-	DistributedTransactionTimeStamp		distribTransactionTimeStamp,
 	DistributedTransactionId			*distribXid);
 
 extern void LocalDistribXactCache_AddCommitted(
 	TransactionId						localXid,
-	DistributedTransactionTimeStamp		distribTransactionTimeStamp,
 	DistributedTransactionId			distribXid);
 
 extern void LocalDistribXactCache_ShowStats(char *nameStr);

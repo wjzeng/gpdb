@@ -1,7 +1,7 @@
 package MSBuildProject;
 
 #
-# Package that encapsulates a MSBuild project file (Visual C++ 2010 or greater)
+# Package that encapsulates a MSBuild project file (Visual C++ 2013 or greater)
 #
 # src/tools/msvc/MSBuildProject.pm
 #
@@ -10,6 +10,8 @@ use Carp;
 use strict;
 use warnings;
 use base qw(Project);
+
+no warnings qw(redefine);    ## no critic
 
 sub _new
 {
@@ -34,10 +36,16 @@ sub WriteHeader
 EOF
 	$self->WriteConfigurationHeader($f, 'Debug');
 	$self->WriteConfigurationHeader($f, 'Release');
+	my $sdkversion=$ENV{'WindowsSDKVersion'};
+	if ($sdkversion =~ /.*\\$/)
+	{
+		chop $sdkversion;
+	}
 	print $f <<EOF;
   </ItemGroup>
   <PropertyGroup Label="Globals">
     <ProjectGuid>$self->{guid}</ProjectGuid>
+    <WindowsTargetPlatformVersion>$sdkversion</WindowsTargetPlatformVersion>
   </PropertyGroup>
   <Import Project="\$(VCTargetsPath)\\Microsoft.Cpp.Default.props" />
 EOF
@@ -63,24 +71,24 @@ EOF
   </PropertyGroup>
 EOF
 
-	# We have to use this flag on 32 bit targets because the 32bit perls
-	# are built with it and sometimes crash if we don't.
-	my $use_32bit_time_t =
-	  $self->{platform} eq 'Win32' ? '_USE_32BIT_TIME_T;' : '';
-
 	$self->WriteItemDefinitionGroup(
 		$f, 'Debug',
-		{   defs    => "_DEBUG;DEBUG=1;$use_32bit_time_t",
+		{
+			defs    => "_DEBUG;DEBUG=1",
 			opt     => 'Disabled',
 			strpool => 'false',
-			runtime => 'MultiThreadedDebugDLL' });
+			runtime => 'MultiThreadedDebugDLL'
+		});
 	$self->WriteItemDefinitionGroup(
 		$f,
 		'Release',
-		{   defs    => "$use_32bit_time_t",
+		{
+			defs    => "",
 			opt     => 'Full',
 			strpool => 'true',
-			runtime => 'MultiThreadedDLL' });
+			runtime => 'MultiThreadedDLL'
+		});
+	return;
 }
 
 sub AddDefine
@@ -88,6 +96,7 @@ sub AddDefine
 	my ($self, $def) = @_;
 
 	$self->{defines} .= $def . ';';
+	return;
 }
 
 sub WriteReferences
@@ -113,6 +122,7 @@ EOF
   </ItemGroup>
 EOF
 	}
+	return;
 }
 
 sub WriteFiles
@@ -127,7 +137,7 @@ EOF
 	foreach my $fileNameWithPath (sort keys %{ $self->{files} })
 	{
 		confess "Bad format filename '$fileNameWithPath'\n"
-		  unless ($fileNameWithPath =~ /^(.*)\\([^\\]+)\.[r]?[cyl]$/);
+		  unless ($fileNameWithPath =~ m!^(.*)/([^/]+)\.(c|cpp|y|l|rc)$!);
 		my $dir      = $1;
 		my $fileName = $2;
 		if ($fileNameWithPath =~ /\.y$/ or $fileNameWithPath =~ /\.l$/)
@@ -143,7 +153,7 @@ EOF
 
 			# File already exists, so fake a new name
 			my $obj = $dir;
-			$obj =~ s/\\/_/g;
+			$obj =~ s!/!_!g;
 
 			print $f <<EOF;
     <ClCompile Include="$fileNameWithPath">
@@ -175,7 +185,7 @@ EOF
 			if ($grammarFile =~ /\.y$/)
 			{
 				$outputFile =~
-s{^src\\pl\\plpgsql\\src\\gram.c$}{src\\pl\\plpgsql\\src\\pl_gram.c};
+				  s{^src\\pl\\plpgsql\\src\\gram.c$}{src\\pl\\plpgsql\\src\\pl_gram.c};
 				print $f <<EOF;
     <CustomBuild Include="$grammarFile">
       <Message Condition="'\$(Configuration)|\$(Platform)'=='Debug|$self->{platform}'">Running bison on $grammarFile</Message>
@@ -224,6 +234,7 @@ EOF
   </ItemGroup>
 EOF
 	}
+	return;
 }
 
 sub WriteConfigurationHeader
@@ -235,6 +246,7 @@ sub WriteConfigurationHeader
       <Platform>$self->{platform}</Platform>
     </ProjectConfiguration>
 EOF
+	return;
 }
 
 sub WriteConfigurationPropertyGroup
@@ -251,8 +263,10 @@ sub WriteConfigurationPropertyGroup
     <UseOfMfc>false</UseOfMfc>
     <CharacterSet>MultiByte</CharacterSet>
     <WholeProgramOptimization>$p->{wholeopt}</WholeProgramOptimization>
+    <PlatformToolset>$self->{PlatformToolset}</PlatformToolset>
   </PropertyGroup>
 EOF
+	return;
 }
 
 sub WritePropertySheetsPropertyGroup
@@ -263,6 +277,7 @@ sub WritePropertySheetsPropertyGroup
     <Import Project="\$(UserRootDir)\\Microsoft.Cpp.\$(Platform).user.props" Condition="exists('\$(UserRootDir)\\Microsoft.Cpp.\$(Platform).user.props')" Label="LocalAppDataPlatform" />
   </ImportGroup>
 EOF
+	return;
 }
 
 sub WriteAdditionalProperties
@@ -273,6 +288,7 @@ sub WriteAdditionalProperties
     <IntDir Condition="'\$(Configuration)|\$(Platform)'=='$cfgname|$self->{platform}'">.\\$cfgname\\$self->{name}\\</IntDir>
     <LinkIncremental Condition="'\$(Configuration)|\$(Platform)'=='$cfgname|$self->{platform}'">false</LinkIncremental>
 EOF
+	return;
 }
 
 sub WriteItemDefinitionGroup
@@ -325,13 +341,15 @@ sub WriteItemDefinitionGroup
       <GenerateMapFile>false</GenerateMapFile>
       <MapFileName>.\\$cfgname\\$self->{name}\\$self->{name}.map</MapFileName>
       <RandomizedBaseAddress>false</RandomizedBaseAddress>
+      <!-- Permit links to MinGW-built, 32-bit DLLs (default before VS2012). -->
+      <ImageHasSafeExceptionHandlers/>
       <SubSystem>Console</SubSystem>
       <TargetMachine>$targetmachine</TargetMachine>
 EOF
 	if ($self->{disablelinkerwarnings})
 	{
 		print $f
-"      <AdditionalOptions>/ignore:$self->{disablelinkerwarnings} \%(AdditionalOptions)</AdditionalOptions>\n";
+		  "      <AdditionalOptions>/ignore:$self->{disablelinkerwarnings} \%(AdditionalOptions)</AdditionalOptions>\n";
 	}
 	if ($self->{implib})
 	{
@@ -363,6 +381,7 @@ EOF
 	print $f <<EOF;
   </ItemDefinitionGroup>
 EOF
+	return;
 }
 
 sub Footer
@@ -376,70 +395,7 @@ sub Footer
   </ImportGroup>
 </Project>
 EOF
-}
-
-package VC2010Project;
-
-#
-# Package that encapsulates a Visual C++ 2010 project file
-#
-
-use strict;
-use warnings;
-use base qw(MSBuildProject);
-
-sub new
-{
-	my $classname = shift;
-	my $self      = $classname->SUPER::_new(@_);
-	bless($self, $classname);
-
-	$self->{vcver} = '10.00';
-
-	return $self;
-}
-
-package VC2012Project;
-
-#
-# Package that encapsulates a Visual C++ 2012 project file
-#
-
-use strict;
-use warnings;
-use base qw(MSBuildProject);
-
-sub new
-{
-	my $classname = shift;
-	my $self      = $classname->SUPER::_new(@_);
-	bless($self, $classname);
-
-	$self->{vcver}           = '11.00';
-	$self->{PlatformToolset} = 'v110';
-
-	return $self;
-}
-
-# This override adds the <PlatformToolset> element
-# to the PropertyGroup labeled "Configuration"
-sub WriteConfigurationPropertyGroup
-{
-	my ($self, $f, $cfgname, $p) = @_;
-	my $cfgtype =
-	  ($self->{type} eq "exe")
-	  ? 'Application'
-	  : ($self->{type} eq "dll" ? 'DynamicLibrary' : 'StaticLibrary');
-
-	print $f <<EOF;
-  <PropertyGroup Condition="'\$(Configuration)|\$(Platform)'=='$cfgname|$self->{platform}'" Label="Configuration">
-    <ConfigurationType>$cfgtype</ConfigurationType>
-    <UseOfMfc>false</UseOfMfc>
-    <CharacterSet>MultiByte</CharacterSet>
-    <WholeProgramOptimization>$p->{wholeopt}</WholeProgramOptimization>
-    <PlatformToolset>$self->{PlatformToolset}</PlatformToolset>
-  </PropertyGroup>
-EOF
+	return;
 }
 
 package VC2013Project;
@@ -450,7 +406,9 @@ package VC2013Project;
 
 use strict;
 use warnings;
-use base qw(VC2012Project);
+use base qw(MSBuildProject);
+
+no warnings qw(redefine);    ## no critic
 
 sub new
 {
@@ -461,6 +419,56 @@ sub new
 	$self->{vcver}           = '12.00';
 	$self->{PlatformToolset} = 'v120';
 	$self->{ToolsVersion}    = '12.0';
+
+	return $self;
+}
+
+package VC2015Project;
+
+#
+# Package that encapsulates a Visual C++ 2015 project file
+#
+
+use strict;
+use warnings;
+use base qw(MSBuildProject);
+
+no warnings qw(redefine);    ## no critic
+
+sub new
+{
+	my $classname = shift;
+	my $self      = $classname->SUPER::_new(@_);
+	bless($self, $classname);
+
+	$self->{vcver}           = '14.00';
+	$self->{PlatformToolset} = 'v140';
+	$self->{ToolsVersion}    = '14.0';
+
+	return $self;
+}
+
+package VC2017Project;
+
+#
+# Package that encapsulates a Visual C++ 2017 project file
+#
+
+use strict;
+use warnings;
+use base qw(MSBuildProject);
+
+no warnings qw(redefine);    ## no critic
+
+sub new
+{
+	my $classname = shift;
+	my $self      = $classname->SUPER::_new(@_);
+	bless($self, $classname);
+
+	$self->{vcver}           = '15.00';
+	$self->{PlatformToolset} = 'v141';
+	$self->{ToolsVersion}    = '15.0';
 
 	return $self;
 }

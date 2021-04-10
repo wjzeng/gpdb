@@ -5,7 +5,7 @@
  *
  *
  * Portions Copyright (c) 2005-2008, Greenplum inc
- * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
  *
  *
  * IDENTIFICATION
@@ -27,6 +27,7 @@
 #include "cdb/cdbsrlz.h"
 #include "cdb/tupleremap.h"
 #include "nodes/execnodes.h"
+#include "pgstat.h"
 #include "tcop/tcopprot.h"
 #include "utils/datum.h"
 #include "utils/guc.h"
@@ -38,6 +39,7 @@
 #include "utils/session_state.h"
 #include "utils/typcache.h"
 #include "miscadmin.h"
+#include "mb/pg_wchar.h"
 
 #include "cdb/cdbdisp.h"
 #include "cdb/cdbdisp_query.h"
@@ -50,6 +52,13 @@
 
 extern bool Test_print_direct_dispatch_info;
 
+typedef struct ParamWalkerContext
+{
+	plan_tree_base_prefix base; /* Required prefix for
+								 * plan_tree_walker/mutator */
+	List	   *params;
+} ParamWalkerContext;
+
 /*
  * We need an array describing the relationship between a slice and
  * the number of "child" slices which depend on it.
@@ -58,7 +67,7 @@ typedef struct
 {
 	int			sliceIndex;
 	int			children;
-	Slice	   *slice;
+	ExecSlice  *slice;
 } SliceVec;
 
 /*
@@ -71,14 +80,10 @@ typedef struct DispatchCommandQueryParms
 	 */
 	const char *strCommand;
 	int			strCommandlen;
-	char	   *serializedQuerytree;
-	int			serializedQuerytreelen;
 	char	   *serializedPlantree;
 	int			serializedPlantreelen;
 	char	   *serializedQueryDispatchDesc;
 	int			serializedQueryDispatchDesclen;
-	char	   *serializedParams;
-	int			serializedParamslen;
 
 	/*
 	 * Additional information.
@@ -91,8 +96,6 @@ typedef struct DispatchCommandQueryParms
 	 */
 	char	   *serializedDtxContextInfo;
 	int			serializedDtxContextInfolen;
-
-	int			rootIdx;
 } DispatchCommandQueryParms;
 
 static int fillSliceVector(SliceTable *sliceTable,
@@ -108,20 +111,40 @@ static DispatchCommandQueryParms *cdbdisp_buildUtilityQueryParms(struct Node *st
 static DispatchCommandQueryParms *cdbdisp_buildCommandQueryParms(const char *strCommand, int flags);
 
 static void cdbdisp_dispatchCommandInternal(DispatchCommandQueryParms *pQueryParms,
-											int flags, CdbPgResults *cdb_pgresults);
+											int flags, List *segments,
+											CdbPgResults *cdb_pgresults);
 
 static void
 cdbdisp_dispatchX(QueryDesc *queryDesc,
 			bool planRequiresTxn,
 			bool cancelOnError);
 
-static char *serializeParamListInfo(ParamListInfo paramLI, int *len_p);
+static List *formIdleSegmentIdList(void);
 
-static List * formIdleSegmentIdList(void);
+static bool param_walker(Node *node, ParamWalkerContext *context);
+static Oid	findParamType(List *params, int paramid);
+static Bitmapset *getExecParamsToDispatch(PlannedStmt *stmt, ParamExecData *intPrm,
+										  List **paramExecTypes);
+static SerializedParams *serializeParamsForDispatch(QueryDesc *queryDesc,
+													ParamListInfo externParams,
+													ParamExecData *execParams,
+													List *paramExecTypes,
+													Bitmapset *sendParams);
+
+
+
 /*
  * Compose and dispatch the MPPEXEC commands corresponding to a plan tree
  * within a complete parallel plan. (A plan tree will correspond either
  * to an initPlan or to the main plan.)
+ *
+ * 'execParams', 'paramExecTypes' and 'sendParams' describe executor
+ * parameters (PARAM_EXEC) that should be sent with the query.
+ * 'sendParams' indicates which parameters are included and 'execParams'
+ * contains their values. 'paramExecTypes' is a list indexed by paramid,
+ * containing the datatype OID of each parameter.
+ * GPDB_11_MERGE_FIXME: In PostgreSQL v11, we have paramExecTypes in
+ * PlannedStmt, so it will no longer be necessary to pass it as a param.
  *
  * If cancelOnError is true, then any dispatching error, a cancellation
  * request from the client, or an error from any of the associated QEs,
@@ -149,21 +172,19 @@ static List * formIdleSegmentIdList(void);
  * Note that the slice tree dispatched is the one specified in the EState
  * of the argument QueryDesc as es_cur__slice.
  *
- * Note that the QueryDesc params must include PARAM_EXEC_REMOTE parameters
- * containing the values of any initplans required by the slice to be run.
- * (This is handled by calls to addRemoteExecParamsToParamList() from the
- * functions preprocess_initplans() and ExecutorRun().)
- *
  * Each QE receives its assignment as a message of type 'M' in PostgresMain().
  * The message is deserialized and processed by exec_mpp_query() in postgres.c.
  */
 void
 CdbDispatchPlan(struct QueryDesc *queryDesc,
+				ParamExecData *execParams,
 				bool planRequiresTxn,
 				bool cancelOnError)
 {
 	PlannedStmt *stmt;
 	bool		is_SRI = false;
+	List	   *paramExecTypes;
+	Bitmapset  *sendParams;
 
 	Assert(Gp_role == GP_ROLE_DISPATCH);
 	Assert(queryDesc != NULL && queryDesc->estate != NULL);
@@ -216,6 +237,19 @@ CdbDispatchPlan(struct QueryDesc *queryDesc,
 	}
 
 	/*
+	 * Fill in parameter info.
+	 *
+	 * First, figure out which executor parameters (PARAM_EXEC) have valid
+	 * values that need to be included with the query. Then serialize them,
+	 * and also any PARAM_EXTERN parameters.
+	 */
+	sendParams = getExecParamsToDispatch(stmt, execParams, &paramExecTypes);
+	queryDesc->ddesc->paramInfo =
+		serializeParamsForDispatch(queryDesc,
+								   queryDesc->params,
+								   execParams, paramExecTypes, sendParams);
+
+	/*
 	 * Cursor queries and bind/execute path queries don't run on the
 	 * writer-gang QEs; but they require snapshot-synchronization to get
 	 * started.
@@ -228,10 +262,29 @@ CdbDispatchPlan(struct QueryDesc *queryDesc,
 	 */
 	if (queryDesc->extended_query)
 	{
-		verify_shared_snapshot_ready();
+		verify_shared_snapshot_ready(gp_command_count);
 	}
 
 	cdbdisp_dispatchX(queryDesc, planRequiresTxn, cancelOnError);
+}
+
+/*
+ * SET command can not be dispatched to named portal (like CURSOR). On the one
+ * hand, named portal might be busy and also it should not be affected by
+ * the SET command. Then when a dispatcher state of named portal is destroyed,
+ * its gang should not be recycled because its guc was not set, so need to mark
+ * those gangs as not recyclable.
+ */
+static void
+cdbdisp_markNamedPortalGangsDestroyed(void)
+{
+	dispatcher_handle_t *head = open_dispatcher_handles;
+	while (head != NULL)
+	{
+		if (head->dispatcherState->isExtendedQuery)
+			head->dispatcherState->forceDestroyGang = true;
+		head = head->next;
+	}
 }
 
 /*
@@ -247,15 +300,11 @@ CdbDispatchSetCommand(const char *strCommand, bool cancelOnError)
 {
 	CdbDispatcherState *ds;
 	DispatchCommandQueryParms *pQueryParms;
+	Gang *primaryGang;
 	char	   *queryText;
 	int		queryTextLength;
 	ListCell   *le;
 	ErrorData *qeError = NULL;
-
-	dtmPreCommand("CdbDispatchSetCommand", strCommand, NULL,
-				  false /* no two-phase commit needed for SET */,
-				  false, /* no snapshot needed for SET */
-				  false /* inCursor */ );
 
 	elog((Debug_print_full_dtm ? LOG : DEBUG5),
 		 "CdbDispatchSetCommand for command = '%s'",
@@ -267,7 +316,7 @@ CdbDispatchSetCommand(const char *strCommand, bool cancelOnError)
 
 	queryText = buildGpQueryString(pQueryParms, &queryTextLength);
 
-	AllocateGang(ds, GANGTYPE_PRIMARY_WRITER, cdbcomponent_getCdbComponentsList());
+	primaryGang = AllocateGang(ds, GANGTYPE_PRIMARY_WRITER, cdbcomponent_getCdbComponentsList());
 
 	/* put all idle segment to a gang so QD can send SET command to them */
 	AllocateGang(ds, GANGTYPE_PRIMARY_READER, formIdleSegmentIdList());
@@ -281,14 +330,18 @@ CdbDispatchSetCommand(const char *strCommand, bool cancelOnError)
 
 		cdbdisp_dispatchToGang(ds, rg, -1);
 	}
+	addToGxactDtxSegments(primaryGang);
+
+	/*
+	 * No need for two-phase commit, so no need to call
+	 * addToGxactDtxSegments.
+	 */
 
 	cdbdisp_waitDispatchFinish(ds);
 
 	cdbdisp_checkDispatchResult(ds, DISPATCH_WAIT_NONE);
 
 	cdbdisp_getDispatchResults(ds, &qeError);
-
-	cdbdisp_destroyDispatcherState(ds);
 
 	/*
 	 * For named portal (like CURSOR), SET command will not be
@@ -299,8 +352,12 @@ CdbDispatchSetCommand(const char *strCommand, bool cancelOnError)
 
 	if (qeError)
 	{
+
+		FlushErrorState();
 		ReThrowError(qeError);
 	}
+
+	cdbdisp_destroyDispatcherState(ds);
 }
 
 /*
@@ -311,20 +368,33 @@ CdbDispatchSetCommand(const char *strCommand, bool cancelOnError)
  *
  * -flags:
  *  Is the combination of DF_NEED_TWO_PHASE, DF_WITH_SNAPSHOT,DF_CANCEL_ON_ERROR
- *
  */
 void
 CdbDispatchCommand(const char *strCommand,
 				   int flags,
 				   CdbPgResults *cdb_pgresults)
 {
+	return CdbDispatchCommandToSegments(strCommand,
+										flags,
+										cdbcomponent_getCdbComponentsList(),
+										cdb_pgresults);
+}
+
+/*
+ * Like CdbDispatchCommand, but sends the command only to the
+ * specified segments.
+ */
+void
+CdbDispatchCommandToSegments(const char *strCommand,
+							 int flags,
+							 List *segments,
+							 CdbPgResults *cdb_pgresults)
+{
 	DispatchCommandQueryParms *pQueryParms;
 	bool needTwoPhase = flags & DF_NEED_TWO_PHASE;
-	bool withSnapshot = flags & DF_WITH_SNAPSHOT;
 
-	dtmPreCommand("CdbDispatchCommand", strCommand,
-				  NULL, needTwoPhase, withSnapshot,
-				  false /* inCursor */ );
+	if (needTwoPhase)
+		setupDtxTransaction();
 
 	elogif((Debug_print_full_dtm || log_min_messages <= DEBUG5), LOG,
 		   "CdbDispatchCommand: %s (needTwoPhase = %s)",
@@ -332,7 +402,10 @@ CdbDispatchCommand(const char *strCommand,
 
 	pQueryParms = cdbdisp_buildCommandQueryParms(strCommand, flags);
 
-	return cdbdisp_dispatchCommandInternal(pQueryParms, flags, cdb_pgresults);
+	return cdbdisp_dispatchCommandInternal(pQueryParms,
+										   flags,
+										   segments,
+										   cdb_pgresults);
 }
 
 /*
@@ -357,24 +430,27 @@ CdbDispatchUtilityStatement(struct Node *stmt,
 {
 	DispatchCommandQueryParms *pQueryParms;
 	bool needTwoPhase = flags & DF_NEED_TWO_PHASE;
-	bool withSnapshot = flags & DF_WITH_SNAPSHOT;
 
-	dtmPreCommand("CdbDispatchUtilityStatement", debug_query_string,
-				  NULL, needTwoPhase, withSnapshot,
-				  false /* inCursor */ );
+	if (needTwoPhase)
+		setupDtxTransaction();
 
 	elogif((Debug_print_full_dtm || log_min_messages <= DEBUG5), LOG,
 		   "CdbDispatchUtilityStatement: %s (needTwoPhase = %s)",
-		   debug_query_string, (needTwoPhase ? "true" : "false"));
+		   (PointerIsValid(debug_query_string) ? debug_query_string : "\"\""),
+		   (needTwoPhase ? "true" : "false"));
 
 	pQueryParms = cdbdisp_buildUtilityQueryParms(stmt, flags, oid_assignments);
 
-	return cdbdisp_dispatchCommandInternal(pQueryParms, flags, cdb_pgresults);
+	return cdbdisp_dispatchCommandInternal(pQueryParms,
+										   flags,
+										   cdbcomponent_getCdbComponentsList(),
+										   cdb_pgresults);
 }
 
 static void
 cdbdisp_dispatchCommandInternal(DispatchCommandQueryParms *pQueryParms,
                                 int flags,
+								List *segments,
                                 CdbPgResults *cdb_pgresults)
 {
 	CdbDispatcherState *ds;
@@ -389,19 +465,38 @@ cdbdisp_dispatchCommandInternal(DispatchCommandQueryParms *pQueryParms,
 	 */
 	ds = cdbdisp_makeDispatcherState(false);
 
+	/*
+	 * Reader gangs use local snapshot to access catalog, as a result, it will
+	 * not synchronize with the global snapshot from write gang which will lead
+	 * to inconsistent visibilty of catalog table. Considering the case:
+	 * 
+	 * select * from t, t t1; -- create a reader gang.
+	 * begin;
+	 * create role r1;
+	 * set role r1;  -- set command will also dispatched to idle reader gang
+	 *
+	 * When set role command dispatched to reader gang, reader gang cannot see
+	 * the new tuple t1 in catalog table pg_auth.
+	 * To fix this issue, we should drop the idle reader gangs after each
+	 * utility statement which may modify the catalog table.
+	 */
+	ds->destroyIdleReaderGang = true;
+
 	queryText = buildGpQueryString(pQueryParms, &queryTextLength);
 
 	/*
 	 * Allocate a primary QE for every available segDB in the system.
 	 */
-	primaryGang = AllocateGang(ds, GANGTYPE_PRIMARY_WRITER,
-										cdbcomponent_getCdbComponentsList());
+	primaryGang = AllocateGang(ds, GANGTYPE_PRIMARY_WRITER, segments);
 	Assert(primaryGang);
 
 	cdbdisp_makeDispatchResults(ds, 1, flags & DF_CANCEL_ON_ERROR);
 	cdbdisp_makeDispatchParams (ds, 1, queryText, queryTextLength);
 
 	cdbdisp_dispatchToGang(ds, primaryGang, -1);
+
+	if ((flags & DF_NEED_TWO_PHASE) != 0 || isDtxExplicitBegin())
+		addToGxactDtxSegments(primaryGang);
 
 	cdbdisp_waitDispatchFinish(ds);
 
@@ -411,9 +506,12 @@ cdbdisp_dispatchCommandInternal(DispatchCommandQueryParms *pQueryParms,
 
 	if (qeError)
 	{
-		cdbdisp_destroyDispatcherState(ds);
+		FlushErrorState();
 		ReThrowError(qeError);
 	}
+
+	/* collect pgstat from QEs for current transaction level */
+	pgstat_combine_from_qe(pr, -1);
 
 	cdbdisp_returnResults(pr, cdb_pgresults);
 
@@ -429,8 +527,6 @@ cdbdisp_buildCommandQueryParms(const char *strCommand, int flags)
 
 	pQueryParms = palloc0(sizeof(*pQueryParms));
 	pQueryParms->strCommand = strCommand;
-	pQueryParms->serializedQuerytree = NULL;
-	pQueryParms->serializedQuerytreelen = 0;
 	pQueryParms->serializedQueryDispatchDesc = NULL;
 	pQueryParms->serializedQueryDispatchDesclen = 0;
 
@@ -451,25 +547,23 @@ cdbdisp_buildUtilityQueryParms(struct Node *stmt,
 				int flags,
 				List *oid_assignments)
 {
-	char *serializedQuerytree = NULL;
+	char *serializedPlantree = NULL;
 	char *serializedQueryDispatchDesc = NULL;
-	int serializedQuerytree_len = 0;
+	int serializedPlantree_len = 0;
 	int serializedQueryDispatchDesc_len = 0;
 	bool needTwoPhase = flags & DF_NEED_TWO_PHASE;
 	bool withSnapshot = flags & DF_WITH_SNAPSHOT;
 	QueryDispatchDesc *qddesc;
-	Query *q;
+	PlannedStmt *pstmt;
 	DispatchCommandQueryParms *pQueryParms;
 
 	Assert(stmt != NULL);
 	Assert(stmt->type < 1000);
 	Assert(stmt->type > 0);
 
-	q = makeNode(Query);
-
-	q->querySource = QSRC_ORIGINAL;
-	q->commandType = CMD_UTILITY;
-	q->utilityStmt = stmt;
+	/* Wrap it in a PlannedStmt */
+	pstmt = makeNode(PlannedStmt);
+	pstmt->commandType = CMD_UTILITY;
 
 	/*
 	 * We must set q->canSetTag = true.  False would be used to hide a command
@@ -479,15 +573,17 @@ cdbdisp_buildUtilityQueryParms(struct Node *stmt,
 	 * should come back as "SELECT n" and should not reflect other commands
 	 * inserted by rewrite rules.  True means we want the status.
 	 */
-	q->canSetTag = true;
+	pstmt->canSetTag = true;
+	pstmt->utilityStmt = stmt;
+	pstmt->stmt_location = 0;
+	pstmt->stmt_len = 0;
 
 	/*
 	 * serialized the stmt tree, and create the sql statement: mppexec ....
 	 */
-	serializedQuerytree = serializeNode((Node *) q, &serializedQuerytree_len,
-										NULL /* uncompressed_size */ );
-
-	Assert(serializedQuerytree != NULL);
+	serializedPlantree = serializeNode((Node *) pstmt, &serializedPlantree_len,
+									   NULL /* uncompressed_size */ );
+	Assert(serializedPlantree != NULL);
 
 	if (oid_assignments)
 	{
@@ -499,9 +595,9 @@ cdbdisp_buildUtilityQueryParms(struct Node *stmt,
 	}
 
 	pQueryParms = palloc0(sizeof(*pQueryParms));
-	pQueryParms->strCommand = debug_query_string;
-	pQueryParms->serializedQuerytree = serializedQuerytree;
-	pQueryParms->serializedQuerytreelen = serializedQuerytree_len;
+	pQueryParms->strCommand = PointerIsValid(debug_query_string) ? debug_query_string : "";
+	pQueryParms->serializedPlantree = serializedPlantree;
+	pQueryParms->serializedPlantreelen = serializedPlantree_len;
 	pQueryParms->serializedQueryDispatchDesc = serializedQueryDispatchDesc;
 	pQueryParms->serializedQueryDispatchDesclen = serializedQueryDispatchDesc_len;
 
@@ -522,24 +618,14 @@ cdbdisp_buildPlanQueryParms(struct QueryDesc *queryDesc,
 							bool planRequiresTxn)
 {
 	char	   *splan,
-			   *sddesc,
-			   *sparams;
+			   *sddesc;
 
 	int			splan_len,
 				splan_len_uncompressed,
 				sddesc_len,
-				sparams_len,
 				rootIdx;
 
 	rootIdx = RootSliceIndex(queryDesc->estate);
-
-#ifdef USE_ASSERT_CHECKING
-	SliceTable *sliceTbl = queryDesc->estate->es_sliceTable;
-
-	Assert(rootIdx == 0 ||
-		   (rootIdx > sliceTbl->nMotions
-			&& rootIdx <= sliceTbl->nMotions + sliceTbl->nInitPlans));
-#endif
 
 	DispatchCommandQueryParms *pQueryParms = (DispatchCommandQueryParms *) palloc0(sizeof(*pQueryParms));
 
@@ -567,28 +653,13 @@ cdbdisp_buildPlanQueryParms(struct QueryDesc *queryDesc,
 
 	Assert(splan != NULL && splan_len > 0 && splan_len_uncompressed > 0);
 
-	if (queryDesc->params != NULL && queryDesc->params->numParams > 0)
-	{
-		sparams = serializeParamListInfo(queryDesc->params, &sparams_len);
-	}
-	else
-	{
-		sparams = NULL;
-		sparams_len = 0;
-	}
-
 	sddesc = serializeNode((Node *) queryDesc->ddesc, &sddesc_len, NULL /* uncompressed_size */ );
 
 	pQueryParms->strCommand = queryDesc->sourceText;
-	pQueryParms->serializedQuerytree = NULL;
-	pQueryParms->serializedQuerytreelen = 0;
 	pQueryParms->serializedPlantree = splan;
 	pQueryParms->serializedPlantreelen = splan_len;
-	pQueryParms->serializedParams = sparams;
-	pQueryParms->serializedParamslen = sparams_len;
 	pQueryParms->serializedQueryDispatchDesc = sddesc;
 	pQueryParms->serializedQueryDispatchDesclen = sddesc_len;
-	pQueryParms->rootIdx = rootIdx;
 
 	/*
 	 * Serialize a version of our snapshot, and generate our transction
@@ -647,19 +718,6 @@ compare_slice_order(const void *aa, const void *bb)
 	{
 		Assert(b->slice->gangType == GANGTYPE_UNALLOCATED);
 		return -1;
-	}
-
-	/*
-	 * sort the writer gang slice first, because he sets the shared snapshot
-	 */
-	if (a->slice->primaryGang->gang_id == 1)
-	{
-		Assert(b->slice->primaryGang->gang_id != 1);
-		return -1;
-	}
-	if (b->slice->primaryGang->gang_id == 1)
-	{
-		return 1;
 	}
 
 	/* sort slice with larger size first because it has a bigger chance to contain writers */
@@ -728,7 +786,7 @@ markbit_dep_children(SliceTable *sliceTable, int sliceIdx,
 					 SliceVec *sliceVec, int bitmasklen, char *bits)
 {
 	ListCell   *sublist;
-	Slice	   *slice = (Slice *) list_nth(sliceTable->slices, sliceIdx);
+	ExecSlice  *slice = &sliceTable->slices[sliceIdx];
 
 	foreach(sublist, slice->children)
 	{
@@ -792,18 +850,12 @@ buildGpQueryString(DispatchCommandQueryParms *pQueryParms,
 {
 	const char *command = pQueryParms->strCommand;
 	int			command_len;
-	const char *querytree = pQueryParms->serializedQuerytree;
-	int			querytree_len = pQueryParms->serializedQuerytreelen;
 	const char *plantree = pQueryParms->serializedPlantree;
 	int			plantree_len = pQueryParms->serializedPlantreelen;
-	const char *params = pQueryParms->serializedParams;
-	int			params_len = pQueryParms->serializedParamslen;
 	const char *sddesc = pQueryParms->serializedQueryDispatchDesc;
 	int			sddesc_len = pQueryParms->serializedQueryDispatchDesclen;
 	const char *dtxContextInfo = pQueryParms->serializedDtxContextInfo;
 	int			dtxContextInfo_len = pQueryParms->serializedDtxContextInfolen;
-	int			flags = 0;		/* unused flags */
-	int			rootIdx = pQueryParms->rootIdx;
 	int64		currentStatementStartTimestamp = GetCurrentStatementStartTimestamp();
 	Oid			sessionUserId = GetSessionUserId();
 	Oid			outerUserId = GetOuterUserId();
@@ -826,16 +878,19 @@ buildGpQueryString(DispatchCommandQueryParms *pQueryParms,
 	oldContext = MemoryContextSwitchTo(DispatcherContext);
 
 	/*
-	 * If either querytree or plantree is set then the query string is not so
+	 * If plantree is set then the query string is not so
 	 * important, dispatch a truncated version to increase the performance.
 	 *
 	 * Here we only need to determine the truncated size, the actual work is
 	 * done later when copying it to the result buffer.
+	 *
+	 * The +1 and -1 below are adjustments to accommodate terminating null
+	 * character.
 	 */
-	if (querytree || plantree)
-		command_len = strnlen(command, QUERY_STRING_TRUNCATE_SIZE - 1) + 1;
-	else
-		command_len = strlen(command) + 1;
+	command_len = strlen(command) + 1;
+	if (plantree && command_len > QUERY_STRING_TRUNCATE_SIZE)
+		command_len = pg_mbcliplen(command, command_len,
+								   QUERY_STRING_TRUNCATE_SIZE-1) + 1;
 
 	initStringInfo(&resgroupInfo);
 	if (IsResGroupActivated())
@@ -847,26 +902,20 @@ buildGpQueryString(DispatchCommandQueryParms *pQueryParms,
 		sizeof(sessionUserId) /* sessionUserIsSuper */ +
 		sizeof(outerUserId) /* outerUserIsSuper */ +
 		sizeof(currentUserId) +
-		sizeof(rootIdx) +
 		sizeof(n32) * 2 /* currentStatementStartTimestamp */ +
 		sizeof(command_len) +
-		sizeof(querytree_len) +
 		sizeof(plantree_len) +
-		sizeof(params_len) +
 		sizeof(sddesc_len) +
 		sizeof(dtxContextInfo_len) +
 		dtxContextInfo_len +
-		sizeof(flags) +
 		command_len +
-		querytree_len +
 		plantree_len +
-		params_len +
 		sddesc_len +
 		sizeof(numsegments) +
 		sizeof(resgroupInfo.len) +
 		resgroupInfo.len;
 
-	shared_query = palloc0(total_query_len);
+	shared_query = palloc(total_query_len);
 
 	pos = shared_query;
 
@@ -890,10 +939,6 @@ buildGpQueryString(DispatchCommandQueryParms *pQueryParms,
 	memcpy(pos, &tmp, sizeof(currentUserId));
 	pos += sizeof(currentUserId);
 
-	tmp = htonl(rootIdx);
-	memcpy(pos, &tmp, sizeof(rootIdx));
-	pos += sizeof(rootIdx);
-
 	/*
 	 * High order half first, since we're doing MSB-first
 	 */
@@ -914,17 +959,9 @@ buildGpQueryString(DispatchCommandQueryParms *pQueryParms,
 	memcpy(pos, &tmp, sizeof(command_len));
 	pos += sizeof(command_len);
 
-	tmp = htonl(querytree_len);
-	memcpy(pos, &tmp, sizeof(querytree_len));
-	pos += sizeof(querytree_len);
-
 	tmp = htonl(plantree_len);
 	memcpy(pos, &tmp, sizeof(plantree_len));
 	pos += sizeof(plantree_len);
-
-	tmp = htonl(params_len);
-	memcpy(pos, &tmp, sizeof(params_len));
-	pos += sizeof(params_len);
 
 	tmp = htonl(sddesc_len);
 	memcpy(pos, &tmp, sizeof(tmp));
@@ -940,31 +977,15 @@ buildGpQueryString(DispatchCommandQueryParms *pQueryParms,
 		pos += dtxContextInfo_len;
 	}
 
-	tmp = htonl(flags);
-	memcpy(pos, &tmp, sizeof(tmp));
-	pos += sizeof(tmp);
-
 	memcpy(pos, command, command_len);
 	/* If command is truncated we need to set the terminating '\0' manually */
 	pos[command_len - 1] = '\0';
 	pos += command_len;
 
-	if (querytree_len > 0)
-	{
-		memcpy(pos, querytree, querytree_len);
-		pos += querytree_len;
-	}
-
 	if (plantree_len > 0)
 	{
 		memcpy(pos, plantree, plantree_len);
 		pos += plantree_len;
-	}
-
-	if (params_len > 0)
-	{
-		memcpy(pos, params, params_len);
-		pos += params_len;
 	}
 
 	if (sddesc_len > 0)
@@ -1035,10 +1056,6 @@ cdbdisp_dispatchX(QueryDesc* queryDesc,
 	Assert(sliceTbl != NULL);
 
 	rootIdx = RootSliceIndex(estate);
-	Assert(rootIdx == 0 ||
-		   (rootIdx > sliceTbl->nMotions &&
-			rootIdx <= sliceTbl->nMotions + sliceTbl->nInitPlans));
-
 
 	ds = cdbdisp_makeDispatcherState(queryDesc->extended_query);
 
@@ -1046,11 +1063,8 @@ cdbdisp_dispatchX(QueryDesc* queryDesc,
 	 * Since we intend to execute the plan, inventory the slice tree,
 	 * allocate gangs, and associate them with slices.
 	 *
-	 * For now, always use segment 'gp_singleton_segindex' for
-	 * singleton gangs.
-	 *
 	 * On return, gangs have been allocated and CDBProcess lists have
-	 * been filled in in the slice table.)
+	 * been filled in the slice table.)
 	 * 
 	 * Notice: This must be done before cdbdisp_buildPlanQueryParms
 	 */
@@ -1060,9 +1074,11 @@ cdbdisp_dispatchX(QueryDesc* queryDesc,
 	 * Traverse the slice tree in sliceTbl rooted at rootIdx and build a
 	 * vector of slice indexes specifying the order of [potential] dispatch.
 	 */
-	nTotalSlices = list_length(sliceTbl->slices);
+	nTotalSlices = sliceTbl->numSlices;
 	sliceVector = palloc0(nTotalSlices * sizeof(SliceVec));
 	nSlices = fillSliceVector(sliceTbl, rootIdx, sliceVector, nTotalSlices);
+	/* Each slice table has a unique-id. */
+	sliceTbl->ic_instance_id = ++gp_interconnect_id;
 
 	pQueryParms = cdbdisp_buildPlanQueryParms(queryDesc, planRequiresTxn);
 	queryText = buildGpQueryString(pQueryParms, &queryTextLength);
@@ -1096,7 +1112,7 @@ cdbdisp_dispatchX(QueryDesc* queryDesc,
 	for (iSlice = 0; iSlice < nSlices; iSlice++)
 	{
 		Gang	   *primaryGang = NULL;
-		Slice	   *slice = NULL;
+		ExecSlice  *slice;
 		int			si = -1;
 
 		Assert(sliceVector != NULL);
@@ -1120,11 +1136,14 @@ cdbdisp_dispatchX(QueryDesc* queryDesc,
 
 		primaryGang = slice->primaryGang;
 		Assert(primaryGang != NULL);
+		AssertImply(queryDesc->extended_query,
+					primaryGang->type == GANGTYPE_PRIMARY_READER ||
+					primaryGang->type == GANGTYPE_SINGLETON_READER ||
+					primaryGang->type == GANGTYPE_ENTRYDB_READER);
 
 		if (Test_print_direct_dispatch_info)
 			elog(INFO, "(slice %d) Dispatch command to %s", slice->sliceIndex,
-				 		segmentsToContentStr(slice->directDispatch.isDirectDispatch ?
-											slice->directDispatch.contentIds : slice->segments));
+						segmentsToContentStr(slice->segments));
 
 		/*
 		 * Bail out if already got an error or cancellation request.
@@ -1136,11 +1155,13 @@ cdbdisp_dispatchX(QueryDesc* queryDesc,
 			if (InterruptPending)
 				break;
 		}
-		SIMPLE_FAULT_INJECTOR(BeforeOneSliceDispatched);
+		SIMPLE_FAULT_INJECTOR("before_one_slice_dispatched");
 
 		cdbdisp_dispatchToGang(ds, primaryGang, si);
+		if (planRequiresTxn || isDtxExplicitBegin())
+			addToGxactDtxSegments(primaryGang);
 
-		SIMPLE_FAULT_INJECTOR(AfterOneSliceDispatched);
+		SIMPLE_FAULT_INJECTOR("after_one_slice_dispatched");
 	}
 
 	pfree(sliceVector);
@@ -1167,10 +1188,11 @@ cdbdisp_dispatchX(QueryDesc* queryDesc,
 		 */
 		cdbdisp_getDispatchResults(ds, &qeError);
 
-		cdbdisp_destroyDispatcherState(ds);
-
 		if (qeError)
+		{
+			FlushErrorState();
 			ReThrowError(qeError);
+		}
 
 		/*
 		 * Wasn't an error, must have been an interrupt.
@@ -1180,8 +1202,9 @@ cdbdisp_dispatchX(QueryDesc* queryDesc,
 		/*
 		 * Strange! Not an interrupt either.
 		 */
-		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
-						errmsg_internal("Unable to dispatch plan.")));
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg_internal("unable to dispatch plan")));
 	}
 
 	if (DEBUG1 >= log_min_messages)
@@ -1203,133 +1226,25 @@ cdbdisp_dispatchX(QueryDesc* queryDesc,
 }
 
 /*
- * Serialization of query parameters (ParamListInfos).
- *
- * When a query is dispatched from QD to QE, we also need to dispatch any
- * query parameters, contained in the ParamListInfo struct. We need to
- * serialize ParamListInfo, but there are a few complications:
- *
- * - ParamListInfo is not a Node type, so we cannot use the usual
- * nodeToStringBinary() function directly. We turn the array of
- * ParamExternDatas into a List of SerializedParamExternData nodes,
- * which we can then pass to nodeToStringBinary().
- *
- * - The paramFetch callback, which could be used in this process to fetch
- * parameter values on-demand, cannot be used in a different process.
- * Therefore, fetch all parameters before serializing them. When
- * deserializing, leave the callbacks NULL.
- *
- * - In order to deserialize correctly, the receiver needs the typlen and
- * typbyval information for each datatype. The receiver has access to the
- * catalogs, so it could look them up, but for the sake of simplicity and
- * robustness in the receiver, we include that information in
- * SerializedParamExternData.
- *
- * - RECORD types. Type information of transient record is kept only in
- * backend private memory, indexed by typmod. The recipient will not know
- * what a record type's typmod means. And record types can also be nested.
- * Because of that, if there are any RECORD, we include a copy of the whole
- * transient record type cache.
- *
- * If there are no record types involved, we dispatch a list of
- * SerializedParamListInfos, i.e.
- *
- * List<SerializedParamListInfo>
- *
- * With record types, we dispatch:
- *
- * List(List<TupleDescNode>, List<SerializedParamListInfo>)
- *
- * XXX: Sending *all* record types can be quite bulky, but ATM there is no
- * easy way to extract just the needed record types.
+ * Copy external query parameters from serialized form into a ParamListInfo.
  */
-static char *
-serializeParamListInfo(ParamListInfo paramLI, int *len_p)
-{
-	int			i;
-	List	   *sparams;
-	bool		found_records = false;
-
-	/* Construct a list of SerializedParamExternData */
-	sparams = NIL;
-	for (i = 0; i < paramLI->numParams; i++)
-	{
-		ParamExternData *prm = &paramLI->params[i];
-		SerializedParamExternData *sprm;
-
-		/*
-		 * First, use paramFetch to fetch any "lazy" parameters. (The callback
-		 * function is of no use in the QE.)
-		 */
-		if (paramLI->paramFetch && !OidIsValid(prm->ptype))
-			(*paramLI->paramFetch) (paramLI, i + 1);
-
-		sprm = makeNode(SerializedParamExternData);
-
-		sprm->value = prm->value;
-		sprm->isnull = prm->isnull;
-		sprm->pflags = prm->pflags;
-		sprm->ptype = prm->ptype;
-
-		if (OidIsValid(prm->ptype))
-		{
-			get_typlenbyval(prm->ptype, &sprm->plen, &sprm->pbyval);
-
-			if (prm->ptype == RECORDOID && !prm->isnull)
-			{
-				/*
-				 * Note: We don't want to use lookup_rowtype_tupdesc_copy here, because
-				 * it copies defaults and constraints too. We don't want those.
-				 */
-				found_records = true;
-			}
-		}
-		else
-		{
-			sprm->plen = 0;
-			sprm->pbyval = true;
-		}
-
-		sparams = lappend(sparams, sprm);
-	}
-
-	/*
-	 * If there were any record types, include the transient record type cache.
-	 */
-	if (found_records)
-		sparams = lcons(build_tuple_node_list(0), sparams);
-
-	return nodeToBinaryStringFast(sparams, len_p);
-}
-
 ParamListInfo
-deserializeParamListInfo(const char *str, int slen)
+deserializeExternParams(SerializedParams *sparams)
 {
-	List	   *sparams;
-	ListCell   *lc;
 	TupleRemapper *remapper;
 	ParamListInfo paramLI;
-	int			numParams;
-	int			iparam;
 
-	sparams = (List *) readNodeFromBinaryString(str, slen);
-	if (!IsA(sparams, List))
-		elog(ERROR, "could not deserialize query parameters");
-
-	if (!sparams)
-		return NULL;;
+	if (sparams->nExternParams == 0)
+		return NULL;
 
 	/*
 	 * If a transient record type cache was included, load it into
 	 * a TupleRemapper.
 	 */
-	if (IsA(linitial(sparams), List))
+	if (sparams->transientTypes)
 	{
-		List *typelist = (List *) linitial(sparams);
-		sparams = list_delete_first(sparams);
-
 		remapper = CreateTupleRemapper();
-		TRHandleTypeLists(remapper, typelist);
+		TRHandleTypeLists(remapper, sparams->transientTypes);
 	}
 	else
 		remapper = NULL;
@@ -1337,24 +1252,19 @@ deserializeParamListInfo(const char *str, int slen)
 	/*
 	 * Build a new ParamListInfo.
 	 */
-	numParams = list_length(sparams);
-
-	paramLI = palloc(offsetof(ParamListInfoData, params) + numParams * sizeof(ParamExternData));
+	paramLI = palloc(offsetof(ParamListInfoData, params) +
+					 sparams->nExternParams * sizeof(ParamExternData));
 	/* this clears the callback fields, among others */
 	memset(paramLI, 0, offsetof(ParamListInfoData, params));
-	paramLI->numParams = numParams;
+	paramLI->numParams = sparams->nExternParams;
 
 	/*
 	 * Read the ParamExternDatas
 	 */
-	iparam = 0;
-	foreach(lc, sparams)
+	for (int i = 0; i < sparams->nExternParams; i++)
 	{
-		SerializedParamExternData *sprm = (SerializedParamExternData *) lfirst(lc);
-		ParamExternData *prm = &paramLI->params[iparam];
-
-		if (!IsA(sprm, SerializedParamExternData))
-			elog(ERROR, "could not deserialize query parameters");
+		SerializedParamExternData *sprm = &sparams->externParams[i];
+		ParamExternData *prm = &paramLI->params[i];
 
 		prm->ptype = sprm->ptype;
 		prm->isnull = sprm->isnull;
@@ -1365,8 +1275,6 @@ deserializeParamListInfo(const char *str, int slen)
 			prm->value = TRRemapDatum(remapper, sprm->ptype, sprm->value);
 		else
 			prm->value = sprm->value;
-
-		iparam++;
 	}
 
 	return paramLI;
@@ -1394,15 +1302,14 @@ CdbDispatchCopyStart(struct CdbCopy *cdbCopy, Node *stmt, int flags)
 	Gang *primaryGang;
 	ErrorData *error = NULL;
 	bool needTwoPhase = flags & DF_NEED_TWO_PHASE;
-	bool withSnapshot = flags & DF_WITH_SNAPSHOT;
 
-	dtmPreCommand("CdbDispatchCopyStart", debug_query_string,
-				  NULL, needTwoPhase, withSnapshot,
-				  false /* inCursor */ );
+	if (needTwoPhase)
+		setupDtxTransaction();
 
 	elogif((Debug_print_full_dtm || log_min_messages <= DEBUG5), LOG,
 		   "CdbDispatchCopyStart: %s (needTwoPhase = %s)",
-		   debug_query_string, (needTwoPhase ? "true" : "false"));
+		   (PointerIsValid(debug_query_string) ? debug_query_string : "\"\""),
+		   (needTwoPhase ? "true" : "false"));
 
 	pQueryParms = cdbdisp_buildUtilityQueryParms(stmt, flags, NULL);
 
@@ -1416,14 +1323,15 @@ CdbDispatchCopyStart(struct CdbCopy *cdbCopy, Node *stmt, int flags)
 	/*
 	 * Allocate a primary QE for every available segDB in the system.
 	 */
-	primaryGang = AllocateGang(ds, GANGTYPE_PRIMARY_WRITER,
-										cdbcomponent_getCdbComponentsList());
+	primaryGang = AllocateGang(ds, GANGTYPE_PRIMARY_WRITER, cdbCopy->seglist);
 	Assert(primaryGang);
 
 	cdbdisp_makeDispatchResults(ds, 1, flags & DF_CANCEL_ON_ERROR);
 	cdbdisp_makeDispatchParams (ds, 1, queryText, queryTextLength);
 
 	cdbdisp_dispatchToGang(ds, primaryGang, -1);
+	if ((flags & DF_NEED_TWO_PHASE) != 0 || isDtxExplicitBegin())
+		addToGxactDtxSegments(primaryGang);
 
 	cdbdisp_waitDispatchFinish(ds);
 
@@ -1431,13 +1339,12 @@ CdbDispatchCopyStart(struct CdbCopy *cdbCopy, Node *stmt, int flags)
 
 	if (!cdbdisp_getDispatchResults(ds, &error))
 	{
-		Assert(error);
-		cdbdisp_destroyDispatcherState(ds);
+		FlushErrorState();
 		ReThrowError(error);
 	}
 
 	/*
-	 * Notice: Do not call cdbdisp_finishCommand to destory dispatcher state,
+	 * Notice: Do not call cdbdisp_finishCommand to destroy dispatcher state,
 	 * following PQputCopyData/PQgetCopyData will be called on those connections
 	 */
 	cdbCopy->dispatcherState = ds;
@@ -1467,7 +1374,7 @@ formIdleSegmentIdList(void)
 	List					*segments = NIL;
 	int						i, j;
 
-	cdbs = cdbcomponent_getCdbComponents(true);
+	cdbs = cdbcomponent_getCdbComponents();
 
 	if (cdbs->segment_db_info != NULL)
 	{
@@ -1475,9 +1382,264 @@ formIdleSegmentIdList(void)
 		{
 			CdbComponentDatabaseInfo *cdi = &cdbs->segment_db_info[i];
 			for (j = 0; j < cdi->numIdleQEs; j++)
-				segments = lappend_int(segments, cdi->segindex);
+				segments = lappend_int(segments, cdi->config->segindex);
 		}
 	}
 
 	return segments;
+}
+
+
+/*
+ * Serialization of query parameters (ParamListInfos and executor params)
+ *
+ * When a query is dispatched from QD to QE, we also need to dispatch any
+ * query parameters (contained in the ParamListInfo struct), and executor
+ * parameters that have already been evaluated in the QD. We need to
+ * serialize ParamListInfo, but there are a few complications:
+ *
+ * - ParamListInfo is not a Node type, so we cannot use the usual
+ * nodeToStringBinary() function directly. We turn the array of
+ * ParamExternDatas into a List of SerializedParamExternData nodes,
+ * which we can then pass to nodeToStringBinary().
+ *
+ * - The paramFetch callback, which could be used in this process to fetch
+ * parameter values on-demand, cannot be used in a different process.
+ * Therefore, fetch all parameters before serializing them. When
+ * deserializing, leave the callbacks NULL.
+ *
+ * - In order to deserialize correctly, the receiver needs the typlen and
+ * typbyval information for each datatype. The receiver has access to the
+ * catalogs, so it could look them up, but for the sake of simplicity and
+ * robustness in the receiver, we include that information in
+ * SerializedParamExternData.
+ *
+ * - RECORD types. Type information of transient record is kept only in
+ * backend private memory, indexed by typmod. The recipient will not know
+ * what a record type's typmod means. And record types can also be nested.
+ * Because of that, if there are any RECORD, we include a copy of the whole
+ * transient record type cache.
+ *
+ * We form a SerializedParams struct, which contains enough information
+ * to reconstruct in the QEs.
+ *
+ * XXX: Sending *all* record types can be quite bulky, but ATM there is no
+ * easy way to extract just the needed record types.
+ */
+static SerializedParams *
+serializeParamsForDispatch(QueryDesc *queryDesc,
+						   ParamListInfo externParams,
+						   ParamExecData *execParams,
+						   List *paramExecTypes,
+						   Bitmapset *sendParams)
+{
+	SerializedParams *result = makeNode(SerializedParams);
+	bool		found_records = false;
+
+	/* materialize Extern params */
+	if (externParams)
+	{
+		result->nExternParams = externParams->numParams;
+		result->externParams = palloc0(externParams->numParams * sizeof(SerializedParamExternData));
+
+		for (int i = 0; i < externParams->numParams; i++)
+		{
+			ParamExternData *prm;
+			SerializedParamExternData *sprm = &result->externParams[i];
+			ParamExternData prmdata;
+
+			/*
+			 * First, use paramFetch to fetch any "lazy" parameters. (The callback
+			 * function is of no use in the QE.)
+			 */
+			if (externParams->paramFetch != NULL)
+				prm = externParams->paramFetch(externParams, i + 1, false, &prmdata);
+			else
+				prm = &externParams->params[i];
+
+			sprm->value = prm->value;
+			sprm->isnull = prm->isnull;
+			sprm->pflags = prm->pflags;
+			sprm->ptype = prm->ptype;
+
+			if (OidIsValid(prm->ptype))
+			{
+				get_typlenbyval(prm->ptype, &sprm->plen, &sprm->pbyval);
+				if (prm->ptype == RECORDOID && !prm->isnull)
+					found_records = true;
+			}
+			else
+			{
+				sprm->plen = 0;
+				sprm->pbyval = true;
+			}
+		}
+	}
+
+	/* materialize Exec params */
+	if (!bms_is_empty(sendParams))
+	{
+		int			numExecParams = list_length(paramExecTypes);
+		int			x;
+
+		result->nExecParams = numExecParams;
+		result->execParams = palloc0(numExecParams * sizeof(SerializedParamExecData));
+
+		x = -1;
+		while ((x = bms_next_member(sendParams, x)) >= 0)
+		{
+			ParamExecData *prm = &execParams[x];
+			SerializedParamExecData *sprm = &result->execParams[x];
+			Oid			ptype = list_nth_oid(paramExecTypes, x);
+
+			sprm->value = prm->value;
+			sprm->isnull = prm->isnull;
+			sprm->isvalid = true;
+
+			get_typlenbyval(ptype, &sprm->plen, &sprm->pbyval);
+			if (ptype == RECORDOID && !prm->isnull)
+				found_records = true;
+		}
+	}
+
+	/*
+	 * If there were any record types, include the transient record type cache.
+	 */
+	if (found_records)
+		result->transientTypes = build_tuple_node_list(0);
+
+	return result;
+}
+
+/*
+ * Function: getExecParamsToDispatch()
+ *
+ * Determine which PARAM_EXEC values are valid, and should be included
+ * when the query is dispatched to the QEs.
+ *
+ * When the query eventually runs (on the QD or a QE), it will have access
+ * to these PARAM_EXEC values (locally or through serialization).
+
+ * Then, rather than lazily-evaluating the SubPlan to get its value (as for
+ * an internal parameter), the plan will just use the value that's already
+ * in the EState->es_param_exec_vals array.
+ */
+static Bitmapset *
+getExecParamsToDispatch(PlannedStmt *stmt, ParamExecData *intPrm,
+						List **paramExecTypes)
+{
+	ParamWalkerContext context;
+	int			i;
+	Plan	   *plan = stmt->planTree;
+	int			nIntPrm = list_length(stmt->paramExecTypes);
+	Bitmapset  *sendParams = NULL;
+
+	if (nIntPrm == 0)
+	{
+		*paramExecTypes = NIL;
+		return NULL;
+	}
+	Assert(intPrm != NULL);		/* So there must be some internal parameters. */
+
+	/*
+	 * Walk the plan, looking for Param nodes of kind PARAM_EXEC, i.e.,
+	 * executor internal parameters.
+	 *
+	 * We need these for their paramtype field, which isn't available in
+	 * either the ParamExecData struct or the SubPlan struct.
+	 */
+
+	exec_init_plan_tree_base(&context.base, stmt);
+	context.params = NIL;
+	param_walker((Node *) plan, &context);
+
+	/*
+	 * mpp-25490: subplanX may is within subplan Y, try to param_walker the
+	 * subplans list
+	 */
+	if (list_length(context.params) < nIntPrm)
+	{
+		ListCell   *sb;
+
+		foreach(sb, stmt->subplans)
+		{
+			Node	   *subplan = lfirst(sb);
+
+			param_walker((Node *) subplan, &context);
+		}
+	}
+
+	/*
+	 * Now set the bit corresponding to each init plan param. Use the datatype
+	 * info harvested above.
+	 */
+	*paramExecTypes = NIL;
+	for (i = 0; i < nIntPrm; i++)
+	{
+		Oid			paramType = findParamType(context.params, i);
+
+		*paramExecTypes = lappend_oid(*paramExecTypes, paramType);
+		if (paramType != InvalidOid)
+		{
+			sendParams = bms_add_member(sendParams, i);
+		}
+		else
+		{
+			/*
+			 * Param of id i not found. Likely has been removed by constant
+			 * folding.
+			 */
+		}
+	}
+
+	list_free(context.params);
+
+	return sendParams;
+}
+
+/*
+ * Helper function param_walker() walks a plan and adds any Param nodes
+ * to a list in the ParamWalkerContext.
+ *
+ * This list is input to the function findParamType(), which loops over the
+ * list looking for a specific paramid, and returns its type.
+ */
+static bool
+param_walker(Node *node, ParamWalkerContext *context)
+{
+	if (node == NULL)
+		return false;
+
+	if (nodeTag(node) == T_Param)
+	{
+		Param	   *param = (Param *) node;
+
+		if (param->paramkind == PARAM_EXEC)
+		{
+			context->params = lappend(context->params, param);
+			return false;
+		}
+	}
+	return plan_tree_walker(node, param_walker, context, true);
+}
+
+/*
+ * Helper function findParamType() iterates over a list of Param nodes,
+ * trying to match on the passed-in paramid. Returns the paramtype of a
+ * match, else error.
+ */
+static Oid
+findParamType(List *params, int paramid)
+{
+	ListCell   *l;
+
+	foreach(l, params)
+	{
+		Param	   *p = lfirst(l);
+
+		if (p->paramid == paramid)
+			return p->paramtype;
+	}
+
+	return InvalidOid;
 }

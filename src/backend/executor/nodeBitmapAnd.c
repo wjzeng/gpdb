@@ -3,7 +3,7 @@
  * nodeBitmapAnd.c
  *	  routines to handle BitmapAnd nodes.
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -33,6 +33,19 @@
 #include "executor/nodeBitmapAnd.h"
 #include "nodes/tidbitmap.h"
 
+
+/* ----------------------------------------------------------------
+ *		ExecBitmapAnd
+ *
+ *		stub for pro forma compliance
+ * ----------------------------------------------------------------
+ */
+static TupleTableSlot *
+ExecBitmapAnd(PlanState *pstate)
+{
+	elog(ERROR, "BitmapAnd node does not support ExecProcNode call convention");
+	return NULL;
+}
 
 /* ----------------------------------------------------------------
  *		ExecInitBitmapAnd
@@ -66,15 +79,9 @@ ExecInitBitmapAnd(BitmapAnd *node, EState *estate, int eflags)
 	 */
 	bitmapandstate->ps.plan = (Plan *) node;
 	bitmapandstate->ps.state = estate;
+	bitmapandstate->ps.ExecProcNode = ExecBitmapAnd;
 	bitmapandstate->bitmapplans = bitmapplanstates;
 	bitmapandstate->nplans = nplans;
-
-	/*
-	 * Miscellaneous initialization
-	 *
-	 * BitmapAnd plans don't have expression contexts because they never call
-	 * ExecQual or ExecProject.  They don't need any tuple slots either.
-	 */
 
 	/*
 	 * call ExecInitNode on each of the plans to be executed and save the
@@ -87,6 +94,13 @@ ExecInitBitmapAnd(BitmapAnd *node, EState *estate, int eflags)
 		bitmapplanstates[i] = ExecInitNode(initNode, estate, eflags);
 		i++;
 	}
+
+	/*
+	 * Miscellaneous initialization
+	 *
+	 * BitmapAnd plans don't have expression contexts because they never call
+	 * ExecQual or ExecProject.  They don't need any tuple slots either.
+	 */
 
 	return bitmapandstate;
 }
@@ -148,6 +162,7 @@ MultiExecBitmapAnd(BitmapAndState *node)
 			else
 			{
 				tbm_intersect(hbm, (TIDBitmap *)subresult);
+				tbm_generic_free(subresult);
 			}
 
 			/*
@@ -159,13 +174,6 @@ MultiExecBitmapAnd(BitmapAndState *node)
 			 */
 			if (tbm_is_empty(hbm))
 			{
-				/*
-				 * GPDB_84_MERGE_FIXME: If we saw any StreamBitmap inputs, we
-				 * will create an OpStream to AND the empty result with the
-				 * StreamBitmaps we saw already. We could just close them now,
-				 * and return an empty hash bitmap here, but I'm not sure how
-				 * to close the already-opened stream bitmaps correctly.
-				 */
 				empty = true;
 				break;
 			}
@@ -182,6 +190,7 @@ MultiExecBitmapAnd(BitmapAndState *node)
    				{
 	   				StreamBitmap *s = (StreamBitmap *)subresult;
 	   				stream_move_node((StreamBitmap *)node->bitmap, s, BMS_AND);
+					tbm_generic_free(subresult);
 			   	}
 			}
    			else
@@ -235,8 +244,6 @@ ExecEndBitmapAnd(BitmapAndState *node)
 		if (bitmapplans[i])
 			ExecEndNode(bitmapplans[i]);
 	}
-
-	EndPlanStateGpmonPkt(&node->ps);
 }
 
 void

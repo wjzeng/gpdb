@@ -1,5 +1,5 @@
 -- complain if script is sourced in psql, rather than via CREATE EXTENSION
-\echo Use "CREATE EXTENSION file_fdw" to load this file. \quit
+\echo Use "CREATE EXTENSION gp_internal_tools" to load this file. \quit
 
 
 --------------------------------------------------------------------------------
@@ -38,7 +38,7 @@ SET search_path = session_state;
 CREATE FUNCTION session_state_memory_entries_f_on_master()
 RETURNS SETOF record
 AS '$libdir/gp_session_state_memory_stats', 'gp_session_state_memory_entries'
-LANGUAGE C VOLATILE EXECUTE ON MASTER;
+LANGUAGE C VOLATILE EXECUTE ON COORDINATOR;
 
 GRANT EXECUTE ON FUNCTION session_state_memory_entries_f_on_master() TO public;
 
@@ -105,3 +105,5 @@ pg_stat_activity as S
 ON M.sessionid = S.sess_id;
 
 GRANT SELECT ON session_level_memory_consumption TO public;
+
+SET search_path TO DEFAULT;

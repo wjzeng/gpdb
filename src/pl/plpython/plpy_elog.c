@@ -22,11 +22,19 @@ PyObject   *PLy_exc_fatal = NULL;
 PyObject   *PLy_exc_spi_error = NULL;
 
 
-static void PLy_traceback(char **xmsg, char **tbmsg, int *tb_depth);
+static void PLy_traceback(PyObject *e, PyObject *v, PyObject *tb,
+						  char **xmsg, char **tbmsg, int *tb_depth);
 static void PLy_get_spi_error_data(PyObject *exc, int *sqlerrcode, char **detail,
-					   char **hint, char **query, int *position);
+								   char **hint, char **query, int *position,
+								   char **schema_name, char **table_name, char **column_name,
+								   char **datatype_name, char **constraint_name);
+static void PLy_get_error_data(PyObject *exc, int *sqlerrcode, char **detail,
+							   char **hint, char **schema_name, char **table_name, char **column_name,
+							   char **datatype_name, char **constraint_name);
 static char *get_source_line(const char *src, int lineno);
 
+static void get_string_attr(PyObject *obj, char *attrname, char **str);
+static bool set_string_attr(PyObject *obj, char *attrname, char *str);
 
 /*
  * Emit a PG error or notice, together with any available info about
@@ -37,8 +45,9 @@ static char *get_source_line(const char *src, int lineno);
  * in the context.
  */
 void
-PLy_elog(int elevel, const char *fmt,...)
+PLy_elog_impl(int elevel, const char *fmt,...)
 {
+	int			save_errno = errno;
 	char	   *xmsg;
 	char	   *tbmsg;
 	int			tb_depth;
@@ -52,6 +61,11 @@ PLy_elog(int elevel, const char *fmt,...)
 	char	   *hint = NULL;
 	char	   *query = NULL;
 	int			position = 0;
+	char	   *schema_name = NULL;
+	char	   *table_name = NULL;
+	char	   *column_name = NULL;
+	char	   *datatype_name = NULL;
+	char	   *constraint_name = NULL;
 
 	/*
 	 *  If the error was a KeyboardException that we raised because
@@ -63,16 +77,27 @@ PLy_elog(int elevel, const char *fmt,...)
 	CHECK_FOR_INTERRUPTS();
 
 	PyErr_Fetch(&exc, &val, &tb);
+
 	if (exc != NULL)
 	{
+		PyErr_NormalizeException(&exc, &val, &tb);
+
 		if (PyErr_GivenExceptionMatches(val, PLy_exc_spi_error))
-			PLy_get_spi_error_data(val, &sqlerrcode, &detail, &hint, &query, &position);
+			PLy_get_spi_error_data(val, &sqlerrcode,
+								   &detail, &hint, &query, &position,
+								   &schema_name, &table_name, &column_name,
+								   &datatype_name, &constraint_name);
+		else if (PyErr_GivenExceptionMatches(val, PLy_exc_error))
+			PLy_get_error_data(val, &sqlerrcode, &detail, &hint,
+							   &schema_name, &table_name, &column_name,
+							   &datatype_name, &constraint_name);
 		else if (PyErr_GivenExceptionMatches(val, PLy_exc_fatal))
 			elevel = FATAL;
 	}
-	PyErr_Restore(exc, val, tb);
 
-	PLy_traceback(&xmsg, &tbmsg, &tb_depth);
+	/* this releases our refcount on tb! */
+	PLy_traceback(exc, val, tb,
+				  &xmsg, &tbmsg, &tb_depth);
 
 	if (fmt)
 	{
@@ -82,6 +107,7 @@ PLy_elog(int elevel, const char *fmt,...)
 			va_list		ap;
 			int			needed;
 
+			errno = save_errno;
 			va_start(ap, fmt);
 			needed = appendStringInfoVA(&emsg, dgettext(TEXTDOMAIN, fmt), ap);
 			va_end(ap);
@@ -107,13 +133,23 @@ PLy_elog(int elevel, const char *fmt,...)
 	PG_TRY();
 	{
 		ereport(elevel,
-				(errcode(sqlerrcode ? sqlerrcode : ERRCODE_INTERNAL_ERROR),
-			  errmsg_internal("%s", primary ? primary : "no exception data"),
+				(errcode(sqlerrcode ? sqlerrcode : ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
+				 errmsg_internal("%s", primary ? primary : "no exception data"),
 				 (detail) ? errdetail_internal("%s", detail) : 0,
 				 (tb_depth > 0 && tbmsg) ? errcontext("%s", tbmsg) : 0,
 				 (hint) ? errhint("%s", hint) : 0,
 				 (query) ? internalerrquery(query) : 0,
-				 (position) ? internalerrposition(position) : 0));
+				 (position) ? internalerrposition(position) : 0,
+				 (schema_name) ? err_generic_string(PG_DIAG_SCHEMA_NAME,
+													schema_name) : 0,
+				 (table_name) ? err_generic_string(PG_DIAG_TABLE_NAME,
+												   table_name) : 0,
+				 (column_name) ? err_generic_string(PG_DIAG_COLUMN_NAME,
+													column_name) : 0,
+				 (datatype_name) ? err_generic_string(PG_DIAG_DATATYPE_NAME,
+													  datatype_name) : 0,
+				 (constraint_name) ? err_generic_string(PG_DIAG_CONSTRAINT_NAME,
+														constraint_name) : 0));
 	}
 	PG_CATCH();
 	{
@@ -123,6 +159,9 @@ PLy_elog(int elevel, const char *fmt,...)
 			pfree(xmsg);
 		if (tbmsg)
 			pfree(tbmsg);
+		Py_XDECREF(exc);
+		Py_XDECREF(val);
+
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
@@ -133,21 +172,24 @@ PLy_elog(int elevel, const char *fmt,...)
 		pfree(xmsg);
 	if (tbmsg)
 		pfree(tbmsg);
+	Py_XDECREF(exc);
+	Py_XDECREF(val);
 }
 
 /*
- * Extract a Python traceback from the current exception.
+ * Extract a Python traceback from the given exception data.
  *
  * The exception error message is returned in xmsg, the traceback in
  * tbmsg (both as palloc'd strings) and the traceback depth in
  * tb_depth.
+ *
+ * We release refcounts on all the Python objects in the traceback stack,
+ * but not on e or v.
  */
 static void
-PLy_traceback(char **xmsg, char **tbmsg, int *tb_depth)
+PLy_traceback(PyObject *e, PyObject *v, PyObject *tb,
+			  char **xmsg, char **tbmsg, int *tb_depth)
 {
-	PyObject   *e,
-			   *v,
-			   *tb;
 	PyObject   *e_type_o;
 	PyObject   *e_module_o;
 	char	   *e_type_s = NULL;
@@ -158,12 +200,7 @@ PLy_traceback(char **xmsg, char **tbmsg, int *tb_depth)
 	StringInfoData tbstr;
 
 	/*
-	 * get the current exception
-	 */
-	PyErr_Fetch(&e, &v, &tb);
-
-	/*
-	 * oops, no exception, return
+	 * if no exception, return nulls
 	 */
 	if (e == NULL)
 	{
@@ -173,8 +210,6 @@ PLy_traceback(char **xmsg, char **tbmsg, int *tb_depth)
 
 		return;
 	}
-
-	PyErr_NormalizeException(&e, &v, &tb);
 
 	/*
 	 * Format the exception and its value and put it in xmsg.
@@ -219,7 +254,7 @@ PLy_traceback(char **xmsg, char **tbmsg, int *tb_depth)
 
 	*tb_depth = 0;
 	initStringInfo(&tbstr);
-	/* Mimick Python traceback reporting as close as possible. */
+	/* Mimic Python traceback reporting as close as possible. */
 	appendStringInfoString(&tbstr, "Traceback (most recent call last):");
 	while (tb != NULL && tb != Py_None)
 	{
@@ -232,6 +267,12 @@ PLy_traceback(char **xmsg, char **tbmsg, int *tb_depth)
 
 		PG_TRY();
 		{
+			/*
+			 * Ancient versions of Python (circa 2.3) contain a bug whereby
+			 * the fetches below can fail if the error indicator is set.
+			 */
+			PyErr_Clear();
+
 			lineno = PyObject_GetAttrString(tb, "tb_lineno");
 			if (lineno == NULL)
 				elog(ERROR, "could not get line number from Python traceback");
@@ -274,7 +315,7 @@ PLy_traceback(char **xmsg, char **tbmsg, int *tb_depth)
 			long		plain_lineno;
 
 			/*
-			 * The second frame points at the internal function, but to mimick
+			 * The second frame points at the internal function, but to mimic
 			 * Python error reporting we want to say <module>.
 			 */
 			if (*tb_depth == 1)
@@ -288,11 +329,11 @@ PLy_traceback(char **xmsg, char **tbmsg, int *tb_depth)
 
 			if (proname == NULL)
 				appendStringInfo(
-				&tbstr, "\n  PL/Python anonymous code block, line %ld, in %s",
+								 &tbstr, "\n  PL/Python anonymous code block, line %ld, in %s",
 								 plain_lineno - 1, fname);
 			else
 				appendStringInfo(
-					&tbstr, "\n  PL/Python function \"%s\", line %ld, in %s",
+								 &tbstr, "\n  PL/Python function \"%s\", line %ld, in %s",
 								 proname, plain_lineno - 1, fname);
 
 			/*
@@ -342,15 +383,13 @@ PLy_traceback(char **xmsg, char **tbmsg, int *tb_depth)
 	Py_XDECREF(e_type_o);
 	Py_XDECREF(e_module_o);
 	Py_XDECREF(vob);
-	Py_XDECREF(v);
-	Py_DECREF(e);
 }
 
 /*
  * Extract error code from SPIError's sqlstate attribute.
  */
 static void
-PLy_get_spi_sqlerrcode(PyObject *exc, int *sqlerrcode)
+PLy_get_sqlerrcode(PyObject *exc, int *sqlerrcode)
 {
 	PyObject   *sqlstate;
 	char	   *buffer;
@@ -370,20 +409,26 @@ PLy_get_spi_sqlerrcode(PyObject *exc, int *sqlerrcode)
 	Py_DECREF(sqlstate);
 }
 
-
 /*
  * Extract the error data from a SPIError
  */
 static void
-PLy_get_spi_error_data(PyObject *exc, int *sqlerrcode, char **detail, char **hint, char **query, int *position)
+PLy_get_spi_error_data(PyObject *exc, int *sqlerrcode, char **detail,
+					   char **hint, char **query, int *position,
+					   char **schema_name, char **table_name,
+					   char **column_name,
+					   char **datatype_name, char **constraint_name)
 {
-	PyObject   *spidata = NULL;
+	PyObject   *spidata;
 
 	spidata = PyObject_GetAttrString(exc, "spidata");
 
 	if (spidata != NULL)
 	{
-		PyArg_ParseTuple(spidata, "izzzi", sqlerrcode, detail, hint, query, position);
+		PyArg_ParseTuple(spidata, "izzzizzzzz",
+						 sqlerrcode, detail, hint, query, position,
+						 schema_name, table_name, column_name,
+						 datatype_name, constraint_name);
 	}
 	else
 	{
@@ -391,12 +436,31 @@ PLy_get_spi_error_data(PyObject *exc, int *sqlerrcode, char **detail, char **hin
 		 * If there's no spidata, at least set the sqlerrcode. This can happen
 		 * if someone explicitly raises a SPI exception from Python code.
 		 */
-		PLy_get_spi_sqlerrcode(exc, sqlerrcode);
+		PLy_get_sqlerrcode(exc, sqlerrcode);
 	}
 
-	PyErr_Clear();
-	/* no elog here, we simply won't report the errhint, errposition etc */
 	Py_XDECREF(spidata);
+}
+
+/*
+ * Extract the error data from an Error.
+ *
+ * Note: position and query attributes are never set for Error so, unlike
+ * PLy_get_spi_error_data, this function doesn't return them.
+ */
+static void
+PLy_get_error_data(PyObject *exc, int *sqlerrcode, char **detail, char **hint,
+				   char **schema_name, char **table_name, char **column_name,
+				   char **datatype_name, char **constraint_name)
+{
+	PLy_get_sqlerrcode(exc, sqlerrcode);
+	get_string_attr(exc, "detail", detail);
+	get_string_attr(exc, "hint", hint);
+	get_string_attr(exc, "schema_name", schema_name);
+	get_string_attr(exc, "table_name", table_name);
+	get_string_attr(exc, "column_name", column_name);
+	get_string_attr(exc, "datatype_name", datatype_name);
+	get_string_attr(exc, "constraint_name", constraint_name);
 }
 
 /*
@@ -473,4 +537,103 @@ PLy_exception_set_plural(PyObject *exc,
 	va_end(ap);
 
 	PyErr_SetString(exc, buf);
+}
+
+/* set attributes of the given exception to details from ErrorData */
+void
+PLy_exception_set_with_details(PyObject *excclass, ErrorData *edata)
+{
+	PyObject   *args = NULL;
+	PyObject   *error = NULL;
+
+	args = Py_BuildValue("(s)", edata->message);
+	if (!args)
+		goto failure;
+
+	/* create a new exception with the error message as the parameter */
+	error = PyObject_CallObject(excclass, args);
+	if (!error)
+		goto failure;
+
+	if (!set_string_attr(error, "sqlstate",
+						 unpack_sql_state(edata->sqlerrcode)))
+		goto failure;
+
+	if (!set_string_attr(error, "detail", edata->detail))
+		goto failure;
+
+	if (!set_string_attr(error, "hint", edata->hint))
+		goto failure;
+
+	if (!set_string_attr(error, "query", edata->internalquery))
+		goto failure;
+
+	if (!set_string_attr(error, "schema_name", edata->schema_name))
+		goto failure;
+
+	if (!set_string_attr(error, "table_name", edata->table_name))
+		goto failure;
+
+	if (!set_string_attr(error, "column_name", edata->column_name))
+		goto failure;
+
+	if (!set_string_attr(error, "datatype_name", edata->datatype_name))
+		goto failure;
+
+	if (!set_string_attr(error, "constraint_name", edata->constraint_name))
+		goto failure;
+
+	PyErr_SetObject(excclass, error);
+
+	Py_DECREF(args);
+	Py_DECREF(error);
+
+	return;
+
+failure:
+	Py_XDECREF(args);
+	Py_XDECREF(error);
+
+	elog(ERROR, "could not convert error to Python exception");
+}
+
+/* get string value of an object attribute */
+static void
+get_string_attr(PyObject *obj, char *attrname, char **str)
+{
+	PyObject   *val;
+
+	val = PyObject_GetAttrString(obj, attrname);
+	if (val != NULL && val != Py_None)
+	{
+		*str = pstrdup(PyString_AsString(val));
+	}
+	Py_XDECREF(val);
+}
+
+/* set an object attribute to a string value, returns true when the set was
+ * successful
+ */
+static bool
+set_string_attr(PyObject *obj, char *attrname, char *str)
+{
+	int			result;
+	PyObject   *val;
+
+	if (str != NULL)
+	{
+		val = PyString_FromString(str);
+		if (!val)
+			return false;
+	}
+	else
+	{
+		val = Py_None;
+		Py_INCREF(Py_None);
+	}
+
+	result = PyObject_SetAttrString(obj, attrname, val);
+	Py_DECREF(val);
+
+	return result != -1;
 }

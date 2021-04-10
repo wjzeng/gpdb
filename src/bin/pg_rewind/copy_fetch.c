@@ -3,30 +3,25 @@
  * copy_fetch.c
  *	  Functions for using a data directory as the source.
  *
- * Portions Copyright (c) 2013-2015, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2013-2019, PostgreSQL Global Development Group
  *
  *-------------------------------------------------------------------------
  */
 #include "postgres_fe.h"
 
-#include <sys/types.h>
 #include <sys/stat.h>
 #include <dirent.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include <string.h>
 
 #include "datapagemap.h"
 #include "fetch.h"
 #include "file_ops.h"
 #include "filemap.h"
-#include "logging.h"
 #include "pg_rewind.h"
 
-#include "catalog/catalog.h"
-
 static void recurse_dir(const char *datadir, const char *path,
-			process_file_callback_t callback);
+						process_file_callback_t callback);
 
 static void execute_pagemap(datapagemap_t *pagemap, const char *path);
 
@@ -61,8 +56,8 @@ recurse_dir(const char *datadir, const char *parentpath,
 
 	xldir = opendir(fullparentpath);
 	if (xldir == NULL)
-		pg_fatal("could not open directory \"%s\": %s\n",
-				 fullparentpath, strerror(errno));
+		pg_fatal("could not open directory \"%s\": %m",
+				 fullparentpath);
 
 	while (errno = 0, (xlde = readdir(xldir)) != NULL)
 	{
@@ -90,8 +85,8 @@ recurse_dir(const char *datadir, const char *parentpath,
 				 */
 			}
 			else
-				pg_fatal("could not stat file \"%s\": %s\n",
-						 fullpath, strerror(errno));
+				pg_fatal("could not stat file \"%s\": %m",
+						 fullpath);
 		}
 
 		if (parentpath)
@@ -101,6 +96,11 @@ recurse_dir(const char *datadir, const char *parentpath,
 
 		if (S_ISREG(fst.st_mode))
 			callback(path, FILE_TYPE_REGULAR, fst.st_size, NULL);
+		else if (S_ISFIFO(fst.st_mode))
+		{
+			/* Greenplum uses FIFO for pgsql_tmp files. */
+			callback(path, FILE_TYPE_FIFO, fst.st_size, NULL);
+		}
 		else if (S_ISDIR(fst.st_mode))
 		{
 			callback(path, FILE_TYPE_DIRECTORY, 0, NULL);
@@ -119,37 +119,44 @@ recurse_dir(const char *datadir, const char *parentpath,
 
 			len = readlink(fullpath, link_target, sizeof(link_target));
 			if (len < 0)
-				pg_fatal("could not read symbolic link \"%s\": %s\n",
-						 fullpath, strerror(errno));
+				pg_fatal("could not read symbolic link \"%s\": %m",
+						 fullpath);
 			if (len >= sizeof(link_target))
-				pg_fatal("symbolic link \"%s\" target is too long\n",
+				pg_fatal("symbolic link \"%s\" target is too long",
 						 fullpath);
 			link_target[len] = '\0';
+
+			if(parentpath && strcmp(parentpath, "pg_tblspc") == 0)
+			{
+				/* Lop off the dbid before sending the link target. */
+				char *file_sep_before_dbid_in_link_target = strrchr(link_target, '/');
+				*file_sep_before_dbid_in_link_target = '\0';
+			}
 
 			callback(path, FILE_TYPE_SYMLINK, 0, link_target);
 
 			/*
 			 * If it's a symlink within pg_tblspc, we need to recurse into it,
 			 * to process all the tablespaces.  We also follow a symlink if
-			 * it's for pg_xlog.  Symlinks elsewhere are ignored.
+			 * it's for pg_wal.  Symlinks elsewhere are ignored.
 			 */
 			if ((parentpath && strcmp(parentpath, "pg_tblspc") == 0) ||
-				strcmp(path, "pg_xlog") == 0)
+				strcmp(path, "pg_wal") == 0)
 				recurse_dir(datadir, path, callback);
 #else
-			pg_fatal("\"%s\" is a symbolic link, but symbolic links are not supported on this platform\n",
+			pg_fatal("\"%s\" is a symbolic link, but symbolic links are not supported on this platform",
 					 fullpath);
-#endif   /* HAVE_READLINK */
+#endif							/* HAVE_READLINK */
 		}
 	}
 
 	if (errno)
-		pg_fatal("could not read directory \"%s\": %s\n",
-				 fullparentpath, strerror(errno));
+		pg_fatal("could not read directory \"%s\": %m",
+				 fullparentpath);
 
 	if (closedir(xldir))
-		pg_fatal("could not close directory \"%s\": %s\n",
-				 fullparentpath, strerror(errno));
+		pg_fatal("could not close directory \"%s\": %m",
+				 fullparentpath);
 }
 
 /*
@@ -160,7 +167,7 @@ recurse_dir(const char *datadir, const char *parentpath,
 static void
 rewind_copy_file_range(const char *path, off_t begin, off_t end, bool trunc)
 {
-	char		buf[BLCKSZ];
+	PGAlignedBlock buf;
 	char		srcpath[MAXPGPATH];
 	int			srcfd;
 
@@ -168,11 +175,11 @@ rewind_copy_file_range(const char *path, off_t begin, off_t end, bool trunc)
 
 	srcfd = open(srcpath, O_RDONLY | PG_BINARY, 0);
 	if (srcfd < 0)
-		pg_fatal("could not open source file \"%s\": %s\n",
-				 srcpath, strerror(errno));
+		pg_fatal("could not open source file \"%s\": %m",
+				 srcpath);
 
 	if (lseek(srcfd, begin, SEEK_SET) == -1)
-		pg_fatal("could not seek in source file: %s\n", strerror(errno));
+		pg_fatal("could not seek in source file: %m");
 
 	open_target_file(path, trunc);
 
@@ -186,20 +193,20 @@ rewind_copy_file_range(const char *path, off_t begin, off_t end, bool trunc)
 		else
 			len = end - begin;
 
-		readlen = read(srcfd, buf, len);
+		readlen = read(srcfd, buf.data, len);
 
 		if (readlen < 0)
-			pg_fatal("could not read file \"%s\": %s\n",
-					 srcpath, strerror(errno));
+			pg_fatal("could not read file \"%s\": %m",
+					 srcpath);
 		else if (readlen == 0)
-			pg_fatal("unexpected EOF while reading file \"%s\"\n", srcpath);
+			pg_fatal("unexpected EOF while reading file \"%s\"", srcpath);
 
-		write_target_range(buf, begin, readlen);
+		write_target_range(buf.data, begin, readlen);
 		begin += readlen;
 	}
 
 	if (close(srcfd) != 0)
-		pg_fatal("could not close file \"%s\": %s\n", srcpath, strerror(errno));
+		pg_fatal("could not close file \"%s\": %m", srcpath);
 }
 
 /*
@@ -215,7 +222,7 @@ copy_executeFileMap(filemap_t *map)
 	for (i = 0; i < map->narray; i++)
 	{
 		entry = map->array[i];
-		execute_pagemap(&entry->pagemap, entry->path);
+		execute_pagemap(&entry->target_pages_to_overwrite, entry->path);
 
 		switch (entry->action)
 		{
@@ -224,16 +231,16 @@ copy_executeFileMap(filemap_t *map)
 				break;
 
 			case FILE_ACTION_COPY:
-				rewind_copy_file_range(entry->path, 0, entry->newsize, true);
+				rewind_copy_file_range(entry->path, 0, entry->source_size, true);
 				break;
 
 			case FILE_ACTION_TRUNCATE:
-				truncate_target_file(entry->path, entry->newsize);
+				truncate_target_file(entry->path, entry->source_size);
 				break;
 
 			case FILE_ACTION_COPY_TAIL:
-				rewind_copy_file_range(entry->path, entry->oldsize,
-									   entry->newsize, false);
+				rewind_copy_file_range(entry->path, entry->target_size,
+									   entry->source_size, false);
 				break;
 
 			case FILE_ACTION_CREATE:
@@ -242,6 +249,10 @@ copy_executeFileMap(filemap_t *map)
 
 			case FILE_ACTION_REMOVE:
 				remove_target(entry);
+				break;
+
+			case FILE_ACTION_UNDECIDED:
+				pg_fatal("no action decided for \"%s\"", entry->path);
 				break;
 		}
 	}

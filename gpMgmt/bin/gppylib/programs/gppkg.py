@@ -10,18 +10,16 @@ try:
     from gppylib import gplog, pgconf
     from gppylib.commands import gp
     from gppylib.commands.base import Command, ExecutionError
-    from gppylib.commands.unix import curr_platform, SUNOS
     from gppylib.db import dbconn
     from gppylib.gparray import GpArray
     from gppylib.gpversion import GpVersion
     from gppylib.gpparseopts import OptParser, OptChecker
-    from gppylib.mainUtils import addMasterDirectoryOptionForSingleClusterProgram, addStandardLoggingAndHelpOptions, ExceptionNoStackTraceNeeded
-    from gppylib.operations.package import MigratePackages, InstallPackage, UninstallPackage, QueryPackage, BuildGppkg, UpdatePackage, CleanGppkg, Gppkg, GPPKG_EXTENSION, GPPKG_ARCHIVE_PATH
+    from gppylib.mainUtils import addCoordinatorDirectoryOptionForSingleClusterProgram, addStandardLoggingAndHelpOptions, ExceptionNoStackTraceNeeded
+    from gppylib.operations.package import MigratePackages, InstallPackage, UninstallPackage, QueryPackage, BuildGppkg, UpdatePackage, CleanGppkg, Gppkg, GPPKG_EXTENSION, GPPKG_ARCHIVE_PATH, linux_distribution_id
     from gppylib.userinput import ask_yesno
     from gppylib.operations.unix import ListFilesByPattern
 
-    import yaml
-except ImportError, ex:
+except ImportError as ex:
     sys.exit('Cannot import modules.  Please check that you have sourced greenplum_path.sh.  Detail: ' + str(ex))
 
 logger = gplog.get_default_logger()
@@ -29,11 +27,11 @@ logger = gplog.get_default_logger()
 class GpPkgProgram:
     """ This is the CLI entry point to package management code.  """
     def __init__(self, options, args):
-        self.master_datadir = options.masterDataDirectory
+        self.coordinator_datadir = options.coordinatorDataDirectory
 
-        # TODO: AK: Program logic should not be dictating master, standby, and segment information
+        # TODO: AK: Program logic should not be dictating coordinator, standby, and segment information
         # In other words, the fundamental Operations should have APIs that preclude the need for this.
-        self.master_host = None
+        self.coordinator_host = None
         self.standby_host = None
         self.segment_host_list = None
 
@@ -45,6 +43,7 @@ class GpPkgProgram:
         self.clean = options.clean
         self.migrate = options.migrate
         self.interactive = options.interactive
+        self.filename = options.filename
 
         # only one of the following may be provided: --install, --remove, --update, --query, --build, --clean, --migrate
         count = sum([1 for opt in ['install', 'remove', 'update', 'query', 'build', 'clean', 'migrate'] if getattr(self, opt)])
@@ -73,6 +72,18 @@ class GpPkgProgram:
                 raise ExceptionNoStackTraceNeeded('Invalid syntax, expecting "gppkg --migrate <from_gphome> <to_gphome>".')
             self.migrate = (args[0], args[1])
 
+        # gppkg should check gpexpand status unless in build mode.
+        #
+        # Build mode does not use any information from the cluster and does not
+        # affect its running status, in fact it does not require a cluster
+        # exists at all.
+        if not self.build:
+            check_result, msg = gp.conflict_with_gpexpand("gppkg",
+                                                          refuse_phase1=True,
+                                                          refuse_phase2=False)
+            if not check_result:
+                raise ExceptionNoStackTraceNeeded(msg)
+
     @staticmethod
     def create_parser():
         parser = OptParser(option_class=OptChecker,
@@ -88,9 +99,9 @@ class GpPkgProgram:
         add_to = OptionGroup(parser, 'General Options')
         parser.add_option_group(add_to)
 
-        addMasterDirectoryOptionForSingleClusterProgram(add_to)
+        addCoordinatorDirectoryOptionForSingleClusterProgram(add_to)
 
-        # TODO: AK: Eventually, these options may need to be flexible enough to accept mutiple packages
+        # TODO: AK: Eventually, these options may need to be flexible enough to accept multiple packages
         # in one invocation. If so, the structure of this parser may need to change.
         add_to.add_option('-i', '--install', help='install the given gppkg', metavar='<package>')
         add_to.add_option('-u', '--update', help='update the given gppkg', metavar='<package>')
@@ -99,6 +110,7 @@ class GpPkgProgram:
         add_to.add_option('-b', '--build', help='build a gppkg', metavar='<directory>')
         add_to.add_option('-c', '--clean', help='clean the cluster of the given gppkg', action='store_true')
         add_to.add_option('--migrate', help='migrate gppkgs from a separate $GPHOME', metavar='<from_gphome> <to_gphome>', action='store_true', default=False)
+        add_to.add_option('-f', '--filename', help='set specific package name', metavar='<name>')
 
         add_to = OptionGroup(parser, 'Query Options')
         parser.add_option_group(add_to)
@@ -120,23 +132,23 @@ class GpPkgProgram:
             This method gets the host names
             of all hosts in the gpdb array.
             It sets the following variables
-                GpPkgProgram.master_host to master
+                GpPkgProgram.coordinator_host to coordinator
                 GpPkgProgram.standby_host to standby
                 GpPkgProgram.segment_host_list to segment hosts
         """
 
         logger.debug('_get_gpdb_host_list')
 
-        gparr = GpArray.initFromCatalog(dbconn.DbURL(port = self.master_port), utility = True)
-        master_host = None
+        gparr = GpArray.initFromCatalog(dbconn.DbURL(port = self.coordinator_port), utility = True)
+        coordinator_host = None
         standby_host = None
         segment_host_list = []
 
         segs = gparr.getDbList()
 
         for seg in segs:
-            if seg.isSegmentMaster(current_role = True):
-                master_host = seg.getSegmentHostName()
+            if seg.isSegmentCoordinator(current_role = True):
+                coordinator_host = seg.getSegmentHostName()
             elif seg.isSegmentStandby(current_role = True):
                 standby_host = seg.getSegmentHostName()
             else:
@@ -146,53 +158,61 @@ class GpPkgProgram:
         # dont install multiple times on the same host
         segment_host_list = list(set(segment_host_list))
 
-        # Segments might exist on the master host. Since we store the
-        # master host separately in self.master_host, storing the master_host
+        # Segments might exist on the coordinator host. Since we store the
+        # coordinator host separately in self.coordinator_host, storing the coordinator_host
         # in the segment_host_list is redundant.
         for host in segment_host_list:
-            if host == master_host or host == standby_host:
+            if host == coordinator_host or host == standby_host:
                 segment_host_list.remove(host)
 
-        self.master_host = master_host
+        self.coordinator_host = coordinator_host
         self.standby_host = standby_host
         self.segment_host_list = segment_host_list
 
-    def _get_master_port(self, datadir):
+    def _get_coordinator_port(self, datadir):
 
         '''
-            Obtain the master port from the pgconf file
+            Obtain the coordinator port from the pgconf file
         '''
 
-        logger.debug('_get_master_port')
+        logger.debug('_get_coordinator_port')
         pgconf_dict = pgconf.readfile(os.path.join(datadir, 'postgresql.conf'))
         return pgconf_dict.int('port') or os.getenv('PGPORT')
 
     def run(self):
         if self.build:
-            BuildGppkg(self.build).run()
+            if self.filename:
+                BuildGppkg(self.build, self.filename).run()
+            else:
+                BuildGppkg(self.build, None).run()
             return
 
-        #Check for RPM and Solaris OS
-        if curr_platform == SUNOS:
-            raise ExceptionNoStackTraceNeeded('gppkg is not supported on Solaris')
+        if linux_distribution_id() == 'ubuntu':
+            try:
+                cmd = Command(name='Check for dpkg', cmdStr='dpkg --version')
+                cmd.run(validateAfter=True)
+                cmd = Command(name='Check for fakeroot', cmdStr='fakeroot --version')
+                cmd.run(validateAfter=True)
+            except Exception as ex:
+                raise ExceptionNoStackTraceNeeded('fakeroot and dpkg are both required by gppkg')
+        else:
+            try:
+                cmd = Command(name = 'Check for rpm', cmdStr = 'rpm --version')
+                cmd.run(validateAfter = True)
+                results = cmd.get_results().stdout.strip()
+                rpm_version_string = results.split(' ')[-1]
 
-        try:
-            cmd = Command(name = 'Check for rpm', cmdStr = 'rpm --version')
-            cmd.run(validateAfter = True)
-            results = cmd.get_results().stdout.strip()
-            rpm_version_string = results.split(' ')[-1]
+                if not rpm_version_string.startswith('4.'):
+                    raise ExceptionNoStackTraceNeeded('gppkg requires rpm version 4.x')
 
-            if not rpm_version_string.startswith('4.'):
-                raise ExceptionNoStackTraceNeeded('gppkg requires rpm version 4.x')
+            except ExecutionError as ex:
+                results = ex.cmd.get_results().stderr.strip()
+                if len(results) != 0 and 'not found' in results:
+                    raise ExceptionNoStackTraceNeeded('gppkg requires RPM to be available in PATH')
 
-        except ExecutionError, ex:
-            results = ex.cmd.get_results().stderr.strip()
-            if len(results) != 0 and 'not found' in results:
-                raise ExceptionNoStackTraceNeeded('gppkg requires RPM to be available in PATH')
-
-        if self.master_datadir is None:
-            self.master_datadir = gp.get_masterdatadir()
-        self.master_port = self._get_master_port(self.master_datadir)
+        if self.coordinator_datadir is None:
+            self.coordinator_datadir = gp.get_coordinatordatadir()
+        self.coordinator_port = self._get_coordinator_port(self.coordinator_datadir)
 
         self._get_gpdb_host_list()
 
@@ -206,7 +226,7 @@ class GpPkgProgram:
 
         if self.install:
             pkg = Gppkg.from_package_path(self.install)
-            InstallPackage(pkg, self.master_host, self.standby_host, self.segment_host_list).run()
+            InstallPackage(pkg, self.coordinator_host, self.standby_host, self.segment_host_list).run()
         elif self.query:
             query_type, package_path = self.query
             QueryPackage(query_type, package_path).run()
@@ -227,7 +247,7 @@ class GpPkgProgram:
 
             pkg_file = pkg_file_list[0]
             pkg = Gppkg.from_package_path(os.path.join(GPPKG_ARCHIVE_PATH, pkg_file))
-            UninstallPackage(pkg, self.master_host, self.standby_host, self.segment_host_list).run()
+            UninstallPackage(pkg, self.coordinator_host, self.standby_host, self.segment_host_list).run()
         elif self.update:
             logger.warning('WARNING: The process of updating a package includes removing all')
             logger.warning('previous versions of the system objects related to the package. For')
@@ -239,7 +259,7 @@ class GpPkgProgram:
                     logger.info('Skipping update of gppkg based on user input')
                     return
             pkg = Gppkg.from_package_path(self.update)
-            UpdatePackage(pkg, self.master_host, self.standby_host, self.segment_host_list).run()
+            UpdatePackage(pkg, self.coordinator_host, self.standby_host, self.segment_host_list).run()
         elif self.clean:
             CleanGppkg(self.standby_host, self.segment_host_list).run()
 

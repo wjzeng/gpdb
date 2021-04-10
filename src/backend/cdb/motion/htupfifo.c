@@ -4,7 +4,7 @@
  *	   A FIFO queue for HeapTuples.
  *
  * Portions Copyright (c) 2005-2008, Greenplum inc
- * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
  *
  *
  * IDENTIFICATION
@@ -19,70 +19,25 @@
 #include "utils/memutils.h"
 #include "cdb/htupfifo.h"
 
-#define HTF_FREELIST_MAX_LEN (10)
-
 static void htfifo_cleanup(htup_fifo htf);
 
 /*
  * Create and initialize a HeapTuple FIFO. The FIFO state is allocated
  * by this function, then initialized and returned.
- *
- * The HeapTuple FIFO must be given at least MIN_HTUPFIFO_KB bytes of
- * space to work with.  Anything less will be trapped as an
- * assert-failure.
- *
- * Parameters:
- *		max_mem_kb - The maximum memory size the FIFO can grow to, in
- *		kilobytes.  If the FIFO grows larger than this, an error is
- *		logged.
- *
- * XXX: THIS MEMORY PARAMETER IS COMPLETELY IGNORED!
  */
 htup_fifo
-htfifo_create(int max_mem_kb)
+htfifo_create(void)
 {
 	htup_fifo	htf;
 
 	htf = (htup_fifo) palloc(sizeof(htup_fifo_state));
-	htfifo_init(htf, max_mem_kb);
-
-	return htf;
-}
-
-
-/*
- * Initialize a HeapTuple FIFO.  The FIFO state is already allocated before
- * this function is called, but it is assumed that its contents are
- * uninitialized.
- *
- * The HeapTuple FIFO must be given at least MIN_HTUPFIFO_KB bytes of space
- * to work with.  Anything less will be trapped as an assert-failure.
- *
- * Parameters:
- *
- *	   htf - An uninitialized pointer to a htup_fifo_state structure.
- *
- * XXX: THIS MEMORY PARAMETER IS COMPLETELY IGNORED!
- *	   max_mem_kb - The maximum memory size the FIFO can grow to, in
- *		   kilobytes.  If the FIFO grows larger than this, an error is logged.
- */
-void
-htfifo_init(htup_fifo htf, int max_mem_kb)
-{
-	AssertArg(htf != NULL);
-	AssertArg(max_mem_kb > MIN_HTUPFIFO_KB);
-
 	htf->p_first = NULL;
 	htf->p_last = NULL;
 
 	htf->freelist = NULL;
-	htf->freelist_count = 0;
 
-	htf->tup_count = 0;
-	htf->curr_mem_size = 0;
-	htf->max_mem_size = max_mem_kb * 1024;
+	return htf;
 }
-
 
 /*
  * Clean up a HeapTuple FIFO.  This frees all dynamically-allocated
@@ -91,7 +46,7 @@ htfifo_init(htup_fifo htf, int max_mem_kb)
 static void
 htfifo_cleanup(htup_fifo htf)
 {
-	GenericTuple tup;
+	MinimalTuple tup;
 
 	AssertArg(htf != NULL);
 
@@ -107,13 +62,9 @@ htfifo_cleanup(htup_fifo htf)
 
 		pfree(trash);
 	}
-	htf->freelist_count = 0;
 
 	htf->p_first = NULL;
 	htf->p_last = NULL;
-	htf->tup_count = 0;
-	htf->curr_mem_size = 0;
-	htf->max_mem_size = 0;
 }
 
 /*
@@ -144,19 +95,21 @@ htfifo_destroy(htup_fifo htf)
  * init-time, then an error is flagged.
  */
 void
-htfifo_addtuple(htup_fifo htf, GenericTuple tup)
+htfifo_addtuple(htup_fifo htf, MinimalTuple tup)
 {
 	htf_entry	p_ent;
 
 	AssertArg(htf != NULL);
 	AssertArg(tup != NULL);
 
+	/* Serialized tuple should never have external attribute */
+	Assert(!(tup->t_infomask & HEAP_HASEXTERNAL));
+
 	/* Populate the new entry. */
 	if (htf->freelist != NULL)
 	{
 		p_ent = htf->freelist;
 		htf->freelist = p_ent->p_next;
-		htf->freelist_count = htf->freelist_count - 1;
 	}
 	else
 	{
@@ -178,23 +131,18 @@ htfifo_addtuple(htup_fifo htf, GenericTuple tup)
 		htf->p_first = p_ent;
 	}
 	htf->p_last = p_ent;
-
-	/* Update the FIFO state. */
-
-	htf->tup_count++;
-	htf->curr_mem_size += GetMemoryChunkSpace(p_ent) + GetMemoryChunkSpace(tup);
 }
 
 
 /*
- * Retrieve the next HeapTuple from the start of the FIFO. If the FIFO
+ * Retrieve the next tuple from the start of the FIFO. If the FIFO
  * is empty then NULL is returned.
  */
-GenericTuple
+MinimalTuple
 htfifo_gettuple(htup_fifo htf)
 {
 	htf_entry	p_ent;
-	GenericTuple tup;
+	MinimalTuple tup;
 
 	AssertArg(htf != NULL);
 
@@ -214,38 +162,13 @@ htfifo_gettuple(htup_fifo htf)
 		tup = p_ent->tup;
 		AssertState(tup != NULL);
 
-		/* Update the FIFO state. */
-
-		AssertState(htf->tup_count > 0);
-		AssertState(htf->curr_mem_size > 0);
-
-		htf->tup_count--;
-		htf->curr_mem_size -=
-			(GetMemoryChunkSpace(p_ent) + GetMemoryChunkSpace(tup));
-
-		AssertState(htf->tup_count >= 0);
-		AssertState(htf->curr_mem_size >= 0);
-
 		/* Free the FIFO entry. */
-		if (htf->freelist_count > HTF_FREELIST_MAX_LEN)
-		{
-			pfree(p_ent);
-		}
-		else
-		{
-			p_ent->p_next = htf->freelist;
-			htf->freelist = p_ent;
-			htf->freelist_count = htf->freelist_count + 1;
-		}
+		p_ent->p_next = htf->freelist;
+		htf->freelist = p_ent;
 	}
 	else
 	{
-		/*
-		 * No entries in FIFO.	Just do some sanity checks, but NULL is the
-		 * result.
-		 */
-		AssertState(htf->tup_count == 0);
-		AssertState(htf->curr_mem_size == 0);
+		/* No entries in FIFO. */
 		tup = NULL;
 	}
 

@@ -4,15 +4,17 @@
  *
  * Routines to support SELinux labels (security context)
  *
- * Copyright (c) 2010-2014, PostgreSQL Global Development Group
+ * Copyright (c) 2010-2019, PostgreSQL Global Development Group
  *
  * -------------------------------------------------------------------------
  */
 #include "postgres.h"
 
-#include "access/heapam.h"
+#include <selinux/label.h>
+
 #include "access/htup_details.h"
 #include "access/genam.h"
+#include "access/table.h"
 #include "access/xact.h"
 #include "catalog/catalog.h"
 #include "catalog/dependency.h"
@@ -33,11 +35,8 @@
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
-#include "utils/tqual.h"
 
 #include "sepgsql.h"
-
-#include <selinux/label.h>
 
 /*
  * Saved hook entries (if stacked)
@@ -60,17 +59,17 @@ static fmgr_hook_type next_fmgr_hook = NULL;
  * labels were set during the (sub-)transactions.
  */
 static char *client_label_peer = NULL;	/* set by getpeercon(3) */
-static List *client_label_pending = NIL;		/* pending list being set by
-												 * sepgsql_setcon() */
-static char *client_label_committed = NULL;		/* set by sepgsql_setcon(),
-												 * and already committed */
+static List *client_label_pending = NIL;	/* pending list being set by
+											 * sepgsql_setcon() */
+static char *client_label_committed = NULL; /* set by sepgsql_setcon(), and
+											 * already committed */
 static char *client_label_func = NULL;	/* set by trusted procedure */
 
 typedef struct
 {
 	SubTransactionId subid;
 	char	   *label;
-}	pending_label;
+}			pending_label;
 
 /*
  * sepgsql_get_client_label
@@ -161,7 +160,7 @@ sepgsql_set_client_label(const char *new_label)
 /*
  * sepgsql_xact_callback
  *
- * A callback routine of transaction commit/abort/prepare.  Commmit or abort
+ * A callback routine of transaction commit/abort/prepare.  Commit or abort
  * changes in the client_label_pending list.
  */
 static void
@@ -469,7 +468,7 @@ sepgsql_get_label(Oid classId, Oid objectId, int32 subId)
 		if (security_get_initial_context_raw("unlabeled", &unlabeled) < 0)
 			ereport(ERROR,
 					(errcode(ERRCODE_INTERNAL_ERROR),
-			   errmsg("SELinux: failed to get initial security label: %m")));
+					 errmsg("SELinux: failed to get initial security label: %m")));
 		PG_TRY();
 		{
 			label = pstrdup(unlabeled);
@@ -502,7 +501,7 @@ sepgsql_object_relabel(const ObjectAddress *object, const char *seclabel)
 		security_check_context_raw((security_context_t) seclabel) < 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_NAME),
-			   errmsg("SELinux: invalid security label: \"%s\"", seclabel)));
+				 errmsg("SELinux: invalid security label: \"%s\"", seclabel)));
 
 	/*
 	 * Do actual permission checks for each object classes
@@ -532,7 +531,10 @@ sepgsql_object_relabel(const ObjectAddress *object, const char *seclabel)
 			break;
 
 		default:
-			elog(ERROR, "unsupported object type: %u", object->classId);
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("sepgsql provider does not support labels on %s",
+							getObjectTypeDescription(object))));
 			break;
 	}
 }
@@ -587,7 +589,7 @@ PG_FUNCTION_INFO_V1(sepgsql_mcstrans_in);
 Datum
 sepgsql_mcstrans_in(PG_FUNCTION_ARGS)
 {
-	text	   *label = PG_GETARG_TEXT_P(0);
+	text	   *label = PG_GETARG_TEXT_PP(0);
 	char	   *raw_label;
 	char	   *result;
 
@@ -627,7 +629,7 @@ PG_FUNCTION_INFO_V1(sepgsql_mcstrans_out);
 Datum
 sepgsql_mcstrans_out(PG_FUNCTION_ARGS)
 {
-	text	   *label = PG_GETARG_TEXT_P(0);
+	text	   *label = PG_GETARG_TEXT_PP(0);
 	char	   *qual_label;
 	char	   *result;
 
@@ -710,7 +712,7 @@ quote_object_name(const char *src1, const char *src2,
  * catalog OID.
  */
 static void
-exec_object_restorecon(struct selabel_handle * sehnd, Oid catalogId)
+exec_object_restorecon(struct selabel_handle *sehnd, Oid catalogId)
 {
 	Relation	rel;
 	SysScanDesc sscan;
@@ -724,7 +726,7 @@ exec_object_restorecon(struct selabel_handle * sehnd, Oid catalogId)
 	 * Open the target catalog. We don't want to allow writable accesses by
 	 * other session during initial labeling.
 	 */
-	rel = heap_open(catalogId, AccessShareLock);
+	rel = table_open(catalogId, AccessShareLock);
 
 	sscan = systable_beginscan(rel, InvalidOid, false,
 							   NULL, 0, NULL);
@@ -755,7 +757,7 @@ exec_object_restorecon(struct selabel_handle * sehnd, Oid catalogId)
 											NULL, NULL, NULL);
 
 				object.classId = DatabaseRelationId;
-				object.objectId = HeapTupleGetOid(tuple);
+				object.objectId = datForm->oid;
 				object.objectSubId = 0;
 				break;
 
@@ -769,14 +771,15 @@ exec_object_restorecon(struct selabel_handle * sehnd, Oid catalogId)
 											NULL, NULL);
 
 				object.classId = NamespaceRelationId;
-				object.objectId = HeapTupleGetOid(tuple);
+				object.objectId = nspForm->oid;
 				object.objectSubId = 0;
 				break;
 
 			case RelationRelationId:
 				relForm = (Form_pg_class) GETSTRUCT(tuple);
 
-				if (relForm->relkind == RELKIND_RELATION)
+				if (relForm->relkind == RELKIND_RELATION ||
+					relForm->relkind == RELKIND_PARTITIONED_TABLE)
 					objtype = SELABEL_DB_TABLE;
 				else if (relForm->relkind == RELKIND_SEQUENCE)
 					objtype = SELABEL_DB_SEQUENCE;
@@ -793,14 +796,15 @@ exec_object_restorecon(struct selabel_handle * sehnd, Oid catalogId)
 				pfree(namespace_name);
 
 				object.classId = RelationRelationId;
-				object.objectId = HeapTupleGetOid(tuple);
+				object.objectId = relForm->oid;
 				object.objectSubId = 0;
 				break;
 
 			case AttributeRelationId:
 				attForm = (Form_pg_attribute) GETSTRUCT(tuple);
 
-				if (get_rel_relkind(attForm->attrelid) != RELKIND_RELATION)
+				if (get_rel_relkind(attForm->attrelid) != RELKIND_RELATION &&
+					get_rel_relkind(attForm->attrelid) != RELKIND_PARTITIONED_TABLE)
 					continue;	/* no need to assign security label */
 
 				objtype = SELABEL_DB_COLUMN;
@@ -833,7 +837,7 @@ exec_object_restorecon(struct selabel_handle * sehnd, Oid catalogId)
 				pfree(namespace_name);
 
 				object.classId = ProcedureRelationId;
-				object.objectId = HeapTupleGetOid(tuple);
+				object.objectId = proForm->oid;
 				object.objectSubId = 0;
 				break;
 
@@ -876,7 +880,7 @@ exec_object_restorecon(struct selabel_handle * sehnd, Oid catalogId)
 	}
 	systable_endscan(sscan);
 
-	heap_close(rel, NoLock);
+	table_close(rel, NoLock);
 }
 
 /*
@@ -912,7 +916,7 @@ sepgsql_restorecon(PG_FUNCTION_ARGS)
 	if (!superuser())
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-		  errmsg("SELinux: must be superuser to restore initial contexts")));
+				 errmsg("SELinux: must be superuser to restore initial contexts")));
 
 	/*
 	 * Open selabel_lookup(3) stuff. It provides a set of mapping between an
@@ -932,7 +936,7 @@ sepgsql_restorecon(PG_FUNCTION_ARGS)
 	if (!sehnd)
 		ereport(ERROR,
 				(errcode(ERRCODE_INTERNAL_ERROR),
-			   errmsg("SELinux: failed to initialize labeling handle: %m")));
+				 errmsg("SELinux: failed to initialize labeling handle: %m")));
 	PG_TRY();
 	{
 		exec_object_restorecon(sehnd, DatabaseRelationId);

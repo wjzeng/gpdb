@@ -5,6 +5,7 @@
 CREATE TABLE INT8_TBL(q1 int8, q2 int8);
 
 INSERT INTO INT8_TBL VALUES('  123   ','  456');
+ANALYZE INT8_TBL;
 INSERT INTO INT8_TBL VALUES('123   ','4567890123456789');
 INSERT INTO INT8_TBL VALUES('4567890123456789','123');
 INSERT INTO INT8_TBL VALUES(+4567890123456789,'4567890123456789');
@@ -18,6 +19,10 @@ INSERT INTO INT8_TBL(q1) VALUES ('-1204982019841029840928340329840934');
 INSERT INTO INT8_TBL(q1) VALUES ('- 123');
 INSERT INTO INT8_TBL(q1) VALUES ('  345     5');
 INSERT INTO INT8_TBL(q1) VALUES ('');
+
+-- The queries in this file are not sensitive to the stats, but
+-- other more complicated queries in other test files are.
+ANALYZE int8_tbl;
 
 SELECT * FROM INT8_TBL;
 
@@ -205,3 +210,23 @@ SELECT (-9223372036854775808)::int8 % (-1)::int4;
 SELECT (-9223372036854775808)::int8 * (-1)::int2;
 SELECT (-9223372036854775808)::int8 / (-1)::int2;
 SELECT (-9223372036854775808)::int8 % (-1)::int2;
+
+-- check rounding when casting from float
+SELECT x, x::int8 AS int8_value
+FROM (VALUES (-2.5::float8),
+             (-1.5::float8),
+             (-0.5::float8),
+             (0.0::float8),
+             (0.5::float8),
+             (1.5::float8),
+             (2.5::float8)) t(x);
+
+-- check rounding when casting from numeric
+SELECT x, x::int8 AS int8_value
+FROM (VALUES (-2.5::numeric),
+             (-1.5::numeric),
+             (-0.5::numeric),
+             (0.0::numeric),
+             (0.5::numeric),
+             (1.5::numeric),
+             (2.5::numeric)) t(x);

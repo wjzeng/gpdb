@@ -8,7 +8,6 @@
 
 #include "mb/pg_wchar.h"
 #include "utils/memutils.h"
-#include "utils/palloc.h"
 
 #include "plpython.h"
 
@@ -16,42 +15,6 @@
 
 #include "plpy_elog.h"
 
-
-void *
-PLy_malloc(size_t bytes)
-{
-	/* We need our allocations to be long-lived, so use TopMemoryContext */
-	return MemoryContextAlloc(TopMemoryContext, bytes);
-}
-
-void *
-PLy_malloc0(size_t bytes)
-{
-	void	   *ptr = PLy_malloc(bytes);
-
-	MemSet(ptr, 0, bytes);
-	return ptr;
-}
-
-char *
-PLy_strdup(const char *str)
-{
-	char	   *result;
-	size_t		len;
-
-	len = strlen(str) + 1;
-	result = PLy_malloc(len);
-	memcpy(result, str, len);
-
-	return result;
-}
-
-/* define this away */
-void
-PLy_free(void *ptr)
-{
-	pfree(ptr);
-}
 
 /*
  * Convert a Python unicode object to a Python string/bytes object in
@@ -121,7 +84,7 @@ PLyUnicode_Bytes(PyObject *unicode)
  * function.  The result is palloc'ed.
  *
  * Note that this function is disguised as PyString_AsString() when
- * using Python 3.  That function retuns a pointer into the internal
+ * using Python 3.  That function returns a pointer into the internal
  * memory of the argument, which isn't exactly the interface of this
  * function.  But in either case you get a rather short-lived
  * reference that you ought to better leave alone.
@@ -142,19 +105,30 @@ PLyUnicode_AsString(PyObject *unicode)
  * unicode object.  Reference ownership is passed to the caller.
  */
 PyObject *
-PLyUnicode_FromString(const char *s)
+PLyUnicode_FromStringAndSize(const char *s, Py_ssize_t size)
 {
 	char	   *utf8string;
 	PyObject   *o;
 
-	utf8string = pg_server_to_any(s, strlen(s), PG_UTF8);
+	utf8string = pg_server_to_any(s, size, PG_UTF8);
 
-	o = PyUnicode_FromString(utf8string);
-
-	if (utf8string != s)
+	if (utf8string == s)
+	{
+		o = PyUnicode_FromStringAndSize(s, size);
+	}
+	else
+	{
+		o = PyUnicode_FromString(utf8string);
 		pfree(utf8string);
+	}
 
 	return o;
 }
 
-#endif   /* PY_MAJOR_VERSION >= 3 */
+PyObject *
+PLyUnicode_FromString(const char *s)
+{
+	return PLyUnicode_FromStringAndSize(s, strlen(s));
+}
+
+#endif							/* PY_MAJOR_VERSION >= 3 */

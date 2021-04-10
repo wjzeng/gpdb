@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 #
 # Copyright (c) Greenplum Inc 2008. All Rights Reserved. 
 #
@@ -57,6 +57,8 @@ def get_default_logger():
 
     return _LOGGER
 
+def get_logger_dir():
+    return os.path.dirname(_FILENAME)
 
 def get_unittest_logger():
     """
@@ -242,7 +244,6 @@ def _set_file_logging(filename):
     _FILE_HANDLER.setFormatter(_get_default_formatter())
     _LOGGER.addHandler(_FILE_HANDLER)
 
-
 def _get_default_formatter():
     """
     Returns the default formatter, constructing it if needed.
@@ -311,10 +312,10 @@ class EncodingFileHandler(logging.FileHandler):
         logging.FileHandler.__init__(self, filename, mode, encoding, delay)
 
     def emit(self, record):
-        if not isinstance(record.msg, str) and not isinstance(record.msg, unicode):
+        if not isinstance(record.msg, str) and not isinstance(record.msg, str):
             record.msg = str(record.msg)
-        if not isinstance(record.msg, unicode):
-            record.msg = unicode(record.msg, 'utf-8')
+        if not isinstance(record.msg, str):
+            record.msg = str(record.msg, 'utf-8')
         logging.FileHandler.emit(self, record)
 
 
@@ -327,8 +328,8 @@ class EncodingStreamHandler(logging.StreamHandler):
         logging.StreamHandler.__init__(self, strm)
 
     def emit(self, record):
-        if not isinstance(record.msg, str) and not isinstance(record.msg, unicode):
+        if not isinstance(record.msg, str) and not isinstance(record.msg, str):
             record.msg = str(record.msg)
-        if not isinstance(record.msg, unicode):
-            record.msg = unicode(record.msg, 'utf-8')
+        if not isinstance(record.msg, str):
+            record.msg = str(record.msg, 'utf-8')
         logging.StreamHandler.emit(self, record)

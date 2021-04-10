@@ -10,7 +10,7 @@
  *	  Over time, this has also become the preferred place for widely known
  *	  resource-limitation stuff, such as work_mem and check_stack_depth().
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/miscadmin.h
@@ -23,11 +23,11 @@
 #ifndef MISCADMIN_H
 #define MISCADMIN_H
 
+#include <signal.h>
+
+#include "datatype/timestamp.h" /* for TimestampTZ */
 #include "pgtime.h"				/* for pg_time_t */
 
-
-#define PG_VERSIONSTR "postgres (Greenplum Database) " PG_VERSION "\n"
-#define PG_BACKEND_VERSIONSTR "postgres (Greenplum Database) " PG_VERSION "\n"
 
 #define InvalidPid				(-1)
 
@@ -53,6 +53,10 @@
  * will be held off until CHECK_FOR_INTERRUPTS() is done outside any
  * HOLD_INTERRUPTS() ... RESUME_INTERRUPTS() section.
  *
+ * There is also a mechanism to prevent query cancel interrupts, while still
+ * allowing die interrupts: HOLD_CANCEL_INTERRUPTS() and
+ * RESUME_CANCEL_INTERRUPTS().
+ *
  * Special mechanisms are used to let an interrupt be accepted when we are
  * waiting for a lock or when we are waiting for command input (but, of
  * course, only if the interrupt holdoff counter is zero).  See the
@@ -74,33 +78,27 @@
 
 /* in globals.c */
 /* these are marked volatile because they are set by signal handlers: */
-extern PGDLLIMPORT volatile bool InterruptPending;
-extern PGDLLIMPORT volatile bool QueryCancelPending;
-extern PGDLLIMPORT volatile bool QueryCancelCleanup; /* GPDB only */
-extern PGDLLIMPORT volatile bool QueryFinishPending;
-extern PGDLLIMPORT volatile bool ProcDiePending;
+extern PGDLLIMPORT volatile sig_atomic_t InterruptPending;
+extern PGDLLIMPORT volatile sig_atomic_t QueryCancelPending;
+extern PGDLLIMPORT volatile sig_atomic_t QueryCancelCleanup; /* GPDB only */
+extern PGDLLIMPORT volatile sig_atomic_t QueryFinishPending;
+extern PGDLLIMPORT volatile sig_atomic_t ProcDiePending;
+extern PGDLLIMPORT volatile sig_atomic_t IdleInTransactionSessionTimeoutPending;
+extern PGDLLIMPORT volatile sig_atomic_t ConfigReloadPending;
 
-extern volatile bool ClientConnectionLost;
+extern PGDLLIMPORT volatile sig_atomic_t ClientConnectionLost;
 
 /* these are marked volatile because they are examined by signal handlers: */
-extern PGDLLIMPORT volatile bool ImmediateInterruptOK;
-extern PGDLLIMPORT volatile bool ImmediateDieOK;
-extern PGDLLIMPORT volatile bool TermSignalReceived;
 extern PGDLLIMPORT volatile int32 InterruptHoldoffCount;
+extern PGDLLIMPORT volatile int32 QueryCancelHoldoffCount;
 extern PGDLLIMPORT volatile int32 CritSectionCount;
 
 /* in tcop/postgres.c */
 extern void ProcessInterrupts(const char* filename, int lineno);
-extern void BackoffBackendTick(void);
-extern bool gp_enable_resqueue_priority;
-extern void gp_set_thread_sigmasks(void);
 
 /* Hook get notified when QueryCancelPending or ProcDiePending is raised */
 typedef void (*cancel_pending_hook_type) (void);
 extern PGDLLIMPORT cancel_pending_hook_type cancel_pending_hook;
-
-/* in utils/resource_manager.h */
-extern bool IsResQueueEnabled(void);
 
 /*
  * We don't want to include the entire vmem_tracker.h, and so,
@@ -108,34 +106,37 @@ extern bool IsResQueueEnabled(void);
  */
 extern void RedZoneHandler_DetectRunawaySession(void);
 
+/*
+ * These should be in backoff.h, but we need the in CHECK_FOR_INTERRUPTS(),
+ * and we don't want to include the entire backoff.h here.
+ */
+extern int backoffTickCounter;
+extern int gp_resqueue_priority_local_interval;
+
+extern void BackoffBackendTickExpired(void);
+
+static inline void
+BackoffBackendTick(void)
+{
+	backoffTickCounter++;
+
+	if (backoffTickCounter >= gp_resqueue_priority_local_interval)
+	{
+		/* Enough time has passed. Perform backoff. */
+		BackoffBackendTickExpired();
+	}
+}
+
 #ifndef WIN32
 
-#ifdef USE_TEST_UTILS
-#define CHECK_FOR_INTERRUPTS() \
-do { \
-	if (gp_test_time_slice) \
-	{ \
-		CHECK_TIME_SLICE(); \
-	} \
-\
-	if (InterruptPending) \
-		ProcessInterrupts(__FILE__, __LINE__); \
-	if (IsResQueueEnabled() && gp_enable_resqueue_priority)	\
-		BackoffBackendTick(); \
-	ReportOOMConsumption(); \
-	RedZoneHandler_DetectRunawaySession();\
-} while(0)
-#else
 #define CHECK_FOR_INTERRUPTS() \
 do { \
 	if (InterruptPending) \
 		ProcessInterrupts(__FILE__, __LINE__); \
-	if (IsResQueueEnabled() && gp_enable_resqueue_priority)	\
-		BackoffBackendTick(); \
+	BackoffBackendTick(); \
 	ReportOOMConsumption(); \
 	RedZoneHandler_DetectRunawaySession();\
 } while(0)
-#endif   /* USE_TEST_UTILS */
 
 #else							/* WIN32 */
 
@@ -146,7 +147,7 @@ do { \
 	if (InterruptPending) \
 		ProcessInterrupts(__FILE__, __LINE__); \
 } while(0)
-#endif   /* WIN32 */
+#endif							/* WIN32 */
 
 
 #define HOLD_INTERRUPTS() \
@@ -161,6 +162,20 @@ do { \
 	if (InterruptHoldoffCount <= 0) \
 		elog(PANIC, "Resume interrupt holdoff count is bad (%d)", InterruptHoldoffCount); \
 	InterruptHoldoffCount--; \
+} while(0)
+
+#define HOLD_CANCEL_INTERRUPTS() \
+do{ \
+    if (QueryCancelHoldoffCount < 0) \
+        elog(PANIC, "Hold cancel interrupt holdoff count is bad (%d)", QueryCancelHoldoffCount); \
+    QueryCancelHoldoffCount++; \
+} while(0)
+
+#define RESUME_CANCEL_INTERRUPTS() \
+do { \
+    if (QueryCancelHoldoffCount <= 0) \
+        elog(PANIC, "Resume cancel interrupt holdoff count is bad (%d)", QueryCancelHoldoffCount); \
+    QueryCancelHoldoffCount--; \
 } while(0)
 
 #define START_CRIT_SECTION() \
@@ -190,26 +205,31 @@ do { \
 /*
  * from utils/init/globals.c
  */
-extern pid_t PostmasterPid;
-extern bool IsPostmasterEnvironment;
+extern PGDLLIMPORT pid_t PostmasterPid;
+extern PGDLLIMPORT bool IsPostmasterEnvironment;
 extern PGDLLIMPORT bool IsUnderPostmaster;
-extern bool IsBackgroundWorker;
-extern bool IsBinaryUpgrade;
+extern PGDLLIMPORT bool IsBackgroundWorker;
+extern PGDLLIMPORT bool IsBinaryUpgrade;
+extern bool ConvertMasterDataDirToSegment;
 
-extern bool ExitOnAnyError;
+extern PGDLLIMPORT bool ExitOnAnyError;
 
 extern PGDLLIMPORT char *DataDir;
+extern PGDLLIMPORT int data_directory_mode;
 
 extern PGDLLIMPORT int NBuffers;
-extern int	MaxBackends;
-extern int	MaxConnections;
-extern int	max_worker_processes;
+extern PGDLLIMPORT int MaxBackends;
+extern PGDLLIMPORT int MaxConnections;
+extern PGDLLIMPORT int max_worker_processes;
+extern PGDLLIMPORT int max_parallel_workers;
 extern int gp_workfile_max_entries;
 
 extern PGDLLIMPORT int MyProcPid;
 extern PGDLLIMPORT pg_time_t MyStartTime;
+extern PGDLLIMPORT TimestampTz MyStartTimestamp;
 extern PGDLLIMPORT struct Port *MyProcPort;
-extern long MyCancelKey;
+extern PGDLLIMPORT struct Latch *MyLatch;
+extern int32 MyCancelKey;
 extern int	MyPMChildSlot;
 
 extern char OutputFileName[];
@@ -219,8 +239,6 @@ extern char pkglib_path[];
 #ifdef EXEC_BACKEND
 extern char postgres_exec_path[];
 #endif
-
-extern PGDLLIMPORT int gpperfmon_port; 
 
 /* for pljava */
 extern PGDLLIMPORT char* pljava_vmoptions;
@@ -293,10 +311,11 @@ extern PGDLLIMPORT int IntervalStyle;
 #define MAXTZLEN		10		/* max TZ name len, not counting tr. null */
 
 extern bool enableFsync;
-extern bool allowSystemTableMods;
+extern PGDLLIMPORT bool allowSystemTableMods;
 extern PGDLLIMPORT int planner_work_mem;
 extern PGDLLIMPORT int work_mem;
 extern PGDLLIMPORT int maintenance_work_mem;
+extern PGDLLIMPORT int max_parallel_maintenance_workers;
 extern PGDLLIMPORT int statement_mem;
 extern PGDLLIMPORT int max_statement_mem;
 extern PGDLLIMPORT int gp_vmem_limit_per_query;
@@ -305,7 +324,7 @@ extern int	VacuumCostPageHit;
 extern int	VacuumCostPageMiss;
 extern int	VacuumCostPageDirty;
 extern int	VacuumCostLimit;
-extern int	VacuumCostDelay;
+extern double VacuumCostDelay;
 
 extern int	VacuumPageHit;
 extern int	VacuumPageMiss;
@@ -313,6 +332,8 @@ extern int	VacuumPageDirty;
 
 extern int	VacuumCostBalance;
 extern bool VacuumCostActive;
+
+extern double vacuum_cleanup_index_scale_factor;
 
 extern int gp_vmem_protect_limit;
 extern int gp_vmem_protect_gang_cache_limit;
@@ -332,14 +353,30 @@ typedef char *pg_stack_base_t;
 extern pg_stack_base_t set_stack_base(void);
 extern void restore_stack_base(pg_stack_base_t base);
 extern void check_stack_depth(void);
+extern bool stack_is_too_deep(void);
+
+extern void PostgresSigHupHandler(SIGNAL_ARGS);
 
 /* in tcop/utility.c */
 extern void PreventCommandIfReadOnly(const char *cmdname);
+extern void PreventCommandIfParallelMode(const char *cmdname);
 extern void PreventCommandDuringRecovery(const char *cmdname);
 
 /* in utils/misc/guc.c */
 extern int	trace_recovery_messages;
 extern int	trace_recovery(int trace_level);
+
+/*
+ * database which is used by dtx recovery, gdd, fts, etc for catalog access.
+ * We are not using template1 since it seems that users would like to recreate
+ * the template1 database for customization sometimes. That means template1
+ * could be dropped and then recreated and thus that will break dtx recovery,
+ * gdd, fts, etc. Also template1 is the default template for the 'create
+ * database' command. Using template1 will make that command fail: "ERROR:
+ * source database "template1" is being accessed by other users" "DETAIL:
+ * There are 2 other sessions using the database."
+ */
+#define DB_FOR_COMMON_ACCESS	"postgres"
 
 /*****************************************************************************
  *	  pdir.h --																 *
@@ -349,33 +386,42 @@ extern int	trace_recovery(int trace_level);
 /* flags to be OR'd to form sec_context */
 #define SECURITY_LOCAL_USERID_CHANGE	0x0001
 #define SECURITY_RESTRICTED_OPERATION	0x0002
+#define SECURITY_NOFORCE_RLS			0x0004
 
 extern char *DatabasePath;
 
 /* now in utils/init/miscinit.c */
+extern void InitPostmasterChild(void);
+extern void InitStandaloneProcess(const char *argv0);
+
 extern void SetDatabasePath(const char *path);
 
-extern char *GetUserNameFromId(Oid roleid);
+extern char *GetUserNameFromId(Oid roleid, bool noerr);
 extern Oid	GetUserId(void);
 extern Oid	GetOuterUserId(void);
 extern Oid	GetSessionUserId(void);
-extern void 	SetSessionUserId(Oid, bool);
+extern void	SetSessionUserId(Oid, bool);
 extern Oid	GetAuthenticatedUserId(void);
 extern bool IsAuthenticatedUserSuperUser(void);
 extern void GetUserIdAndSecContext(Oid *userid, int *sec_context);
 extern void SetUserIdAndSecContext(Oid userid, int sec_context);
 extern bool InLocalUserIdChange(void);
 extern bool InSecurityRestrictedOperation(void);
+extern bool InNoForceRLSOperation(void);
 extern void GetUserIdAndContext(Oid *userid, bool *sec_def_context);
 extern void SetUserIdAndContext(Oid userid, bool sec_def_context);
-extern void InitializeSessionUserId(const char *rolename);
+extern void InitializeSessionUserId(const char *rolename, Oid useroid);
 extern void InitializeSessionUserIdStandalone(void);
 extern void SetSessionAuthorization(Oid userid, bool is_superuser);
 extern Oid	GetCurrentRoleId(void);
 extern void SetCurrentRoleId(Oid roleid, bool is_superuser);
 
+extern void checkDataDir(void);
 extern void SetDataDir(const char *dir);
 extern void ChangeToDataDir(void);
+
+extern void SwitchToSharedLatch(void);
+extern void SwitchBackToLocalLatch(void);
 
 /* in utils/misc/superuser.c */
 extern bool superuser(void);	/* current user is superuser */
@@ -468,10 +514,10 @@ extern AuxProcType MyAuxProcType;
 
 /* in utils/init/postinit.c */
 extern bool FindMyDatabase(const char *dbname, Oid *db_id, Oid *db_tablespace);
-extern void pg_split_opts(char **argv, int *argcp, char *optstr);
+extern void pg_split_opts(char **argv, int *argcp, const char *optstr);
 extern void InitializeMaxBackends(void);
 extern void InitPostgres(const char *in_dbname, Oid dboid, const char *username,
-			 char *out_dbname);
+						 Oid useroid, char *out_dbname, bool override_allow_connections);
 extern void BaseInit(void);
 
 /* in utils/init/miscinit.c */
@@ -481,36 +527,12 @@ extern char *session_preload_libraries_string;
 extern char *shared_preload_libraries_string;
 extern char *local_preload_libraries_string;
 
-/*
- * As of 9.1, the contents of the data-directory lock file are:
- *
- * line #
- *		1	postmaster PID (or negative of a standalone backend's PID)
- *		2	data directory path
- *		3	postmaster start timestamp (time_t representation)
- *		4	port number
- *		5	first Unix socket directory path (empty if none)
- *		6	first listen_address (IP address or "*"; empty if no TCP port)
- *		7	shared memory key (not present on Windows)
- *
- * Lines 6 and up are added via AddToDataDirLockFile() after initial file
- * creation.
- *
- * The socket lock file, if used, has the same contents as lines 1-5.
- */
-#define LOCK_FILE_LINE_PID			1
-#define LOCK_FILE_LINE_DATA_DIR		2
-#define LOCK_FILE_LINE_START_TIME	3
-#define LOCK_FILE_LINE_PORT			4
-#define LOCK_FILE_LINE_SOCKET_DIR	5
-#define LOCK_FILE_LINE_LISTEN_ADDR	6
-#define LOCK_FILE_LINE_SHMEM_KEY	7
-
 extern void CreateDataDirLockFile(bool amPostmaster);
 extern void CreateSocketLockFile(const char *socketfile, bool amPostmaster,
-					 const char *socketDir);
+								 const char *socketDir);
 extern void TouchSocketLockFiles(void);
 extern void AddToDataDirLockFile(int target_line, const char *str);
+extern bool RecheckDataDirLockFile(void);
 extern void ValidatePgVersion(const char *path);
 extern void process_shared_preload_libraries(void);
 extern void process_session_preload_libraries(void);
@@ -521,4 +543,4 @@ extern bool has_rolreplication(Oid roleid);
 extern bool BackupInProgress(void);
 extern void CancelBackup(void);
 
-#endif   /* MISCADMIN_H */
+#endif							/* MISCADMIN_H */

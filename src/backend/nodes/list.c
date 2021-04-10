@@ -4,7 +4,7 @@
  *	  implementation for PostgreSQL generic linked list package
  *
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -14,9 +14,6 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
-
-/* see pg_list.h */
-#define PG_LIST_INCLUDE_DEFINITIONS
 
 #include "nodes/pg_list.h"
 
@@ -55,7 +52,7 @@ check_list_invariants(const List *list)
 }
 #else
 #define check_list_invariants(l)
-#endif   /* USE_ASSERT_CHECKING */
+#endif							/* USE_ASSERT_CHECKING */
 
 /*
  * Return a freshly allocated List. Since empty non-NIL lists are
@@ -838,6 +835,32 @@ list_intersection(const List *list1, const List *list2)
 }
 
 /*
+ * As list_intersection but operates on lists of integers.
+ */
+List *
+list_intersection_int(const List *list1, const List *list2)
+{
+	List	   *result;
+	const ListCell *cell;
+
+	if (list1 == NIL || list2 == NIL)
+		return NIL;
+
+	Assert(IsIntegerList(list1));
+	Assert(IsIntegerList(list2));
+
+	result = NIL;
+	foreach(cell, list1)
+	{
+		if (list_member_int(list2, lfirst_int(cell)))
+			result = lappend_int(result, lfirst_int(cell));
+	}
+
+	check_list_invariants(result);
+	return result;
+}
+
+/*
  * Return a list that contains all the cells in list1 that are not in
  * list2. The returned list is freshly allocated via palloc(), but the
  * cells themselves point to the same objects as the cells of the
@@ -1239,6 +1262,68 @@ list_copy_tail(const List *oldlist, int nskip)
 
 	newlist_prev->next = NULL;
 	newlist->tail = newlist_prev;
+
+	check_list_invariants(newlist);
+	return newlist;
+}
+
+/*
+ * Sort a list as though by qsort.
+ *
+ * A new list is built and returned.  Like list_copy, this doesn't make
+ * fresh copies of any pointed-to data.
+ *
+ * The comparator function receives arguments of type ListCell **.
+ */
+List *
+list_qsort(const List *list, list_qsort_comparator cmp)
+{
+	int			len = list_length(list);
+	ListCell  **list_arr;
+	List	   *newlist;
+	ListCell   *newlist_prev;
+	ListCell   *cell;
+	int			i;
+
+	/* Empty list is easy */
+	if (len == 0)
+		return NIL;
+
+	/* Flatten list cells into an array, so we can use qsort */
+	list_arr = (ListCell **) palloc(sizeof(ListCell *) * len);
+	i = 0;
+	foreach(cell, list)
+		list_arr[i++] = cell;
+
+	qsort(list_arr, len, sizeof(ListCell *), cmp);
+
+	/* Construct new list (this code is much like list_copy) */
+	newlist = new_list(list->type);
+	newlist->length = len;
+
+	/*
+	 * Copy over the data in the first cell; new_list() has already allocated
+	 * the head cell itself
+	 */
+	newlist->head->data = list_arr[0]->data;
+
+	newlist_prev = newlist->head;
+	for (i = 1; i < len; i++)
+	{
+		ListCell   *newlist_cur;
+
+		newlist_cur = (ListCell *) palloc(sizeof(*newlist_cur));
+		newlist_cur->data = list_arr[i]->data;
+		newlist_prev->next = newlist_cur;
+
+		newlist_prev = newlist_cur;
+	}
+
+	newlist_prev->next = NULL;
+	newlist->tail = newlist_prev;
+
+	/* Might as well free the workspace array */
+	pfree(list_arr);
 
 	check_list_invariants(newlist);
 	return newlist;

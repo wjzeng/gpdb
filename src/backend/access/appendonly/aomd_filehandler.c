@@ -5,7 +5,7 @@
  * so we separate it out here.
  *
  * Portions Copyright (c) 2008, Greenplum Inc.
- * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
  * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
@@ -68,7 +68,7 @@ ao_foreach_extent_file(ao_extent_callback callback, void *ctx)
 {
     int segno;
     int colnum;
-    int concurrency[AOTupleId_MaxSegmentFileNum];
+    int concurrency[MAX_AOREL_CONCURRENCY];
     int concurrencySize;
 
     /*

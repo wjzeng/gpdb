@@ -7,7 +7,7 @@ class GucCollection:
     provide an enhanced dict of gucs, with responsibilities to assemble sets of info per segment.
 
     """
-    MASTER_KEY = '-1'
+    COORDINATOR_KEY = '-1'
 
     def __init__(self):
         self.gucs = {}
@@ -38,35 +38,35 @@ class GucCollection:
         return True
 
     def _check_consistency_across_segments(self):
-        segments_only = [v for k, v in self.gucs.iteritems() if self.MASTER_KEY != k]
+        segments_only = [v for k, v in self.gucs.items() if self.COORDINATOR_KEY != k]
         segment_values = [guc.get_value() for guc in segments_only]
         if len(set(segment_values)) > 1:
             return False
         return True
 
     def _check_consistency_within_single_segment(self):
-        for guc in self.gucs.values():
+        for guc in list(self.gucs.values()):
             if not guc.is_internally_consistent():
                 return False
         return True
 
     def validate(self):
-        if len(self.gucs) < 2 or self.MASTER_KEY not in self.gucs:
-            raise Exception("Collections must have at least a master and segment value")
+        if len(self.gucs) < 2 or self.COORDINATOR_KEY not in self.gucs:
+            raise Exception("Collections must have at least a coordinator and segment value")
 
     def values(self):
-        return sorted(self.gucs.values(), key=lambda x: x.context)
+        return sorted(list(self.gucs.values()), key=lambda x: x.context)
 
     def report(self):
         self.validate()
 
         if self.are_segments_consistent():
-            last_seg_key = sorted(self.gucs.keys(), reverse=True)[0]
-            report = [self.gucs[self.MASTER_KEY].report_success_format(),
+            last_seg_key = sorted(list(self.gucs.keys()), reverse=True)[0]
+            report = [self.gucs[self.COORDINATOR_KEY].report_success_format(),
                       self.gucs[last_seg_key].report_success_format()]
             return "\n".join(report)
         else:
-            sorted_gucs = sorted(self.gucs.values(), key=lambda x: x.context)
+            sorted_gucs = sorted(list(self.gucs.values()), key=lambda x: x.context)
             report = []
             for guc in sorted_gucs:
                 report.extend(guc.report_fail_format())

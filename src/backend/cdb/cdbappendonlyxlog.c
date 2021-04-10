@@ -3,7 +3,7 @@
  * cdbappendonlyxlog.c
  *
  * Portions Copyright (c) 2009-2010, Greenplum inc
- * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
  *
  *
  * IDENTIFICATION
@@ -19,11 +19,14 @@
 #include <fcntl.h>
 #include <sys/file.h>
 
-#include "cdb/cdbappendonlyxlog.h"
-#include "storage/fd.h"
-#include "catalog/catalog.h"
-
+#include "access/aomd.h"
 #include "access/xlogutils.h"
+#include "catalog/catalog.h"
+#include "cdb/cdbappendonlyxlog.h"
+#include "pgstat.h"
+#include "storage/fd.h"
+#include "utils/faultinjector.h"
+#include "utils/faultinjector_lists.h"
 
 /*
  * Insert an AO XLOG/AOCO record.
@@ -35,43 +38,35 @@ xlog_ao_insert(RelFileNode relFileNode, int32 segmentFileNum,
 			   int64 offset, void *buffer, int32 bufferLen)
 {
 	xl_ao_insert	xlaoinsert;
-	XLogRecData		rdata[2];
 
 	xlaoinsert.target.node = relFileNode;
 	xlaoinsert.target.segment_filenum = segmentFileNum;
 	xlaoinsert.target.offset = offset;
 
-	rdata[0].data = (char*) &xlaoinsert;
-	rdata[0].len = SizeOfAOInsert;
-	rdata[0].buffer = InvalidBuffer;
+	XLogBeginInsert();
+	XLogRegisterData((char*) &xlaoinsert, SizeOfAOInsert);
 
-	if (bufferLen == 0)
-		rdata[0].next = NULL;
-	else
-	{
-		rdata[0].next = &(rdata[1]);
+	if (bufferLen != 0)
+		XLogRegisterData((char*) buffer, bufferLen);
 
-		rdata[1].data = (char*) buffer;
-		rdata[1].len = bufferLen;
-		rdata[1].buffer = InvalidBuffer;
-		rdata[1].next = NULL;
-	}
+	SIMPLE_FAULT_INJECTOR("xlog_ao_insert");
 
-	XLogInsert(RM_APPEND_ONLY_ID, XLOG_APPENDONLY_INSERT, rdata);
+	XLogInsert(RM_APPEND_ONLY_ID, XLOG_APPENDONLY_INSERT);
+
+	wait_to_avoid_large_repl_lag();
 }
 
 static void
-ao_insert_replay(XLogRecord *record)
+ao_insert_replay(XLogReaderState *record)
 {
 	char	   *dbPath;
 	char		path[MAXPGPATH];
 	int			written_len;
-	int64		seek_offset;
 	File		file;
 	int			fileFlags;
 	xl_ao_insert *xlrec = (xl_ao_insert *) XLogRecGetData(record);
 	char	   *buffer = (char *) xlrec + SizeOfAOInsert;
-	uint32		len = record->xl_len - SizeOfAOInsert;
+	uint32		len = XLogRecGetDataLen(record) - SizeOfAOInsert;
 
 	dbPath = GetDatabasePath(xlrec->target.node.dbNode,
 							 xlrec->target.node.spcNode);
@@ -87,25 +82,15 @@ ao_insert_replay(XLogRecord *record)
 	/* When writing from the beginning of the file, it might not exist yet. Create it. */
 	if (xlrec->target.offset == 0)
 		fileFlags |= O_CREAT;
-	file = PathNameOpenFile(path, fileFlags, 0600);
+	file = PathNameOpenFile(path, fileFlags);
 	if (file < 0)
 	{
 		XLogAOSegmentFile(xlrec->target.node, xlrec->target.segment_filenum);
 		return;
 	}
 
-	seek_offset = FileSeek(file, xlrec->target.offset, SEEK_SET);
-	if (seek_offset != xlrec->target.offset)
-	{
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("seeked to position " INT64_FORMAT " but expected to seek to position " INT64_FORMAT " in file \"%s\": %m",
-						seek_offset,
-						xlrec->target.offset,
-						path)));
-	}
-
-	written_len = FileWrite(file, buffer, len);
+	written_len = FileWrite(file, buffer, len, xlrec->target.offset,
+							WAIT_EVENT_COPY_FILE_WRITE);
 	if (written_len < 0 || written_len != len)
 	{
 		ereport(ERROR,
@@ -115,13 +100,9 @@ ao_insert_replay(XLogRecord *record)
 						path)));
 	}
 
-	if (FileSync(file) != 0)
-	{
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("failed to flush file \"%s\": %m",
-						path)));
-	}
+	register_dirty_segment_ao(xlrec->target.node,
+							  xlrec->target.segment_filenum,
+							  file);
 
 	FileClose(file);
 }
@@ -132,22 +113,19 @@ ao_insert_replay(XLogRecord *record)
 void xlog_ao_truncate(RelFileNode relFileNode, int32 segmentFileNum, int64 offset)
 {
 	xl_ao_truncate	xlaotruncate;
-	XLogRecData		rdata[1];
 
 	xlaotruncate.target.node = relFileNode;
 	xlaotruncate.target.segment_filenum = segmentFileNum;
 	xlaotruncate.target.offset = offset;
 
-	rdata[0].data = (char*) &xlaotruncate;
-	rdata[0].len = sizeof(xl_ao_truncate);
-	rdata[0].buffer = InvalidBuffer;
-	rdata[0].next = NULL;
+	XLogBeginInsert();
+	XLogRegisterData((char*) &xlaotruncate, sizeof(xl_ao_truncate));
 
-	XLogInsert(RM_APPEND_ONLY_ID, XLOG_APPENDONLY_TRUNCATE, rdata);
+	XLogInsert(RM_APPEND_ONLY_ID, XLOG_APPENDONLY_TRUNCATE);
 }
 
 static void
-ao_truncate_replay(XLogRecord *record)
+ao_truncate_replay(XLogReaderState *record)
 {
 	char	   *dbPath;
 	char		path[MAXPGPATH];
@@ -162,15 +140,30 @@ ao_truncate_replay(XLogRecord *record)
 		snprintf(path, MAXPGPATH, "%s/%u", dbPath, xlrec->target.node.relNode);
 	else
 		snprintf(path, MAXPGPATH, "%s/%u.%u", dbPath, xlrec->target.node.relNode, xlrec->target.segment_filenum);
+	pfree(dbPath);
+	dbPath = NULL;
 
-	file = PathNameOpenFile(path, O_RDWR | PG_BINARY, 0600);
+	file = PathNameOpenFile(path, O_RDWR | PG_BINARY);
 	if (file < 0)
 	{
-		XLogAOSegmentFile(xlrec->target.node, xlrec->target.segment_filenum);
+		/*
+		 * Primary creates the file first and then writes the xlog record for
+		 * the creation for AO tables similar to heap.  Hence, file can get
+		 * created on primary without writing xlog record if failure happens
+		 * on primary just after creating the file. This creates situation
+		 * where VACUUM can generate truncate record based on aoseg entry with
+		 * eof 0 and file present on primary. Then during replay mirror may
+		 * not have the file, as was never created on mirror. So, avoid adding
+		 * the entry to invalid hash table for truncate at offset zero
+		 * (EOF=0).  This avoids mirror PANIC, as anyways truncate to zero is
+		 * same as file not present.
+		 */
+		if (xlrec->target.offset != 0)
+			XLogAOSegmentFile(xlrec->target.node, xlrec->target.segment_filenum);
 		return;
 	}
 
-	if (FileTruncate(file, xlrec->target.offset) != 0)
+	if (FileTruncate(file, xlrec->target.offset, WAIT_EVENT_DATA_FILE_TRUNCATE) != 0)
 	{
 		ereport(WARNING,
 				(errcode_for_file_access(),
@@ -182,10 +175,9 @@ ao_truncate_replay(XLogRecord *record)
 }
 
 void
-appendonly_redo(XLogRecPtr beginLoc, XLogRecPtr lsn, XLogRecord *record)
+appendonly_redo(XLogReaderState *record)
 {
-	uint8         xl_info = record->xl_info;
-	uint8         info = xl_info & ~XLR_INFO_MASK;
+	uint8         info = XLogRecGetInfo(record) & ~XLR_INFO_MASK;
 
 	/*
 	 * Perform redo of AO XLOG records only for standby mode. We do

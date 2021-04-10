@@ -6,6 +6,8 @@
 
 #include "postgres.h"
 
+#include <limits.h>
+
 #include "access/htup_details.h"
 #include "access/xact.h"
 #include "catalog/pg_type.h"
@@ -28,9 +30,9 @@
 #include "plpy_resultobject.h"
 
 
-static PyObject *PLy_spi_execute_query(char *query, int64 limit);
-static PyObject *PLy_spi_execute_plan(PyObject *ob, PyObject *list, int64 limit);
-static PyObject *PLy_spi_execute_fetch_result(SPITupleTable *tuptable, int64 rows, int status);
+static PyObject *PLy_spi_execute_query(char *query, long limit);
+static PyObject *PLy_spi_execute_fetch_result(SPITupleTable *tuptable,
+											  uint64 rows, int status);
 static void PLy_spi_exception_set(PyObject *excclass, ErrorData *edata);
 
 
@@ -45,19 +47,20 @@ PLy_spi_prepare(PyObject *self, PyObject *args)
 	PyObject   *list = NULL;
 	PyObject   *volatile optr = NULL;
 	char	   *query;
+	PLyExecutionContext *exec_ctx = PLy_current_execution_context();
 	volatile MemoryContext oldcontext;
 	volatile ResourceOwner oldowner;
 	volatile int nargs;
 
 	PLy_enter_python_intepreter = false;
 
-	if (!PyArg_ParseTuple(args, "s|O", &query, &list))
+	if (!PyArg_ParseTuple(args, "s|O:prepare", &query, &list))
 		return NULL;
 
 	if (list && (!PySequence_Check(list)))
 	{
 		PLy_exception_set(PyExc_TypeError,
-					   "second argument of plpy.prepare must be a sequence");
+						  "second argument of plpy.prepare must be a sequence");
 		PLy_enter_python_intepreter = true;
 		return NULL;
 	}
@@ -68,12 +71,19 @@ PLy_spi_prepare(PyObject *self, PyObject *args)
 		return NULL;
 	}
 
+	plan->mcxt = AllocSetContextCreate(TopMemoryContext,
+									   "PL/Python plan context",
+									   ALLOCSET_DEFAULT_SIZES);
+	oldcontext = MemoryContextSwitchTo(plan->mcxt);
+
 	nargs = list ? PySequence_Length(list) : 0;
 
 	plan->nargs = nargs;
-	plan->types = nargs ? PLy_malloc(sizeof(Oid) * nargs) : NULL;
-	plan->values = nargs ? PLy_malloc(sizeof(Datum) * nargs) : NULL;
-	plan->args = nargs ? PLy_malloc(sizeof(PLyTypeInfo) * nargs) : NULL;
+	plan->types = nargs ? palloc0(sizeof(Oid) * nargs) : NULL;
+	plan->values = nargs ? palloc0(sizeof(Datum) * nargs) : NULL;
+	plan->args = nargs ? palloc0(sizeof(PLyObToDatum) * nargs) : NULL;
+
+	MemoryContextSwitchTo(oldcontext);
 
 	oldcontext = CurrentMemoryContext;
 	oldowner = CurrentResourceOwner;
@@ -84,23 +94,11 @@ PLy_spi_prepare(PyObject *self, PyObject *args)
 	{
 		int			i;
 
-		/*
-		 * the other loop might throw an exception, if PLyTypeInfo member
-		 * isn't properly initialized the Py_DECREF(plan) will go boom
-		 */
-		for (i = 0; i < nargs; i++)
-		{
-			PLy_typeinfo_init(&plan->args[i]);
-			plan->values[i] = PointerGetDatum(NULL);
-		}
-
 		for (i = 0; i < nargs; i++)
 		{
 			char	   *sptr;
-			HeapTuple	typeTup;
 			Oid			typeId;
 			int32		typmod;
-			Form_pg_type typeStruct;
 
 			optr = PySequence_GetItem(list, i);
 			if (PyString_Check(optr))
@@ -122,11 +120,6 @@ PLy_spi_prepare(PyObject *self, PyObject *args)
 
 			parseTypeString(sptr, &typeId, &typmod, false);
 
-			typeTup = SearchSysCache1(TYPEOID,
-									  ObjectIdGetDatum(typeId));
-			if (!HeapTupleIsValid(typeTup))
-				elog(ERROR, "cache lookup failed for type %u", typeId);
-
 			Py_DECREF(optr);
 
 			/*
@@ -136,14 +129,9 @@ PLy_spi_prepare(PyObject *self, PyObject *args)
 			optr = NULL;
 
 			plan->types[i] = typeId;
-			typeStruct = (Form_pg_type) GETSTRUCT(typeTup);
-			if (typeStruct->typtype != TYPTYPE_COMPOSITE)
-				PLy_output_datum_func(&plan->args[i], typeTup);
-			else
-				ereport(ERROR,
-						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				   errmsg("plpy.prepare does not support composite types")));
-			ReleaseSysCache(typeTup);
+			PLy_output_setup_func(&plan->args[i], plan->mcxt,
+								  typeId, typmod,
+								  exec_ctx->curr_proc);
 		}
 
 		pg_verifymbstr(query, strlen(query), false);
@@ -208,7 +196,7 @@ PLy_spi_execute(PyObject *self, PyObject *args)
 	return NULL;
 }
 
-static PyObject *
+PyObject *
 PLy_spi_execute_plan(PyObject *ob, PyObject *list, int64 limit)
 {
 	volatile int nargs;
@@ -242,8 +230,8 @@ PLy_spi_execute_plan(PyObject *ob, PyObject *list, int64 limit)
 			PLy_elog(ERROR, "could not execute plan");
 		sv = PyString_AsString(so);
 		PLy_exception_set_plural(PyExc_TypeError,
-							  "Expected sequence of %d argument, got %d: %s",
-							 "Expected sequence of %d arguments, got %d: %s",
+								 "Expected sequence of %d argument, got %d: %s",
+								 "Expected sequence of %d arguments, got %d: %s",
 								 plan->nargs,
 								 plan->nargs, nargs, sv);
 		Py_DECREF(so);
@@ -269,39 +257,24 @@ PLy_spi_execute_plan(PyObject *ob, PyObject *list, int64 limit)
 
 		for (j = 0; j < nargs; j++)
 		{
+			PLyObToDatum *arg = &plan->args[j];
 			PyObject   *elem;
 
 			elem = PySequence_GetItem(list, j);
-			if (elem != Py_None)
+			PG_TRY();
 			{
-				PG_TRY();
-				{
-					plan->values[j] =
-						plan->args[j].out.d.func(&(plan->args[j].out.d),
-												 -1,
-												 elem,
-												 false);
-				}
-				PG_CATCH();
-				{
-					Py_DECREF(elem);
-					PG_RE_THROW();
-				}
-				PG_END_TRY();
+				bool		isnull;
 
-				Py_DECREF(elem);
-				nulls[j] = ' ';
+				plan->values[j] = PLy_output_convert(arg, elem, &isnull);
+				nulls[j] = isnull ? 'n' : ' ';
 			}
-			else
+			PG_CATCH();
 			{
 				Py_DECREF(elem);
-				plan->values[j] =
-					InputFunctionCall(&(plan->args[j].out.d.typfunc),
-									  NULL,
-									  plan->args[j].out.d.typioparam,
-									  -1);
-				nulls[j] = 'n';
+				PG_RE_THROW();
 			}
+			PG_END_TRY();
+			Py_DECREF(elem);
 		}
 
 		rv = SPI_execute_plan(plan->plan, plan->values, nulls,
@@ -322,7 +295,7 @@ PLy_spi_execute_plan(PyObject *ob, PyObject *list, int64 limit)
 		 */
 		for (k = 0; k < nargs; k++)
 		{
-			if (!plan->args[k].out.d.typbyval &&
+			if (!plan->args[k].typbyval &&
 				(plan->values[k] != PointerGetDatum(NULL)))
 			{
 				pfree(DatumGetPointer(plan->values[k]));
@@ -337,7 +310,7 @@ PLy_spi_execute_plan(PyObject *ob, PyObject *list, int64 limit)
 
 	for (i = 0; i < nargs; i++)
 	{
-		if (!plan->args[i].out.d.typbyval &&
+		if (!plan->args[i].typbyval &&
 			(plan->values[i] != PointerGetDatum(NULL)))
 		{
 			pfree(DatumGetPointer(plan->values[i]));
@@ -399,16 +372,17 @@ PLy_spi_execute_query(char *query, int64 limit)
 }
 
 static PyObject *
-PLy_spi_execute_fetch_result(SPITupleTable *tuptable, int64 rows, int status)
+PLy_spi_execute_fetch_result(SPITupleTable *tuptable, uint64 rows, int status)
 {
 	PLyResultObject *result;
+	PLyExecutionContext *exec_ctx = PLy_current_execution_context();
 	volatile MemoryContext oldcontext;
 
 
 #ifdef FAULT_INJECTOR
 	if (rows >= 10000 && rows <= 1000000)
 	{
-		if (FaultInjector_InjectFaultIfSet(ExecutorRunHighProcessed,
+		if (FaultInjector_InjectFaultIfSet("executor_run_high_processed",
 											DDLNotSpecified,
 											"" /* databaseName */,
 											"" /* tableName */) == FaultInjectorTypeSkip)
@@ -423,23 +397,34 @@ PLy_spi_execute_fetch_result(SPITupleTable *tuptable, int64 rows, int status)
 #endif /* FAULT_INJECTOR */
 
 	result = (PLyResultObject *) PLy_result_new();
+	if (!result)
+	{
+		SPI_freetuptable(tuptable);
+		return NULL;
+	}
 	Py_DECREF(result->status);
 	result->status = PyInt_FromLong(status);
 
 	if (status > 0 && tuptable == NULL)
 	{
 		Py_DECREF(result->nrows);
-		/* rows is 64 bit, Python Integer holds sys.maxint = 2^63 - 1 */
-		result->nrows = PyInt_FromLong((long) rows);
+		result->nrows = PyLong_FromUnsignedLongLong(rows);
 	}
 	else if (status > 0 && tuptable != NULL)
 	{
-		PLyTypeInfo args;
-		int64			i;
+		PLyDatumToOb ininfo;
+		MemoryContext cxt;
 
 		Py_DECREF(result->nrows);
-		result->nrows = PyInt_FromLong((long) rows);
-		PLy_typeinfo_init(&args);
+		result->nrows = PyLong_FromUnsignedLongLong(rows);
+
+		cxt = AllocSetContextCreate(CurrentMemoryContext,
+									"PL/Python temp context",
+									ALLOCSET_DEFAULT_SIZES);
+
+		/* Initialize for converting result tuples to Python */
+		PLy_input_setup_func(&ininfo, cxt, RECORDOID, -1,
+							 exec_ctx->curr_proc);
 
 		oldcontext = CurrentMemoryContext;
 		PG_TRY();
@@ -448,17 +433,34 @@ PLy_spi_execute_fetch_result(SPITupleTable *tuptable, int64 rows, int status)
 
 			if (rows)
 			{
+				uint64		i;
+
+				/*
+				 * PyList_New() and PyList_SetItem() use Py_ssize_t for list
+				 * size and list indices; so we cannot support a result larger
+				 * than PY_SSIZE_T_MAX.
+				 */
+				if (rows > (uint64) PY_SSIZE_T_MAX)
+					ereport(ERROR,
+							(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+							 errmsg("query result has too many rows to fit in a Python list")));
+
 				Py_DECREF(result->rows);
-				result->rows = PyList_New((Py_ssize_t)rows);
-
-				PLy_input_tuple_funcs(&args, tuptable->tupdesc);
-				for (i = 0; i < rows; i++)
+				result->rows = PyList_New(rows);
+				if (result->rows)
 				{
-					PyObject   *row = PLyDict_FromTuple(&args,
-														tuptable->vals[i],
-														tuptable->tupdesc);
+					PLy_input_setup_tuple(&ininfo, tuptable->tupdesc,
+										  exec_ctx->curr_proc);
 
-					PyList_SetItem(result->rows, (Py_ssize_t)i, row);
+					for (i = 0; i < rows; i++)
+					{
+						PyObject   *row = PLy_input_from_tuple(&ininfo,
+															   tuptable->vals[i],
+															   tuptable->tupdesc,
+															   true);
+
+						PyList_SetItem(result->rows, i, row);
+					}
 				}
 			}
 
@@ -477,14 +479,21 @@ PLy_spi_execute_fetch_result(SPITupleTable *tuptable, int64 rows, int status)
 		PG_CATCH();
 		{
 			MemoryContextSwitchTo(oldcontext);
-			PLy_typeinfo_dealloc(&args);
+			MemoryContextDelete(cxt);
 			Py_DECREF(result);
 			PG_RE_THROW();
 		}
 		PG_END_TRY();
 
-		PLy_typeinfo_dealloc(&args);
+		MemoryContextDelete(cxt);
 		SPI_freetuptable(tuptable);
+
+		/* in case PyList_New() failed above */
+		if (!result->rows)
+		{
+			Py_DECREF(result);
+			result = NULL;
+		}
 	}
 
 	return (PyObject *) result;
@@ -530,12 +539,6 @@ PLy_spi_subtransaction_commit(MemoryContext oldcontext, ResourceOwner oldowner)
 	ReleaseCurrentSubTransaction();
 	MemoryContextSwitchTo(oldcontext);
 	CurrentResourceOwner = oldowner;
-
-	/*
-	 * AtEOSubXact_SPI() should not have popped any SPI context, but just in
-	 * case it did, make sure we remain connected.
-	 */
-	SPI_restore_connection();
 }
 
 void
@@ -555,18 +558,14 @@ PLy_spi_subtransaction_abort(MemoryContext oldcontext, ResourceOwner oldowner)
 	MemoryContextSwitchTo(oldcontext);
 	CurrentResourceOwner = oldowner;
 
-	/*
-	 * If AtEOSubXact_SPI() popped any SPI context of the subxact, it will
-	 * have left us in a disconnected state.  We need this hack to return to
-	 * connected state.
-	 */
-	SPI_restore_connection();
-
 	/* Look up the correct exception */
 	entry = hash_search(PLy_spi_exceptions, &(edata->sqlerrcode),
 						HASH_FIND, NULL);
-	/* We really should find it, but just in case have a fallback */
-	Assert(entry != NULL);
+
+	/*
+	 * This could be a custom error code, if that's the case fallback to
+	 * SPIError
+	 */
 	exc = entry ? entry->exc : PLy_exc_spi_error;
 	/* Make Python raise the exception */
 	PLy_spi_exception_set(exc, edata);
@@ -593,8 +592,10 @@ PLy_spi_exception_set(PyObject *excclass, ErrorData *edata)
 	if (!spierror)
 		goto failure;
 
-	spidata = Py_BuildValue("(izzzi)", edata->sqlerrcode, edata->detail, edata->hint,
-							edata->internalquery, edata->internalpos);
+	spidata = Py_BuildValue("(izzzizzzzz)", edata->sqlerrcode, edata->detail, edata->hint,
+							edata->internalquery, edata->internalpos,
+							edata->schema_name, edata->table_name, edata->column_name,
+							edata->datatype_name, edata->constraint_name);
 	if (!spidata)
 		goto failure;
 

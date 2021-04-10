@@ -1,16 +1,15 @@
-#!/bin/env python
+#!/usr/bin/env python3
 # Copyright Pivotal 2014
 
 
 import glob
 import os
 import re
-import string
 import shutil
 import stat
 import sys
 from optparse import OptionParser
-from subprocess import Popen, PIPE
+from subprocess import Popen, PIPE, STDOUT
 
 
 def _getPlatformInfo():
@@ -18,7 +17,8 @@ def _getPlatformInfo():
         for file in glob.glob('/etc/*release'):
             shutil.copy(file, '.')
     else:
-        Popen('/usr/bin/lsb_release -a > ./lsb_release.out', shell=True)
+        Popen('/usr/bin/lsb_release -a > ./lsb_release.out',
+              shell=True, stderr=PIPE)
 
     if os.path.exists('/etc/gpdb-appliance-version'):
         shutil.copy('/etc/gpdb-appliance-version', '.')
@@ -27,8 +27,18 @@ def _getPlatformInfo():
 
 
 def _getFileInfo(coreFile):
-    cmd = Popen('/usr/bin/file ' + coreFile, shell=True, stdout=PIPE)
-    return cmd.communicate()[0]
+    cmd = Popen(['/usr/bin/file', '--version'], stdout=PIPE, stderr=STDOUT)
+    fileVersion = cmd.communicate()[0].split()[0].strip().decode()
+    # file allow setting parameters from command line from version 5.21, refer:
+    # https://github.com/file/file/commit/6ce24f35cd4a43c4bdd249e8e0c4952c1f8eac67
+    # Set ELF program sections processed for core files to suppres "too many
+    # program headers" output
+    opts = ['/usr/bin/file']
+    if fileVersion >= 'file-5.21':
+        opts += ['-P', 'elf_phnum=2048']
+    opts += [coreFile]
+    cmd = Popen(opts, stdout=PIPE)
+    return cmd.communicate()[0].decode()
 
 
 def _isCore(fileCmdOutput):
@@ -38,23 +48,62 @@ def _isCore(fileCmdOutput):
 
 
 def _findBinary(fileCmdOutput):
-    start = string.find(fileCmdOutput, "'") + 1
-    end = string.find(fileCmdOutput, "'", start)
-    cmd = fileCmdOutput[start:end].split()[0].translate(None, string.punctuation)
+    # execfn: '/path/to/postgres'
+    field = str.find(fileCmdOutput, 'execfn')
+    # if 'execfn' field is not found, search for 'from' field instead
+    if field < 0:
+        # from: /path/to/postgres
+        # from: postgres: 5432, ...
+        field = str.find(fileCmdOutput, 'from')
+    # if 'from' field is still missing, search for any single-quoted string
+    if field < 0:
+        field = 0
+    start = str.find(fileCmdOutput, "'", field) + 1
+    end = str.find(fileCmdOutput, "'", start)
+    if start <= 0 or end < 0:
+        return None
+    cmd = fileCmdOutput[start:end]
+    # special characters can be correctly handled in abs format, no need to
+    # remove them
     if os.path.isabs(cmd):
         return cmd
+    # otherwise try to search with the process name, punctuations like ':'
+    # should be removed
+    cmd = cmd.split()[0].translate(None, str.punctuation)
     return which(cmd)
 
 
 def _getLibraryListWithLDD(binary):
     # We manually seed this with a few libraries that are missed
-    # This may not be needed for all proces, but will round out the
+    # This may not be needed for all processes, but will round out the
     # postgres binary debugging
-    # TODO: Look a ways to distinguise a 32 vs. 64 bit executable
-    libraries = ['/lib64/libgcc_s.so.1', '/lib64/libnss_files.so.2', '/lib/libgcc_s.so.1', '/lib/libnss_files.so.2']
-    ldd_output = Popen('ldd `which postgres`', shell=True, stdout=PIPE)
+    # TODO: Look at ways to distinguish a 32 vs. 64 bit executable
+    libraries = [
+        # on centos
+        '/lib64/libgcc_s.so.1',
+        '/lib64/libnss_files.so.2',
+        '/lib/libgcc_s.so.1',
+        '/lib/libnss_files.so.2',
+
+        # on ubuntu
+        '/lib/x86_64-linux-gnu/libgcc_s.so.1',
+        '/lib/x86_64-linux-gnu/libnss_files.so.2',
+        '/usr/lib32/libgcc_s.so.1',
+        '/lib32/libnss_files.so.2',
+        '/usr/libx32/libgcc_s.so.1',
+        '/libx32/libnss_files.so.2',
+    ]
+
+    ldd = which('ldd')
+    if ldd:
+        args = [ldd]
+    else:
+        # simulate ldd with ld-linux.so
+        args = ['/lib64/ld-linux-x86-64.so.2', '--list']
+
+    ldd_output = Popen(args + [binary], stdout=PIPE)
     for line in ldd_output.stdout:
-        match = re.search(r'(\S+) \(0x', line)
+        match = re.search(r'(\S+) \(0x', line.decode())
         if match and match.group(1):
             libraries.append(match.group(1).strip())
     return libraries
@@ -71,13 +120,37 @@ def _getLibraryListWithGDB(coreFile, binary):
     for key in ('PYTHONHOME', 'PYTHONPATH', 'LD_LIBRARY_PATH'):
         if key in environ:
             del environ[key]
-    cmd = Popen(gdb + ' --eval-command="quit" ' + binary + ' -c ' + coreFile, shell=True, stdout=PIPE, stderr=PIPE)
-    result = cmd.communicate()[0]
 
+    cmd = Popen([gdb,
+                 '--batch',     # exit after processing options
+                 '--nx',        # do not read any .gdbinit files
+                 '--eval-command=info sharedlibrary',
+                                # list shared libraries explicitly
+                 '-c', coreFile,
+                 binary],
+                stdout=PIPE, stderr=PIPE)
+    result = cmd.communicate()[0].decode()
+
+    # gdb output looks like below:
+    #
+    #     ...
+    #     (gdb) info sharedlibrary
+    #     From        To          Syms Read  Shared Object Library
+    #     0x00001000  0x00001234  Yes (*)    /path/to/liba.so.1.0
+    #     0x00002000  0x00002234  Yes (*)    /path/to/libb.so.1.0
+    #     0x00003000  0x00003234  Yes        /path/to/libc.so.1.0
+    #     (*): Shared library is missing debugging information.
+    #
+    # to get the list we first search for the header line, then collect all the
+    # path strings in following lines.
+    header = False
     for line in result.splitlines():
-        if line.find('Reading symbols') is 0:
-            end = line.find('...')
-            libraries.append(line[21:end])
+        if header:
+            begin = line.find(os.path.sep)
+            if begin >= 0:
+                libraries.append(line[begin:])
+        elif 'Shared Object Library' in line:
+            header = True
 
     return libraries
 
@@ -94,12 +167,18 @@ def _copyFilePath(src, dst):
 
 def _generateGDBScript(b, c):
     with open('runGDB.sh', 'w') as f1:
-        print >>f1, '#!/bin/bash'
-        print >>f1, 'unset PYTHONHOME'
-        print >>f1, 'unset PYTHONPATH'
-        print >>f1, 'curDIR=`pwd`'
-        print >>f1, '/usr/bin/gdb --eval-command="set sysroot $curDIR" --eval-command="core %s" %s' % (c, b)
-    os.chmod('runGDB.sh', 0755)
+        print('''\
+#!/bin/bash
+unset PYTHONHOME
+unset PYTHONPATH
+curDIR=`pwd`
+/usr/bin/gdb \\
+    --eval-command="set sysroot $curDIR" \\
+    --eval-command="core {core}" \\
+    {binary} \\
+    "$@"
+'''.format(core=c, binary=b), file=f1)
+    os.chmod('runGDB.sh', 0o0755)
 
 
 # This is taken from Python 3.3:
@@ -168,9 +247,10 @@ def which(cmd, mode=os.F_OK | os.X_OK, path=None):
 
 def packCoreFile(coreFile, binary):
     packDir = './packcore-' + os.path.basename(coreFile)
+    packTarball = packDir + '.tgz'
     oldDir = os.getcwd()
+    os.mkdir(packDir)
     try:
-        os.mkdir(packDir)
         os.chdir(packDir)
         shutil.copy(coreFile, '.')
         _getPlatformInfo()
@@ -189,20 +269,23 @@ def packCoreFile(coreFile, binary):
 
         _generateGDBScript(os.path.basename(binary), os.path.basename(coreFile))
         os.chdir(oldDir)
-        cmd = Popen('tar zcf packcore-' + os.path.basename(coreFile) + '.tgz ' + packDir, shell=True)
+        cmd = Popen(['tar', 'zcf', packTarball, packDir])
         cmd.wait()
+    except Exception as e:
+        Popen(['rm', '-rf', packTarball])
+        raise e
     finally:
         os.chdir(oldDir)
-        Popen('rm -rf ' + packDir, shell=True)
+        Popen(['rm', '-rf', packDir])
 
 
 def parseArgs():
     u = '''%prog [options] core_file
 This will create an archive with the core file and all required
 libraries for analysis.  The preference is to use GDB so that we can
-resolve dependancies for extensions.'''
+resolve dependencies for extensions.'''
 
-    parser = OptionParser(version='%prog: 0.4beta', usage=u)
+    parser = OptionParser(version='%prog: $Revision: #1 $', usage=u)
     parser.add_option('-b', '--binary', action='store', type='string', dest='binary', metavar='PROGRAMME', help='The full path to the binary that created the core file.  Used when packcore cannot determine the source binary')
     (option, args) = parser.parse_args()
     if len(args) != 1:

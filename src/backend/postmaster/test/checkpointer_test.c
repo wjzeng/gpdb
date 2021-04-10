@@ -9,7 +9,7 @@
 
 #define MAX_BGW_REQUESTS 5
 
-void
+static void
 init_request_queue(void)
 {
 	size_t size = sizeof(CheckpointerShmemStruct) + sizeof(CheckpointerRequest)*MAX_BGW_REQUESTS;
@@ -26,38 +26,39 @@ init_request_queue(void)
  * Basic enqueue tests, including compaction upon enqueuing into a
  * full queue.
  */
-void
-test__ForwardFsyncRequest_enqueue(void **state)
+static void
+test__ForwardSyncRequest_enqueue(void **state)
 {
 	bool ret;
 	int i;
-	RelFileNode dummy = {1,1,1};
+	FileTag dummy_tag = {1, MAIN_FORKNUM, {1, 1, 1}, 1};
 	init_request_queue();
 	ProcGlobal->checkpointerLatch = NULL;
-	expect_value(LWLockAcquire, l, CheckpointerCommLock);
+	expect_value(LWLockAcquire, lock, CheckpointerCommLock);
 	expect_value(LWLockAcquire, mode, LW_EXCLUSIVE);
 	will_return(LWLockAcquire, true);
-	expect_value(LWLockRelease, l, CheckpointerCommLock);
+	expect_value(LWLockRelease, lock, CheckpointerCommLock);
 	will_be_called(LWLockRelease);
 	/* basic enqueue */
-	ret = ForwardFsyncRequest(dummy, MAIN_FORKNUM, 1);
+	ret = ForwardSyncRequest(&dummy_tag, SYNC_REQUEST);
 	assert_true(ret);
 	assert_true(CheckpointerShmem->num_requests == 1);
 	/* fill up the queue */
 	for (i=2; i<=MAX_BGW_REQUESTS; i++)
 	{
-		expect_value(LWLockAcquire, l, CheckpointerCommLock);
+		expect_value(LWLockAcquire, lock, CheckpointerCommLock);
 		expect_value(LWLockAcquire, mode, LW_EXCLUSIVE);
 		will_return(LWLockAcquire, true);
-		expect_value(LWLockRelease, l, CheckpointerCommLock);
+		expect_value(LWLockRelease, lock, CheckpointerCommLock);
 		will_be_called(LWLockRelease);
-		ret = ForwardFsyncRequest(dummy, MAIN_FORKNUM, i);
+		dummy_tag.segno = i;
+		ret = ForwardSyncRequest(&dummy_tag, SYNC_REQUEST);
 		assert_true(ret);
 	}
-	expect_value(LWLockAcquire, l, CheckpointerCommLock);
+	expect_value(LWLockAcquire, lock, CheckpointerCommLock);
 	expect_value(LWLockAcquire, mode, LW_EXCLUSIVE);
 	will_return(LWLockAcquire, true);
-	expect_value(LWLockRelease, l, CheckpointerCommLock);
+	expect_value(LWLockRelease, lock, CheckpointerCommLock);
 	will_be_called(LWLockRelease);
 #ifdef USE_ASSERT_CHECKING
 	expect_value(LWLockHeldByMe, l, CheckpointerCommLock);
@@ -68,7 +69,7 @@ test__ForwardFsyncRequest_enqueue(void **state)
 	 * duplicates are in the queue.  So the queue should remain
 	 * full.
 	 */
-	ret = ForwardFsyncRequest(dummy, MAIN_FORKNUM, 0);
+	ret = ForwardSyncRequest(&dummy_tag, SYNC_REQUEST);
 	assert_false(ret);
 	assert_true(CheckpointerShmem->num_requests == CheckpointerShmem->max_requests);
 	free(CheckpointerShmem);
@@ -79,7 +80,7 @@ main(int argc, char* argv[]) {
 	cmockery_parse_arguments(argc, argv);
 	MemoryContextInit();
 	const UnitTest tests[] = {
-		unit_test(test__ForwardFsyncRequest_enqueue)
+		unit_test(test__ForwardSyncRequest_enqueue)
 	};
 	return run_tests(tests);
 }

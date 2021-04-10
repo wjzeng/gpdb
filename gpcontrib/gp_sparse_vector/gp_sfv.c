@@ -1,3 +1,17 @@
+/*-------------------------------------------------------------------------
+ *
+ * gp_sfv.c
+ *
+ * Copyright (c) 2010, Greenplum Software
+ * Portions Copyright (c) 2013-Present VMware, Inc. or its affiliates.
+ *
+ *
+ * IDENTIFICATION
+ *	    gpcontrib/gp_sparse_vector/gp_sfv.c
+ *
+ *-------------------------------------------------------------------------
+ */
+
 #include <stdio.h>
 #include <string.h>
 #include <search.h>
@@ -14,19 +28,15 @@
 #include "sparse_vector.h"
 
 static char **get_text_array_contents(ArrayType *array, int *numitems);
-int gp_isnew_query(void);
+static int gp_isnew_query(void);
+static SvecType *classify_document(char **features, int num_features, char **document, int num_words, int allocate);
 
 #ifdef PG_MODULE_MAGIC
 PG_MODULE_MAGIC;
 #endif
 
-SvecType *classify_document(char **features, int num_features, char **document, int num_words, int allocate);
 
-Datum calc_logidf(PG_FUNCTION_ARGS);
 Datum gp_extract_feature_histogram(PG_FUNCTION_ARGS);
-
-void gp_extract_feature_histogram_usage(char *msg);
-void gp_extract_feature_histogram_errout(char *msg);
 
 /*
  * 	gp_extract_feature_histogram
@@ -66,9 +76,6 @@ void gp_extract_feature_histogram_errout(char *msg);
  * 		  We would like to store the SFV in a terse representation that fits in a small amount of memory.
  * 		  We also want to be able to compare the number of instances where the SFV of one document intersects
  * 		  another.  This routine uses the Sparse Vector datatype to store the SFV.
- *
- * 	License: Use of this code is restricted to those with explicit authorization from Greenplum.
- * 		 All rights to this code are asserted.
  *
  * Function Signature is:
  *
@@ -133,7 +140,10 @@ gp_extract_feature_histogram(PG_FUNCTION_ARGS)
          * trying to call this in some sort of crazy way. 
          */
         if (PG_NARGS() != 2) 
-		gp_extract_feature_histogram_usage("gp_extract_feature_histogram called with wrong number of arguments");
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("gp_extract_feature_histogram called with wrong number of arguments"),
+					 errhint("Required argument is a base 10 encoded IPv4 address. Example: 10.4.128.1 would be entered here as the number 10004128001.")));
 
 	/* Retrieve the C text array equivalents from the PG text[][] inputs */
 	features = get_text_array_contents(PG_GETARG_ARRAYTYPE_P(0),&num_features);
@@ -142,8 +152,8 @@ gp_extract_feature_histogram(PG_FUNCTION_ARGS)
 /* End of UDF wrapper =================================================== */
 
 #ifdef VERBOSE
-	elog(NOTICE,"Number of text items in the feature array is: %d\n",num_features);
-	elog(NOTICE,"Number of text items in the document array is: %d\n",num_words);
+	elog(NOTICE,"Number of text items in the feature array is: %d",num_features);
+	elog(NOTICE,"Number of text items in the document array is: %d",num_words);
 #endif
        	returnval = classify_document(features,num_features,document,num_words,gp_isnew_query());
 
@@ -153,25 +163,21 @@ gp_extract_feature_histogram(PG_FUNCTION_ARGS)
 	PG_RETURN_POINTER(returnval);
 }
 
-void
-gp_extract_feature_histogram_usage(char *msg) {
-	ereport(ERROR,(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				errmsg(
-		"%s\ngp_extract_feature_histogram requires args: IP_Address INT8\nWhere IP_Address is a 10s encoded IPV4 address.  For example: 10.4.128.1 would be entered here as the number 10004128001.",msg)));
-}
-
-void
-gp_extract_feature_histogram_errout(char *msg) {
-	ereport(ERROR,(errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
-				errmsg(
-		"%s\ngp_extract_feature_histogram internal error.",msg)));
-}
-
-SvecType *classify_document(char **features, int num_features, char **document, int num_words, int allocate) {
-	static float8 *histogram=NULL;
+static SvecType *
+classify_document(char **features, int num_features, char **document, int num_words, int allocate)
+{
+	float8 *histogram = NULL;
         ENTRY item, *found_item;
 	int i;
 	SvecType *output_sfv; //Output SFV in a sparse vector datatype
+
+	/*
+	 * We need to palloc the histogram array first, since the error cleanup
+	 * process on memory pressure allocation failure won't be able to handle
+	 * the malloc'ed ordinals array below. Should ordinals fail to allocate
+	 * however, then the invoked ereport() will clean up histogram.
+	 */
+	histogram = (float8 *) palloc0(sizeof(float8) * num_features);
 
 	/*
 	 * On saving the state between calls:
@@ -192,11 +198,23 @@ SvecType *classify_document(char **features, int num_features, char **document, 
 	if (allocate) {
 		int *ordinals;
 #ifdef VERBOSE
-		elog(NOTICE,"Classify_document allocating..., Number of features = %d\n",num_features);
+		elog(NOTICE,"Classify_document allocating..., Number of features = %d",num_features);
 #endif
-		(void) hdestroy();
-		ordinals    = (int *)malloc(sizeof(int)*num_features); //Need to use malloc so that hdestroy() can be called.
-		histogram = (float8 *)malloc(sizeof(float8)*num_features); //Use malloc because pallocs are cleaned up between queries
+		/*
+		 * Calling hdestroy() isn't guaranteed to free any memory allocated
+		 * for the items, the details are implementation specific. Best case
+		 * is that the item keys are free'd, while the item data pointers are
+		 * never freed. The proper solution here is to move this to using a
+		 * dynahash and properly manage the memory, but that remains a TODO
+		 * for a rainy day still.
+		 */
+		hdestroy();
+		/* Need to use malloc so that hdestroy() can be called */
+		ordinals = (int *) malloc(sizeof(int) * num_features);
+		if (!ordinals)
+			ereport(ERROR,
+					(errcode(ERRCODE_OUT_OF_MEMORY),
+					 errmsg("out of memory")));
 
 		for (i=0; i<num_features; i++) {
 			ordinals[i] = i;
@@ -206,18 +224,40 @@ SvecType *classify_document(char **features, int num_features, char **document, 
 		for (i=0; i<num_features; i++) {
 			if (features[i] != NULL) {
 		  		item.key = strdup(features[i]);
-		  		item.data = (void *)(&(ordinals[i]));
-		  		(void) hsearch(item,ENTER);
+				if (!item.key)
+				{
+					hdestroy();
+					free(ordinals);
+					ereport(ERROR,
+							(errcode(ERRCODE_OUT_OF_MEMORY),
+							 errmsg("out of memory")));
+				}
+
+				/* If the hash table has the entry already */
+				if (hsearch(item, FIND) != NULL)
+					free(item.key);
+				else
+				{
+					item.data = (void *)(&(ordinals[i]));
+
+					/*
+					 * If the ENTER action returns NULL it means that we are
+					 * out of memory and need to error out of this, cleaning
+					 * up as best as we can.
+					 */
+					if (hsearch(item,ENTER) == NULL)
+					{
+						hdestroy();
+						free(item.key);
+						free(ordinals);
+						ereport(ERROR,
+								(errcode(ERRCODE_OUT_OF_MEMORY),
+								 errmsg("out of memory")));
+					}
+				}
 			}
 		}
 	}
-
-	/*
-	 * For all items in the document, probe hash table to find matches.  When we 
-	 * find one, increment the counter at the appropriate ordinal.
-	 */
-	for (i=0;i<num_features;i++) //Zero out the found count array for this document
-		histogram[i]=0;
 
 	for (i=0;i<num_words;i++) {
 		if (document[i] != NULL)
@@ -229,7 +269,7 @@ SvecType *classify_document(char **features, int num_features, char **document, 
 			histogram[*((int *)found_item->data)]++; //Increment the count at the appropriate ordinal
 		  } else {
 #ifdef VERBOSE
-			elog(NOTICE,"Item not found in feature list %s\n",(char *)item.key);
+			elog(NOTICE,"Item not found in feature list %s",(char *)item.key);
 #endif
 			  continue;
 		  }
@@ -264,7 +304,7 @@ get_text_array_contents(ArrayType *array, int *numitems)
 
         if (ARR_ELEMTYPE(array) != TEXTOID) {
 		*numitems = 0;
-		elog(WARNING,"attempt to use a non-text[][] variable with a function that uses text[][] argumenst.\n");
+		elog(WARNING,"attempt to use a non-text[][] variable with a function that uses text[][] arguments");
 		return(NULL);
 	}
 
@@ -310,7 +350,9 @@ get_text_array_contents(ArrayType *array, int *numitems)
 extern int gp_command_count;
 extern int gp_session_id;
 
-int gp_isnew_query(void) {
+static int
+gp_isnew_query(void)
+{
 	static int firstcall=1;
 	static int last_cnt,last_sid;
 

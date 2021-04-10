@@ -7,13 +7,25 @@ insert into bm_test select i % 10, (i % 10)::text  from generate_series(1, 100) 
 create index bm_test_idx on bm_test using bitmap (i);
 select count(*) from bm_test where i=1;
 select count(*) from bm_test where i in(1, 3);
+
+ -- this sql should confirm that the tuple with i=1
+ -- and the tuple with i=5 are on different segments
+select count(distinct gp_segment_id) from bm_test where i in (1, 5);
+select count(*) from bm_test where i in(1, 5);
+
 select * from bm_test where i > 10;
 reindex index bm_test_idx;
 select count(*) from bm_test where i in(1, 3);
 drop index bm_test_idx;
-create index bm_test_multi_idx on bm_test using bitmap(i, t);
+create index bm_test_coll_idx on bm_test using bitmap(i, t COLLATE "C");
 select * from bm_test where i=5 and t='5';
 select * from bm_test where i=5 or t='6';
+
+ -- this sql should confirm that the tuple with i=5
+ -- and the tuple with t='1' are on different segments
+ select count(distinct gp_segment_id) from bm_test where i=5 or t='1';
+select * from bm_test where i=5 or t='1';
+
 select * from bm_test where i between 1 and 10 and i::text = t;
 drop table bm_test;
 
@@ -141,6 +153,7 @@ drop table bm_test3;
 
 create table bm_test (i int, j int);
 insert into bm_test values (0, 0), (0, 0), (0, 1), (1,0), (1,0), (1,1);
+analyze bm_test;
 create index bm_test_j on bm_test using bitmap(j);
 delete from bm_test where j =1;
 vacuum bm_test;
@@ -179,7 +192,6 @@ create unique index ijk_ij on ijk(i,j);
 -- should OK.
 create unique index ijk_ijk on ijk(i,j,k);
 
-set gp_enable_mk_sort=on;
 drop table if exists ijk;
 create table ijk(i int, j int, k int) distributed by (i);
 insert into ijk values (1, 1, 3);
@@ -195,7 +207,6 @@ create unique index ijk_ij on ijk(i,j);
 -- should OK.
 create unique index ijk_ijk on ijk(i,j,k);
 
-set gp_enable_mk_sort=off;
 drop table ijk;
 
 --
@@ -236,6 +247,27 @@ drop index oversize_test_idx;
 insert into oversize_test values (array_to_string(array(select generate_series(1, 10000)), '123456789'));
 CREATE INDEX oversize_test_idx ON oversize_test USING BITMAP (c1);
 
+--
+-- Test Index Only Scans.
+--
+-- Bitmap indexes don't really support index only scans at the moment. But the
+-- planner can still choose an Index Only Scan, if the query doesn't need any
+-- of the attributes from the index.
+create table bm_indexonly_test (i int, t text);
+insert into bm_indexonly_test select g, 'foo' || g from generate_series(1, 5) g;
+create index on bm_indexonly_test using bitmap (i, t);
+set enable_seqscan=off;
+set enable_bitmapscan=off;
+set enable_indexscan=on;
+set enable_indexonlyscan=on;
+
+-- if bitmap indexes supported Index Only Scans, properly, this could use one.
+explain (costs off) select i, t from bm_indexonly_test where i = 1;
+select i, t from bm_indexonly_test where i = 1;
+
+-- even without proper support, the planner chooses an Index Only Scan for this.
+explain (costs off) select 'foobar' from bm_indexonly_test;
+select 'foobar' from bm_indexonly_test;
 
 --
 -- Test unlogged table
@@ -254,7 +286,12 @@ drop table unlogged_test;
 --
 -- Test crash recovery
 --
-CREATE EXTENSION IF NOT EXISTS gp_inject_fault;
+
+--
+-- disable fault-tolerance service (FTS) probing to ensure
+-- the mirror does not accidentally get promoted
+--
+SELECT gp_inject_fault_infinite('fts_probe', 'skip', dbid) FROM gp_segment_configuration WHERE role = 'p' and content = -1;
 CREATE TABLE bm_test_insert(a int) DISTRIBUTED BY (a);
 CREATE INDEX bm_a_idx ON bm_test_insert USING bitmap(a);
 CREATE TABLE bm_test_update(a int, b int) DISTRIBUTED BY (a);
@@ -282,3 +319,75 @@ SELECT * FROM bm_test_update WHERE b=1;
 DROP TABLE trigger_recovery_on_primaries;
 DROP TABLE bm_test_insert;
 DROP TABLE bm_test_update;
+
+--
+-- re-enable fault-tolerance service (FTS) probing after recovery completed.
+--
+SELECT gp_inject_fault('fts_probe', 'reset', dbid) FROM gp_segment_configuration WHERE role = 'p' and content = -1;
+
+
+-- If the table is AO table, it need generate some fake tuple pointer,
+-- this pointer is a little different from the heap tables pointer,
+-- If the Offset in pointer is 0(If the row number is 32768, the Offset
+-- should be 0), we set the 16th bit of the Offsert to be 1, so we
+-- do not forget to remove the flag when we use it, otherwise we will
+-- get an wrong value.
+CREATE TABLE bm_test_reindex(c1 int, c2 int) WITH (appendonly=true);
+CREATE INDEX bm_test_reindex_idx ON bm_test_reindex USING bitmap(c2);
+INSERT INTO bm_test_reindex SELECT 1,i FROM generate_series(1, 65537)i;
+REINDEX INDEX bm_test_reindex_idx;
+SET enable_bitmapscan to on;
+SET enable_seqscan to off;
+SELECT * from bm_test_reindex where c2 = 32767;
+SELECT * from bm_test_reindex where c2 = 32768;
+SELECT * from bm_test_reindex where c2 = 32769;
+SELECT * from bm_test_reindex where c2 = 65536;
+
+SET enable_seqscan = ON;
+SET enable_indexscan = ON;
+
+--
+-- correct cost estimate to avoid bm index scan for wrong result
+--
+CREATE TABLE test_bmselec(id int, type int, msg text) distributed by (id);
+INSERT INTO test_bmselec (id, type, msg) SELECT g, g % 10000, md5(g::text) FROM generate_series(1,100000) as g;
+CREATE INDEX ON test_bmselec USING bitmap(type);
+ANALYZE test_bmselec;
+
+-- it used to choose bitmap index over seq scan, which not right.
+explain (analyze, verbose) select * from test_bmselec where type < 500;
+
+SET enable_seqscan = OFF;
+SET enable_bitmapscan = OFF;
+-- we can see the bitmap index scan is much more slower
+explain (analyze, verbose) select * from test_bmselec where type < 500;
+DROP TABLE test_bmselec;
+
+SET enable_seqscan = ON;
+SET enable_bitmapscan = ON;
+
+-- for sparse bitmap index
+create table test_bmsparse(id int, type int, msg text) distributed by (id);
+INSERT INTO test_bmsparse (id, type, msg) SELECT g, g % 10000, md5(g::text) FROM generate_series(1,10000) as g;
+INSERT INTO test_bmsparse (id, type, msg) SELECT g, g % 200, md5(g::text) FROM generate_series(1,80000) as g;
+INSERT INTO test_bmsparse (id, type, msg) SELECT g, g % 10000, md5(g::text) FROM generate_series(1,10000) as g;
+CREATE INDEX ON test_bmsparse USING bitmap(type);
+ANALYZE test_bmsparse;
+
+-- select lots of rows but on small part of distinct values, should use seq scan
+explain (analyze, verbose) select * from test_bmsparse where type < 200;
+
+SET enable_seqscan = OFF;
+SET enable_bitmapscan = OFF;
+explain (analyze, verbose) select * from test_bmsparse where type < 200;
+
+SET enable_seqscan = ON;
+SET enable_bitmapscan = ON;
+-- select small part of table but on lots of distinct values, should use seq scan
+explain (analyze, verbose) select * from test_bmsparse where type > 500;
+
+SET enable_seqscan = OFF;
+SET enable_bitmapscan = OFF;
+explain (analyze, verbose) select * from test_bmsparse where type > 500;
+
+DROP TABLE test_bmsparse;

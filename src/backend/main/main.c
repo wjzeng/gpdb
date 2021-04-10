@@ -9,7 +9,7 @@
  * proper FooMain() routine for the incarnation.
  *
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -22,22 +22,20 @@
 
 #include <unistd.h>
 
-#if defined(__alpha) && defined(__osf__)		/* no __alpha__ ? */
-#include <sys/sysinfo.h>
-#include "machine/hal_sysinfo.h"
-#define ASSEMBLER
-#include <sys/proc.h>
-#undef ASSEMBLER
-#endif
-
 #if defined(__NetBSD__)
 #include <sys/param.h>
 #endif
 
+#if defined(_M_AMD64) && _MSC_VER == 1800
+#include <math.h>
+#include <versionhelpers.h>
+#endif
+
 #include "bootstrap/bootstrap.h"
 #include "common/username.h"
+#include "port/atomics.h"
 #include "postmaster/postmaster.h"
-#include "storage/barrier.h"
+#include "storage/s_lock.h"
 #include "storage/spin.h"
 #include "tcop/tcopprot.h"
 #include "utils/help_config.h"
@@ -51,6 +49,7 @@ const char *progname;
 
 
 static void startup_hacks(const char *progname);
+static void init_locale(const char *categoryname, int category, const char *locale);
 static void help(const char *progname);
 static void check_root(const char *progname);
 
@@ -62,6 +61,14 @@ int
 main(int argc, char *argv[])
 {
 	bool		do_check_root = true;
+
+	/*
+	 * If supported on the current platform, set up a handler to be called if
+	 * the backend/postmaster crashes with a fatal signal or exception.
+	 */
+#if defined(WIN32) && defined(HAVE_MINIDUMP_TYPE)
+	pgwin32_install_crashdump_handler();
+#endif
 
 	progname = get_progname(argv[0]);
 
@@ -82,14 +89,6 @@ main(int argc, char *argv[])
 	 * result pointer.
 	 */
 	argv = save_ps_display_args(argc, argv);
-
-	/*
-	 * If supported on the current platform, set up a handler to be called if
-	 * the backend/postmaster crashes with a fatal signal or exception.
-	 */
-#if defined(WIN32) && defined(HAVE_MINIDUMP_TYPE)
-	pgwin32_install_crashdump_handler();
-#endif
 
 	/*
 	 * Fire up essential subsystems: error and memory management
@@ -123,31 +122,31 @@ main(int argc, char *argv[])
 		char	   *env_locale;
 
 		if ((env_locale = getenv("LC_COLLATE")) != NULL)
-			pg_perm_setlocale(LC_COLLATE, env_locale);
+			init_locale("LC_COLLATE", LC_COLLATE, env_locale);
 		else
-			pg_perm_setlocale(LC_COLLATE, "");
+			init_locale("LC_COLLATE", LC_COLLATE, "");
 
 		if ((env_locale = getenv("LC_CTYPE")) != NULL)
-			pg_perm_setlocale(LC_CTYPE, env_locale);
+			init_locale("LC_CTYPE", LC_CTYPE, env_locale);
 		else
-			pg_perm_setlocale(LC_CTYPE, "");
+			init_locale("LC_CTYPE", LC_CTYPE, "");
 	}
 #else
-	pg_perm_setlocale(LC_COLLATE, "");
-	pg_perm_setlocale(LC_CTYPE, "");
+	init_locale("LC_COLLATE", LC_COLLATE, "");
+	init_locale("LC_CTYPE", LC_CTYPE, "");
 #endif
 
 #ifdef LC_MESSAGES
-	pg_perm_setlocale(LC_MESSAGES, "");
+	init_locale("LC_MESSAGES", LC_MESSAGES, "");
 #endif
 
 	/*
 	 * We keep these set to "C" always, except transiently in pg_locale.c; see
 	 * that file for explanations.
 	 */
-	pg_perm_setlocale(LC_MONETARY, "C");
-	pg_perm_setlocale(LC_NUMERIC, "C");
-	pg_perm_setlocale(LC_TIME, "C");
+	init_locale("LC_MONETARY", LC_MONETARY, "C");
+	init_locale("LC_NUMERIC", LC_NUMERIC, "C");
+	init_locale("LC_TIME", LC_TIME, "C");
 
 	/*
 	 * Now that we have absorbed as much as we wish to from the locale
@@ -155,6 +154,8 @@ main(int argc, char *argv[])
 	 * variables installed by pg_perm_setlocale have force.
 	 */
 	unsetenv("LC_ALL");
+
+	check_strxfrm_bug();
 
 	/*
 	 * Catch standard options before doing much else, in particular before we
@@ -169,12 +170,12 @@ main(int argc, char *argv[])
 		}
 		if (strcmp(argv[1], "--version") == 0 || strcmp(argv[1], "-V") == 0)
 		{
-			puts("postgres (Greenplum Database) " PG_VERSION);
+			fputs(PG_BACKEND_VERSIONSTR, stdout);
 			exit(0);
 		}
 		if (strcmp(argv[1], "--gp-version") == 0)
 		{
-			puts("postgres (Greenplum Database) " GP_VERSION);
+			fputs("postgres (Greenplum Database) " GP_VERSION "\n", stdout);
 			exit(0);
 		}
 		if (strcmp(argv[1], "--catalog-version") == 0 )
@@ -190,7 +191,7 @@ main(int argc, char *argv[])
 		 * read-only activities.  The -C case is important because pg_ctl may
 		 * try to invoke it while still holding administrator privileges on
 		 * Windows.  Note that while -C can normally be in any argv position,
-		 * if you wanna bypass the root check you gotta put it first.  This
+		 * if you want to bypass the root check you must put it first.  This
 		 * reduces the risk that we might misinterpret some other mode's -C
 		 * switch as being the postmaster/postgres one.
 		 */
@@ -228,7 +229,7 @@ main(int argc, char *argv[])
 #endif
 
 	if (argc > 1 && strcmp(argv[1], "--boot") == 0)
-		AuxiliaryProcessMain(argc, argv);		/* does not return */
+		AuxiliaryProcessMain(argc, argv);	/* does not return */
 	else if (argc > 1 && strcmp(argv[1], "--describe-config") == 0)
 		GucInfoMain();			/* does not return */
 	else if (argc > 1 && strcmp(argv[1], "--single") == 0)
@@ -236,7 +237,7 @@ main(int argc, char *argv[])
 					 NULL,		/* no dbname */
 					 strdup(get_user_name_or_exit(progname)));	/* does not return */
 	else
-		PostmasterMain(argc, argv);		/* does not return */
+		PostmasterMain(argc, argv); /* does not return */
 	abort();					/* should not get here */
 }
 
@@ -256,27 +257,6 @@ main(int argc, char *argv[])
 static void
 startup_hacks(const char *progname)
 {
-	/*
-	 * On some platforms, unaligned memory accesses result in a kernel trap;
-	 * the default kernel behavior is to emulate the memory access, but this
-	 * results in a significant performance penalty.  We want PG never to make
-	 * such unaligned memory accesses, so this code disables the kernel
-	 * emulation: unaligned accesses will result in SIGBUS instead.
-	 */
-#ifdef NOFIXADE
-
-#if defined(__alpha)			/* no __alpha__ ? */
-	{
-		int			buffer[] = {SSIN_UACPROC, UAC_SIGBUS | UAC_NOPRINT};
-
-		if (setsysinfo(SSI_NVPAIRS, buffer, 1, (caddr_t) NULL,
-					   (unsigned long) NULL) < 0)
-			write_stderr("%s: setsysinfo failed: %s\n",
-						 progname, strerror(errno));
-	}
-#endif   /* __alpha */
-#endif   /* NOFIXADE */
-
 	/*
 	 * Windows-specific execution environment hacking.
 	 */
@@ -300,8 +280,25 @@ startup_hacks(const char *progname)
 
 		/* In case of general protection fault, don't show GUI popup box */
 		SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
+
+#if defined(_M_AMD64) && _MSC_VER == 1800
+
+		/*----------
+		 * Avoid crashing in certain floating-point operations if we were
+		 * compiled for x64 with MS Visual Studio 2013 and are running on
+		 * Windows prior to 7/2008R2 SP1 on an AVX2-capable CPU.
+		 *
+		 * Ref: https://connect.microsoft.com/VisualStudio/feedback/details/811093/visual-studio-2013-rtm-c-x64-code-generation-bug-for-avx2-instructions
+		 *----------
+		 */
+		if (!IsWindows7SP1OrGreater())
+		{
+			_set_FMA3_enable(0);
+		}
+#endif							/* defined(_M_AMD64) && _MSC_VER == 1800 */
+
 	}
-#endif   /* WIN32 */
+#endif							/* WIN32 */
 
 	/*
 	 * Initialize dummy_spinlock, in case we are on a platform where we have
@@ -309,6 +306,24 @@ startup_hacks(const char *progname)
 	 */
 	SpinLockInit(&dummy_spinlock);
 }
+
+
+/*
+ * Make the initial permanent setting for a locale category.  If that fails,
+ * perhaps due to LC_foo=invalid in the environment, use locale C.  If even
+ * that fails, perhaps due to out-of-memory, the entire startup fails with it.
+ * When this returns, we are guaranteed to have a setting for the given
+ * category's environment variable.
+ */
+static void
+init_locale(const char *categoryname, int category, const char *locale)
+{
+	if (pg_perm_setlocale(category, locale) == NULL &&
+		pg_perm_setlocale(category, "C") == NULL)
+		elog(FATAL, "could not adopt \"%s\" locale nor C locale for %s",
+			 locale, categoryname);
+}
+
 
 
 /*
@@ -325,9 +340,6 @@ help(const char *progname)
 	printf(_("%s is the PostgreSQL server.\n\n"), progname);
 	printf(_("Usage:\n  %s [OPTION]...\n\n"), progname);
 	printf(_("Options:\n"));
-#ifdef USE_ASSERT_CHECKING
-	printf(_("  -A 1|0             enable/disable run-time assert checking\n"));
-#endif
 	printf(_("  -B NBUFFERS        number of shared buffers\n"));
 	printf(_("  -c NAME=VALUE      set run-time parameter\n"));
 	printf(_("  -C NAME            print value of run-time parameter, then exit\n"));
@@ -383,7 +395,7 @@ help(const char *progname)
 	printf(_("  -x NUM             internal use\n"));
 
 	printf(_("\nPlease read the documentation for the complete list of run-time\n"
-	 "configuration settings and how to set them on the command line or in\n"
+			 "configuration settings and how to set them on the command line or in\n"
 			 "the configuration file.\n\n"
 			 "Report bugs to <bugs@greenplum.org>.\n"));
 }
@@ -398,8 +410,8 @@ check_root(const char *progname)
 	{
 		write_stderr("\"root\" execution of the PostgreSQL server is not permitted.\n"
 					 "The server must be started under an unprivileged user ID to prevent\n"
-		  "possible system security compromise.  See the documentation for\n"
-				  "more information on how to properly start the server.\n");
+					 "possible system security compromise.  See the documentation for\n"
+					 "more information on how to properly start the server.\n");
 		exit(1);
 	}
 
@@ -424,10 +436,10 @@ check_root(const char *progname)
 		write_stderr("Execution of PostgreSQL by a user with administrative permissions is not\n"
 					 "permitted.\n"
 					 "The server must be started under an unprivileged user ID to prevent\n"
-		 "possible system security compromises.  See the documentation for\n"
-				  "more information on how to properly start the server.\n");
+					 "possible system security compromises.  See the documentation for\n"
+					 "more information on how to properly start the server.\n");
 		exit(1);
 	}
 #endif
-#endif   /* WIN32 */
+#endif							/* WIN32 */
 }

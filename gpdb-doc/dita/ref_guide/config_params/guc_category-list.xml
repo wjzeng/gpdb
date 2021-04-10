@@ -23,9 +23,6 @@
       <li id="kh158533">
         <xref href="#topic29" type="topic" format="dita"/>
       </li>
-      <li id="kh171207">
-        <xref href="#topic33" type="topic" format="dita"/>
-      </li>
       <li id="kh158545">
         <xref href="#topic37" type="topic" format="dita"/>
       </li>
@@ -113,7 +110,7 @@
               </p>
               <p>
                 <xref href="guc-list.xml#unix_socket_directory" type="section"
-                  >unix_socket_directory</xref>
+                  >unix_socket_directories</xref>
               </p>
               <p>
                 <xref href="guc-list.xml#unix_socket_group" type="section">unix_socket_group</xref>
@@ -150,15 +147,8 @@
             </stentry>
             <stentry>
               <p>
-                <xref href="guc-list.xml#krb_srvname" type="section">krb_srvname</xref>
-              </p>
-              <p>
                 <xref href="guc-list.xml#password_encryption" type="section"
                   >password_encryption</xref>
-              </p>
-              <p>
-                <xref href="guc-list.xml#password_hash_algorithm" type="section"
-                  >password_hash_algorithm</xref>
               </p>
               <p>
                 <xref href="guc-list.xml#ssl" type="section">ssl</xref>
@@ -323,22 +313,36 @@
             <p>
               <xref href="guc-list.xml#optimizer_array_expansion_threshold" type="section"
                 >optimizer_array_expansion_threshold</xref></p>
+            <p><xref href="guc-list.xml#optimizer_control" type="section">optimizer_control</xref>
+            </p>
+            <p><xref href="guc-list.xml#optimizer_cost_model" type="section"
+                >optimizer_cost_model</xref>
+            </p>
             <p><xref href="guc-list.xml#optimizer_cte_inlining_bound" type="section"
                 >optimizer_cte_inlining_bound</xref>
             </p>
-            <p><xref href="guc-list.xml#optimizer_control" type="section">optimizer_control</xref>
+            <p><xref href="guc-list.xml#optimizer_dpe_stats" type="section"
+                >optimizer_dpe_stats</xref>
             </p>
             <p><xref href="guc-list.xml#optimizer_enable_associativity" type="section"
                 >optimizer_enable_associativity</xref></p>
+            <p><xref href="guc-list.xml#optimizer_enable_dml" type="section"
+                >optimizer_enable_dml</xref>
+            </p>
+            <p><xref href="guc-list.xml#optimizer_enable_indexonlyscan" type="section"
+                >optimizer_enable_indexonlyscan</xref>
+            </p>
             <p><xref href="guc-list.xml#optimizer_enable_master_only_queries" type="section"
                 >optimizer_enable_master_only_queries</xref></p>
+            <p><xref href="guc-list.xml#optimizer_force_agg_skew_avoidance" type="section"
+                >optimizer_force_agg_skew_avoidance</xref></p>
             <p><xref href="guc-list.xml#optimizer_force_multistage_agg" type="section"
                 >optimizer_force_multistage_agg</xref>
             </p>
-            <p><xref href="guc-list.xml#optimizer_force_three_stage_scalar_dqa" type="section"
-                >optimizer_force_three_stage_scalar_dqa</xref></p>
           </stentry>
           <stentry>
+            <p><xref href="guc-list.xml#optimizer_force_three_stage_scalar_dqa" type="section"
+                >optimizer_force_three_stage_scalar_dqa</xref></p>
             <p><xref href="guc-list.xml#optimizer_join_arity_for_associativity_commutativity"
                 type="section">optimizer_join_arity_for_associativity_commutativity</xref></p>
             <p><xref href="guc-list.xml#optimizer_join_order" format="dita" type="section"
@@ -353,6 +357,8 @@
             </p>
             <p><xref href="guc-list.xml#optimizer_parallel_union" type="section"
                 >optimizer_parallel_union</xref></p>
+            <p><xref href="guc-list.xml#optimizer_penalize_skew" type="section"
+                >optimizer_penalize_skew</xref></p>
             <p><xref href="guc-list.xml#optimizer_print_missing_stats" type="section"
                 >optimizer_print_missing_stats</xref>
             </p>
@@ -361,6 +367,8 @@
             </p>
             <p><xref href="guc-list.xml#optimizer_sort_factor" format="dita"
                 >optimizer_sort_factor</xref></p>
+            <p><xref href="guc-list.xml#optimizer_use_gpdb_allocators" format="dita"
+                >optimizer_use_gpdb_allocators</xref></p>
           </stentry>
         </strow>
       </simpletable>
@@ -371,12 +379,12 @@
     <abstract>These parameters control aspects of SQL query processing such as query operators and
       operator settings and statistics sampling.</abstract>
     <topic id="topic22" xml:lang="en">
-      <title>Legacy Query Optimizer Operator Control Parameters</title>
+      <title>Postgres Planner Control Parameters</title>
       <body>
-        <p>The following parameters control the types of plan operations the legacy query optimizer
-          can use. Enable or disable plan operations to force the legacy optimizer to choose a
-          different plan. This is useful for testing and comparing query performance using different
-          plan types.</p>
+        <p>The following parameters control the types of plan operations the Postgres Planner can
+          use. Enable or disable plan operations to force the Postgres Planner to choose a different
+          plan. This is useful for testing and comparing query performance using different plan
+          types.</p>
         <simpletable id="kh158625" frame="none">
           <strow>
             <stentry>
@@ -409,10 +417,6 @@
               </p>
               <p>
                 <xref href="guc-list.xml#enable_tidscan" type="section">enable_tidscan</xref>
-              </p>
-              <p>
-                <xref href="guc-list.xml#gp_enable_adaptive_nestloop" type="section"
-                  >gp_enable_adaptive_nestloop</xref>
               </p>
               <p>
                 <xref href="guc-list.xml#gp_enable_agg_distinct" type="section"
@@ -468,7 +472,7 @@
       </body>
     </topic>
     <topic id="topic23" xml:lang="en">
-      <title>Legacy Query Optimizer Costing Parameters</title>
+      <title>Postgres Planner Costing Parameters</title>
       <body>
         <note type="warning">Do not adjust these query costing parameters. They are tuned to reflect
           Greenplum Database hardware configurations and typical workloads. All of these parameters
@@ -530,10 +534,6 @@
                 <xref href="guc-list.xml#default_statistics_target" type="section"
                   >default_statistics_target </xref>
               </p>
-              <p>
-                <xref href="guc-list.xml#gp_analyze_relative_error" type="section"
-                  >gp_analyze_relative_error</xref>
-              </p>
             </stentry>
           </strow>
         </simpletable>
@@ -591,8 +591,8 @@
                   >gp_enable_groupext_distinct_pruning</xref>
               </p>
               <p>
-                <xref href="guc-list.xml#gp_workfile_compress_algorithm" type="section"
-                  >gp_workfile_compress_algorithm</xref>
+                <xref href="guc-list.xml#gp_workfile_compression" type="section"
+                  >gp_workfile_compression</xref>
               </p>
             </stentry>
           </strow>
@@ -613,19 +613,15 @@
                 <xref href="guc-list.xml#gp_adjust_selectivity_for_outerjoins" type="section"
                   >gp_adjust_selectivity_for_outerjoins</xref>
               </p>
+            </stentry>
+            <stentry>
               <p>
                 <xref href="guc-list.xml#gp_hashjoin_tuples_per_bucket" type="section"
                   >gp_hashjoin_tuples_per_bucket</xref>
               </p>
-            </stentry>
-            <stentry>
               <p>
-                <xref href="guc-list.xml#gp_statistics_use_fkeys" type="section"
-                  >gp_statistics_use_fkeys</xref>
-              </p>
-              <p>
-                <xref href="guc-list.xml#gp_workfile_compress_algorithm" type="section"
-                  >gp_workfile_compress_algorithm</xref>
+                <xref href="guc-list.xml#gp_workfile_compression" type="section"
+                  >gp_workfile_compression</xref>
               </p>
             </stentry>
           </strow>
@@ -633,7 +629,7 @@
       </body>
     </topic>
     <topic id="topic28" xml:lang="en">
-      <title>Other Legacy Query Optimizer Configuration Parameters</title>
+      <title>Other Postgres Planner Configuration Parameters</title>
       <body>
         <simpletable id="d1e746" frame="none">
           <strow>
@@ -653,6 +649,10 @@
                 <xref href="guc-list.xml#gp_statistics_pullup_from_child_partition" type="section"
                   >gp_statistics_pullup_from_child_partition</xref>
               </p>
+              <p>
+                <xref href="guc-list.xml#gp_statistics_use_fkeys" type="section"
+                  >gp_statistics_use_fkeys</xref>
+              </p>
             </stentry>
           </strow>
         </simpletable>
@@ -666,6 +666,7 @@
           <strow>
             <stentry>
               <p><xref href="guc-list.xml#gp_max_slices">gp_max_slices</xref></p>
+              <p><xref href="guc-list.xml#plan_cache_mode">plan_cache_mode</xref></p>
             </stentry>
           </strow>
         </simpletable>
@@ -823,130 +824,37 @@
       </body>
     </topic>
   </topic>
-  <topic id="topic33" xml:lang="en">
-    <title id="kh171299">System Monitoring Parameters</title>
-    <abstract>These configuration parameters control Greenplum Database data collection and
-      notifications related to database monitoring.</abstract>
-    <topic id="topic34" xml:lang="en">
-      <title>SNMP Alerts</title>
-      <body>
-        <p>The following parameters send SNMP notifications when events occur.</p>
-        <simpletable id="kh178188" frame="none">
-          <strow>
-            <stentry>
-              <p>
-                <xref href="guc-list.xml#gp_snmp_community" type="section">gp_snmp_community</xref>
-              </p>
-              <p>
-                <xref href="guc-list.xml#gp_snmp_monitor_address" type="section"
-                  >gp_snmp_monitor_address</xref>
-              </p>
-            </stentry>
-            <stentry>
-              <p>
-                <xref href="guc-list.xml#gp_snmp_use_inform_or_trap" type="section"
-                  >gp_snmp_use_inform_or_trap</xref>
-              </p>
-            </stentry>
-          </strow>
-        </simpletable>
-      </body>
-    </topic>
-    <topic id="topic35" xml:lang="en">
-      <title>Email Alerts</title>
-      <body>
-        <p>The following parameters configure the system to send email alerts for fatal error
-          events, such as a segment going down or a server crash and reset.</p>
-        <simpletable id="kh171646" frame="none">
-          <strow>
-            <stentry>
-              <p>
-                <xref href="guc-list.xml#gp_email_from" type="section">gp_email_from</xref>
-              </p>
-              <p>
-                <xref href="guc-list.xml#gp_email_smtp_password" type="section"
-                  >gp_email_smtp_password</xref>
-              </p>
-              <p>
-                <xref href="guc-list.xml#gp_email_smtp_server" type="section"
-                  >gp_email_smtp_server</xref>
-              </p>
-            </stentry>
-            <stentry>
-              <p>
-                <xref href="guc-list.xml#gp_email_smtp_userid" type="section"
-                  >gp_email_smtp_userid</xref>
-              </p>
-              <p>
-                <xref href="guc-list.xml#gp_email_to" type="section">gp_email_to</xref>
-              </p>
-            </stentry>
-          </strow>
-        </simpletable>
-      </body>
-    </topic>
-    <topic id="topic36" xml:lang="en">
-      <title>Greenplum Performance Database</title>
-      <body>
-        <p>The following parameters configure the data collection agents that populate the
-            <codeph>gpperfmon</codeph> database.</p>
-        <simpletable id="kh171891" frame="none">
-          <strow>
-            <stentry>
-              <p>
-                <xref href="guc-list.xml#gp_enable_gpperfmon" type="section"
-                  >gp_enable_gpperfmon</xref>
-              </p>
-              <p>
-                <xref href="guc-list.xml#gp_gpperfmon_send_interval" type="section"
-                  >gp_gpperfmon_send_interval</xref>
-              </p>
-            </stentry>
-            <stentry>
-              <p>
-                <xref href="guc-list.xml#gpperfmon_log_alert_level" type="section"
-                  >gpperfmon_log_alert_level</xref>
-              </p>
-              <p>
-                <xref href="guc-list.xml#gpperfmon_port" type="section">gpperfmon_port</xref>
-              </p>
-            </stentry>
-          </strow>
-        </simpletable>
-      </body>
-    </topic>
-    <topic id="query-metrics">
-      <title>Query Metrics Collection Parameters</title>
-      <body>
-        <p>These parameters enable and configure query metrics collection. When enabled, Greenplum
-          Database saves metrics to shared memory during query execution. These metrics are used by
-          Pivotal Greenplum Command Center, which is included with Pivotal's commercial version of
-          Greenplum Database.</p>
-        <simpletable id="query-metrics" frame="none">
-          <strow>
-            <stentry>
-              <p>
-                <xref href="guc-list.xml#gp_enable_query_metrics" type="section"
-                  >gp_enable_query_metrics</xref>
-              </p>
-            </stentry>
-            <stentry>
-              <p>
-                <xref href="guc-list.xml#gp_instrument_shmem_size" type="section"
-                  >gp_instrument_shmem_size</xref>
-              </p>
-            </stentry>
-          </strow>
-        </simpletable>
-      </body>
-    </topic>
+  <topic id="query-metrics">
+    <title>Query Metrics Collection Parameters</title>
+    <body>
+      <p>These parameters enable and configure query metrics collection. When enabled, Greenplum
+        Database saves metrics to shared memory during query execution. These metrics are used by
+        Tanzu Greenplum Command Center, which is included with VMware's commercial version of
+        Greenplum Database.</p>
+      <simpletable id="query-metrics" frame="none">
+        <strow>
+          <stentry>
+            <p>
+              <xref href="guc-list.xml#gp_enable_query_metrics" type="section"
+                >gp_enable_query_metrics</xref>
+            </p>
+          </stentry>
+          <stentry>
+            <p>
+              <xref href="guc-list.xml#gp_instrument_shmem_size" type="section"
+                >gp_instrument_shmem_size</xref>
+            </p>
+          </stentry>
+        </strow>
+      </simpletable>
+    </body>
   </topic>
   <topic id="topic37" xml:lang="en">
     <title id="kh171364">Runtime Statistics Collection Parameters</title>
     <body>
       <p>These parameters control the server statistics collection feature. When statistics
-        collection is enabled, you can access the statistics data using the <i>pg_stat</i> and
-          <i>pg_statio</i> family of system catalog views.</p>
+        collection is enabled, you can access the statistics data using the <i>pg_stat</i> family of
+        system catalog views.</p>
       <simpletable id="kh171301" frame="none">
         <strow>
           <stentry>
@@ -1025,26 +933,22 @@
                   >default_tablespace</xref>
               </p>
               <p>
+                <xref href="guc-list.xml#default_transaction_deferrable"/>
+              </p>
+              <p>
                 <xref href="guc-list.xml#default_transaction_isolation" type="section"
                   >default_transaction_isolation</xref>
               </p>
-              <p>
-                <xref href="guc-list.xml#default_transaction_read_only" type="section"
-                  >default_transaction_read_only</xref>
-              </p>
             </stentry>
-            <stentry>
-              <p>
+            <stentry><xref href="guc-list.xml#default_transaction_read_only" type="section"
+                >default_transaction_read_only</xref><p>
                 <xref href="guc-list.xml#search_path" type="section">search_path</xref>
-              </p>
-              <p>
+              </p><p>
                 <xref href="guc-list.xml#statement_timeout" type="section">statement_timeout</xref>
-              </p>
-              <p>
+              </p><p><xref href="guc-list.xml#topic_k52_fqm_f3b"/></p><p>
                 <xref href="guc-list.xml#vacuum_freeze_min_age" type="section"
                   >vacuum_freeze_min_age</xref>
-              </p>
-            </stentry>
+              </p></stentry>
           </strow>
         </simpletable>
       </body>
@@ -1128,9 +1032,16 @@
     <body>
       <simpletable id="d1e1187" frame="none">
         <strow>
+          <stentry><p>
+              <xref href="guc-list.xml#deadlock_timeout" type="section">deadlock_timeout</xref>
+            </p><xref href="guc-list.xml#gp_enable_global_deadlock_detector" type="section"
+              >gp_enable global_deadlock_detector</xref><p>
+              <xref href="guc-list.xml#gp_global_deadlock_detector_period" type="section"
+                >gp_global_deadlock_detector_period</xref>
+            </p></stentry>
           <stentry>
             <p>
-              <xref href="guc-list.xml#deadlock_timeout" type="section">deadlock_timeout</xref>
+              <xref href="guc-list.xml#lock_timeout" type="section">lock_timeout</xref>
             </p>
             <p>
               <xref href="guc-list.xml#max_locks_per_transaction" type="section"
@@ -1235,6 +1146,9 @@
               <xref href="guc-list.xml#gp_resource_group_memory_limit" type="section"
                 >gp_resource_group_memory_limit</xref>
             </p><p>
+              <xref href="guc-list.xml#gp_resource_group_queuing_timeout" type="section"
+                >gp_resource_group_queuing_timeout</xref>
+            </p><p>
               <xref href="guc-list.xml#gp_resource_manager" type="section"
                 >gp_resource_manager</xref>
             </p></stentry>
@@ -1248,7 +1162,17 @@
                 >gp_vmem_protect_segworker_cache_limit</xref>
             </p>
             <p>
+              <xref href="guc-list.xml#max_statement_mem" type="section">max_statement_mem</xref>
+            </p>
+            <p>
               <xref href="guc-list.xml#memory_spill_ratio" type="section">memory_spill_ratio</xref>
+            </p>
+            <p>
+              <xref href="guc-list.xml#runaway_detector_activation_percent" type="section"
+                >runaway_detector_activation_percent</xref>
+            </p>
+            <p>
+              <xref href="guc-list.xml#statement_mem" type="section">statement_mem</xref>
             </p>
             <p><xref href="guc-list.xml#vmem_process_interrupt" type="section"
                 >vmem_process_interrupt</xref></p>
@@ -1286,6 +1210,8 @@
             </p>
           </stentry>
           <stentry>
+            <p><xref href="guc-list.xml#gpfdist_retry_timeout" type="section"
+                >gpfdist_retry_timeout</xref></p>
             <p>
               <xref href="guc-list.xml#readable_external_table_timeout" type="section"
                 >readable_external_table_timeout</xref>
@@ -1320,6 +1246,9 @@
             </p>
             <p><xref href="guc-list.xml#gp_enable_segment_copy_checking"
                 >gp_enable_segment_copy_checking</xref></p>
+            <p>
+              <xref href="guc-list.xml#gp_use_legacy_hashops" type="section"
+                >gp_use_legacy_hashops</xref></p>
           </stentry>
         </strow>
       </simpletable>
@@ -1363,9 +1292,6 @@
           <strow>
             <stentry>
               <p>
-                <xref href="guc-list.xml#add_missing_from" type="section">add_missing_from</xref>
-              </p>
-              <p>
                 <xref href="guc-list.xml#array_nulls" type="section">array_nulls</xref>
               </p>
               <p>
@@ -1377,8 +1303,7 @@
               </p>
             </stentry>
             <stentry>
-              <p>
-                <xref href="guc-list.xml#regex_flavor" type="section">regex_flavor</xref>
+              <p><xref href="guc-list.xml#regex_flavor" type="section">regex_flavor</xref>
               </p>
               <p>
                 <xref href="guc-list.xml#standard_conforming_strings" type="section"
@@ -1425,22 +1350,25 @@
                   >gp_interconnect_fc_method</xref>
               </p>
               <p>
-                <xref href="guc-list.xml#gp_interconnect_hash_multiplier" type="section"
-                  >gp_interconnect_hash_multiplier</xref>
-              </p>
+                <xref href="guc-list.xml#gp_interconnect_proxy_addresses" type="section"
+                  >gp_interconnect_proxy_addresses</xref></p>
               <p>
                 <xref href="guc-list.xml#gp_interconnect_queue_depth" type="section"
                   >gp_interconnect_queue_depth</xref>
               </p>
-            </stentry>
-            <stentry>
               <p>
                 <xref href="guc-list.xml#gp_interconnect_setup_timeout" type="section"
                   >gp_interconnect_setup_timeout</xref>
               </p>
+            </stentry>
+            <stentry>
               <p>
                 <xref href="guc-list.xml#gp_interconnect_snd_queue_depth" type="section"
                   >gp_interconnect_snd_queue_depth</xref>
+              </p>
+              <p>
+                <xref href="guc-list.xml#gp_interconnect_transmit_timeout" type="section"
+                  >gp_interconnect_transmit_timeout</xref>
               </p>
               <p>
                 <xref href="guc-list.xml#gp_interconnect_type" type="section"
@@ -1509,8 +1437,8 @@
                 <xref href="guc-list.xml#gp_fts_probe_timeout" format="dita"/>
               </p>
               <p>
-                <xref href="guc-list.xml#gp_fts_probe_threadcount" type="section"
-                  >gp_fts_probe_threadcount</xref>
+                <xref href="guc-list.xml#gp_fts_replication_attempt_count" type="section"
+                  >gp_fts_replication_attempt_count</xref>
               </p>
               <p>
                 <xref href="guc-list.xml#gp_log_fts" format="dita"/>
@@ -1550,10 +1478,6 @@
               <p>
                 <xref href="guc-list.xml#gp_dbid" type="section">gp_dbid</xref>
               </p>
-              <p>
-                <xref href="guc-list.xml#gp_num_contents_in_cluster" type="section"
-                  >gp_num_contents_in_cluster</xref>
-              </p>
             </stentry>
             <stentry>
               <p>
@@ -1584,15 +1508,17 @@
         <strow>
           <stentry>
             <p>
-              <xref href="guc-list.xml#keep_wal_segments" type="section">keep_wal_segments</xref>
-            </p>
-            <p>
               <xref href="guc-list.xml#repl_catchup_within_range" type="section"
                 >repl_catchup_within_range</xref>
             </p>
             <p>
               <xref href="guc-list.xml#replication_timeout" type="section"
                 >replication_timeout</xref>
+            </p>
+            <p><xref href="guc-list.xml#wait_for_replication_threshold" type="section"
+                >wait_for_replication_threshold</xref>
+            </p>
+            <p><xref href="guc-list.xml#wal_keep_segments" type="section">wal_keep_segments</xref>
             </p>
             <p>
               <xref href="guc-list.xml#wal_receiver_status_interval" type="section"
@@ -1604,9 +1530,10 @@
     </body>
   </topic>
   <topic id="topic56">
-    <title>Greenplum Database Extension Parameters</title>
+    <title>Greenplum PL/Java Parameters</title>
     <body>
-      <p>The parameters in this topic control the configuration of Greenplum Database extensions. </p>
+      <p>The parameters in this topic control the configuration of the Greenplum Database PL/Java
+        language. </p>
       <simpletable frame="none" id="simpletable_n1h_tzl_zp">
         <strow>
           <stentry>
@@ -1627,22 +1554,24 @@
         </strow>
       </simpletable>
     </body>
-    <topic id="topic_t3n_qml_rz">
-      <title>XML Data Parameters</title>
-      <body>
-        <simpletable frame="none" id="simpletable_yyd_tml_rz">
-          <strow>
-            <stentry>
-              <p>
-                <xref href="guc-list.xml#xmlbinary">xmlbinary</xref>
-              </p>
-              <p>
-                <xref href="guc-list.xml#xmloption">xmloption</xref>
-              </p>
-            </stentry>
-          </strow>
-        </simpletable>
-      </body>
-    </topic>
+  </topic>
+  <topic id="topic_t3n_qml_rz">
+    <title>XML Data Parameters</title>
+    <body>
+      <p>The parameters in this topic control the configuration of the Greenplum Database XML data
+        type. </p>
+      <simpletable frame="none" id="simpletable_yyd_tml_rz">
+        <strow>
+          <stentry>
+            <p>
+              <xref href="guc-list.xml#xmlbinary">xmlbinary</xref>
+            </p>
+            <p>
+              <xref href="guc-list.xml#xmloption">xmloption</xref>
+            </p>
+          </stentry>
+        </strow>
+      </simpletable>
+    </body>
   </topic>
 </topic>

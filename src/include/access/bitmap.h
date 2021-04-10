@@ -14,14 +14,8 @@
 #ifndef BITMAP_H
 #define BITMAP_H
 
-#include "access/htup.h"
-#include "access/itup.h"
-#include "access/relscan.h"
-#include "access/sdir.h"
-#include "access/xlog.h"
-#include "access/xlogutils.h"
-#include "storage/lock.h"
-#include "miscadmin.h"
+#include "storage/bufmgr.h"
+#include "storage/bufpage.h"
 
 #define BM_READ		BUFFER_LOCK_SHARE
 #define BM_WRITE	BUFFER_LOCK_EXCLUSIVE
@@ -264,29 +258,6 @@ typedef struct BMBitmapData
 } BMBitmapData;
 typedef BMBitmapData *BMBitmap;
 
-/*
- * Data structure for used to buffer index creation during bmbuild().
- * Buffering provides three benefits: firstly, it makes for many fewer
- * calls to the lower-level bitmap insert functions; secondly, it means that
- * we reduce the amount of unnecessary compression and decompression we do;
- * thirdly, in some cases pages for a given bitmap vector will be contiguous
- * on disk.
- *
- * byte_size counts how many bytes we've consumed in the buffer.
- * max_lov_block is a hint as to whether we'll find a LOV block in lov_blocks
- * or not (we take advantage of the fact that LOV block numbers will be
- * increasing).
- * lov_blocks is a list of LOV block buffers. The structures put in
- * this list are defined in bitmapinsert.c.
- */
-
-typedef struct BMTidBuildBuf
-{
-	uint32 byte_size; /* The size in bytes of the buffer's data */
-	BlockNumber max_lov_block; /* highest lov block we're seen */
-	List *lov_blocks;	/* list of lov blocks we're buffering */
-} BMTidBuildBuf;
-
 
 /*
  * The number of tid locations to be found at once during query processing.
@@ -321,19 +292,6 @@ typedef struct BMTidBuildBuf
 #define WORDNO_GET_HEADER_BIT(cw_no) \
 	((BM_HRL_WORD)1 << (BM_HRL_WORD_SIZE - 1 - ((cw_no) % BM_HRL_WORD_SIZE)))
 
-/*
- * To see if the content word at n is a compressed word or not we must look
- * look in the header words h_words. Each bit in the header words corresponds
- * to a word amongst the content words. If the bit is 1, the word is compressed
- * (i.e., it is a fill word) otherwise it is uncompressed.
- *
- * See src/backend/access/bitmap/README for more details
- */
-
-#define IS_FILL_WORD(h, n) \
-	(bool) ((((h)[(n)/BM_HRL_WORD_SIZE]) & (WORDNO_GET_HEADER_BIT(n))) > 0 ? \
-			true : false)
-
 /* A simplified interface to IS_FILL_WORD */
 
 #define CUR_WORD_IS_FILL(b) \
@@ -360,495 +318,42 @@ typedef struct BMTidBuildBuf
 #define BM_INT_GET_OFFSET(i) \
 	(((i - 1) % BM_MAX_TUPLES_PER_PAGE) + 1)
 
+/*
+ * To see if the content word at wordno is a compressed word or not we must look
+ * in the header words. Each bit in the header words corresponds to a word
+ * amongst the content words. If the bit is 1, the word is compressed (i.e., it
+ * is a fill word) otherwise it is uncompressed.
+ *
+ * See src/backend/access/bitmap/README for more details
+ */
+static inline bool
+IS_FILL_WORD(const BM_HRL_WORD *words, int16 wordno)
+{
+	return (words[wordno / BM_HRL_WORD_SIZE] & WORDNO_GET_HEADER_BIT(wordno)) > 0;
+}
 
 /*
- * BMTIDBuffer represents TIDs we've buffered for a given bitmap vector --
- * i.e., TIDs for a distinct value in the underlying table. We take advantage
- * of the fact that since we are reading the table from beginning to end
- * TIDs will be ordered.
- */
-
-typedef struct BMTIDBuffer
-{
-	/* The last two bitmap words */
-	BM_HRL_WORD last_compword;
-	BM_HRL_WORD last_word;
-	bool		is_last_compword_fill;
-
-	uint64          start_tid;  /* starting TID for this buffer */
-	uint64			last_tid;	/* most recent tid added */
-	int16			curword; /* index into content */
-	int16			num_cwords;	/* number of allocated words in content */
-
-	/* the starting array index that contains useful content words */
-	int16           start_wordno;
-
-	/* the last tids, one for each actual data words */
-	uint64         *last_tids;
-
-	/* the header and content words */
-	BM_HRL_WORD 	hwords[BM_NUM_OF_HEADER_WORDS];
-	BM_HRL_WORD    *cwords;
-} BMTIDBuffer;
-
-typedef struct BMBuildLovData
-{
-	BlockNumber 	lov_block;
-	OffsetNumber	lov_off;
-} BMBuildLovData;
-
-
-/*
- * the state for index build 
- */
-typedef struct BMBuildState
-{
-	TupleDesc		bm_tupDesc;
-	Relation		bm_lov_heap;
-	Relation		bm_lov_index;
-	/*
-	 * We use this hash to cache lookups of lov blocks for different keys
-	 * When one of attribute types can not be hashed, we set this hash
-	 * to NULL.
-	 */
-	HTAB		   *lovitem_hash;
-
-	/**
-	 * when lovitem_hash is non-NULL then this will correspond to the
-	 *   size of the keys in the hash
-	 */
-	int lovitem_hashKeySize;
-
-	/*
-	 * When the attributes to be indexed can not be hashed, we can not use
-	 * the hash for the lov blocks. We have to search through the
-	 * btree.
-	 */
-	ScanKey			bm_lov_scanKeys;
-	IndexScanDesc	bm_lov_scanDesc;
-
-	/*
-	 * the buffer to store last several tid locations for each distinct
-	 * value.
-	 */
-	BMTidBuildBuf	*bm_tidLocsBuffer;
-
-	double 			ituples;	/* the number of index tuples */
-	bool			use_wal;	/* whether or not we write WAL records */
-} BMBuildState;
-
-/**
- * The key used inside BMBuildState's lovitem_hash hashtable
- *
- * The caller should assign attributeValueArr and isNullArr to point at the values and isnull array to be hashed
- *
- * When inside the hashtable, attributeValueArr and isNullArr will point to aligned memory within the key block itself
- */
-typedef struct BMBuildHashKey
-{
-    Datum *attributeValueArr;
-    bool *isNullArr;
-} BMBuildHashKey;
-
-/*
- * Define an iteration result while scanning an BMBatchWords.
- *
- * This result includes the last scan position in an BMBatchWords,
- * and all tids that are generated from previous scan.
- */
-typedef struct BMIterateResult
-{
-	uint64	nextTid; /* the first tid for the next iteration */
-	uint32	lastScanPos; /* position in the bitmap word we're looking at */
-	uint32	lastScanWordNo;	/* offset in BWBatchWords */
-	uint64	nextTids[BM_BATCH_TIDS]; /* array of matching TIDs */
-	uint32	numOfTids; /* number of TIDs matched */
-	uint32	nextTidLoc; /* the next position in 'nextTids' to be read. */
-} BMIterateResult;
-
-/*
- * Stores a batch of consecutive bitmap words from a bitmap vector.
- *
- * These bitmap words come from a bitmap vector stored in this bitmap
- * index, or a bitmap vector that is generated by ANDing/ORing several
- * bitmap vectors.
- *
- * This struct also contains information to compute the tid locations
- * for the set bits in these bitmap words.
- */
-typedef struct BMBatchWords
-{
-	uint32	maxNumOfWords;		/* maximum number of words in this list */
-
-	/* Number of uncompressed words that have been read already */
-	uint64	nwordsread;			
-	uint64	nextread;			/* next word to read */
-	uint64	firstTid;			/* the TID we're up to */
-	uint32	startNo;			/* position we're at in cwords */
-	uint32	nwords;				/* the number of bitmap words */
-	BM_HRL_WORD *hwords; 		/* the header words */
-	BM_HRL_WORD *cwords;		/* the actual bitmap words */	
-} BMBatchWords;
-
-/*
- * Scan opaque data for one bitmap vector.
- *
- * This structure stores a batch of consecutive bitmap words for a
- * bitmap vector that have been read from the disk, and remembers
- * the next reading position for the next batch of consecutive
+ * GET_NUM_BITS() -- return the number of bits included in the given
  * bitmap words.
  */
-typedef struct BMVectorData
+static inline uint64
+GET_NUM_BITS(const BM_HRL_WORD *contentWords,
+			 const BM_HRL_WORD *headerWords,
+			 uint32 nwords)
 {
-	Buffer			bm_lovBuffer;/* the buffer that contains the LOV item. */
-	OffsetNumber	bm_lovOffset;	/* the offset of the LOV item */
-	BlockNumber		bm_nextBlockNo; /* the next bitmap page block */
+	uint64	nbits = 0;
+	uint32	i;
 
-	/* indicate if the last two words in the bitmap has been read. 
-	 * These two words are stored inside a BMLovItem. If this value
-	 * is true, it means this bitmap vector has no more words.
-	 */
-	bool			bm_readLastWords;
-	BMBatchWords   *bm_batchWords; /* actual bitmap words */
+	for (i = 0; i < nwords; i++)
+	{
+		if (IS_FILL_WORD(headerWords, i))
+			nbits += FILL_LENGTH(contentWords[i]) * BM_HRL_WORD_SIZE;
+		else
+			nbits += BM_HRL_WORD_SIZE;
+	}
 
-} BMVectorData;
-typedef BMVectorData *BMVector;
-
-/*
- * Defines the current position of a scan.
- *
- * For each scan, all related bitmap vectors are read from the bitmap
- * index, and ORed together into a final bitmap vector. The words
- * in each bitmap vector are read in batches. This structure stores
- * the following:
- * (1) words for a final bitmap vector after ORing words from
- *     related bitmap vectors. 
- * (2) tid locations that satisfy the query.
- * (3) One BMVectorData for each related bitmap vector.
- */
-typedef struct BMScanPositionData
-{
-	bool			done;	/* indicate if this scan is over */
-	int				nvec;	/* the number of related bitmap vectors */
-	/* the words in the final bitmap vector that satisfies the query. */
-	BMBatchWords   *bm_batchWords;
-
-	/*
-	 * The BMIterateResult instance that contains the final 
-	 * tid locations for tuples that satisfy the query.
-	 */
-	BMIterateResult bm_result;
-	BMVector	posvecs;	/* one or more bitmap vectors */
-} BMScanPositionData;
-
-typedef BMScanPositionData *BMScanPosition;
-
-typedef struct BMScanOpaqueData
-{
-	BMScanPosition		bm_currPos;
-	bool				cur_pos_valid;
-	/* XXX: should we pull out mark pos? */
-	BMScanPosition		bm_markPos;
-	bool				mark_pos_valid;
-} BMScanOpaqueData;
-
-typedef BMScanOpaqueData *BMScanOpaque;
-
-/*
- * XLOG records for bitmap index operations
- *
- * Some information in high 4 bits of log record xl_info field.
- */
-/* 0x10 is unused */
-#define XLOG_BITMAP_INSERT_LOVITEM	0x20 /* add a new entry into a LOV page */
-#define XLOG_BITMAP_INSERT_META		0x30 /* update the metapage */
-#define XLOG_BITMAP_INSERT_BITMAP_LASTWORDS	0x40 /* update the last 2 words
-													in a bitmap */
-/* insert bitmap words into a bitmap page which is not the last one. */
-#define XLOG_BITMAP_INSERT_WORDS		0x50
-/* 0x60 is unused */
-#define XLOG_BITMAP_UPDATEWORD			0x70
-#define XLOG_BITMAP_UPDATEWORDS			0x80
-
-/*
- * The information about writing bitmap words to last bitmap page
- * and lov page.
- */
-typedef struct xl_bm_bitmapwords
-{
-	RelFileNode 	bm_node;
-
-	/* The block number for the bitmap page */
-	BlockNumber		bm_blkno;
-	/* The next block number for this bitmap page */
-	BlockNumber		bm_next_blkno;
-	/* The last tid location for this bitmap page */
-	uint64			bm_last_tid;
-	/*
-	 * The block number and offset for the lov page that is associated
-	 * with this bitmap page.
-	 */
-	BlockNumber		bm_lov_blkno;
-	OffsetNumber	bm_lov_offset;
-
-	/* The information for the lov page */
-	BM_HRL_WORD		bm_last_compword;
-	BM_HRL_WORD		bm_last_word;
-	uint8			lov_words_header;
-	uint64			bm_last_setbit;
-
-	/*
-	 * Indicate if these bitmap words are stored in the last bitmap
-	 * page and the lov buffer.
-	 */
-	bool			bm_is_last;
-
-	/*
-	 * Indicate if this is the first time to insert into a bitmap
-	 * page.
-	 */
-	bool			bm_is_first;
-
-	/*
-	 * The words stored in the following array to be written to this
-	 * bitmap page.
-	 */
-	uint64			bm_start_wordno;
-	uint64			bm_words_written;
-
-	/*
-	 * Total number of new bitmap words. We need to log all new words
-	 * to be able to do recovery.
-	 */
-	uint64			bm_num_cwords;
-
-	/*
-	 * The following are arrays of last tids, content words, and header
-	 * words. They are located one after the other. There are bm_num_cwords
-	 * of last tids and content words, and BM_CALC_H_WORDS(bm_num_cwords)
-	 * header words.
-	 */
-} xl_bm_bitmapwords;
-
-typedef struct xl_bm_updatewords
-{
-	RelFileNode		bm_node;
-
-	BlockNumber		bm_lov_blkno;
-	OffsetNumber	bm_lov_offset;
-
-	BlockNumber		bm_first_blkno;
-	BM_HRL_WORD		bm_first_cwords[BM_NUM_OF_HRL_WORDS_PER_PAGE];
-	BM_HRL_WORD		bm_first_hwords[BM_NUM_OF_HEADER_WORDS];
-	uint64			bm_first_last_tid;
-	uint64			bm_first_num_cwords;
-
-	BlockNumber		bm_second_blkno;
-	BM_HRL_WORD		bm_second_cwords[BM_NUM_OF_HRL_WORDS_PER_PAGE];
-	BM_HRL_WORD		bm_second_hwords[BM_NUM_OF_HEADER_WORDS];
-	uint64			bm_second_last_tid;
-	uint64			bm_second_num_cwords;
-
-	/* Indicate if this update involves two bitmap pages */
-	bool			bm_two_pages;
-
-	/* The previous next page number for the first page. */
-	BlockNumber		bm_next_blkno;
-
-	/* Indicate if the second page is a new last bitmap page */
-	bool			bm_new_lastpage;
-} xl_bm_updatewords;
-
-typedef struct xl_bm_updateword
-{
-	RelFileNode		bm_node;
-
-	BlockNumber		bm_blkno;
-	int				bm_word_no;
-	BM_HRL_WORD		bm_cword;
-	BM_HRL_WORD		bm_hword;
-} xl_bm_updateword;
-
-/* The information about inserting a new lovitem into the LOV list. */
-typedef struct xl_bm_lovitem
-{
-	RelFileNode 	bm_node;
-	ForkNumber		bm_fork;
-
-	BlockNumber		bm_lov_blkno;
-	OffsetNumber	bm_lov_offset;
-	BMLOVItemData	bm_lovItem;
-	bool			bm_is_new_lov_blkno;
-} xl_bm_lovitem;
-
-/* The information about adding a new page */
-typedef struct xl_bm_newpage
-{
-	RelFileNode 	bm_node;
-	BlockNumber		bm_new_blkno;
-} xl_bm_newpage;
-
-/*
- * The information about changes on a bitmap page. 
- * If bm_isOpaque is true, then bm_next_blkno is set.
- */
-typedef struct xl_bm_bitmappage
-{
-	RelFileNode 	bm_node;
-
-	BlockNumber		bm_bitmap_blkno;
-
-	bool			bm_isOpaque;
-	BlockNumber		bm_next_blkno;
-
-	uint32			bm_last_tid_location;
-	uint32			bm_hrl_words_used;
-	uint32			bm_num_words;
-	/* for simplicity, we log the header words each time */
-	BM_HRL_WORD 	hwords[BM_NUM_OF_HEADER_WORDS];
-	/* followed by the "bm_num_words" content words. */
-} xl_bm_bitmappage;
-
-/* The information about changes to the last 2 words in a bitmap vector */
-typedef struct xl_bm_bitmap_lastwords
-{
-	RelFileNode 	bm_node;
-
-	BM_HRL_WORD		bm_last_compword;
-	BM_HRL_WORD		bm_last_word;
-	uint8			lov_words_header;
-	uint64          bm_last_setbit;
-	uint64          bm_last_tid_location;
-
-	BlockNumber		bm_lov_blkno;
-	OffsetNumber	bm_lov_offset;
-} xl_bm_bitmap_lastwords;
-
-/* The information about the changes in the metapage. */
-typedef struct xl_bm_metapage
-{
-	RelFileNode 	bm_node;
-	ForkNumber		bm_fork;
-	Oid				bm_lov_heapId;		/* the relation id for the heap */
-	Oid				bm_lov_indexId;		/* the relation id for the index */
-	/* the block number for the last LOV pages. */
-	BlockNumber		bm_lov_lastpage;
-} xl_bm_metapage;
-
-/* public routines */
-extern Datum bmbuild(PG_FUNCTION_ARGS);
-extern Datum bmbuildempty(PG_FUNCTION_ARGS);
-extern Datum bminsert(PG_FUNCTION_ARGS);
-extern Datum bmbeginscan(PG_FUNCTION_ARGS);
-extern Datum bmgettuple(PG_FUNCTION_ARGS);
-extern Datum bmgetbitmap(PG_FUNCTION_ARGS);
-extern Datum bmrescan(PG_FUNCTION_ARGS);
-extern Datum bmendscan(PG_FUNCTION_ARGS);
-extern Datum bmmarkpos(PG_FUNCTION_ARGS);
-extern Datum bmrestrpos(PG_FUNCTION_ARGS);
-extern Datum bmbulkdelete(PG_FUNCTION_ARGS);
-extern Datum bmvacuumcleanup(PG_FUNCTION_ARGS);
-extern Datum bmoptions(PG_FUNCTION_ARGS);
-
-extern void GetBitmapIndexAuxOids(Relation index, Oid *heapId, Oid *indexId);
-
-/* bitmappages.c */
-extern Buffer _bitmap_getbuf(Relation rel, BlockNumber blkno, int access);
-extern void _bitmap_wrtbuf(Buffer buf);
-extern void _bitmap_relbuf(Buffer buf);
-extern void _bitmap_init_lovpage(Relation rel, Buffer buf);
-extern void _bitmap_init_bitmappage(Relation rel, Buffer buf);
-extern void _bitmap_init_buildstate(Relation index, BMBuildState* bmstate);
-extern void _bitmap_cleanup_buildstate(Relation index, BMBuildState* bmstate);
-extern void _bitmap_init(Relation indexrel, bool use_wal, bool for_empty);
-
-/* bitmapinsert.c */
-extern void _bitmap_buildinsert(Relation rel, ItemPointerData ht_ctid, 
-								Datum *attdata, bool *nulls,
-							 	BMBuildState *state);
-extern void _bitmap_doinsert(Relation rel, ItemPointerData ht_ctid, 
-							 Datum *attdata, bool *nulls);
-extern void _bitmap_write_alltids(Relation rel, BMTidBuildBuf *tids,
-						  		  bool use_wal);
-extern uint64 _bitmap_write_bitmapwords(Buffer bitmapBuffer,
-								BMTIDBuffer* buf);
-extern void _bitmap_write_new_bitmapwords(
-	Relation rel,
-	Buffer lovBuffer, OffsetNumber lovOffset,
-	BMTIDBuffer* buf, bool use_wal);
-extern uint16 _bitmap_free_tidbuf(BMTIDBuffer* buf);
-
-/* bitmaputil.c */
-extern BMLOVItem _bitmap_formitem(uint64 currTidNumber);
-extern BMMetaPage _bitmap_get_metapage_data(Relation rel, Buffer metabuf);
-extern void _bitmap_init_batchwords(BMBatchWords* words,
-									uint32	maxNumOfWords,
-									MemoryContext mcxt);
-extern void _bitmap_copy_batchwords(BMBatchWords *words, BMBatchWords *copyWords);
-extern void _bitmap_reset_batchwords(BMBatchWords* words);
-extern void _bitmap_cleanup_batchwords(BMBatchWords* words);
-extern void _bitmap_cleanup_scanpos(BMVector bmScanPos,
-									uint32 numBitmapVectors);
-extern uint64 _bitmap_findnexttid(BMBatchWords *words,
-								  BMIterateResult *result);
-extern void _bitmap_findnexttids(BMBatchWords *words,
-								 BMIterateResult *result, uint32 maxTids);
-#ifdef NOT_USED /* we might use this later */
-extern void _bitmap_intersect(BMBatchWords **batches, uint32 numBatches,
-						   BMBatchWords *result);
-#endif
-extern void _bitmap_union(BMBatchWords **batches, uint32 numBatches,
-					   BMBatchWords *result);
-extern void _bitmap_begin_iterate(BMBatchWords *words, BMIterateResult *result);
-extern void _bitmap_log_metapage(Relation rel, ForkNumber fork, Page page);
-extern void _bitmap_log_bitmap_lastwords(Relation rel, Buffer lovBuffer,
-									 OffsetNumber lovOffset, BMLOVItem lovItem);
-extern void _bitmap_log_lovitem	(Relation rel, ForkNumber fork, Buffer lovBuffer,
-								 OffsetNumber offset, BMLOVItem lovItem,
-								 Buffer metabuf,  bool is_new_lov_blkno);
-extern void _bitmap_log_bitmapwords(Relation rel, Buffer bitmapBuffer, Buffer lovBuffer,
-						OffsetNumber lovOffset, BMTIDBuffer* buf,
-						uint64 words_written, uint64 tidnum, BlockNumber nextBlkno,
-						bool isLast, bool isFirst);
-extern void _bitmap_log_updatewords(Relation rel,
-						Buffer lovBuffer, OffsetNumber lovOffset,
-						Buffer firstBuffer, Buffer secondBuffer,
-						bool new_lastpage);
-extern void _bitmap_log_updateword(Relation rel, Buffer bitmapBuffer, int word_no);
-
-/* bitmapsearch.c */
-extern bool _bitmap_first(IndexScanDesc scan, ScanDirection dir);
-extern bool _bitmap_next(IndexScanDesc scan, ScanDirection dir);
-extern bool _bitmap_firstbatchwords(IndexScanDesc scan, ScanDirection dir);
-extern bool _bitmap_nextbatchwords(IndexScanDesc scan, ScanDirection dir);
-extern void _bitmap_findbitmaps(IndexScanDesc scan, ScanDirection dir);
-
-
-
-/* bitmapattutil.c */
-extern void _bitmap_create_lov_heapandindex(Relation rel,
-											Oid *lovHeapOid,
-											Oid *lovIndexOid);
-extern void _bitmap_open_lov_heapandindex(Relation rel, BMMetaPage metapage,
-						 Relation *lovHeapP, Relation *lovIndexP,
-						 LOCKMODE lockMode);
-extern void _bitmap_insert_lov(Relation lovHeap, Relation lovIndex,
-							   Datum *datum, bool *nulls, bool use_wal);
-extern void _bitmap_close_lov_heapandindex(Relation lovHeap, 
-										Relation lovIndex, LOCKMODE lockMode);
-extern bool _bitmap_findvalue(Relation lovHeap, Relation lovIndex,
-							 ScanKey scanKey, IndexScanDesc scanDesc,
-							 BlockNumber *lovBlock, bool *blockNull,
-							 OffsetNumber *lovOffset, bool *offsetNull);
-
-/*
- * prototypes for functions in bitmapxlog.c
- */
-extern void bitmap_redo(XLogRecPtr beginLoc, XLogRecPtr lsn, XLogRecord *record);
-extern void bitmap_desc(StringInfo buf, XLogRecord *record);
-extern void bitmap_xlog_startup(void);
-extern void bitmap_xlog_cleanup(void);
-extern bool bitmap_safe_restartpoint(void);
+	return nbits;
+}
 
 /* reloptions.c */
 #define BITMAP_MIN_FILLFACTOR		10

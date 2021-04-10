@@ -522,7 +522,7 @@ CREATE TABLE shoe_data (
 	shoename   char(10),      -- primary key
 	sh_avail   integer,       -- available # of pairs
 	slcolor    char(10),      -- preferred shoelace color
-	slminlen   float,         -- miminum shoelace length
+	slminlen   float,         -- minimum shoelace length
 	slmaxlen   float,         -- maximum shoelace length
 	slunit     char(8)        -- length unit
 );
@@ -680,6 +680,9 @@ SELECT * FROM shoelace_log ORDER BY sl_name;
 
 insert into shoelace values ('sl9', 0, 'pink', 35.0, 'inch', 0.0);
 insert into shoelace values ('sl10', 1000, 'magenta', 40.0, 'inch', 0.0);
+-- Unsupported (even though a similar updatable view construct is)
+insert into shoelace values ('sl10', 1000, 'magenta', 40.0, 'inch', 0.0)
+  on conflict do nothing;
 
 SELECT * FROM shoelace_obsolete ORDER BY sl_len_cm;
 SELECT * FROM shoelace_candelete;
@@ -697,34 +700,34 @@ SELECT count(*) FROM shoe;
 --
 -- Simple test of qualified ON INSERT ... this did not work in 7.0 ...
 --
-create table foo (f1 int);
-create table foo2 (f1 int);
+create table rules_foo (f1 int);
+create table rules_foo2 (f1 int);
 
-create rule foorule as on insert to foo where f1 < 100
+create rule rules_foorule as on insert to rules_foo where f1 < 100
 do instead nothing;
 
-insert into foo values(1);
-insert into foo values(1001);
-select * from foo;
+insert into rules_foo values(1);
+insert into rules_foo values(1001);
+select * from rules_foo;
 
-drop rule foorule on foo;
+drop rule rules_foorule on rules_foo;
 
 -- this should fail because f1 is not exposed for unqualified reference:
-create rule foorule as on insert to foo where f1 < 100
-do instead insert into foo2 values (f1);
+create rule rules_foorule as on insert to rules_foo where f1 < 100
+do instead insert into rules_foo2 values (f1);
 -- this is the correct way:
-create rule foorule as on insert to foo where f1 < 100
-do instead insert into foo2 values (new.f1);
+create rule rules_foorule as on insert to rules_foo where f1 < 100
+do instead insert into rules_foo2 values (new.f1);
 
-insert into foo values(2);
-insert into foo values(100);
+insert into rules_foo values(2);
+insert into rules_foo values(100);
 
-select * from foo;
-select * from foo2;
+select * from rules_foo;
+select * from rules_foo2;
 
-drop rule foorule on foo;
-drop table foo;
-drop table foo2;
+drop rule rules_foorule on rules_foo;
+drop table rules_foo;
+drop table rules_foo2;
 
 
 --
@@ -772,10 +775,13 @@ drop table cchild;
 -- temporarily disable fancy output, so view changes create less diff noise
 \a\t
 
-SELECT viewname, definition FROM pg_views WHERE schemaname <> 'information_schema' AND viewname <> 'pg_roles' AND viewname <> 'gp_pgdatabase' AND viewname <> 'pg_locks' AND viewname <> 'gp_max_external_files' AND viewname <> 'pg_resqueue_status' AND viewname <> 'pg_stat_resqueues' ORDER BY viewname;
+SELECT viewname, definition FROM pg_views
+WHERE schemaname <> 'information_schema' AND viewname <> 'pg_roles' AND viewname <> 'gp_pgdatabase' AND viewname <> 'pg_locks' AND viewname <> 'gp_max_external_files' AND viewname <> 'pg_resqueue_status' AND viewname <> 'pg_stat_resqueues'
+ORDER BY viewname;
 
 SELECT tablename, rulename, definition FROM pg_rules
-	ORDER BY tablename, rulename;
+WHERE schemaname IN ('pg_catalog', 'public')
+ORDER BY tablename, rulename;
 
 -- restore normal output mode
 \a\t
@@ -844,6 +850,17 @@ insert into rule_and_refint_t3 values (1, 12, 11, 'row3');
 insert into rule_and_refint_t3 values (1, 12, 12, 'row4');
 insert into rule_and_refint_t3 values (1, 11, 13, 'row5');
 insert into rule_and_refint_t3 values (1, 13, 11, 'row6');
+-- Ordinary table
+insert into rule_and_refint_t3 values (1, 13, 11, 'row6')
+  on conflict do nothing;
+-- rule not fired, so fk violation
+insert into rule_and_refint_t3 values (1, 13, 11, 'row6')
+  on conflict (id3a, id3b, id3c) do update
+  set id3b = excluded.id3b;
+-- rule fired, so unsupported
+insert into shoelace values ('sl9', 0, 'pink', 35.0, 'inch', 0.0)
+  on conflict (sl_name) do update
+  set sl_avail = excluded.sl_avail;
 
 create rule rule_and_refint_t3_ins as on insert to rule_and_refint_t3
 	where (exists (select 1 from rule_and_refint_t3
@@ -862,27 +879,37 @@ insert into rule_and_refint_t3 values (1, 13, 11, 'row8');
 -- disallow dropping a view's rule (bug #5072)
 --
 
-create view fooview as select 'foo'::text;
-drop rule "_RETURN" on fooview;
-drop view fooview;
+create view rules_fooview as select 'rules_foo'::text;
+drop rule "_RETURN" on rules_fooview;
+drop view rules_fooview;
 
 --
 -- test conversion of table to view (needed to load some pg_dump files)
 --
 
-create table fooview (x int, y text);
-select xmin, * from fooview;
+create table rules_fooview (x int, y text);
+select xmin, * from rules_fooview;
 
-create rule "_RETURN" as on select to fooview do instead
+create rule "_RETURN" as on select to rules_fooview do instead
   select 1 as x, 'aaa'::text as y;
 
-select * from fooview;
-select xmin, * from fooview;  -- fail, views don't have such a column
+select * from rules_fooview;
+select xmin, * from rules_fooview;  -- fail, views don't have such a column
 
 select reltoastrelid, relkind, relfrozenxid
-  from pg_class where oid = 'fooview'::regclass;
+  from pg_class where oid = 'rules_fooview'::regclass;
 
-drop view fooview;
+drop view rules_fooview;
+
+-- trying to convert a partitioned table to view is not allowed
+create table rules_fooview (x int, y text) partition by list (x);
+create rule "_RETURN" as on select to rules_fooview do instead
+  select 1 as x, 'aaa'::text as y;
+
+-- nor can one convert a partition to view
+create table rules_fooview_part partition of rules_fooview for values in (1);
+create rule "_RETURN" as on select to rules_fooview_part do instead
+  select 1 as x, 'aaa'::text as y;
 
 --
 -- check for planner problems with complex inherited UPDATES
@@ -912,9 +939,7 @@ update id_ordered set name = 'update 4' where id = 4;
 update id_ordered set name = 'update 5' where id = 5;
 select * from id_ordered;
 
-set client_min_messages to warning; -- suppress cascade notices
 drop table id cascade;
-reset client_min_messages;
 
 --
 -- check corner case where an entirely-dummy subplan is created by
@@ -953,6 +978,8 @@ select * from only t1;
 select * from only t1_1;
 select * from only t1_2;
 
+reset constraint_exclusion;
+
 -- test various flavors of pg_get_viewdef()
 
 select pg_get_viewdef('shoe'::regclass) as unpretty;
@@ -978,6 +1005,13 @@ update rules_src set f2 = f2 / 10;
 select * from rules_src;
 select * from rules_log;
 create rule r3 as on delete to rules_src do notify rules_src_deletion;
+\d+ rules_src
+
+--
+-- Ensure an aliased target relation for insert is correctly deparsed.
+--
+create rule r4 as on insert to rules_src do instead insert into rules_log AS trgt SELECT NEW.* RETURNING trgt.f1, trgt.f2;
+create rule r5 as on update to rules_src do instead UPDATE rules_log AS trgt SET tag = 'updated' WHERE trgt.f1 = new.f1;
 \d+ rules_src
 
 --
@@ -1007,3 +1041,197 @@ ALTER RULE "_RETURN" ON rule_v1 RENAME TO abc; -- ON SELECT rule cannot be renam
 
 DROP VIEW rule_v1;
 DROP TABLE rule_t1;
+
+--
+-- check display of VALUES in view definitions
+--
+create view rule_v1 as values(1,2);
+\d+ rule_v1
+drop view rule_v1;
+create view rule_v1(x) as values(1,2);
+\d+ rule_v1
+drop view rule_v1;
+create view rule_v1(x) as select * from (values(1,2)) v;
+\d+ rule_v1
+drop view rule_v1;
+create view rule_v1(x) as select * from (values(1,2)) v(q,w);
+\d+ rule_v1
+drop view rule_v1;
+
+-- test for pg_get_functiondef properly regurgitating SET parameters
+-- Note that the function is kept around to stress pg_dump.
+CREATE FUNCTION func_with_set_params() RETURNS integer
+    AS 'select 1;'
+    LANGUAGE SQL
+    SET extra_float_digits TO 2
+    SET work_mem TO '4MB'
+    SET datestyle to iso, mdy
+    SET search_path TO PG_CATALOG, "Mixed/Case", 'c:/''a"/path', '', '0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789'
+    IMMUTABLE STRICT;
+SELECT pg_get_functiondef('func_with_set_params()'::regprocedure);
+
+--
+-- Check DO INSTEAD rules with ON CONFLICT
+--
+CREATE TABLE hats (
+	hat_name    char(10) primary key,
+	hat_color   char(10)      -- hat color
+);
+
+CREATE TABLE hat_data (
+	hat_name    char(10),
+	hat_color   char(10)      -- hat color
+);
+create unique index hat_data_unique_idx
+  on hat_data (hat_name COLLATE "C" bpchar_pattern_ops);
+
+-- DO NOTHING with ON CONFLICT
+CREATE RULE hat_nosert AS ON INSERT TO hats
+    DO INSTEAD
+    INSERT INTO hat_data VALUES (
+           NEW.hat_name,
+           NEW.hat_color)
+        ON CONFLICT (hat_name COLLATE "C" bpchar_pattern_ops) WHERE hat_color = 'green'
+        DO NOTHING
+        RETURNING *;
+SELECT definition FROM pg_rules WHERE tablename = 'hats' ORDER BY rulename;
+
+-- Works (projects row)
+INSERT INTO hats VALUES ('h7', 'black') RETURNING *;
+-- Works (does nothing)
+INSERT INTO hats VALUES ('h7', 'black') RETURNING *;
+SELECT tablename, rulename, definition FROM pg_rules
+	WHERE tablename = 'hats';
+DROP RULE hat_nosert ON hats;
+
+-- DO NOTHING without ON CONFLICT
+CREATE RULE hat_nosert_all AS ON INSERT TO hats
+    DO INSTEAD
+    INSERT INTO hat_data VALUES (
+           NEW.hat_name,
+           NEW.hat_color)
+        ON CONFLICT
+        DO NOTHING
+        RETURNING *;
+SELECT definition FROM pg_rules WHERE tablename = 'hats' ORDER BY rulename;
+DROP RULE hat_nosert_all ON hats;
+
+-- Works (does nothing)
+INSERT INTO hats VALUES ('h7', 'black') RETURNING *;
+
+-- DO UPDATE with a WHERE clause
+CREATE RULE hat_upsert AS ON INSERT TO hats
+    DO INSTEAD
+    INSERT INTO hat_data VALUES (
+           NEW.hat_name,
+           NEW.hat_color)
+        ON CONFLICT (hat_name)
+        DO UPDATE
+           SET hat_name = hat_data.hat_name, hat_color = excluded.hat_color
+           WHERE excluded.hat_color <>  'forbidden' AND hat_data.* != excluded.*
+        RETURNING *;
+SELECT definition FROM pg_rules WHERE tablename = 'hats' ORDER BY rulename;
+
+-- Works (does upsert)
+INSERT INTO hats VALUES ('h8', 'black') RETURNING *;
+SELECT * FROM hat_data WHERE hat_name = 'h8';
+INSERT INTO hats VALUES ('h8', 'white') RETURNING *;
+SELECT * FROM hat_data WHERE hat_name = 'h8';
+INSERT INTO hats VALUES ('h8', 'forbidden') RETURNING *;
+SELECT * FROM hat_data WHERE hat_name = 'h8';
+SELECT tablename, rulename, definition FROM pg_rules
+	WHERE tablename = 'hats';
+-- ensure explain works for on insert conflict rules
+explain (costs off) INSERT INTO hats VALUES ('h8', 'forbidden') RETURNING *;
+
+-- ensure upserting into a rule, with a CTE (different offsets!) works
+WITH data(hat_name, hat_color) AS MATERIALIZED (
+    VALUES ('h8', 'green'),
+        ('h9', 'blue'),
+        ('h7', 'forbidden')
+)
+INSERT INTO hats
+    SELECT * FROM data
+RETURNING *;
+EXPLAIN (costs off)
+WITH data(hat_name, hat_color) AS MATERIALIZED (
+    VALUES ('h8', 'green'),
+        ('h9', 'blue'),
+        ('h7', 'forbidden')
+)
+INSERT INTO hats
+    SELECT * FROM data
+RETURNING *;
+SELECT * FROM hat_data WHERE hat_name IN ('h8', 'h9', 'h7') ORDER BY hat_name;
+
+DROP RULE hat_upsert ON hats;
+
+drop table hats;
+drop table hat_data;
+
+-- test for pg_get_functiondef properly regurgitating SET parameters
+-- Note that the function is kept around to stress pg_dump.
+CREATE FUNCTION func_with_set_params() RETURNS integer
+    AS 'select 1;'
+    LANGUAGE SQL
+    SET search_path TO PG_CATALOG
+    SET extra_float_digits TO 2
+    SET work_mem TO '4MB'
+    SET datestyle to iso, mdy
+    SET local_preload_libraries TO "Mixed/Case", 'c:/''a"/path', '', '0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789'
+    IMMUTABLE STRICT;
+SELECT pg_get_functiondef('func_with_set_params()'::regprocedure);
+
+-- tests for pg_get_*def with invalid objects
+SELECT pg_get_constraintdef(0);
+SELECT pg_get_functiondef(0);
+SELECT pg_get_indexdef(0);
+SELECT pg_get_ruledef(0);
+SELECT pg_get_statisticsobjdef(0);
+SELECT pg_get_triggerdef(0);
+SELECT pg_get_viewdef(0);
+SELECT pg_get_function_arguments(0);
+SELECT pg_get_function_identity_arguments(0);
+SELECT pg_get_function_result(0);
+SELECT pg_get_function_arg_default(0, 0);
+SELECT pg_get_function_arg_default('pg_class'::regclass, 0);
+SELECT pg_get_partkeydef(0);
+
+-- test rename for a rule defined on a partitioned table
+CREATE TABLE rules_parted_table (a int) PARTITION BY LIST (a);
+CREATE TABLE rules_parted_table_1 PARTITION OF rules_parted_table FOR VALUES IN (1);
+CREATE RULE rules_parted_table_insert AS ON INSERT to rules_parted_table
+    DO INSTEAD INSERT INTO rules_parted_table_1 VALUES (NEW.*);
+ALTER RULE rules_parted_table_insert ON rules_parted_table RENAME TO rules_parted_table_insert_redirect;
+DROP TABLE rules_parted_table;
+
+--
+-- Test enabling/disabling
+--
+CREATE TABLE ruletest1 (a int);
+CREATE TABLE ruletest2 (b int);
+
+CREATE RULE rule1 AS ON INSERT TO ruletest1
+    DO INSTEAD INSERT INTO ruletest2 VALUES (NEW.*);
+
+INSERT INTO ruletest1 VALUES (1);
+ALTER TABLE ruletest1 DISABLE RULE rule1;
+INSERT INTO ruletest1 VALUES (2);
+ALTER TABLE ruletest1 ENABLE RULE rule1;
+SET session_replication_role = replica;
+INSERT INTO ruletest1 VALUES (3);
+ALTER TABLE ruletest1 ENABLE REPLICA RULE rule1;
+INSERT INTO ruletest1 VALUES (4);
+RESET session_replication_role;
+INSERT INTO ruletest1 VALUES (5);
+
+SELECT * FROM ruletest1;
+SELECT * FROM ruletest2;
+
+DROP TABLE ruletest1;
+DROP TABLE ruletest2;
+
+-- test rule for select-for-update
+create table t_test_rules_select_for_update (c int) distributed randomly;
+create rule myrule as on insert to t_test_rules_select_for_update
+do instead select * from t_test_rules_select_for_update for update;

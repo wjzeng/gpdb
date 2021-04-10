@@ -15,7 +15,7 @@ set search_path to qp_gist_indexes3;
 ------------------------------------------------------------------------------
 -- start_ignore
 -- Portions Copyright (c) 2010, Greenplum, Inc.  All rights reserved.
--- Portions Copyright (c) 2012-Present Pivotal Software, Inc.
+-- Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
 -- PURPOSE:
 --     Test VACUUM on GiST indexes.
 --     Also test somewhat larger data sets than most of my other GiST index 
@@ -62,6 +62,7 @@ BEGIN
    s2 = CAST((seed - 1) AS VARCHAR);
    str1 = '((' || ss || ', ' || ss || '), (' || s2 || ', ' || s2 || '))';
    INSERT INTO GistTable3(id, property) VALUES (seed, TO_BOX(CAST(str1 AS TEXT)) );
+   ANALYZE GistTable3;
 END;
 $$
 LANGUAGE PLPGSQL
@@ -211,10 +212,14 @@ CREATE UNIQUE INDEX ShouldNotExist ON gisttable_pktest USING GiST (poli);
 CREATE UNIQUE INDEX ShouldNotExist ON gisttable_pktest USING GiST (bullseye);
 
 
--- Test whether geometric types can be part of a primary key.
+-- Test whether geometric types can be part of a distribution key.
 CREATE TABLE GistTable2 (id INTEGER, property BOX) DISTRIBUTED BY (property);
 CREATE TABLE GistTable2 (id INTEGER, poli POLYGON) DISTRIBUTED BY (poli);
 CREATE TABLE GistTable2 (id INTEGER, bullseye CIRCLE) DISTRIBUTED BY (bullseye);
+
+-- Same with ALTER TABLE.
+CREATE TABLE GistTable2 (id INTEGER, property BOX) DISTRIBUTED RANDOMLY;
+ALTER TABLE GistTable2 SET DISTRIBUTED BY (property);
 
 -- ----------------------------------------------------------------------
 -- Test: test09NegativeTests.sql
@@ -241,7 +246,7 @@ CREATE INDEX ShouldNotExist ON gisttable_pktest USING GiST (id, property);
 ------------------------------------------------------------------------------
 -- PURPOSE:
 --     Test that you get a reasonable error message when you try to create a
---     HASH index (we no longer support those).
+--     HASH index ('box' datatype doesn't have a hash opclass).
 ------------------------------------------------------------------------------
 
 CREATE TABLE GistTable14 (
@@ -253,6 +258,24 @@ CREATE TABLE GistTable14 (
 -- Try to create a hash index.
 CREATE INDEX GistIndex14a ON GistTable14 USING HASH (id);
 CREATE INDEX GistIndex14b ON GistTable14 USING HASH (property);
+
+-- ----------------------------------------------------------------------
+-- Test GiST index on an AO table
+-- ----------------------------------------------------------------------
+
+------------------------------------------------------------------------------
+-- PURPOSE:
+--     Test the logic in forming TIDs for AO tuples. Before GPDB 6, the
+--     offset numbers in AO tids ran from 32768 to 65535, which collided
+--     with the special offsets used in GiST to mark invalid tuples. This
+--     test reproduced an error with that.
+------------------------------------------------------------------------------
+create table ao_points (i int, p point) with (appendonly=true) distributed by(i);
+create index on ao_points using gist (p);
+
+insert into ao_points select 1, point(g,g) from generate_series(1, 70000) g;
+
+select count(*) from ao_points where p <@ box('(32600,32600)', '(32800,32800)');
 
 
 -- ----------------------------------------------------------------------

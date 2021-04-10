@@ -59,6 +59,33 @@ SELECT '' AS fortyfive, r1.*, r2.*
    WHERE r1.f1 > r2.f1
    ORDER BY r1.f1, r2.f1;
 
+-- Test intervals that are large enough to overflow 64 bits in comparisons
+CREATE TEMP TABLE INTERVAL_TBL_OF (f1 interval);
+INSERT INTO INTERVAL_TBL_OF (f1) VALUES
+  ('2147483647 days 2147483647 months'),
+  ('2147483647 days -2147483648 months'),
+  ('1 year'),
+  ('-2147483648 days 2147483647 months'),
+  ('-2147483648 days -2147483648 months');
+-- these should fail as out-of-range
+INSERT INTO INTERVAL_TBL_OF (f1) VALUES ('2147483648 days');
+INSERT INTO INTERVAL_TBL_OF (f1) VALUES ('-2147483649 days');
+INSERT INTO INTERVAL_TBL_OF (f1) VALUES ('2147483647 years');
+INSERT INTO INTERVAL_TBL_OF (f1) VALUES ('-2147483648 years');
+
+SELECT r1.*, r2.*
+   FROM INTERVAL_TBL_OF r1, INTERVAL_TBL_OF r2
+   WHERE r1.f1 > r2.f1
+   ORDER BY r1.f1, r2.f1;
+
+CREATE INDEX ON INTERVAL_TBL_OF USING btree (f1);
+SET enable_seqscan TO false;
+EXPLAIN (COSTS OFF)
+SELECT f1 FROM INTERVAL_TBL_OF r1 ORDER BY f1;
+SELECT f1 FROM INTERVAL_TBL_OF r1 ORDER BY f1;
+RESET enable_seqscan;
+
+DROP TABLE INTERVAL_TBL_OF;
 
 -- Test multiplication and division with intervals.
 -- Floating point arithmetic rounding errors can lead to unexpected results,
@@ -183,8 +210,6 @@ SELECT interval '123 2:03 -2:04'; -- not ok, redundant hh:mm fields
 SELECT interval(0) '1 day 01:23:45.6789';
 SELECT interval(2) '1 day 01:23:45.6789';
 SELECT interval '12:34.5678' minute to second(2);  -- per SQL spec
-SELECT interval(2) '12:34.5678' minute to second;  -- historical PG
-SELECT interval(2) '12:34.5678' minute to second(2);  -- syntax error
 SELECT interval '1.234' second;
 SELECT interval '1.234' second(2);
 SELECT interval '1 2.345' day to second(2);
@@ -197,6 +222,11 @@ SELECT interval '1 2:03:04.5678' hour to second(2);
 SELECT interval '1 2.3456' minute to second(2);
 SELECT interval '1 2:03.5678' minute to second(2);
 SELECT interval '1 2:03:04.5678' minute to second(2);
+
+-- test casting to restricted precision (bug #14479)
+SELECT f1, f1::INTERVAL DAY TO MINUTE AS "minutes",
+  (f1 + INTERVAL '1 month')::INTERVAL MONTH::INTERVAL YEAR AS "years"
+  FROM interval_tbl;
 
 -- test inputting and outputting SQL standard interval literals
 SET IntervalStyle TO sql_standard;

@@ -5,7 +5,7 @@
  *	  those routines.
  *
  * Portions Copyright (c) 2005-2008, Greenplum inc
- * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
  *
  *
  * IDENTIFICATION
@@ -17,20 +17,9 @@
 #ifndef CDBUTIL_H
 #define CDBUTIL_H
 
-/*
- * Copied from geqo_random.h (deprecated)
- */
-
-#include <math.h>
-#include "catalog/gp_segment_config.h"
+#include "catalog/gp_segment_configuration.h"
 #include "nodes/pg_list.h"
-
-/* cdb_rand returns a random float value between 0 and 1 inclusive */
-#define cdb_rand() ((double) random() / (double) MAX_RANDOM_VALUE)
-
-/* cdb_randint returns integer value between lower and upper inclusive */
-#define cdb_randint(upper,lower) \
-	( (int) floor( cdb_rand()*(((upper)-(lower))+0.999999) ) + (lower) )
+#include "nodes/plannodes.h"
 
 struct SegmentDatabaseDescriptor;
 
@@ -51,8 +40,9 @@ typedef struct CdbComponentDatabases CdbComponentDatabases;
  *
  */
 #define COMPONENT_DBS_MAX_ADDRS (8)
-struct CdbComponentDatabaseInfo
+typedef struct GpSegConfigEntry 
 {
+	/* copy of entry in gp_segment_configuration */
 	int16		dbid;			/* the dbid of this database */
 	int16		segindex;		/* content indicator: -1 for entry database,
 								 * 0, ..., n-1 for segment database */
@@ -61,36 +51,41 @@ struct CdbComponentDatabaseInfo
 	char		preferred_role; /* what role would we "like" to have this segment in ? */
 	char		mode;
 	char		status;
-
-	char	   *hostname;		/* name or ip address of host machine */
-	char	   *address;		/* ip address of host machine */
-
-	char	   *datadir;		/* absolute path to data directory on the host. */
-
-	char	   *hostip;			/* cached lookup of name */
 	int32		port;			/* port that instance is listening on */
+	char		*hostname;		/* name or ip address of host machine */
+	char		*address;		/* ip address of host machine */
+	char		*datadir;		/* absolute path to data directory on the host. */
 
-	char	   *hostaddrs[COMPONENT_DBS_MAX_ADDRS];	/* cached lookup of names */	
-	int16		hostSegs;		/* number of primary segments on the same hosts */
-	List		*freelist;		/* list of idle segment dbs */
-	int			numIdleQEs;
-	int			numActiveQEs;
+	/* additional cached info */
+	char		*hostip;	/* cached lookup of name */
+	char		*hostaddrs[COMPONENT_DBS_MAX_ADDRS];	/* cached lookup of names */	
+} GpSegConfigEntry;
+
+struct CdbComponentDatabaseInfo
+{
+	struct GpSegConfigEntry	*config;
 
 	CdbComponentDatabases	*cdbs; /* point to owners */
+
+	int16		hostSegs;	/* number of primary segments on the same hosts */
+	List		*freelist;	/* list of idle segment dbs */
+	int			numIdleQEs;
+	int			numActiveQEs;
 };
 
+
 #define SEGMENT_IS_ACTIVE_MIRROR(p) \
-	((p)->role == GP_SEGMENT_CONFIGURATION_ROLE_MIRROR ? true : false)
+	((p)->config->role == GP_SEGMENT_CONFIGURATION_ROLE_MIRROR ? true : false)
 #define SEGMENT_IS_ACTIVE_PRIMARY(p) \
-	((p)->role == GP_SEGMENT_CONFIGURATION_ROLE_PRIMARY ? true : false)
+	((p)->config->role == GP_SEGMENT_CONFIGURATION_ROLE_PRIMARY ? true : false)
 
 #define SEGMENT_IS_ALIVE(p) \
-	((p)->status == GP_SEGMENT_CONFIGURATION_STATUS_UP ? true : false)
+	((p)->config->status == GP_SEGMENT_CONFIGURATION_STATUS_UP ? true : false)
 
 #define SEGMENT_IS_IN_SYNC(p) \
-	((p)->mode == GP_SEGMENT_CONFIGURATION_MODE_INSYNC ? true : false)
+	((p)->config->mode == GP_SEGMENT_CONFIGURATION_MODE_INSYNC ? true : false)
 #define SEGMENT_IS_NOT_INSYNC(p) \
-	((p)->mode == GP_SEGMENT_CONFIGURATION_MODE_NOTINSYNC ? true : false)
+	((p)->config->mode == GP_SEGMENT_CONFIGURATION_MODE_NOTINSYNC ? true : false)
 
 /* --------------------------------------------------------------------------------------------------
  * Structure for return value from getCdbSegmentDatabases()
@@ -109,14 +104,12 @@ struct CdbComponentDatabases
 												 * entry databases */
 	int			total_entry_dbs;	/* count of the array  */
 	int			total_segments; /* count of distinct segindexes */
-	int			my_dbid;		/* the dbid of this database */
-	int			my_segindex;	/* the content of this database */
-	bool		my_isprimary;	/* the isprimary flag of this database */
 	uint8		fts_version;	/* the version of fts */
 	int			expand_version;
 	int			numActiveQEs;
 	int			numIdleQEs;
 	int			qeCounter;
+	List		*freeCounterList;
 };
 
 //
@@ -141,7 +134,7 @@ extern void cdb_setup(void);
  * when disabling Greenplum Database functionality.
  *
  */
-extern void cdb_cleanup(int code, Datum arg  __attribute__((unused)) );
+extern void cdb_cleanup(int code, Datum arg  pg_attribute_unused() );
 
 
 /*
@@ -154,7 +147,7 @@ extern void cdb_cleanup(int code, Datum arg  __attribute__((unused)) );
  * The same is true for pointer-based values in CdbComponentDatabaseInfo.  The caller is responsible
  * for setting the current storage context and releasing the storage occupied the returned values.
  */
-CdbComponentDatabases * cdbcomponent_getCdbComponents(bool DNSLookupAsError);
+CdbComponentDatabases * cdbcomponent_getCdbComponents(void);
 void cdbcomponent_destroyCdbComponents(void);
 
 void cdbcomponent_updateCdbComponents(void);
@@ -189,6 +182,9 @@ bool cdbcomponent_qesExist(void);
 bool cdbcomponent_activeQEsExist(void);
 
 List *cdbcomponent_getCdbComponentsList(void);
+
+extern void writeGpSegConfigToFTSFiles(void);
+
 /*
  * Given total number of primary segment databases and a number of segments
  * to "skip" - this routine creates a boolean map (array) the size of total
@@ -205,7 +201,7 @@ extern bool *makeRandomSegMap(int total_primaries, int total_to_skip);
 extern char *getDnsAddress(char *name, int port, int elevel);
 
 extern int16 master_standby_dbid(void);
-extern CdbComponentDatabaseInfo *dbid_get_dbinfo(int16 dbid);
+extern GpSegConfigEntry *dbid_get_dbinfo(int16 dbid);
 extern int16 contentid_get_dbid(int16 contentid, char role, bool getPreferredRoleNotCurrentRole);
 
 extern int numsegmentsFromQD;
@@ -213,6 +209,10 @@ extern int numsegmentsFromQD;
  * Returns the number of segments
  */
 extern int getgpsegmentCount(void);
+
+extern bool IsOnConflictUpdate(PlannedStmt *ps);
+
+extern void AvoidCorefileGeneration(void);
 
 #define ELOG_DISPATCHER_DEBUG(...) do { \
        if (gp_log_gang >= GPVARS_VERBOSITY_DEBUG) elog(LOG, __VA_ARGS__); \

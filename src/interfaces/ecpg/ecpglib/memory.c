@@ -7,7 +7,7 @@
 #include "ecpgtype.h"
 #include "ecpglib.h"
 #include "ecpgerrno.h"
-#include "extern.h"
+#include "ecpglib_extern.h"
 
 void
 ecpg_free(void *ptr)
@@ -26,7 +26,7 @@ ecpg_alloc(long size, int lineno)
 		return NULL;
 	}
 
-	return (new);
+	return new;
 }
 
 char *
@@ -40,7 +40,7 @@ ecpg_realloc(void *ptr, long size, int lineno)
 		return NULL;
 	}
 
-	return (new);
+	return new;
 }
 
 char *
@@ -58,7 +58,7 @@ ecpg_strdup(const char *string, int lineno)
 		return NULL;
 	}
 
-	return (new);
+	return new;
 }
 
 /* keep a list of memory we allocated for the user */
@@ -93,7 +93,7 @@ get_auto_allocs(void)
 }
 
 static void
-set_auto_allocs(struct auto_mem * am)
+set_auto_allocs(struct auto_mem *am)
 {
 	pthread_setspecific(auto_mem_key, am);
 }
@@ -104,14 +104,34 @@ static struct auto_mem *auto_allocs = NULL;
 #define set_auto_allocs(am)		do { auto_allocs = (am); } while(0)
 #endif
 
-void
+char *
+ecpg_auto_alloc(long size, int lineno)
+{
+	void	   *ptr = (void *) ecpg_alloc(size, lineno);
+
+	if (!ptr)
+		return NULL;
+
+	if (!ecpg_add_mem(ptr, lineno))
+	{
+		ecpg_free(ptr);
+		return NULL;
+	}
+	return ptr;
+}
+
+bool
 ecpg_add_mem(void *ptr, int lineno)
 {
 	struct auto_mem *am = (struct auto_mem *) ecpg_alloc(sizeof(struct auto_mem), lineno);
 
+	if (!am)
+		return false;
+
 	am->pointer = ptr;
 	am->next = get_auto_allocs();
 	set_auto_allocs(am);
+	return true;
 }
 
 void

@@ -13,4 +13,11 @@ SUBPARTITION TEMPLATE
    END (date '2012-01-01') EXCLUSIVE
    EVERY (INTERVAL '1 month'), 
    DEFAULT PARTITION outlying_dates );
-update gp_distribution_policy set attrnums = '{2}' where localoid in (select localoid from gp_distribution_policy order by random() limit 3);
+update gp_distribution_policy set distkey = '2' where localoid in (select localoid from gp_distribution_policy order by random() limit 3);
+
+-- Corrupt a partition's distribution opclass
+CREATE TABLE test (a int, b int)
+    DISTRIBUTED BY (a, b)
+    PARTITION BY RANGE(a) (START(1) END(2) EVERY(1));
+UPDATE gp_distribution_policy SET distkey=1::int2vector
+    WHERE localoid='test_1_prt_1'::regclass;

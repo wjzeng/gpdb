@@ -23,14 +23,28 @@ RESET gp_allow_rename_relation_without_lock;
 -- MPP-20466 Dis-allow duplicate constraint names for same table
 create table dupconstr (
 						i int,
-						j int constraint test CHECK (j > 10))
+						j int constraint dup_constraint CHECK (j > 10))
 						distributed by (i);
 -- should fail because of duplicate constraint name
-alter table dupconstr add constraint test unique (i);
-alter table dupconstr add constraint test primary key (i);
+alter table dupconstr add constraint dup_constraint unique (i);
+alter table dupconstr add constraint dup_constraint primary key (i);
 -- cleanup
 drop table dupconstr;
 
+--
+-- Alter datatype of column with constraint should raise meaningful error
+-- See github issue: https://github.com/greenplum-db/gpdb/issues/10561
+--
+create table contype (i int4 primary key, j int check (j < 100));
+alter table contype alter i type numeric; --error
+
+insert into contype values (1, 1), (2, 2), (3, 3);
+-- after insert data, alter primary key/unique column's type will go through a special check logic
+alter table contype alter i type numeric; --error
+
+alter table contype alter j type numeric;
+-- cleanup
+drop table contype;
 
 --
 -- Test ALTER COLUMN TYPE after dropped column with text datatype (see MPP-19146)
@@ -81,3 +95,140 @@ SELECT * FROM altable ORDER BY 1;
 -- (There used to be a quoting bug in the internal query this issues.)
 create table "foo'bar" (id int4, t text);
 alter table "foo'bar" alter column t type integer using length(t);
+
+--
+-- ADD/DROP/ALTER COLUMN on root partition is approved.
+--
+-- Heap table
+DROP TABLE IF EXISTS test_part_col;
+CREATE TABLE test_part_col(a int, b int, c int, d int, e int)
+DISTRIBUTED BY(a)
+PARTITION BY RANGE (b)
+( START (1) END (2) EVERY (1),
+    DEFAULT PARTITION other_b);
+
+ALTER TABLE ONLY test_part_col ADD COLUMN f int; --error
+ALTER TABLE test_part_col ADD COLUMN f int;
+
+ALTER TABLE ONLY test_part_col ALTER COLUMN f TYPE TEXT; --error
+ALTER TABLE test_part_col ALTER COLUMN f TYPE TEXT;
+
+ALTER TABLE ONLY test_part_col DROP COLUMN f; --error
+ALTER TABLE test_part_col DROP COLUMN f;
+
+ALTER TABLE ONLY test_part_col_1_prt_other_b ADD COLUMN f int;
+ALTER TABLE test_part_col_1_prt_other_b ADD COLUMN f int;
+
+ALTER TABLE ONLY test_part_col_1_prt_other_b ALTER COLUMN e TYPE TEXT; --error
+ALTER TABLE test_part_col_1_prt_other_b ALTER COLUMN e TYPE TEXT;
+
+ALTER TABLE ONLY test_part_col_1_prt_other_b DROP COLUMN e; --error
+ALTER TABLE test_part_col_1_prt_other_b DROP COLUMN e;
+
+DROP TABLE test_part_col;
+
+-- Non-partition heap table
+CREATE TABLE test_part_col(a int, b int, c int, d int, e int) DISTRIBUTED BY(a);
+
+ALTER TABLE ONLY test_part_col ADD COLUMN f int;
+ALTER TABLE ONLY test_part_col ALTER COLUMN f TYPE TEXT;
+ALTER TABLE ONLY test_part_col DROP COLUMN f;
+
+ALTER TABLE test_part_col ADD COLUMN f int;
+ALTER TABLE test_part_col ALTER COLUMN f TYPE TEXT;
+ALTER TABLE test_part_col DROP COLUMN f;
+
+DROP TABLE test_part_col;
+
+-- AO table
+CREATE TABLE test_part_col(a int, b int, c int, d int, e int)
+WITH (appendonly=true)
+DISTRIBUTED BY(a)
+PARTITION BY RANGE (b)
+( START (1) END (2) EVERY (1),
+    DEFAULT PARTITION other_b);
+
+ALTER TABLE ONLY test_part_col ADD COLUMN f int; --error
+ALTER TABLE test_part_col ADD COLUMN f int;
+
+ALTER TABLE ONLY test_part_col ALTER COLUMN f TYPE TEXT; --error
+ALTER TABLE test_part_col ALTER COLUMN f TYPE TEXT;
+
+ALTER TABLE ONLY test_part_col DROP COLUMN f; --error
+ALTER TABLE test_part_col DROP COLUMN f;
+
+ALTER TABLE ONLY test_part_col_1_prt_other_b ADD COLUMN f int;
+ALTER TABLE test_part_col_1_prt_other_b ADD COLUMN f int;
+
+ALTER TABLE ONLY test_part_col_1_prt_other_b ALTER COLUMN e TYPE TEXT; --error
+ALTER TABLE test_part_col_1_prt_other_b ALTER COLUMN e TYPE TEXT;
+
+ALTER TABLE ONLY test_part_col_1_prt_other_b DROP COLUMN e; --error
+ALTER TABLE test_part_col_1_prt_other_b DROP COLUMN e;
+
+DROP TABLE test_part_col;
+
+-- Non-partition AO table
+CREATE TABLE test_part_col(a int, b int, c int, d int, e int)
+WITH (appendonly=true) DISTRIBUTED BY(a);
+
+ALTER TABLE ONLY test_part_col ADD COLUMN f int;
+ALTER TABLE ONLY test_part_col ALTER COLUMN f TYPE TEXT;
+ALTER TABLE ONLY test_part_col DROP COLUMN f;
+
+ALTER TABLE test_part_col ADD COLUMN f int;
+ALTER TABLE test_part_col ALTER COLUMN f TYPE TEXT;
+ALTER TABLE test_part_col DROP COLUMN f;
+
+DROP TABLE test_part_col;
+
+-- AOCS table
+CREATE TABLE test_part_col(a int, b int, c int, d int, e int)
+WITH (appendonly=true, orientation=column)
+DISTRIBUTED BY(a)
+PARTITION BY RANGE (b)
+( START (1) END (2) EVERY (1),
+    DEFAULT PARTITION other_b);
+
+ALTER TABLE ONLY test_part_col ADD COLUMN f int; --error
+ALTER TABLE test_part_col ADD COLUMN f int;
+
+ALTER TABLE ONLY test_part_col ALTER COLUMN f TYPE TEXT; --error
+ALTER TABLE test_part_col ALTER COLUMN f TYPE TEXT;
+
+ALTER TABLE ONLY test_part_col DROP COLUMN f; --error
+ALTER TABLE test_part_col DROP COLUMN f;
+
+ALTER TABLE ONLY test_part_col_1_prt_other_b ADD COLUMN f int;
+ALTER TABLE test_part_col_1_prt_other_b ADD COLUMN f int;
+
+ALTER TABLE ONLY test_part_col_1_prt_other_b ALTER COLUMN e TYPE TEXT; --error
+ALTER TABLE test_part_col_1_prt_other_b ALTER COLUMN e TYPE TEXT;
+
+ALTER TABLE ONLY test_part_col_1_prt_other_b DROP COLUMN e; --error
+ALTER TABLE test_part_col_1_prt_other_b DROP COLUMN e;
+
+DROP TABLE test_part_col;
+
+-- Non-partition AOCS table
+CREATE TABLE test_part_col(a int, b int, c int, d int, e int)
+WITH (appendonly=true, orientation=column) DISTRIBUTED BY(a);
+
+ALTER TABLE ONLY test_part_col ADD COLUMN f int;
+ALTER TABLE ONLY test_part_col ALTER COLUMN f TYPE TEXT;
+ALTER TABLE ONLY test_part_col DROP COLUMN f;
+
+ALTER TABLE test_part_col ADD COLUMN f int;
+ALTER TABLE test_part_col ALTER COLUMN f TYPE TEXT;
+ALTER TABLE test_part_col DROP COLUMN f;
+
+DROP TABLE test_part_col;
+
+
+-- Test the new "fast default" mechanism from PostgreSQL v11. It's important
+-- that each segment gets the same attmissingval.
+CREATE TABLE gp_test_fast_def(i int);
+INSERT INTO gp_test_fast_def (i) SELECT g FROM generate_series(1, 10) g;
+ALTER TABLE gp_test_fast_def ADD COLUMN ts timestamp DEFAULT now();
+ANALYZE gp_test_fast_def;
+SELECT COUNT (DISTINCT ts) FROM gp_test_fast_def;

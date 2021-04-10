@@ -5,7 +5,7 @@
  *
  *
  * Portions Copyright (c) 2006-2008, Greenplum inc.
- * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
  * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
@@ -167,7 +167,6 @@ extern bool ResDestroyQueue(Oid queueid);
 extern void ResLockPortal(Portal portal, QueryDesc *qDesc);
 extern void ResUnLockPortal(Portal portal);
 
-extern void ResCheckPortalType(Portal portal);
 extern Oid	GetResQueueForRole(Oid roleid);
 extern Oid	GetResQueueId(void);
 extern Oid	GetResQueueIdForName(char *name);

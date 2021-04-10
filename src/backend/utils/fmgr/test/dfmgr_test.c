@@ -3,8 +3,8 @@
 #include <setjmp.h>
 #include "cmockery.h"
 
-#include "c.h"
 #include "postgres.h"
+#include "lib/stringinfo.h"
 #include "nodes/nodes.h"
 #include "utils/memutils.h"
 
@@ -26,6 +26,7 @@
  * Mock PG_RE_THROW as well, because we are not using real elog.o.
  * The closest mockery is to call siglongjmp().
  */
+#undef PG_RE_THROW
 #define PG_RE_THROW() siglongjmp(*PG_exception_stack, 1)
 
 /* Buffer to store the last error mesage from errdetail */
@@ -35,22 +36,23 @@ static char expectedErrorMsg[ERROR_MESSAGE_MAX_LEN];
 
 static MemoryContext testMemoryContext = NULL;
 
-int errfinish_impl(int dummy __attribute__((unused)),...)
+static void
+errfinish_impl(const char *filename, int lineno, const char *funcname)
 {
 	/* We only throw error if the error message matches our expectation */
 	if (0 == strcmp(lastErrorMsg, expectedErrorMsg))
 	{
 		PG_RE_THROW();
 	}
-	return 0;
 }
 
-int errmsg_impl(const char *fmt, ...)
+static void
+errmsg_impl(const char *fmt, ...)
 {
-	return 0;
 }
 
-int errdetail_internal_impl(const char* fmt, ...)
+static void
+errdetail_internal_impl(const char* fmt, ...)
 {
     StringInfoData	buf;
     initStringInfo(&buf);
@@ -61,16 +63,12 @@ int errdetail_internal_impl(const char* fmt, ...)
 	strncpy(lastErrorMsg, buf.data, sizeof(lastErrorMsg) / sizeof(lastErrorMsg[0]));
 
 	pfree(buf.data);
-	return 0;
 }
 
 #include "../dfmgr.c"
 
 #define EXPECT_EREPORT(LOG_LEVEL)     \
 	expect_any(errstart, elevel); \
-	expect_any(errstart, filename); \
-	expect_any(errstart, lineno); \
-	expect_any(errstart, funcname); \
 	expect_any(errstart, domain); \
 	if (LOG_LEVEL < ERROR) \
 	{ \
@@ -82,25 +80,6 @@ int errdetail_internal_impl(const char* fmt, ...)
     } \
 
 
-/* Generates a version mismatch error message and sets the expectedErrorMsg to that value */
-static void
-SetExpectedErrorMessage(Pg_magic_struct module_magic, int expectedHeaderVersion)
-{
-	const char *magic_product     = get_magic_product(&magic_data);
-	const char *mod_magic_product = get_magic_product(&module_magic);
-
-	/* Save the expected error message, as determined by the struct size mismatch */
-	snprintf(expectedErrorMsg, 255, "Server version is %s %d.%d (header version: %d), library is %s %d.%d (header version: %d).",
-			magic_product,
-			magic_data.version / 100,
-			magic_data.version % 100,
-			magic_data.headerversion,
-			mod_magic_product,
-			module_magic.version / 100,
-			module_magic.version % 100,
-			expectedHeaderVersion);
-}
-
 /*
  * Tests if we error out if the loaded module's expected Pg_magic_struct
  * is smaller (i.e., we have newer fields)
@@ -111,9 +90,9 @@ test__incompatible_module_error__struct_size_mismatch(void **state)
 	Pg_magic_struct module_magic = PG_MODULE_MAGIC_DATA;
 
 	/* Simulate a smaller structure for the module's Pg_magic_struct */
-	module_magic.len = offsetof(Pg_magic_struct, headerversion);
+	module_magic.len = offsetof(Pg_magic_struct, version);
 
-	SetExpectedErrorMessage(module_magic, 0);
+	snprintf(expectedErrorMsg, 255, "Magic block has unexpected length or padding difference.");
 
 	EXPECT_EREPORT(ERROR);
 
@@ -137,9 +116,8 @@ test__incompatible_module_error__struct_size_mismatch(void **state)
 static void CheckHeaderVersionMismatch(int diffOffset)
 {
 	Pg_magic_struct module_magic = PG_MODULE_MAGIC_DATA;
-	module_magic.headerversion = magic_data.headerversion + diffOffset;
 
-	SetExpectedErrorMessage(module_magic, module_magic.headerversion);
+	snprintf(expectedErrorMsg, 255, "Magic block has unexpected length or padding difference.");
 
 	EXPECT_EREPORT(ERROR);
 
@@ -192,7 +170,8 @@ test__incompatible_module_error__headerversion_identical(void **state)
 /*
  * Sets up the global data structures and the memory context
  */
-void SetupDataStructures(void **state)
+static void
+SetupDataStructures(void **state)
 {
 	lastErrorMsg[0] = '\0';
 	expectedErrorMsg[0] = '\0';
@@ -218,7 +197,8 @@ void SetupDataStructures(void **state)
 /*
  * Cleans up memory by reseting testMemoryContext
  */
-void TeardownDataStructures(void **state)
+static void
+TeardownDataStructures(void **state)
 {
 	assert_true(NULL != testMemoryContext &&
 			CurrentMemoryContext == testMemoryContext);

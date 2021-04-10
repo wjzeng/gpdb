@@ -10,9 +10,6 @@
 -- m/(ERROR|WARNING|CONTEXT|NOTICE):.*The previous session was reset because its gang was disconnected/
 -- s/session id \=\s*\d+/session id \= DUMMY/gm
 --
--- m/NOTICE:  exchanged partition .*/
--- s/pg_temp_\d+/pg_temp_DUMMY/gm
---
 -- end_matchsubs
 --
 --
@@ -552,3 +549,56 @@ begin;
 reindex table pg_class;
 commit;
 \c regression
+
+--
+-- Check that committing a subtransaction releases the lock on the
+-- subtransaction's XID.
+--
+-- It's not too bad if it doesn't, because if anyone wants to wait for the
+-- subtransaction and sees that it's been committed already, they will wait
+-- for the top transaction XID instead. So even though the lock on the sub-XID
+-- is released at RELEASE SAVEPOINT, logically it's held until the end of
+-- the top transaction anyway. But releasing the lock early saves space in
+-- the lock table. (We had a silly bug once upon a time in GPDB where we failed
+-- to release the lock.)
+--
+BEGIN;
+CREATE TEMPORARY TABLE foo (i integer);
+DO $$
+declare
+  i int;
+begin
+  for i in 1..100 loop
+    begin
+      insert into foo values (i);
+    exception
+      when others then raise 'got error';
+    end;
+  end loop;
+end;
+$$;
+SELECT CASE WHEN count(*) < 50 THEN 'not many XID locks'
+            ELSE 'lots of XID locks: ' || count(*) END
+FROM pg_locks WHERE locktype='transactionid';
+ROLLBACK;
+
+-- Test that exported snapshots are cleared upon abort.  In Greenplum,
+-- exported snapshots are cleared earlier than PostgreSQL during
+-- abort.
+begin;
+select count(1) = 1 from pg_catalog.pg_export_snapshot();
+select pg_cancel_backend(pg_backend_pid());
+rollback;
+
+-- Test a bug that a two-phase subtransaction is considered as one-phase.
+set optimizer = off; -- orca optimizes value scan so the output is different between orca and postgres optimizer.
+truncate distxact1_4;
+set test_print_direct_dispatch_info = true;
+begin;
+savepoint sp1;
+insert into distxact1_4 values (2),(1);
+release sp1;
+end;
+reset test_print_direct_dispatch_info;
+reset optimizer;
+select count(gp_segment_id) from distxact1_4 group by gp_segment_id; -- sanity check: tuples should be in > 1 segments

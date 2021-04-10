@@ -6,6 +6,7 @@ from sys import *
 from xml.dom import minidom
 from xml.dom import Node
 
+import pgdb
 from gppylib.gplog import *
 
 logger = get_default_logger()
@@ -137,22 +138,22 @@ def openAnything(source):
         return sys.stdin
 
     # try to open with urllib (if source is http, ftp, or file URL)
-    import urllib                         
+    import urllib.request, urllib.parse, urllib.error                         
     try:                                  
-        return urllib.urlopen(source)     
+        return urllib.request.urlopen(source)     
     except (IOError, OSError):            
         pass                              
     
     # try to open with native open function (if source is pathname)
     try:                                  
         return open(source)               
-    except Exception, e: 
-        print ("Exception occurred opening file %s Error: %s"  % (source, str(e)))                             
+    except Exception as e: 
+        print(("Exception occurred opening file %s Error: %s"  % (source, str(e))))                             
         
     
     # treat source as string
-    import StringIO                       
-    return StringIO.StringIO(str(source)) 
+    import io                       
+    return io.StringIO(str(source)) 
 def getOs():
     dist=None
     fdesc = None
@@ -184,7 +185,7 @@ def getOs():
             fdesc.close()
     return dist
 def factory(aClass, *args):
-    return apply(aClass,args)
+    return aClass(*args)
 
 def addDicts(a,b):
     c = dict(a)
@@ -197,7 +198,7 @@ def joinPath(a,b,parm=""):
 
 def debug(varname, o):
     if _debug == 1:
-        print "Debug: %s -> %s" %(varname, o)
+        print("Debug: %s -> %s" %(varname, o))
 
 def loadXmlElement(config,elementName):
     fdesc = openAnything(config)
@@ -218,7 +219,7 @@ def docIter(node):
         #have no set order. The values() call
         #gets a list of actual attribute node objects
         #from the dictionary
-        for attr in node.attributes.values():
+        for attr in list(node.attributes.values()):
             yield attr
     for child in node.childNodes:
         #Create a generator for each child,
@@ -286,17 +287,17 @@ def deleteBlock(fileName,beginPattern, endPattern):
                 fdesc.close()
                 os.rename(fileNameTmp,fileName)
         except IOError:
-            print("IOERROR", IOError)
+            print(("IOERROR", IOError))
             sys.exit()
     else:
-        print "***********%s  file does not exits"%(fileName)
+        print("***********%s  file does not exits"%(fileName))
 
 def make_inf_hosts(hp, hstart, hend, istart, iend, hf=None):
     hfArr = []
     inf_hosts=[]
     if None != hf:
         hfArr=hf.split('-')
-    print hfArr 
+    print(hfArr) 
     for h in range(int(hstart), int(hend)+1):
         host = '%s%d' % (hp, h)
         for i in range(int(istart), int(iend)+1):
@@ -320,7 +321,7 @@ def copyFile(srcDir,srcFile, destDir, destFile):
             result=pipe.read().strip()
             #debug ("result",result)
         else:
-            print "no such file or directory " + filePath
+            print("no such file or directory " + filePath)
     except OSError:
         print ("OS Error occurred")
     return result
@@ -347,50 +348,6 @@ def parseKeyColonValueLines(str):
 
 def sortedDictByKey(di):
     return  [ (k,di[k]) for k in sorted(di.keys())]
-
-def appendNewEntriesToHbaFile(fileName, segments):
-    """
-    Will raise Exception if there is a problem updating the hba file
-    """
-
-    try:
-        #
-        # Get the list of lines that already exist...we won't write those again
-        #
-        # Replace runs of whitespace with single space to improve deduping
-        #
-        def lineToCanonical(s):
-            s = re.sub("\s", " ", s) # first reduce whitespace runs to single space
-            s = re.sub(" $", "", s) # remove trailing space
-            s = re.sub("^ ", "", s) # remove leading space
-            return s
-        existingLineMap = {}
-        for line in readAllLinesFromFile(fileName):
-            existingLineMap[lineToCanonical(line)] = True
-
-        fp = open(fileName, 'a')
-        try:
-            for newSeg in segments:
-                address = newSeg.getSegmentAddress()
-                addrinfo = socket.getaddrinfo(address, None)
-                ipaddrlist = list(set([ (ai[0], ai[4][0]) for ai in addrinfo]))
-                haveWrittenCommentHeader = False
-                for addr in ipaddrlist:
-                    newLine = 'host\tall\tall\t%s/%s\ttrust' % (addr[1], '32' if addr[0] == socket.AF_INET else '128')
-                    newLineCanonical = lineToCanonical(newLine)
-                    if newLineCanonical not in existingLineMap:
-                        if not haveWrittenCommentHeader:
-                            fp.write('# %s\n' % address)
-                            haveWrittenCommentHeader = True
-                        fp.write(newLine)
-                        fp.write('\n')
-                        existingLineMap[newLineCanonical] = True
-        finally:
-            fp.close()
-    except IOError, msg:
-        raise Exception('Failed to open %s' % fileName)
-    except Exception, msg:
-        raise Exception('Failed to add new segments to template %s' % fileName)
 
 class TableLogger:
 
@@ -505,138 +462,6 @@ class TableLogger:
     def hasWarnings(self):
         return self.getNumWarnings() > 0
 
-class ParsedConfigFile:
-    """
-    returned by call to parseMirroringConfigFile
-    """
-
-    def __init__( self, flexibleHeaders, rows):
-        self.__flexibleHeaders = flexibleHeaders
-        self.__rows = rows
-
-    def getRows(self):
-        """
-        @return a non-None list of ParsedConfigFileRow
-        """
-        return self.__rows
-
-    def getFlexibleHeaders(self):
-        """
-        @return a non-None list of strings
-        """
-        return self.__flexibleHeaders
-
-class ParsedConfigFileRow:
-    """
-    used as part of ParseConfigFile, returned by call to parseMirroringConfigFile
-    """
-
-    def __init__(self, fixedValuesMap, flexibleValuesMap, line):
-        self.__fixedValuesMap = fixedValuesMap
-        self.__flexibleValuesMap = flexibleValuesMap
-        self.__line = line
-
-    def getFixedValuesMap(self):
-        """
-        @return non-None dictionary
-        """
-        return self.__fixedValuesMap
-
-    def getFlexibleValuesMap(self):
-        """
-        @return non-None dictionary
-        """
-        return self.__flexibleValuesMap
-
-    def getLine(self):
-        """
-        @return the actual line that produced this config row; can be used for error reporting
-        """
-        return self.__line
-
-def parseMirroringConfigFile( lines, fileLabelForExceptions, fixedHeaderNames, keyForFlexibleHeaders,
-                                linesWillHaveLineHeader, numberRequiredHeadersForRecoversegFormat=None):
-    """
-    Read a config file that is in the mirroring or recoverseg config format
-
-    @params lines the list of Strings to parse
-    @param staticHeaders a list of Strings, listing what should appear as the first length(staticHeaders)
-                        values in each row
-    @param keyForFlexibleHeaders if None then no extra values are read, otherwise it's the key for flexible
-                        headers that should be passed.  If this is passed then the first line of the file
-                        should look like keyValue=a1:a2:...a3
-    @param numberRequiredHeadersForRecoversegFormat if not None then the line can be either this
-                        many elements from fixedHeaderNames, or that many elements then a space separator and
-                        then the remaining required ones.  If we consolidate formats then we could remove
-                        this hacky option
-    @return a list of values
-
-    todo: should allow escaping of colon values, or switch to CSV and support CSV escaping
-    """
-    lines = [s.strip() for s in lines if len(s.strip()) > 0]
-
-    # see if there is the flexible header
-    rows = []
-    flexibleHeaders = []
-    if keyForFlexibleHeaders is not None:
-        if len(lines) == 0:
-            raise Exception("Missing header line with %s= values specified" % keyForFlexibleHeaders )
-
-        flexHeaderLineSplit = lines[0].split("=")
-        if len(flexHeaderLineSplit) != 2 or flexHeaderLineSplit[0] != keyForFlexibleHeaders:
-            raise Exception('%s format error for first line %s' % (fileLabelForExceptions, lines[0]))
-
-        str = flexHeaderLineSplit[1].strip()
-        if len(str) > 0:
-            flexibleHeaders = str.split(":")
-
-        lines = lines[1:]
-
-    # now read the real lines
-    numExpectedValuesPerLine = len(fixedHeaderNames) + len(flexibleHeaders)
-    for line in lines:
-        origLine = line
-
-        if linesWillHaveLineHeader:
-            arr = line.split("=")
-            if len(arr) != 2:
-                raise Exception('%s format error for line %s' % (fileLabelForExceptions, line))
-            line = arr[1]
-
-        numExpectedThisLine = numExpectedValuesPerLine
-        fixedToRead = fixedHeaderNames
-        flexibleToRead = flexibleHeaders
-        if numberRequiredHeadersForRecoversegFormat is not None:
-            arr = line.split()
-            if len(arr) == 1:
-                numExpectedThisLine = numberRequiredHeadersForRecoversegFormat
-                fixedToRead = fixedHeaderNames[0:numberRequiredHeadersForRecoversegFormat]
-                flexibleToRead = []
-            elif len(arr) == 2:
-                # read the full ones, treat it like one big line
-                line = arr[0] + ":" + arr[1]
-            else: raise Exception('config file format error. %s' % line)
-
-        arr = line.split(":")
-        if len(arr) != numExpectedThisLine:
-            raise Exception('%s format error for line (wrong number of values.  '
-                            'Found %d but expected %d) : %s' %
-                            (fileLabelForExceptions, len(arr), numExpectedThisLine, line))
-
-        fixedValuesMap = {}
-        flexibleValuesMap = {}
-
-        index = 0
-        for name in fixedToRead:
-            fixedValuesMap[name] = arr[index]
-            index += 1
-        for name in flexibleToRead:
-            flexibleValuesMap[name] = arr[index]
-            index += 1
-
-        rows.append(ParsedConfigFileRow(fixedValuesMap, flexibleValuesMap, origLine))
-
-    return ParsedConfigFile( flexibleHeaders, rows)
 
 def createSegmentSpecificPath(path, gpPrefix, segment):
     """
@@ -670,30 +495,6 @@ def normalizeAndValidateInputPath(path, errorMessagePathSource=None, errorMessag
                 ( firstPart, path, secondPart ))
     return os.path.normpath(path)
 
-def canStringBeParsedAsInt(str):
-    """
-    return True if int(str) would produce a value rather than throwing an error,
-          else return False
-    """
-    try:
-        int(str)
-        return True
-    except ValueError:
-        return False
-
-def shellEscape(string):
-    """
-    shellEscape: Returns a string in which the shell-significant quoted-string characters are
-    escaped.
-    This function escapes the following characters: '"', '$', '`', '\', '!'
-    """
-    res = []
-    for ch in string:
-        if ch in ['\\', '`', '$', '!', '"']:
-            res.append('\\')
-        res.append(ch)
-    return ''.join(res)
-
 
 def escapeDoubleQuoteInSQLString(string, forceDoubleQuote=True):
     string = string.replace('"', '""')
@@ -701,3 +502,108 @@ def escapeDoubleQuoteInSQLString(string, forceDoubleQuote=True):
     if forceDoubleQuote:
         string = '"' + string + '"'
     return string
+
+
+def Escape(query_str):
+    return pgdb.escape_string(query_str)
+
+
+def escapeArrayElement(query_str):
+    # also escape backslashes and double quotes, in addition to the doubling of single quotes
+    return pgdb.escape_string(query_str).replace('\\','\\\\').replace('"','\\"')
+
+
+# Transform Python list to Postgres array literal (of the form: '{...}')
+def format_array_literal(val):
+    if len(val) == 0:
+        val = "'{}'"
+    elif isinstance(val[0], str):
+        # Convert ['..', '..', ...] to '{"..", "..", ...}'
+        val = ['"%s"' % escapeArrayElement(e) for e in val]
+        val = ','.join(val)
+        # use an escaped string and add one more layer of escape symbols
+        val = "E'{%s}'" % val.replace('\\', '\\\\')
+    else:
+        # Convert [.., .., ...] to '{.., .., ...}'
+        val = str(val)
+        val = "'{%s}'" % val[1:-1]
+    return val
+
+
+def formatInsertValuesList(row, starelid, inclHLL):
+    """
+    @return rowVals
+    """
+
+    rowVals = ["\t%s" % (starelid)]
+
+    # the types of the columns in the pg_statistic table, except for starelid and stavalues[1-5]
+    types = ['smallint',  # staattnum
+             'boolean',
+             'real',
+             'integer',
+             'real',
+             'smallint',  # stakind1
+             'smallint',
+             'smallint',
+             'smallint',
+             'smallint',
+             'oid',       # staop1
+             'oid',
+             'oid',
+             'oid',
+             'oid',
+             'oid',       # stacoll1
+             'oid',
+             'oid',
+             'oid',
+             'oid',
+             'real[]',    # stanumbers1
+             'real[]',
+             'real[]',
+             'real[]',
+             'real[]'
+             ]
+    i = 0
+    hll = False
+    typeschema = row[3]
+    typename = row[4]
+    if typeschema != "pg_catalog":
+        # a type that is not built-in, qualify it with its schema name
+        # and play it safe by double-quoting the identifiers
+        typename = '"%s"."%s"' % (typeschema, typename)
+
+    # Populate types for stavaluesN: infer the type from pg_type.typname
+    if row[4][0] == '_':
+        # column is an array type, use as is
+        rowTypes = types + [typename] * 5
+    else:
+        # non-array type, make an array type out of it
+        rowTypes = types + [typename + '[]'] * 5
+
+    for val, typ in zip(row[6:], rowTypes):
+        i = i + 1
+        # Check stakind1 to see if slot is a hll slot or a full hll slot
+        if i == 10 and (val == 98 or val == 99):
+            if inclHLL == False:
+                val = 0
+            hll = True
+        elif val is None:
+            val = 'NULL'
+        # Format stavalues5 for an hll slot
+        elif i == 30 and hll:
+            if inclHLL:
+                val = '\'{"%s"}\'' % pgdb.escape_bytea(val[0])
+                rowVals.append('\t{0}::{1}'.format(val, 'bytea[]'))
+            else:
+                rowVals.append('\t{0}'.format('NULL::int4[]'))
+            continue
+        # Postgres array types are adapted to Python lists by pgdb
+        # We have to transform these lists to Postgres array literals in the
+        # output file.
+        elif isinstance(val, list):
+            val = format_array_literal(val)
+
+        rowVals.append('\t{0}::{1}'.format(val, typ))
+
+    return rowVals

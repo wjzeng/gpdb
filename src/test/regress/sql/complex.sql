@@ -5,7 +5,7 @@
 DROP TABLE complex_ttbl;   
 DROP SEQUENCE  complex_seq;
 -- end_ignore
-CREATE SEQUENCE complex_seq;
+CREATE SEQUENCE complex_seq CACHE 1;
 CREATE TABLE complex_ttbl (id INTEGER NOT NULL DEFAULT 1, orderid INTEGER NOT NULL DEFAULT NEXTVAL('complex_seq'), c COMPLEX) DISTRIBUTED BY (id); 
 
 -- regular input
@@ -354,7 +354,7 @@ DROP SEQUENCE complex_seq;
 DROP FUNCTION complex_dp_eq(a COMPLEX, b COMPLEX, diff FLOAT8);
 
 -- check hashable
-CREATE SEQUENCE complex_seq;
+CREATE SEQUENCE complex_seq CACHE 1;
 CREATE TABLE complex_ttbl (id INT4 DEFAULT NEXTVAL('complex_seq'), c COMPLEX) DISTRIBUTED BY (c);
 
 INSERT INTO complex_ttbl(c) VALUES (COMPLEX(NEXTVAL('complex_seq'), NEXTVAL('complex_seq')));
@@ -374,6 +374,11 @@ SELECT * FROM complex_ttbl ORDER BY id;
 SELECT COUNT(c) = 4 AS tr, COUNT(DISTINCT gp_segment_id) = 1 AS tr 
 	FROM complex_ttbl 
 	WHERE re(c) = 0 AND im(c) = 0;
+
+-- Use a complex in GROUP BY, to test the hash function used in hash agg.
+set enable_groupagg = off;
+SELECT c, count(*) FROM complex_ttbl GROUP BY c;
+reset enable_groupagg;
 
 DROP TABLE complex_ttbl;
 DROP SEQUENCE complex_seq;

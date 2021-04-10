@@ -1,7 +1,7 @@
 /*
  * psql - the PostgreSQL interactive terminal
  *
- * Copyright (c) 2000-2014, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2019, PostgreSQL Global Development Group
  *
  * src/bin/psql/prompt.c
  */
@@ -34,6 +34,7 @@
  * %M - database server "hostname.domainname", "[local]" for AF_UNIX
  *		sockets, "[local:/dir/name]" if not default
  * %m - like %M, but hostname only (before first dot), or always "[local]"
+ * %p - backend pid
  * %> - database server port number
  * %n - database user name
  * %/ - current database
@@ -44,6 +45,7 @@
  *		in prompt2 -, *, ', or ";
  *		in prompt3 nothing
  * %x - transaction status: empty, *, !, ? (unknown or no connection)
+ * %l - The line number inside the current statement, starting from 1.
  * %? - the error code of the last query (not yet implemented)
  * %% - a percent sign
  *
@@ -64,7 +66,7 @@
  */
 
 char *
-get_prompt(promptStatus_t status)
+get_prompt(promptStatus_t status, ConditionalStack cstack)
 {
 #define MAX_PROMPT_SIZE 256
 	static char destination[MAX_PROMPT_SIZE + 1];
@@ -160,6 +162,16 @@ get_prompt(promptStatus_t status)
 					if (pset.db)
 						strlcpy(buf, session_username(), sizeof(buf));
 					break;
+					/* backend pid */
+				case 'p':
+					if (pset.db)
+					{
+						int			pid = PQbackendPID(pset.db);
+
+						if (pid)
+							snprintf(buf, sizeof(buf), "%d", pid);
+					}
+					break;
 
 				case '0':
 				case '1':
@@ -169,14 +181,16 @@ get_prompt(promptStatus_t status)
 				case '5':
 				case '6':
 				case '7':
-					*buf = (char) strtol(p, (char **) &p, 8);
+					*buf = (char) strtol(p, unconstify(char **, &p), 8);
 					--p;
 					break;
 				case 'R':
 					switch (status)
 					{
 						case PROMPT_READY:
-							if (!pset.db)
+							if (cstack != NULL && !conditional_active(cstack))
+								buf[0] = '@';
+							else if (!pset.db)
 								buf[0] = '!';
 							else if (!pset.singleline)
 								buf[0] = '=';
@@ -227,6 +241,10 @@ get_prompt(promptStatus_t status)
 								buf[0] = '?';
 								break;
 						}
+					break;
+
+				case 'l':
+					snprintf(buf, sizeof(buf), UINT64_FORMAT, pset.stmt_lineno);
 					break;
 
 				case '?':
@@ -292,7 +310,7 @@ get_prompt(promptStatus_t status)
 					 */
 					buf[0] = (*p == '[') ? RL_PROMPT_START_IGNORE : RL_PROMPT_END_IGNORE;
 					buf[1] = '\0';
-#endif   /* USE_READLINE */
+#endif							/* USE_READLINE */
 					break;
 
 				default:

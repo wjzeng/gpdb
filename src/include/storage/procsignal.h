@@ -4,7 +4,7 @@
  *	  Routines for interprocess signalling
  *
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/storage/procsignal.h
@@ -31,8 +31,8 @@ typedef enum
 {
 	PROCSIG_CATCHUP_INTERRUPT,	/* sinval catchup interrupt */
 	PROCSIG_NOTIFY_INTERRUPT,	/* listen/notify interrupt */
-
-	PROCSIG_QUERY_FINISH,		/* query finish */
+	PROCSIG_PARALLEL_MESSAGE,	/* message from cooperating parallel backend */
+	PROCSIG_WALSND_INIT_STOPPING,	/* ask walsenders to prepare for shutdown  */
 
 	/* Recovery conflict reasons */
 	PROCSIG_RECOVERY_CONFLICT_DATABASE,
@@ -41,6 +41,9 @@ typedef enum
 	PROCSIG_RECOVERY_CONFLICT_SNAPSHOT,
 	PROCSIG_RECOVERY_CONFLICT_BUFFERPIN,
 	PROCSIG_RECOVERY_CONFLICT_STARTUP_DEADLOCK,
+
+	PROCSIG_QUERY_FINISH,		/* query finish */
+	PROCSIG_RESOURCE_GROUP_MOVE_QUERY,	/* move query to a new resource group */
 
 	NUM_PROCSIGNALS				/* Must be last! */
 } ProcSignalReason;
@@ -52,11 +55,9 @@ extern Size ProcSignalShmemSize(void);
 extern void ProcSignalShmemInit(void);
 
 extern void ProcSignalInit(int pss_idx);
-extern int SendProcSignal(pid_t pid, ProcSignalReason reason,
-			   BackendId backendId);
+extern int	SendProcSignal(pid_t pid, ProcSignalReason reason,
+						   BackendId backendId);
 
 extern void procsignal_sigusr1_handler(SIGNAL_ARGS);
-extern PGDLLIMPORT bool set_latch_on_sigusr1;
-extern bool AmIInSIGUSR1Handler(void);
 
-#endif   /* PROCSIGNAL_H */
+#endif							/* PROCSIGNAL_H */

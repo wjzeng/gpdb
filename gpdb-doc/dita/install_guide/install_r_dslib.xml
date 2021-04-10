@@ -8,7 +8,7 @@
       collection of data science-related R libraries that can be used with the Greenplum Database
       PL/R language. You can download these libraries in <codeph>.gppkg</codeph> format from <xref
         href="https://network.pivotal.io/products/pivotal-gpdb" format="html" scope="external"
-        >Pivotal Network</xref>.</p>
+        >VMware Tanzu Network</xref>.</p>
     <p>This chapter contains the following information:</p>
     <ul>
       <li id="py2177">
@@ -22,77 +22,114 @@
       </li>
     </ul>
     <p>For information about the Greenplum Database PL/R Language, see <xref scope="peer"
-        type="topic" format="dita" href="../ref_guide/extensions/pl_r.xml#topic1">Greenplum PL/R
-        Language Extension</xref>.</p>
+        type="topic" format="dita" href="../analytics/pl_r.xml#topic1">Greenplum PL/R Language
+        Extension</xref>.</p>
   </body>
   <topic xml:lang="en" id="topic2">
     <title>R Data Science Libraries</title>
     <body>
-      <p> Libraries provided in the R Data Science package include: <simpletable id="l33">
+      <p>Libraries provided in the R Data Science package include: <simpletable id="l33">
           <strow>
             <stentry>
               <p>abind</p>
               <p>adabag</p>
               <p>arm</p>
               <p>assertthat</p>
+              <p>backports</p>
               <p>BH</p>
               <p>bitops</p>
               <p>car</p>
               <p>caret</p>
               <p>caTools</p>
+              <p>cli</p>
+              <p>clipr</p>
               <p>coda</p>
               <p>colorspace</p>
               <p>compHclust</p>
+              <p>crayon</p>
               <p>curl</p>
               <p>data.table</p>
               <p>DBI</p>
+              <p>Deriv</p>
               <p>dichromat</p>
               <p>digest</p>
+              <p>doParallel</p>
               <p>dplyr</p>
               <p>e1071</p>
+              <p>fansi</p>
+              <p>fastICA</p>
+              <p>fBasics</p>
+              <p>fGarch</p>
               <p>flashClust</p>
+              <p>foreach</p>
               <p>forecast</p>
               <p>foreign</p>
+              <p>fracdiff</p>
               <p>gdata</p>
+              <p>generics</p>
               <p>ggplot2</p>
+              <p>glmnet</p>
+              <p>glue</p>
+              <p>gower</p>
+              <p>gplots</p>
             </stentry>
             <stentry>
-              <p>glmnet</p>
-              <p>gplots</p>
+              <p>gss</p>
               <p>gtable</p>
               <p>gtools</p>
               <p>hms</p>
               <p>hybridHclust</p>
               <p>igraph</p>
+              <p>ipred</p>
+              <p>iterators</p>
               <p>labeling</p>
               <p>lattice</p>
+              <p>lava</p>
               <p>lazyeval</p>
               <p>lme4</p>
               <p>lmtest</p>
+              <p>lubridate</p>
               <p>magrittr</p>
               <p>MASS</p>
               <p>Matrix</p>
-              <p>MCMCPack</p>
+              <p>MatrixModels</p>
+              <p>mcmc</p>
+              <p>MCMCpack</p>
               <p>minqa</p>
+              <p>ModelMetrics</p>
               <p>MTS</p>
               <p>munsell</p>
+              <p>mvtnorm</p>
               <p>neuralnet</p>
               <p>nloptr</p>
               <p>nnet</p>
+              <p>numDeriv</p>
               <p>pbkrtest</p>
+              <p>pillar</p>
+              <p>pkgconfig</p>
+              <p>plogr</p>
               <p>plyr</p>
-            </stentry>
-            <stentry>
+              <p>prodlim</p>
+              <p>purrr</p>
+              <p>quadprog</p>
+              <p>quantmod</p>
               <p>quantreg</p>
               <p>R2jags</p>
+            </stentry>
+            <stentry>
+              <p>R2WinBUGS</p>
               <p>R6</p>
               <p>randomForest</p>
               <p>RColorBrewer</p>
               <p>Rcpp</p>
+              <p>RcppArmadillo</p>
               <p>RcppEigen</p>
+              <p>RcppRoll</p>
               <p>readr</p>
+              <p>recipes</p>
               <p>reshape2</p>
               <p>rjags</p>
+              <p>rlang</p>
               <p>RobustRankAggreg</p>
               <p>ROCR</p>
               <p>rpart</p>
@@ -100,11 +137,25 @@
               <p>sandwich</p>
               <p>scales</p>
               <p>SparseM</p>
+              <p>SQUAREM</p>
+              <p>stabledist</p>
               <p>stringi</p>
               <p>stringr</p>
               <p>survival</p>
               <p>tibble</p>
+              <p>tidyr</p>
+              <p>tidyselect</p>
+              <p>timeDate</p>
+              <p>timeSeries</p>
               <p>tseries</p>
+              <p>TTR</p>
+              <p>urca</p>
+              <p>utf8</p>
+              <p>vctrs</p>
+              <p>viridisLite</p>
+              <p>withr</p>
+              <p>xts</p>
+              <p>zeallot</p>
               <p>zoo</p>
             </stentry>
           </strow>
@@ -121,10 +172,10 @@
       <ol>
         <li>Locate the R Data Science library package that you built or downloaded.<p>The file name
             format of the package is
-              <codeph>DataScienceR-&lt;version&gt;-relhel&lt;N&gt;-x86_64.gppkg</codeph>.</p></li>
-        <li>Copy the package to the Greenplum Database master host.</li>
+              <codeph>DataScienceR-&lt;version&gt;-relhel&lt;N&gt;_x86_64.gppkg</codeph>.</p></li>
+        <li>Copy the package to the Greenplum Database coordinator host.</li>
         <li>Use the <codeph>gppkg</codeph> command to install the package. For
-              example:<codeblock>$ gppkg -i DataScienceR-&lt;version&gt;-relhel&lt;N&gt;-x86_64.gppkg</codeblock><p><codeph>gppkg</codeph>
+              example:<codeblock>$ gppkg -i DataScienceR-&lt;version&gt;-relhel&lt;N&gt;_x86_64.gppkg</codeblock><p><codeph>gppkg</codeph>
             installs the R Data Science libraries on all nodes in your Greenplum Database cluster.
             The command also sets the <codeph>R_LIBS_USER</codeph> environment variable and updates
             the <codeph>PATH</codeph> and <codeph>LD_LIBRARY_PATH</codeph> environment variables in

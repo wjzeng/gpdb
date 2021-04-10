@@ -3,12 +3,12 @@
 --
 --
 -- start_matchsubs
--- m/could not find segment file to use for inserting into relation ao .*/
--- s/could not find segment file to use for inserting into relation ao .*/could not find segment file to use for inserting into relation ao ###/
+-- m/could not find segment file to use for inserting into relation "ao" .*/
+-- s/could not find segment file to use for inserting into relation "ao" .*/could not find segment file to use for inserting into relation "ao" ###/
 -- end_matchsubs
 
 DROP TABLE IF EXISTS ao;
-CREATE TABLE ao (a INT, b INT) WITH (appendonly=true, orientation=@orientation@);
+CREATE TABLE ao (a INT, b INT) USING @amname@;
 
 ALTER RESOURCE GROUP admin_group SET CONCURRENCY 130;
 

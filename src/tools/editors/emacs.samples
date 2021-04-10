@@ -30,7 +30,12 @@
 (add-hook 'c-mode-hook
           (defun postgresql-c-mode-hook ()
             (when (string-match "/postgres\\(ql\\)?/" buffer-file-name)
-              (c-set-style "postgresql"))))
+              (c-set-style "postgresql")
+              ;; Don't override the style we just set with the style in
+              ;; `dir-locals-file'.  Emacs 23.4.1 needs this; it is obsolete,
+              ;; albeit harmless, by Emacs 24.3.1.
+              (set (make-local-variable 'ignored-local-variables)
+                   (append '(c-file-style) ignored-local-variables)))))
 
 
 ;;; Perl files
@@ -42,10 +47,14 @@
   (interactive)
   (setq perl-brace-imaginary-offset 0)
   (setq perl-brace-offset 0)
-  (setq perl-continued-brace-offset 4)
-  (setq perl-continued-statement-offset 4)
+  (setq perl-continued-statement-offset 2)
+  (setq perl-continued-brace-offset (- perl-continued-statement-offset))
   (setq perl-indent-level 4)
   (setq perl-label-offset -2)
+  ;; Next two aren't marked safe-local-variable, so .dir-locals.el omits them.
+  (setq perl-indent-continued-arguments 4)
+  (setq perl-indent-parens-as-block t)
+  (setq indent-tabs-mode t)
   (setq tab-width 4))
 
 (add-hook 'perl-mode-hook
@@ -56,12 +65,23 @@
 
 ;;; documentation files
 
-(add-hook 'sgml-mode-hook
-          (defun postgresql-sgml-mode-hook ()
+;; *.sgml files are actually XML
+(add-to-list 'auto-mode-alist '("/postgres\\(ql\\)?/.*\\.sgml\\'" . nxml-mode))
+
+(add-hook 'nxml-mode-hook
+          (defun postgresql-xml-mode-hook ()
              (when (string-match "/postgres\\(ql\\)?/" buffer-file-name)
                (setq fill-column 78)
-               (setq indent-tabs-mode nil)
-               (setq sgml-basic-offset 1))))
+               (setq indent-tabs-mode nil))))
+
+;; The *.xsl files use 2-space indent, which is consistent with
+;; docbook-xsl sources and also the nxml-mode default.  But the *.sgml
+;; files use 1-space indent, mostly for historical reasons at this
+;; point.
+(add-hook 'nxml-mode-hook
+          (defun postgresql-xml-src-mode-hook ()
+             (when (string-match "/postgres\\(ql\\)?/.*\\.sgml\\'" buffer-file-name)
+               (setq nxml-child-indent 1))))
 
 
 ;;; Makefiles

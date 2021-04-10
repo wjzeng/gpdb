@@ -1,14 +1,15 @@
 /*
  * psql - the PostgreSQL interactive terminal
  *
- * Copyright (c) 2000-2014, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2019, PostgreSQL Global Development Group
  *
  * src/bin/psql/common.c
  */
 #include "postgres_fe.h"
-#include "common.h"
 
 #include <ctype.h>
+#include <limits.h>
+#include <math.h>
 #include <signal.h>
 #ifndef WIN32
 #include <unistd.h>				/* for write() */
@@ -17,31 +18,79 @@
 #include <win32.h>
 #endif
 
+#include "common/logging.h"
+#include "fe_utils/mbprint.h"
+#include "fe_utils/string_utils.h"
 #include "portability/instr_time.h"
 
-#include "settings.h"
 #include "command.h"
+#include "common.h"
 #include "copy.h"
-#include "mbprint.h"
+#include "crosstabview.h"
+#include "settings.h"
 
 
-
+static bool DescribeQuery(const char *query, double *elapsed_msec);
 static bool ExecQueryUsingCursor(const char *query, double *elapsed_msec);
 static bool command_no_begin(const char *query);
 static bool is_select_command(const char *query);
+
+
+/*
+ * openQueryOutputFile --- attempt to open a query output file
+ *
+ * fname == NULL selects stdout, else an initial '|' selects a pipe,
+ * else plain file.
+ *
+ * Returns output file pointer into *fout, and is-a-pipe flag into *is_pipe.
+ * Caller is responsible for adjusting SIGPIPE state if it's a pipe.
+ *
+ * On error, reports suitable error message and returns false.
+ */
+bool
+openQueryOutputFile(const char *fname, FILE **fout, bool *is_pipe)
+{
+	if (!fname || fname[0] == '\0')
+	{
+		*fout = stdout;
+		*is_pipe = false;
+	}
+	else if (*fname == '|')
+	{
+		*fout = popen(fname + 1, "w");
+		*is_pipe = true;
+	}
+	else
+	{
+		*fout = fopen(fname, "w");
+		*is_pipe = false;
+	}
+
+	if (*fout == NULL)
+	{
+		pg_log_error("%s: %m", fname);
+		return false;
+	}
+
+	return true;
+}
 
 /*
  * setQFout
  * -- handler for -o command line option and \o command
  *
- * Tries to open file fname (or pipe if fname starts with '|')
- * and stores the file handle in pset)
- * Upon failure, sets stdout and returns false.
+ * On success, updates pset with the new output file and returns true.
+ * On failure, returns false without changing pset state.
  */
 bool
 setQFout(const char *fname)
 {
-	bool		status = true;
+	FILE	   *fout;
+	bool		is_pipe;
+
+	/* First make sure we can open the new output file/pipe */
+	if (!openQueryOutputFile(fname, &fout, &is_pipe))
+		return false;
 
 	/* Close old file/pipe */
 	if (pset.queryFout && pset.queryFout != stdout && pset.queryFout != stderr)
@@ -52,62 +101,117 @@ setQFout(const char *fname)
 			fclose(pset.queryFout);
 	}
 
-	/* If no filename, set stdout */
-	if (!fname || fname[0] == '\0')
-	{
-		pset.queryFout = stdout;
-		pset.queryFoutPipe = false;
-	}
-	else if (*fname == '|')
-	{
-		pset.queryFout = popen(fname + 1, "w");
-		pset.queryFoutPipe = true;
-	}
-	else
-	{
-		pset.queryFout = fopen(fname, "w");
-		pset.queryFoutPipe = false;
-	}
+	pset.queryFout = fout;
+	pset.queryFoutPipe = is_pipe;
 
-	if (!(pset.queryFout))
-	{
-		psql_error("%s: %s\n", fname, strerror(errno));
-		pset.queryFout = stdout;
-		pset.queryFoutPipe = false;
-		status = false;
-	}
+	/* Adjust SIGPIPE handling appropriately: ignore signal if is_pipe */
+	set_sigpipe_trap_state(is_pipe);
+	restore_sigpipe_trap();
 
-	/* Direct signals */
-#ifndef WIN32
-	pqsignal(SIGPIPE, pset.queryFoutPipe ? SIG_IGN : SIG_DFL);
-#endif
-
-	return status;
+	return true;
 }
-
 
 
 /*
- * Error reporting for scripts. Errors should look like
- *	 psql:filename:lineno: message
+ * Variable-fetching callback for flex lexer
  *
+ * If the specified variable exists, return its value as a string (malloc'd
+ * and expected to be freed by the caller); else return NULL.
+ *
+ * If "quote" isn't PQUOTE_PLAIN, then return the value suitably quoted and
+ * escaped for the specified quoting requirement.  (Failure in escaping
+ * should lead to printing an error and returning NULL.)
+ *
+ * "passthrough" is the pointer previously given to psql_scan_set_passthrough.
+ * In psql, passthrough points to a ConditionalStack, which we check to
+ * determine whether variable expansion is allowed.
  */
-void
-psql_error(const char *fmt,...)
+char *
+psql_get_variable(const char *varname, PsqlScanQuoteType quote,
+				  void *passthrough)
 {
-	va_list		ap;
+	char	   *result = NULL;
+	const char *value;
 
-	fflush(stdout);
-	if (pset.queryFout && pset.queryFout != stdout)
-		fflush(pset.queryFout);
+	/* In an inactive \if branch, suppress all variable substitutions */
+	if (passthrough && !conditional_active((ConditionalStack) passthrough))
+		return NULL;
 
-	if (pset.inputfile)
-		fprintf(stderr, "%s:%s:" UINT64_FORMAT ": ", pset.progname, pset.inputfile, pset.lineno);
-	va_start(ap, fmt);
-	vfprintf(stderr, _(fmt), ap);
-	va_end(ap);
+	value = GetVariable(pset.vars, varname);
+	if (!value)
+		return NULL;
+
+	switch (quote)
+	{
+		case PQUOTE_PLAIN:
+			result = pg_strdup(value);
+			break;
+		case PQUOTE_SQL_LITERAL:
+		case PQUOTE_SQL_IDENT:
+			{
+				/*
+				 * For these cases, we use libpq's quoting functions, which
+				 * assume the string is in the connection's client encoding.
+				 */
+				char	   *escaped_value;
+
+				if (!pset.db)
+				{
+					pg_log_error("cannot escape without active connection");
+					return NULL;
+				}
+
+				if (quote == PQUOTE_SQL_LITERAL)
+					escaped_value =
+						PQescapeLiteral(pset.db, value, strlen(value));
+				else
+					escaped_value =
+						PQescapeIdentifier(pset.db, value, strlen(value));
+
+				if (escaped_value == NULL)
+				{
+					const char *error = PQerrorMessage(pset.db);
+
+					pg_log_info("%s", error);
+					return NULL;
+				}
+
+				/*
+				 * Rather than complicate the lexer's API with a notion of
+				 * which free() routine to use, just pay the price of an extra
+				 * strdup().
+				 */
+				result = pg_strdup(escaped_value);
+				PQfreemem(escaped_value);
+				break;
+			}
+		case PQUOTE_SHELL_ARG:
+			{
+				/*
+				 * For this we use appendShellStringNoError, which is
+				 * encoding-agnostic, which is fine since the shell probably
+				 * is too.  In any case, the only special character is "'",
+				 * which is not known to appear in valid multibyte characters.
+				 */
+				PQExpBufferData buf;
+
+				initPQExpBuffer(&buf);
+				if (!appendShellStringNoError(&buf, value))
+				{
+					pg_log_error("shell command argument contains a newline or carriage return: \"%s\"",
+								 value);
+					free(buf.data);
+					return NULL;
+				}
+				result = buf.data;
+				break;
+			}
+
+			/* No default: we want a compiler warning for missing cases */
+	}
+
+	return result;
 }
-
 
 
 /*
@@ -117,7 +221,7 @@ void
 NoticeProcessor(void *arg, const char *message)
 {
 	(void) arg;					/* not used */
-	psql_error("%s", message);
+	pg_log_info("%s", message);
 }
 
 
@@ -141,7 +245,7 @@ NoticeProcessor(void *arg, const char *message)
  * database queries.  In most places, this is accomplished by checking
  * cancel_pressed during long-running loops.  However, that won't work when
  * blocked on user input (in readline() or fgets()).  In those places, we
- * set sigint_interrupt_enabled TRUE while blocked, instructing the signal
+ * set sigint_interrupt_enabled true while blocked, instructing the signal
  * catcher to longjmp through sigint_interrupt_jmp.  We assume readline and
  * fgets are coded to handle possible interruption.  (XXX currently this does
  * not work on win32, so control-C is less useful there)
@@ -156,8 +260,18 @@ static PGcancel *volatile cancelConn = NULL;
 static CRITICAL_SECTION cancelConnLock;
 #endif
 
-/* Used from signal handlers, no buffering */
-#define write_stderr(str)	write(fileno(stderr), str, strlen(str))
+/*
+ * Write a simple string to stderr --- must be safe in a signal handler.
+ * We ignore the write() result since there's not much we could do about it.
+ * Certain compilers make that harder than it ought to be.
+ */
+#define write_stderr(str) \
+	do { \
+		const char *str_ = (str); \
+		int		rc_; \
+		rc_ = write(fileno(stderr), str_, strlen(str_)); \
+		(void) rc_; \
+	} while (0)
 
 
 #ifndef WIN32
@@ -166,7 +280,6 @@ static void
 handle_sigint(SIGNAL_ARGS)
 {
 	int			save_errno = errno;
-	int			rc;
 	char		errbuf[256];
 
 	/* if we are waiting for input, longjmp out of it */
@@ -183,16 +296,11 @@ handle_sigint(SIGNAL_ARGS)
 	if (cancelConn != NULL)
 	{
 		if (PQcancel(cancelConn, errbuf, sizeof(errbuf)))
-		{
-			rc = write_stderr("Cancel request sent\n");
-			(void) rc;			/* ignore errors, nothing we can do here */
-		}
+			write_stderr("Cancel request sent\n");
 		else
 		{
-			rc = write_stderr("Could not send cancel request: ");
-			(void) rc;			/* ignore errors, nothing we can do here */
-			rc = write_stderr(errbuf);
-			(void) rc;			/* ignore errors, nothing we can do here */
+			write_stderr("Could not send cancel request: ");
+			write_stderr(errbuf);
 		}
 	}
 
@@ -249,7 +357,7 @@ setup_cancel_handler(void)
 
 	SetConsoleCtrlHandler(consoleHandler, TRUE);
 }
-#endif   /* WIN32 */
+#endif							/* WIN32 */
 
 
 /* ConnectionUp
@@ -284,23 +392,23 @@ CheckConnection(void)
 	{
 		if (!pset.cur_cmd_interactive)
 		{
-			psql_error("connection to server was lost\n");
+			pg_log_fatal("connection to server was lost");
 			exit(EXIT_BADCONN);
 		}
 
-		psql_error("The connection to the server was lost. Attempting reset: ");
+		fprintf(stderr, _("The connection to the server was lost. Attempting reset: "));
 		PQreset(pset.db);
 		OK = ConnectionUp();
 		if (!OK)
 		{
-			psql_error("Failed.\n");
+			fprintf(stderr, _("Failed.\n"));
 			PQfinish(pset.db);
 			pset.db = NULL;
 			ResetCancelConn();
 			UnsyncVariables();
 		}
 		else
-			psql_error("Succeeded.\n");
+			fprintf(stderr, _("Succeeded.\n"));
 	}
 
 	return OK;
@@ -400,8 +508,8 @@ AcceptResult(const PGresult *result)
 
 			default:
 				OK = false;
-				psql_error("unexpected PQresultStatus: %d\n",
-						   PQresultStatus(result));
+				pg_log_error("unexpected PQresultStatus: %d",
+							 PQresultStatus(result));
 				break;
 		}
 
@@ -410,7 +518,7 @@ AcceptResult(const PGresult *result)
 		const char *error = PQerrorMessage(pset.db);
 
 		if (strlen(error))
-			psql_error("%s", error);
+			pg_log_info("%s", error);
 
 		CheckConnection();
 	}
@@ -419,16 +527,137 @@ AcceptResult(const PGresult *result)
 }
 
 
+/*
+ * Set special variables from a query result
+ * - ERROR: true/false, whether an error occurred on this query
+ * - SQLSTATE: code of error, or "00000" if no error, or "" if unknown
+ * - ROW_COUNT: how many rows were returned or affected, or "0"
+ * - LAST_ERROR_SQLSTATE: same for last error
+ * - LAST_ERROR_MESSAGE: message of last error
+ *
+ * Note: current policy is to apply this only to the results of queries
+ * entered by the user, not queries generated by slash commands.
+ */
+static void
+SetResultVariables(PGresult *results, bool success)
+{
+	if (success)
+	{
+		const char *ntuples = PQcmdTuples(results);
+
+		SetVariable(pset.vars, "ERROR", "false");
+		SetVariable(pset.vars, "SQLSTATE", "00000");
+		SetVariable(pset.vars, "ROW_COUNT", *ntuples ? ntuples : "0");
+	}
+	else
+	{
+		const char *code = PQresultErrorField(results, PG_DIAG_SQLSTATE);
+		const char *mesg = PQresultErrorField(results, PG_DIAG_MESSAGE_PRIMARY);
+
+		SetVariable(pset.vars, "ERROR", "true");
+
+		/*
+		 * If there is no SQLSTATE code, use an empty string.  This can happen
+		 * for libpq-detected errors (e.g., lost connection, ENOMEM).
+		 */
+		if (code == NULL)
+			code = "";
+		SetVariable(pset.vars, "SQLSTATE", code);
+		SetVariable(pset.vars, "ROW_COUNT", "0");
+		SetVariable(pset.vars, "LAST_ERROR_SQLSTATE", code);
+		SetVariable(pset.vars, "LAST_ERROR_MESSAGE", mesg ? mesg : "");
+	}
+}
+
+
+/*
+ * ClearOrSaveResult
+ *
+ * If the result represents an error, remember it for possible display by
+ * \errverbose.  Otherwise, just PQclear() it.
+ *
+ * Note: current policy is to apply this to the results of all queries,
+ * including "back door" queries, for debugging's sake.  It's OK to use
+ * PQclear() directly on results known to not be error results, however.
+ */
+static void
+ClearOrSaveResult(PGresult *result)
+{
+	if (result)
+	{
+		switch (PQresultStatus(result))
+		{
+			case PGRES_NONFATAL_ERROR:
+			case PGRES_FATAL_ERROR:
+				if (pset.last_error_result)
+					PQclear(pset.last_error_result);
+				pset.last_error_result = result;
+				break;
+
+			default:
+				PQclear(result);
+				break;
+		}
+	}
+}
+
+
+/*
+ * Print microtiming output.  Always print raw milliseconds; if the interval
+ * is >= 1 second, also break it down into days/hours/minutes/seconds.
+ */
+static void
+PrintTiming(double elapsed_msec)
+{
+	double		seconds;
+	double		minutes;
+	double		hours;
+	double		days;
+
+	if (elapsed_msec < 1000.0)
+	{
+		/* This is the traditional (pre-v10) output format */
+		printf(_("Time: %.3f ms\n"), elapsed_msec);
+		return;
+	}
+
+	/*
+	 * Note: we could print just seconds, in a format like %06.3f, when the
+	 * total is less than 1min.  But that's hard to interpret unless we tack
+	 * on "s" or otherwise annotate it.  Forcing the display to include
+	 * minutes seems like a better solution.
+	 */
+	seconds = elapsed_msec / 1000.0;
+	minutes = floor(seconds / 60.0);
+	seconds -= 60.0 * minutes;
+	if (minutes < 60.0)
+	{
+		printf(_("Time: %.3f ms (%02d:%06.3f)\n"),
+			   elapsed_msec, (int) minutes, seconds);
+		return;
+	}
+
+	hours = floor(minutes / 60.0);
+	minutes -= 60.0 * hours;
+	if (hours < 24.0)
+	{
+		printf(_("Time: %.3f ms (%02d:%02d:%06.3f)\n"),
+			   elapsed_msec, (int) hours, (int) minutes, seconds);
+		return;
+	}
+
+	days = floor(hours / 24.0);
+	hours -= 24.0 * days;
+	printf(_("Time: %.3f ms (%.0f d %02d:%02d:%06.3f)\n"),
+		   elapsed_msec, days, (int) hours, (int) minutes, seconds);
+}
+
 
 /*
  * PSQLexec
  *
  * This is the way to send "backdoor" queries (those not directly entered
  * by the user). It is subject to -E but not -e.
- *
- * In autocommit-off mode, a new transaction block is started if start_xact
- * is true; nothing special is done when start_xact is false.  Typically,
- * start_xact = false is used for SELECTs and explicit BEGIN/COMMIT commands.
  *
  * Caller is responsible for handling the ensuing processing if a COPY
  * command is sent.
@@ -437,13 +666,13 @@ AcceptResult(const PGresult *result)
  * caller uses this path to issue "SET CLIENT_ENCODING".
  */
 PGresult *
-PSQLexec(const char *query, bool start_xact)
+PSQLexec(const char *query)
 {
 	PGresult   *res;
 
 	if (!pset.db)
 	{
-		psql_error("You are currently not connected to a database.\n");
+		pg_log_error("You are currently not connected to a database.");
 		return NULL;
 	}
 
@@ -468,20 +697,47 @@ PSQLexec(const char *query, bool start_xact)
 
 	SetCancelConn();
 
-	if (start_xact &&
-		!pset.autocommit &&
-		PQtransactionStatus(pset.db) == PQTRANS_IDLE)
+	res = PQexec(pset.db, query);
+
+	ResetCancelConn();
+
+	if (!AcceptResult(res))
 	{
-		res = PQexec(pset.db, "BEGIN");
-		if (PQresultStatus(res) != PGRES_COMMAND_OK)
-		{
-			psql_error("%s", PQerrorMessage(pset.db));
-			PQclear(res);
-			ResetCancelConn();
-			return NULL;
-		}
-		PQclear(res);
+		ClearOrSaveResult(res);
+		res = NULL;
 	}
+
+	return res;
+}
+
+
+/*
+ * PSQLexecWatch
+ *
+ * This function is used for \watch command to send the query to
+ * the server and print out the results.
+ *
+ * Returns 1 if the query executed successfully, 0 if it cannot be repeated,
+ * e.g., because of the interrupt, -1 on error.
+ */
+int
+PSQLexecWatch(const char *query, const printQueryOpt *opt)
+{
+	PGresult   *res;
+	double		elapsed_msec = 0;
+	instr_time	before;
+	instr_time	after;
+
+	if (!pset.db)
+	{
+		pg_log_error("You are currently not connected to a database.");
+		return 0;
+	}
+
+	SetCancelConn();
+
+	if (pset.timing)
+		INSTR_TIME_SET_CURRENT(before);
 
 	res = PQexec(pset.db, query);
 
@@ -489,13 +745,66 @@ PSQLexec(const char *query, bool start_xact)
 
 	if (!AcceptResult(res))
 	{
-		PQclear(res);
-		res = NULL;
+		ClearOrSaveResult(res);
+		return 0;
 	}
 
-	return res;
-}
+	if (pset.timing)
+	{
+		INSTR_TIME_SET_CURRENT(after);
+		INSTR_TIME_SUBTRACT(after, before);
+		elapsed_msec = INSTR_TIME_GET_MILLISEC(after);
+	}
 
+	/*
+	 * If SIGINT is sent while the query is processing, the interrupt will be
+	 * consumed.  The user's intention, though, is to cancel the entire watch
+	 * process, so detect a sent cancellation request and exit in this case.
+	 */
+	if (cancel_pressed)
+	{
+		PQclear(res);
+		return 0;
+	}
+
+	switch (PQresultStatus(res))
+	{
+		case PGRES_TUPLES_OK:
+			printQuery(res, opt, pset.queryFout, false, pset.logfile);
+			break;
+
+		case PGRES_COMMAND_OK:
+			fprintf(pset.queryFout, "%s\n%s\n\n", opt->title, PQcmdStatus(res));
+			break;
+
+		case PGRES_EMPTY_QUERY:
+			pg_log_error("\\watch cannot be used with an empty query");
+			PQclear(res);
+			return -1;
+
+		case PGRES_COPY_OUT:
+		case PGRES_COPY_IN:
+		case PGRES_COPY_BOTH:
+			pg_log_error("\\watch cannot be used with COPY");
+			PQclear(res);
+			return -1;
+
+		default:
+			pg_log_error("unexpected result status for \\watch");
+			PQclear(res);
+			return -1;
+	}
+
+	PQclear(res);
+
+	fflush(pset.queryFout);
+
+	/* Possible microtiming output */
+	if (pset.timing)
+		PrintTiming(elapsed_msec);
+
+	return 1;
+}
 
 
 /*
@@ -506,7 +815,8 @@ PrintNotifications(void)
 {
 	PGnotify   *notify;
 
-	while ((notify = PQnotifies(pset.db)))
+	PQconsumeInput(pset.db);
+	while ((notify = PQnotifies(pset.db)) != NULL)
 	{
 		/* for backward compatibility, only show payload if nonempty */
 		if (notify->extra[0])
@@ -517,6 +827,7 @@ PrintNotifications(void)
 					notify->relname, notify->be_pid);
 		fflush(pset.queryFout);
 		PQfreemem(notify);
+		PQconsumeInput(pset.db);
 	}
 }
 
@@ -531,33 +842,33 @@ PrintQueryTuples(const PGresult *results)
 {
 	printQueryOpt my_popt = pset.popt;
 
+	/* one-shot expanded output requested via \gx */
+	if (pset.g_expanded)
+		my_popt.topt.expanded = 1;
+
 	/* write output to \g argument, if any */
 	if (pset.gfname)
 	{
-		/* keep this code in sync with ExecQueryUsingCursor */
-		FILE	   *queryFout_copy = pset.queryFout;
-		bool		queryFoutPipe_copy = pset.queryFoutPipe;
+		FILE	   *fout;
+		bool		is_pipe;
 
-		pset.queryFout = stdout;	/* so it doesn't get closed */
-
-		/* open file/pipe */
-		if (!setQFout(pset.gfname))
-		{
-			pset.queryFout = queryFout_copy;
-			pset.queryFoutPipe = queryFoutPipe_copy;
+		if (!openQueryOutputFile(pset.gfname, &fout, &is_pipe))
 			return false;
+		if (is_pipe)
+			disable_sigpipe_trap();
+
+		printQuery(results, &my_popt, fout, false, pset.logfile);
+
+		if (is_pipe)
+		{
+			pclose(fout);
+			restore_sigpipe_trap();
 		}
-
-		printQuery(results, &my_popt, pset.queryFout, pset.logfile);
-
-		/* close file/pipe, restore old setting */
-		setQFout(NULL);
-
-		pset.queryFout = queryFout_copy;
-		pset.queryFoutPipe = queryFoutPipe_copy;
+		else
+			fclose(fout);
 	}
 	else
-		printQuery(results, &my_popt, pset.queryFout, pset.logfile);
+		printQuery(results, &my_popt, pset.queryFout, false, pset.logfile);
 
 	return true;
 }
@@ -575,12 +886,12 @@ StoreQueryTuple(const PGresult *result)
 
 	if (PQntuples(result) < 1)
 	{
-		psql_error("no rows returned for \\gset\n");
+		pg_log_error("no rows returned for \\gset");
 		success = false;
 	}
 	else if (PQntuples(result) > 1)
 	{
-		psql_error("more than one row returned for \\gset\n");
+		pg_log_error("more than one row returned for \\gset");
 		success = false;
 	}
 	else
@@ -593,7 +904,7 @@ StoreQueryTuple(const PGresult *result)
 			char	   *varname;
 			char	   *value;
 
-			/* concate prefix and column name */
+			/* concatenate prefix and column name */
 			varname = psprintf("%s%s", pset.gset_prefix, colname);
 
 			if (!PQgetisnull(result, 0, i))
@@ -606,7 +917,6 @@ StoreQueryTuple(const PGresult *result)
 
 			if (!SetVariable(pset.vars, varname, value))
 			{
-				psql_error("could not set variable \"%s\"\n", varname);
 				free(varname);
 				success = false;
 				break;
@@ -616,6 +926,76 @@ StoreQueryTuple(const PGresult *result)
 		}
 	}
 
+	return success;
+}
+
+
+/*
+ * ExecQueryTuples: assuming query result is OK, execute each query
+ * result field as a SQL statement
+ *
+ * Returns true if successful, false otherwise.
+ */
+static bool
+ExecQueryTuples(const PGresult *result)
+{
+	bool		success = true;
+	int			nrows = PQntuples(result);
+	int			ncolumns = PQnfields(result);
+	int			r,
+				c;
+
+	/*
+	 * We must turn off gexec_flag to avoid infinite recursion.  Note that
+	 * this allows ExecQueryUsingCursor to be applied to the individual query
+	 * results.  SendQuery prevents it from being applied when fetching the
+	 * queries-to-execute, because it can't handle recursion either.
+	 */
+	pset.gexec_flag = false;
+
+	for (r = 0; r < nrows; r++)
+	{
+		for (c = 0; c < ncolumns; c++)
+		{
+			if (!PQgetisnull(result, r, c))
+			{
+				const char *query = PQgetvalue(result, r, c);
+
+				/* Abandon execution if cancel_pressed */
+				if (cancel_pressed)
+					goto loop_exit;
+
+				/*
+				 * ECHO_ALL mode should echo these queries, but SendQuery
+				 * assumes that MainLoop did that, so we have to do it here.
+				 */
+				if (pset.echo == PSQL_ECHO_ALL && !pset.singlestep)
+				{
+					puts(query);
+					fflush(stdout);
+				}
+
+				if (!SendQuery(query))
+				{
+					/* Error - abandon execution if ON_ERROR_STOP */
+					success = false;
+					if (pset.on_error_stop)
+						goto loop_exit;
+				}
+			}
+		}
+	}
+
+loop_exit:
+
+	/*
+	 * Restore state.  We know gexec_flag was on, else we'd not be here. (We
+	 * also know it'll get turned off at end of command, but that's not ours
+	 * to do here.)
+	 */
+	pset.gexec_flag = true;
+
+	/* Return true if all queries were successful */
 	return success;
 }
 
@@ -680,7 +1060,7 @@ ProcessResult(PGresult **results)
 			default:
 				/* AcceptResult() should have caught anything else. */
 				is_copy = false;
-				psql_error("unexpected PQresultStatus: %d\n", result_status);
+				pg_log_error("unexpected PQresultStatus: %d", result_status);
 				break;
 		}
 
@@ -691,20 +1071,49 @@ ProcessResult(PGresult **results)
 			 * connection out of its COPY state, then call PQresultStatus()
 			 * once and report any error.
 			 *
-			 * If pset.copyStream is set, use that as data source/sink,
-			 * otherwise use queryFout or cur_cmd_source as appropriate.
+			 * For COPY OUT, direct the output to pset.copyStream if it's set,
+			 * otherwise to pset.gfname if it's set, otherwise to queryFout.
+			 * For COPY IN, use pset.copyStream as data source if it's set,
+			 * otherwise cur_cmd_source.
 			 */
-			FILE	   *copystream = pset.copyStream;
+			FILE	   *copystream;
 			PGresult   *copy_result;
 
 			SetCancelConn();
 			if (result_status == PGRES_COPY_OUT)
 			{
-				if (!copystream)
+				bool		need_close = false;
+				bool		is_pipe = false;
+
+				if (pset.copyStream)
+				{
+					/* invoked by \copy */
+					copystream = pset.copyStream;
+				}
+				else if (pset.gfname)
+				{
+					/* invoked by \g */
+					if (openQueryOutputFile(pset.gfname,
+											&copystream, &is_pipe))
+					{
+						need_close = true;
+						if (is_pipe)
+							disable_sigpipe_trap();
+					}
+					else
+						copystream = NULL;	/* discard COPY data entirely */
+				}
+				else
+				{
+					/* fall back to the generic query output stream */
 					copystream = pset.queryFout;
+				}
+
 				success = handleCopyOut(pset.db,
 										copystream,
-										&copy_result) && success;
+										&copy_result)
+					&& success
+					&& (copystream != NULL);
 
 				/*
 				 * Suppress status printing if the report would go to the same
@@ -716,11 +1125,25 @@ ProcessResult(PGresult **results)
 					PQclear(copy_result);
 					copy_result = NULL;
 				}
+
+				if (need_close)
+				{
+					/* close \g argument file/pipe */
+					if (is_pipe)
+					{
+						pclose(copystream);
+						restore_sigpipe_trap();
+					}
+					else
+					{
+						fclose(copystream);
+					}
+				}
 			}
 			else
 			{
-				if (!copystream)
-					copystream = pset.cur_cmd_source;
+				/* COPY IN */
+				copystream = pset.copyStream ? pset.copyStream : pset.cur_cmd_source;
 				success = handleCopyIn(pset.db,
 									   copystream,
 									   PQbinaryTuples(*results),
@@ -754,6 +1177,8 @@ ProcessResult(PGresult **results)
 		*results = next_result;
 		first_cycle = false;
 	}
+
+	SetResultVariables(*results, success);
 
 	/* may need this to recover from conn loss during COPY */
 	if (!first_cycle && !CheckConnection())
@@ -794,7 +1219,7 @@ PrintQueryStatus(PGresult *results)
 
 
 /*
- * PrintQueryResults: print out (or store) query results as required
+ * PrintQueryResults: print out (or store or execute) query results as required
  *
  * Note: Utility function for use by SendQuery() only.
  *
@@ -812,9 +1237,13 @@ PrintQueryResults(PGresult *results)
 	switch (PQresultStatus(results))
 	{
 		case PGRES_TUPLES_OK:
-			/* store or print the data ... */
+			/* store or execute or print the data ... */
 			if (pset.gset_prefix)
 				success = StoreQueryTuple(results);
+			else if (pset.gexec_flag)
+				success = ExecQueryTuples(results);
+			else if (pset.crosstab_flag)
+				success = PrintResultsInCrosstab(results);
 			else
 				success = PrintQueryTuples(results);
 			/* if it's INSERT/UPDATE/DELETE RETURNING, also print status */
@@ -848,8 +1277,8 @@ PrintQueryResults(PGresult *results)
 
 		default:
 			success = false;
-			psql_error("unexpected PQresultStatus: %d\n",
-					   PQresultStatus(results));
+			pg_log_error("unexpected PQresultStatus: %d",
+						 PQresultStatus(results));
 			break;
 	}
 
@@ -878,12 +1307,13 @@ SendQuery(const char *query)
 	PGTransactionStatusType transaction_status;
 	double		elapsed_msec = 0;
 	bool		OK = false;
+	int			i;
 	bool		on_error_rollback_savepoint = false;
 	static bool on_error_rollback_warning = false;
 
 	if (!pset.db)
 	{
-		psql_error("You are currently not connected to a database.\n");
+		pg_log_error("You are currently not connected to a database.");
 		goto sendquery_cleanup;
 	}
 
@@ -891,6 +1321,7 @@ SendQuery(const char *query)
 	{
 		char		buf[3];
 
+		fflush(stderr);
 		printf(_("***(Single step mode: verify command)*******************************************\n"
 				 "%s\n"
 				 "***(press return to proceed or enter x and return to cancel)********************\n"),
@@ -899,6 +1330,8 @@ SendQuery(const char *query)
 		if (fgets(buf, sizeof(buf), stdin) != NULL)
 			if (buf[0] == 'x')
 				goto sendquery_cleanup;
+		if (cancel_pressed)
+			goto sendquery_cleanup;
 	}
 	else if (pset.echo == PSQL_ECHO_QUERIES)
 	{
@@ -926,12 +1359,12 @@ SendQuery(const char *query)
 		results = PQexec(pset.db, "BEGIN");
 		if (PQresultStatus(results) != PGRES_COMMAND_OK)
 		{
-			psql_error("%s", PQerrorMessage(pset.db));
-			PQclear(results);
+			pg_log_info("%s", PQerrorMessage(pset.db));
+			ClearOrSaveResult(results);
 			ResetCancelConn();
 			goto sendquery_cleanup;
 		}
-		PQclear(results);
+		ClearOrSaveResult(results);
 		transaction_status = PQtransactionStatus(pset.db);
 	}
 
@@ -942,8 +1375,11 @@ SendQuery(const char *query)
 	{
 		if (on_error_rollback_warning == false && pset.sversion < 80000)
 		{
-			psql_error("The server (version %d.%d) does not support savepoints for ON_ERROR_ROLLBACK.\n",
-					   pset.sversion / 10000, (pset.sversion / 100) % 100);
+			char		sverbuf[32];
+
+			pg_log_warning("The server (version %s) does not support savepoints for ON_ERROR_ROLLBACK.",
+						   formatPGVersionNumber(pset.sversion, false,
+												 sverbuf, sizeof(sverbuf)));
 			on_error_rollback_warning = true;
 		}
 		else
@@ -951,17 +1387,25 @@ SendQuery(const char *query)
 			results = PQexec(pset.db, "SAVEPOINT pg_psql_temporary_savepoint");
 			if (PQresultStatus(results) != PGRES_COMMAND_OK)
 			{
-				psql_error("%s", PQerrorMessage(pset.db));
-				PQclear(results);
+				pg_log_info("%s", PQerrorMessage(pset.db));
+				ClearOrSaveResult(results);
 				ResetCancelConn();
 				goto sendquery_cleanup;
 			}
-			PQclear(results);
+			ClearOrSaveResult(results);
 			on_error_rollback_savepoint = true;
 		}
 	}
 
-	if (pset.fetch_count <= 0 || !is_select_command(query))
+	if (pset.gdesc_flag)
+	{
+		/* Describe query's result columns, without executing it */
+		OK = DescribeQuery(query, &elapsed_msec);
+		ResetCancelConn();
+		results = NULL;			/* PQclear(NULL) does nothing */
+	}
+	else if (pset.fetch_count <= 0 || pset.gexec_flag ||
+			 pset.crosstab_flag || !is_select_command(query))
 	{
 		/* Default fetch-it-all-and-print mode */
 		instr_time	before,
@@ -994,6 +1438,9 @@ SendQuery(const char *query)
 		ResetCancelConn();
 		results = NULL;			/* PQclear(NULL) does nothing */
 	}
+
+	if (!OK && pset.echo == PSQL_ECHO_ERRORS)
+		pg_log_info("STATEMENT:  %s", query);
 
 	/* If we made a temporary savepoint, possibly release/rollback */
 	if (on_error_rollback_savepoint)
@@ -1036,8 +1483,8 @@ SendQuery(const char *query)
 				OK = false;
 				/* PQTRANS_UNKNOWN is expected given a broken connection. */
 				if (transaction_status != PQTRANS_UNKNOWN || ConnectionUp())
-					psql_error("unexpected transaction status (%d)\n",
-							   transaction_status);
+					pg_log_error("unexpected transaction status (%d)",
+								 transaction_status);
 				break;
 		}
 
@@ -1048,8 +1495,8 @@ SendQuery(const char *query)
 			svptres = PQexec(pset.db, svptcmd);
 			if (PQresultStatus(svptres) != PGRES_COMMAND_OK)
 			{
-				psql_error("%s", PQerrorMessage(pset.db));
-				PQclear(svptres);
+				pg_log_info("%s", PQerrorMessage(pset.db));
+				ClearOrSaveResult(svptres);
 				OK = false;
 
 				PQclear(results);
@@ -1060,11 +1507,11 @@ SendQuery(const char *query)
 		}
 	}
 
-	PQclear(results);
+	ClearOrSaveResult(results);
 
 	/* Possible microtiming output */
 	if (pset.timing)
-		printf(_("Time: %.3f ms\n"), elapsed_msec);
+		PrintTiming(elapsed_msec);
 
 	/* check for events that may occur during query execution */
 
@@ -1091,12 +1538,143 @@ sendquery_cleanup:
 		pset.gfname = NULL;
 	}
 
+	/* reset \gx's expanded-mode flag */
+	pset.g_expanded = false;
+
 	/* reset \gset trigger */
 	if (pset.gset_prefix)
 	{
 		free(pset.gset_prefix);
 		pset.gset_prefix = NULL;
 	}
+
+	/* reset \gdesc trigger */
+	pset.gdesc_flag = false;
+
+	/* reset \gexec trigger */
+	pset.gexec_flag = false;
+
+	/* reset \crosstabview trigger */
+	pset.crosstab_flag = false;
+	for (i = 0; i < lengthof(pset.ctv_args); i++)
+	{
+		pg_free(pset.ctv_args[i]);
+		pset.ctv_args[i] = NULL;
+	}
+
+	return OK;
+}
+
+
+/*
+ * DescribeQuery: describe the result columns of a query, without executing it
+ *
+ * Returns true if the operation executed successfully, false otherwise.
+ *
+ * If pset.timing is on, total query time (exclusive of result-printing) is
+ * stored into *elapsed_msec.
+ */
+static bool
+DescribeQuery(const char *query, double *elapsed_msec)
+{
+	PGresult   *results;
+	bool		OK;
+	instr_time	before,
+				after;
+
+	*elapsed_msec = 0;
+
+	if (pset.timing)
+		INSTR_TIME_SET_CURRENT(before);
+
+	/*
+	 * To parse the query but not execute it, we prepare it, using the unnamed
+	 * prepared statement.  This is invisible to psql users, since there's no
+	 * way to access the unnamed prepared statement from psql user space. The
+	 * next Parse or Query protocol message would overwrite the statement
+	 * anyway.  (So there's no great need to clear it when done, which is a
+	 * good thing because libpq provides no easy way to do that.)
+	 */
+	results = PQprepare(pset.db, "", query, 0, NULL);
+	if (PQresultStatus(results) != PGRES_COMMAND_OK)
+	{
+		pg_log_info("%s", PQerrorMessage(pset.db));
+		SetResultVariables(results, false);
+		ClearOrSaveResult(results);
+		return false;
+	}
+	PQclear(results);
+
+	results = PQdescribePrepared(pset.db, "");
+	OK = AcceptResult(results) &&
+		(PQresultStatus(results) == PGRES_COMMAND_OK);
+	if (OK && results)
+	{
+		if (PQnfields(results) > 0)
+		{
+			PQExpBufferData buf;
+			int			i;
+
+			initPQExpBuffer(&buf);
+
+			printfPQExpBuffer(&buf,
+							  "SELECT name AS \"%s\", pg_catalog.format_type(tp, tpm) AS \"%s\"\n"
+							  "FROM (VALUES ",
+							  gettext_noop("Column"),
+							  gettext_noop("Type"));
+
+			for (i = 0; i < PQnfields(results); i++)
+			{
+				const char *name;
+				char	   *escname;
+
+				if (i > 0)
+					appendPQExpBufferStr(&buf, ",");
+
+				name = PQfname(results, i);
+				escname = PQescapeLiteral(pset.db, name, strlen(name));
+
+				if (escname == NULL)
+				{
+					pg_log_info("%s", PQerrorMessage(pset.db));
+					PQclear(results);
+					termPQExpBuffer(&buf);
+					return false;
+				}
+
+				appendPQExpBuffer(&buf, "(%s, '%u'::pg_catalog.oid, %d)",
+								  escname,
+								  PQftype(results, i),
+								  PQfmod(results, i));
+
+				PQfreemem(escname);
+			}
+
+			appendPQExpBufferStr(&buf, ") s(name, tp, tpm)");
+			PQclear(results);
+
+			results = PQexec(pset.db, buf.data);
+			OK = AcceptResult(results);
+
+			if (pset.timing)
+			{
+				INSTR_TIME_SET_CURRENT(after);
+				INSTR_TIME_SUBTRACT(after, before);
+				*elapsed_msec += INSTR_TIME_GET_MILLISEC(after);
+			}
+
+			if (OK && results)
+				OK = PrintQueryResults(results);
+
+			termPQExpBuffer(&buf);
+		}
+		else
+			fprintf(pset.queryFout,
+					_("The command has no result, or the result has no columns.\n"));
+	}
+
+	SetResultVariables(results, OK);
+	ClearOrSaveResult(results);
 
 	return OK;
 }
@@ -1119,10 +1697,11 @@ ExecQueryUsingCursor(const char *query, double *elapsed_msec)
 	PGresult   *results;
 	PQExpBufferData buf;
 	printQueryOpt my_popt = pset.popt;
-	FILE	   *queryFout_copy = pset.queryFout;
-	bool		queryFoutPipe_copy = pset.queryFoutPipe;
+	FILE	   *fout;
+	bool		is_pipe;
+	bool		is_pager = false;
 	bool		started_txn = false;
-	bool		did_pager = false;
+	int64		total_tuples = 0;
 	int			ntuples;
 	int			fetch_count;
 	char		fetch_cmd[64];
@@ -1146,7 +1725,7 @@ ExecQueryUsingCursor(const char *query, double *elapsed_msec)
 		results = PQexec(pset.db, "BEGIN");
 		OK = AcceptResult(results) &&
 			(PQresultStatus(results) == PGRES_COMMAND_OK);
-		PQclear(results);
+		ClearOrSaveResult(results);
 		if (!OK)
 			return false;
 		started_txn = true;
@@ -1160,7 +1739,9 @@ ExecQueryUsingCursor(const char *query, double *elapsed_msec)
 	results = PQexec(pset.db, buf.data);
 	OK = AcceptResult(results) &&
 		(PQresultStatus(results) == PGRES_COMMAND_OK);
-	PQclear(results);
+	if (!OK)
+		SetResultVariables(results, OK);
+	ClearOrSaveResult(results);
 	termPQExpBuffer(&buf);
 	if (!OK)
 		goto cleanup;
@@ -1185,24 +1766,29 @@ ExecQueryUsingCursor(const char *query, double *elapsed_msec)
 			 "FETCH FORWARD %d FROM _psql_cursor",
 			 fetch_count);
 
+	/* one-shot expanded output requested via \gx */
+	if (pset.g_expanded)
+		my_popt.topt.expanded = 1;
+
 	/* prepare to write output to \g argument, if any */
 	if (pset.gfname)
 	{
-		/* keep this code in sync with PrintQueryTuples */
-		pset.queryFout = stdout;	/* so it doesn't get closed */
-
-		/* open file/pipe */
-		if (!setQFout(pset.gfname))
+		if (!openQueryOutputFile(pset.gfname, &fout, &is_pipe))
 		{
-			pset.queryFout = queryFout_copy;
-			pset.queryFoutPipe = queryFoutPipe_copy;
 			OK = false;
 			goto cleanup;
 		}
+		if (is_pipe)
+			disable_sigpipe_trap();
+	}
+	else
+	{
+		fout = pset.queryFout;
+		is_pipe = false;		/* doesn't matter */
 	}
 
 	/* clear any pre-existing error indication on the output stream */
-	clearerr(pset.queryFout);
+	clearerr(fout);
 
 	for (;;)
 	{
@@ -1222,17 +1808,16 @@ ExecQueryUsingCursor(const char *query, double *elapsed_msec)
 		if (PQresultStatus(results) != PGRES_TUPLES_OK)
 		{
 			/* shut down pager before printing error message */
-			if (did_pager)
+			if (is_pager)
 			{
-				ClosePager(pset.queryFout);
-				pset.queryFout = queryFout_copy;
-				pset.queryFoutPipe = queryFoutPipe_copy;
-				did_pager = false;
+				ClosePager(fout);
+				is_pager = false;
 			}
 
 			OK = AcceptResult(results);
 			Assert(!OK);
-			PQclear(results);
+			SetResultVariables(results, OK);
+			ClearOrSaveResult(results);
 			break;
 		}
 
@@ -1240,30 +1825,35 @@ ExecQueryUsingCursor(const char *query, double *elapsed_msec)
 		{
 			/* StoreQueryTuple will complain if not exactly one row */
 			OK = StoreQueryTuple(results);
-			PQclear(results);
+			ClearOrSaveResult(results);
 			break;
 		}
 
+		/*
+		 * Note we do not deal with \gdesc, \gexec or \crosstabview modes here
+		 */
+
 		ntuples = PQntuples(results);
+		total_tuples += ntuples;
 
 		if (ntuples < fetch_count)
 		{
 			/* this is the last result set, so allow footer decoration */
 			my_popt.topt.stop_table = true;
 		}
-		else if (pset.queryFout == stdout && !did_pager)
+		else if (fout == stdout && !is_pager)
 		{
 			/*
 			 * If query requires multiple result sets, hack to ensure that
 			 * only one pager instance is used for the whole mess
 			 */
-			pset.queryFout = PageOutput(100000, my_popt.topt.pager);
-			did_pager = true;
+			fout = PageOutput(INT_MAX, &(my_popt.topt));
+			is_pager = true;
 		}
 
-		printQuery(results, &my_popt, pset.queryFout, pset.logfile);
+		printQuery(results, &my_popt, fout, is_pager, pset.logfile);
 
-		PQclear(results);
+		ClearOrSaveResult(results);
 
 		/* after the first result set, disallow header decoration */
 		my_popt.topt.start_table = false;
@@ -1275,7 +1865,7 @@ ExecQueryUsingCursor(const char *query, double *elapsed_msec)
 		 * the pager dies/exits/etc, there's no sense throwing more data at
 		 * it.
 		 */
-		flush_error = fflush(pset.queryFout);
+		flush_error = fflush(fout);
 
 		/*
 		 * Check if we are at the end, if a cancel was pressed, or if there
@@ -1285,24 +1875,40 @@ ExecQueryUsingCursor(const char *query, double *elapsed_msec)
 		 * stop bothering to pull down more data.
 		 */
 		if (ntuples < fetch_count || cancel_pressed || flush_error ||
-			ferror(pset.queryFout))
+			ferror(fout))
 			break;
 	}
 
-	/* close \g argument file/pipe, restore old setting */
 	if (pset.gfname)
 	{
-		/* keep this code in sync with PrintQueryTuples */
-		setQFout(NULL);
-
-		pset.queryFout = queryFout_copy;
-		pset.queryFoutPipe = queryFoutPipe_copy;
+		/* close \g argument file/pipe */
+		if (is_pipe)
+		{
+			pclose(fout);
+			restore_sigpipe_trap();
+		}
+		else
+			fclose(fout);
 	}
-	else if (did_pager)
+	else if (is_pager)
 	{
-		ClosePager(pset.queryFout);
-		pset.queryFout = queryFout_copy;
-		pset.queryFoutPipe = queryFoutPipe_copy;
+		/* close transient pager */
+		ClosePager(fout);
+	}
+
+	if (OK)
+	{
+		/*
+		 * We don't have a PGresult here, and even if we did it wouldn't have
+		 * the right row count, so fake SetResultVariables().  In error cases,
+		 * we already set the result variables above.
+		 */
+		char		buf[32];
+
+		SetVariable(pset.vars, "ERROR", "false");
+		SetVariable(pset.vars, "SQLSTATE", "00000");
+		snprintf(buf, sizeof(buf), INT64_FORMAT, total_tuples);
+		SetVariable(pset.vars, "ROW_COUNT", buf);
 	}
 
 cleanup:
@@ -1319,15 +1925,17 @@ cleanup:
 	{
 		OK = AcceptResult(results) &&
 			(PQresultStatus(results) == PGRES_COMMAND_OK);
+		ClearOrSaveResult(results);
 	}
-	PQclear(results);
+	else
+		PQclear(results);
 
 	if (started_txn)
 	{
 		results = PQexec(pset.db, OK ? "COMMIT" : "ROLLBACK");
 		OK &= AcceptResult(results) &&
 			(PQresultStatus(results) == PGRES_COMMAND_OK);
-		PQclear(results);
+		ClearOrSaveResult(results);
 	}
 
 	if (pset.timing)
@@ -1463,8 +2071,8 @@ command_no_begin(const char *query)
 
 	/*
 	 * Commands not allowed within transactions.  The statements checked for
-	 * here should be exactly those that call PreventTransactionChain() in the
-	 * backend.
+	 * here should be exactly those that call PreventInTransactionBlock() in
+	 * the backend.
 	 */
 	if (wordlen == 6 && pg_strncasecmp(query, "vacuum", 6) == 0)
 		return true;
@@ -1524,6 +2132,23 @@ command_no_begin(const char *query)
 		return false;
 	}
 
+	if (wordlen == 5 && pg_strncasecmp(query, "alter", 5) == 0)
+	{
+		query += wordlen;
+
+		query = skip_white_space(query);
+
+		wordlen = 0;
+		while (isalpha((unsigned char) query[wordlen]))
+			wordlen += PQmblen(&query[wordlen], pset.encoding);
+
+		/* ALTER SYSTEM isn't allowed in xacts */
+		if (wordlen == 6 && pg_strncasecmp(query, "system", 6) == 0)
+			return true;
+
+		return false;
+	}
+
 	/*
 	 * Note: these tests will match DROP SYSTEM and REINDEX TABLESPACE, which
 	 * aren't really valid commands so we don't care much. The other four
@@ -1546,6 +2171,40 @@ command_no_begin(const char *query)
 			return true;
 		if (wordlen == 10 && pg_strncasecmp(query, "tablespace", 10) == 0)
 			return true;
+		if (wordlen == 5 && (pg_strncasecmp(query, "index", 5) == 0 ||
+							 pg_strncasecmp(query, "table", 5) == 0))
+		{
+			query += wordlen;
+			query = skip_white_space(query);
+			wordlen = 0;
+			while (isalpha((unsigned char) query[wordlen]))
+				wordlen += PQmblen(&query[wordlen], pset.encoding);
+
+			/*
+			 * REINDEX [ TABLE | INDEX ] CONCURRENTLY are not allowed in
+			 * xacts.
+			 */
+			if (wordlen == 12 && pg_strncasecmp(query, "concurrently", 12) == 0)
+				return true;
+		}
+
+		/* DROP INDEX CONCURRENTLY isn't allowed in xacts */
+		if (wordlen == 5 && pg_strncasecmp(query, "index", 5) == 0)
+		{
+			query += wordlen;
+
+			query = skip_white_space(query);
+
+			wordlen = 0;
+			while (isalpha((unsigned char) query[wordlen]))
+				wordlen += PQmblen(&query[wordlen], pset.encoding);
+
+			if (wordlen == 12 && pg_strncasecmp(query, "concurrently", 12) == 0)
+				return true;
+
+			return false;
+		}
+
 		return false;
 	}
 
@@ -1730,4 +2389,45 @@ expand_tilde(char **filename)
 #endif
 
 	return;
+}
+
+/*
+ * Checks if connection string starts with either of the valid URI prefix
+ * designators.
+ *
+ * Returns the URI prefix length, 0 if the string doesn't contain a URI prefix.
+ *
+ * XXX This is a duplicate of the eponymous libpq function.
+ */
+static int
+uri_prefix_length(const char *connstr)
+{
+	/* The connection URI must start with either of the following designators: */
+	static const char uri_designator[] = "postgresql://";
+	static const char short_uri_designator[] = "postgres://";
+
+	if (strncmp(connstr, uri_designator,
+				sizeof(uri_designator) - 1) == 0)
+		return sizeof(uri_designator) - 1;
+
+	if (strncmp(connstr, short_uri_designator,
+				sizeof(short_uri_designator) - 1) == 0)
+		return sizeof(short_uri_designator) - 1;
+
+	return 0;
+}
+
+/*
+ * Recognized connection string either starts with a valid URI prefix or
+ * contains a "=" in it.
+ *
+ * Must be consistent with parse_connection_string: anything for which this
+ * returns true should at least look like it's parseable by that routine.
+ *
+ * XXX This is a duplicate of the eponymous libpq function.
+ */
+bool
+recognized_connection_string(const char *connstr)
+{
+	return uri_prefix_length(connstr) != 0 || strchr(connstr, '=') != NULL;
 }

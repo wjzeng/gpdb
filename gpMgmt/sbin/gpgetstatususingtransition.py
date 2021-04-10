@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 #
 # Copyright (c) Greenplum Inc 2010. All Rights Reserved. 
 #
@@ -9,7 +9,8 @@
 from gppylib.mainUtils import *
 import os, sys
 
-import pickle, base64
+import json
+import re
 
 from optparse import Option, OptionGroup, OptionParser, OptionValueError
 
@@ -17,9 +18,77 @@ from gppylib.gpparseopts import OptParser, OptChecker
 from gppylib import gplog, gparray, pgconf
 from gppylib.commands import base, gp, pg, unix
 from gppylib.db import dbconn
-from gppylib.utils import parseKeyColonValueLines
 
 logger = gplog.get_default_logger()
+
+# Return codes for PQping(), exported by libpq and returned from pg_isready.
+PQPING_OK = 0
+PQPING_REJECT = 1
+PQPING_NO_RESPONSE = 2
+PQPING_NO_ATTEMPT = 3
+PQPING_MIRROR_READY = 64
+
+# When attempting to connect to a mirror, the postmaster will report the
+# software version after a short prefix. This is that prefix, which must match
+# that in <postmaster/postmaster.h>.
+POSTMASTER_MIRROR_VERSION_DETAIL_MSG = "- VERSION:"
+
+def _get_segment_status(segment):
+    cmd = base.Command('pg_isready for segment',
+                       "pg_isready -q -h %s -p %d" % (segment.hostname, segment.port))
+    cmd.run()
+
+    rc = cmd.get_return_code()
+
+    if rc == PQPING_OK:
+        if segment.role == gparray.ROLE_PRIMARY:
+            return 'Up'
+        elif segment.role == gparray.ROLE_MIRROR:
+            return 'Acting as Primary'
+    elif rc == PQPING_REJECT:
+        return 'Rejecting Connections'
+    elif rc == PQPING_NO_RESPONSE:
+        return 'Down'
+    elif rc == PQPING_MIRROR_READY:
+        if segment.role == gparray.ROLE_PRIMARY:
+            return 'Acting as Mirror'
+        elif segment.role == gparray.ROLE_MIRROR:
+            return 'Up'
+
+    return None
+
+# Used by _get_segment_version() to find the version string for a mirror.
+_version_regex = re.compile(r'%s (.*)' % POSTMASTER_MIRROR_VERSION_DETAIL_MSG)
+
+def _get_segment_version(seg):
+    try:
+        if seg.role == gparray.ROLE_PRIMARY:
+            dburl = dbconn.DbURL(hostname=seg.hostname, port=seg.port, dbname="template1")
+            conn = dbconn.connect(dburl, utility=True)
+            return dbconn.querySingleton(conn, "select version()")
+
+        if seg.role == gparray.ROLE_MIRROR:
+            cmd = base.Command("Try connecting to mirror",
+                               "psql -h %s -p %s template1 -c 'select 1'"
+                               %(seg.hostname, seg.port))
+            cmd.run(validateAfter=False)
+            if cmd.results.rc == 0:
+                raise RuntimeError("Connection to mirror succeeded unexpectedly")
+
+            stderr = cmd.results.stderr.splitlines()
+            for line in stderr:
+                match = _version_regex.match(line)
+                if match:
+                    return match.group(1)
+
+            raise RuntimeError("Unexpected error from mirror connection: %s" % cmd.results.stderr)
+
+        logger.error("Invalid role '%s' for dbid %d", seg.role, seg.dbid)
+        return None
+
+    except Exception as ex:
+        logger.error("Could not get segment version for dbid %d", seg.dbid, exc_info=ex)
+        return None
 
 #
 # todo: the file containing this should be renamed since it gets more status than just from transition
@@ -87,39 +156,6 @@ class GpSegStatusProgram:
             'pidValue' : pidValue
         }
 
-    def __processMirrorStatusOutput(self, str):
-        data = parseKeyColonValueLines(str)
-
-        if data is None:
-            return data
-
-        # verify that all expected ones are there
-        for expected in ["mode","segmentState","dataState", "postmasterState", "databaseStatus", "isFullResync",
-                            "resyncNumCompleted","resyncTotalToComplete","estimatedCompletionTimeSecondsSinceEpoch",
-                            "totalResyncObjectCount", "curResyncObjectCount", "changeTrackingBytesUsed"]:
-            if expected not in data:
-                logger.warn("Missing data key %s from str %s" % (expected, str))
-                return None
-
-        # convert some to long integers
-        for toConvert in ["resyncNumCompleted","resyncTotalToComplete","estimatedCompletionTimeSecondsSinceEpoch",
-                            "changeTrackingBytesUsed"]:
-            value = data[toConvert]
-            try:
-                data[toConvert] = long(value)
-            except ValueError:
-                logger.warn("Invalid integer value %s from str %s" % (value, str))
-                return None
-
-        # convert some to booleans
-        for toConvert in ["isFullResync"]:
-            if data[toConvert] != "1" and data[toConvert] != "0":
-                logger.warn("Invalid boolean str %s" % (str))
-                return None
-            data[toConvert] = (data[toConvert] == "1")
-
-        return data
-
     def run(self):
 
         if self.__options.statusQueryRequests is None:
@@ -128,7 +164,7 @@ class GpSegStatusProgram:
             raise ProgramArgumentValidationException("-D argument not specified")
 
         toFetch = self.__options.statusQueryRequests.split(":")
-        segments = map(gparray.Segment.initFromString, self.__options.dirList)
+        segments = list(map(gparray.Segment.initFromString, self.__options.dirList))
 
         output = {}
         for seg in segments:
@@ -138,14 +174,12 @@ class GpSegStatusProgram:
             for statusRequest in toFetch:
                 data = None
                 if statusRequest == gp.SEGMENT_STATUS__GET_VERSION:
-#                    data = self.getStatusUsingTransition(seg, statusRequest, pidRunningStatus)
-                    if data is not None:
-                        data = data.rstrip()
+                    data = _get_segment_version(seg)
 
                 elif statusRequest == gp.SEGMENT_STATUS__GET_MIRROR_STATUS:
-#                    data = self.getStatusUsingTransition(seg, statusRequest, pidRunningStatus)
+                    data = _get_segment_status(seg)
                     if data is not None:
-                        data = self.__processMirrorStatusOutput(data)
+                        data = {'databaseStatus': data}
 
                 elif statusRequest == gp.SEGMENT_STATUS__GET_PID:
                     data = self.getPidStatus(seg, pidRunningStatus)
@@ -161,7 +195,7 @@ class GpSegStatusProgram:
                     
                 outputThisSeg[statusRequest] = data
 
-        status = '\nSTATUS_RESULTS:' + base64.urlsafe_b64encode(pickle.dumps(output))
+        status = '\nSTATUS_RESULTS:' + json.dumps(output)
         logger.info(status)
 
     def cleanup(self):

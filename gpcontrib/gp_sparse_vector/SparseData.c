@@ -1,3 +1,17 @@
+/*-------------------------------------------------------------------------
+ *
+ * SparseData.c
+ *
+ * Copyright (c) 2010, Greenplum Software
+ * Portions Copyright (c) 2013-Present VMware, Inc. or its affiliates.
+ *
+ *
+ * IDENTIFICATION
+ *	    gpcontrib/gp_sparse_vector/SparseData.c
+ *
+ *-------------------------------------------------------------------------
+ */
+
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -91,10 +105,9 @@ SparseData makeSparseDataFromDouble(double constant,int64 dimension)
 	sdata->index->data = bytestore;
 	sdata->index->len = int8compstoragesize(bytestore);
 	sdata->total_value_count=dimension;
-	if (sdata->index->maxlen < int8compstoragesize(bytestore)) {
-		ereport(ERROR,(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-			errmsg("Internal error")));
-	}
+	if (sdata->index->maxlen < int8compstoragesize(bytestore))
+		elog(ERROR, "internal error: double value exceeds sparse data max length");
+
 	return(sdata);
 }
 
@@ -223,17 +236,12 @@ double *sdata_to_float8arr(SparseData sdata) {
 
 	if (sdata->type_of_data != FLOAT8OID)
 	{
-		ereport(ERROR,(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-			errmsg("Data type of SparseData is not FLOAT64\n")));
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("data type of SparseData is not FLOAT64")));
 	}
 
-	if ((array = (double *)palloc(sizeof(double)*(sdata->total_value_count)))
-			== NULL)
-	{
-		ereport(ERROR,(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-			errmsg("Error allocating memory for array\n")));
-	}
-
+	array = (double *) palloc(sizeof(double) * sdata->total_value_count);
 	iptr = sdata->index->data;
 	aptr = 0;
 	for (int i=0; i<sdata->unique_value_count; i++) {
@@ -245,12 +253,10 @@ double *sdata_to_float8arr(SparseData sdata) {
 
 	if ((aptr) != sdata->total_value_count) 
 	{
-		ereport(ERROR,(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-		 errmsg("Array size is incorrect, is: %d and should be %d\n",
-				aptr,sdata->total_value_count)));
-
-		pfree(array);
-		return NULL;
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("array size is incorrect, is: %d and should be %d",
+						aptr,sdata->total_value_count)));
 	}
 
 	return array;
@@ -296,51 +302,5 @@ void serializeSparseData(char *target, SparseData source)
 	} else
 	{
 		((StringInfo)(SDATA_INDEX_SINFO(target)))->data = NULL;
-	}
-}
-
-#ifdef NOT
-//TODO
-SparseData deserializeSparseData(char *source)
-{
-	SparseData sdata = makeEmptySparseData();
-	char *target = (char *)sdata;
-	int index_size,vals_size;
-	/* Unpack into an empty SparseDataStructure and fill the empty 
-	 * StringInfo structures with data
-	 */
-	/* SparseDataStruct header */
-	memcpy(target,source,SIZEOF_SPARSEDATAHDR);
-	target+=SIZEOF_SPARSEDATAHDR;
-
-	index_size = SDATA_INDEX_SIZE(source);
-	vals_size = SDATA_DATA_SIZE(source);
-
-	sdata->vals->data  = (char *)palloc(vals_size);
-	sdata->index->data = (char *)palloc(index_size);
-
-	sdata->vals->len = sdata->unique_value_count;
-	sdata->vals->maxlen = sdata->unique_value_count;
-	memcpy(sdata->vals->data,SDATA_VALS_PTR(source),vals_size);
-
-	sdata->index->len = index_size;
-	sdata->index->maxlen = sdata->index->len;
-	memcpy(sdata->index->data,SDATA_INDEX_PTR(source),index_size);
-
-	return(sdata);
-}
-#endif
-
-void printSparseData(SparseData sdata);
-void printSparseData(SparseData sdata) {
-	int value_count = sdata->unique_value_count;
-	{
-		char *indexdata = sdata->index->data;
-		double *values  = (double *)(sdata->vals->data);
-		for (int i=0; i<value_count; i++) {
-			printf("run_length[%d] = %lld, ",i,(long long int)compword_to_int8(indexdata));
-			printf("value[%d] = %f\n",i,values[i]);
-			indexdata+=int8compstoragesize(indexdata);
-		}
 	}
 }

@@ -6,7 +6,7 @@
  * (See .h file for usage comments)
  *
  * Portions Copyright (c) 2007, greenplum inc
- * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
  *
  *
  * IDENTIFICATION
@@ -21,10 +21,12 @@
 
 #include "cdb/cdbappendonlyxlog.h"
 #include "cdb/cdbbufferedappend.h"
+#include "pgstat.h"
 #include "utils/guc.h"
 
 static void BufferedAppendWrite(
-					BufferedAppend *bufferedAppend);
+					BufferedAppend *bufferedAppend,
+					bool needsWAL);
 
 /*
  * Determines the amount of memory to supply for
@@ -32,14 +34,14 @@ static void BufferedAppendWrite(
  * large write lengths.
  */
 int32
-BufferedAppendMemoryLen(int32 maxBufferLen,
+BufferedAppendMemoryLen(int32 maxBufferWithCompressionOverrrunLen,
 						int32 maxLargeWriteLen)
 {
-	Assert(maxBufferLen > 0);
-	Assert(maxLargeWriteLen >= maxBufferLen);
+	Assert(maxBufferWithCompressionOverrrunLen > 0);
+	Assert(maxLargeWriteLen >= maxBufferWithCompressionOverrrunLen);
 
 	/* Large write memory areas plus adjacent extra memory for 1 buffer. */
-	return (maxLargeWriteLen + maxBufferLen);
+	return (maxLargeWriteLen + maxBufferWithCompressionOverrrunLen);
 }
 
 /*
@@ -52,15 +54,15 @@ void
 BufferedAppendInit(BufferedAppend *bufferedAppend,
 				   uint8 *memory,
 				   int32 memoryLen,
-				   int32 maxBufferLen,
+				   int32 maxBufferWithCompressionOverrrunLen,
 				   int32 maxLargeWriteLen,
 				   char *relationName)
 {
 	Assert(bufferedAppend != NULL);
 	Assert(memory != NULL);
-	Assert(maxBufferLen > 0);
-	Assert(maxLargeWriteLen >= maxBufferLen);
-	Assert(memoryLen >= BufferedAppendMemoryLen(maxBufferLen, maxLargeWriteLen));
+	Assert(maxBufferWithCompressionOverrrunLen> 0);
+	Assert(maxLargeWriteLen >= maxBufferWithCompressionOverrrunLen);
+	Assert(memoryLen >= BufferedAppendMemoryLen(maxBufferWithCompressionOverrrunLen, maxLargeWriteLen));
 
 	memset(bufferedAppend, 0, sizeof(BufferedAppend));
 
@@ -72,7 +74,7 @@ BufferedAppendInit(BufferedAppend *bufferedAppend,
 	/*
 	 * Large-read memory level members.
 	 */
-	bufferedAppend->maxBufferLen = maxBufferLen;
+	bufferedAppend->maxBufferWithCompressionOverrrunLen = maxBufferWithCompressionOverrrunLen;
 	bufferedAppend->maxLargeWriteLen = maxLargeWriteLen;
 
 	bufferedAppend->memory = memory;
@@ -139,32 +141,11 @@ BufferedAppendSetFile(BufferedAppend *bufferedAppend,
  * Perform a large write i/o.
  */
 static void
-BufferedAppendWrite(BufferedAppend *bufferedAppend)
+BufferedAppendWrite(BufferedAppend *bufferedAppend, bool needsWAL)
 {
 	int32		bytesleft;
 	int32		bytestotal;
 	uint8	   *largeWriteMemory;
-
-#ifdef USE_ASSERT_CHECKING
-	{
-		int64		currentWritePosition;
-
-		currentWritePosition = FileNonVirtualCurSeek(bufferedAppend->file);
-		if (currentWritePosition < 0)
-			ereport(ERROR, (errcode_for_file_access(),
-							errmsg("unable to get current position in table \"%s\" for file \"%s\": %m",
-								   bufferedAppend->relationName,
-								   bufferedAppend->filePathName)));
-
-		if (currentWritePosition != bufferedAppend->largeWritePosition)
-			ereport(ERROR, (errcode_for_file_access(),
-							errmsg("Current position mismatch actual "
-								   INT64_FORMAT ", expected " INT64_FORMAT " in table \"%s\" for file \"%s\"",
-								   currentWritePosition, bufferedAppend->largeWritePosition,
-								   bufferedAppend->relationName,
-								   bufferedAppend->filePathName)));
-	}
-#endif
 
 	Assert(bufferedAppend->largeWriteLen > 0);
 	largeWriteMemory = bufferedAppend->largeWriteMemory;
@@ -177,7 +158,9 @@ BufferedAppendWrite(BufferedAppend *bufferedAppend)
 
 		byteswritten = FileWrite(bufferedAppend->file,
 								 (char *) largeWriteMemory + bytestotal,
-								 bytesleft);
+								 bytesleft,
+								 bufferedAppend->largeWritePosition + bytestotal,
+								 WAIT_EVENT_DATA_FILE_WRITE);
 		if (byteswritten < 0)
 			ereport(ERROR,
 					(errcode_for_file_access(),
@@ -187,6 +170,9 @@ BufferedAppendWrite(BufferedAppend *bufferedAppend)
 
 		bytesleft -= byteswritten;
 		bytestotal += byteswritten;
+
+		if (file_extend_hook)
+			(*file_extend_hook)(bufferedAppend->relFileNode);
 	}
 
 	elogif(Debug_appendonly_print_append_block, LOG,
@@ -206,7 +192,7 @@ BufferedAppendWrite(BufferedAppend *bufferedAppend)
 	 * controls the visibility of data in AO / CO files, writing xlog
 	 * record after writing to file works fine.
 	 */
-	if (!RelFileNodeBackendIsTemp(bufferedAppend->relFileNode))
+	if (needsWAL)
 		xlog_ao_insert(bufferedAppend->relFileNode.node, bufferedAppend->segmentFileNum,
 					   bufferedAppend->largeWritePosition, largeWriteMemory, bytestotal);
 
@@ -253,10 +239,10 @@ BufferedAppendGetBuffer(BufferedAppend *bufferedAppend,
 
 	Assert(bufferedAppend != NULL);
 	Assert(bufferedAppend->file >= 0);
-	if (bufferLen > bufferedAppend->maxBufferLen)
+	if (bufferLen > bufferedAppend->maxBufferWithCompressionOverrrunLen)
 		elog(ERROR,
 			 "bufferLen %d greater than maxBufferLen %d at position " INT64_FORMAT " in table \"%s\" in file \"%s\"",
-			 bufferLen, bufferedAppend->maxBufferLen, bufferedAppend->largeWritePosition,
+			 bufferLen, bufferedAppend->maxBufferWithCompressionOverrrunLen, bufferedAppend->largeWritePosition,
 			 bufferedAppend->relationName,
 			 bufferedAppend->filePathName);
 
@@ -267,7 +253,7 @@ BufferedAppendGetBuffer(BufferedAppend *bufferedAppend,
 	currentLargeWriteLen = bufferedAppend->largeWriteLen;
 	Assert(currentLargeWriteLen + bufferLen <=
 		   bufferedAppend->maxLargeWriteLen +
-		   bufferedAppend->maxBufferLen);
+		   bufferedAppend->maxBufferWithCompressionOverrrunLen);
 
 	bufferedAppend->bufferLen = bufferLen;
 
@@ -300,7 +286,7 @@ BufferedAppendGetMaxBuffer(BufferedAppend *bufferedAppend)
 
 	return BufferedAppendGetBuffer(
 								   bufferedAppend,
-								   bufferedAppend->maxBufferLen);
+								   bufferedAppend->maxBufferWithCompressionOverrrunLen);
 }
 
 void
@@ -318,7 +304,8 @@ BufferedAppendCancelLastBuffer(BufferedAppend *bufferedAppend)
 void
 BufferedAppendFinishBuffer(BufferedAppend *bufferedAppend,
 						   int32 usedLen,
-						   int32 usedLen_uncompressed)
+						   int32 usedLen_uncompressed,
+						   bool needsWAL)
 {
 	int32		newLen;
 
@@ -334,14 +321,14 @@ BufferedAppendFinishBuffer(BufferedAppend *bufferedAppend,
 
 	newLen = bufferedAppend->largeWriteLen + usedLen;
 	Assert(newLen <= bufferedAppend->maxLargeWriteLen +
-		   bufferedAppend->maxBufferLen);
+		   bufferedAppend->maxBufferWithCompressionOverrrunLen);
 	if (newLen >= bufferedAppend->maxLargeWriteLen)
 	{
 		/*
 		 * Current large-write memory is full.
 		 */
 		bufferedAppend->largeWriteLen = bufferedAppend->maxLargeWriteLen;
-		BufferedAppendWrite(bufferedAppend);
+		BufferedAppendWrite(bufferedAppend, needsWAL);
 
 		if (newLen > bufferedAppend->maxLargeWriteLen)
 		{
@@ -392,14 +379,15 @@ BufferedAppendFinishBuffer(BufferedAppend *bufferedAppend,
 void
 BufferedAppendCompleteFile(BufferedAppend *bufferedAppend,
 						   int64 *fileLen,
-						   int64 *fileLen_uncompressed)
+						   int64 *fileLen_uncompressed,
+						   bool needsWAL)
 {
 
 	Assert(bufferedAppend != NULL);
 	Assert(bufferedAppend->file >= 0);
 
 	if (bufferedAppend->largeWriteLen > 0)
-		BufferedAppendWrite(bufferedAppend);
+		BufferedAppendWrite(bufferedAppend, needsWAL);
 
 	*fileLen = bufferedAppend->fileLen;
 	*fileLen_uncompressed = bufferedAppend->fileLen_uncompressed;

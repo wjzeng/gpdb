@@ -4,7 +4,7 @@
  *	  support functions for GIN's indexing of any array
  *
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -14,7 +14,7 @@
 #include "postgres.h"
 
 #include "access/gin.h"
-#include "access/skey.h"
+#include "access/stratnum.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
@@ -113,7 +113,7 @@ ginqueryarrayextract(PG_FUNCTION_ARGS)
 		case GinContainsStrategy:
 			if (nelems > 0)
 				*searchMode = GIN_SEARCH_MODE_DEFAULT;
-			else	/* everything contains the empty set */
+			else				/* everything contains the empty set */
 				*searchMode = GIN_SEARCH_MODE_ALL;
 			break;
 		case GinContainedStrategy:

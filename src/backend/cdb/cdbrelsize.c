@@ -3,7 +3,7 @@
  * cdbrelsize.c
  *
  * Portions Copyright (c) 2006-2008, Greenplum inc
- * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
  *
  *
  * IDENTIFICATION
@@ -26,6 +26,7 @@
 #include "utils/int8.h"
 #include "utils/lsyscache.h"
 #include "utils/builtins.h"
+#include "utils/rel.h"
 
 #include "cdb/cdbrelsize.h"
 
@@ -38,20 +39,17 @@ cdbRelMaxSegSize(Relation rel)
 	int64		size = 0;
 	int			i;
 	CdbPgResults cdb_pgresults = {NULL, 0};
-	StringInfoData buffer;
+	char	   *sql;
 
 	/*
 	 * Let's ask the QEs for the size of the relation
-	 */
-	initStringInfo(&buffer);
-
-	/*
+	 *
 	 * Relation Oids are assumed to be in sync in all nodes.
 	 */
-	appendStringInfo(&buffer, "select pg_relation_size(%u)",
-					 RelationGetRelid(rel));
+	sql = psprintf("select pg_catalog.pg_relation_size(%u)",
+				   RelationGetRelid(rel));
 
-	CdbDispatchCommand(buffer.data, DF_WITH_SNAPSHOT, &cdb_pgresults);
+	CdbDispatchCommand(sql, DF_WITH_SNAPSHOT, &cdb_pgresults);
 
 	for (i = 0; i < cdb_pgresults.numResults; i++)
 	{
@@ -74,7 +72,7 @@ cdbRelMaxSegSize(Relation rel)
 		}
 	}
 
-	pfree(buffer.data);
+	pfree(sql);
 
 	cdbdisp_clearCdbPgResults(&cdb_pgresults);
 

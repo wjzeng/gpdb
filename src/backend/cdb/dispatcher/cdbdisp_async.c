@@ -1,12 +1,17 @@
-
 /*-------------------------------------------------------------------------
  *
  * cdbdisp_async.c
  *	  Functions for asynchronous implementation of dispatching
  *	  commands to QExecutors.
  *
+ * GPDB_12_MERGE_FIXME: We should switch to using WaitEventSetWait() instead
+ * of straight poll() in this file. WaitEventSetWait() would report the status
+ * using the new wait event infrastructure, so that it would show up as a
+ * separate state in pg_stat_activity. It's also potentially more efficient.
+ *
+ *
  * Portions Copyright (c) 2005-2008, Greenplum inc
- * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
  *
  *
  * IDENTIFICATION
@@ -16,7 +21,6 @@
  */
 
 #include "postgres.h"
-#include <limits.h>
 
 #ifdef HAVE_POLL_H
 #include <poll.h>
@@ -236,7 +240,7 @@ cdbdisp_waitDispatchFinish_async(struct CdbDispatcherState *ds)
 			}
 			else if (ret < 0)
 			{
-				pqHandleSendFailure(conn);
+				/* error message should be set up already */
 				char	   *msg = PQerrorMessage(conn);
 
 				qeResult->stillRunning = false;
@@ -580,6 +584,8 @@ dispatchCommand(CdbDispatchResult *dispatchResult,
 						dispatchResult->segdbDesc->whoami, msg ? msg : "unknown error")));
 	}
 
+	forwardQENotices();
+
 	if (DEBUG1 >= log_min_messages)
 	{
 		TimestampDifference(beforeSend, GetCurrentTimestamp(), &secs, &usecs);
@@ -640,6 +646,7 @@ handlePollError(CdbDispatchCmdAsync *pParms)
 			dispatchResult->stillRunning = false;
 		}
 	}
+	forwardQENotices();
 
 	return;
 }
@@ -816,7 +823,8 @@ checkSegmentAlive(CdbDispatchCmdAsync *pParms)
 static inline void
 send_sequence_response(PGconn *conn, Oid oid, int64 last, int64 cached, int64 increment, bool overflow, bool error)
 {
-	pqPutMsgStart(SEQ_NEXTVAL_QUERY_RESPONSE, false, conn);
+	if (pqPutMsgStart(SEQ_NEXTVAL_QUERY_RESPONSE, false, conn) < 0)
+		elog(ERROR, "Failed to send sequence response: %s", PQerrorMessage(conn));
 	pqPutInt(oid, 4, conn);
 	pqPutInt(last >> 32, 4, conn);
 	pqPutInt(last, 4, conn);
@@ -826,8 +834,10 @@ send_sequence_response(PGconn *conn, Oid oid, int64 last, int64 cached, int64 in
 	pqPutInt(increment, 4, conn);
 	pqPutc(overflow ? SEQ_NEXTVAL_TRUE : SEQ_NEXTVAL_FALSE, conn);
 	pqPutc(error ? SEQ_NEXTVAL_TRUE : SEQ_NEXTVAL_FALSE, conn);
-	pqPutMsgEnd(conn);
-	pqFlush(conn);
+	if (pqPutMsgEnd(conn) < 0)
+		elog(ERROR, "Failed to send sequence response: %s", PQerrorMessage(conn));
+	if (pqFlush(conn) < 0)
+		elog(ERROR, "Failed to send sequence response: %s", PQerrorMessage(conn));
 }
 
 /*
@@ -853,6 +863,7 @@ processResults(CdbDispatchResult *dispatchResult)
 									   segdbDesc->whoami, msg ? msg : "unknown error");
 		return true;
 	}
+	forwardQENotices();
 
 	/*
 	 * If we have received one or more complete messages, process them.
@@ -863,6 +874,8 @@ processResults(CdbDispatchResult *dispatchResult)
 		PGresult   *pRes;
 		ExecStatusType resultStatus;
 		int			resultIndex;
+
+		forwardQENotices();
 
 		/*
 		 * PQisBusy() does some error handling, which can cause the connection
@@ -899,6 +912,19 @@ processResults(CdbDispatchResult *dispatchResult)
 			ELOG_DISPATCHER_DEBUG("%s -> idle", segdbDesc->whoami);
 			/* this is normal end of command */
 			return true;
+		}
+
+		if (segdbDesc->conn->wrote_xlog)
+		{
+			MarkTopTransactionWriteXLogOnExecutor();
+
+			/*
+			 * Reset the worte_xlog here. Since if the received pgresult not process
+			 * the xlog write message('x' message sends from QE in ReadyForQuery),
+			 * the value may still refer to previous dispatch statement. Which may
+			 * always mark current top transaction has wrote xlog on executor.
+			 */
+			segdbDesc->conn->wrote_xlog = false;
 		}
 
 		/*
@@ -980,6 +1006,8 @@ processResults(CdbDispatchResult *dispatchResult)
 		}
 	}
 
+	forwardQENotices();
+
 	/*
 	 * If there was nextval request then respond back on this libpq connection
 	 * with the next value. Check and process nextval message only if QD has not
@@ -1023,6 +1051,8 @@ processResults(CdbDispatchResult *dispatchResult)
 	}
 	if (nextval)
 		PQfreemem(nextval);
+
+	forwardQENotices();
 
 	return false;				/* we must keep on monitoring this socket */
 }

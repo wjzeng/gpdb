@@ -16,7 +16,8 @@ sub _new
 	my $good_types = {
 		lib => 1,
 		exe => 1,
-		dll => 1, };
+		dll => 1,
+	};
 	confess("Bad project type: $type\n") unless exists $good_types->{$type};
 	my $self = {
 		name                  => $name,
@@ -32,7 +33,8 @@ sub _new
 		solution              => $solution,
 		disablewarnings       => '4018;4244;4273;4102;4090;4267',
 		disablelinkerwarnings => '',
-		platform              => $solution->{platform}, };
+		platform              => $solution->{platform},
+	};
 
 	bless($self, $classname);
 	return $self;
@@ -43,6 +45,7 @@ sub AddFile
 	my ($self, $filename) = @_;
 
 	$self->{files}->{$filename} = 1;
+	return;
 }
 
 sub AddFiles
@@ -52,20 +55,21 @@ sub AddFiles
 
 	while (my $f = shift)
 	{
-		$self->{files}->{ $dir . "\\" . $f } = 1;
+		$self->{files}->{ $dir . "/" . $f } = 1;
 	}
+	return;
 }
 
 sub ReplaceFile
 {
 	my ($self, $filename, $newname) = @_;
-	my $re = "\\\\$filename\$";
+	my $re = "\\/$filename\$";
 
 	foreach my $file (keys %{ $self->{files} })
 	{
 
 		# Match complete filename
-		if ($filename =~ /\\/)
+		if ($filename =~ m!/!)
 		{
 			if ($file eq $filename)
 			{
@@ -77,7 +81,7 @@ sub ReplaceFile
 		elsif ($file =~ m/($re)/)
 		{
 			delete $self->{files}{$file};
-			$self->{files}{"$newname\\$filename"} = 1;
+			$self->{files}{"$newname/$filename"} = 1;
 			return;
 		}
 	}
@@ -105,9 +109,10 @@ sub RelocateFiles
 		if ($r)
 		{
 			$self->RemoveFile($f);
-			$self->AddFile($targetdir . '\\' . basename($f));
+			$self->AddFile($targetdir . '/' . basename($f));
 		}
 	}
+	return;
 }
 
 sub AddReference
@@ -118,8 +123,9 @@ sub AddReference
 	{
 		push @{ $self->{references} }, $ref;
 		$self->AddLibrary(
-			"__CFGNAME__\\" . $ref->{name} . "\\" . $ref->{name} . ".lib");
+			"__CFGNAME__/" . $ref->{name} . "/" . $ref->{name} . ".lib");
 	}
+	return;
 }
 
 sub AddLibrary
@@ -136,6 +142,7 @@ sub AddLibrary
 	{
 		push @{ $self->{suffixlib} }, $lib;
 	}
+	return;
 }
 
 sub AddIncludeDir
@@ -147,6 +154,7 @@ sub AddIncludeDir
 		$self->{includes} .= ';';
 	}
 	$self->{includes} .= $inc;
+	return;
 }
 
 sub AddPrefixInclude
@@ -154,6 +162,7 @@ sub AddPrefixInclude
 	my ($self, $inc) = @_;
 
 	$self->{prefixincludes} = $inc . ';' . $self->{prefixincludes};
+	return;
 }
 
 sub AddDefine
@@ -162,6 +171,7 @@ sub AddDefine
 
 	$def =~ s/"/&quot;&quot;/g;
 	$self->{defines} .= $def . ';';
+	return;
 }
 
 sub FullExportDLL
@@ -169,8 +179,9 @@ sub FullExportDLL
 	my ($self, $libname) = @_;
 
 	$self->{builddef} = 1;
-	$self->{def}      = ".\\__CFGNAME__\\$self->{name}\\$self->{name}.def";
-	$self->{implib}   = "__CFGNAME__\\$self->{name}\\$libname";
+	$self->{def}      = "./__CFGNAME__/$self->{name}/$self->{name}.def";
+	$self->{implib}   = "__CFGNAME__/$self->{name}/$libname";
+	return;
 }
 
 sub UseDef
@@ -178,33 +189,26 @@ sub UseDef
 	my ($self, $def) = @_;
 
 	$self->{def} = $def;
+	return;
 }
 
 sub AddDir
 {
 	my ($self, $reldir) = @_;
-	my $MF;
+	my $mf = read_makefile($reldir);
 
-	my $t = $/;
-	undef $/;
-	open($MF, "$reldir\\Makefile")
-	  || open($MF, "$reldir\\GNUMakefile")
-	  || croak "Could not open $reldir\\Makefile\n";
-	my $mf = <$MF>;
-	close($MF);
-
-	$mf =~ s{\\\s*[\r\n]+}{}mg;
+	$mf =~ s{\\\r?\n}{}g;
 	if ($mf =~ m{^(?:SUB)?DIRS[^=]*=\s*(.*)$}mg)
 	{
 		foreach my $subdir (split /\s+/, $1)
 		{
 			next
 			  if $subdir eq "\$(top_builddir)/src/timezone"
-			;    #special case for non-standard include
+			  ;    #special case for non-standard include
 			next
-			  if $reldir . "\\" . $subdir eq "src\\backend\\port\\darwin";
+			  if $reldir . "/" . $subdir eq "src/backend/port/darwin";
 
-			$self->AddDir($reldir . "\\" . $subdir);
+			$self->AddDir($reldir . "/" . $subdir);
 		}
 	}
 	while ($mf =~ m{^(?:EXTRA_)?OBJS[^=]*=\s*(.*)$}m)
@@ -225,6 +229,7 @@ sub AddDir
 
 				if ($filter eq "LIBOBJS")
 				{
+					no warnings qw(once);
 					if (grep(/$p/, @main::pgportfiles, @main::pgcommonfiles)
 						== 1)
 					{
@@ -251,13 +256,11 @@ sub AddDir
 			if ($f =~ /^\$\(top_builddir\)\/(.*)/)
 			{
 				$f = $1;
-				$f =~ s/\//\\/g;
 				$self->{files}->{$f} = 1;
 			}
 			else
 			{
-				$f =~ s/\//\\/g;
-				$self->{files}->{"$reldir\\$f"} = 1;
+				$self->{files}->{"$reldir/$f"} = 1;
 			}
 		}
 		$mf =~ s{OBJS[^=]*=\s*(.*)$}{}m;
@@ -266,13 +269,12 @@ sub AddDir
 	# Match rules that pull in source files from different directories, eg
 	# pgstrcasecmp.c rint.c snprintf.c: % : $(top_srcdir)/src/port/%
 	my $replace_re =
-	  qr{^([^:\n\$]+\.c)\s*:\s*(?:%\s*: )?\$(\([^\)]+\))\/(.*)\/[^\/]+$}m;
+	  qr{^([^:\n\$]+\.c)\s*:\s*(?:%\s*: )?\$(\([^\)]+\))\/(.*)\/[^\/]+\n}m;
 	while ($mf =~ m{$replace_re}m)
 	{
 		my $match  = $1;
 		my $top    = $2;
 		my $target = $3;
-		$target =~ s{/}{\\}g;
 		my @pieces = split /\s+/, $match;
 		foreach my $fn (@pieces)
 		{
@@ -282,7 +284,7 @@ sub AddDir
 			}
 			elsif ($top eq "(backend_src)")
 			{
-				eval { $self->ReplaceFile($fn, "src\\backend\\$target") };
+				eval { $self->ReplaceFile($fn, "src/backend/$target") };
 			}
 			else
 			{
@@ -292,7 +294,16 @@ sub AddDir
 		$mf =~ s{$replace_re}{}m;
 	}
 
-	# See if this Makefile contains a description, and should have a RC file
+	$self->AddDirResourceFile($reldir);
+	return;
+}
+
+# If the directory's Makefile bears a description string, add a resource file.
+sub AddDirResourceFile
+{
+	my ($self, $reldir) = @_;
+	my $mf = read_makefile($reldir);
+
 	if ($mf =~ /^PGFILEDESC\s*=\s*\"([^\"]+)\"/m)
 	{
 		my $desc = $1;
@@ -300,7 +311,7 @@ sub AddDir
 		if ($mf =~ /^PGAPPICON\s*=\s*(.*)$/m) { $ico = $1; }
 		$self->AddResourceFile($reldir, $desc, $ico);
 	}
-	$/ = $t;
+	return;
 }
 
 sub AddResourceFile
@@ -311,15 +322,15 @@ sub AddResourceFile
 	  localtime(time);
 	my $d = sprintf("%02d%03d", ($year - 100), $yday);
 
-	if (Solution::IsNewer("$dir\\win32ver.rc", 'src\port\win32ver.rc'))
+	if (Solution::IsNewer("$dir/win32ver.rc", 'src/port/win32ver.rc'))
 	{
 		print "Generating win32ver.rc for $dir\n";
-		open(I, 'src\port\win32ver.rc')
+		open(my $i, '<', 'src/port/win32ver.rc')
 		  || confess "Could not open win32ver.rc";
-		open(O, ">$dir\\win32ver.rc")
+		open(my $o, '>', "$dir/win32ver.rc")
 		  || confess "Could not write win32ver.rc";
 		my $icostr = $ico ? "IDI_ICON ICON \"src/port/$ico.ico\"" : "";
-		while (<I>)
+		while (<$i>)
 		{
 			s/FILEDESC/"$desc"/gm;
 			s/_ICO_/$icostr/gm;
@@ -328,12 +339,13 @@ sub AddResourceFile
 			{
 				s/VFT_APP/VFT_DLL/gm;
 			}
-			print O;
+			print $o $_;
 		}
+		close($o);
+		close($i);
 	}
-	close(O);
-	close(I);
-	$self->AddFile("$dir\\win32ver.rc");
+	$self->AddFile("$dir/win32ver.rc");
+	return;
 }
 
 sub DisableLinkerWarnings
@@ -343,36 +355,38 @@ sub DisableLinkerWarnings
 	$self->{disablelinkerwarnings} .= ','
 	  unless ($self->{disablelinkerwarnings} eq '');
 	$self->{disablelinkerwarnings} .= $warnings;
+	return;
 }
 
 sub Save
 {
 	my ($self) = @_;
 
-# If doing DLL and haven't specified a DEF file, do a full export of all symbols
-# in the project.
+	# If doing DLL and haven't specified a DEF file, do a full export of all symbols
+	# in the project.
 	if ($self->{type} eq "dll" && !$self->{def})
 	{
 		$self->FullExportDLL($self->{name} . ".lib");
 	}
 
-# Warning 4197 is about double exporting, disable this per
-# http://connect.microsoft.com/VisualStudio/feedback/ViewFeedback.aspx?FeedbackID=99193
+	# Warning 4197 is about double exporting, disable this per
+	# http://connect.microsoft.com/VisualStudio/feedback/ViewFeedback.aspx?FeedbackID=99193
 	$self->DisableLinkerWarnings('4197') if ($self->{platform} eq 'x64');
 
 	# Dump the project
-	open(F, ">$self->{name}$self->{filenameExtension}")
+	open(my $f, '>', "$self->{name}$self->{filenameExtension}")
 	  || croak(
 		"Could not write to $self->{name}$self->{filenameExtension}\n");
-	$self->WriteHeader(*F);
-	$self->WriteFiles(*F);
-	$self->Footer(*F);
-	close(F);
+	$self->WriteHeader($f);
+	$self->WriteFiles($f);
+	$self->Footer($f);
+	close($f);
+	return;
 }
 
 sub GetAdditionalLinkerDependencies
 {
-	my ($self, $cfgname, $seperator) = @_;
+	my ($self, $cfgname, $separator) = @_;
 	my $libcfg = (uc $cfgname eq "RELEASE") ? "MD" : "MDd";
 	my $libs = '';
 	foreach my $lib (@{ $self->{libraries} })
@@ -386,7 +400,7 @@ sub GetAdditionalLinkerDependencies
 				last;
 			}
 		}
-		$libs .= $xlib . $seperator;
+		$libs .= $xlib . $separator;
 	}
 	$libs =~ s/.$//;
 	$libs =~ s/__CFGNAME__/$cfgname/g;
@@ -401,7 +415,24 @@ sub read_file
 	my $t = $/;
 
 	undef $/;
-	open($F, $filename) || croak "Could not open file $filename\n";
+	open($F, '<', $filename) || croak "Could not open file $filename\n";
+	my $txt = <$F>;
+	close($F);
+	$/ = $t;
+
+	return $txt;
+}
+
+sub read_makefile
+{
+	my $reldir = shift;
+	my $F;
+	my $t = $/;
+
+	undef $/;
+	open($F, '<', "$reldir/GNUmakefile")
+	  || open($F, '<', "$reldir/Makefile")
+	  || confess "Could not open $reldir/Makefile\n";
 	my $txt = <$F>;
 	close($F);
 	$/ = $t;

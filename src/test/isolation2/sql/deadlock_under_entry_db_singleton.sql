@@ -1,5 +1,3 @@
-CREATE EXTENSION IF NOT EXISTS gp_inject_fault;
-
 -- Test to validate that ENTRY_DB_SINGLETON reader does not cause a
 -- deadlock.
 --
@@ -41,6 +39,7 @@ LANGUAGE plpgsql VOLATILE MODIFIES SQL DATA;
 -- inject fault on QD
 select gp_inject_fault('transaction_start_under_entry_db_singleton', 'reset', 1);
 select gp_inject_fault_infinite('transaction_start_under_entry_db_singleton', 'suspend', 1);
+2&: select gp_wait_until_triggered_fault('transaction_start_under_entry_db_singleton', 1, 1);
 
 -- The QD should already hold RowExclusiveLock and ExclusiveLock on
 -- deadlock_entry_db_singleton_table and the QE ENTRY_DB_SINGLETON
@@ -48,7 +47,7 @@ select gp_inject_fault_infinite('transaction_start_under_entry_db_singleton', 's
 1&:UPDATE deadlock_entry_db_singleton_table set d = d + 1 FROM (select 1 from deadlock_entry_db_singleton_table, function_volatile(5)) t;
 
 -- verify the fault hit
-select gp_inject_fault('transaction_start_under_entry_db_singleton', 'status', 1);
+2<:
 
 -- This session will wait for ExclusiveLock on
 -- deadlock_entry_db_singleton_table.

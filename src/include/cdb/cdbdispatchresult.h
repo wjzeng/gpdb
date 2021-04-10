@@ -4,7 +4,7 @@
  * routines for processing dispatch results.
  *
  * Portions Copyright (c) 2005-2008, Greenplum inc
- * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
  *
  *
  * IDENTIFICATION
@@ -70,13 +70,6 @@ typedef struct CdbDispatchResult
 	 * an int) of first error, or 0.
 	 */
 	int errcode;
-
-	/*
-	 * index of first entry in resultbuf
-	 * that represents an error; or -1.
-	 * Pass to cdbconn_getResult().
-	 */
-	int errindex;
 
 	/*
 	 * index of last entry in resultbuf
@@ -210,8 +203,7 @@ cdbdisp_appendMessageNonThread(CdbDispatchResult *dispatchResult,
 							   int errcode,
 							   const char *fmt,
 							   ...)
-/* This extension allows gcc to check the format string */
-__attribute__((format(printf, 3, 4)));
+pg_attribute_printf(3, 4);
 
 
 /*
@@ -278,15 +270,6 @@ cdbdisp_sumCmdTuples(CdbDispatchResults *results, int sliceIndex);
 void
 cdbdisp_sumRejectedRows(CdbDispatchResults *results);
 
-HTAB *
-cdbdisp_sumAoPartTupCount(PartitionNode *parts, CdbDispatchResults *results);
-
-/*
- * max of the lastOid values returned from the QEs
- */
-Oid
-cdbdisp_maxLastOid(CdbDispatchResults *results, int sliceIndex);
-
 /*
  * Return ptr to first resultArray entry for a given sliceIndex.
  */
@@ -320,9 +303,5 @@ cdbdisp_makeDispatchResults(struct CdbDispatcherState *ds,
 
 void
 cdbdisp_clearCdbPgResults(CdbPgResults* cdb_pgresults);
-
-extern struct HTAB *
-PQprocessAoTupCounts(struct PartitionNode *parts, struct HTAB *ht,
-					 void *aotupcounts, int naotupcounts);
 
 #endif   /* CDBDISPATCHRESULT_H */

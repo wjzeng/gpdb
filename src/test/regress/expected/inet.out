@@ -4,8 +4,9 @@
 -- prepare the table...
 DROP TABLE INET_TBL;
 ERROR:  table "inet_tbl" does not exist
-CREATE TABLE INET_TBL (c cidr, i inet);
+CREATE TABLE INET_TBL (c cidr, i inet) distributed by (i);
 INSERT INTO INET_TBL (c, i) VALUES ('192.168.1', '192.168.1.226/24');
+ANALYZE INET_TBL;
 INSERT INTO INET_TBL (c, i) VALUES ('192.168.1.0/26', '192.168.1.226');
 INSERT INTO INET_TBL (c, i) VALUES ('192.168.1', '192.168.1.0/24');
 INSERT INTO INET_TBL (c, i) VALUES ('192.168.1', '192.168.1.0/25');
@@ -204,6 +205,18 @@ SELECT '' AS ten, i, c,
      | ::4.3.2.1/24     | ::ffff:1.2.3.4/128 | t  | t  | f  | f  | f  | t  | f  | f   | t   | t   | t
 (17 rows)
 
+SELECT max(i) AS max, min(i) AS min FROM INET_TBL;
+     max     |    min    
+-------------+-----------
+ 10:23::ffff | 9.1.2.3/8
+(1 row)
+
+SELECT max(c) AS max, min(c) AS min FROM INET_TBL;
+       max       |    min     
+-----------------+------------
+ 10:23::8000/113 | 10.0.0.0/8
+(1 row)
+
 -- check the conversion to/from text and set_netmask
 SELECT '' AS ten, set_masklen(inet(text(i)), 24) FROM INET_TBL;
  ten |   set_masklen    
@@ -230,6 +243,17 @@ SELECT '' AS ten, set_masklen(inet(text(i)), 24) FROM INET_TBL;
 -- check that btree index works correctly
 CREATE INDEX inet_idx1 ON inet_tbl(i);
 SET enable_seqscan TO off;
+EXPLAIN (COSTS OFF)
+SELECT * FROM inet_tbl WHERE i<<'192.168.1.0/24'::cidr;
+                                     QUERY PLAN                                      
+-------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Index Scan using inet_idx1 on inet_tbl
+         Index Cond: ((i > '192.168.1.0/24'::inet) AND (i <= '192.168.1.255'::inet))
+         Filter: (i << '192.168.1.0/24'::inet)
+ Optimizer: Postgres query optimizer
+(5 rows)
+
 SELECT * FROM inet_tbl WHERE i<<'192.168.1.0/24'::cidr;
        c        |        i         
 ----------------+------------------
@@ -237,6 +261,17 @@ SELECT * FROM inet_tbl WHERE i<<'192.168.1.0/24'::cidr;
  192.168.1.0/24 | 192.168.1.255/25
  192.168.1.0/26 | 192.168.1.226
 (3 rows)
+
+EXPLAIN (COSTS OFF)
+SELECT * FROM inet_tbl WHERE i<<='192.168.1.0/24'::cidr;
+                                      QUERY PLAN                                      
+--------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Index Scan using inet_idx1 on inet_tbl
+         Index Cond: ((i >= '192.168.1.0/24'::inet) AND (i <= '192.168.1.255'::inet))
+         Filter: (i <<= '192.168.1.0/24'::inet)
+ Optimizer: Postgres query optimizer
+(5 rows)
 
 SELECT * FROM inet_tbl WHERE i<<='192.168.1.0/24'::cidr;
        c        |        i         
@@ -248,6 +283,47 @@ SELECT * FROM inet_tbl WHERE i<<='192.168.1.0/24'::cidr;
  192.168.1.0/24 | 192.168.1.255/25
  192.168.1.0/26 | 192.168.1.226
 (6 rows)
+
+EXPLAIN (COSTS OFF)
+SELECT * FROM inet_tbl WHERE '192.168.1.0/24'::cidr >>= i;
+                                      QUERY PLAN                                      
+--------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Index Scan using inet_idx1 on inet_tbl
+         Index Cond: ((i >= '192.168.1.0/24'::inet) AND (i <= '192.168.1.255'::inet))
+         Filter: ('192.168.1.0/24'::inet >>= i)
+ Optimizer: Postgres query optimizer
+(5 rows)
+
+SELECT * FROM inet_tbl WHERE '192.168.1.0/24'::cidr >>= i;
+       c        |        i         
+----------------+------------------
+ 192.168.1.0/24 | 192.168.1.0/24
+ 192.168.1.0/24 | 192.168.1.226/24
+ 192.168.1.0/24 | 192.168.1.255/24
+ 192.168.1.0/24 | 192.168.1.0/25
+ 192.168.1.0/24 | 192.168.1.255/25
+ 192.168.1.0/26 | 192.168.1.226
+(6 rows)
+
+EXPLAIN (COSTS OFF)
+SELECT * FROM inet_tbl WHERE '192.168.1.0/24'::cidr >> i;
+                                     QUERY PLAN                                      
+-------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Index Scan using inet_idx1 on inet_tbl
+         Index Cond: ((i > '192.168.1.0/24'::inet) AND (i <= '192.168.1.255'::inet))
+         Filter: ('192.168.1.0/24'::inet >> i)
+ Optimizer: Postgres query optimizer
+(5 rows)
+
+SELECT * FROM inet_tbl WHERE '192.168.1.0/24'::cidr >> i;
+       c        |        i         
+----------------+------------------
+ 192.168.1.0/24 | 192.168.1.0/25
+ 192.168.1.0/24 | 192.168.1.255/25
+ 192.168.1.0/26 | 192.168.1.226
+(3 rows)
 
 SET enable_seqscan TO on;
 DROP INDEX inet_idx1;
@@ -378,8 +454,181 @@ SELECT * FROM inet_tbl WHERE i <> '192.168.1.0/24'::cidr ORDER BY i,c;
  10:23::8000/113    | 10:23::ffff
 (16 rows)
 
+-- test index-only scans
+EXPLAIN (COSTS OFF)
+SELECT i FROM inet_tbl WHERE i << '192.168.1.0/24'::cidr ORDER BY i;
+                       QUERY PLAN                        
+---------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Merge Key: i
+   ->  Sort
+         Sort Key: i
+         ->  Index Only Scan using inet_idx2 on inet_tbl
+               Index Cond: (i << '192.168.1.0/24'::inet)
+ Optimizer: Postgres query optimizer
+(7 rows)
+
+SELECT i FROM inet_tbl WHERE i << '192.168.1.0/24'::cidr ORDER BY i;
+        i         
+------------------
+ 192.168.1.0/25
+ 192.168.1.255/25
+ 192.168.1.226
+(3 rows)
+
 SET enable_seqscan TO on;
 DROP INDEX inet_idx2;
+-- check that spgist index works correctly
+CREATE INDEX inet_idx3 ON inet_tbl using spgist (i);
+SET enable_seqscan TO off;
+SELECT * FROM inet_tbl WHERE i << '192.168.1.0/24'::cidr ORDER BY i;
+       c        |        i         
+----------------+------------------
+ 192.168.1.0/24 | 192.168.1.0/25
+ 192.168.1.0/24 | 192.168.1.255/25
+ 192.168.1.0/26 | 192.168.1.226
+(3 rows)
+
+SELECT * FROM inet_tbl WHERE i <<= '192.168.1.0/24'::cidr ORDER BY i;
+       c        |        i         
+----------------+------------------
+ 192.168.1.0/24 | 192.168.1.0/24
+ 192.168.1.0/24 | 192.168.1.226/24
+ 192.168.1.0/24 | 192.168.1.255/24
+ 192.168.1.0/24 | 192.168.1.0/25
+ 192.168.1.0/24 | 192.168.1.255/25
+ 192.168.1.0/26 | 192.168.1.226
+(6 rows)
+
+SELECT * FROM inet_tbl WHERE i && '192.168.1.0/24'::cidr ORDER BY i;
+       c        |        i         
+----------------+------------------
+ 192.168.1.0/24 | 192.168.1.0/24
+ 192.168.1.0/24 | 192.168.1.226/24
+ 192.168.1.0/24 | 192.168.1.255/24
+ 192.168.1.0/24 | 192.168.1.0/25
+ 192.168.1.0/24 | 192.168.1.255/25
+ 192.168.1.0/26 | 192.168.1.226
+(6 rows)
+
+SELECT * FROM inet_tbl WHERE i >>= '192.168.1.0/24'::cidr ORDER BY i;
+       c        |        i         
+----------------+------------------
+ 192.168.1.0/24 | 192.168.1.0/24
+ 192.168.1.0/24 | 192.168.1.226/24
+ 192.168.1.0/24 | 192.168.1.255/24
+(3 rows)
+
+SELECT * FROM inet_tbl WHERE i >> '192.168.1.0/24'::cidr ORDER BY i;
+ c | i 
+---+---
+(0 rows)
+
+SELECT * FROM inet_tbl WHERE i < '192.168.1.0/24'::cidr ORDER BY i;
+      c      |      i      
+-------------+-------------
+ 10.0.0.0/8  | 9.1.2.3/8
+ 10.0.0.0/8  | 10.1.2.3/8
+ 10.0.0.0/32 | 10.1.2.3/8
+ 10.0.0.0/8  | 10.1.2.3/8
+ 10.1.0.0/16 | 10.1.2.3/16
+ 10.1.2.0/24 | 10.1.2.3/24
+ 10.1.2.3/32 | 10.1.2.3
+ 10.0.0.0/8  | 11.1.2.3/8
+(8 rows)
+
+SELECT * FROM inet_tbl WHERE i <= '192.168.1.0/24'::cidr ORDER BY i;
+       c        |       i        
+----------------+----------------
+ 10.0.0.0/8     | 9.1.2.3/8
+ 10.0.0.0/8     | 10.1.2.3/8
+ 10.0.0.0/32    | 10.1.2.3/8
+ 10.0.0.0/8     | 10.1.2.3/8
+ 10.1.0.0/16    | 10.1.2.3/16
+ 10.1.2.0/24    | 10.1.2.3/24
+ 10.1.2.3/32    | 10.1.2.3
+ 10.0.0.0/8     | 11.1.2.3/8
+ 192.168.1.0/24 | 192.168.1.0/24
+(9 rows)
+
+SELECT * FROM inet_tbl WHERE i = '192.168.1.0/24'::cidr ORDER BY i;
+       c        |       i        
+----------------+----------------
+ 192.168.1.0/24 | 192.168.1.0/24
+(1 row)
+
+SELECT * FROM inet_tbl WHERE i >= '192.168.1.0/24'::cidr ORDER BY i;
+         c          |        i         
+--------------------+------------------
+ 192.168.1.0/24     | 192.168.1.0/24
+ 192.168.1.0/24     | 192.168.1.226/24
+ 192.168.1.0/24     | 192.168.1.255/24
+ 192.168.1.0/24     | 192.168.1.0/25
+ 192.168.1.0/24     | 192.168.1.255/25
+ 192.168.1.0/26     | 192.168.1.226
+ ::ffff:1.2.3.4/128 | ::4.3.2.1/24
+ 10:23::f1/128      | 10:23::f1/64
+ 10:23::8000/113    | 10:23::ffff
+(9 rows)
+
+SELECT * FROM inet_tbl WHERE i > '192.168.1.0/24'::cidr ORDER BY i;
+         c          |        i         
+--------------------+------------------
+ 192.168.1.0/24     | 192.168.1.226/24
+ 192.168.1.0/24     | 192.168.1.255/24
+ 192.168.1.0/24     | 192.168.1.0/25
+ 192.168.1.0/24     | 192.168.1.255/25
+ 192.168.1.0/26     | 192.168.1.226
+ ::ffff:1.2.3.4/128 | ::4.3.2.1/24
+ 10:23::f1/128      | 10:23::f1/64
+ 10:23::8000/113    | 10:23::ffff
+(8 rows)
+
+SELECT * FROM inet_tbl WHERE i <> '192.168.1.0/24'::cidr ORDER BY i;
+         c          |        i         
+--------------------+------------------
+ 10.0.0.0/8         | 9.1.2.3/8
+ 10.0.0.0/8         | 10.1.2.3/8
+ 10.0.0.0/32        | 10.1.2.3/8
+ 10.0.0.0/8         | 10.1.2.3/8
+ 10.1.0.0/16        | 10.1.2.3/16
+ 10.1.2.0/24        | 10.1.2.3/24
+ 10.1.2.3/32        | 10.1.2.3
+ 10.0.0.0/8         | 11.1.2.3/8
+ 192.168.1.0/24     | 192.168.1.226/24
+ 192.168.1.0/24     | 192.168.1.255/24
+ 192.168.1.0/24     | 192.168.1.0/25
+ 192.168.1.0/24     | 192.168.1.255/25
+ 192.168.1.0/26     | 192.168.1.226
+ ::ffff:1.2.3.4/128 | ::4.3.2.1/24
+ 10:23::f1/128      | 10:23::f1/64
+ 10:23::8000/113    | 10:23::ffff
+(16 rows)
+
+-- test index-only scans
+EXPLAIN (COSTS OFF)
+SELECT i FROM inet_tbl WHERE i << '192.168.1.0/24'::cidr ORDER BY i;
+                       QUERY PLAN                        
+---------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Merge Key: i
+   ->  Sort
+         Sort Key: i
+         ->  Index Only Scan using inet_idx3 on inet_tbl
+               Index Cond: (i << '192.168.1.0/24'::inet)
+ Optimizer: Postgres query optimizer
+(7 rows)
+
+SELECT i FROM inet_tbl WHERE i << '192.168.1.0/24'::cidr ORDER BY i;
+        i         
+------------------
+ 192.168.1.0/25
+ 192.168.1.255/25
+ 192.168.1.226
+(3 rows)
+
+SET enable_seqscan TO on;
+DROP INDEX inet_idx3;
 -- simple tests of inet boolean and arithmetic operators
 SELECT i, ~i AS "~i" FROM inet_tbl;
         i         |                     ~i                     
@@ -582,4 +831,32 @@ SELECT '127::1'::inet - '127::2'::inet;
 ----------
        -1
 (1 row)
+
+-- insert one more row with addressed from different families
+INSERT INTO INET_TBL (c, i) VALUES ('10', '10::/8');
+-- now, this one should fail
+SELECT inet_merge(c, i) FROM INET_TBL;
+ERROR:  cannot merge addresses from different families
+-- fix it by inet_same_family() condition
+SELECT inet_merge(c, i) FROM INET_TBL WHERE inet_same_family(c, i);
+   inet_merge    
+-----------------
+ 192.168.1.0/24
+ 192.168.1.0/24
+ 192.168.1.0/24
+ 192.168.1.0/24
+ 192.168.1.0/24
+ 192.168.1.0/24
+ 10.0.0.0/8
+ 10.0.0.0/8
+ 10.1.2.3/32
+ 10.1.2.0/24
+ 10.1.0.0/16
+ 10.0.0.0/8
+ 10.0.0.0/7
+ 8.0.0.0/6
+ 10:23::/64
+ 10:23::8000/113
+ ::/24
+(17 rows)
 

@@ -4,7 +4,7 @@
  *	  Routines related to memory quota for queries.
  *
  * Portions Copyright (c) 2005-2010, Greenplum inc
- * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
  *
  *
  * IDENTIFICATION
@@ -50,7 +50,7 @@ extern void PolicyEagerFreeAssignOperatorMemoryKB(PlannedStmt *stmt, uint64 memo
 /**
  * Inverse for explain analyze.
  */
-extern uint64 PolicyAutoStatementMemForNoSpillKB(PlannedStmt *stmt, uint64 minOperatorMemKB);
+extern uint64 PolicyAutoStatementMemForNoSpill(PlannedStmt *stmt, uint64 minOperatorMemKB);
 
 /**
  * Is result node memory intensive?

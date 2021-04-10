@@ -6,7 +6,6 @@ from gppylib.commands import unix
 from gppylib.commands import gp
 from gppylib.commands import base
 from gppylib.gparray import GpArray
-from gppylib import gphostcache
 from gppylib.commands.gp import SEGMENT_TIMEOUT_DEFAULT
 
 logger = get_default_logger()
@@ -42,7 +41,6 @@ class StartSegmentsResult:
     def __init__(self):
         self.__successfulSegments = []
         self.__failedSegments = []
-        pass
 
     def getSuccessfulSegments(self):
         return self.__successfulSegments[:]
@@ -58,35 +56,36 @@ class StartSegmentsResult:
 
     def addFailure(self, segment, reason, reasonCode):
         self.__failedSegments.append(FailedSegmentResult(segment, reason, reasonCode))
-        
+
     def clearSuccessfulSegments(self):
         self.__successfulSegments = []
 
 class StartSegmentsOperation:
     """
-       This operation, to be run from the master, will start the segments up
+       This operation, to be run from the coordinator, will start the segments up
             and, if necessary, convert them to the proper mode
 
-       Note that this can be used to start only a subset of the segments 
+       Note that this can be used to start only a subset of the segments
 
     """
 
     def __init__(self, workerPool, quiet, gpVersion,
-                 gpHome, masterDataDirectory, master_checksum_value=None, timeout=SEGMENT_TIMEOUT_DEFAULT,
-                 specialMode=None, wrapper=None, wrapper_args=None,
+                 gpHome, coordinatorDataDirectory, coordinator_checksum_value=None, timeout=SEGMENT_TIMEOUT_DEFAULT,
+                 specialMode=None, wrapper=None, wrapper_args=None, parallel=gp.DEFAULT_GPSTART_NUM_WORKERS,
                  logfileDirectory=False):
         checkNotNone("workerPool", workerPool)
         self.__workerPool = workerPool
         self.__quiet = quiet
         self.__gpVersion = gpVersion
         self.__gpHome = gpHome
-        self.__masterDataDirectory = masterDataDirectory
+        self.__coordinatorDataDirectory = coordinatorDataDirectory
         self.__timeout = timeout
         assert(specialMode in [None, 'upgrade', 'maintenance'])
         self.__specialMode = specialMode
         self.__wrapper = wrapper
         self.__wrapper_args = wrapper_args
-        self.master_checksum_value = master_checksum_value
+        self.__parallel = parallel
+        self.coordinator_checksum_value = coordinator_checksum_value
         self.logfileDirectory = logfileDirectory
 
     def startSegments(self, gpArray, segments, startMethod, era):
@@ -103,22 +102,6 @@ class StartSegmentsOperation:
         segmentsDbids = []
         for seg in segments:
             segmentsDbids.append(seg.getSegmentDbId())
-
-        # check on pingability
-        self.hostcache = gphostcache.GpHostCache(gpArray, self.__workerPool)
-        failedPings=self.hostcache.ping_hosts(self.__workerPool)
-        failedPingDbIds = {}
-        for segment in failedPings:
-            hostName = segment.getSegmentHostName()
-            logger.warning("Skipping startup of segdb on %s directory %s Ping Failed <<<<<<" % \
-                                        (hostName, segment.getSegmentDataDirectory()))
-            if segment.getSegmentDbId() in segmentsDbids:
-               result.addFailure(segment, 'Failed to Ping on host: %s' % hostName, gp.SEGSTART_ERROR_PING_FAILED )
-            failedPingDbIds[segment.getSegmentDbId()] = True
-
-        self.hostcache.log_contents()
-
-        segments = [seg for seg in segments if failedPingDbIds.get(seg.getSegmentDbId()) is None]
 
         # now do the start!
         numNodes = len(gpArray.getHostList())
@@ -162,14 +145,13 @@ class StartSegmentsOperation:
             logger.info("Commencing parallel primary and mirror segment instance startup, please wait...")
         else:
             logger.info("Commencing parallel segment instance startup, please wait...")
-        dispatchCount=0
 
         dbIdToPeerMap = gpArray.getDbIdToPeerMap()
 
         mirroringModePreTransition = MIRROR_MODE_MIRRORLESS if startMethod == START_AS_MIRRORLESS else MIRROR_MODE_QUIESCENT
 
         # launch the start
-        for hostName, segments in GpArray.getSegmentsByHostName(segments).iteritems():
+        for hostName, segments in GpArray.getSegmentsByHostName(segments).items():
             logger.debug("Dispatching command to start segments on host: %s, " \
                             "with %s contents in cluster" % (hostName, numContentsInCluster))
 
@@ -190,7 +172,7 @@ class StartSegmentsOperation:
                                    mirroringModePreTransition,
                                    numContentsInCluster,
                                    era,
-                                   self.master_checksum_value,
+                                   self.coordinator_checksum_value,
                                    self.__timeout,
                                    verbose=logging_is_verbose(),
                                    ctxt=base.REMOTE,
@@ -199,11 +181,14 @@ class StartSegmentsOperation:
                                    specialMode=self.__specialMode,
                                    wrapper=self.__wrapper,
                                    wrapper_args=self.__wrapper_args,
+                                   parallel=self.__parallel,
                                    logfileDirectory=self.logfileDirectory)
             self.__workerPool.addCommand(cmd)
-            dispatchCount+=1
 
-        self.__workerPool.wait_and_printdots(dispatchCount, self.__quiet)
+        if self.__quiet:
+            self.__workerPool.join()
+        else:
+            base.join_and_indicate_progress(self.__workerPool)
 
         # process results
         self.__processStartOrConvertCommands(resultOut)
@@ -215,7 +200,7 @@ class StartSegmentsOperation:
             if cmd.get_results().rc == 0 or cmd.get_results().rc == 1:
             # error code 0 mean all good, 1 means it ran but at least one thing failed
                 cmdout = cmd.get_results().stdout
-                lines=cmdout.split('\n')
+                lines = cmdout.split('\n')
                 for line in lines:
                     if line.startswith("STATUS"):
                         fields=line.split('--')
@@ -249,6 +234,8 @@ class StartSegmentsOperation:
                                     resultOut.addSuccess(segment)
                                 else:
                                     resultOut.addFailure(segment, reasonStr, reasonCode)
+                if cmd.get_results().stderr is not None:
+                    logger.info(cmd.get_results().stderr)
             else:
                 for segment in cmd.dblist:
                     resultOut.addFailure(segment, cmd.get_results(), gp.SEGSTART_ERROR_UNKNOWN_ERROR)

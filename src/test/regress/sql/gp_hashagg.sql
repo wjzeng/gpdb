@@ -14,11 +14,6 @@ insert into hashagg_test values (1,1,'1/3/2006','hi',4);
 set enable_seqscan=off;
 select grp,sum(v) from hashagg_test where id1 = 1 and id2 = 1 and day between '1/1/2006' and '1/31/2006' group by grp order by sum(v) desc;
 
--- this will get the wrong answer (right number of rows, wrong aggregates)
-set enable_seqscan=off;
-set gp_hashagg_streambottom=off;
-select grp,sum(v) from hashagg_test where id1 = 1 and id2 = 1 and day between '1/1/2006' and '1/31/2006' group by grp order by sum(v) desc;
-
 create index hashagg_test_idx_bm on hashagg_test using bitmap (id1,id2,day,grp);
 set enable_indexscan=off; -- turn off b-tree index
 select grp,sum(v) from hashagg_test where id1 = 1 and id2 = 1 and day between '1/1/2006' and '1/31/2006' group by grp order by sum(v) desc;
@@ -89,3 +84,59 @@ set enable_sort=off;
 -- use a Sort + Group, because nohash_int type is not hashable.
 select normal_int from hashagg_test2 group by normal_int;
 select nohash_int from hashagg_test2 group by nohash_int;
+
+reset enable_sort;
+
+-- We had a bug in the following combine functions where if the combine function
+-- returned a NULL, it didn't set fcinfo->isnull = true. This led to a segfault
+-- when we would spill in the final stage of a two-stage agg inside the serial
+-- function.
+CREATE TABLE test_combinefn_null (a int8, b int, c char(32000));
+INSERT INTO test_combinefn_null SELECT i, (i | 15), i::text FROM generate_series(1, 1024) i;
+ANALYZE test_combinefn_null;
+SET statement_mem='2MB';
+set enable_sort=off;
+
+-- Test int8_avg_combine()
+SELECT $$
+SELECT
+sum(a) FILTER (WHERE false)
+FROM test_combinefn_null
+GROUP BY b
+HAVING max(c) = '31'
+$$ AS qry \gset
+EXPLAIN (COSTS OFF, VERBOSE) :qry;
+:qry;
+
+-- Test numeric_poly_combine()
+SELECT $$
+SELECT
+var_pop(a::int) FILTER (WHERE false)
+FROM test_combinefn_null
+GROUP BY b
+HAVING max(c) = '31'
+$$ AS qry \gset
+EXPLAIN (COSTS OFF, VERBOSE) :qry;
+:qry;
+
+-- Test numeric_avg_combine()
+SELECT $$
+SELECT
+sum(a::numeric) FILTER (WHERE false)
+FROM test_combinefn_null
+GROUP BY b
+HAVING max(c) = '31'
+$$ AS qry \gset
+EXPLAIN (COSTS OFF, VERBOSE) :qry;
+:qry;
+
+-- Test numeric_combine()
+SELECT $$
+SELECT
+var_pop(a::numeric) FILTER (WHERE false)
+FROM test_combinefn_null
+GROUP BY b
+HAVING max(c) = '31'
+$$ AS qry \gset
+EXPLAIN (COSTS OFF, VERBOSE) :qry;
+:qry;

@@ -7,7 +7,7 @@
  * Client-side code should include postgres_fe.h instead.
  *
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1995, Regents of the University of California
  *
  * src/include/postgres.h
@@ -24,8 +24,7 @@
  *	  section	description
  *	  -------	------------------------------------------------
  *		1)		variable-length datatypes (TOAST support)
- *		2)		datum type + support macros
- *		3)		exception handling backend support
+ *		2)		Datum type + support macros
  *
  *	 NOTES
  *
@@ -45,15 +44,9 @@
 #define POSTGRES_H
 
 #include "c.h"
-
-#ifdef __cplusplus
-extern "C" {
-#endif
-
 #include "utils/elog.h"
 #include "utils/palloc.h"
 #include "storage/itemptr.h"
-#include "utils/testutils.h"
 
 /* ----------------------------------------------------------------
  *				Section 1:	variable-length datatypes (TOAST support)
@@ -61,11 +54,11 @@ extern "C" {
  */
 
 /*
- * struct varatt_external is a "TOAST pointer", that is, the information needed
- * to fetch a Datum stored in an out-of-line on-disk Datum. The data is
- * compressed if and only if va_extsize < va_rawsize - VARHDRSZ.  This struct
- * must not contain any padding, because we sometimes compare pointers using
- * memcmp.
+ * struct varatt_external is a traditional "TOAST pointer", that is, the
+ * information needed to fetch a Datum stored out-of-line in a TOAST table.
+ * The data is compressed if and only if va_extsize < va_rawsize - VARHDRSZ.
+ * This struct must not contain any padding, because we sometimes compare
+ * these pointers using memcmp.
  *
  * Note that this information is stored unaligned within actual tuples, so
  * you need to memcpy from the tuple into a local struct variable before
@@ -78,36 +71,67 @@ typedef struct varatt_external
 	int32		va_extsize;		/* External saved size (doesn't) */
 	Oid			va_valueid;		/* Unique ID of value within TOAST table */
 	Oid			va_toastrelid;	/* RelID of TOAST table containing it */
-}	varatt_external;
+}			varatt_external;
 
 /*
- * Out-of-line Datum thats stored in memory in contrast to varatt_external
- * pointers which points to data in an external toast relation.
+ * struct varatt_indirect is a "TOAST pointer" representing an out-of-line
+ * Datum that's stored in memory, not in an external toast relation.
+ * The creator of such a Datum is entirely responsible that the referenced
+ * storage survives for as long as referencing pointer Datums can exist.
  *
- * Note that just as varatt_external's this is stored unaligned within the
- * tuple.
+ * Note that just as for struct varatt_external, this struct is stored
+ * unaligned within any containing tuple.
  */
 typedef struct varatt_indirect
 {
 	struct varlena *pointer;	/* Pointer to in-memory varlena */
-}	varatt_indirect;
-
+}			varatt_indirect;
 
 /*
- * Type of external toast datum stored. The peculiar value for VARTAG_ONDISK
- * comes from the requirement for on-disk compatibility with the older
- * definitions of varattrib_1b_e where v_tag was named va_len_1be...
+ * struct varatt_expanded is a "TOAST pointer" representing an out-of-line
+ * Datum that is stored in memory, in some type-specific, not necessarily
+ * physically contiguous format that is convenient for computation not
+ * storage.  APIs for this, in particular the definition of struct
+ * ExpandedObjectHeader, are in src/include/utils/expandeddatum.h.
+ *
+ * Note that just as for struct varatt_external, this struct is stored
+ * unaligned within any containing tuple.
+ */
+typedef struct ExpandedObjectHeader ExpandedObjectHeader;
+
+typedef struct varatt_expanded
+{
+	ExpandedObjectHeader *eohptr;
+} varatt_expanded;
+
+/*
+ * Type tag for the various sorts of "TOAST pointer" datums.  The peculiar
+ * value for VARTAG_ONDISK comes from a requirement for on-disk compatibility
+ * with a previous notion that the tag field was the pointer datum's length.
+ *
+ * GPDB: In PostgreSQL VARTAG_ONDISK is set to 18 in order to match the
+ * historic (VARHDRSZ_EXTERNAL + sizeof(struct varatt_external)) value of the
+ * pointer datum's length. In Greenplum VARHDRSZ_EXTERNAL is two bytes longer
+ * than PostgreSQL due to extra padding in varattrib_1b_e, so VARTAG_ONDISK has
+ * to be set to 20.
  */
 typedef enum vartag_external
 {
 	VARTAG_INDIRECT = 1,
-	VARTAG_ONDISK = 18
+	VARTAG_EXPANDED_RO = 2,
+	VARTAG_EXPANDED_RW = 3,
+	VARTAG_ONDISK = 20
 } vartag_external;
 
+/* this test relies on the specific tag values above */
+#define VARTAG_IS_EXPANDED(tag) \
+	(((tag) & ~1) == VARTAG_EXPANDED_RO)
+
 #define VARTAG_SIZE(tag) \
-	((tag) == VARTAG_INDIRECT ? sizeof(varatt_indirect) :		\
+	((tag) == VARTAG_INDIRECT ? sizeof(varatt_indirect) : \
+	 VARTAG_IS_EXPANDED(tag) ? sizeof(varatt_expanded) : \
 	 (tag) == VARTAG_ONDISK ? sizeof(varatt_external) : \
-	 TrapMacro(true, "unknown vartag"))
+	 TrapMacro(true, "unrecognized TOAST vartag"))
 
 /*
  * These structs describe the header of a varlena object that may have been
@@ -123,33 +147,30 @@ typedef union
 	struct						/* Normal varlena (4-byte length) */
 	{
 		uint32		va_header;
-		char		va_data[1];
+		char		va_data[FLEXIBLE_ARRAY_MEMBER];
 	}			va_4byte;
 	struct						/* Compressed-in-line format */
 	{
 		uint32		va_header;
 		uint32		va_rawsize; /* Original data size (excludes header) */
-		char		va_data[1]; /* Compressed data */
+		char		va_data[FLEXIBLE_ARRAY_MEMBER]; /* Compressed data */
 	}			va_compressed;
 } varattrib_4b;
 
 typedef struct
 {
 	uint8		va_header;
-	char		va_data[1];		/* Data begins here */
+	char		va_data[FLEXIBLE_ARRAY_MEMBER]; /* Data begins here */
 } varattrib_1b;
 
-/* NOT Like Postgres! ...In GPDB, We waste a few bytes of padding, and don't always set the va_len_1be to anything */
-/* GPDB_94_MERGE_FIXME: The va_len_1be field was changed to va_tag in PostgreSQL 9.4.
- * There were comments here that va_len_1be was ignored in GPDB. Does this change to
- * va_tag work correctly with pg_upgrade in GPDB?
- */
+/* NOT Like Postgres! ...In GPDB, We waste a few bytes of padding */
+/* TOAST pointers are a subset of varattrib_1b with an identifying tag byte */
 typedef struct
 {
 	uint8		va_header;		/* Always 0x80  */
 	uint8		va_tag;			/* Type of datum */
 	uint8		va_padding[2];	/*** GPDB only:  Alignment padding ***/
-	char		va_data[1];		/* Data (of the type indicated by va_tag) */
+	char		va_data[FLEXIBLE_ARRAY_MEMBER]; /* Type-specific data */
 } varattrib_1b_e;
 
 /*
@@ -175,8 +196,8 @@ typedef struct
  * this lets us disambiguate alignment padding bytes from the start of an
  * unaligned datum.  (We now *require* pad bytes to be filled with zero!)
  *
- * In TOAST datums the tag field in varattrib_1b_e is used to discern whether
- * its an indirection pointer or more commonly an on-disk tuple.
+ * In TOAST pointers the va_tag field (see varattrib_1b_e) is used to discern
+ * the specific type and length of the pointer datum.
  */
 
 /*
@@ -219,7 +240,6 @@ typedef struct
 	(((varattrib_1b_e *) (PTR))->va_header = 0x80, \
 	 ((varattrib_1b_e *) (PTR))->va_tag = (tag))
 
-
 #define VARHDRSZ_SHORT			offsetof(varattrib_1b, va_data)
 #define VARATT_SHORT_MAX		0x7F
 #define VARATT_CAN_MAKE_SHORT(PTR) \
@@ -242,20 +262,18 @@ typedef struct
 /* Externally visible macros */
 
 /*
- * VARDATA, VARSIZE, and SET_VARSIZE are the recommended API for most code
- * for varlena datatypes.  Note that they only work on untoasted,
- * 4-byte-header Datums!
+ * In consumers oblivious to data alignment, call PG_DETOAST_DATUM_PACKED(),
+ * VARDATA_ANY(), VARSIZE_ANY() and VARSIZE_ANY_EXHDR().  Elsewhere, call
+ * PG_DETOAST_DATUM(), VARDATA() and VARSIZE().  Directly fetching an int16,
+ * int32 or wider field in the struct representing the datum layout requires
+ * aligned data.  memcpy() is alignment-oblivious, as are most operations on
+ * datatypes, such as text, whose layout struct contains only char fields.
  *
- * Code that wants to use 1-byte-header values without detoasting should
- * use VARSIZE_ANY/VARSIZE_ANY_EXHDR/VARDATA_ANY.  The other macros here
- * should usually be used only by tuple assembly/disassembly code and
- * code that specifically wants to work with still-toasted Datums.
+ * Code assembling a new datum should call VARDATA() and SET_VARSIZE().
+ * (Datums begin life untoasted.)
  *
- * WARNING: It is only safe to use VARDATA_ANY() -- typically with
- * PG_DETOAST_DATUM_PACKED() -- if you really don't care about the alignment.
- * Either because you're working with something like text where the alignment
- * doesn't matter or because you're not going to access its constituent parts
- * and just use things like memcpy on it anyways.
+ * Other macros here should usually be used only by tuple assembly/disassembly
+ * code and code that specifically wants to work with still-toasted Datums.
  */
 #define VARDATA(PTR)						VARDATA_4B(PTR)
 #define VARSIZE(PTR)						VARSIZE_4B(PTR)
@@ -273,6 +291,14 @@ typedef struct
 	(VARATT_IS_EXTERNAL(PTR) && VARTAG_EXTERNAL(PTR) == VARTAG_ONDISK)
 #define VARATT_IS_EXTERNAL_INDIRECT(PTR) \
 	(VARATT_IS_EXTERNAL(PTR) && VARTAG_EXTERNAL(PTR) == VARTAG_INDIRECT)
+#define VARATT_IS_EXTERNAL_EXPANDED_RO(PTR) \
+	(VARATT_IS_EXTERNAL(PTR) && VARTAG_EXTERNAL(PTR) == VARTAG_EXPANDED_RO)
+#define VARATT_IS_EXTERNAL_EXPANDED_RW(PTR) \
+	(VARATT_IS_EXTERNAL(PTR) && VARTAG_EXTERNAL(PTR) == VARTAG_EXPANDED_RW)
+#define VARATT_IS_EXTERNAL_EXPANDED(PTR) \
+	(VARATT_IS_EXTERNAL(PTR) && VARTAG_IS_EXPANDED(VARTAG_EXTERNAL(PTR)))
+#define VARATT_IS_EXTERNAL_NON_EXPANDED(PTR) \
+	(VARATT_IS_EXTERNAL(PTR) && !VARTAG_IS_EXPANDED(VARTAG_EXTERNAL(PTR)))
 #define VARATT_IS_SHORT(PTR)				VARATT_IS_1B(PTR)
 #define VARATT_IS_EXTENDED(PTR)				(!VARATT_IS_4B_U(PTR))
 
@@ -300,28 +326,22 @@ typedef struct
 
 
 /* ----------------------------------------------------------------
- *				Section 2:	datum type + support macros
+ *				Section 2:	Datum type + support macros
  * ----------------------------------------------------------------
  */
 
 /*
- * Port Notes:
- *	Postgres makes the following assumptions about datatype sizes:
+ * A Datum contains either a value of a pass-by-value type or a pointer to a
+ * value of a pass-by-reference type.  Therefore, we require:
  *
- *	sizeof(Datum) == sizeof(void *) == 4 or 8
- *	sizeof(char) == 1
- *	sizeof(short) == 2
+ * sizeof(Datum) == sizeof(void *) == 4 or 8
  *
  *  Greenplum CDB:
  *     Datum is always 8 bytes, regardless if it is 32bit or 64bit machine.
  *  so may be > sizeof(void *).
  *
- * When a type narrower than Datum is stored in a Datum, we place it in the
- * low-order bits and are careful that the DatumGetXXX macro for it discards
- * the unused high-order bits (as opposed to, say, assuming they are zero).
- * This is needed to support old-style user-defined functions, since depending
- * on architecture and compiler, the return value of a function returning char
- * or short may contain garbage when called as if it returned Datum.
+ * The macros below and the analogous macros for other types should be used to
+ * convert between a Datum and the appropriate C type.
  */
 
 typedef int64 Datum;
@@ -351,24 +371,37 @@ typedef Datum *DatumPtr;
 #if SIZEOF_DATUM == 8
 #define SET_8_BYTES(value)	((Datum) (value))
 #endif
+/*
+ * A NullableDatum is used in places where both a Datum and its nullness needs
+ * to be stored. This can be more efficient than storing datums and nullness
+ * in separate arrays, due to better spatial locality, even if more space may
+ * be wasted due to padding.
+ */
+typedef struct NullableDatum
+{
+#define FIELDNO_NULLABLE_DATUM_DATUM 0
+	Datum		value;
+#define FIELDNO_NULLABLE_DATUM_ISNULL 1
+	bool		isnull;
+	/* due to alignment padding this could be used for flags for free */
+} NullableDatum;
+
 
 /* 
  * Conversion between Datum and type X.  Changed from Macro to static inline
  * functions to get proper type checking.
  */
 
-
 /*
  * DatumGetBool
  *		Returns boolean value of a datum.
  *
- * Note: any nonzero value will be considered TRUE, but we ignore bits to
- * the left of the width of bool, per comment above.
+ * Note: any nonzero value will be considered true.
  */
 static inline bool DatumGetBool(Datum d) { return ((bool)d) != 0; }
 static inline Datum BoolGetDatum(bool b) { return (b ? 1 : 0); } 
 
-static inline char DatumGetChar(Datum d) { return (char) d; } 
+static inline char DatumGetChar(Datum d) { return (char) d; }
 static inline Datum CharGetDatum(char c) { return (Datum) c; } 
 
 static inline int8 DatumGetInt8(Datum d) { return (int8) d; } 
@@ -401,7 +434,7 @@ static inline Datum Int64GetDatumFast(int64 x) { return Int64GetDatum(x); }
  */
 
 #ifdef USE_FLOAT8_BYVAL
-#define DatumGetUInt64(X) ((uint64) GET_8_BYTES(X))
+#define DatumGetUInt64(X) ((uint64) (X))
 #else
 #define DatumGetUInt64(X) (* ((uint64 *) DatumGetPointer(X)))
 #endif
@@ -415,7 +448,7 @@ static inline Datum Int64GetDatumFast(int64 x) { return Int64GetDatum(x); }
  */
 
 #ifdef USE_FLOAT8_BYVAL
-#define UInt64GetDatum(X) ((Datum) SET_8_BYTES(X))
+#define UInt64GetDatum(X) ((Datum) (X))
 #else
 #define UInt64GetDatum(X) Int64GetDatum((int64) (X))
 #endif
@@ -464,7 +497,6 @@ static inline float8 DatumGetFloat8(Datum d) { Datum_U du; du.d = d; return du.f
 static inline Datum Float8GetDatum(float8 f) { Datum_U du; du.f8 = f; return du.d; }
 static inline Datum Float8GetDatumFast(float8 f) { return Float8GetDatum(f); }
 
-
 static inline ItemPointer DatumGetItemPointer(Datum d) { return (ItemPointer) DatumGetPointer(d); }
 static inline Datum ItemPointerGetDatum(ItemPointer i) { return PointerGetDatum(i); }
 
@@ -484,20 +516,12 @@ static inline bool IsAligned(void *p, int align)
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof(*(x)))
 
 /*
- * These declarations supports the assertion-related macros in c.h.
- * assert_enabled is here because that file doesn't have PGDLLIMPORT in the
- * right place, and ExceptionalCondition must be present, for the backend only,
- * even when assertions are not enabled.
+ * Backend only infrastructure for the assertion-related macros in c.h.
+ *
+ * ExceptionalCondition must be present even when assertions are not enabled.
  */
-extern PGDLLIMPORT bool assert_enabled;
-
 extern void ExceptionalCondition(const char *conditionName,
 					 const char *errorType,
-			 const char *fileName, int lineNumber) __attribute__((noreturn));
+			   const char *fileName, int lineNumber) pg_attribute_noreturn();
 
-
-#ifdef __cplusplus
-}   /* extern "C" */
-#endif
-
-#endif   /* POSTGRES_H */
+#endif							/* POSTGRES_H */

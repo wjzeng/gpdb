@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 import unittest
 import sys
@@ -10,7 +10,8 @@ import fileinput
 import platform
 import re
 import subprocess
-from pygresql import pg
+from shutil import copyfile
+import pg
 
 """
 Global Values
@@ -23,8 +24,8 @@ if UPD not in sys.path:
 
 def ensure_env(name):
     v = os.environ.get(name)
-    if v == None:
-        print "Environment variable " + name + " is required"
+    if v is None:
+        print(("Environment variable " + name + " is required"))
         sys.exit(1)
     return v
 
@@ -40,9 +41,9 @@ d = mkpath('config')
 if not os.path.exists(d):
     os.mkdir(d)
 
-def write_config_file(mode='insert', reuse_flag='',columns_flag='0',mapping='0',portNum='8081',database='reuse_gptest',host='localhost',formatOpts='text',file='data/external_file_01.txt',table='texttable',format='text',delimiter="'|'",escape='',quote='',truncate='False'):
+def write_config_file(mode='insert', reuse_flag='',columns_flag='0',mapping='0',portNum='8081',database='reuse_gptest',host='localhost',formatOpts='text',file=os.path.join('data','external_file_01.txt'),table='texttable',format='text',delimiter="'|'",escape='',quote='',truncate='False'):
 
-    f = open(mkpath('config/config_file'),'w')
+    f = open(mkpath(os.path.join('config','config_file')),'w')
     f.write("VERSION: 1.0.0.1")
     if database:
         f.write("\nDATABASE: "+database)
@@ -147,13 +148,13 @@ def psql_run(ifile = None, ofile = None, cmd = None,
     @param port    : port where gpdb is running
     @param PGOPTIONS: connects to postgres via utility mode
     '''
-    if dbname == None:
+    if dbname is None:
         dbname = DBNAME
 
-    if username == None:
+    if username is None:
         username = PGUSER  # Use the default login user
 
-    if PGOPTIONS == None:
+    if PGOPTIONS is None:
         PGOPTIONS = ""
     else:
         PGOPTIONS = "PGOPTIONS='%s'" % PGOPTIONS
@@ -182,7 +183,10 @@ def psql_run(ifile = None, ofile = None, cmd = None,
     if ofile == '-':
         ofile = '2>&1'
     elif not ofile:
-        ofile = '> /dev/null 2>&1'
+        if (platform.system()) in ['Windows', 'Microsoft']:
+            ofile = '>  NUL'
+        else:
+            ofile = '> /dev/null 2>&1'
     else:
         ofile = '> %s 2>&1' % ofile
 
@@ -218,9 +222,9 @@ def changeExtFile( fname, ext = ".diff", outputPath = "" ):
     if len( outputPath ) == 0:
         return os.path.splitext( fname )[0] + ext
     else:
-        filename = fname.split( "/" )
+        filename = fname.split( os.sep )
         fname = os.path.splitext( filename[len( filename ) - 1] )[0]
-        return outputPath + "/" + fname + ext
+        return outputPath + os.sep + fname + ext
 
 def gpdbAnsFile(fname):
     ext = '.ans'
@@ -235,21 +239,23 @@ def isFileEqual( f1, f2, optionalFlags = "", outputPath = "", myinitfile = ""):
         raise Exception( 'Error: cannot find file %s' % f2 )
     dfile = diffFile( f1, outputPath = outputPath )
     # Gets the suitePath name to add init_file
-    suitePath = f1[0:f1.rindex( "/" )]
-    if os.path.exists(suitePath + "/init_file"):
+    suitePath = f1[0:f1.rindex( os.sep )]
+    global_init_file = os.path.join(LMYD, "global_init_file")
+    init_file = os.path.join(suitePath, "init_file")
+    if os.path.exists(os.path.join(suitePath, "init_file")):
         (ok, out) = run('gpdiff.pl -w ' + optionalFlags + \
-                              ' --gp_init_file=%s/global_init_file --gp_init_file=%s/init_file '
-                              '%s %s > %s 2>&1' % (LMYD, suitePath, f1, f2, dfile))
+                              ' --gp_init_file=%s --gp_init_file=%s '
+                              '%s %s > %s 2>&1' % (global_init_file, init_file, f1, f2, dfile))
 
     else:
         if os.path.exists(myinitfile):
             (ok, out) = run('gpdiff.pl -w ' + optionalFlags + \
-                                  ' -I NOTICE: -I HINT: -I CONTEXT: -I GP_IGNORE: --gp_init_file=%s/global_init_file --gp_init_file=%s '
-                                  '%s %s > %s 2>&1' % (LMYD, myinitfile, f1, f2, dfile))
+                                  ' -I NOTICE: -I HINT: -I CONTEXT: -I GP_IGNORE: --gp_init_file=%s --gp_init_file=%s '
+                                  '%s %s > %s 2>&1' % (global_init_file, myinitfile, f1, f2, dfile))
         else:
             (ok, out) = run( 'gpdiff.pl -w ' + optionalFlags + \
-                              ' -I NOTICE: -I HINT: -I CONTEXT: -I GP_IGNORE: --gp_init_file=%s/global_init_file '
-                              '%s %s > %s 2>&1' % ( LMYD, f1, f2, dfile ) )
+                              ' -I NOTICE: -I HINT: -I CONTEXT: -I GP_IGNORE: --gp_init_file=%s '
+                              '%s %s > %s 2>&1' % ( global_init_file, f1, f2, dfile ) )
 
 
     if ok:
@@ -266,9 +272,7 @@ def read_diff(ifile, outputPath):
         return diff.read()
 
 def copy_data(source='',target=''):
-    cmd = 'cp '+ mkpath('data/' + source) + ' ' + mkpath(target)
-    p = subprocess.Popen(cmd,shell=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
-    return p.communicate()
+    copyfile(os.path.join('data', source), target)
 
 def get_table_name():
     try:
@@ -276,14 +280,14 @@ def get_table_name():
                   ,host='localhost'
                   ,port=int(PGPORT)
                   )
-    except Exception,e:
+    except Exception as e:
         errorMessage = str(e)
-        print 'could not connect to database: ' + errorMessage
-    queryString = """SELECT tablename
-                     from pg_tables
-                     WHERE tablename
+        print(('could not connect to database: ' + errorMessage))
+    queryString = """SELECT relname
+                     from pg_class
+                     WHERE relname
                      like 'ext_gpload_reusable%'
-                     OR tablename
+                     OR relname
                      like 'staging_gpload_reusable%';"""
     resultList = db.query(queryString.encode('utf-8')).getresult()
     return resultList
@@ -294,9 +298,9 @@ def drop_tables():
                   ,host='localhost'
                   ,port=int(PGPORT)
                   )
-    except Exception,e:
+    except Exception as e:
         errorMessage = str(e)
-        print 'could not connect to database: ' + errorMessage
+        print(('could not connect to database: ' + errorMessage))
 
     list = get_table_name()
     for i in list:
@@ -349,13 +353,23 @@ class GPLoad_FormatOpts_TestCase(unittest.TestCase):
     def doTest(self, num, query=''):
         file = mkpath('query%d.diff' % num)
         if os.path.isfile(file):
-           run("rm -f" + " " + file)
-        f = open(mkpath('run_gpload.sh'), 'w')
-        f.write("gpload -f "+mkpath('config/config_file')+ " -d reuse_gptest\n"+"gpload -f "+mkpath('config/config_file')+ " -d reuse_gptest\n" )
+           os.remove(file)
+        ext = '.sh'
+
+        commands = "gpload -f "+mkpath(os.path.join('config','config_file'))+" -d reuse_gptest"+os.linesep+"gpload -f "+mkpath(os.path.join('config','config_file'))+ " -d reuse_gptest\n"
+        if (platform.system()) in ['Windows', 'Microsoft']:
+            ext = '.bat'
+            commands = "@ECHO OFF" + os.linesep+ " call gpload -f "+mkpath(os.path.join('config','config_file'))+ " -d reuse_gptest"+os.linesep+"call gpload -f "+mkpath(os.path.join('config','config_file'))+ " -d reuse_gptest" + os.linesep
+        f = open(mkpath('run_gpload' + ext), 'w')
+        f.write(commands)
         f.write(query)
         f.close()
 
         cmd = 'sh run_gpload.sh > query%d.out 2>&1' % num
+        if (platform.system()) in ['Windows', 'Microsoft']:
+            cmd = 'call run_gpload.bat > query%d.out 2>&1' % num
+
+
         run(cmd)
         self.check_result(file)
 
@@ -385,9 +399,9 @@ class GPLoad_FormatOpts_TestCase(unittest.TestCase):
         self.doTest(3)
 
     def test_04_gpload_formatOpts_delimiter(self):
-        "4  gpload formatOpts delimiter E'\u0009' with reuse"
+        "4  gpload formatOpts delimiter E'\\u0009' with reuse"
         copy_data('external_file_02.txt','data_file.txt')
-        write_config_file(reuse_flag='true',formatOpts='text',file='data_file.txt',table='texttable',delimiter="E'\u0009'")
+        write_config_file(reuse_flag='true',formatOpts='text',file='data_file.txt',table='texttable',delimiter="E'\\u0009'")
         self.doTest(4)
 
     def test_05_gpload_formatOpts_delimiter(self):
@@ -406,7 +420,7 @@ class GPLoad_FormatOpts_TestCase(unittest.TestCase):
         "7  gpload insert mode without reuse"
         runfile(mkpath('setup.sql'))
         write_config_file(mode='insert',reuse_flag='false')
-        self.doTest(7, "psql -d reuse_gptest -c 'select count(*) from texttable;'")
+        self.doTest(7, 'psql -d reuse_gptest -c "select count(*) from texttable;"')
 
     def test_08_gpload_reuse_table_update_mode_with_reuse(self):
         "8  gpload update mode with reuse"
@@ -419,7 +433,7 @@ class GPLoad_FormatOpts_TestCase(unittest.TestCase):
         "9  gpload update mode without reuse"
         copy_data('external_file_05.txt','data_file.txt')
         write_config_file(mode='update',reuse_flag='false',file='data_file.txt')
-        self.doTest(9, "psql -d reuse_gptest -c 'select count(*) from texttable;'\n"+"psql -d reuse_gptest -c 'select * from texttable where n2=222;'")
+        self.doTest(9, 'psql -d reuse_gptest -c "select count(*) from texttable;"\n'+'psql -d reuse_gptest -c "select * from texttable where n2=222;"')
 
     def test_10_gpload_reuse_table_merge_mode_with_reuse(self):
         "10  gpload merge mode with reuse "
@@ -456,8 +470,8 @@ class GPLoad_FormatOpts_TestCase(unittest.TestCase):
 
     def test_15_gpload_reuse_table_merge_mode_with_different_columns_order(self):
         "15 gpload merge mode with different columns' order "
-        copy_data('external_file_10.txt','data/data_file.tbl')
-        write_config_file('merge','true',file='data/data_file.tbl',columns_flag='1',mapping='1')
+        copy_data('external_file_10.txt',os.path.join('data','data_file.tbl'))
+        write_config_file('merge','true',file=os.path.join('data','data_file.tbl'),columns_flag='1',mapping='1')
         self.doTest(15)
 
     def test_16_gpload_formatOpts_quote(self):

@@ -4,7 +4,7 @@
  *      AOCS segment files
  *
  * Portions Copyright (c) 2009, Greenplum INC.
- * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
  *
  *
  * IDENTIFICATION
@@ -18,7 +18,7 @@
 
 #include "access/appendonly_visimap.h"
 #include "access/aosegfiles.h"
-#include "utils/tqual.h"
+#include "utils/snapshot.h"
 
 #define Natts_pg_aocsseg 7
 #define Anum_pg_aocs_segno 1
@@ -56,7 +56,7 @@ aocs_vpinfo_size(int nvp)
 static inline AOCSVPInfo *
 create_aocs_vpinfo(int nvp)
 {
-	AOCSVPInfo *vpinfo = palloc0(aocs_vpinfo_size(nvp));
+	AOCSVPInfo *vpinfo = (AOCSVPInfo *) palloc0(aocs_vpinfo_size(nvp));
 
 	SET_VARSIZE(vpinfo, aocs_vpinfo_size(nvp));
 	vpinfo->nEntry = nvp;
@@ -73,8 +73,6 @@ create_aocs_vpinfo(int nvp)
  */
 typedef struct AOCSFileSegInfo
 {
-	TupleVisibilitySummary tupleVisibilitySummary;
-
 	int32		segno;
 
 	/*
@@ -134,33 +132,26 @@ struct AOCSAddColumnDescData;
  * to append data to the segment file.
  */
 extern AOCSFileSegInfo *GetAOCSFileSegInfo(Relation prel,
-				   Snapshot appendOnlyMetaDataSnapshot,
-				   int32 segno);
+										   Snapshot appendOnlyMetaDataSnapshot,
+										   int32 segno, bool locked);
 
 
 extern AOCSFileSegInfo **GetAllAOCSFileSegInfo(Relation prel,
 					  Snapshot appendOnlyMetaDataSnapshot,
 					  int *totalseg);
-
 extern void FreeAllAOCSSegFileInfo(AOCSFileSegInfo **allAOCSSegInfo, int totalSegFiles);
 
-extern int64 GetAOCSTotalBytes(
-				  Relation parentrel,
-				  Snapshot appendOnlyMetaDataSnapshot,
-				  bool compressed);
 extern FileSegTotals *GetAOCSSSegFilesTotals(Relation parentrel,
 					   Snapshot appendOnlyMetaDataSnapshot);
 
-extern AOCSFileSegInfo *NewAOCSFileSegInfo(int32 segno, int32 nvp);
-extern void InsertInitialAOCSFileSegInfo(Relation prel, int32 segno, int32 nvp);
+extern void InsertInitialAOCSFileSegInfo(Relation prel, int32 segno, int32 nvp, Oid segrelid);
 extern void UpdateAOCSFileSegInfo(struct AOCSInsertDescData *desc);
 extern void AOCSFileSegInfoAddVpe(
 					  Relation prel, int32 segno,
 					  struct AOCSAddColumnDescData *desc, int num_newcols, bool empty);
 extern void AOCSFileSegInfoAddCount(Relation prel, int32 segno, int64 tupadded, int64 varblockadded, int64 modcount_added);
-extern void ClearAOCSFileSegInfo(Relation prel, int segno, FileSegInfoState newState);
-extern void SetAOCSFileSegInfoState(Relation parentrel, int segno, FileSegInfoState newState);
-extern int64 gp_update_aocol_master_stats_internal(Relation parentrel, Snapshot appendOnlyMetaDataSnapshot);
+extern void ClearAOCSFileSegInfo(Relation prel, int segno);
+extern void MarkAOCSFileSegInfoAwaitingDrop(Relation parentrel, int segno);
 extern float8 aocol_compression_ratio_internal(Relation parentrel);
 
 #endif

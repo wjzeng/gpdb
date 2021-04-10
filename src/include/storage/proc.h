@@ -5,8 +5,8 @@
  *
  *
  * Portions Copyright (c) 2006-2008, Greenplum inc
- * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/storage/proc.h
@@ -16,16 +16,18 @@
 #ifndef _PROC_H_
 #define _PROC_H_
 
+#include "access/clog.h"
 #include "access/xlogdefs.h"
+#include "lib/ilist.h"
 #include "storage/latch.h"
 #include "storage/lock.h"
 #include "storage/spin.h"
 #include "storage/pg_sema.h"
-#include "utils/timestamp.h"
-#include "access/xlog.h"
+#include "storage/proclist_types.h"
 
 #include "cdb/cdblocaldistribxact.h"  /* LocalDistribXactData */
 #include "cdb/cdbtm.h"  /* TMGXACT */
+#include "dsm.h"
 
 /*
  * Each backend advertises up to PGPROC_MAX_CACHED_SUBXIDS TransactionIds
@@ -45,27 +47,41 @@ struct XidCache
 	TransactionId xids[PGPROC_MAX_CACHED_SUBXIDS];
 };
 
-/* Flags for PGXACT->vacuumFlags */
+/*
+ * Flags for PGXACT->vacuumFlags
+ *
+ * Note: If you modify these flags, you need to modify PROCARRAY_XXX flags
+ * in src/include/storage/procarray.h.
+ *
+ * PROC_RESERVED may later be assigned for use in vacuumFlags, but its value is
+ * used for PROCARRAY_SLOTS_XMIN in procarray.h, so GetOldestXmin won't be able
+ * to match and ignore processes with this flag set.
+ */
 #define		PROC_IS_AUTOVACUUM	0x01	/* is it an autovac worker? */
-#if 0 /* Upstream code not applicable to GPDB */
 #define		PROC_IN_VACUUM		0x02	/* currently running lazy vacuum */
-#endif
 #define		PROC_IN_ANALYZE		0x04	/* currently running analyze */
 #define		PROC_VACUUM_FOR_WRAPAROUND	0x08	/* set by autovac only */
 #define		PROC_IN_LOGICAL_DECODING	0x10	/* currently doing logical
-												 * decoding */
+												 * decoding outside xact */
+#define		PROC_RESERVED				0x20	/* reserved for procarray */
 
 /* flags reset at EOXact */
 #define		PROC_VACUUM_STATE_MASK \
 	(/* PROC_IN_VACUUM | */ PROC_IN_ANALYZE | PROC_VACUUM_FOR_WRAPAROUND)
 
 /*
- * We allow a small number of "weak" relation locks (AccesShareLock,
+ * We allow a small number of "weak" relation locks (AccessShareLock,
  * RowShareLock, RowExclusiveLock) to be recorded in the PGPROC structure
  * rather than the main lock table.  This eases contention on the lock
  * manager LWLocks.  See storage/lmgr/README for additional details.
  */
 #define		FP_LOCK_SLOTS_PER_BACKEND 16
+
+/*
+ * An invalid pgprocno.  Must be larger than the maximum number of PGPROC
+ * structures we could possibly have.  See comments for MAX_BACKENDS.
+ */
+#define INVALID_PGPROCNO		PG_INT32_MAX
 
 /*
  * Each backend has a PGPROC struct in shared memory.  There is also a list of
@@ -87,8 +103,9 @@ struct PGPROC
 {
 	/* proc->links MUST BE FIRST IN STRUCT (see ProcSleep,ProcWakeup,etc) */
 	SHM_QUEUE	links;			/* list link if process is in a list */
+	PGPROC	  **procgloballist; /* procglobal list that owns this PGPROC */
 
-	PGSemaphoreData sem;		/* ONE semaphore to sleep on */
+	PGSemaphore sem;			/* ONE semaphore to sleep on */
 	int			waitStatus;		/* STATUS_WAITING, STATUS_OK or STATUS_ERROR */
 
 	Latch		procLatch;		/* generic latch for process */
@@ -100,7 +117,7 @@ struct PGPROC
 	/*
 	 * Distributed transaction information. This is only maintained on QE's
 	 * and accessed by the backend itself, so this doesn't need to be
-	 * protected by any lock. On QD currentGXact provides this info, hence
+	 * protected by any lock. On QD MyTmGxact provides this info, hence
 	 * redundant info is not maintained here for QD. In fact, it could be just
 	 * a global variable in backend-private memory, but it seems useful to
 	 * have this information available for debugging purposes.
@@ -118,6 +135,11 @@ struct PGPROC
     int         mppLocalProcessSerial;  /* this backend's PGPROC serial num */
     bool		mppIsWriter;	/* The writer gang member, holder of locks */
 
+	Oid			tempNamespaceId;	/* OID of temp schema this backend is
+									 * using */
+
+	bool		isBackgroundWorker; /* true if background worker. */
+
 	/*
 	 * While in hot standby mode, shows that a conflict signal has been sent
 	 * for the current transaction. Set/cleared while holding ProcArrayLock,
@@ -128,7 +150,10 @@ struct PGPROC
 	/* Info about LWLock the process is currently waiting for, if any. */
 	bool		lwWaiting;		/* true if waiting for an LW lock */
 	uint8		lwWaitMode;		/* lwlock mode being waited for */
-	struct PGPROC *lwWaitLink;	/* next waiter for same LW lock */
+	proclist_node lwWaitLink;	/* position in LW lock wait list */
+
+	/* Support for condition variables. */
+	proclist_node cvWaitLink;	/* position in CV wait list */
 
 	/* Info about lock the process is currently waiting for, if any. */
 	/* waitLock and waitProcLock are NULL if not currently waiting. */
@@ -164,36 +189,83 @@ struct PGPROC
 	uint32		waitPortalId;	/* portal id we are waiting on */
 
 	/*
-	 * Information for our combocid-map (populated in writer/dispatcher backends only)
+	 * Handle for our shared comboCids array (populated in writer/dispatcher
+	 * backends only)
 	 */
-	uint32		combocid_map_count; /* how many entries in the map ? */
+	dsm_handle  comboCidsHandle;
 
-	bool serializableIsoLevel; /* true if proc has serializable isolation level set */
+	/*
+	 * Current command_id for the running query
+	 * This counter is not dead code although there is no consumer in the gpdb
+	 * code tree, it is required by external monitoring infrastructure.
+	 * As a monitoring approach, each query execution is assigned with a unique
+	 * ID. The queryCommandId is part of the ID. Monitoring extension with
+	 * shared memory access can use queryCommandId to map query execution with
+	 * a backend entity to access related metrics information.
+	 */
+	int			queryCommandId;
 
 	/*
 	 * Information for resource group
 	 */
 	void		*resSlot;	/* the resource group slot granted.
-   							 * NULL indicates the resource group is
+							 * NULL indicates the resource group is
 							 * locked for drop. */
+	void		*movetoResSlot; /* the resource group slot move to, valid only on QD */
+	Oid			movetoGroupId;  /* the resource group id move to */
 
-	/* Per-backend LWLock.  Protects fields below. */
-	LWLock	   *backendLock;	/* protects the fields below */
+	/* Support for group XID clearing. */
+	/* true, if member of ProcArray group waiting for XID clear */
+	bool		procArrayGroupMember;
+	/* next ProcArray group member waiting for XID clear */
+	pg_atomic_uint32 procArrayGroupNext;
+
+	/*
+	 * latest transaction id among the transaction's main XID and
+	 * subtransactions
+	 */
+	TransactionId procArrayGroupMemberXid;
+
+	uint32		wait_event_info;	/* proc's wait information */
+
+	/* Support for group transaction status update. */
+	bool		clogGroupMember;	/* true, if member of clog group */
+	pg_atomic_uint32 clogGroupNext; /* next clog group member */
+	TransactionId clogGroupMemberXid;	/* transaction id of clog group member */
+	XidStatus	clogGroupMemberXidStatus;	/* transaction status of clog
+											 * group member */
+	int			clogGroupMemberPage;	/* clog page corresponding to
+										 * transaction id of clog group member */
+	XLogRecPtr	clogGroupMemberLsn; /* WAL location of commit record for clog
+									 * group member */
+
+	/* Per-backend LWLock.  Protects fields below (but not group fields). */
+	LWLock		backendLock;
 
 	/* Lock manager data, recording fast-path locks taken by this backend. */
 	uint64		fpLockBits;		/* lock modes held for each fast-path slot */
 	uint64		fpHoldTillEndXactBits;	/* HoldTillEndXactBits for each slot */
-	Oid			fpRelId[FP_LOCK_SLOTS_PER_BACKEND];		/* slots for rel oids */
+	Oid			fpRelId[FP_LOCK_SLOTS_PER_BACKEND]; /* slots for rel oids */
 	bool		fpVXIDLock;		/* are we holding a fast-path VXID lock? */
 	LocalTransactionId fpLocalTransactionId;	/* lxid for fast-path VXID
 												 * lock */
+
+	/*
+	 * Support for lock groups.  Use LockHashPartitionLockByProc on the group
+	 * leader to get the LWLock protecting these fields.
+	 */
+	PGPROC	   *lockGroupLeader;	/* lock group leader, if I'm a member */
+	dlist_head	lockGroupMembers;	/* list of members, if I'm a leader */
+	dlist_node	lockGroupLink;	/* my member link, if I'm a member */
 };
 
 /* NOTE: "typedef struct PGPROC PGPROC" appears in storage/lock.h. */
 
+
 extern PGDLLIMPORT PGPROC *MyProc;
 extern PGDLLIMPORT struct PGXACT *MyPgXact;
 extern PGDLLIMPORT struct TMGXACT *MyTmGxact;
+extern PGDLLIMPORT struct TMGXACTLOCAL *MyTmGxactLocal;
 
 /* Special for MPP reader gangs */
 extern PGDLLIMPORT PGPROC *lockHolderProcPtr;
@@ -244,13 +316,18 @@ typedef struct PROC_HDR
 	PGPROC	   *autovacFreeProcs;
 	/* Head of list of bgworker free PGPROC structures */
 	PGPROC	   *bgworkerFreeProcs;
+	/* Head of list of walsender free PGPROC structures */
+	PGPROC	   *walsenderFreeProcs;
+	/* First pgproc waiting for group XID clear */
+	pg_atomic_uint32 procArrayGroupFirst;
+	/* First pgproc waiting for group transaction status update */
+	pg_atomic_uint32 clogGroupFirst;
 	/* WALWriter process's latch */
 	Latch	   *walwriterLatch;
 	/* Checkpointer process's latch */
 	Latch	   *checkpointerLatch;
 	/* Current shared estimate of appropriate spins_per_delay value */
 	int			spins_per_delay;
-
 	/* The proc of the Startup process, since not in ProcArray */
 	PGPROC	   *startupProc;
 	int			startupProcPid;
@@ -261,9 +338,12 @@ typedef struct PROC_HDR
     int         mppLocalProcessCounter;
 } PROC_HDR;
 
-extern PROC_HDR *ProcGlobal;
+extern PGDLLIMPORT PROC_HDR *ProcGlobal;
 
 extern PGPROC *PreparedXactProcs;
+
+/* Accessor for PGPROC given a pgprocno. */
+#define GetPGProcByNumber(n) (&ProcGlobal->allProcs[(n)])
 
 /*
  * We set aside some extra PGPROC structures for auxiliary processes,
@@ -272,17 +352,14 @@ extern PGPROC *PreparedXactProcs;
  * Background writer, checkpointer and WAL writer run during normal operation.
  * Startup process and WAL receiver also consume 2 slots, but WAL writer is
  * launched only after startup has exited, so we only need 4 slots.
- *
- * In GPDB, we have some extra processes.
- * GPDB_90_MERGE_FIXME: count them correctly. 10 is an exaggeration.
  */
-#define NUM_AUXILIARY_PROCS		(/* PG */ 4 + /* GPDB */ 10)
-
+#define NUM_AUXILIARY_PROCS		4
 
 /* configurable options */
-extern int	DeadlockTimeout;
+extern PGDLLIMPORT int DeadlockTimeout;
 extern int	StatementTimeout;
 extern int	LockTimeout;
+extern int	IdleInTransactionSessionTimeout;
 extern bool log_lock_waits;
 
 
@@ -307,12 +384,17 @@ extern void ProcQueueInit(PROC_QUEUE *queue);
 extern int	ProcSleep(LOCALLOCK *locallock, LockMethod lockMethodTable);
 extern PGPROC *ProcWakeup(PGPROC *proc, int waitStatus);
 extern void ProcLockWakeup(LockMethod lockMethodTable, LOCK *lock);
-extern void CheckDeadLock(void);
+extern void CheckDeadLockAlert(void);
 extern bool IsWaitingForLock(void);
 extern void LockErrorCleanup(void);
 
-extern void ProcWaitForSignal(void);
+extern void ProcWaitForSignal(uint32 wait_event_info);
 extern void ProcSendSignal(int pid);
+
+extern PGPROC *AuxiliaryPidGetProc(int pid);
+
+extern void BecomeLockGroupLeader(void);
+extern bool BecomeLockGroupMember(PGPROC *leader, int pid);
 
 extern int ResProcSleep(LOCKMODE lockmode, LOCALLOCK *locallock, void *incrementSet);
 
@@ -320,4 +402,4 @@ extern void ResLockWaitCancel(void);
 extern bool ProcCanSetMppSessionId(void);
 extern void ProcNewMppSessionId(int *newSessionId);
 
-#endif   /* PROC_H */
+#endif							/* PROC_H */

@@ -3,7 +3,6 @@
 
 from contextlib import closing
 import os
-import platform
 import shutil
 import sys
 import tarfile
@@ -23,7 +22,7 @@ try:
 
     import yaml
     from yaml.scanner import ScannerError
-except ImportError, ex:
+except ImportError as ex:
     sys.exit(
         'Operation: Cannot import modules.  Please check that you have sourced greenplum_path.sh.  Detail: ' + str(ex))
 
@@ -59,6 +58,11 @@ SPECFILE_OPTIONAL_TAGS = ['preinstall', 'postinstall', 'preuninstall', 'postunin
 RPM_DATABASE_PATH = 'share/packages/database'
 RPM_DATABASE = os.path.join(GPHOME, RPM_DATABASE_PATH)
 RPM_INSTALLATION_PATH = GPHOME
+
+# An Update for deb package
+DEB_DATABASE_DIR = GPHOME + '/share/packages/database/deb/{info,updates,triggers}'
+DEB_DATABASE = os.path.join(GPHOME + '/share/packages/database/deb')
+DEB_STATUSFILE = GPHOME + '/share/packages/database/deb/status'
 
 # TODO: AK: Our interactions with the archive could benefit from an abstraction layer
 # that hides the implementations of archival, unarchival, queries, etc.
@@ -117,16 +121,6 @@ class OSCompatibilityError(Exception):
 
     def __init__(self, requiredos, foundos):
         Exception.__init__(self, '%s OS required. %s OS found' % (requiredos, foundos))
-
-
-class ArchCompatibilityError(Exception):
-    """
-        Exception to notify that architecture does not meet
-        the requirement
-    """
-
-    def __init__(self, requiredarch, foundarch):
-        Exception.__init__(self, '%s Arch required. %s Arch found' % (requiredarch, foundarch))
 
 
 class RequiredDependencyError(Exception):
@@ -235,8 +229,8 @@ class Gppkg:
             for cur_file in archive_list:
                 if cur_file.endswith(SPECFILE_NAME):
                     specfile = tarinfo.extractfile(cur_file)
-                    yamlfile = yaml.load(specfile)
-                    keys = yamlfile.keys()
+                    yamlfile = yaml.safe_load(specfile)
+                    keys = list(yamlfile.keys())
                     break
 
         # store all the tags
@@ -256,14 +250,25 @@ class Gppkg:
         pkg['abspath'] = pkg_path
 
         # store all the dependencies of the gppkg
-        for cur_file in archive_list:
-            if cur_file.find('deps/') != -1 and cur_file.endswith('.rpm'):
-                pkg['dependencies'].append(cur_file[cur_file.rfind('/') + 1:])
+        if linux_distribution_id() == 'ubuntu':
+            for cur_file in archive_list:
+                if cur_file.find('deps/') != -1 and cur_file.endswith('.deb'):
+                    pkg['dependencies'].append(cur_file[cur_file.rfind('/') + 1:])
 
-        # store the main rpm
-        for cur_file in archive_list:
-            if cur_file.find('deps/') == -1 and cur_file.endswith('.rpm'):
-                pkg['main_rpm'] = cur_file
+            # store the main deb, remain the attr name main_rpm to keep compatibility
+            for cur_file in archive_list:
+                if cur_file.find('deps/') == -1 and cur_file.endswith('.deb'):
+                    pkg['main_rpm'] = cur_file
+
+        else:
+            for cur_file in archive_list:
+                if cur_file.find('deps/') != -1 and cur_file.endswith('.rpm'):
+                    pkg['dependencies'].append(cur_file[cur_file.rfind('/') + 1:])
+
+            # store the main rpm
+            for cur_file in archive_list:
+                if cur_file.find('deps/') == -1 and cur_file.endswith('.rpm'):
+                    pkg['main_rpm'] = cur_file
 
         gppkg = Gppkg(**pkg)
 
@@ -441,6 +446,89 @@ class IsVersionCompatible(Operation):
         return int(magic_num)
 
 
+class ValidateInstallDebPackage(Operation):
+    """
+    A replicate class of ValidateInstallPackage that used for test deb package for Ubuntu,
+    it will use dpkg --verify that is instead of rpm --test
+
+    NOTE: In newest GPDB, the dependencies will use system's dependencies, we still leave the gppkg
+    to install dependencies, but did not check it anymore.
+
+    """
+
+    def __init__(self, gppkg, is_update=False):
+        self.gppkg = gppkg
+        self.is_update = is_update
+
+    def execute(self):
+        # Check the GPDB requirements
+        if not IsVersionCompatible(self.gppkg).run():
+            raise GpdbVersionError
+
+        self.prepare_deb_env()
+
+        # No need to check the architecture here as there is no i386 arch in GPDB 5 or newer version
+        deb_set = set([self.gppkg.main_rpm] + self.gppkg.dependencies)
+        deb_packages_path = ' '.join([os.path.join(TEMP_EXTRACTION_PATH, deb_path) for deb_path in deb_set])
+
+        if self.is_update:
+            deb_test_command = 'fakeroot dpkg --dry-run --force-not-root --force-depends --log=/dev/null --admindir=%s ' \
+                               '--instdir=%s -i %s' % (DEB_DATABASE, GPHOME, deb_packages_path)
+        else:
+            deb_test_command = 'fakeroot dpkg --dry-run --force-not-root --log=/dev/null --admindir=%s ' \
+                               '--instdir=%s -i %s' % (DEB_DATABASE, GPHOME, deb_packages_path)
+
+        cmd = Command('Validating deb installation', deb_test_command)
+        logger.info(cmd)
+
+        try:
+            cmd.run(validateAfter=True)
+        except ExecutionError as e:
+            lines = e.cmd.get_results().stderr.splitlines()
+
+            if len(lines) == 0:
+                raise
+
+            # TODO: Add dependency and already installed check
+
+        archive_package_exists = CheckFile(os.path.join(GPPKG_ARCHIVE_PATH, self.gppkg.pkg)).run()
+        package_already_installed = (not deb_set) and archive_package_exists
+        if package_already_installed:
+            raise AlreadyInstalledError(self.gppkg.pkg)
+
+        already_installed = self.check_existence()
+        if self.is_update:
+            if not already_installed:
+                raise NotInstalledError(self.gppkg.pkg)
+        else:
+            if already_installed:
+                raise AlreadyInstalledError(self.gppkg.pkg)
+
+        return deb_set
+
+    def check_existence(self):
+        command = 'dpkg --force-not-root --log=/dev/null --admindir=%s --instdir=%s -l %s' % (DEB_DATABASE, GPHOME, self.gppkg.pkgname)
+        cmd = Command('Check installation of package', command)
+        logger.info(cmd)
+
+        cmd.run(validateAfter=False)
+        return cmd.results.rc == 0
+
+    def prepare_deb_env(self):
+        prepare_env_dir = 'mkdir -p ' + DEB_DATABASE_DIR
+        prepare_env_file = 'touch ' + DEB_STATUSFILE
+        cmd_dir = Command('Prepare deb package DIY directories', prepare_env_dir)
+        cmd_file = Command('Prepare deb package Status file', prepare_env_file)
+
+        try:
+            cmd_dir.run(validateAfter=True)
+            cmd_file.run(validateAfter=True)
+        except ExecutionError as e:
+            lines = e.cmd.get_results().stderr.splitlines()
+
+            raise ExecutionError('Can not setup deb package env', lines)
+
+
 class ValidateInstallPackage(Operation):
     """
     Ensure that the given rpms can be installed safely. This is accomplished mainly
@@ -471,15 +559,6 @@ class ValidateInstallPackage(Operation):
         if not IsVersionCompatible(self.gppkg).run():
             raise GpdbVersionError
 
-        # TODO: AK: I've changed our use of the OS tag from 'Linux' to 'rhel5' or 'suse10'.
-        # So, the two lines below will not work properly.
-        # if self.gppkg.os.lower() != platform.system().lower():
-        #    raise OSCompatibilityError(self.gppkg.os, platform.system().lower())
-
-        # architecture compatibility
-        if self.gppkg.architecture.lower() != platform.machine().lower():
-            raise ArchCompatibilityError(self.gppkg.architecture, platform.machine().lower())
-
         rpm_set = set([self.gppkg.main_rpm] + self.gppkg.dependencies)
         rpm_install_string = ' '.join([os.path.join(TEMP_EXTRACTION_PATH, rpm) for rpm in rpm_set])
         if self.is_update:
@@ -493,7 +572,8 @@ class ValidateInstallPackage(Operation):
 
         try:
             cmd.run(validateAfter=True)
-        except ExecutionError, e:
+        except ExecutionError as e:
+            already_install = False
             lines = e.cmd.get_results().stderr.splitlines()
 
             # Forking between code paths 2 and 3 depends on some meaningful stderr
@@ -520,12 +600,22 @@ class ValidateInstallPackage(Operation):
             #    package postgis-1.0-1.x86_64 is already installed
             for line in lines:
                 if 'already installed' in line.lower():
-                    package_name = line.split()[1]
+                    # if installed version is newer than currently, we use old version name
+                    if 'newer than' in line.lower():
+                        # example: package json-c-0.12-1.x86_64 (which is newer than json-c-0.11-1.x86_64) is already installed
+                        package_name = line.split()[6].replace(')','')
+                    else:
+                        package_name = line.split()[1]
                     rpm_name = "%s.rpm" % package_name
                     rpm_set.remove(rpm_name)
+                    already_install = True
+                elif 'conflicts with file' in line.lower():
+                    # if the library file(s) is(are) the same as installed dependencies, we skip it and use the installed dependencies
+                    already_install = True
                 else:
                     # This is unexpected, so bubble up the ExecutionError.
-                    raise
+                    if already_install is not True:
+                        raise
 
         # MPP-14359 - installation and uninstallation prechecks must also consider
         # the archive. That is, if a partial installation had added all rpms
@@ -538,6 +628,34 @@ class ValidateInstallPackage(Operation):
 
         # Code path 1 (See docstring)
         return rpm_set
+
+
+class ValidateUninstallDebPackage(Operation):
+    """
+     A replicate class of ValidateUninstallPackage that used for pre-uninstall deb package for Ubuntu.
+     We do not need to test dependencies in GPDB 6 as there is no GPDB's dependencies anymore.
+
+    """
+
+    def __init__(self, gppkg):
+        self.gppkg = gppkg
+
+    def execute(self):
+        deb_list = [self.gppkg.main_rpm] + self.gppkg.dependencies
+
+        def strip_extension_and_arch(filename):
+            # expecting filename of form %{name}-%{version}-%{release}.%{arch}.rpm
+            rest = str.split(filename, '-')
+            return rest[-3]
+
+        # We check the installed list only
+        deb_set = set([strip_extension_and_arch(deb_package) for deb_package in deb_list])
+        archive_package_exists = CheckFile(os.path.join(GPPKG_ARCHIVE_PATH, self.gppkg.pkg)).run()
+        package_not_installed = (not deb_set) and (not archive_package_exists)
+        if package_not_installed:
+            raise NotInstalledError(self.gppkg.pkg)
+
+        return deb_set
 
 
 class ValidateUninstallPackage(Operation):
@@ -576,7 +694,7 @@ class ValidateUninstallPackage(Operation):
 
         try:
             cmd.run(validateAfter=True)
-        except ExecutionError, e:
+        except ExecutionError as e:
             lines = e.cmd.get_results().stderr.splitlines()
 
             # Forking between code paths 2 and 3 depends on some meaningful stderr
@@ -628,10 +746,8 @@ class ValidateUninstallPackage(Operation):
 
         In simpler terms, consider this example:
             pljava depends on jre, which its gppkg contains
-            gphdfs depends on jre, which its gppkg contains
-            install the gppkgs for both pljava and gphdfs
+            install the gppkgs for pljava
             uninstall pljava gppkg
-            we internally attempt to "rpm -e" the jre rpm, hitting the gphdfs dependency error here involving "jre = 1.6"
             we determine that the jre rpm is responsible for *providing* "jre = 1.6"
             so, we ultimately omit the jre rpm from our "rpm -e" and move on
 
@@ -655,7 +771,8 @@ class ValidateUninstallPackage(Operation):
             cmd = Command('Discerning culprit rpms for %s' % violated_capability,
                           'rpm -q --whatprovides %s --dbpath %s' % (violated_capability, RPM_DATABASE))
             cmd.run(validateAfter=True)
-            culprit_rpms = set(cmd.get_results().stdout.splitlines())
+            # remove the .x86_64 suffix for each rpm package to match the name in rpm_set
+            culprit_rpms = set(dep.replace('.x86_64', '') for dep in cmd.get_results().stdout.splitlines())
             rpm_set -= culprit_rpms
 
 
@@ -684,6 +801,49 @@ class ExtractPackage(Operation):
         if os.path.exists(path):
             for cur_file in os.listdir(path):
                 shutil.move(os.path.join(TEMP_EXTRACTION_PATH, DEPS_DIR, cur_file), TEMP_EXTRACTION_PATH)
+
+
+class InstallDebPackageLocally(Operation):
+    """
+    For deb package
+    """
+    def __init__(self, package_path, is_update=False):
+        self.package_path = package_path
+        self.is_update = is_update
+
+    def execute(self):
+        current_package_location = self.package_path
+        package_name = os.path.basename(current_package_location)
+        logger.info('Installing %s locally' % package_name)
+        final_package_location = os.path.join(GPPKG_ARCHIVE_PATH, package_name)
+
+        gppkg = Gppkg.from_package_path(current_package_location)
+        ExtractPackage(gppkg).run()
+
+        # squash AlreadyInstalledError here: the caller doesn't ever need to
+        # know that we didn't have to do anything here
+        try:
+            deb_set = ValidateInstallDebPackage(gppkg, is_update=self.is_update).run()
+        except AlreadyInstalledError as e:
+            logger.info(e)
+            return
+
+        if deb_set:
+            deb_packages = " ".join([os.path.join(TEMP_EXTRACTION_PATH, deb_package) for deb_package in deb_set])
+            if self.is_update:
+                deb_install_command = 'fakeroot dpkg --force-not-root --force-depends --log=/dev/null --admindir=%s ' \
+                                      '--instdir=%s -i %s' % (DEB_DATABASE, GPHOME, deb_packages)
+            else:
+                deb_install_command = 'fakeroot dpkg --force-not-root --log=/dev/null --admindir=%s --instdir=%s -i %s' % \
+                                      (DEB_DATABASE, GPHOME, deb_packages)
+
+            cmd = Command('Installing debs', deb_install_command)
+            logger.info(cmd)
+            cmd.run(validateAfter=True)
+
+        MakeDir(GPPKG_ARCHIVE_PATH).run()
+        shutil.copy(current_package_location, final_package_location)
+        logger.info("Completed local installation of %s." % package_name)
 
 
 class InstallPackageLocally(Operation):
@@ -722,7 +882,7 @@ class InstallPackageLocally(Operation):
         # know that we didn't have to do anything here
         try:
             rpm_set = ValidateInstallPackage(gppkg, is_update=self.is_update).run()
-        except AlreadyInstalledError, e:
+        except AlreadyInstalledError as e:
             logger.info(e)
             return
 
@@ -730,7 +890,7 @@ class InstallPackageLocally(Operation):
             if self.is_update:
                 rpm_install_command = 'rpm -U --force %s --dbpath %s --prefix=%s'
             else:
-                rpm_install_command = 'rpm -i %s --dbpath %s --prefix=%s'
+                rpm_install_command = 'rpm -i --force %s --dbpath %s --prefix=%s'
             rpm_install_command = rpm_install_command % \
                                   (" ".join([os.path.join(TEMP_EXTRACTION_PATH, rpm) for rpm in rpm_set]),
                                    RPM_DATABASE,
@@ -744,6 +904,40 @@ class InstallPackageLocally(Operation):
         MakeDir(GPPKG_ARCHIVE_PATH).run()
         shutil.copy(current_package_location, final_package_location)
         logger.info("Completed local installation of %s." % package_name)
+
+
+class UninstallDebPackageLocally(Operation):
+    """
+     A replicate class of ValidateUninstallPackage that used for uninstall deb package for Ubuntu.
+     Same logic as UninstallPackageLocally
+
+    """
+
+    def __init__(self, package_name):
+        self.package_name = package_name
+
+    def execute(self):
+        current_package_location = os.path.join(GPPKG_ARCHIVE_PATH, self.package_name)
+        gppkg = Gppkg.from_package_path(current_package_location)
+
+        # squash NotInstalledError here: the caller doesn't ever need to
+        # know that we didn't have to do anything here
+        try:
+            deb_set = ValidateUninstallDebPackage(gppkg).run()
+        except NotInstalledError as e:
+            logger.info(e)
+            return
+
+        if deb_set:
+            deb_uninstall_command = 'fakeroot dpkg --force-not-root --log=/dev/null --admindir=%s --instdir=%s -r %s' % (
+                DEB_DATABASE, GPHOME, " ".join(deb_set))
+            cmd = Command('Uninstalling debs', deb_uninstall_command)
+            logger.info(cmd)
+            cmd.run(validateAfter=True)
+
+        MakeDir(GPPKG_ARCHIVE_PATH).run()
+        RemoveFile(current_package_location).run()
+        logger.info("Completed local uninstallation of %s." % self.package_name)
 
 
 class UninstallPackageLocally(Operation):
@@ -774,7 +968,7 @@ class UninstallPackageLocally(Operation):
         # know that we didn't have to do anything here
         try:
             rpm_set = ValidateUninstallPackage(gppkg).run()
-        except NotInstalledError, e:
+        except NotInstalledError as e:
             logger.info(e)
             return
 
@@ -792,7 +986,7 @@ class UninstallPackageLocally(Operation):
 
 class SyncPackages(Operation):
     """
-    Synchronizes packages from master to a remote host
+    Synchronizes packages from coordinator to a remote host
 
     TODO: AK: MPP-15568
     """
@@ -806,14 +1000,14 @@ class SyncPackages(Operation):
         if not CheckRemoteDir(GPPKG_ARCHIVE_PATH, self.host).run():
             MakeRemoteDir(GPPKG_ARCHIVE_PATH, self.host).run()
 
-        # set of packages on the master
-        master_package_set = set(ListFilesByPattern(GPPKG_ARCHIVE_PATH, '*' + GPPKG_EXTENSION).run())
+        # set of packages on the coordinator
+        coordinator_package_set = set(ListFilesByPattern(GPPKG_ARCHIVE_PATH, '*' + GPPKG_EXTENSION).run())
         # set of packages on the remote host
         remote_package_set = set(ListRemoteFilesByPattern(GPPKG_ARCHIVE_PATH, '*' + GPPKG_EXTENSION, self.host).run())
         # packages to be uninstalled on the remote host
-        uninstall_package_set = remote_package_set - master_package_set
+        uninstall_package_set = remote_package_set - coordinator_package_set
         # packages to be installed on the remote host
-        install_package_set = master_package_set - remote_package_set
+        install_package_set = coordinator_package_set - remote_package_set
 
         if not install_package_set and not uninstall_package_set:
             logger.info('The packages on %s are consistent.' % self.host)
@@ -821,7 +1015,7 @@ class SyncPackages(Operation):
 
         if install_package_set:
             logger.info(
-                'The following packages will be installed on %s: %s' % (self.host, ', '.join(install_package_set)))
+                'The following packages will be installed on %s: %s' % (self.host, ', '.join(sorted(install_package_set))))
             for package in install_package_set:
                 logger.debug('copying %s to %s' % (package, self.host))
                 dstFile = os.path.join(GPHOME, package)
@@ -829,33 +1023,45 @@ class SyncPackages(Operation):
                     srcFile=os.path.join(GPPKG_ARCHIVE_PATH, package),
                     dstFile=dstFile,
                     dstHost=self.host).run(validateAfter=True)
-                RemoteOperation(InstallPackageLocally(dstFile), self.host).run()
+                if linux_distribution_id() == 'ubuntu':
+                    RemoteOperation(InstallDebPackageLocally(dstFile), self.host).run()
+                else:
+                    RemoteOperation(InstallPackageLocally(dstFile), self.host).run()
                 RemoveRemoteFile(dstFile, self.host).run()
 
         if uninstall_package_set:
             logger.info(
-                'The following packages will be uninstalled on %s: %s' % (self.host, ', '.join(uninstall_package_set)))
+                'The following packages will be uninstalled on %s: %s' % (self.host, ', '.join(sorted(uninstall_package_set))))
             for package in uninstall_package_set:
-                RemoteOperation(UninstallPackageLocally(package), self.host).run()
+                if linux_distribution_id() == 'ubuntu':
+                    RemoteOperation(UninstallDebPackageLocally(package), self.host).run()
+                else:
+                    RemoteOperation(UninstallPackageLocally(package), self.host).run()
 
 
 class InstallPackage(Operation):
-    def __init__(self, gppkg, master_host, standby_host, segment_host_list):
+    def __init__(self, gppkg, coordinator_host, standby_host, segment_host_list):
         self.gppkg = gppkg
-        self.master_host = master_host
-        self.standby_host = standby_host
+        self.coordinator_host = coordinator_host
+        if coordinator_host != standby_host:
+            self.standby_host = standby_host
+        else:
+            self.standby_host = None
         self.segment_host_list = segment_host_list
 
     def execute(self):
         logger.info('Installing package %s' % self.gppkg.pkg)
 
-        # TODO: AK: MPP-15736 - precheck package state on master
+        # TODO: AK: MPP-15736 - precheck package state on coordinator
         ExtractPackage(self.gppkg).run()
-        ValidateInstallPackage(self.gppkg).run()
+        if linux_distribution_id() == 'ubuntu':
+            ValidateInstallDebPackage(self.gppkg).run()
+        else:
+            ValidateInstallPackage(self.gppkg).run()
 
         # perform any pre-installation steps
         PerformHooks(hooks=self.gppkg.preinstall,
-                     master_host=self.master_host,
+                     coordinator_host=self.coordinator_host,
                      standby_host=self.standby_host,
                      segment_host_list=self.segment_host_list).run()
 
@@ -863,25 +1069,42 @@ class InstallPackage(Operation):
         srcFile = self.gppkg.abspath
         dstFile = os.path.join(GPHOME, self.gppkg.pkg)
 
-        # install package on segments
-        if self.segment_host_list:
-            GpScp(srcFile, dstFile, self.segment_host_list).run()
-            HostOperation(InstallPackageLocally(dstFile), self.segment_host_list).run()
+        if linux_distribution_id() == 'ubuntu':
+            # install package on segments
+            if self.segment_host_list:
+                GpScp(srcFile, dstFile, self.segment_host_list).run()
+                HostOperation(InstallDebPackageLocally(dstFile), self.segment_host_list).run()
 
-        # install package on standby
-        if self.standby_host:
-            Scp(name='copying %s to %s' % (srcFile, self.standby_host),
-                srcFile=srcFile,
-                dstFile=dstFile,
-                dstHost=self.standby_host).run(validateAfter=True)
-            RemoteOperation(InstallPackageLocally(dstFile), self.standby_host).run()
+            # install package on standby
+            if self.standby_host:
+                Scp(name='copying %s to %s' % (srcFile, self.standby_host),
+                    srcFile=srcFile,
+                    dstFile=dstFile,
+                    dstHost=self.standby_host).run(validateAfter=True)
+                RemoteOperation(InstallDebPackageLocally(dstFile), self.standby_host).run()
 
-        # install package on master
-        InstallPackageLocally(srcFile).run()
+            # install package on coordinator
+            InstallDebPackageLocally(srcFile).run()
+        else:
+            # install package on segments
+            if self.segment_host_list:
+                GpScp(srcFile, dstFile, self.segment_host_list).run()
+                HostOperation(InstallPackageLocally(dstFile), self.segment_host_list).run()
+
+            # install package on standby
+            if self.standby_host:
+                Scp(name='copying %s to %s' % (srcFile, self.standby_host),
+                    srcFile=srcFile,
+                    dstFile=dstFile,
+                    dstHost=self.standby_host).run(validateAfter=True)
+                RemoteOperation(InstallPackageLocally(dstFile), self.standby_host).run()
+
+            # install package on coordinator
+            InstallPackageLocally(srcFile).run()
 
         # perform any post-installation steps
         PerformHooks(hooks=self.gppkg.postinstall,
-                     master_host=self.master_host,
+                     coordinator_host=self.coordinator_host,
                      standby_host=self.standby_host,
                      segment_host_list=self.segment_host_list).run()
 
@@ -889,7 +1112,7 @@ class InstallPackage(Operation):
 
 
 class PerformHooks(Operation):
-    def __init__(self, hooks, master_host, standby_host, segment_host_list):
+    def __init__(self, hooks, coordinator_host, standby_host, segment_host_list):
         """
         Performs steps that have been specified in the yaml file for a particular
         stage of gppkg execution
@@ -899,61 +1122,88 @@ class PerformHooks(Operation):
         the spec file, rpms, and other artifacts (external scripts, perhaps.) To support
         this, these commands should be prefixed with a "cd".
 
-        TODO: AK: I'm adding master_host for consistency.
-        But, why would we ever need master_host?  We're on the master host!
+        TODO: AK: I'm adding coordinator_host for consistency.
+        But, why would we ever need coordinator_host?  We're on the coordinator host!
         """
         self.hooks = hooks
-        self.master_host = master_host
-        self.standby_host = standby_host
+        self.coordinator_host = coordinator_host
+        if coordinator_host != standby_host:
+            self.standby_host = standby_host
+        else:
+            self.standby_host = []
         self.segment_host_list = segment_host_list
 
     def execute(self):
         if self.hooks is None:
             return
         for hook in self.hooks:
-            key = hook.keys()
+            key = list(hook.keys())
             if key is None:
                 return
             key_str = key[0]
-            if key_str.lower() == 'master':
+            if key_str.lower() == 'coordinator':
                 if self.standby_host:
                     RemoteCommand(hook[key_str], [self.standby_host]).run()
                 LocalCommand(hook[key_str], True).run()
             elif key_str.lower() == 'segment':
                 RemoteCommand(hook[key_str], self.segment_host_list).run()
+            elif key_str.lower() == 'all':
+                if self.standby_host:
+                    RemoteCommand(hook[key_str], [self.standby_host]).run()
+                # Change on Coordinator
+                LocalCommand(hook[key_str], True).run()
+                # Change on Segment hosts
+                RemoteCommand(hook[key_str], self.segment_host_list).run()
+
 
 
 class UninstallPackage(Operation):
-    def __init__(self, gppkg, master_host, standby_host, segment_host_list):
+    def __init__(self, gppkg, coordinator_host, standby_host, segment_host_list):
         self.gppkg = gppkg
-        self.master_host = master_host
-        self.standby_host = standby_host
+        self.coordinator_host = coordinator_host
+        if coordinator_host != standby_host:
+            self.standby_host = standby_host
+        else:
+            self.standby_host = []
         self.segment_host_list = segment_host_list
 
     def execute(self):
         logger.info('Uninstalling package %s' % self.gppkg.pkg)
 
-        # TODO: AK: MPP-15736 - precheck package state on master
+        # TODO: AK: MPP-15736 - precheck package state on coordinator
         ExtractPackage(self.gppkg).run()
-        ValidateUninstallPackage(self.gppkg).run()
+
+        if linux_distribution_id() == 'ubuntu':
+            ValidateUninstallDebPackage(self.gppkg).run()
+        else:
+            ValidateUninstallPackage(self.gppkg).run()
 
         # perform any pre-uninstallation steps
         PerformHooks(hooks=self.gppkg.preuninstall,
-                     master_host=self.master_host,
+                     coordinator_host=self.coordinator_host,
                      standby_host=self.standby_host,
                      segment_host_list=self.segment_host_list).run()
 
         # uninstall on segments
-        HostOperation(UninstallPackageLocally(self.gppkg.pkg), self.segment_host_list).run()
+        if linux_distribution_id() == 'ubuntu':
+            HostOperation(UninstallDebPackageLocally(self.gppkg.pkg), self.segment_host_list).run()
 
-        if self.standby_host:
-            RemoteOperation(UninstallPackageLocally(self.gppkg.pkg), self.standby_host).run()
+            if self.standby_host:
+                RemoteOperation(UninstallDebPackageLocally(self.gppkg.pkg), self.standby_host).run()
 
-        UninstallPackageLocally(self.gppkg.pkg).run()
+            UninstallDebPackageLocally(self.gppkg.pkg).run()
 
-        # perform any pre-installation steps
+        else:
+            HostOperation(UninstallPackageLocally(self.gppkg.pkg), self.segment_host_list).run()
+
+            if self.standby_host:
+                RemoteOperation(UninstallPackageLocally(self.gppkg.pkg), self.standby_host).run()
+
+            UninstallPackageLocally(self.gppkg.pkg).run()
+
+        # perform any post-installation steps
         PerformHooks(hooks=self.gppkg.postuninstall,
-                     master_host=self.master_host,
+                     coordinator_host=self.coordinator_host,
                      standby_host=self.standby_host,
                      segment_host_list=self.segment_host_list).run()
 
@@ -961,7 +1211,7 @@ class UninstallPackage(Operation):
 
 
 class QueryPackage(Operation):
-    INFO, LIST, ALL = range(3)
+    INFO, LIST, ALL = list(range(3))
 
     def __init__(self, query_type, package_path):
         self.query_type = query_type
@@ -989,20 +1239,20 @@ class QueryPackage(Operation):
         elif self.query_type == QueryPackage.LIST:
             package = Gppkg.from_package_path(self.package_path)
             for file in package.file_list:
-                print file
+                print(file)
         elif self.query_type == QueryPackage.ALL:
             package_name_list = ListPackages().run()
             for package_name in package_name_list:
-                print package_name
+                print(package_name)
         else:
             package = Gppkg.from_package_path(self.package_path)
             try:
                 ExtractPackage(package).run()
                 ValidateInstallPackage(package).run()
             except AlreadyInstalledError:
-                print '%s is installed.' % package.pkgname
+                print('%s is installed.' % package.pkgname)
             else:
-                print '%s is not installed.' % package.pkgname
+                print('%s is not installed.' % package.pkgname)
 
 
 class BuildGppkg(Operation):
@@ -1011,8 +1261,9 @@ class BuildGppkg(Operation):
         the spec file, rpms and any pre/post installation scripts
     """
 
-    def __init__(self, directory):
+    def __init__(self, directory, filename):
         self.directory = directory
+        self.filename = filename;
 
     def execute(self):
 
@@ -1042,8 +1293,11 @@ class BuildGppkg(Operation):
             raise BuildPkgError
 
         # The file already exists. Rewrite the original with the new one
-        pkg = pkg_path_details['pkgname'] + '-' + str(pkg_path_details['version']) + '-' + pkg_path_details[
-            'os'] + '-' + pkg_path_details['architecture'] + GPPKG_EXTENSION
+        if self.filename is None:
+            pkg = pkg_path_details['pkgname'] + '-' + str(pkg_path_details['version']) + '-' + pkg_path_details[
+                'os'] + '-' + pkg_path_details['architecture'] + GPPKG_EXTENSION
+        else:
+            pkg = self.filename
         if os.path.exists(pkg):
             os.remove(pkg)
 
@@ -1071,9 +1325,9 @@ class BuildGppkg(Operation):
         cur_file = None
 
         with open(specfile) as cur_file:
-            yamlfile = yaml.load(cur_file)
+            yamlfile = yaml.safe_load(cur_file)
 
-            tags = yamlfile.keys()
+            tags = list(yamlfile.keys())
 
             pkg_path_details = {}
 
@@ -1094,13 +1348,13 @@ class BuildGppkg(Operation):
 
         try:
             with open(specfile) as cur_file:
-                yamlfile = yaml.load(cur_file)
+                yamlfile = yaml.safe_load(cur_file)
 
                 if not self._verify_tags(yamlfile):
                     return False
 
                 return True
-        except ScannerError, ex:
+        except ScannerError as ex:
             return False
 
     def _verify_tags(self, yamlfile):
@@ -1111,7 +1365,7 @@ class BuildGppkg(Operation):
         """
 
         logger.debug('_verify_tags')
-        tags = yamlfile.keys()
+        tags = list(yamlfile.keys())
 
         tags = [tag.lower() for tag in tags]
 
@@ -1133,17 +1387,23 @@ class BuildGppkg(Operation):
 class UpdatePackage(Operation):
     """ TODO: AK: Enforce gppkg version is higher than currently installed version """
 
-    def __init__(self, gppkg, master_host, standby_host, segment_host_list):
+    def __init__(self, gppkg, coordinator_host, standby_host, segment_host_list):
         self.gppkg = gppkg
-        self.master_host = master_host
-        self.standby_host = standby_host
+        self.coordinator_host = coordinator_host
+        if coordinator_host != standby_host:
+            self.standby_host = standby_host
+        else:
+            self.standby_host = []
         self.segment_host_list = segment_host_list
 
     def execute(self):
         logger.info('Updating package %s' % self.gppkg.pkg)
 
         ExtractPackage(self.gppkg).run()
-        ValidateInstallPackage(self.gppkg, is_update=True).run()
+        if linux_distribution_id() == 'ubuntu':
+            ValidateInstallDebPackage(self.gppkg, is_update=True).run()
+        else:
+            ValidateInstallPackage(self.gppkg, is_update=True).run()
 
         # distribute package to segments
         srcFile = self.gppkg.abspath
@@ -1161,12 +1421,12 @@ class UpdatePackage(Operation):
                 dstHost=self.standby_host).run(validateAfter=True)
             RemoteOperation(UpdatePackageLocally(dstFile), self.standby_host).run()
 
-        # update package on master
+        # update package on coordinator
         UpdatePackageLocally(srcFile).run()
 
         # perform any post-update steps
         PerformHooks(hooks=self.gppkg.postupdate,
-                     master_host=self.master_host,
+                     coordinator_host=self.coordinator_host,
                      standby_host=self.standby_host,
                      segment_host_list=self.segment_host_list).run()
 
@@ -1187,7 +1447,10 @@ class UpdatePackageLocally(Operation):
         self.package_path = package_path
 
     def execute(self):
-        InstallPackageLocally(self.package_path, is_update=True).run()
+        if linux_distribution_id() == 'ubuntu':
+            InstallDebPackageLocally(self.package_path, is_update=True).run()
+        else:
+            InstallPackageLocally(self.package_path, is_update=True).run()
 
         # Remove other versions of the package from archive.
         # Note: Do not rely on filename format to discern such packages.
@@ -1227,7 +1490,7 @@ class CleanGppkg(Operation):
         for operation in operations:
             try:
                 operation.get_ret()
-            except Exception, e:
+            except Exception as e:
                 exceptions += '\n'+str(e)
 
         if exceptions:
@@ -1275,7 +1538,10 @@ class MigratePackages(Operation):
         for package in packages:
             package_path = os.path.join(old_archive_path, package)
             try:
-                InstallPackageLocally(package_path).run()
+                if linux_distribution_id() == 'ubuntu':
+                    InstallDebPackageLocally(package_path).run()
+                else:
+                    InstallPackageLocally(package_path).run()
             except AlreadyInstalledError:
                 logger.info("%s is already installed." % package)
             except Exception:
@@ -1351,3 +1617,29 @@ class HostOperation(Operation):
         ParallelOperation(operations).run()
         for operation in operations:
             operation.get_ret()
+
+
+# As of py3.8, platform library doesn't have linux_distribution.
+# But all the production systems we support use systemd and hence have this info in /etc/os-release.
+# https://www.freedesktop.org/software/systemd/man/os-release.html
+def _platform_linux_distribution(search_key, osid_filename):
+    try:
+        with open(osid_filename) as f:
+            full_key = '%s=' % search_key
+
+            for line in f.readlines():
+                line = line.strip().replace('"', '')
+                if line.startswith(full_key):
+                    return line[len(full_key):]
+    except:
+        pass
+
+    return 'unknown'
+
+
+def linux_distribution_id(osid_filename='/etc/os-release'):
+    return _platform_linux_distribution('ID', osid_filename)
+
+
+def linux_distribution_version(osid_filename='/etc/os-release'):
+    return _platform_linux_distribution('VERSION_ID', osid_filename)

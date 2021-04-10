@@ -1,5 +1,8 @@
 # src/interfaces/ecpg/test/Makefile
 
+PGFILEDESC = "ECPG Test - regression tests for ECPG"
+PGAPPICON = win32
+
 subdir = src/interfaces/ecpg/test
 top_builddir = ../../../..
 include $(top_builddir)/src/Makefile.global
@@ -9,13 +12,9 @@ override CPPFLAGS := \
 	'-I$(top_srcdir)/src/test/regress' \
 	-Wno-error \
 	'-DHOST_TUPLE="$(host_tuple)"' \
-	'-DMAKEPROG="$(MAKE)"' \
 	'-DSHELLPROG="$(SHELL)"' \
 	'-DDLSUFFIX="$(DLSUFFIX)"' \
 	$(CPPFLAGS)
-
-# where to find psql for testing an existing installation
-PSQLDIR = $(bindir)
 
 # default encoding for regression tests
 ENCODING = SQL_ASCII
@@ -32,6 +31,7 @@ all install installdirs uninstall distprep:
 	$(MAKE) -C pgtypeslib $@
 	$(MAKE) -C preproc $@
 	$(MAKE) -C compat_informix $@
+	$(MAKE) -C compat_oracle $@
 	$(MAKE) -C thread $@
 
 clean distclean maintainer-clean:
@@ -40,16 +40,17 @@ clean distclean maintainer-clean:
 	$(MAKE) -C pgtypeslib $@
 	$(MAKE) -C preproc $@
 	$(MAKE) -C compat_informix $@
+	$(MAKE) -C compat_oracle $@
 	$(MAKE) -C thread $@
 	rm -rf tmp_check results log
-	rm -f pg_regress regression.diffs regression.out pg_regress_ecpg.o
+	rm -f pg_regress regression.diffs regression.out pg_regress_ecpg.o $(WIN32RES)
 
 # Build regression test driver
 
 all: pg_regress$(X)
 
-pg_regress$(X): pg_regress_ecpg.o $(top_builddir)/src/test/regress/pg_regress.o
-	$(CC) $(CFLAGS) $(LDFLAGS) $(LDFLAGS_EX) $^ $(LIBS) -o $@
+pg_regress$(X): pg_regress_ecpg.o $(WIN32RES) $(top_builddir)/src/test/regress/pg_regress.o
+	$(CC) $(CFLAGS) $^ $(LDFLAGS) $(LDFLAGS_EX) $(LIBS) -o $@
 
 $(top_builddir)/src/test/regress/pg_regress.o:
 	$(MAKE) -C $(dir $@) $(notdir $@)
@@ -68,7 +69,7 @@ $(top_builddir)/src/port/pg_config_paths.h: $(top_builddir)/src/Makefile.global
 # $(srcdir) to the build directory.
 
 ifdef VPATH
-remaining_files_src := $(wildcard $(srcdir)/*/*.pgc) $(wildcard $(srcdir)/expected/*.c) $(wildcard $(srcdir)/expected/*.stdout) $(wildcard $(srcdir)/expected/*.stderr) $(srcdir)/resultmap
+remaining_files_src := $(wildcard $(srcdir)/*/*.pgc) $(wildcard $(srcdir)/expected/*.c) $(wildcard $(srcdir)/expected/*.stdout) $(wildcard $(srcdir)/expected/*.stderr)
 remaining_files_build := $(patsubst $(srcdir)/%, $(abs_builddir)/%, $(remaining_files_src))
 
 all: $(remaining_files_build)
@@ -77,14 +78,25 @@ $(remaining_files_build): $(abs_builddir)/%: $(srcdir)/%
 endif
 
 # Common options for tests. Also pick up anything passed in EXTRA_REGRESS_OPTS
-REGRESS_OPTS = --dbname=regress1,connectdb --create-role=connectuser,connectdb $(EXTRA_REGRESS_OPTS)
+REGRESS_OPTS = --dbname=ecpg1_regression,ecpg2_regression --create-role=regress_ecpg_user1,regress_ecpg_user2 $(EXTRA_REGRESS_OPTS)
 
 check: all
-	./pg_regress $(REGRESS_OPTS) --top-builddir=$(top_builddir) --temp-install=./tmp_check $(pg_regress_locale_flags) $(THREAD) --schedule=$(srcdir)/ecpg_schedule
+	$(with_temp_install) ./pg_regress $(REGRESS_OPTS) --temp-instance=./tmp_check $(TEMP_CONF) --bindir= $(pg_regress_locale_flags) $(THREAD) --schedule=$(srcdir)/ecpg_schedule sql/twophase
 
-# the same options, but with --listen-on-tcp
-checktcp: all
-	./pg_regress $(REGRESS_OPTS) --top-builddir=$(top_builddir) --temp-install=./tmp_check $(pg_regress_locale_flags) $(THREAD) --schedule=$(srcdir)/ecpg_schedule_tcp --host=localhost
+# Connect to the server using TCP, and add a TCP-specific test.
+checktcp: all | temp-install
+	$(with_temp_install) ./pg_regress $(REGRESS_OPTS) --temp-instance=./tmp_check $(TEMP_CONF) --bindir= $(pg_regress_locale_flags) $(THREAD) --schedule=$(srcdir)/ecpg_schedule --host=localhost sql/twophase connect/test1
 
 installcheck: all
-	./pg_regress $(REGRESS_OPTS) --psqldir='$(PSQLDIR)' --top-builddir=$(top_builddir) $(pg_regress_locale_flags) $(THREAD) --schedule=$(srcdir)/ecpg_schedule
+	./pg_regress $(REGRESS_OPTS) --bindir='$(bindir)' $(pg_regress_locale_flags) $(THREAD) --schedule=$(srcdir)/ecpg_schedule
+
+# Versions of the check tests that include the twophase commit test.
+# It only makes sense to run these if set up to use prepared transactions,
+# via TEMP_CONFIG for the check case, or via the postgresql.conf for the
+# installcheck case.
+
+installcheck-prepared-txns: all
+	./pg_regress $(REGRESS_OPTS) --bindir='$(bindir)' $(pg_regress_locale_flags) $(THREAD) --schedule=$(srcdir)/ecpg_schedule sql/twophase
+
+check-prepared-txns: all | temp-install
+	$(with_temp_install) ./pg_regress $(REGRESS_OPTS) --temp-instance=./tmp_check $(TEMP_CONF) --bindir= $(pg_regress_locale_flags) $(THREAD) --schedule=$(srcdir)/ecpg_schedule sql/twophase

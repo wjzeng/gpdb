@@ -5,7 +5,7 @@
  *
  *
  * Portions Copyright (c) 2005-2008, Greenplum inc
- * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
  *
  *
  * IDENTIFICATION
@@ -36,10 +36,8 @@
 typedef struct DispatchCommandDtxProtocolParms
 {
 	DtxProtocolCommand dtxProtocolCommand;
-	int			flags;
 	char	   *dtxProtocolCommandLoggingStr;
 	char		gid[TMGIDSIZE];
-	DistributedTransactionId gxid;
 	char	   *serializedDtxContextInfo;
 	int			serializedDtxContextInfoLen;
 } DispatchCommandDtxProtocolParms;
@@ -68,14 +66,11 @@ static char *buildGpDtxProtocolCommand(DispatchCommandDtxProtocolParms *pDtxProt
  */
 struct pg_result **
 CdbDispatchDtxProtocolCommand(DtxProtocolCommand dtxProtocolCommand,
-							  int flags,
 							  char *dtxProtocolCommandLoggingStr,
 							  char *gid,
-							  DistributedTransactionId gxid,
 							  ErrorData **qeError,
 							  int *numresults,
-							  bool *badGangs,
-							  List *twophaseSegments,
+							  List *dtxSegments,
 							  char *serializedDtxContextInfo,
 							  int serializedDtxContextInfoLen)
 {
@@ -88,18 +83,14 @@ CdbDispatchDtxProtocolCommand(DtxProtocolCommand dtxProtocolCommand,
 	char	   *queryText = NULL;
 	int			queryTextLen = 0;
 
-	*badGangs = false;
 	*qeError = NULL;
 
 	MemSet(&dtxProtocolParms, 0, sizeof(dtxProtocolParms));
 	dtxProtocolParms.dtxProtocolCommand = dtxProtocolCommand;
-	dtxProtocolParms.flags = flags;
-	dtxProtocolParms.dtxProtocolCommandLoggingStr =
-		dtxProtocolCommandLoggingStr;
+	dtxProtocolParms.dtxProtocolCommandLoggingStr = dtxProtocolCommandLoggingStr;
 	if (strlen(gid) >= TMGIDSIZE)
 		elog(PANIC, "Distribute transaction identifier too long (%d)", (int) strlen(gid));
 	memcpy(dtxProtocolParms.gid, gid, TMGIDSIZE);
-	dtxProtocolParms.gxid = gxid;
 	dtxProtocolParms.serializedDtxContextInfo = serializedDtxContextInfo;
 	dtxProtocolParms.serializedDtxContextInfoLen = serializedDtxContextInfoLen;
 
@@ -110,22 +101,15 @@ CdbDispatchDtxProtocolCommand(DtxProtocolCommand dtxProtocolCommand,
 
 	queryText = buildGpDtxProtocolCommand(&dtxProtocolParms, &queryTextLen);
 
-	primaryGang = AllocateGang(ds, GANGTYPE_PRIMARY_WRITER, twophaseSegments);
+	primaryGang = AllocateGang(ds, GANGTYPE_PRIMARY_WRITER, dtxSegments);
 
 	Assert(primaryGang);
-
-	if (primaryGang->dispatcherActive)
-	{
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("query plan with multiple segworker groups is not supported"),
-				 errhint("dispatching DTX commands to a busy gang")));
-	}
 
 	cdbdisp_makeDispatchResults(ds, 1, false);
 	cdbdisp_makeDispatchParams(ds, 1, queryText, queryTextLen);
 
 	cdbdisp_dispatchToGang(ds, primaryGang, -1);
+	addToGxactDtxSegments(primaryGang);
 
 	cdbdisp_waitDispatchFinish(ds);
 
@@ -135,14 +119,6 @@ CdbDispatchDtxProtocolCommand(DtxProtocolCommand dtxProtocolCommand,
 
 	if (!pr)
 	{
-		if (!GangOK(primaryGang))
-		{
-			*badGangs = true;
-			elog((Debug_print_full_dtm ? LOG : DEBUG5),
-				 "CdbDispatchDtxProtocolCommand: Bad gang from dispatch of %s for gid = %s",
-				 dtxProtocolCommandLoggingStr, gid);
-		}
-
 		cdbdisp_destroyDispatcherState(ds);
 		return NULL;
 	}
@@ -164,6 +140,7 @@ qdSerializeDtxContextInfo(int *size, bool wantSnapshot, bool inCursor,
 	Snapshot	snapshot = NULL;
 	int			serializedLen;
 	DtxContextInfo *pDtxContextInfo = NULL;
+	DtxContext currentDistributedTransactionContext = DistributedTransactionContext;
 
 	/*
 	 * If 'wantSnapshot' is set, then serialize the ActiveSnapshot. The
@@ -178,20 +155,21 @@ qdSerializeDtxContextInfo(int *size, bool wantSnapshot, bool inCursor,
 		snapshot = GetActiveSnapshot();
 	}
 
-	switch (DistributedTransactionContext)
+	switch (currentDistributedTransactionContext)
 	{
 		case DTX_CONTEXT_QD_DISTRIBUTED_CAPABLE:
 		case DTX_CONTEXT_LOCAL_ONLY:
-			DtxContextInfo_CreateOnMaster(&TempQDDtxContextInfo,
+			DtxContextInfo_CreateOnMaster(&TempQDDtxContextInfo, inCursor,
 										  txnOptions, snapshot);
-
-			TempQDDtxContextInfo.cursorContext = inCursor;
 
 			if (DistributedTransactionContext ==
 				DTX_CONTEXT_QD_DISTRIBUTED_CAPABLE && snapshot != NULL)
 			{
-				updateSharedLocalSnapshot(&TempQDDtxContextInfo, snapshot,
-										  "qdSerializeDtxContextInfo");
+				updateSharedLocalSnapshot(
+					&TempQDDtxContextInfo,
+					currentDistributedTransactionContext,
+					snapshot,
+					"qdSerializeDtxContextInfo");
 			}
 
 			pDtxContextInfo = &TempQDDtxContextInfo;
@@ -207,6 +185,7 @@ qdSerializeDtxContextInfo(int *size, bool wantSnapshot, bool inCursor,
 		case DTX_CONTEXT_QE_FINISH_PREPARED:
 			elog(FATAL, "Unexpected distribute transaction context: '%s'",
 				 DtxContextToString(DistributedTransactionContext));
+			break;
 
 		default:
 			elog(FATAL, "Unrecognized DTX transaction context: %d",
@@ -236,10 +215,8 @@ buildGpDtxProtocolCommand(DispatchCommandDtxProtocolParms *pDtxProtocolParms,
 						 int *finalLen)
 {
 	int			dtxProtocolCommand = (int) pDtxProtocolParms->dtxProtocolCommand;
-	int			flags = pDtxProtocolParms->flags;
 	char	   *dtxProtocolCommandLoggingStr = pDtxProtocolParms->dtxProtocolCommandLoggingStr;
 	char	   *gid = pDtxProtocolParms->gid;
-	int			gxid = pDtxProtocolParms->gxid;
 	char	   *serializedDtxContextInfo = pDtxProtocolParms->serializedDtxContextInfo;
 	int			serializedDtxContextInfoLen = pDtxProtocolParms->serializedDtxContextInfoLen;
 	int			tmp = 0;
@@ -250,12 +227,10 @@ buildGpDtxProtocolCommand(DispatchCommandDtxProtocolParms *pDtxProtocolParms,
 	int			total_query_len = 1 /* 'T' */ +
 	sizeof(len) +
 	sizeof(dtxProtocolCommand) +
-	sizeof(flags) +
 	sizeof(loggingStrLen) +
 	loggingStrLen +
 	sizeof(gidLen) +
 	gidLen +
-	sizeof(gxid) +
 	sizeof(serializedDtxContextInfoLen) +
 	serializedDtxContextInfoLen;
 
@@ -276,10 +251,6 @@ buildGpDtxProtocolCommand(DispatchCommandDtxProtocolParms *pDtxProtocolParms,
 	memcpy(pos, &tmp, sizeof(tmp));
 	pos += sizeof(tmp);
 
-	tmp = htonl(flags);
-	memcpy(pos, &tmp, sizeof(tmp));
-	pos += sizeof(tmp);
-
 	tmp = htonl(loggingStrLen);
 	memcpy(pos, &tmp, sizeof(tmp));
 	pos += sizeof(tmp);
@@ -293,10 +264,6 @@ buildGpDtxProtocolCommand(DispatchCommandDtxProtocolParms *pDtxProtocolParms,
 
 	memcpy(pos, gid, gidLen);
 	pos += gidLen;
-
-	tmp = htonl(gxid);
-	memcpy(pos, &tmp, sizeof(tmp));
-	pos += sizeof(tmp);
 
 	tmp = htonl(serializedDtxContextInfoLen);
 	memcpy(pos, &tmp, sizeof(tmp));

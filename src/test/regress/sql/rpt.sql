@@ -123,13 +123,13 @@ CREATE TABLE parent_part (
 CREATE TABLE child (
         salary          int4,
         manager         name
-) INHERITS (parent_rep) WITH OIDS;
+) INHERITS (parent_rep);
 
 -- replicated table can not have parents, should fail
 CREATE TABLE child (
         salary          int4,
         manager         name
-) INHERITS (parent_part) WITH OIDS DISTRIBUTED REPLICATED;
+) INHERITS (parent_part) DISTRIBUTED REPLICATED;
 
 drop table if exists parent_rep;
 drop table if exists parent_part;
@@ -267,4 +267,166 @@ select * from foo;
 delete from foo where y = 1;
 select * from foo;
 
+-- Test replicate table within init plan
+insert into foo values (1, 1), (2, 1);
+select * from bar where exists (select * from foo);
+
+------
+-- Test Current Of is disabled for replicated table
+------
+begin;
+declare c1 cursor for select * from foo;
+fetch 1 from c1;
+delete from foo where current of c1;
+abort;
+
+begin;
+declare c1 cursor for select * from foo;
+fetch 1 from c1;
+update foo set y = 1 where current of c1;
+abort;
+
+-----
+-- Test updatable view works for replicated table
+----
+truncate foo;
+truncate bar;
+insert into foo values (1, 1);
+insert into foo values (2, 2);
+insert into bar values (1, 1);
+create view v_foo as select * from foo where y = 1;
+begin;
+update v_foo set y = 2; 
+select * from gp_dist_random('foo');
+abort;
+
+update v_foo set y = 3 from bar where bar.y = v_foo.y; 
+select * from gp_dist_random('foo');
+-- Test gp_segment_id for replicated table
+-- gp_segment_id is ambiguous for replicated table, it's been disabled now.
+create table baz (c1 int, c2 int) distributed replicated;
+create table qux (c1 int, c2 int);
+
+select gp_segment_id from baz;
+select xmin from baz;
+select xmax from baz;
+select ctid from baz;
+select * from baz where c2 = gp_segment_id;
+select * from baz, qux where baz.c1 = gp_segment_id;
+update baz set c2 = gp_segment_id;
+update baz set c2 = 1 where gp_segment_id = 1;
+update baz set c2 = 1 from qux where gp_segment_id = baz.c1;
+insert into baz select i, i from generate_series(1, 1000) i;
+vacuum baz;
+vacuum full baz;
+analyze baz;
+
+-- Test dependencies check when alter table to replicated table
+create view v_qux as select ctid from qux;
+alter table qux set distributed replicated;
+drop view v_qux;
+alter table qux set distributed replicated;
+
+-- Test cursor for update also works for replicated table
+create table cursor_update (c1 int, c2 int) distributed replicated;
+insert into cursor_update select i, i from generate_series(1, 10) i;
+begin;
+declare c1 cursor for select * from cursor_update order by c2 for update;
+fetch next from c1;
+end;
+
+-- Test MinMax path on replicated table
+create table minmaxtest (x int, y int) distributed replicated;
+create index on minmaxtest (x);
+insert into minmaxtest select generate_series(1, 10);
+set enable_seqscan=off;
+select min(x) from minmaxtest;
+
+-- Test replicated on partition table
+-- should fail
+CREATE TABLE foopart (a int4, b int4) DISTRIBUTED REPLICATED PARTITION BY RANGE (a) (START (1) END (10));
+CREATE TABLE foopart (a int4, b int4) PARTITION BY RANGE (a) (START (1) END (10)) ;
+-- should fail
+ALTER TABLE foopart SET DISTRIBUTED REPLICATED;
+ALTER TABLE foopart_1_prt_1 SET DISTRIBUTED REPLICATED;
+DROP TABLE foopart;
+
+-- Test that replicated table can't inherit a parent table, and it also
+-- can't be inherited by a child table.
+-- 1. Replicated table can't inherit a parent table.
+CREATE TABLE parent (t text) DISTRIBUTED BY (t);
+-- This is not allowed: should fail
+CREATE TABLE child () INHERITS (parent) DISTRIBUTED REPLICATED;
+
+CREATE TABLE child (t text) DISTRIBUTED REPLICATED;
+-- should fail
+ALTER TABLE child INHERIT parent;
+DROP TABLE child, parent;
+
+-- 2. Replicated table can't be inherited
+CREATE TABLE parent (t text) DISTRIBUTED REPLICATED;
+-- should fail
+CREATE TABLE child () INHERITS (parent) DISTRIBUTED REPLICATED;
+CREATE TABLE child () INHERITS (parent) DISTRIBUTED BY (t);
+
+CREATE TABLE child (t text) DISTRIBUTED REPLICATED;
+ALTER TABLE child INHERIT parent;
+
+CREATE TABLE child2(t text) DISTRIBUTED BY (t);
+ALTER TABLE child2 INHERIT parent;
+
+DROP TABLE child, child2, parent;
+
+-- volatile replicated
+-- General and segmentGeneral locus imply that if the corresponding
+-- slice is executed in many different segments should provide the
+-- same result data set. Thus, in some cases, General and segmentGeneral
+-- can be treated like broadcast. But if the segmentGeneral and general
+-- locus path contain volatile functions, they lose the property and
+-- can only be treated as singleQE. The following cases are to check that
+-- we correctly handle all these cases.
+
+-- FIXME: ORCA does not consider this, we need to fix the cases when ORCA
+-- consider this.
+create table t_hashdist(a int, b int, c int) distributed by (a);
+create table t_replicate_volatile(a int, b int, c int) distributed replicated;
+
+---- pushed down filter
+explain (costs off) select * from t_replicate_volatile, t_hashdist where t_replicate_volatile.a > random();
+
+-- join qual
+explain (costs off) select * from t_hashdist, t_replicate_volatile x, t_replicate_volatile y where x.a + y.a > random();
+
+-- sublink & subquery
+explain (costs off) select * from t_hashdist where a > All (select random() from t_replicate_volatile);
+explain (costs off) select * from t_hashdist where a in (select random()::int from t_replicate_volatile);
+
+-- subplan
+explain (costs off, verbose) select * from t_hashdist left join t_replicate_volatile on t_hashdist.a > any (select random() from t_replicate_volatile);
+
+-- targetlist
+explain (costs off) select * from t_hashdist cross join (select random () from t_replicate_volatile)x;
+explain (costs off) select * from t_hashdist cross join (select a, sum(random()) from t_replicate_volatile group by a) x;
+explain (costs off) select * from t_hashdist cross join (select random() as k, sum(a) from t_replicate_volatile group by k) x;
+explain (costs off) select * from t_hashdist cross join (select a, sum(b) as s from t_replicate_volatile group by a having sum(b) > random() order by a) x ;
+
+-- insert
+explain (costs off) insert into t_replicate_volatile select random() from t_replicate_volatile;
+explain (costs off) insert into t_replicate_volatile select random(), a, a from generate_series(1, 10) a;
+create sequence seq_for_insert_replicated_table;
+explain (costs off) insert into t_replicate_volatile select nextval('seq_for_insert_replicated_table');
+-- update & delete
+explain (costs off) update t_replicate_volatile set a = 1 where b > random();
+explain (costs off) update t_replicate_volatile set a = 1 from t_replicate_volatile x where x.a + random() = t_replicate_volatile.b;
+explain (costs off) update t_replicate_volatile set a = 1 from t_hashdist x where x.a + random() = t_replicate_volatile.b;
+explain (costs off) delete from t_replicate_volatile where a < random();
+explain (costs off) delete from t_replicate_volatile using t_replicate_volatile x where t_replicate_volatile.a + x.b < random();
+explain (costs off) update t_replicate_volatile set a = random();
+
+-- limit
+explain (costs off) insert into t_replicate_volatile select * from t_replicate_volatile limit random();
+explain (costs off) select * from t_hashdist cross join (select * from t_replicate_volatile limit random()) x;
+
+-- start_ignore
 drop schema rpt cascade;
+-- end_ignore

@@ -34,7 +34,8 @@ ANALYZE [VERBOSE] ROOTPARTITION {ALL | <varname>root_partition</varname> [ (<var
           <li>When updating HLL statistics, <codeph>ANALYZE</codeph> operations are required only on
             leaf child partitions that have changed. For example, <codeph>ANALYZE</codeph> is
             required if the leaf child partition data has changed, or if the leaf child partition
-            has been exchanged with another table.</li>
+            has been exchanged with another table. For more information about updating partitioned
+            table statistics, see <xref href="#topic1/section5" format="dita">Notes</xref>.</li>
         </ul></p>
       <note type="important">If you intend to execute queries on partitioned tables with GPORCA
         enabled (the default), then you must collect statistics on the root partition of the
@@ -92,9 +93,12 @@ ANALYZE [VERBOSE] ROOTPARTITION {ALL | <varname>root_partition</varname> [ (<var
           <pd>The <codeph>ROOTPARTITION</codeph> clause is not valid with <codeph>VACUUM
               ANALYZE</codeph>. The command <codeph>VACUUM ANALYZE ROOTPARTITION</codeph> returns an
             error. </pd>
-          <pd>The time to run <codeph>ANALYZE ROOTPARTITION</codeph> is similar to the time to
-            analyze a non-partitioned table with the same data since <codeph>ANALYZE
-              ROOTPARTITION</codeph> only samples the leaf child partition data. </pd>
+          <pd>If all the leaf partitions have statistics, performing <codeph>ANALYZE
+              ROOTPARTITION</codeph> to generate root partition statistics should be quick (a few
+            seconds depending on the number of partitions and table columns). If some of the leaf
+            partitions do not have statistics, then all the table data is sampled to generate root
+            partition statistics. Sampling table data takes longer and results in lower quality root
+            partition statistics.</pd>
           <pd>For the partitioned table <i>sales_curr_yr</i>, this example command collects
             statistics only on the root partition of the partitioned table. <codeph>ANALYZE
               ROOTPARTITION sales_curr_yr; </codeph></pd>
@@ -118,8 +122,8 @@ ANALYZE [VERBOSE] ROOTPARTITION {ALL | <varname>root_partition</varname> [ (<var
           <pt>
             <varname>table</varname>
           </pt>
-          <pd>The name (possibly schema-qualified) of a specific table to analyze. Defaults to all
-            tables in the current database. </pd>
+          <pd>The name (possibly schema-qualified) of a specific table to analyze. If omitted, all regular tables (but not foreign tables)
+            in the current database are analyzed. </pd>
         </plentry>
         <plentry>
           <pt>
@@ -131,14 +135,18 @@ ANALYZE [VERBOSE] ROOTPARTITION {ALL | <varname>root_partition</varname> [ (<var
     </section>
     <section id="section5">
       <title>Notes</title>
+      <p>Foreign tables are analyzed only when explicitly selected. Not all foreign data wrappers
+        support <codeph>ANALYZE</codeph>. If the table's wrapper does not support
+          <codeph>ANALYZE</codeph>, the command prints a warning and does nothing.</p>
       <p>It is a good idea to run <codeph>ANALYZE</codeph> periodically, or just after making major
         changes in the contents of a table. Accurate statistics helps Greenplum Database choose the
         most appropriate query plan, and thereby improve the speed of query processing. A common
-        strategy is to run <codeph><xref href="./VACUUM.xml#topic1" type="topic" format="dita"
-          /></codeph> and <codeph>ANALYZE</codeph> once a day during a low-usage time of day. You
+        strategy for read-mostly databases is to run <codeph><xref href="./VACUUM.xml#topic1"
+            type="topic" format="dita"/></codeph> and <codeph>ANALYZE</codeph> once a day during a
+        low-usage time of day. (This will not be sufficient if there is heavy update activity.) You
         can check for tables with missing statistics using the <codeph>gp_stats_missing</codeph>
-        view, which is in the <codeph>gp_toolkit</codeph>
-        schema:<codeblock>SELECT * from gp_toolkit.gp_stats_missing;</codeblock></p>
+        view, which is in the <codeph>gp_toolkit</codeph> schema:</p>
+      <codeblock>SELECT * from gp_toolkit.gp_stats_missing;</codeblock>
       <p><codeph>ANALYZE</codeph> requires <codeph>SHARE UPDATE EXCLUSIVE</codeph> lock on the
         target table. This lock conflicts with these locks: <codeph>SHARE UPDATE EXCLUSIVE</codeph>,
           <codeph>SHARE</codeph>, <codeph>SHARE ROW EXCLUSIVE</codeph>, <codeph>EXCLUSIVE</codeph>,
@@ -150,30 +158,32 @@ ANALYZE [VERBOSE] ROOTPARTITION {ALL | <varname>root_partition</varname> [ (<var
       <p>For a partitioned table, specifying which portion of the table to analyze, the root
         partition or subpartitions (leaf child partition tables) can be useful if the partitioned
         table has a large number of partitions that have been analyzed and only a few leaf child
-        partitions have changed.</p>
+        partitions have changed. <note>When you create a partitioned table with the <codeph>CREATE
+            TABLE</codeph> command, Greenplum Database creates the table that you specify (the root
+          partition or parent table), and also creates a hierarchy of tables based on the partition
+          hierarchy that you specified (the child tables). </note></p>
       <ul>
         <li id="bd138200">When you run <codeph>ANALYZE</codeph> on the root partitioned table,
           statistics are collected for all the leaf child partitions. Leaf child partitions are the
           lowest-level tables in the hierarchy of child tables created by Greenplum Database for use
           by the partitioned table. </li>
         <li id="bd138204">When you run <codeph>ANALYZE</codeph> on a leaf child partition,
-          statistics are collected only for that leaf child partition and the root partition. When
-          you run <codeph>ANALYZE</codeph> on a child table that is not a leaf child partition,
-          statistics are not collected. <p>For example, you can create a partitioned table with
-            partitions for the years 2006 to 2016 and subpartitions for each month in each year. If
-            you run <codeph>ANALYZE</codeph> on the child table for the year 2013 no statistics are
-            collected. If you run <codeph>ANALYZE</codeph> on the leaf child partition for March of
-            2013, statistics are collected only for that leaf child partition. </p>
-          <note>When you create a partitioned table with the <codeph>CREATE TABLE</codeph> command,
-            Greenplum Database creates the table that you specify (the root partition or parent
-            table), and also creates a hierarchy of tables based on the partition hierarchy that you
-            specified (the child tables). Partitioned tables, child tables and their inheritance
-            level relationships are tracked in the system view <i>pg_partitions</i>.</note></li>
-        <li>For a leaf child partition that has changed, (for example, you make significant updates
-          to the leaf child partition data or exchange the leaf child partition), you can run
-            <codeph>ANALYZE</codeph> on a leaf child partition to collect table statistics. By
-          default, if all other leaf child partitions have statistics, the command updates the root
-          partition statistics. </li>
+          statistics are collected only for that leaf child partition and the root partition. If
+          data in the leaf partition has changed (for example, you made significant updates to the
+          leaf child partition data or you exchanged the leaf child partition), then you can run
+          ANALYZE on the leaf child partition to collect table statistics. By default, if all other
+          leaf child partitions have statistics, the command updates the root partition statistics.
+            <p>For example, if you collected statistics on a partitioned table with a large number
+            partitions and then updated data in only a few leaf child partitions, you can run
+              <codeph>ANALYZE</codeph> only on those partitions to update statistics on the
+            partitions and the statistics on the root partition.</p></li>
+        <li>When you run <codeph>ANALYZE</codeph> on a child table that is not a leaf child
+          partition, statistics are not collected. <p>For example, you can create a partitioned
+            table with partitions for the years 2006 to 2016 and subpartitions for each month in
+            each year. If you run <codeph>ANALYZE</codeph> on the child table for the year 2013 no
+            statistics are collected. If you run <codeph>ANALYZE</codeph> on the leaf child
+            partition for March of 2013, statistics are collected only for that leaf child
+            partition. </p></li>
       </ul>
       <p>For a partitioned table that contains a leaf child partition that has been exchanged to use
         an external table, <codeph>ANALYZE</codeph> does not collect statistics for the external
@@ -212,7 +222,7 @@ ANALYZE [VERBOSE] ROOTPARTITION {ALL | <varname>root_partition</varname> [ (<var
         avoid this, raise the amount of statistics collected by <codeph>ANALYZE</codeph> by
         adjusting the <varname>default_statistics_target</varname> configuration parameter, or on a
         column-by-column basis by setting the per-column statistics target with <codeph>ALTER TABLE
-          ... ALTER COLUMN ... SET STATISTICS</codeph> (see <codeph>ALTER TABLE</codeph>). The
+          ... ALTER COLUMN ... SET (n_distinct ...)</codeph> (see <codeph>ALTER TABLE</codeph>). The
         target value sets the maximum number of entries in the most-common-value list and the
         maximum number of bins in the histogram. The default target value is 100, but this can be
         adjusted up or down to trade off accuracy of planner estimates against the time taken for
@@ -225,6 +235,12 @@ ANALYZE [VERBOSE] ROOTPARTITION {ALL | <varname>root_partition</varname> [ (<var
       <p>The largest statistics target among the columns being analyzed determines the number of
         table rows sampled to prepare the statistics. Increasing the target causes a proportional
         increase in the time and space needed to do <codeph>ANALYZE</codeph>.</p>
+      <p>One of the values estimated by <codeph>ANALYZE</codeph> is the number of distinct values
+        that appear in each column. Because only a subset of the rows are examined, this estimate
+        can sometimes be quite inaccurate, even with the largest possible statistics target. If this
+        inaccuracy leads to bad query plans, a more accurate value can be determined manually and
+        then installed with <codeph>ALTER TABLE ... ALTER COLUMN ... SET STATISTICS
+          DISTINCT</codeph> (see <xref href="ALTER_TABLE.xml#topic1"/>).</p>
       <p>When Greenplum Database performs an <codeph>ANALYZE</codeph> operation to collect
         statistics for a table and detects that all the sampled table data pages are empty (do not
         contain valid data), Greenplum Database displays a message that a <codeph>VACUUM
@@ -235,8 +251,8 @@ ANALYZE [VERBOSE] ROOTPARTITION {ALL | <varname>root_partition</varname> [ (<var
         statistics. </p>
       <p>If there are no statistics for the table, the server configuration parameter <codeph><xref
             href="../config_params/guc-list.xml#gp_enable_relsize_collection"/></codeph> controls
-        whether the legacy query optimizer uses a default statistics file or estimates the size of a
-        table using the <codeph>pg_relation_size</codeph> function. By default, the legacy optimizer
+        whether the Postgres Planner uses a default statistics file or estimates the size of a
+        table using the <codeph>pg_relation_size</codeph> function. By default, the Postgres Planner
         uses the default statistics file to estimate the number of rows if statistics are not
         available.</p>
     </section>

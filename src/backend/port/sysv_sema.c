@@ -4,7 +4,7 @@
  *	  Implement PGSemaphores using SysV semaphore facilities
  *
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -27,8 +27,14 @@
 #include "miscadmin.h"
 #include "storage/ipc.h"
 #include "storage/pg_sema.h"
-#include "utils/guc.h"
+#include "storage/shmem.h"
 
+
+typedef struct PGSemaphoreData
+{
+	int			semId;			/* semaphore set identifier */
+	int			semNum;			/* semaphore number within set */
+} PGSemaphoreData;
 
 #ifndef HAVE_UNION_SEMUN
 union semun
@@ -55,17 +61,20 @@ typedef int IpcSemaphoreId;		/* semaphore ID returned by semget(2) */
 #define PGSemaMagic		537		/* must be less than SEMVMX */
 
 
-static IpcSemaphoreId *mySemaSets;		/* IDs of sema sets acquired so far */
+static PGSemaphore sharedSemas; /* array of PGSemaphoreData in shared memory */
+static int	numSharedSemas;		/* number of PGSemaphoreDatas used so far */
+static int	maxSharedSemas;		/* allocated size of PGSemaphoreData array */
+static IpcSemaphoreId *mySemaSets;	/* IDs of sema sets acquired so far */
 static int	numSemaSets;		/* number of sema sets acquired so far */
 static int	maxSemaSets;		/* allocated size of mySemaSets array */
-static IpcSemaphoreKey nextSemaKey;		/* next key to try using */
+static IpcSemaphoreKey nextSemaKey; /* next key to try using */
 static int	nextSemaNumber;		/* next free sem num in last sema set */
 
 
 static IpcSemaphoreId InternalIpcSemaphoreCreate(IpcSemaphoreKey semKey,
-						   int numSems);
+												 int numSems);
 static void IpcSemaphoreInitialize(IpcSemaphoreId semId, int semNum,
-					   int value);
+								   int value);
 static void IpcSemaphoreKill(IpcSemaphoreId semId);
 static int	IpcSemaphoreGetValue(IpcSemaphoreId semId, int semNum);
 static pid_t IpcSemaphoreGetLastPID(IpcSemaphoreId semId, int semNum);
@@ -117,12 +126,12 @@ InternalIpcSemaphoreCreate(IpcSemaphoreKey semKey, int numSems)
 						   IPC_CREAT | IPC_EXCL | IPCProtection),
 				 (saved_errno == ENOSPC) ?
 				 errhint("This error does *not* mean that you have run out of disk space.  "
-		  "It occurs when either the system limit for the maximum number of "
-			 "semaphore sets (SEMMNI), or the system wide maximum number of "
-			"semaphores (SEMMNS), would be exceeded.  You need to raise the "
-		  "respective kernel parameter.  Alternatively, reduce PostgreSQL's "
+						 "It occurs when either the system limit for the maximum number of "
+						 "semaphore sets (SEMMNI), or the system wide maximum number of "
+						 "semaphores (SEMMNS), would be exceeded.  You need to raise the "
+						 "respective kernel parameter.  Alternatively, reduce PostgreSQL's "
 						 "consumption of semaphores by reducing its max_connections parameter.\n"
-			  "The PostgreSQL documentation contains more information about "
+						 "The PostgreSQL documentation contains more information about "
 						 "configuring your system for PostgreSQL.") : 0));
 	}
 
@@ -147,7 +156,7 @@ IpcSemaphoreInitialize(IpcSemaphoreId semId, int semNum, int value)
 								 semId, semNum, value),
 				 (saved_errno == ERANGE) ?
 				 errhint("You possibly need to raise your kernel's SEMVMX value to be at least "
-				  "%d.  Look into the PostgreSQL documentation for details.",
+						 "%d.  Look into the PostgreSQL documentation for details.",
 						 value) : 0));
 	}
 }
@@ -275,6 +284,15 @@ IpcSemaphoreCreate(int numSems)
 
 
 /*
+ * Report amount of shared memory needed for semaphores
+ */
+Size
+PGSemaphoreShmemSize(int maxSemas)
+{
+	return mul_size(maxSemas, sizeof(PGSemaphoreData));
+}
+
+/*
  * PGReserveSemaphores --- initialize semaphore support
  *
  * This is called during postmaster start or shared memory reinitialization.
@@ -288,12 +306,26 @@ IpcSemaphoreCreate(int numSems)
  * zero will be passed.
  *
  * In the SysV implementation, we acquire semaphore sets on-demand; the
- * maxSemas parameter is just used to size the array that keeps track of
- * acquired sets for subsequent releasing.
+ * maxSemas parameter is just used to size the arrays.  There is an array
+ * of PGSemaphoreData structs in shared memory, and a postmaster-local array
+ * with one entry per SysV semaphore set, which we use for releasing the
+ * semaphore sets when done.  (This design ensures that postmaster shutdown
+ * doesn't rely on the contents of shared memory, which a failed backend might
+ * have clobbered.)
  */
 void
 PGReserveSemaphores(int maxSemas, int port)
 {
+	/*
+	 * We must use ShmemAllocUnlocked(), since the spinlock protecting
+	 * ShmemAlloc() won't be ready yet.  (This ordering is necessary when we
+	 * are emulating spinlocks with semaphores.)
+	 */
+	sharedSemas = (PGSemaphore)
+		ShmemAllocUnlocked(PGSemaphoreShmemSize(maxSemas));
+	numSharedSemas = 0;
+	maxSharedSemas = maxSemas;
+
 	maxSemaSets = (maxSemas + SEMAS_PER_SET - 1) / SEMAS_PER_SET;
 	mySemaSets = (IpcSemaphoreId *)
 		malloc(maxSemaSets * sizeof(IpcSemaphoreId));
@@ -301,7 +333,7 @@ PGReserveSemaphores(int maxSemas, int port)
 		elog(PANIC, "out of memory");
 	numSemaSets = 0;
 	nextSemaKey = port * 1000;
-	nextSemaNumber = SEMAS_PER_SET;		/* force sema set alloc on 1st call */
+	nextSemaNumber = SEMAS_PER_SET; /* force sema set alloc on 1st call */
 
 	on_shmem_exit(ReleaseSemaphores, 0);
 }
@@ -324,11 +356,13 @@ ReleaseSemaphores(int status, Datum arg)
 /*
  * PGSemaphoreCreate
  *
- * Initialize a PGSemaphore structure to represent a sema with count 1
+ * Allocate a PGSemaphore structure with initial count 1
  */
-void
-PGSemaphoreCreate(PGSemaphore sema)
+PGSemaphore
+PGSemaphoreCreate(void)
 {
+	PGSemaphore sema;
+
 	/* Can't do this in a backend, because static state is postmaster's */
 	Assert(!IsUnderPostmaster);
 
@@ -341,11 +375,17 @@ PGSemaphoreCreate(PGSemaphore sema)
 		numSemaSets++;
 		nextSemaNumber = 0;
 	}
+	/* Use the next shared PGSemaphoreData */
+	if (numSharedSemas >= maxSharedSemas)
+		elog(PANIC, "too many semaphores created");
+	sema = &sharedSemas[numSharedSemas++];
 	/* Assign the next free semaphore in the current set */
 	sema->semId = mySemaSets[numSemaSets - 1];
 	sema->semNum = nextSemaNumber++;
 	/* Initialize it to count 1 */
 	IpcSemaphoreInitialize(sema->semId, sema->semNum, 1);
+
+	return sema;
 }
 
 /*
@@ -365,7 +405,7 @@ PGSemaphoreReset(PGSemaphore sema)
  * Lock a semaphore (decrement count), blocking if count would be < 0
  */
 void
-PGSemaphoreLock(PGSemaphore sema, bool interruptOK)
+PGSemaphoreLock(PGSemaphore sema)
 {
 	int			errStatus;
 	struct sembuf sops;
@@ -379,48 +419,13 @@ PGSemaphoreLock(PGSemaphore sema, bool interruptOK)
 	 * from the operation prematurely because we were sent a signal.  So we
 	 * try and lock the semaphore again.
 	 *
-	 * Each time around the loop, we check for a cancel/die interrupt.  On
-	 * some platforms, if such an interrupt comes in while we are waiting, it
-	 * will cause the semop() call to exit with errno == EINTR, allowing us to
-	 * service the interrupt (if not in a critical section already) during the
-	 * next loop iteration.
-	 *
-	 * Once we acquire the lock, we do NOT check for an interrupt before
-	 * returning.  The caller needs to be able to record ownership of the lock
-	 * before any interrupt can be accepted.
-	 *
-	 * There is a window of a few instructions between CHECK_FOR_INTERRUPTS
-	 * and entering the semop() call.  If a cancel/die interrupt occurs in
-	 * that window, we would fail to notice it until after we acquire the lock
-	 * (or get another interrupt to escape the semop()).  We can avoid this
-	 * problem by temporarily setting ImmediateInterruptOK to true before we
-	 * do CHECK_FOR_INTERRUPTS; then, a die() interrupt in this interval will
-	 * execute directly.  However, there is a huge pitfall: there is another
-	 * window of a few instructions after the semop() before we are able to
-	 * reset ImmediateInterruptOK.  If an interrupt occurs then, we'll lose
-	 * control, which means that the lock has been acquired but our caller did
-	 * not get a chance to record the fact. Therefore, we only set
-	 * ImmediateInterruptOK if the caller tells us it's OK to do so, ie, the
-	 * caller does not need to record acquiring the lock.  (This is currently
-	 * true for lockmanager locks, since the process that granted us the lock
-	 * did all the necessary state updates. It's not true for SysV semaphores
-	 * used to implement LW locks or emulate spinlocks --- but the wait time
-	 * for such locks should not be very long, anyway.)
-	 *
-	 * On some platforms, signals marked SA_RESTART (which is most, for us)
-	 * will not interrupt the semop(); it will just keep waiting.  Therefore
-	 * it's necessary for cancel/die interrupts to be serviced directly by the
-	 * signal handler.  On these platforms the behavior is really the same
-	 * whether the signal arrives just before the semop() begins, or while it
-	 * is waiting.  The loop on EINTR is thus important only for platforms
-	 * without SA_RESTART.
+	 * We used to check interrupts here, but that required servicing
+	 * interrupts directly from signal handlers. Which is hard to do safely
+	 * and portably.
 	 */
 	do
 	{
-		ImmediateInterruptOK = interruptOK;
-		CHECK_FOR_INTERRUPTS();
 		errStatus = semop(sema->semId, &sops, 1);
-		ImmediateInterruptOK = false;
 	} while (errStatus < 0 && errno == EINTR);
 
 	if (errStatus < 0)

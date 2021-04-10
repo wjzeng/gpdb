@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 import os
 import unittest
@@ -9,31 +9,31 @@ from mock import MagicMock, Mock, mock_open, patch
 
 class InitStandbyTestCase(unittest.TestCase):
 
-    @patch('gppylib.operations.initstandby.unix.InterfaceAddrs.remote', return_value=['192.168.2.1', '192.168.1.1'])
+    @patch('gppylib.operations.initstandby.gp.IfAddrs.list_addrs', return_value=['192.168.2.1', '192.168.1.1'])
     @patch('gppylib.operations.initstandby.unix.UserId.local', return_value='all')
     def test_get_standby_pg_hba_info(self, m1, m2):
-        expected = '# standby master host ip addresses\nhost\tall\tall\t192.168.2.1/32\ttrust\nhost\tall\tall\t192.168.1.1/32\ttrust\n'
+        expected = '# standby coordinator host ip addresses\nhost\tall\tall\t192.168.2.1/32\ttrust\nhost\tall\tall\t192.168.1.1/32\ttrust\n'
         self.assertEqual(expected, get_standby_pg_hba_info('host'))
 
     def test_update_pg_hba(self):
         file_contents = """some pg hba data here\n"""
-        pg_hba_info = '# standby master host ip addresses\nhost\tall\tall\t192.168.2.1/32\ttrust\nhost\tall\tall\t192.168.1.1/32\ttrust\n'
+        pg_hba_info = '# standby coordinator host ip addresses\nhost\tall\tall\t192.168.2.1/32\ttrust\nhost\tall\tall\t192.168.1.1/32\ttrust\n'
         data_dirs = ['/tmp/d1', '/tmp/d2']
         expected = [file_contents + pg_hba_info, file_contents + pg_hba_info]
         m = MagicMock()
         m.return_value.__enter__.return_value.read.side_effect = [file_contents, file_contents]
-        with patch('__builtin__.open', m, create=True):
+        with patch('builtins.open', m, create=True):
             self.assertEqual(expected, update_pg_hba(pg_hba_info, data_dirs))
 
     def test_update_pg_hba_duplicate(self):
         file_contents = """some pg hba data here\n"""
-        duplicate_entry = """# standby master host ip addresses\nhost\tall\tall\t192.168.2.1/32\ttrust\nhost\tall\tall\t192.168.1.1/32\ttrust\n"""
-        pg_hba_info = '# standby master host ip addresses\nhost\tall\tall\t192.168.2.1/32\ttrust\nhost\tall\tall\t192.168.1.1/32\ttrust\n'
+        duplicate_entry = """# standby coordinator host ip addresses\nhost\tall\tall\t192.168.2.1/32\ttrust\nhost\tall\tall\t192.168.1.1/32\ttrust\n"""
+        pg_hba_info = '# standby coordinator host ip addresses\nhost\tall\tall\t192.168.2.1/32\ttrust\nhost\tall\tall\t192.168.1.1/32\ttrust\n'
         data_dirs = ['/tmp/d1', '/tmp/d2']
         expected = [file_contents + pg_hba_info]
         m = MagicMock()
         m.return_value.__enter__.return_value.read.side_effect = [file_contents, file_contents + duplicate_entry]
-        with patch('__builtin__.open', m, create=True):
+        with patch('builtins.open', m, create=True):
             res = update_pg_hba(pg_hba_info, data_dirs)
             self.assertEqual(expected, res) 
 

@@ -1,13 +1,13 @@
 /*-------------------------------------------------------------------------
  *
- * resgroup-ops-cgroup.c
+ * resgroup-ops-linux.c
  *	  OS dependent resource group operations - cgroup implementation
  *
- * Copyright (c) 2017 Pivotal Software, Inc.
+ * Copyright (c) 2017 VMware, Inc. or its affiliates.
  *
  *
  * IDENTIFICATION
- *	    src/backend/utils/resgroup/resgroup-ops-cgroup.c
+ *	    src/backend/utils/resgroup/resgroup-ops-linux.c
  *
  *-------------------------------------------------------------------------
  */
@@ -125,6 +125,7 @@ static void writeStr(Oid group, BaseType base, ResGroupCompType comp, const char
 static bool permListCheck(const PermList *permlist, Oid group, bool report);
 static bool checkPermission(Oid group, bool report);
 static bool checkCpuSetPermission(Oid group, bool report);
+static void checkCompHierarchy();
 static void getMemoryInfo(unsigned long *ram, unsigned long *swap);
 static void getCgMemoryInfo(uint64 *cgram, uint64 *cgmemsw);
 static int getOvercommitRatio(void);
@@ -132,6 +133,7 @@ static bool detectCgroupMountPoint(void);
 static void initCpu(void);
 static void initCpuSet(void);
 static void createDefaultCpuSetGroup(void);
+static int64 getCfsPeriodUs(ResGroupCompType);
 
 /*
  * currentGroupIdInCGroup & oldCaps are used for reducing redundant
@@ -490,10 +492,9 @@ buildPath(Oid group,
 
 	if (!result)
 	{
-		CGROUP_CONFIG_ERROR("invalid %s name '%s': %s",
+		CGROUP_CONFIG_ERROR("invalid %s name '%s': %m",
 							prop[0] ? "file" : "directory",
-							path,
-							strerror(errno));
+							path);
 	}
 
 	return result;
@@ -648,13 +649,13 @@ unassignGroup(Oid group, ResGroupCompType comp, int fddir)
 		if (ptr == end)
 			break;
 
-		char str[16];
+		char str[22];
 		sprintf(str, "%ld", pid);
 		int n = write(fdw, str, strlen(str));
 		if (n < 0)
 		{
-			elog(LOG, "failed to migrate pid to gpdb root cgroup: pid=%ld: %s",
-				 pid, strerror(errno));
+			elog(LOG, "failed to migrate pid to gpdb root cgroup: pid=%ld: %m",
+				 pid);
 		}
 		else
 		{
@@ -692,8 +693,7 @@ lockDir(const char *path, bool block)
 			return -1;
 		}
 
-		CGROUP_ERROR("can't open dir to lock: %s: %s",
-					 path, strerror(errno));
+		CGROUP_ERROR("can't open dir to lock: %s: %m", path);
 	}
 
 	int flags = LOCK_EX;
@@ -860,7 +860,7 @@ getCpuCores(void)
 	int i;
 
 	if (sched_getaffinity(0, sizeof(cpuset), &cpuset) < 0)
-		CGROUP_ERROR("can't get cpu cores: %s", strerror(errno));
+		CGROUP_ERROR("can't get cpu cores: %m");
 
 	for (i = 0; i < CPU_SETSIZE; i++)
 	{
@@ -882,7 +882,7 @@ readData(const char *path, char *data, size_t datasize)
 {
 	int fd = open(path, O_RDONLY);
 	if (fd < 0)
-		elog(ERROR, "can't open file '%s': %s", path, strerror(errno));
+		elog(ERROR, "can't open file '%s': %m", path);
 
 	ssize_t ret = read(fd, data, datasize);
 
@@ -904,7 +904,7 @@ writeData(const char *path, const char *data, size_t datasize)
 {
 	int fd = open(path, O_WRONLY);
 	if (fd < 0)
-		elog(ERROR, "can't open file '%s': %s", path, strerror(errno));
+		elog(ERROR, "can't open file '%s': %m", path);
 
 	ssize_t ret = write(fd, data, datasize);
 
@@ -1021,10 +1021,9 @@ permListCheck(const PermList *permlist, Oid group, bool report)
 
 			if (report && !permlist->optional)
 			{
-				CGROUP_CONFIG_ERROR("invalid %s name '%s': %s",
+				CGROUP_CONFIG_ERROR("invalid %s name '%s': %m",
 									prop[0] ? "file" : "directory",
-									path,
-									strerror(errno));
+									path);
 			}
 			return false;
 		}
@@ -1035,10 +1034,9 @@ permListCheck(const PermList *permlist, Oid group, bool report)
 
 			if (report && !permlist->optional)
 			{
-				CGROUP_CONFIG_ERROR("can't access %s '%s': %s",
+				CGROUP_CONFIG_ERROR("can't access %s '%s': %m",
 									prop[0] ? "file" : "directory",
-									path,
-									strerror(errno));
+									path);
 			}
 			return false;
 		}
@@ -1090,13 +1088,88 @@ checkCpuSetPermission(Oid group, bool report)
 	return true;
 }
 
+/*
+ * Check the mount hierarchy of cpu and cpuset subsystem.
+ *
+ * Raise an error if cpu and cpuset are mounted on the same hierarchy.
+ */
+static void
+checkCompHierarchy()
+{
+	ResGroupCompType comp;
+	FILE       *f;
+	char        buf[MAXPATHLEN * 2];
+	
+	f = fopen("/proc/1/cgroup", "r");
+	if (!f)
+	{
+		CGROUP_CONFIG_ERROR("can't check component mount hierarchy \
+					file '/proc/1/cgroup' doesn't exist");
+		return;
+	}
+
+	/*
+	 * format: id:comps:path, e.g.:
+	 *
+	 * 10:cpuset:/
+	 * 4:cpu,cpuacct:/
+	 * 1:name=systemd:/init.scope
+	 * 0::/init.scope
+	 */
+	while (fscanf(f, "%*d:%s", buf) != EOF)
+	{
+		char       *ptr;
+		char       *tmp;
+		char        sep = '\0';
+		/* mark if the line has alread contained cpu or cpuset comp */
+		int        markComp = RESGROUP_COMP_TYPE_UNKNOWN;
+
+		/* buf is stored with "comps:path" */
+		if (buf[0] == ':')
+			continue; /* ignore empty comp */
+
+		/* split comps */
+		for (ptr = buf; sep != ':'; ptr = tmp)
+		{
+			tmp = strpbrk(ptr, ":,=");
+			
+			sep = *tmp;
+			*tmp++ = 0;
+
+			/* for name=comp case there is nothing to do with the name */
+			if (sep == '=')
+				continue;
+			
+			comp = compByName(ptr);
+
+			if (comp == RESGROUP_COMP_TYPE_UNKNOWN)
+				continue; /* not used by us */
+			
+			if (comp == RESGROUP_COMP_TYPE_CPU || comp == RESGROUP_COMP_TYPE_CPUSET)
+			{
+				if (markComp == RESGROUP_COMP_TYPE_UNKNOWN)
+					markComp = comp;
+				else
+				{
+					Assert(markComp != comp);
+					fclose(f);
+					CGROUP_CONFIG_ERROR("can't mount 'cpu' and 'cpuset' on the same hierarchy");
+					return;
+				}
+			}
+		}
+	}
+
+	fclose(f);
+}
+
 /* get total ram and total swap (in Byte) from sysinfo */
 static void
 getMemoryInfo(unsigned long *ram, unsigned long *swap)
 {
 	struct sysinfo info;
 	if (sysinfo(&info) < 0)
-		elog(ERROR, "can't get memory infomation: %s", strerror(errno));
+		elog(ERROR, "can't get memory infomation: %m");
 	*ram = info.totalram;
 	*swap = info.totalswap;
 }
@@ -1267,6 +1340,45 @@ initCpuSet(void)
 	createDefaultCpuSetGroup();
 }
 
+static int64
+getCfsPeriodUs(ResGroupCompType comp)
+{
+	int64		cfs_period_us;
+
+	/*
+	 * calculate cpu rate limit of system.
+	 *
+	 * Ideally the cpu quota is calculated from parent infomation:
+	 *
+	 * system_cfs_quota_us := parent.cfs_period_us * ncores.
+	 *
+	 * However on centos6 we found parent.cfs_period_us can be 0 and is not
+	 * writable.  In the other side, gpdb.cfs_period_us should be equal to
+	 * parent.cfs_period_us because sub dirs inherit parent properties by
+	 * default, so we read it instead.
+	 */
+	cfs_period_us = readInt64(RESGROUP_ROOT_ID, BASETYPE_GPDB,
+							  comp, "cpu.cfs_period_us");
+	if (cfs_period_us == 0LL)
+	{
+		/*
+		 * if gpdb.cfs_period_us is also 0 try to correct it by setting the
+		 * default value 100000 (100ms).
+		 */
+		writeInt64(RESGROUP_ROOT_ID, BASETYPE_GPDB,
+				   comp, "cpu.cfs_period_us", 100000LL);
+
+		/* read again to verify the effect */
+		cfs_period_us = readInt64(RESGROUP_ROOT_ID, BASETYPE_GPDB,
+								  comp, "cpu.cfs_period_us");
+		if (cfs_period_us <= 0LL)
+			CGROUP_CONFIG_ERROR("invalid cpu.cfs_period_us value: "
+								INT64_FORMAT,
+								cfs_period_us);
+	}
+	return cfs_period_us;
+}
+
 /* Return the name for the OS group implementation */
 const char *
 ResGroupOps_Name(void)
@@ -1338,6 +1450,16 @@ ResGroupOps_Bless(void)
 	checkPermission(RESGROUP_ROOT_ID, true);
 
 	/*
+ 	 * Check if cpu and cpuset subsystems are mounted on the same hierarchy.
+ 	 * We do not allow they mount on the same hierarchy, because writting pid
+ 	 * to DEFAULT_CPUSET_GROUP_ID in ResGroupOps_AssignGroup will cause the
+ 	 * removal of the pid in group BASETYPE_GPDB, which will make cpu usage
+ 	 * out of control.
+	 */
+	if (!CGROUP_CPUSET_IS_OPTIONAL)
+		checkCompHierarchy();
+
+	/*
 	 * Dump the cgroup comp dirs to logs.
 	 * Check detectCompDirs() to know why this is not done in that function.
 	 */
@@ -1351,37 +1473,7 @@ ResGroupOps_Bless(void)
 	/* get system cpu cores */
 	ncores = getCpuCores();
 
-	/*
-	 * calculate cpu rate limit of system.
-	 *
-	 * Ideally the cpu quota is calculated from parent infomation:
-	 *
-	 * system_cfs_quota_us := parent.cfs_period_us * ncores.
-	 *
-	 * However on centos6 we found parent.cfs_period_us can be 0 and is not
-	 * writable.  In the other side, gpdb.cfs_period_us should be equal to
-	 * parent.cfs_period_us because sub dirs inherit parent properties by
-	 * default, so we read it instead.
-	 */
-	cfs_period_us = readInt64(RESGROUP_ROOT_ID, BASETYPE_GPDB,
-							  comp, "cpu.cfs_period_us");
-	if (cfs_period_us == 0LL)
-	{
-		/*
-		 * if gpdb.cfs_period_us is also 0 try to correct it by setting the
-		 * default value 100000 (100ms).
-		 */
-		writeInt64(RESGROUP_ROOT_ID, BASETYPE_GPDB,
-				   comp, "cpu.cfs_period_us", 100000LL);
-
-		/* read again to verify the effect */
-		cfs_period_us = readInt64(RESGROUP_ROOT_ID, BASETYPE_GPDB,
-								  comp, "cpu.cfs_period_us");
-		if (cfs_period_us <= 0LL)
-			CGROUP_CONFIG_ERROR("invalid cpu.cfs_period_us value: "
-								INT64_FORMAT,
-								cfs_period_us);
-	}
+	cfs_period_us = getCfsPeriodUs(comp);
 	system_cfs_quota_us = cfs_period_us * ncores;
 
 	/* read cpu rate limit of parent cgroup */
@@ -1433,8 +1525,7 @@ ResGroupOps_CreateGroup(Oid group)
 		(gp_resource_group_enable_cgroup_memory &&
 		 !createDir(group, RESGROUP_COMP_TYPE_MEMORY)))
 	{
-		CGROUP_ERROR("can't create cgroup for resgroup '%d': %s",
-					 group, strerror(errno));
+		CGROUP_ERROR("can't create cgroup for resgroup '%d': %m", group);
 	}
 
 	/*
@@ -1483,8 +1574,8 @@ createDefaultCpuSetGroup(void)
 
 	if (!createDir(DEFAULT_CPUSET_GROUP_ID, comp))
 	{
-		CGROUP_ERROR("can't create cpuset cgroup for resgroup '%d': %s",
-					 DEFAULT_CPUSET_GROUP_ID, strerror(errno));
+		CGROUP_ERROR("can't create cpuset cgroup for resgroup '%d': %m",
+					 DEFAULT_CPUSET_GROUP_ID);
 	}
 
 	/*
@@ -1535,8 +1626,7 @@ ResGroupOps_DestroyGroup(Oid group, bool migrate)
 		(gp_resource_group_enable_cgroup_memory &&
 		 !removeDir(group, RESGROUP_COMP_TYPE_MEMORY, "memory.limit_in_bytes", migrate)))
 	{
-		CGROUP_ERROR("can't remove cgroup for resgroup '%d': %s",
-			 group, strerror(errno));
+		CGROUP_ERROR("can't remove cgroup for resgroup '%d': %m", group);
 	}
 }
 
@@ -1643,6 +1733,18 @@ ResGroupOps_SetCpuRateLimit(Oid group, int cpu_rate_limit)
 							 "cpu.shares");
 	writeInt64(group, BASETYPE_GPDB, comp,
 			   "cpu.shares", shares * cpu_rate_limit / 100);
+
+	/* set cpu.cfs_quota_us if hard CPU enforment is enabled */
+	if (gp_resource_group_cpu_ceiling_enforcement)
+	{
+		int64 periods = getCfsPeriodUs(comp);
+		writeInt64(group, BASETYPE_GPDB, comp, "cpu.cfs_quota_us",
+				   periods * ResGroupOps_GetCpuCores() * cpu_rate_limit / 100);
+	}
+	else
+	{
+		writeInt64(group, BASETYPE_GPDB, comp, "cpu.cfs_quota_us", -1);
+	}
 }
 
 /*

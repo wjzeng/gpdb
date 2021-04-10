@@ -15,8 +15,8 @@
  * a usable vsnprintf(), then a copy of our own implementation of it will
  * be linked into libpq.
  *
- * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/interfaces/libpq/pqexpbuffer.h
@@ -147,10 +147,7 @@ extern int	enlargePQExpBuffer(PQExpBuffer str, size_t needed);
  * This is a convenience routine that does the same thing as
  * resetPQExpBuffer() followed by appendPQExpBuffer().
  */
-extern void
-printfPQExpBuffer(PQExpBuffer str, const char *fmt,...)
-/* This extension allows gcc to check the format string */
-__attribute__((format(PG_PRINTF_ATTRIBUTE, 2, 3)));
+extern void printfPQExpBuffer(PQExpBuffer str, const char *fmt,...) pg_attribute_printf(2, 3);
 
 /*------------------------
  * appendPQExpBuffer
@@ -159,10 +156,7 @@ __attribute__((format(PG_PRINTF_ATTRIBUTE, 2, 3)));
  * to str if necessary.  This is sort of like a combination of sprintf and
  * strcat.
  */
-extern void
-appendPQExpBuffer(PQExpBuffer str, const char *fmt,...)
-/* This extension allows gcc to check the format string */
-__attribute__((format(PG_PRINTF_ATTRIBUTE, 2, 3)));
+extern void appendPQExpBuffer(PQExpBuffer str, const char *fmt,...) pg_attribute_printf(2, 3);
 
 /*------------------------
  * appendPQExpBufferStr
@@ -184,10 +178,9 @@ extern void appendPQExpBufferChar(PQExpBuffer str, char ch);
  * if necessary.
  */
 extern void appendBinaryPQExpBuffer(PQExpBuffer str,
-						const char *data, size_t datalen);
+									const char *data, size_t datalen);
 
 
-extern bool appendPQExpBufferVA(PQExpBuffer str, const char *fmt, va_list args)
-__attribute__((format(PG_PRINTF_ATTRIBUTE, 2, 0)));
+extern bool appendPQExpBufferVA(PQExpBuffer str, const char *fmt, va_list args) pg_attribute_printf(2, 0);
 
-#endif   /* PQEXPBUFFER_H */
+#endif							/* PQEXPBUFFER_H */

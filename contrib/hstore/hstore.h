@@ -76,11 +76,11 @@ typedef struct
 #define STRPTR(x)		( (char*)(ARRPTR(x) + HS_COUNT((HStore*)(x)) * 2) )
 
 /* note multiple/non evaluations */
-#define HS_KEY(arr_,str_,i_) ((str_) + HSE_OFF((arr_)[2*(i_)]))
-#define HS_VAL(arr_,str_,i_) ((str_) + HSE_OFF((arr_)[2*(i_)+1]))
-#define HS_KEYLEN(arr_,i_) (HSE_LEN((arr_)[2*(i_)]))
-#define HS_VALLEN(arr_,i_) (HSE_LEN((arr_)[2*(i_)+1]))
-#define HS_VALISNULL(arr_,i_) (HSE_ISNULL((arr_)[2*(i_)+1]))
+#define HSTORE_KEY(arr_,str_,i_)	((str_) + HSE_OFF((arr_)[2*(i_)]))
+#define HSTORE_VAL(arr_,str_,i_)	((str_) + HSE_OFF((arr_)[2*(i_)+1]))
+#define HSTORE_KEYLEN(arr_,i_)		(HSE_LEN((arr_)[2*(i_)]))
+#define HSTORE_VALLEN(arr_,i_)		(HSE_LEN((arr_)[2*(i_)+1]))
+#define HSTORE_VALISNULL(arr_,i_)	(HSE_ISNULL((arr_)[2*(i_)+1]))
 
 /*
  * currently, these following macros are the _only_ places that rely
@@ -151,7 +151,7 @@ extern HStore *hstoreUpgrade(Datum orig);
 
 #define DatumGetHStoreP(d) hstoreUpgrade(d)
 
-#define PG_GETARG_HS(x) DatumGetHStoreP(PG_GETARG_DATUM(x))
+#define PG_GETARG_HSTORE_P(x) DatumGetHStoreP(PG_GETARG_DATUM(x))
 
 
 /*
@@ -181,7 +181,7 @@ extern Pairs *hstoreArrayToPairs(ArrayType *a, int *npairs);
 #define HStoreExistsStrategyNumber		9
 #define HStoreExistsAnyStrategyNumber	10
 #define HStoreExistsAllStrategyNumber	11
-#define HStoreOldContainsStrategyNumber 13		/* backwards compatibility */
+#define HStoreOldContainsStrategyNumber 13	/* backwards compatibility */
 
 /*
  * defining HSTORE_POLLUTE_NAMESPACE=0 will prevent use of old function names;
@@ -202,4 +202,4 @@ extern Pairs *hstoreArrayToPairs(ArrayType *a, int *npairs);
 	extern int no_such_variable
 #endif
 
-#endif   /* __HSTORE_H__ */
+#endif							/* __HSTORE_H__ */

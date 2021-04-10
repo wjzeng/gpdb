@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 #
 # Copyright (c) Greenplum Inc 2008. All Rights Reserved.
 #
@@ -11,6 +11,7 @@ from gppylib.mainUtils import *
 import os, sys
 import signal
 import time
+import pprint
 from optparse import Option, OptionGroup, OptionParser, OptionValueError, SUPPRESS_USAGE
 import socket
 
@@ -20,7 +21,6 @@ try:
     from gppylib.db import dbconn
     from gppylib.db import catalog
     from gppylib.gparray import *
-    from gppylib import gphostcache
     from gppylib import userinput
     from gppylib import pgconf
     from gppylib.commands import unix
@@ -31,14 +31,17 @@ try:
     from gppylib.commands import dca
     from gppylib.utils import TableLogger
     from gppylib.gp_era import GpEraFile
-    from gppylib.operations.unix import CleanSharedMem
     from gppylib.operations.utils import ParallelOperation, RemoteOperation
     from gppylib.operations.rebalanceSegments import ReconfigDetectionSQLQueryCommand
-except ImportError, e:
+except ImportError as e:
     sys.exit('ERROR: Cannot import modules.  Please check that you have sourced greenplum_path.sh.  Detail: ' + str(e))
 
 DEFAULT_NUM_WORKERS = 64
 logger = get_default_logger()
+
+PG_CTL_STATUS_RUNNING = 0
+PG_CTL_STATUS_STOPPED = 3
+PG_CTL_STATUS_SLEEP_INTERVAL = 1.0  # number of seconds to sleep before issuing next pg_ctl status
 
 
 # ---------------------------------------------------------------
@@ -60,20 +63,42 @@ class SegStopStatus:
             self.db.dbid, self.db.hostname, self.db.datadir, self.reason)
 
 
+def print_progress(pool, interval=10):
+    """
+    Waits for a WorkerPool to complete, printing a progress percentage marker
+    once at the beginning of the call, and thereafter at the provided interval
+    (default ten seconds). A final 100% marker is printed upon completion.
+    """
+    def print_completed_percentage():
+        # pool.completed can change asynchronously; save its value.
+        completed = pool.completed
+
+        pct = 0
+        if pool.assigned:
+            pct = float(completed) / pool.assigned
+
+        pool.logger.info('%0.2f%% of jobs completed' % (pct * 100))
+        return completed >= pool.assigned
+
+    # print_completed_percentage() returns True if we're done.
+    while not print_completed_percentage():
+        pool.join(interval)
+
+
 # ---------------------------------------------------------------
 class GpStop:
     ######
-    def __init__(self, mode, master_datadir=None,
-                 parallel=DEFAULT_NUM_WORKERS, quiet=False, masteronly=False, sighup=False,
+    def __init__(self, mode, coordinator_datadir=None,
+                 parallel=DEFAULT_NUM_WORKERS, quiet=False, coordinatoronly=False, sighup=False,
                  interactive=False, stopstandby=False, restart=False,
                  timeout=SEGMENT_STOP_TIMEOUT_DEFAULT, logfileDirectory=False, onlyThisHost=None):
         self.mode = mode
-        self.master_datadir = master_datadir
+        self.coordinator_datadir = coordinator_datadir
         self.pool = None
         self.parallel = parallel
         self.quiet = quiet
         self.pid = 0
-        self.masteronly = masteronly
+        self.coordinatoronly = coordinatoronly
         self.sighup = sighup
         self.interactive = interactive
         self.stopstandby = stopstandby
@@ -89,7 +114,6 @@ class GpStop:
         self.dburl = None
         self.conn = None
         self.gparray = None
-        self.hostcache = None
         self.gpversion = None
 
         logger.debug("Setting level of parallelism to: %d" % self.parallel)
@@ -135,15 +159,15 @@ class GpStop:
         """
         self._prepare()
 
-        if self.masteronly:
+        if self.coordinatoronly:
             if self.interactive:
-                if not userinput.ask_yesno(None, "\nContinue with master-only shutdown", 'N'):
+                if not userinput.ask_yesno(None, "\nContinue with coordinator-only shutdown", 'N'):
                     raise UserAbortedException()
             try:
                 # Disable Ctrl-C
                 signal.signal(signal.SIGINT, signal.SIG_IGN)
 
-                self._stop_master()
+                self._stop_coordinator()
             finally:
                 # Reenable Ctrl-C
                 self.cleanup()
@@ -155,8 +179,8 @@ class GpStop:
 
                 segs = []
                 if self.onlyThisHost:
-                    if self.onlyThisHost in self.gparray.get_master_host_names():
-                        raise Exception("Specified host '%s' has the master or standby master on it. This node can only be stopped as part of a full-cluster gpstop, without '--host'." %
+                    if self.onlyThisHost in self.gparray.get_coordinator_host_names():
+                        raise Exception("Specified host '%s' has the coordinator or standby coordinator on it. This node can only be stopped as part of a full-cluster gpstop, without '--host'." %
                                         self.onlyThisHost)
                     if not self.gparray.hasMirrors:
                         raise Exception("Cannot perform host-specific gpstop on a cluster without segment mirroring.")
@@ -174,12 +198,9 @@ class GpStop:
                     signal.signal(signal.SIGINT, signal.SIG_IGN)
 
                     if self.onlyThisHost is None:
-                        self._stop_master()
+                        self._stop_coordinator()
                         self._stop_standby()
                     self._stop_segments(segs)
-                    self._stop_gpmmon()
-                    self._stop_gpsmon()
-                    self._remove_shared_memory()  # this creates a new logfile - why?
                 finally:
                     # Reenable Ctrl-C
                     self.cleanup()
@@ -204,7 +225,7 @@ class GpStop:
                 if self.restart:
                     logger.info("Restarting System...")
                     gp.NewGpStart.local('restarting system', verbose=logging_is_verbose(),
-                                        nostandby=not self.stopstandby, masterDirectory=self.master_datadir)
+                                        nostandby=not self.stopstandby, coordinatorDirectory=self.coordinator_datadir)
                 else:
                     if dca.is_dca_appliance():
                         logger.info("Unregistering with DCA")
@@ -217,105 +238,6 @@ class GpStop:
         return 0
 
     ######
-    def _stop_gpmmon(self):
-        logger.info('Cleaning up leftover gpmmon process')
-        gpmmon_running = False
-        cmd = Command('check if gpmmon process is running', cmdStr="ps -ef | grep '[g]pmmon -D' | awk '{print $2}'")
-        try:
-            cmd.run(validateAfter=True)
-        except Exception as e:
-            logger.warning('Unable to determine if gpmmon process is running (%s)' % str(e))
-            logger.warning('Not attempting to stop gpmmon process')
-
-        result = cmd.get_results()
-        if result.rc == 0 and result.stdout.strip() != '':
-            gpmmon_running = True
-
-        if gpmmon_running:
-            cmd = Command('stop the gpmmon process',
-                          cmdStr="ps -ef | grep '[g]pmmon -D' | awk '{print $2}' | xargs kill -9")
-            try:
-                cmd.run(validateAfter=True)
-            except Exception as e:
-                logger.error('Error while stopping gpmmon process (%s)' % str(e))
-        else:
-            logger.info('No leftover gpmmon process found')
-
-    ######
-    def _stop_gpsmon(self):
-        logger.info('Cleaning up leftover gpsmon processes')
-        cluster_hosts = set([gphost.hostname for gphost in self.hostcache.get_hosts()])
-        cluster_hosts.add(self.gparray.master.getSegmentHostName())
-        if self.gparray.standbyMaster:
-            cluster_hosts.add(self.gparray.standbyMaster.getSegmentHostName())
-
-        for host in cluster_hosts:
-            cmd = Command('Check if gpsmon is running', cmdStr="ps -ef | grep '[g]psmon -m' | awk '{print \$2}'",
-                          ctxt=REMOTE, remoteHost=host)
-            self.pool.addCommand(cmd)
-        self.pool.join()
-
-        gpsmon_found = True
-        valid_hosts = set([])
-        for item in self.pool.getCompletedItems():
-            result = item.get_results()
-            if result.rc == 0 and result.stdout.strip() != '':
-                valid_hosts.add(item.remoteHost)
-            else:
-                gpsmon_found = False
-
-        if not gpsmon_found:
-            logger.info(
-                'No leftover gpsmon processes on some hosts. not attempting forceful termination on these hosts')
-
-        for host in valid_hosts:
-            cmd = Command('kill all the gpsmon processes',
-                          cmdStr="ps -ef | grep '[g]psmon -m' | awk '{print \$2}' | xargs kill -9",
-                          ctxt=REMOTE, remoteHost=host)
-            self.pool.addCommand(cmd)
-        self.pool.join()
-
-        for item in self.pool.getCompletedItems():
-            result = item.get_results()
-            if result.rc != 0:
-                logger.warning('Failed to stop gpsmon process on host %s: (%s)' % (item.remoteHost, result.stderr))
-
-    ######
-    def _remove_shared_memory(self):
-        """
-        If segment processes fail to stop even after the alotted time limit of 2 minutes, we proceed
-        to forcibly terminate the processes. This might leave shared memory and semaphores uncleaned.
-        CleanSharedMem class uses the ipcrm command to remove shared memory.
-        ipcrm will only remove shared memory once all the processes that have attached to
-        the shared memory segment have exited. Hence it is safe to call this on all segments.
-        Semaphores however cannot be removed in this manner since we don't know which semaphores
-        are still being used. Hence we leave it to the user to clean up semaphores when it
-        is safe.
-        """
-
-        logger.info('Cleaning up leftover shared memory')
-        cluster_hosts = set([gphost for gphost in self.hostcache.get_hosts()])
-
-        operations = []
-        for gphost in cluster_hosts:
-            operations.append(RemoteOperation(CleanSharedMem(gphost.dbs), gphost.hostname))
-
-        operations.append(
-            RemoteOperation(CleanSharedMem([self.gparray.master]), self.gparray.master.getSegmentHostName()))
-
-        if self.gparray.standbyMaster:
-            operations.append(RemoteOperation(CleanSharedMem([self.gparray.standbyMaster]),
-                                              self.gparray.standbyMaster.getSegmentHostName()))
-
-        ParallelOperation(operations).run()
-
-        for operation in operations:
-            try:
-                operation.get_ret()
-            except Exception as e:
-                logger.warning('Unable to clean shared memory (%s)' % str(e))
-
-    ######
     def cleanup(self):
         if self.pool:
             self.pool.haltWork()
@@ -325,8 +247,8 @@ class GpStop:
     def _prepare(self):
         logger.info("Gathering information and validating the environment...")
         self.gphome = gp.get_gphome()
-        if self.master_datadir is None:
-            self.master_datadir = gp.get_masterdatadir()
+        if self.coordinator_datadir is None:
+            self.coordinator_datadir = gp.get_coordinatordatadir()
         self.user = unix.getUserName()
         gp.check_permissions(self.user)
         self._read_postgresqlconf()
@@ -339,7 +261,7 @@ class GpStop:
     ######
     def _is_hostname_valid(self):
         segments = self.gparray.getSegmentsByHostName( self.gparray.getDbList())
-        host_names = segments.keys()
+        host_names = list(segments.keys())
         if self.onlyThisHost not in host_names:
             logger.error("host '%s' is not found in gp_segment_configuration" % self.onlyThisHost)
             logger.error("hosts in cluster config: %s" % host_names)
@@ -352,8 +274,8 @@ class GpStop:
 
     ######
     def _read_postgresqlconf(self):
-        logger.debug("Obtaining master's port from master data directory")
-        pgconf_dict = pgconf.readfile(self.master_datadir + "/postgresql.conf")
+        logger.debug("Obtaining coordinator's port from coordinator data directory")
+        pgconf_dict = pgconf.readfile(self.coordinator_datadir + "/postgresql.conf")
         self.port = pgconf_dict.int('port')
         logger.debug("Read from postgresql.conf port=%s" % self.port)
 
@@ -361,18 +283,18 @@ class GpStop:
         ######
 
     def _check_db_running(self):
-        if os.path.exists(self.master_datadir + '/postmaster.pid'):
-            self.pid = gp.read_postmaster_pidfile(self.master_datadir)
+        if os.path.exists(self.coordinator_datadir + '/postmaster.pid'):
+            self.pid = gp.read_postmaster_pidfile(self.coordinator_datadir)
             if not unix.check_pid(self.pid):
-                logger.warning("Have a postmaster.pid file but no Master segment process running")
+                logger.warning("Have a postmaster.pid file but no Coordinator segment process running")
                 logger.info("Clearing postmaster.pid file and /tmp lock files")
 
                 lockfile = "/tmp/.s.PGSQL.%s" % self.port
-                logger.info("Clearing Master instance lock files")
+                logger.info("Clearing Coordinator instance lock files")
                 os.remove(lockfile)
 
-                logger.info("Clearing Master instance pid file")
-                os.remove("%s/postmaster.pid" % self.master_datadir)
+                logger.info("Clearing Coordinator instance pid file")
+                os.remove("%s/postmaster.pid" % self.coordinator_datadir)
 
                 logger.info("Setting recovery parameters")
                 self.mode = 'fast'
@@ -384,38 +306,132 @@ class GpStop:
 
     ######
     def _build_gparray(self):
-        logger.info("Obtaining Greenplum Master catalog information")
+        logger.info("Obtaining Greenplum Coordinator catalog information")
 
-        logger.info("Obtaining Segment details from master...")
+        logger.info("Obtaining Segment details from coordinator...")
         self.dburl = dbconn.DbURL(port=self.port, dbname='template1')
         self.gparray = GpArray.initFromCatalog(self.dburl, utility=True)
 
+    class _SigIntHandler(object):
+        def __init__(self):
+            self.interrupted = False
 
-    ######
-    def _stop_master(self, masterOnly=False):
-        ''' shutsdown the master '''
+        def _handler(self, signum, stack_frame):
+            self.interrupted = True
+
+        def enable(self):
+            self.interrupted = False
+            signal.signal(signal.SIGINT, self._handler)
+
+        def disable(self):
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+        def __enter__(self):
+            self._prev_handler = signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+            # Try to prevent easy mistakes by ensuring that SIGINT was
+            # ignored before we entered the manager.
+            if self._prev_handler != signal.SIG_IGN:
+                signal.signal(signal.SIGINT, self._prev_handler)
+                raise Exception("SIGINT disposition must be SIG_IGN before entering SigIntHandler")
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            # Put back the previous handler.
+            signal.signal(signal.SIGINT, self._prev_handler)
+            return False
+
+
+    def _is_coordinator_stopped(self):
+        with open(os.devnull, 'w') as devnull:
+            ret = subprocess.call(['pg_ctl', 'status', '-D', self.coordinator_datadir],
+                                  stdout=devnull)
+        if ret == PG_CTL_STATUS_STOPPED:
+            return True
+        if ret != PG_CTL_STATUS_RUNNING:
+            raise Exception('pg_ctl status failed with return code %d' % ret)
+        return False
+
+
+
+    # Send a no-wait stop to the coordinator, and then poll for it to stop.  If the user gets impatient or
+    # the operation times out, show the connections and allow the user to upgrade the stop to fast or
+    # immediate mode.
+    def _stop_coordinator_smart(self):
+        logger.info("Stopping coordinator segment and waiting for user connections to finish ...")
 
         self.conn = dbconn.connect(self.dburl, utility=True)
-        self._stop_master_checks()
-
+        user_connections_header, user_connections = catalog.getUserConnectionInfo(self.conn)
         self.conn.close()
 
-        e = GpEraFile(self.master_datadir, logger=get_logger_if_verbose())
+        ret = subprocess.call(['pg_ctl', 'stop', '-W', '-m', 'smart', '-D', self.coordinator_datadir])
+        if ret:
+            raise Exception('pg_ctl stop smart failed')
+
+        time_waited = 0
+        wait_forever = False
+        with GpStop._SigIntHandler() as handler:
+            while not self._is_coordinator_stopped():
+                # time.sleep() can be safely interrupted (https://docs.python.org/2/library/time.html#time.sleep)
+                handler.enable()
+                time.sleep(PG_CTL_STATUS_SLEEP_INTERVAL)
+                time_waited = time_waited + PG_CTL_STATUS_SLEEP_INTERVAL
+                handler.disable()
+
+                if handler.interrupted or (time_waited >= self.timeout and not wait_forever):
+                    handler.interrupted = False
+
+                    warn_text = """Smart mode failed to shutdown the coordinator.\n"""
+                    if len(user_connections):
+                        warn_text += """  There were {} user connections at the start of the shutdown. Note: These connections may be outdated.
+  The following connections were found before shutting down:\n""".format(len(user_connections))
+                        for user_conn in user_connections:
+                            warn_text += "  %s" % pprint.pformat(user_conn)
+
+                    logger.warn(warn_text)
+                    logger.info("Continue waiting in smart mode, stop in fast mode, or stop in immediate mode.")
+                    mode_selection = userinput.ask_string("Your_choice",
+                                                          "['(s)mart_mode', '(f)ast_mode', '(i)mmediate_mode']",
+                                                          's',
+                                                          ['s', 'f', 'i'])
+                    logger.info("Your choice was '%s'" % mode_selection)
+                    if mode_selection == 'f':
+                        self.mode = 'fast'
+                        return False
+                    elif mode_selection == 'i':
+                        self.mode = 'immediate'
+                        return False
+                    else:
+                        wait_forever = True
+                        logger.info("Continuing waiting for user connections to finish ...")
+
+
+    ######
+    # NOTE: we must make sure the coordinator is down before leaving this routine
+    def _stop_coordinator(self, coordinatorOnly=False):
+        ''' shutsdown the coordinator '''
+
+        logger.info("Commencing Coordinator instance shutdown with mode='%s'" % self.mode)
+        logger.info("Coordinator segment instance directory=%s" % self.coordinator_datadir)
+
+        e = GpEraFile(self.coordinator_datadir, logger=get_logger_if_verbose())
         e.end_era()
 
-        logger.info("Commencing Master instance shutdown with mode=%s" % self.mode)
-        logger.info("Master segment instance directory=%s" % self.master_datadir)
-
-        cmd = gp.MasterStop("stopping master", self.master_datadir, mode=self.mode, timeout=self.timeout)
         try:
-            cmd.run(validateAfter=True)
+            if self.mode == 'smart':
+                self._stop_coordinator_smart()
+
+            # NOTE: _stop_coordinator_smart() can change self.mode
+            if self.mode != 'smart':
+                cmd = gp.CoordinatorStop("stopping coordinator", self.coordinator_datadir, mode=self.mode, timeout=self.timeout)
+                cmd.run(validateAfter=True)
         except:
             # Didn't stop in timeout or pg_ctl failed.  So try kill
-            (succeeded, mypid, file_datadir) = pg.ReadPostmasterTempFile.local("Read master tmp file",
+            (succeeded, mypid, file_datadir) = pg.ReadPostmasterTempFile.local("Read coordinator tmp file",
                                                                                self.dburl.pgport).getResults()
-            if succeeded and file_datadir == self.master_datadir:
+            if succeeded and file_datadir == self.coordinator_datadir:
                 if unix.check_pid(mypid):
-                    logger.info("Failed to shutdown master with pg_ctl.")
+                    logger.info("Failed to shutdown coordinator with pg_ctl.")
                     logger.info("Sending SIGQUIT signal...")
                     os.kill(mypid, signal.SIGQUIT)
                     time.sleep(5)
@@ -432,41 +448,12 @@ class GpStop:
                         if os.path.exists(lockfile):
                             logger.info("Clearing segment instance lock files")
                             os.remove(lockfile)
-        logger.info('Attempting forceful termination of any leftover master process')
-        (succeeded, mypid, file_datadir) = pg.ReadPostmasterTempFile.local("Read master tmp file",
+        logger.info('Attempting forceful termination of any leftover coordinator process')
+        (succeeded, mypid, file_datadir) = pg.ReadPostmasterTempFile.local("Read coordinator tmp file",
                                                                            self.dburl.pgport).getResults()
-        unix.kill_9_segment_processes(self.master_datadir, self.dburl.pgport, mypid)
+        unix.kill_9_segment_processes(self.coordinator_datadir, self.dburl.pgport, mypid)
 
-        logger.debug("Successfully shutdown the Master instance in admin mode")
-
-    ######
-    def _stop_master_checks(self):
-        total_connections = len(catalog.getUserPIDs(self.conn))
-        logger.info("There are %d connections to the database" % total_connections)
-
-        if total_connections > 0 and self.mode == 'smart':
-            logger.warning("There are other connections to this instance, shutdown mode smart aborted")
-            logger.warning("Either remove connections, or use 'gpstop -M fast' or 'gpstop -M immediate'")
-            logger.warning("See gpstop -? for all options")
-            raise ExceptionNoStackTraceNeeded("Active connections. Aborting shutdown...")
-
-        logger.info("Commencing Master instance shutdown with mode='%s'" % self.mode)
-        logger.info("Master host=%s" % self.gparray.master.hostname)
-
-        if self.mode == 'smart':
-            pass
-        elif self.mode == 'fast':
-            logger.info("Detected %d connections to database" % total_connections)
-            if total_connections > 0:
-                logger.info("Switching to WAIT mode")
-                logger.info("Will wait for shutdown to complete, this may take some time if")
-                logger.info("there are a large number of active complex transactions, please wait...")
-            else:
-                if self.timeout == SEGMENT_STOP_TIMEOUT_DEFAULT:
-                    logger.info("Using standard WAIT mode of %s seconds" % SEGMENT_STOP_TIMEOUT_DEFAULT)
-                else:
-                    logger.info("Using WAIT mode of %s seconds" % self.timeout)
-        pass
+        logger.debug("Successfully shutdown the Coordinator instance in admin mode")
 
     ######
     def _stop_standby(self):
@@ -474,50 +461,50 @@ class GpStop:
         if not self.stopstandby:
             return True
 
-        if self.gparray.standbyMaster:
-            standby = self.gparray.standbyMaster
+        if self.gparray.standbyCoordinator:
+            standby = self.gparray.standbyCoordinator
 
-            logger.info("Stopping master standby host %s mode=fast" % standby.hostname)
+            logger.info("Stopping coordinator standby host %s mode=%s" % (standby.hostname, self.mode))
             try:
-                cmd = SegmentStop("stopping master standby",
-                                     standby.datadir, mode='fast',
+                cmd = SegmentStop("stopping coordinator standby",
+                                     standby.datadir, mode=self.mode,
                                      timeout=self.timeout,
                                      ctxt=base.REMOTE,
                                      remoteHost=standby.hostname)
                 cmd.run(validateAfter=True)
-            except base.ExecutionError, e:
-                logger.warning("Error occured while stopping the standby master: %s" % e)
+            except base.ExecutionError as e:
+                logger.warning("Error occured while stopping the standby coordinator: %s" % e)
 
-            if not pg.DbStatus.remote('checking status of standby master instance', standby, standby.hostname):
+            if not pg.DbStatus.remote('checking status of standby coordinator instance', standby, standby.hostname):
                 logger.info("Successfully shutdown standby process on %s" % standby.hostname)
                 return True
             else:
-                logger.warning("Process master standby still running, will issue fast shutdown with immediate")
+                logger.warning("Process coordinator standby still running, will issue fast shutdown with immediate")
                 try:
-                    cmd = SegmentStop("stopping master standby", standby.datadir, mode='immediate',
+                    cmd = SegmentStop("stopping coordinator standby", standby.datadir, mode='immediate',
                                          timeout=self.timeout,
                                          ctxt=base.REMOTE, remoteHost=standby.hostname)
                     cmd.run(validateAfter=True)
-                except base.ExecutionError, e:
-                    logger.warning("Error occured while stopping the standby master: %s" % e)
+                except base.ExecutionError as e:
+                    logger.warning("Error occured while stopping the standby coordinator: %s" % e)
 
-                if not pg.DbStatus.remote('checking status of standby master instance', standby, standby.hostname):
-                    logger.info("Successfully shutdown master standby process on %s" % standby.hostname)
+                if not pg.DbStatus.remote('checking status of standby coordinator instance', standby, standby.hostname):
+                    logger.info("Successfully shutdown coordinator standby process on %s" % standby.hostname)
                     return True
                 else:
                     logger.error('Failed to stop standby. Attempting forceful termination of standby process')
                     (succeeded, mypid, file_datadir) = pg.ReadPostmasterTempFile.remote("Read standby tmp file",
                                                                                         self.dburl.pgport,
-                                                                                        remoteHost=standby.hostname).getResults()
-                    unix.kill_9_segment_processes(self.master_datadir, self.dburl.pgport, mypid)
-                    if not pg.DbStatus.remote('checking status of standby master instance', standby, standby.hostname):
-                        logger.info("Successfully shutdown master standby process on %s" % standby.hostname)
+                                                                                        standby.hostname).getResults()
+                    unix.kill_9_segment_processes(self.coordinator_datadir, self.dburl.pgport, mypid)
+                    if not pg.DbStatus.remote('checking status of standby coordinator instance', standby, standby.hostname):
+                        logger.info("Successfully shutdown coordinator standby process on %s" % standby.hostname)
                         return True
                     else:
-                        logger.error("Unable to stop master standby on host: %s" % standby.hostname)
+                        logger.error("Unable to stop coordinator standby on host: %s" % standby.hostname)
                         return False
         else:
-            logger.info("No standby master host configured")
+            logger.info("No standby coordinator host configured")
             return True
 
     ######
@@ -528,15 +515,6 @@ class GpStop:
 
         logger.info("Targeting dbid %s for shutdown" % [seg.getSegmentDbId() for seg in segs])
 
-        self.hostcache = gphostcache.GpHostCache(self.gparray, self.pool, segs=segs)
-
-        failed_pings = self.hostcache.ping_hosts(self.pool)
-        for db in failed_pings:
-            logger.warning(
-                "Skipping startup of segdb on %s directory %s Ping Failed <<<<<<" % (db.hostname, db.datadir))
-            failed_seg_status.append(SegStopStatus(db, False, 'Failed to Ping on host: %s' % db.hostname))
-
-        self.hostcache.log_contents()
 
         if self.gparray.hasMirrors:
             # stop primaries
@@ -572,16 +550,14 @@ class GpStop:
 
     ######
     def _stopseg_cmds(self, includePrimaries, includeMirrors, segs):
-        dispatch_count = 0
-
         host_segs_map = {}
         for seg in segs:
-            if seg.getSegmentHostName() in host_segs_map.keys():
+            if seg.getSegmentHostName() in list(host_segs_map.keys()):
                 host_segs_map[seg.getSegmentHostName()].append(seg)
             else:
                 host_segs_map[seg.getSegmentHostName()] = [seg]
 
-        for hostname, gpdb_objs in host_segs_map.iteritems():
+        for hostname, gpdb_objs in host_segs_map.items():
             dbs = []
             for db in gpdb_objs:
                 role = db.getSegmentRole()
@@ -603,10 +579,8 @@ class GpStop:
                                   verbose=logging_is_verbose(), ctxt=base.REMOTE, remoteHost=hostname,
                                   logfileDirectory=self.logfileDirectory)
             self.pool.addCommand(cmd)
-            dispatch_count += 1
 
-        self.pool.print_progress(dispatch_count)
-        pass
+        print_progress(self.pool)
 
     ######
     def _process_segment_stop(self, failed_seg_status):
@@ -743,7 +717,6 @@ class GpStop:
 
         self.pool = SighupWorkerPool(numWorkers=workers)
         dbList = self.gparray.getDbList()
-        dispatch_count = 0
         hostname = socket.gethostname()
         logger.info("Signalling all postmaster processes to reload")
         for db in dbList:
@@ -758,8 +731,12 @@ class GpStop:
                                   remoteHost=remote_host
                                   )
             self.pool.addCommand(cmd)
-            dispatch_count = dispatch_count + 1
-        self.pool.wait_and_printdots(dispatch_count, self.quiet)
+
+        if self.quiet:
+            self.pool.join()
+        else:
+            base.join_and_indicate_progress(self.pool)
+
         self.pool.check_results()
         self.pool.empty_completed_items()
 
@@ -782,19 +759,19 @@ class GpStop:
     ######
     def _summarize_actions(self, segs):
         logger.info("--------------------------------------------")
-        logger.info("Master instance parameters")
+        logger.info("Coordinator instance parameters")
         logger.info("--------------------------------------------")
 
         tabLog = TableLogger(logger=logger).setWarnWithArrows(True)
-        tabLog.info(["Master Greenplum instance process active PID", "= %s" % self.pid])
+        tabLog.info(["Coordinator Greenplum instance process active PID", "= %s" % self.pid])
         tabLog.info(["Database", "= %s" % self.dburl.pgdb])
-        tabLog.info(["Master port", "= %s" % self.port])
-        tabLog.info(["Master directory", "= %s" % self.master_datadir])
+        tabLog.info(["Coordinator port", "= %s" % self.port])
+        tabLog.info(["Coordinator directory", "= %s" % self.coordinator_datadir])
         tabLog.info(["Shutdown mode", "= %s" % self.mode])
         tabLog.info(["Timeout", "= %s" % self.timeout])
 
-        standbyMsg = "On" if self.gparray.standbyMaster and self.stopstandby else "Off"
-        tabLog.info(["Shutdown Master standby host", "= %s" % standbyMsg])
+        standbyMsg = "On" if self.gparray.standbyCoordinator and self.stopstandby else "Off"
+        tabLog.info(["Shutdown Coordinator standby host", "= %s" % standbyMsg])
 
         tabLog.outputTable()
 
@@ -822,7 +799,7 @@ class GpStop:
 
         addTo = OptionGroup(parser, 'Connection options')
         parser.add_option_group(addTo)
-        addMasterDirectoryOptionForSingleClusterProgram(addTo)
+        addCoordinatorDirectoryOptionForSingleClusterProgram(addTo)
 
         addTo = OptionGroup(parser, 'Instance shutdown options: ')
         parser.add_option_group(addTo)
@@ -841,13 +818,13 @@ class GpStop:
 
         addTo.add_option('-r', '--restart', action='store_true',
                          help='Restart Greenplum Database instance after successful gpstop.')
-        addTo.add_option('-m', '--master_only', action='store_true',
-                         help='stop master instance started in maintenance mode')
+        addTo.add_option('-m', '--master_only', '-c', '--coordinator_only', dest='coordinator_only', action='store_true',
+                         help='stop coordinator instance started in maintenance mode')
         addTo.add_option('-y', dest="stop_standby", action='store_false', default=True,
-                         help='Do not stop the standby master process.')
+                         help='Do not stop the standby coordinator process.')
         addTo.add_option('-u', dest="request_sighup", action='store_true',
-                         help="upload new master postgresql.conf settings, does not stop Greenplum array," \
-                              "issues a signal to the master segment postmaster process to reload")
+                         help="upload new coordinator postgresql.conf settings, does not stop Greenplum array," \
+                              "issues a signal to the coordinator segment postmaster process to reload")
 
         addTo.add_option('-B', '--parallel', type="int", default=DEFAULT_NUM_WORKERS, metavar="<parallel_processes>",
                          help='number of segment hosts to run in parallel. Default is %d' % DEFAULT_NUM_WORKERS)
@@ -856,6 +833,8 @@ class GpStop:
         addTo.add_option('--host', dest='only_this_host', type='string',
                          help='stop all segments on this host (this will only complete if failover segments are available). '
                               'hostname as displayed in gp_segment_configuration')
+        addTo.add_option('--skipvalidation', action='store_true', default=False,
+                         help="<development testing only> DO NOT USE")
 
         parser.set_defaults(verbose=False, filters=[], slice=(None, None))
         return parser
@@ -867,9 +846,9 @@ class GpStop:
             if options.fast or options.immediate:
                 raise ProgramArgumentValidationException("Can not mix --mode options with older deprecated '-f,-i,-s'")
 
-        if options.master_only and options.only_this_host:
-            raise ProgramArgumentValidationException("Incompatible flags. Cannot mix '--host' option with '-m' for "
-                                                     "master-only.")
+        if options.coordinator_only and options.only_this_host:
+            raise ProgramArgumentValidationException("Incompatible flags. Cannot mix '--host' option with stopping "
+                                                     "coordinator-only.")
 
         if options.restart and options.only_this_host:
             raise ProgramArgumentValidationException("Incompatible flags. Cannot mix '--host' option with '-r' for "
@@ -904,7 +883,7 @@ class GpStop:
             raise ProgramArgumentValidationException("Invalid value for parallel degree: %s" % options.parallel)
 
         # Don't allow them to go below default
-        if options.timeout < SEGMENT_STOP_TIMEOUT_DEFAULT:
+        if options.timeout < SEGMENT_STOP_TIMEOUT_DEFAULT and not options.skipvalidation:
             raise ProgramArgumentValidationException(
                 "Invalid timeout value.  Must be greater than %s seconds." % SEGMENT_STOP_TIMEOUT_DEFAULT)
 
@@ -913,10 +892,10 @@ class GpStop:
                 "Argument %s is invalid.  Is an option missing a parameter?" % args[-1])
 
         return GpStop(options.mode,
-                      master_datadir=options.masterDataDirectory,
+                      coordinator_datadir=options.coordinatorDataDirectory,
                       parallel=options.parallel,
                       quiet=options.quiet,
-                      masteronly=options.master_only,
+                      coordinatoronly=options.coordinator_only,
                       sighup=options.request_sighup,
                       interactive=options.interactive,
                       stopstandby=options.stop_standby,

@@ -4,7 +4,7 @@
  *	  postgres transaction access method support code
  *
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/access/transam.h
@@ -45,6 +45,33 @@
 #define TransactionIdStore(xid, dest)	(*(dest) = (xid))
 #define StoreInvalidTransactionId(dest) (*(dest) = InvalidTransactionId)
 
+#define EpochFromFullTransactionId(x)	((uint32) ((x).value >> 32))
+#define XidFromFullTransactionId(x)		((uint32) (x).value)
+#define U64FromFullTransactionId(x)		((x).value)
+#define FullTransactionIdPrecedes(a, b)	((a).value < (b).value)
+#define FullTransactionIdIsValid(x)		TransactionIdIsValid(XidFromFullTransactionId(x))
+#define InvalidFullTransactionId		FullTransactionIdFromEpochAndXid(0, InvalidTransactionId)
+
+/*
+ * A 64 bit value that contains an epoch and a TransactionId.  This is
+ * wrapped in a struct to prevent implicit conversion to/from TransactionId.
+ * Not all values represent valid normal XIDs.
+ */
+typedef struct FullTransactionId
+{
+	uint64		value;
+} FullTransactionId;
+
+static inline FullTransactionId
+FullTransactionIdFromEpochAndXid(uint32 epoch, TransactionId xid)
+{
+	FullTransactionId result;
+
+	result.value = ((uint64) epoch) << 32 | xid;
+
+	return result;
+}
+
 /* advance a transaction ID variable, handling wraparound correctly */
 #define TransactionIdAdvance(dest)	\
 	do { \
@@ -52,6 +79,15 @@
 		if ((dest) < FirstNormalTransactionId) \
 			(dest) = FirstNormalTransactionId; \
 	} while(0)
+
+/* advance a FullTransactionId variable, stepping over special XIDs */
+static inline void
+FullTransactionIdAdvance(FullTransactionId *dest)
+{
+	dest->value++;
+	while (XidFromFullTransactionId(*dest) < FirstNormalTransactionId)
+		dest->value++;
+}
 
 /* back up a transaction ID variable, handling wraparound correctly */
 #define TransactionIdRetreat(dest)	\
@@ -96,22 +132,43 @@ typedef struct VariableCacheData
 	/*
 	 * These fields are protected by XidGenLock.
 	 */
-	TransactionId nextXid;		/* next XID to assign */
+	FullTransactionId nextFullXid;	/* next full XID to assign */
 
 	TransactionId oldestXid;	/* cluster-wide minimum datfrozenxid */
 	TransactionId xidVacLimit;	/* start forcing autovacuums here */
 	TransactionId xidWarnLimit; /* start complaining here */
-	TransactionId xidStopLimit; /* refuse to advance nextXid beyond here */
+	TransactionId xidStopLimit; /* refuse to advance nextFullXid beyond here */
 	TransactionId xidWrapLimit; /* where the world ends */
 	Oid			oldestXidDB;	/* database with minimum datfrozenxid */
+
+	/*
+	 * These fields are protected by CommitTsLock
+	 */
+	TransactionId oldestCommitTsXid;
+	TransactionId newestCommitTsXid;
 
 	/*
 	 * These fields are protected by ProcArrayLock.
 	 */
 	TransactionId latestCompletedXid;	/* newest XID that has committed or
 										 * aborted */
-	TransactionId latestCompletedDxid;	/* newest distributed XID that has
+	TransactionId latestCompletedGxid;	/* newest distributed XID that has
 										   committed or aborted */
+
+	/*
+	 * The two variables are protected by shmGxidGenLock.  Note nextGxid won't
+	 * be accurate after crash recovery.  When crash recovery happens, we bump
+	 * them to the next batch on the coordinator, while on the primary, it is
+	 * not accurate until the next query with an assigned gxid is dispatched.
+	 */
+	DistributedTransactionId nextGxid;	/* next full XID to assign */
+	uint32		GxidCount;		/* Gxids available before must do XLOG work */
+
+	/*
+	 * These fields are protected by CLogTruncationLock
+	 */
+	TransactionId oldestClogXid;	/* oldest it's safe to look up in clog */
+
 } VariableCacheData;
 
 typedef VariableCacheData *VariableCache;
@@ -131,6 +188,9 @@ extern PGDLLIMPORT VariableCache ShmemVariableCache;
 extern int xid_stop_limit;
 extern int xid_warn_limit;
 
+/* GPDB-specific */
+extern bool gp_pause_on_restore_point_replay;
+
 /*
  * prototypes for functions in transam/transam.c
  */
@@ -138,7 +198,6 @@ extern bool TransactionIdDidCommit(TransactionId transactionId);
 extern bool TransactionIdDidAbort(TransactionId transactionId);
 extern bool TransactionIdDidAbortForReader(TransactionId transactionId);
 extern bool TransactionIdIsKnownCompleted(TransactionId transactionId);
-extern void TransactionIdAbort(TransactionId transactionId);
 extern void TransactionIdCommitTree(TransactionId xid, int nxids, TransactionId *xids);
 extern void TransactionIdAsyncCommitTree(TransactionId xid, int nxids, TransactionId *xids, XLogRecPtr lsn);
 extern void TransactionIdAbortTree(TransactionId xid, int nxids, TransactionId *xids);
@@ -147,21 +206,38 @@ extern bool TransactionIdPrecedesOrEquals(TransactionId id1, TransactionId id2);
 extern bool TransactionIdFollows(TransactionId id1, TransactionId id2);
 extern bool TransactionIdFollowsOrEquals(TransactionId id1, TransactionId id2);
 extern TransactionId TransactionIdLatest(TransactionId mainxid,
-					int nxids, const TransactionId *xids);
+										 int nxids, const TransactionId *xids);
 extern XLogRecPtr TransactionIdGetCommitLSN(TransactionId xid);
 
 /* in transam/varsup.c */
-extern TransactionId GetNewTransactionId(bool isSubXact);
-extern TransactionId ReadNewTransactionId(void);
-extern TransactionId GetTransactionIdLimit(void);
+extern FullTransactionId GetNewTransactionId(bool isSubXact);
+extern void AdvanceNextFullTransactionIdPastXid(TransactionId xid);
+extern FullTransactionId ReadNextFullTransactionId(void);
 extern void SetTransactionIdLimit(TransactionId oldest_datfrozenxid,
-					  Oid oldest_datoid);
+								  Oid oldest_datoid);
+extern void AdvanceOldestClogXid(TransactionId oldest_datfrozenxid);
 extern bool ForceTransactionIdLimitUpdate(void);
 extern Oid	GetNewObjectId(void);
 extern void AdvanceObjectId(Oid newOid);
 extern Oid	GetNewSegRelfilenode(void);
 extern bool OidFollowsNextOid(Oid id);
 
-#endif   /* TRAMSAM_H */
+/*
+ * Some frontend programs include this header.  For compilers that emit static
+ * inline functions even when they're unused, that leads to unsatisfied
+ * external references; hence hide them with #ifndef FRONTEND.
+ */
+#ifndef FRONTEND
 
+/*
+ * For callers that just need the XID part of the next transaction ID.
+ */
+static inline TransactionId
+ReadNewTransactionId(void)
+{
+	return XidFromFullTransactionId(ReadNextFullTransactionId());
+}
 
+#endif							/* FRONTEND */
+
+#endif							/* TRANSAM_H */

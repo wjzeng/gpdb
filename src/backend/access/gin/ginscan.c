@@ -4,7 +4,7 @@
  *	  routines to manage scans of inverted index relations
  *
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -21,12 +21,9 @@
 #include "utils/rel.h"
 
 
-Datum
-ginbeginscan(PG_FUNCTION_ARGS)
+IndexScanDesc
+ginbeginscan(Relation rel, int nkeys, int norderbys)
 {
-	Relation	rel = (Relation) PG_GETARG_POINTER(0);
-	int			nkeys = PG_GETARG_INT32(1);
-	int			norderbys = PG_GETARG_INT32(2);
 	IndexScanDesc scan;
 	GinScanOpaque so;
 
@@ -41,14 +38,15 @@ ginbeginscan(PG_FUNCTION_ARGS)
 	so->nkeys = 0;
 	so->tempCtx = AllocSetContextCreate(CurrentMemoryContext,
 										"Gin scan temporary context",
-										ALLOCSET_DEFAULT_MINSIZE,
-										ALLOCSET_DEFAULT_INITSIZE,
-										ALLOCSET_DEFAULT_MAXSIZE);
+										ALLOCSET_DEFAULT_SIZES);
+	so->keyCtx = AllocSetContextCreate(CurrentMemoryContext,
+									   "Gin scan key context",
+									   ALLOCSET_DEFAULT_SIZES);
 	initGinState(&so->ginstate, scan->indexRelation);
 
 	scan->opaque = so;
 
-	PG_RETURN_POINTER(scan);
+	return scan;
 }
 
 /*
@@ -149,7 +147,7 @@ ginFillScanKey(GinScanOpaque so, OffsetNumber attnum,
 	key->nuserentries = nUserQueryValues;
 
 	key->scanEntry = (GinScanEntry *) palloc(sizeof(GinScanEntry) * nQueryValues);
-	key->entryRes = (bool *) palloc0(sizeof(bool) * nQueryValues);
+	key->entryRes = (GinTernaryValue *) palloc0(sizeof(GinTernaryValue) * nQueryValues);
 
 	key->query = query;
 	key->queryValues = queryValues;
@@ -163,6 +161,10 @@ ginFillScanKey(GinScanOpaque so, OffsetNumber attnum,
 	key->curItemMatches = false;
 	key->recheckCurItem = false;
 	key->isFinished = false;
+	key->nrequired = 0;
+	key->nadditional = 0;
+	key->requiredEntries = NULL;
+	key->additionalEntries = NULL;
 
 	ginInitConsistentFunction(ginstate, key);
 
@@ -223,25 +225,16 @@ ginFillScanKey(GinScanOpaque so, OffsetNumber attnum,
 	}
 }
 
-static void
-freeScanKeys(GinScanOpaque so)
+/*
+ * Release current scan keys, if any.
+ */
+void
+ginFreeScanKeys(GinScanOpaque so)
 {
 	uint32		i;
 
 	if (so->keys == NULL)
 		return;
-
-	for (i = 0; i < so->nkeys; i++)
-	{
-		GinScanKey	key = so->keys + i;
-
-		pfree(key->scanEntry);
-		pfree(key->entryRes);
-	}
-
-	pfree(so->keys);
-	so->keys = NULL;
-	so->nkeys = 0;
 
 	for (i = 0; i < so->totalentries; i++)
 	{
@@ -255,10 +248,12 @@ freeScanKeys(GinScanOpaque so)
 			tbm_end_iterate(entry->matchIterator);
 		if (entry->matchBitmap)
 			tbm_free(entry->matchBitmap);
-		pfree(entry);
 	}
 
-	pfree(so->entries);
+	MemoryContextResetAndDeleteChildren(so->keyCtx);
+
+	so->keys = NULL;
+	so->nkeys = 0;
 	so->entries = NULL;
 	so->totalentries = 0;
 }
@@ -270,6 +265,14 @@ ginNewScanKey(IndexScanDesc scan)
 	GinScanOpaque so = (GinScanOpaque) scan->opaque;
 	int			i;
 	bool		hasNullQuery = false;
+	MemoryContext oldCtx;
+
+	/*
+	 * Allocate all the scan key information in the key context. (If
+	 * extractQuery leaks anything there, it won't be reset until the end of
+	 * scan or rescan, but that's OK.)
+	 */
+	oldCtx = MemoryContextSwitchTo(so->keyCtx);
 
 	/* if no scan keys provided, allocate extra EVERYTHING GinScanKey */
 	so->keys = (GinScanKey)
@@ -280,7 +283,7 @@ ginNewScanKey(IndexScanDesc scan)
 	so->totalentries = 0;
 	so->allocentries = 32;
 	so->entries = (GinScanEntry *)
-		palloc0(so->allocentries * sizeof(GinScanEntry));
+		palloc(so->allocentries * sizeof(GinScanEntry));
 
 	so->isVoidRes = false;
 
@@ -292,6 +295,7 @@ ginNewScanKey(IndexScanDesc scan)
 		bool	   *partial_matches = NULL;
 		Pointer    *extra_data = NULL;
 		bool	   *nullFlags = NULL;
+		GinNullCategory *categories;
 		int32		searchMode = GIN_SEARCH_MODE_DEFAULT;
 
 		/*
@@ -307,11 +311,11 @@ ginNewScanKey(IndexScanDesc scan)
 		/* OK to call the extractQueryFn */
 		queryValues = (Datum *)
 			DatumGetPointer(FunctionCall7Coll(&so->ginstate.extractQueryFn[skey->sk_attno - 1],
-						   so->ginstate.supportCollation[skey->sk_attno - 1],
+											  so->ginstate.supportCollation[skey->sk_attno - 1],
 											  skey->sk_argument,
 											  PointerGetDatum(&nQueryValues),
-										   UInt16GetDatum(skey->sk_strategy),
-										   PointerGetDatum(&partial_matches),
+											  UInt16GetDatum(skey->sk_strategy),
+											  PointerGetDatum(&partial_matches),
 											  PointerGetDatum(&extra_data),
 											  PointerGetDatum(&nullFlags),
 											  PointerGetDatum(&searchMode)));
@@ -343,15 +347,12 @@ ginNewScanKey(IndexScanDesc scan)
 		}
 
 		/*
-		 * If the extractQueryFn didn't create a nullFlags array, create one,
-		 * assuming that everything's non-null.  Otherwise, run through the
-		 * array and make sure each value is exactly 0 or 1; this ensures
-		 * binary compatibility with the GinNullCategory representation. While
-		 * at it, detect whether any null keys are present.
+		 * Create GinNullCategory representation.  If the extractQueryFn
+		 * didn't create a nullFlags array, we assume everything is non-null.
+		 * While at it, detect whether any null keys are present.
 		 */
-		if (nullFlags == NULL)
-			nullFlags = (bool *) palloc0(nQueryValues * sizeof(bool));
-		else
+		categories = (GinNullCategory *) palloc0(nQueryValues * sizeof(GinNullCategory));
+		if (nullFlags)
 		{
 			int32		j;
 
@@ -359,17 +360,16 @@ ginNewScanKey(IndexScanDesc scan)
 			{
 				if (nullFlags[j])
 				{
-					nullFlags[j] = true;		/* not any other nonzero value */
+					categories[j] = GIN_CAT_NULL_KEY;
 					hasNullQuery = true;
 				}
 			}
 		}
-		/* now we can use the nullFlags as category codes */
 
 		ginFillScanKey(so, skey->sk_attno,
 					   skey->sk_strategy, searchMode,
 					   skey->sk_argument, nQueryValues,
-					   queryValues, (GinNullCategory *) nullFlags,
+					   queryValues, categories,
 					   partial_matches, extra_data);
 	}
 
@@ -404,55 +404,36 @@ ginNewScanKey(IndexScanDesc scan)
 							 RelationGetRelationName(scan->indexRelation))));
 	}
 
+	MemoryContextSwitchTo(oldCtx);
+
 	pgstat_count_index_scan(scan->indexRelation);
 }
 
-Datum
-ginrescan(PG_FUNCTION_ARGS)
+void
+ginrescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
+		  ScanKey orderbys, int norderbys)
 {
-	IndexScanDesc scan = (IndexScanDesc) PG_GETARG_POINTER(0);
-	ScanKey		scankey = (ScanKey) PG_GETARG_POINTER(1);
-
-	/* remaining arguments are ignored */
 	GinScanOpaque so = (GinScanOpaque) scan->opaque;
 
-	freeScanKeys(so);
+	ginFreeScanKeys(so);
 
 	if (scankey && scan->numberOfKeys > 0)
 	{
 		memmove(scan->keyData, scankey,
 				scan->numberOfKeys * sizeof(ScanKeyData));
 	}
-
-	PG_RETURN_VOID();
 }
 
 
-Datum
-ginendscan(PG_FUNCTION_ARGS)
+void
+ginendscan(IndexScanDesc scan)
 {
-	IndexScanDesc scan = (IndexScanDesc) PG_GETARG_POINTER(0);
 	GinScanOpaque so = (GinScanOpaque) scan->opaque;
 
-	freeScanKeys(so);
+	ginFreeScanKeys(so);
 
 	MemoryContextDelete(so->tempCtx);
+	MemoryContextDelete(so->keyCtx);
 
 	pfree(so);
-
-	PG_RETURN_VOID();
-}
-
-Datum
-ginmarkpos(PG_FUNCTION_ARGS)
-{
-	elog(ERROR, "GIN does not support mark/restore");
-	PG_RETURN_VOID();
-}
-
-Datum
-ginrestrpos(PG_FUNCTION_ARGS)
-{
-	elog(ERROR, "GIN does not support mark/restore");
-	PG_RETURN_VOID();
 }

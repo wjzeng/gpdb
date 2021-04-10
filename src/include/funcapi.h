@@ -2,12 +2,13 @@
  *
  * funcapi.h
  *	  Definitions for functions which return composite type and/or sets
+ *	  or work on VARIADIC inputs.
  *
  * This file must be included by all Postgres modules that either define
  * or call FUNCAPI-callable functions or macros.
  *
  *
- * Copyright (c) 2002-2014, PostgreSQL Global Development Group
+ * Copyright (c) 2002-2019, PostgreSQL Global Development Group
  *
  * src/include/funcapi.h
  *
@@ -62,7 +63,7 @@ typedef struct FuncCallContext
 	 * call_cntr is initialized to 0 for you by SRF_FIRSTCALL_INIT(), and
 	 * incremented for you every time SRF_RETURN_NEXT() is called.
 	 */
-	uint32		call_cntr;
+	uint64		call_cntr;
 
 	/*
 	 * OPTIONAL maximum number of calls
@@ -71,15 +72,7 @@ typedef struct FuncCallContext
 	 * not set, you must provide alternative means to know when the function
 	 * is done.
 	 */
-	uint32		max_calls;
-
-	/*
-	 * OPTIONAL pointer to result slot
-	 *
-	 * This is obsolete and only present for backwards compatibility, viz,
-	 * user-defined SRFs that use the deprecated TupleDescGetSlot().
-	 */
-	TupleTableSlot *slot;
+	uint64		max_calls;
 
 	/*
 	 * OPTIONAL pointer to miscellaneous user-provided context information
@@ -143,6 +136,10 @@ typedef struct FuncCallContext
  *		get_call_result_type.  Note: the cases in which rowtypes cannot be
  *		determined are different from the cases for get_call_result_type.
  *		Do *not* use this if you can use one of the others.
+ *
+ * See also get_expr_result_tupdesc(), which is a convenient wrapper around
+ * get_expr_result_type() for use when the caller only cares about
+ * determinable-rowtype cases.
  *----------
  */
 
@@ -151,38 +148,42 @@ typedef enum TypeFuncClass
 {
 	TYPEFUNC_SCALAR,			/* scalar result type */
 	TYPEFUNC_COMPOSITE,			/* determinable rowtype result */
+	TYPEFUNC_COMPOSITE_DOMAIN,	/* domain over determinable rowtype result */
 	TYPEFUNC_RECORD,			/* indeterminate rowtype result */
 	TYPEFUNC_OTHER				/* bogus type, eg pseudotype */
 } TypeFuncClass;
 
 extern TypeFuncClass get_call_result_type(FunctionCallInfo fcinfo,
-					 Oid *resultTypeId,
-					 TupleDesc *resultTupleDesc);
+										  Oid *resultTypeId,
+										  TupleDesc *resultTupleDesc);
 extern TypeFuncClass get_expr_result_type(Node *expr,
-					 Oid *resultTypeId,
-					 TupleDesc *resultTupleDesc);
+										  Oid *resultTypeId,
+										  TupleDesc *resultTupleDesc);
 extern TypeFuncClass get_func_result_type(Oid functionId,
-					 Oid *resultTypeId,
-					 TupleDesc *resultTupleDesc);
+										  Oid *resultTypeId,
+										  TupleDesc *resultTupleDesc);
 extern void  assign_func_result_transient_type(Oid functionId);
 
+extern TupleDesc get_expr_result_tupdesc(Node *expr, bool noError);
 
 extern bool resolve_polymorphic_argtypes(int numargs, Oid *argtypes,
-							 char *argmodes,
-							 Node *call_expr);
+										 char *argmodes,
+										 Node *call_expr);
 
-extern int get_func_arg_info(HeapTuple procTup,
-				  Oid **p_argtypes, char ***p_argnames,
-				  char **p_argmodes);
+extern int	get_func_arg_info(HeapTuple procTup,
+							  Oid **p_argtypes, char ***p_argnames,
+							  char **p_argmodes);
 
-extern int get_func_input_arg_names(Datum proargnames, Datum proargmodes,
-						 char ***arg_names);
+extern int	get_func_input_arg_names(Datum proargnames, Datum proargmodes,
+									 char ***arg_names);
 
+extern int	get_func_trftypes(HeapTuple procTup, Oid **p_trftypes);
 extern char *get_func_result_name(Oid functionId);
 
-extern TupleDesc build_function_result_tupdesc_d(Datum proallargtypes,
-								Datum proargmodes,
-								Datum proargnames);
+extern TupleDesc build_function_result_tupdesc_d(char prokind,
+												 Datum proallargtypes,
+												 Datum proargmodes,
+												 Datum proargnames);
 extern TupleDesc build_function_result_tupdesc_t(HeapTuple procTuple);
 
 
@@ -213,8 +214,6 @@ extern TupleDesc build_function_result_tupdesc_t(HeapTuple procTuple);
  *		TupleDesc based on a named relation.
  * TupleDesc TypeGetTupleDesc(Oid typeoid, List *colaliases) - Use to get a
  *		TupleDesc based on a type OID.
- * TupleTableSlot *TupleDescGetSlot(TupleDesc tupdesc) - Builds a
- *		TupleTableSlot, which is not needed anymore.
  * TupleGetDatum(TupleTableSlot *slot, HeapTuple tuple) - get a Datum
  *		given a tuple and a slot.
  *----------
@@ -232,7 +231,6 @@ extern TupleDesc BlessTupleDesc(TupleDesc tupdesc);
 extern AttInMetadata *TupleDescGetAttInMetadata(TupleDesc tupdesc);
 extern HeapTuple BuildTupleFromCStrings(AttInMetadata *attinmeta, char **values);
 extern Datum HeapTupleHeaderGetDatum(HeapTupleHeader tuple);
-extern TupleTableSlot *TupleDescGetSlot(TupleDesc tupdesc);
 
 
 /*----------
@@ -255,7 +253,7 @@ extern TupleTableSlot *TupleDescGetSlot(TupleDesc tupdesc);
  *		oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
  *		<user defined code>
  *		<if returning composite>
- *			<build TupleDesc, and perhaps AttInMetaData>
+ *			<build TupleDesc, and perhaps AttInMetadata>
  *		<endif returning composite>
  *		<user defined code>
  *		// return to original context when allocating transient memory
@@ -316,4 +314,26 @@ extern void end_MultiFuncCall(PG_FUNCTION_ARGS, FuncCallContext *funcctx);
 		PG_RETURN_NULL(); \
 	} while (0)
 
-#endif   /* FUNCAPI_H */
+/*----------
+ *	Support to ease writing of functions dealing with VARIADIC inputs
+ *----------
+ *
+ * This function extracts a set of argument values, types and NULL markers
+ * for a given input function. This returns a set of data:
+ * - **values includes the set of Datum values extracted.
+ * - **types the data type OID for each element.
+ * - **nulls tracks if an element is NULL.
+ *
+ * variadic_start indicates the argument number where the VARIADIC argument
+ * starts.
+ * convert_unknown set to true will enforce the conversion of arguments
+ * with unknown data type to text.
+ *
+ * The return result is the number of elements stored, or -1 in the case of
+ * "VARIADIC NULL".
+ */
+extern int	extract_variadic_args(FunctionCallInfo fcinfo, int variadic_start,
+								  bool convert_unknown, Datum **values,
+								  Oid **types, bool **nulls);
+
+#endif							/* FUNCAPI_H */

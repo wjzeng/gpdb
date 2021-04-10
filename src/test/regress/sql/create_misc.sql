@@ -7,10 +7,12 @@
 --
 
 INSERT INTO tenk2 SELECT * FROM tenk1;
+ANALYZE tenk2;
 
 SELECT * INTO TABLE onek2 FROM onek;
 
 INSERT INTO fast_emp4000 SELECT * FROM slow_emp4000;
+ANALYZE fast_emp4000;
 
 SELECT *
    INTO TABLE Bprime
@@ -36,6 +38,11 @@ INSERT INTO equipment_r (name, hobby) VALUES ('peet''s coffee', 'posthacking');
 INSERT INTO equipment_r (name, hobby) VALUES ('hightops', 'basketball');
 
 INSERT INTO equipment_r (name, hobby) VALUES ('guts', 'skywalking');
+
+INSERT INTO city VALUES
+('Podunk', '(1,2),(3,4)', '100,127,1000'),
+('Gotham', '(1000,34),(1100,334)', '123456,127,-1000,6789');
+TABLE city;
 
 SELECT *
    INTO TABLE ramp
@@ -186,6 +193,13 @@ INSERT INTO f_star (class, f)
    VALUES ('f', '(11111111,33333333),(22222222,44444444)'::polygon);
 
 INSERT INTO f_star (class) VALUES ('f');
+
+ANALYZE a_star;
+ANALYZE b_star;
+ANALYZE c_star;
+ANALYZE d_star;
+ANALYZE e_star;
+ANALYZE f_star;
 
 
 --

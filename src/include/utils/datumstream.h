@@ -3,7 +3,7 @@
  * datumstream.h
  *
  * Portions Copyright (c) 2008, Greenplum Inc.
- * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
  *
  *
  * IDENTIFICATION
@@ -260,7 +260,8 @@ extern DatumStreamWrite *create_datumstreamwrite(
 						int32 maxsz,
 						Form_pg_attribute attr,
 						char *relname,
-						char *title);
+						char *title,
+						bool needsWAL);
 
 extern DatumStreamRead *create_datumstreamread(
 					   char *compName,
@@ -322,6 +323,5 @@ extern void *datumstreamread_get_upgrade_space(DatumStreamRead *datumStream,
  * before calling datumstreamread_block_content.
  */
 extern void datumstreamread_block_content(DatumStreamRead * acc);
-extern bool init_datumstream_checksum(char *compName, bool checksum);
 
 #endif   /* DATUMSTREAM_H */

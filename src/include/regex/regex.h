@@ -58,7 +58,7 @@ typedef struct
 	size_t		re_nsub;		/* number of subexpressions */
 	long		re_info;		/* information about RE */
 #define  REG_UBACKREF		 000001
-#define  REG_ULOOKAHEAD		 000002
+#define  REG_ULOOKAROUND	 000002
 #define  REG_UBOUNDS	 000004
 #define  REG_UBRACES	 000010
 #define  REG_UBSALNUM		 000020
@@ -152,7 +152,7 @@ typedef struct
 #define REG_INVARG	16			/* invalid argument to regex function */
 #define REG_MIXED	17			/* character widths of regex and string differ */
 #define REG_BADOPT	18			/* invalid embedded option */
-#define REG_ETOOBIG 19			/* nfa has too many states */
+#define REG_ETOOBIG 19			/* regular expression is too complex */
 #define REG_ECOLORS 20			/* too many colors */
 #define REG_CANCEL	21			/* operation cancelled */
 /* two specials for debugging and testing */
@@ -167,11 +167,18 @@ typedef struct
 /*
  * the prototypes for exported functions
  */
+
+/* regcomp.c */
 extern int	pg_regcomp(regex_t *, const pg_wchar *, size_t, int, Oid);
 extern int	pg_regexec(regex_t *, const pg_wchar *, size_t, size_t, rm_detail_t *, size_t, regmatch_t[], int);
 extern int	pg_regprefix(regex_t *, pg_wchar **, size_t *);
 extern void pg_regfree(regex_t *);
 extern size_t pg_regerror(int, const regex_t *, char *, size_t);
-extern void pg_set_regex_collation(Oid collation);
 
-#endif   /* _REGEX_H_ */
+/* regexp.c */
+extern regex_t *RE_compile_and_cache(text *text_re, int cflags, Oid collation);
+extern bool RE_compile_and_execute(text *text_re, char *dat, int dat_len,
+								   int cflags, Oid collation,
+								   int nmatch, regmatch_t *pmatch);
+
+#endif							/* _REGEX_H_ */

@@ -5,7 +5,7 @@
  * Functions returning results from a remote database
  *
  * Portions Copyright (c) 2005-2008, Greenplum inc
- * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
  *
  *
  * IDENTIFICATION
@@ -100,4 +100,7 @@ void cdbconn_setQEIdentifier(SegmentDatabaseDescriptor *segdbDesc, int sliceInde
  * (not necessarily received by the target process).
  */
 bool cdbconn_signalQE(SegmentDatabaseDescriptor *segdbDesc, char *errbuf, bool isCancel);
+
+extern void forwardQENotices(void);
+
 #endif   /* CDBCONN_H */

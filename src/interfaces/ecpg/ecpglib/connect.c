@@ -7,7 +7,7 @@
 #include "ecpgtype.h"
 #include "ecpglib.h"
 #include "ecpgerrno.h"
-#include "extern.h"
+#include "ecpglib_extern.h"
 #include "sqlca.h"
 
 #ifdef ENABLE_THREAD_SAFETY
@@ -67,7 +67,7 @@ ecpg_get_connection_nr(const char *connection_name)
 		ret = con;
 	}
 
-	return (ret);
+	return ret;
 }
 
 struct connection *
@@ -106,11 +106,11 @@ ecpg_get_connection(const char *connection_name)
 #endif
 	}
 
-	return (ret);
+	return ret;
 }
 
 static void
-ecpg_finish(struct connection * act)
+ecpg_finish(struct connection *act)
 {
 	if (act != NULL)
 	{
@@ -168,7 +168,7 @@ ECPGsetcommit(int lineno, const char *mode, const char *connection_name)
 	PGresult   *results;
 
 	if (!ecpg_init(con, connection_name, lineno))
-		return (false);
+		return false;
 
 	ecpg_log("ECPGsetcommit on line %d: action \"%s\"; connection \"%s\"\n", lineno, mode, con->name);
 
@@ -204,7 +204,7 @@ ECPGsetconn(int lineno, const char *connection_name)
 	struct connection *con = ecpg_get_connection(connection_name);
 
 	if (!ecpg_init(con, connection_name, lineno))
-		return (false);
+		return false;
 
 #ifdef ENABLE_THREAD_SAFETY
 	pthread_setspecific(actual_connection_key, con);
@@ -222,6 +222,12 @@ ECPGnoticeReceiver(void *arg, const PGresult *result)
 	char	   *message = PQresultErrorField(result, PG_DIAG_MESSAGE_PRIMARY);
 	struct sqlca_t *sqlca = ECPGget_sqlca();
 	int			sqlcode;
+
+	if (sqlca == NULL)
+	{
+		ecpg_log("out of memory");
+		return;
+	}
 
 	(void) arg;					/* keep the compiler quiet */
 	if (sqlstate == NULL)
@@ -278,6 +284,14 @@ ECPGconnect(int lineno, int c, const char *name, const char *user, const char *p
 	const char **conn_keywords;
 	const char **conn_values;
 
+	if (sqlca == NULL)
+	{
+		ecpg_raise(lineno, ECPG_OUT_OF_MEMORY,
+				   ECPG_SQLSTATE_ECPG_OUT_OF_MEMORY, NULL);
+		ecpg_free(dbname);
+		return false;
+	}
+
 	ecpg_init_sqlca(sqlca);
 
 	/*
@@ -321,7 +335,12 @@ ECPGconnect(int lineno, int c, const char *name, const char *user, const char *p
 	}
 
 	if ((this = (struct connection *) ecpg_alloc(sizeof(struct connection), lineno)) == NULL)
+	{
+		ecpg_free(dbname);
 		return false;
+	}
+
+	memset(this, 0, sizeof(struct connection));
 
 	if (dbname != NULL)
 	{
@@ -654,6 +673,13 @@ ECPGdisconnect(int lineno, const char *connection_name)
 	struct sqlca_t *sqlca = ECPGget_sqlca();
 	struct connection *con;
 
+	if (sqlca == NULL)
+	{
+		ecpg_raise(lineno, ECPG_OUT_OF_MEMORY,
+				   ECPG_SQLSTATE_ECPG_OUT_OF_MEMORY, NULL);
+		return false;
+	}
+
 #ifdef ENABLE_THREAD_SAFETY
 	pthread_mutex_lock(&connections_mutex);
 #endif
@@ -666,6 +692,7 @@ ECPGdisconnect(int lineno, const char *connection_name)
 			struct connection *f = con;
 
 			con = con->next;
+			ecpg_release_declared_statement(f->name);
 			ecpg_finish(f);
 		}
 	}
@@ -678,10 +705,13 @@ ECPGdisconnect(int lineno, const char *connection_name)
 #ifdef ENABLE_THREAD_SAFETY
 			pthread_mutex_unlock(&connections_mutex);
 #endif
-			return (false);
+			return false;
 		}
 		else
+		{
+			ecpg_release_declared_statement(connection_name);
 			ecpg_finish(con);
+		}
 	}
 
 #ifdef ENABLE_THREAD_SAFETY

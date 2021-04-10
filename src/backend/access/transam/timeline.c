@@ -15,13 +15,13 @@
  * <parentTLI> <switchpoint> <reason>
  *
  *	parentTLI	ID of the parent timeline
- *	switchpoint XLogRecPtr of the WAL position where the switch happened
+ *	switchpoint XLogRecPtr of the WAL location where the switch happened
  *	reason		human-readable explanation of why the timeline was changed
  *
  * The fields are separated by tabs. Lines beginning with # are comments, and
  * are ignored. Empty lines are also ignored.
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/backend/access/transam/timeline.c
@@ -32,17 +32,18 @@
 #include "postgres.h"
 
 #include <sys/stat.h>
-#include <stdio.h>
 #include <unistd.h>
 
 #include "access/timeline.h"
+#include "access/xlog.h"
 #include "access/xlog_internal.h"
 #include "access/xlogdefs.h"
+#include "pgstat.h"
 #include "storage/fd.h"
 
 /*
  * Copies all timeline history files with id's between 'begin' and 'end'
- * from archive to pg_xlog.
+ * from archive to pg_wal.
  */
 void
 restoreTimeLineHistoryFiles(TimeLineID begin, TimeLineID end)
@@ -150,12 +151,12 @@ readTimeLineHistory(TimeLineID targetTLI)
 		if (nfields != 3)
 			ereport(FATAL,
 					(errmsg("syntax error in history file: %s", fline),
-			   errhint("Expected a transaction log switchpoint location.")));
+					 errhint("Expected a write-ahead log switchpoint location.")));
 
 		if (result && tli <= lasttli)
 			ereport(FATAL,
 					(errmsg("invalid data in history file: %s", fline),
-				   errhint("Timeline IDs must be in increasing sequence.")));
+					 errhint("Timeline IDs must be in increasing sequence.")));
 
 		lasttli = tli;
 
@@ -176,7 +177,7 @@ readTimeLineHistory(TimeLineID targetTLI)
 	if (result && targetTLI <= lasttli)
 		ereport(FATAL,
 				(errmsg("invalid data in history file \"%s\"", path),
-			errhint("Timeline IDs must be less than child timeline's ID.")));
+				 errhint("Timeline IDs must be less than child timeline's ID.")));
 
 	/*
 	 * Create one more entry for the "tip" of the timeline, which has no entry
@@ -190,7 +191,7 @@ readTimeLineHistory(TimeLineID targetTLI)
 	result = lcons(entry, result);
 
 	/*
-	 * If the history file was fetched from archive, save it in pg_xlog for
+	 * If the history file was fetched from archive, save it in pg_wal for
 	 * future reference.
 	 */
 	if (fromArchive)
@@ -260,7 +261,7 @@ findNewestTimeLine(TimeLineID startTLI)
 	{
 		if (existsTimeLineHistory(probeTLI))
 		{
-			newestTLI = probeTLI;		/* probeTLI exists */
+			newestTLI = probeTLI;	/* probeTLI exists */
 		}
 		else
 		{
@@ -277,7 +278,7 @@ findNewestTimeLine(TimeLineID startTLI)
  *
  *	newTLI: ID of the new timeline
  *	parentTLI: ID of its immediate parent
- *	switchpoint: XLOG position where the system switched to the new timeline
+ *	switchpoint: WAL location where the system switched to the new timeline
  *	reason: human-readable explanation of why the timeline was switched
  *
  * Currently this is only used at the end recovery, and so there are no locking
@@ -306,8 +307,7 @@ writeTimeLineHistory(TimeLineID newTLI, TimeLineID parentTLI,
 	unlink(tmppath);
 
 	/* do not use get_sync_bit() here --- want to fsync only at end of fill */
-	fd = OpenTransientFile(tmppath, O_RDWR | O_CREAT | O_EXCL,
-						   S_IRUSR | S_IWUSR);
+	fd = OpenTransientFile(tmppath, O_RDWR | O_CREAT | O_EXCL);
 	if (fd < 0)
 		ereport(ERROR,
 				(errcode_for_file_access(),
@@ -324,7 +324,7 @@ writeTimeLineHistory(TimeLineID newTLI, TimeLineID parentTLI,
 	else
 		TLHistoryFilePath(path, parentTLI);
 
-	srcfd = OpenTransientFile(path, O_RDONLY, 0);
+	srcfd = OpenTransientFile(path, O_RDONLY);
 	if (srcfd < 0)
 	{
 		if (errno != ENOENT)
@@ -338,7 +338,9 @@ writeTimeLineHistory(TimeLineID newTLI, TimeLineID parentTLI,
 		for (;;)
 		{
 			errno = 0;
+			pgstat_report_wait_start(WAIT_EVENT_TIMELINE_HISTORY_READ);
 			nbytes = (int) read(srcfd, buffer, sizeof(buffer));
+			pgstat_report_wait_end();
 			if (nbytes < 0 || errno != 0)
 				ereport(ERROR,
 						(errcode_for_file_access(),
@@ -346,6 +348,7 @@ writeTimeLineHistory(TimeLineID newTLI, TimeLineID parentTLI,
 			if (nbytes == 0)
 				break;
 			errno = 0;
+			pgstat_report_wait_start(WAIT_EVENT_TIMELINE_HISTORY_WRITE);
 			if ((int) write(fd, buffer, nbytes) != nbytes)
 			{
 				int			save_errno = errno;
@@ -363,10 +366,15 @@ writeTimeLineHistory(TimeLineID newTLI, TimeLineID parentTLI,
 
 				ereport(ERROR,
 						(errcode_for_file_access(),
-					 errmsg("could not write to file \"%s\": %m", tmppath)));
+						 errmsg("could not write to file \"%s\": %m", tmppath)));
 			}
+			pgstat_report_wait_end();
 		}
-		CloseTransientFile(srcfd);
+
+		if (CloseTransientFile(srcfd))
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not close file \"%s\": %m", path)));
 	}
 
 	/*
@@ -400,16 +408,17 @@ writeTimeLineHistory(TimeLineID newTLI, TimeLineID parentTLI,
 				 errmsg("could not write to file \"%s\": %m", tmppath)));
 	}
 
+	pgstat_report_wait_start(WAIT_EVENT_TIMELINE_HISTORY_SYNC);
 	if (pg_fsync(fd) != 0)
-		ereport(ERROR,
+		ereport(data_sync_elevel(ERROR),
 				(errcode_for_file_access(),
 				 errmsg("could not fsync file \"%s\": %m", tmppath)));
+	pgstat_report_wait_end();
 
 	if (CloseTransientFile(fd))
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not close file \"%s\": %m", tmppath)));
-
 
 	/*
 	 * Now move the completed history file into place with its final name.
@@ -417,28 +426,17 @@ writeTimeLineHistory(TimeLineID newTLI, TimeLineID parentTLI,
 	TLHistoryFilePath(path, newTLI);
 
 	/*
-	 * Prefer link() to rename() here just to be really sure that we don't
-	 * overwrite an existing file.  However, there shouldn't be one, so
-	 * rename() is an acceptable substitute except for the truly paranoid.
+	 * Perform the rename using link if available, paranoidly trying to avoid
+	 * overwriting an existing file (there shouldn't be one).
 	 */
-#if HAVE_WORKING_LINK
-	if (link(tmppath, path) < 0)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not link file \"%s\" to \"%s\": %m",
-						tmppath, path)));
-	unlink(tmppath);
-#else
-	if (rename(tmppath, path) < 0)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not rename file \"%s\" to \"%s\": %m",
-						tmppath, path)));
-#endif
+	durable_link_or_rename(tmppath, path, ERROR);
 
 	/* The history file can be archived immediately. */
-	TLHistoryFileName(histfname, newTLI);
-	XLogArchiveNotify(histfname);
+	if (XLogArchivingActive())
+	{
+		TLHistoryFileName(histfname, newTLI);
+		XLogArchiveNotify(histfname);
+	}
 }
 
 /*
@@ -463,14 +461,14 @@ writeTimeLineHistoryFile(TimeLineID tli, char *content, int size)
 	unlink(tmppath);
 
 	/* do not use get_sync_bit() here --- want to fsync only at end of fill */
-	fd = OpenTransientFile(tmppath, O_RDWR | O_CREAT | O_EXCL,
-						   S_IRUSR | S_IWUSR);
+	fd = OpenTransientFile(tmppath, O_RDWR | O_CREAT | O_EXCL);
 	if (fd < 0)
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not create file \"%s\": %m", tmppath)));
 
 	errno = 0;
+	pgstat_report_wait_start(WAIT_EVENT_TIMELINE_HISTORY_FILE_WRITE);
 	if ((int) write(fd, content, size) != size)
 	{
 		int			save_errno = errno;
@@ -486,17 +484,19 @@ writeTimeLineHistoryFile(TimeLineID tli, char *content, int size)
 				(errcode_for_file_access(),
 				 errmsg("could not write to file \"%s\": %m", tmppath)));
 	}
+	pgstat_report_wait_end();
 
+	pgstat_report_wait_start(WAIT_EVENT_TIMELINE_HISTORY_FILE_SYNC);
 	if (pg_fsync(fd) != 0)
-		ereport(ERROR,
+		ereport(data_sync_elevel(ERROR),
 				(errcode_for_file_access(),
 				 errmsg("could not fsync file \"%s\": %m", tmppath)));
+	pgstat_report_wait_end();
 
 	if (CloseTransientFile(fd))
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not close file \"%s\": %m", tmppath)));
-
 
 	/*
 	 * Now move the completed history file into place with its final name.
@@ -504,24 +504,10 @@ writeTimeLineHistoryFile(TimeLineID tli, char *content, int size)
 	TLHistoryFilePath(path, tli);
 
 	/*
-	 * Prefer link() to rename() here just to be really sure that we don't
-	 * overwrite an existing logfile.  However, there shouldn't be one, so
-	 * rename() is an acceptable substitute except for the truly paranoid.
+	 * Perform the rename using link if available, paranoidly trying to avoid
+	 * overwriting an existing file (there shouldn't be one).
 	 */
-#if HAVE_WORKING_LINK
-	if (link(tmppath, path) < 0)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not link file \"%s\" to \"%s\": %m",
-						tmppath, path)));
-	unlink(tmppath);
-#else
-	if (rename(tmppath, path) < 0)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not rename file \"%s\" to \"%s\": %m",
-						tmppath, path)));
-#endif
+	durable_link_or_rename(tmppath, path, ERROR);
 }
 
 /*

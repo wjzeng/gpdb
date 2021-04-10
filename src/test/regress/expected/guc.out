@@ -149,11 +149,11 @@ SELECT '2006-08-13 12:34:56'::timestamptz;
 (1 row)
 
 SAVEPOINT first_sp;
-SET vacuum_cost_delay TO 80;
+SET vacuum_cost_delay TO 80.1;
 SHOW vacuum_cost_delay;
  vacuum_cost_delay 
 -------------------
- 80ms
+ 80100us
 (1 row)
 
 SET datestyle = 'German, DMY';
@@ -183,7 +183,7 @@ SELECT '2006-08-13 12:34:56'::timestamptz;
 (1 row)
 
 SAVEPOINT second_sp;
-SET vacuum_cost_delay TO 90;
+SET vacuum_cost_delay TO '900us';
 SET datestyle = 'SQL, YMD';
 SHOW datestyle;
  DateStyle 
@@ -222,7 +222,7 @@ ROLLBACK TO third_sp;
 SHOW vacuum_cost_delay;
  vacuum_cost_delay 
 -------------------
- 90ms
+ 900us
 (1 row)
 
 SHOW datestyle;
@@ -506,6 +506,11 @@ SELECT '2006-08-13 12:34:56'::timestamptz;
  Sun Aug 13 12:34:56 2006 PDT
 (1 row)
 
+-- Test some simple error cases
+SET seq_page_cost TO 'NaN';
+ERROR:  invalid value for parameter "seq_page_cost": "NaN"
+SET vacuum_cost_delay TO '10s';
+ERROR:  10000 ms is outside the valid range for parameter "vacuum_cost_delay" (0 .. 100)
 --
 -- Test DISCARD TEMP
 --
@@ -531,8 +536,8 @@ PREPARE foo AS SELECT 1;
 LISTEN foo_event;
 SET vacuum_cost_delay = 13;
 CREATE TEMP TABLE tmp_foo (data text) ON COMMIT DELETE ROWS;
-CREATE ROLE temp_reset_user;
-SET SESSION AUTHORIZATION temp_reset_user;
+CREATE ROLE regress_guc_user;
+SET SESSION AUTHORIZATION regress_guc_user;
 -- look changes
 SELECT pg_listening_channels();
  pg_listening_channels 
@@ -564,7 +569,7 @@ SELECT relname from pg_class where relname = 'tmp_foo';
  tmp_foo
 (1 row)
 
-SELECT current_user = 'temp_reset_user';
+SELECT current_user = 'regress_guc_user';
  ?column? 
 ----------
  t
@@ -572,6 +577,8 @@ SELECT current_user = 'temp_reset_user';
 
 -- discard everything
 DISCARD ALL;
+NOTICE:  command without clusterwide effect
+HINT:  Consider alternatives as DEALLOCATE ALL, or DISCARD TEMP if a clusterwide effect is desired.
 -- look again
 SELECT pg_listening_channels();
  pg_listening_channels 
@@ -599,13 +606,13 @@ SELECT relname from pg_class where relname = 'tmp_foo';
 ---------
 (0 rows)
 
-SELECT current_user = 'temp_reset_user';
+SELECT current_user = 'regress_guc_user';
  ?column? 
 ----------
  f
 (1 row)
 
-DROP ROLE temp_reset_user;
+DROP ROLE regress_guc_user;
 --
 -- search_path should react to changes in pg_namespace
 --
@@ -677,8 +684,6 @@ WARNING:  "work_mem": setting is deprecated, and may be removed in a future rele
 select myfunc(0), current_setting('work_mem');
 WARNING:  "work_mem": setting is deprecated, and may be removed in a future release.
 WARNING:  "work_mem": setting is deprecated, and may be removed in a future release.
-CONTEXT:  SQL statement "set local work_mem = '2MB'"
-PL/pgSQL function myfunc(integer) line 3 at SQL statement
  myfunc | current_setting 
 --------+-----------------
  2MB    | 3MB
@@ -687,8 +692,6 @@ PL/pgSQL function myfunc(integer) line 3 at SQL statement
 alter function myfunc(int) reset all;
 select myfunc(0), current_setting('work_mem');
 WARNING:  "work_mem": setting is deprecated, and may be removed in a future release.
-CONTEXT:  SQL statement "set local work_mem = '2MB'"
-PL/pgSQL function myfunc(integer) line 3 at SQL statement
  myfunc | current_setting 
 --------+-----------------
  2MB    | 2MB
@@ -709,8 +712,6 @@ WARNING:  "work_mem": setting is deprecated, and may be removed in a future rele
 select myfunc(0), current_setting('work_mem');
 WARNING:  "work_mem": setting is deprecated, and may be removed in a future release.
 WARNING:  "work_mem": setting is deprecated, and may be removed in a future release.
-CONTEXT:  SQL statement "set work_mem = '2MB'"
-PL/pgSQL function myfunc(integer) line 3 at SQL statement
  myfunc | current_setting 
 --------+-----------------
  2MB    | 2MB
@@ -731,10 +732,8 @@ WARNING:  "work_mem": setting is deprecated, and may be removed in a future rele
 WARNING:  "work_mem": setting is deprecated, and may be removed in a future release.
 select myfunc(0);
 WARNING:  "work_mem": setting is deprecated, and may be removed in a future release.
-WARNING:  "work_mem": setting is deprecated, and may be removed in a future release.
-CONTEXT:  SQL statement "set work_mem = '2MB'"
-PL/pgSQL function myfunc(integer) line 3 at SQL statement
 ERROR:  division by zero
+WARNING:  "work_mem": setting is deprecated, and may be removed in a future release.
 CONTEXT:  SQL statement "SELECT 1/$1"
 PL/pgSQL function myfunc(integer) line 4 at PERFORM
 select current_setting('work_mem');
@@ -746,11 +745,40 @@ select current_setting('work_mem');
 select myfunc(1), current_setting('work_mem');
 WARNING:  "work_mem": setting is deprecated, and may be removed in a future release.
 WARNING:  "work_mem": setting is deprecated, and may be removed in a future release.
-CONTEXT:  SQL statement "set work_mem = '2MB'"
-PL/pgSQL function myfunc(integer) line 3 at SQL statement
  myfunc | current_setting 
 --------+-----------------
  2MB    | 2MB
+(1 row)
+
+-- check current_setting()'s behavior with invalid setting name
+select current_setting('nosuch.setting');  -- FAIL
+ERROR:  unrecognized configuration parameter "nosuch.setting"
+select current_setting('nosuch.setting', false);  -- FAIL
+ERROR:  unrecognized configuration parameter "nosuch.setting"
+select current_setting('nosuch.setting', true) is null;
+ ?column? 
+----------
+ t
+(1 row)
+
+-- after this, all three cases should yield 'nada'
+set nosuch.setting = 'nada';
+select current_setting('nosuch.setting');
+ current_setting 
+-----------------
+ nada
+(1 row)
+
+select current_setting('nosuch.setting', false);
+ current_setting 
+-----------------
+ nada
+(1 row)
+
+select current_setting('nosuch.setting', true);
+ current_setting 
+-----------------
+ nada
 (1 row)
 
 -- Normally, CREATE FUNCTION should complain about invalid values in
@@ -769,3 +797,50 @@ NOTICE:  text search configuration "no_such_config" does not exist
 select func_with_bad_set();
 ERROR:  invalid value for parameter "default_text_search_config": "no_such_config"
 reset check_function_bodies;
+set default_with_oids to f;
+-- Should not allow to set it to true.
+set default_with_oids to t;
+ERROR:  tables declared WITH OIDS are not supported
+SET "request.header.user-agent" = 'curl/7.29.0';
+SHOW "request.header.user-agent";
+ request.header.user-agent 
+---------------------------
+ curl/7.29.0
+(1 row)
+
+-- Test function with SET search_path
+create schema n1;
+create type ty1 as (i int);
+CREATE OR REPLACE FUNCTION n1.drop_table(v_schema character varying, v_table character varying) RETURNS text
+AS $$
+BEGIN
+    EXECUTE 'DROP TABLE IF EXISTS ' || quote_ident(v_schema) || '.' || quote_ident(v_table) || ';';
+    RETURN '0';
+EXCEPTION
+    WHEN OTHERS THEN
+        RETURN SQLSTATE;
+END;
+$$ LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = n1, pg_temp;
+-- Destroy the QD-QE libpq connections.
+select cleanupAllGangs();
+ cleanupallgangs 
+-----------------
+ t
+(1 row)
+
+select n1.drop_table('public','t1');
+NOTICE:  table "t1" does not exist, skipping
+ drop_table 
+------------
+ 0
+(1 row)
+
+-- After funtion drop table, public schema is still in search_path
+create table public.t1(i ty1);
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause, and no column type is suitable for a distribution key. Creating a NULL policy entry.
+drop table public.t1;
+drop type public.ty1;
+drop function n1.drop_table(v_schema character varying, v_table character varying);
+drop schema n1;

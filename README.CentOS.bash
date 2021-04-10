@@ -16,14 +16,19 @@ sudo yum install -y \
     libkadm5 \
     libyaml-devel \
     libxml2-devel \
+    libzstd-devel \
     openssl-devel \
     perl-ExtUtils-Embed \
-    python-devel \
-    python-pip \
+    python3-devel \
+    python3-pip \
     readline-devel \
     xerces-c-devel \
     zlib-devel
 
-sudo pip install conan
-sudo pip install -r python-dependencies.txt
-sudo pip install -r python-developer-dependencies.txt
+# Needed for pygresql, or you can source greenplum_path.sh after compiling database and installing python-dependencies then
+sudo yum install -y \
+    postgresql \
+    postgresql-devel
+
+sudo pip3 install conan
+sudo pip3 install -r python-dependencies.txt

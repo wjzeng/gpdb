@@ -1,7 +1,7 @@
 #!/usr/bin/env perl
 #
 # Portions Copyright (c) 2008-2010 GreenPlum.  All rights reserved.
-# Portions Copyright (c) 2012-Present Pivotal Software, Inc.
+# Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
 #
 # Author: Jeffrey I Cohen
 #
@@ -137,7 +137,7 @@ init, cleanup
 Jeffrey I Cohen
 
 Portions Copyright (c) 2008-2010 GreenPlum.  All rights reserved.
-Portions Copyright (c) 2012-Present Pivotal Software, Inc.
+Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
 
 Address bug reports and comments to: bugs@greenplum.org
 
@@ -526,56 +526,27 @@ sub do_ps_pids
     my $pidlist = [];
     my $pidh = {};
 
-    if ($Config{'osname'} =~ m/solaris|sunos/i)
+    my $cmd = 'ps auxww | grep -v grep | grep gptorment | grep ' . $uid;
+
+    my $psout = `$cmd`;
+
+    my @lines = split(/\n/, $psout);
+
+    for my $lin (@lines)
     {
-		# MPP-10643: fix truncated command args on solaris
-        my $cmd = '/usr/ucb/ps -auxww | grep -v grep | grep gptorment | grep ' . $uid;
-   
-        my $psout = `$cmd`;
+        my @foo = split(/\s+/, $lin, 3);
 
-        my @lines = split(/\n/, $psout);
+        next
+            unless (3 == scalar(@foo));
 
-        for my $lin (@lines)
-        {
-            my @foo = split(/\s+/, $lin, 3);
-        
-            next 
-                unless (3 == scalar(@foo));
+        shift @foo;
 
-            shift @foo;
+        my $pid = shift @foo;
 
-            my $pid = shift @foo;
-        
-            push @{$pidlist}, $pid;
+        push @{$pidlist}, $pid;
 
-            $pidh->{$pid} = 1;
+        $pidh->{$pid} = 1;
 
-        }
-    }
-    else # linux or osx
-    {
-        my $cmd = 'ps auxww | grep -v grep | grep gptorment | grep ' . $uid;
-   
-        my $psout = `$cmd`;
-
-        my @lines = split(/\n/, $psout);
-
-        for my $lin (@lines)
-        {
-            my @foo = split(/\s+/, $lin, 3);
-        
-            next 
-                unless (3 == scalar(@foo));
-
-            shift @foo;
-
-            my $pid = shift @foo;
-        
-            push @{$pidlist}, $pid;
-
-            $pidh->{$pid} = 1;
-
-        }
     }
     return ($pidh, $pidlist);
 } # end do_ps_pids

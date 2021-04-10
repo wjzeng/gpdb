@@ -1,8 +1,10 @@
 DROP TABLE IF EXISTS reindex_crtab_heap_bitmap;
 DROP
 
-CREATE TABLE reindex_crtab_heap_bitmap (a INT); insert into reindex_crtab_heap_bitmap select generate_series(1,1000);
-CREATE 1000
+CREATE TABLE reindex_crtab_heap_bitmap (a INT);
+CREATE
+insert into reindex_crtab_heap_bitmap select generate_series(1,1000);
+INSERT 1000
 insert into reindex_crtab_heap_bitmap select generate_series(1,1000);
 INSERT 1000
 create index idx_reindex_crtab_heap_bitmap on reindex_crtab_heap_bitmap USING BITMAP(a);
@@ -33,9 +35,9 @@ REINDEX
 INSERT 4
 -- Expect two distinct relfilenodes per segment in old_relfilenodes table.
 1: select distinct count(distinct relfilenode), relname from old_relfilenodes group by dbid, relname;
-count|relname                      
------+-----------------------------
-2    |idx_reindex_crtab_heap_bitmap
+ count | relname                       
+-------+-------------------------------
+ 2     | idx_reindex_crtab_heap_bitmap 
 (1 row)
 2: COMMIT;
 COMMIT
@@ -45,22 +47,22 @@ COMMIT
 INSERT 4
 -- Expect three distinct relfilenodes per segment in old_relfilenodes table.
 1: select distinct count(distinct relfilenode), relname from old_relfilenodes group by dbid, relname;
-count|relname                      
------+-----------------------------
-3    |idx_reindex_crtab_heap_bitmap
+ count | relname                       
+-------+-------------------------------
+ 3     | idx_reindex_crtab_heap_bitmap 
 (1 row)
 
 3: select count(*) from reindex_crtab_heap_bitmap where a = 1000;
-count
------
-2    
+ count 
+-------
+ 2     
 (1 row)
 3: set enable_seqscan=false;
 SET
 3: set enable_indexscan=true;
 SET
 3: select count(*) from reindex_crtab_heap_bitmap where a = 1000;
-count
------
-2    
+ count 
+-------
+ 2     
 (1 row)

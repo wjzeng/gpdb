@@ -20,12 +20,15 @@
            protocol='gpfdist'|'http'
     | INHERIT | NOINHERIT
     | LOGIN | NOLOGIN
+    | REPLICATION | NOREPLICATION
     | CONNECTION LIMIT <varname>connlimit</varname>
     | [ ENCRYPTED | UNENCRYPTED ] PASSWORD '<varname>password</varname>'
     | VALID UNTIL '<varname>timestamp</varname>' 
     | IN ROLE <varname>rolename</varname> [, ...]
     | ROLE <varname>rolename</varname> [, ...]
     | ADMIN <varname>rolename</varname> [, ...]
+    | USER <varname>rolename</varname> [, ...]
+    | SYSID <varname>uid</varname> [, ...]
     | RESOURCE QUEUE <varname>queue_name</varname>
     | RESOURCE GROUP <varname>group_name</varname>
     | [ DENY <varname>deny_point</varname> ]
@@ -69,7 +72,7 @@
                 <plentry>
                     <pt>CREATEROLE</pt>
                     <pt>NOCREATEROLE</pt>
-                    <pd>If <codeph>CREATEDB</codeph> is specified, the role being defined will be
+                    <pd>If <codeph>CREATEROLE</codeph> is specified, the role being defined will be
                         allowed to create new roles, alter other roles, and drop other roles.
                             <codeph>NOCREATEROLE</codeph> (the default) will deny a role the ability
                         to create roles or modify roles other than their own. </pd>
@@ -88,11 +91,17 @@
                     <pd>If <codeph>CREATEEXTTABLE</codeph> is specified, the role being defined is
                         allowed to create external tables. The default <codeph>type</codeph> is
                             <codeph>readable</codeph> and the default <codeph>protocol</codeph> is
-                            <codeph>gpfdist</codeph> if not specified.
-                            <codeph>NOCREATEEXTTABLE</codeph> (the default) denies the role the
+                            <codeph>gpfdist</codeph>, if not specified. Valid types are
+                            <codeph>gpfdist</codeph>, <codeph>gpfdists</codeph>,
+                            <codeph>http</codeph>, and <codeph>https</codeph>.
+                            <codeph>NOCREATEEXTTABLE</codeph> (the default type) denies the role the
                         ability to create external tables. Note that external tables that use the
                             <codeph>file</codeph> or <codeph>execute</codeph> protocols can only be
                         created by superusers. </pd>
+                    <pd>Use the <codeph>GRANT...ON PROTOCOL</codeph> command to allow users to
+                        create and use external tables with a custom protocol type, including the
+                            <codeph>s3</codeph> and <codeph>pxf</codeph> protocols included with
+                        Greenplum Database.</pd>
                 </plentry>
                 <plentry>
                     <pt>INHERIT</pt>
@@ -108,8 +117,20 @@
                     <pt>NOLOGIN</pt>
                     <pd>If specified, <codeph>LOGIN</codeph> allows a role to log in to a database.
                         A role having the <codeph>LOGIN</codeph> attribute can be thought of as a
-                        user. Roles with <codeph>NOLOGIN</codeph> (the default) are useful for
-                        managing database privileges, and can be thought of as groups. </pd>
+                        user. Roles with <codeph>NOLOGIN</codeph> are useful for managing database
+                        privileges, and can be thought of as groups. If not specified,
+                            <codeph>NOLOGIN</codeph> is the default, except when <codeph>CREATE
+                            ROLE</codeph> is invoked through its alternative spelling <codeph><xref
+                                href="CREATE_USER.xml#topic1">CREATE USER</xref></codeph>.</pd>
+                </plentry>
+                <plentry>
+                    <pt>REPLICATION</pt>
+                    <pt>NOREPLICATION</pt>
+                    <pd>These clauses determine whether a role is allowed to initiate streaming
+                        replication or put the system in and out of backup mode. A role having the
+                            <codeph>REPLICATION</codeph> attribute is a very highly privileged role,
+                        and should only be used on roles actually used for replication. If not
+                        specified, <codeph>NOREPLICATION</codeph> is the default .</pd>
                 </plentry>
                 <plentry>
                     <pt>CONNECTION LIMIT <varname>connlimit</varname></pt>
@@ -138,9 +159,6 @@
                             <codeph>UNENCRYPTED</codeph> is specified (since the system cannot
                         decrypt the specified encrypted password string). This allows reloading of
                         encrypted passwords during dump/restore.</pd>
-                    <pd>Note that older clients may lack support for the MD5 authentication
-                        mechanism that is needed to work with passwords that are stored encrypted.
-                    </pd>
                 </plentry>
                 <plentry>
                     <pt>VALID UNTIL <varname>'timestamp'</varname></pt>
@@ -167,7 +185,7 @@
                 </plentry>
                 <plentry>
                     <pt>RESOURCE GROUP <varname>group_name</varname></pt>
-                    <pd> The name of the resource group to assign to the the new role. The role will
+                    <pd> The name of the resource group to assign to the new role. The role will
                         be subject to the concurrent transaction, memory, and CPU limits configured
                         for the resource group. You can assign a single resource group to one or
                         more roles.</pd>
@@ -276,6 +294,10 @@
             <codeblock>CREATE ROLE admin WITH CREATEDB CREATEROLE;</codeblock>
             <p>Create a role that does not allow login access on Sundays:</p>
             <codeblock>CREATE ROLE user3 DENY DAY 'Sunday';</codeblock>
+            <p>Create a role that can create readable and writable external tables of type
+                'gpfdist':</p>
+            <codeblock>CREATE ROLE jan WITH CREATEEXTTABLE(type='readable', protocol='gpfdist')
+   CREATEEXTTABLE(type='writable', protocol='gpfdist'); </codeblock>
             <p>Create a role, assigning a resource group:</p>
             <codeblock>CREATE ROLE bill RESOURCE GROUP rg_light;</codeblock>
         </section>
@@ -288,7 +310,7 @@
                 do in the standard. </p>
             <p><codeph>CREATE ROLE</codeph> is in the SQL standard, but the standard only requires
                 the syntax:</p>
-            <codeblock>CREATE ROLE name [WITH ADMIN rolename]</codeblock>
+            <codeblock>CREATE ROLE <varname>name</varname> [WITH ADMIN <varname>rolename</varname>]</codeblock>
             <p>Allowing multiple initial administrators, and all the other options of <codeph>CREATE
                     ROLE</codeph>, are Greenplum Database extensions.</p>
             <p>The behavior specified by the SQL standard is most closely approximated by giving

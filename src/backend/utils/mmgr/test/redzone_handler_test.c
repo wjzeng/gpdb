@@ -7,9 +7,6 @@
 
 #define EXPECT_EREPORT(LOG_LEVEL)     \
 	expect_any(errstart, elevel); \
-	expect_any(errstart, filename); \
-	expect_any(errstart, lineno); \
-	expect_any(errstart, funcname); \
 	expect_any(errstart, domain); \
 	if (LOG_LEVEL < ERROR) \
 	{ \
@@ -24,6 +21,7 @@
 static uint32 fakeIsRunawayDetector = 0;
 extern bool sessionStateInited;
 
+#undef PG_RE_THROW
 #define PG_RE_THROW() siglongjmp(*PG_exception_stack, 1)
 
 /*
@@ -31,7 +29,7 @@ extern bool sessionStateInited;
  * function by re-throwing the exception, essentially falling
  * back to the next available PG_CATCH();
  */
-void
+static void
 _ExceptionalCondition()
 {
      PG_RE_THROW();
@@ -50,8 +48,9 @@ CreateSessionStateArray(int numEntries)
 	SessionStateArray *fakeSessionStateArray = NULL;
 	fakeSessionStateArray = malloc(SessionState_ShmemSize());
 
+	bool found = false;
 	will_return(ShmemInitStruct, fakeSessionStateArray);
-	will_assign_value(ShmemInitStruct, foundPtr, false);
+	will_assign_value(ShmemInitStruct, foundPtr, found);
 
 	expect_any_count(ShmemInitStruct, name, 1);
 	expect_any_count(ShmemInitStruct, size, 1);
@@ -68,7 +67,7 @@ static void
 DestroySessionStateArray()
 {
 	assert_true(NULL != AllSessionStateEntries);
-	free(AllSessionStateEntries);
+	free((void *) AllSessionStateEntries);
 	AllSessionStateEntries = NULL;
 }
 
@@ -76,14 +75,14 @@ DestroySessionStateArray()
  * Acquires a SessionState entry for the specified sessionid. If an existing entry
  * is found, this method reuses that entry
  */
-static SessionState*
+static SessionState *
 AcquireSessionState(int sessionId, int vmem, int activeProcessCount)
 {
 	will_be_called_count(LWLockAcquire, 1);
 	will_be_called_count(LWLockRelease, 1);
-	expect_any_count(LWLockAcquire, l, 1);
+	expect_any_count(LWLockAcquire, lock, 1);
 	expect_any_count(LWLockAcquire, mode, 1);
-	expect_any_count(LWLockRelease, l, 1);
+	expect_any_count(LWLockRelease, lock, 1);
 
 	/* Keep the assertions happy */
 	gp_session_id = sessionId;
@@ -103,13 +102,13 @@ AcquireSessionState(int sessionId, int vmem, int activeProcessCount)
 		MySessionState->activeProcessCount = activeProcessCount;
 	}
 
-	return MySessionState;
+	return (SessionState *) MySessionState;
 }
 /*
  * Checks if RedZoneHandler_ShmemInit() properly initializes the global variables
  * as the postmaster
  */
-void
+static void
 test__RedZoneHandler_ShmemInit__InitializesGlobalVarsWhenPostmaster(void **state)
 {
 	vmemTrackerInited = false;
@@ -122,8 +121,8 @@ test__RedZoneHandler_ShmemInit__InitializesGlobalVarsWhenPostmaster(void **state
 	expect_any_count(ShmemInitStruct, name, 2);
 	expect_any_count(ShmemInitStruct, size, 2);
 	expect_any_count(ShmemInitStruct, foundPtr, 2);
-	will_assign_value(ShmemInitStruct, foundPtr, false);
-	will_assign_value(ShmemInitStruct, foundPtr, false);
+	will_assign_value(ShmemInitStruct, foundPtr, (bool) false);
+	will_assign_value(ShmemInitStruct, foundPtr, (bool) false);
 	will_return_count(ShmemInitStruct, &fakeIsRunawayDetector, 2);
 
 	/*
@@ -156,7 +155,7 @@ test__RedZoneHandler_ShmemInit__InitializesGlobalVarsWhenPostmaster(void **state
  * Checks if RedZoneHandler_ShmemInit() properly initializes the global variables
  * when under postmaster
  */
-void
+static void
 test__RedZoneHandler_ShmemInit__InitializesUnderPostmaster(void **state)
 {
 	vmemTrackerInited = false;
@@ -169,7 +168,7 @@ test__RedZoneHandler_ShmemInit__InitializesUnderPostmaster(void **state)
 	expect_any(ShmemInitStruct, name);
 	expect_any(ShmemInitStruct, size);
 	expect_any(ShmemInitStruct, foundPtr);
-	will_assign_value(ShmemInitStruct, foundPtr, true);
+	will_assign_value(ShmemInitStruct, foundPtr, (bool) true);
 	will_return(ShmemInitStruct, &fakeIsRunawayDetector);
 
 	/* For testing that we don't change this value */
@@ -184,7 +183,7 @@ test__RedZoneHandler_ShmemInit__InitializesUnderPostmaster(void **state)
 /*
  * Checks if RedZoneHandler_IsVmemRedZone() properly identifies red zone
  */
-void
+static void
 test__RedZoneHandler_IsVmemRedZone__ProperlyIdentifiesRedZone(void **state)
 {
 	vmemTrackerInited = false;
@@ -220,14 +219,14 @@ test__RedZoneHandler_IsVmemRedZone__ProperlyIdentifiesRedZone(void **state)
  * Checks if RedZoneHandler_FlagTopConsumer() allows only one detector
  * at a time
  */
-void
+static void
 test__RedZoneHandler_FlagTopConsumer__SingletonDetector(void **state)
 {
 	/* Make sure the code is exercised */
 	vmemTrackerInited = true;
 
 	/* Ensure non-null MySessionState */
-	MySessionState = 0x1234;
+	MySessionState = (SessionState *) 0x1234;
 
 	static uint32 fakeIsRunawayDetector = 0;
 	isRunawayDetector = &fakeIsRunawayDetector;
@@ -245,7 +244,7 @@ test__RedZoneHandler_FlagTopConsumer__SingletonDetector(void **state)
 /*
  * Checks if RedZoneHandler_FlagTopConsumer() finds the top consumer
  */
-void
+static void
 test__RedZoneHandler_FlagTopConsumer__FindsTopConsumer(void **state)
 {
 	/* Make sure the RedZoneHandler_FlagTopConsumer code is exercised */
@@ -264,9 +263,9 @@ test__RedZoneHandler_FlagTopConsumer__FindsTopConsumer(void **state)
 
 	will_be_called_count(LWLockAcquire, 1);
 	will_be_called_count(LWLockRelease, 1);
-	expect_any_count(LWLockAcquire, l, 1);
+	expect_any_count(LWLockAcquire, lock, 1);
 	expect_any_count(LWLockAcquire, mode, 1);
-	expect_any_count(LWLockRelease, l, 1);
+	expect_any_count(LWLockRelease, lock, 1);
 
 	static EventVersion fakeLatestRunawayVersion = 0;
 	static EventVersion fakeCurrentVersion = 1;
@@ -288,7 +287,7 @@ test__RedZoneHandler_FlagTopConsumer__FindsTopConsumer(void **state)
  * Checks if RedZoneHandler_FlagTopConsumer() ignores the idle sessions
  * even if they are the top consumer
  */
-void
+static void
 test__RedZoneHandler_FlagTopConsumer__IgnoresIdleSession(void **state)
 {
 	/* Make sure the RedZoneHandler_FlagTopConsumer code is exercised */
@@ -307,9 +306,9 @@ test__RedZoneHandler_FlagTopConsumer__IgnoresIdleSession(void **state)
 
 	will_be_called_count(LWLockAcquire, 1);
 	will_be_called_count(LWLockRelease, 1);
-	expect_any_count(LWLockAcquire, l, 1);
+	expect_any_count(LWLockAcquire, lock, 1);
 	expect_any_count(LWLockAcquire, mode, 1);
-	expect_any_count(LWLockRelease, l, 1);
+	expect_any_count(LWLockRelease, lock, 1);
 
 	static EventVersion fakeLatestRunawayVersion = 0;
 	static EventVersion fakeCurrentVersion = 1;
@@ -331,7 +330,7 @@ test__RedZoneHandler_FlagTopConsumer__IgnoresIdleSession(void **state)
  * Checks if RedZoneHandler_FlagTopConsumer() reactivates the runaway detector
  * if there is no active session
  */
-void
+static void
 test__RedZoneHandler_FlagTopConsumer__ReactivatesDetectorIfNoActiveSession(void **state)
 {
 	/* Make sure the RedZoneHandler_FlagTopConsumer code is exercised */
@@ -350,9 +349,9 @@ test__RedZoneHandler_FlagTopConsumer__ReactivatesDetectorIfNoActiveSession(void 
 
 	will_be_called_count(LWLockAcquire, 1);
 	will_be_called_count(LWLockRelease, 1);
-	expect_any_count(LWLockAcquire, l, 1);
+	expect_any_count(LWLockAcquire, lock, 1);
 	expect_any_count(LWLockAcquire, mode, 1);
-	expect_any_count(LWLockRelease, l, 1);
+	expect_any_count(LWLockRelease, lock, 1);
 
 	static EventVersion fakeLatestRunawayVersion = 0;
 	static EventVersion fakeCurrentVersion = 1;
@@ -374,7 +373,7 @@ test__RedZoneHandler_FlagTopConsumer__ReactivatesDetectorIfNoActiveSession(void 
  * Checks if RedZoneHandler_FlagTopConsumer() updates the CurrentVersion and
  * latestRunawayVersion
  */
-void
+static void
 test__RedZoneHandler_FlagTopConsumer__UpdatesEventVersions(void **state)
 {
 	/* Make sure the RedZoneHandler_FlagTopConsumer code is exercised */
@@ -390,9 +389,9 @@ test__RedZoneHandler_FlagTopConsumer__UpdatesEventVersions(void **state)
 
 	will_be_called_count(LWLockAcquire, 1);
 	will_be_called_count(LWLockRelease, 1);
-	expect_any_count(LWLockAcquire, l, 1);
+	expect_any_count(LWLockAcquire, lock, 1);
 	expect_any_count(LWLockAcquire, mode, 1);
-	expect_any_count(LWLockRelease, l, 1);
+	expect_any_count(LWLockRelease, lock, 1);
 
 	static EventVersion fakeLatestRunawayVersion = 0;
 	static EventVersion fakeCurrentVersion = 1;

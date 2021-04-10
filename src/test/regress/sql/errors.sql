@@ -2,7 +2,7 @@
 -- ERRORS
 --
 
--- bad in postquel, but ok in postsql
+-- bad in postquel, but ok in PostgreSQL
 select 1;
 
 
@@ -91,7 +91,7 @@ alter table emp rename column nonesuchatt to newnonesuchatt;
 alter table emp rename column salary to manager;
 
 -- conflict
-alter table emp rename column salary to oid;
+alter table emp rename column salary to ctid;
 
 
 --
@@ -388,8 +388,8 @@ create function infinite_recurse() returns int as
 -- # mpp-2756
 -- m/(ERROR|WARNING|CONTEXT|NOTICE):.*stack depth limit exceeded\s+at\s+character/
 -- s/\s+at\s+character.*//
--- m/ERROR:.*GPDB exception. Aborting PQO.*/
--- s/ERROR:.*GPDB exception. Aborting PQO.*//
+-- m/ERROR:.*GPDB exception. Aborting Pivotal Optimizer \(GPORCA\).*/
+-- s/ERROR:.*GPDB exception. Aborting Pivotal Optimizer \(GPORCA\).*//
 -- end_matchsubs
 -- start_ignore
 select infinite_recurse();

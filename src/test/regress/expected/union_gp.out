@@ -219,7 +219,7 @@ CREATE TABLE test1 (id int);
 NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column named 'id' as the Greenplum Database data distribution key for this table.
 HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
 insert into test1 values (1);
-CREATE EXTERNAL WEB TABLE test2 (id int) EXECUTE 'echo 2' ON MASTER FORMAT 'csv';
+CREATE EXTERNAL WEB TABLE test2 (id int) EXECUTE 'echo 2' ON COORDINATOR FORMAT 'csv';
 (SELECT 'test1' as branch, id FROM test1 LIMIT 1)
 union
 (SELECT 'test2' as branch, id FROM test2);
@@ -229,30 +229,82 @@ union
  test2  |  2
 (2 rows)
 
--- The plan you currently get for this has a Motion to move the data from the single QE to
--- QD. That's a bit silly, it would probably make more sense to pull all the data to the QD
--- in the first place, and execute the Limit in the QD, to avoid the extra Motion. But this
--- is hopefully a pretty rare case.
 explain (SELECT 'test1' as branch, id FROM test1 LIMIT 1)
 union
 (SELECT 'test2' as branch, id FROM test2);
-                                                   QUERY PLAN                                                   
-----------------------------------------------------------------------------------------------------------------
- Unique  (cost=1.06..1.07 rows=2 width=4)
-   Group Key: "outer".branch, "*SELECT* 1".id
-   ->  Sort  (cost=1.06..1.06 rows=2 width=4)
-         Sort Key (Distinct): "outer".branch, "*SELECT* 1".id
-         ->  Append  (cost=0.00..1.05 rows=2 width=4)
-               ->  Gather Motion 1:1  (slice2; segments: 1)  (cost=0.00..1.04 rows=1 width=4)
-                     ->  Subquery Scan on "*SELECT* 1"  (cost=0.00..1.04 rows=1 width=4)
-                           ->  Limit  (cost=0.00..1.03 rows=1 width=4)
-                                 ->  Gather Motion 3:1  (slice1; segments: 3)  (cost=0.00..1.03 rows=1 width=4)
-                                       ->  Limit  (cost=0.00..1.01 rows=1 width=4)
-                                             ->  Seq Scan on test1  (cost=0.00..1.01 rows=1 width=4)
-               ->  External Scan on test2  (cost=0.00..0.00 rows=1 width=4)
- Optimizer: legacy query optimizer
-(13 rows)
+                                          QUERY PLAN                                           
+-----------------------------------------------------------------------------------------------
+ HashAggregate  (cost=2.08..2.10 rows=2 width=36)
+   Group Key: ('test1'::text), test1.id
+   ->  Append  (cost=2.05..2.07 rows=2 width=36)
+         ->  Limit  (cost=1.01..2.04 rows=1 width=36)
+               ->  Gather Motion 3:1  (slice1; segments: 3)  (cost=1.01..2.04 rows=1 width=36)
+                     ->  Limit  (cost=1.01..2.02 rows=1 width=36)
+                           ->  Seq Scan on test1  (cost=0.00..1.01 rows=1 width=36)
+         ->  Foreign Scan on test2  (cost=0.00..0.00 rows=1 width=36)
+ Optimizer: Postgres query optimizer
+(9 rows)
 
+--
+-- Test pulling up distribution key expression, when the different branches
+-- of a UNION ALL have different typmods.
+--
+create table pullup_distkey_test(
+    a character varying,
+    b character varying(30)
+) distributed by (b);
+insert into pullup_distkey_test values ('foo', 'bar');
+with base as
+(
+  select a, b from pullup_distkey_test
+  union all
+  select 'xx' as a, 'bar' as b
+)
+select a from base
+union all
+select a from base where a = 'foo';
+  a  
+-----
+ foo
+ xx
+ foo
+(3 rows)
+
+--
+-- Test union all two replicated tables with different numsegments
+--
+create table rep2(c1 int, c2 int) distributed replicated;
+create table rep3(c1 int, c2 int) distributed replicated;
+set allow_system_table_mods = on;
+update gp_distribution_policy set numsegments = 2
+  where localoid = 'rep2'::regclass;
+select localoid::regclass, policytype, numsegments
+  from gp_distribution_policy
+  where localoid::regclass in ('rep2', 'rep3');
+ localoid | policytype | numsegments 
+----------+------------+-------------
+ rep3     | r          |           3
+ rep2     | r          |           2
+(2 rows)
+
+explain select * from rep2 union all select * from rep3;
+                                      QUERY PLAN                                       
+---------------------------------------------------------------------------------------
+ Gather Motion 1:1  (slice1; segments: 1)  (cost=1922.00..1922.00 rows=172200 width=8)
+   ->  Append  (cost=0.00..1922.00 rows=172200 width=8)
+         ->  Seq Scan on rep2  (cost=0.00..961.00 rows=86100 width=8)
+         ->  Seq Scan on rep3  (cost=0.00..961.00 rows=86100 width=8)
+ Optimizer: Postgres query optimizer
+(5 rows)
+
+select * from rep2 union all select * from rep3;
+ c1 | c2 
+----+----
+(0 rows)
+
+reset allow_system_table_mods;
+drop table rep2;
+drop table rep3;
 --
 -- Setup
 --
@@ -273,7 +325,7 @@ NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column named 'c1' a
 HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
 INSERT INTO T_random SELECT i, i%5 from generate_series(1,30) i;
 --start_ignore
-create language plpythonu;
+create language plpython3u;
 --end_ignore
 create or replace function count_operator(query text, operator text) returns int as
 $$
@@ -286,7 +338,7 @@ for i in range(len(rv)):
         result = result+1
 return result
 $$
-language plpythonu;
+language plpython3u;
 --
 -- N-ary UNION ALL results
 --
@@ -1927,9 +1979,246 @@ ORDER BY a;
  5
 (4 rows)
 
+create table t1_ncols(a int, b int, c text, d date) distributed by (a);
+create table t2_ncols(a smallint, b bigint, c varchar(20), d date) distributed by (c, b)
+ partition by range (a) (start (0) end (8) every (4));
+create view v1_ncols(id, a, b, c, d) as select 1,* from t1_ncols union all select 2,* from t2_ncols;
+insert into t1_ncols values (1, 11, 'one', '2001-01-01');
+insert into t2_ncols values (2, 22, 'two', '2002-02-02');
+insert into t2_ncols values (4, 44, 'four','2004-04-04');
+select b from t1_ncols union all select a from t2_ncols;
+ b  
+----
+  4
+  2
+ 11
+(3 rows)
+
+select a+100, b, d from t1_ncols union select b, a+200, d from t2_ncols order by 1;
+ ?column? |  b  |     d      
+----------+-----+------------
+       22 | 202 | 02-02-2002
+       44 | 204 | 04-04-2004
+      101 |  11 | 01-01-2001
+(3 rows)
+
+select c, a from v1_ncols;
+  c   | a 
+------+---
+ one  | 1
+ four | 4
+ two  | 2
+(3 rows)
+
+with cte1(aa, b, c, d) as (select a*100, b, c, d from t1_ncols union select * from t2_ncols)
+select x.aa/100 aaa, x.c, y.c from cte1 x join cte1 y on x.aa=y.aa;
+ aaa |  c   |  c   
+-----+------+------
+   0 | two  | two
+   0 | four | four
+   1 | one  | one
+(3 rows)
+
+select from t2_ncols union select * from t2_ncols;
+ERROR:  each UNION query must have the same number of columns
+LINE 1: select from t2_ncols union select * from t2_ncols;
+                                          ^
+-- Test the result of union of 2 tables distributed on different number of segments
+-- start_ignore
+drop schema if exists union_schema CASCADE;
+NOTICE:  schema "union_schema" does not exist, skipping
+-- end_ignore
+create schema union_schema;
+create table union_schema.t1(a int, b int);
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column named 'a' as the Greenplum Database data distribution key for this table.
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
+create table union_schema.t2(a int, b int);
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column named 'a' as the Greenplum Database data distribution key for this table.
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
+create table union_schema.t3(a int, b int);
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column named 'a' as the Greenplum Database data distribution key for this table.
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
+set allow_system_table_mods = on;
+update gp_distribution_policy set numsegments = 1
+  where localoid = 'union_schema.t1'::regclass::oid;
+update gp_distribution_policy set numsegments = 2
+  where localoid = 'union_schema.t2'::regclass::oid;
+select relname, policytype, numsegments, distkey
+  from pg_class, gp_distribution_policy, pg_namespace ns
+  where pg_class.oid = localoid and relnamespace = ns.oid
+    and nspname = 'union_schema'
+    and relname in ('t1', 't2', 't3')
+  order by relname;
+ relname | policytype | numsegments | distkey 
+---------+------------+-------------+---------
+ t1      | p          |           1 | 1
+ t2      | p          |           2 | 1
+ t3      | p          |           3 | 1
+(3 rows)
+
+insert into union_schema.t1 select i, i from generate_series(1,10)i;
+insert into union_schema.t2 select i, i from generate_series(1,20)i;
+analyze union_schema.t1;
+analyze union_schema.t2;
+explain select * from union_schema.t1 join union_schema.t2
+    on union_schema.t1.a = union_schema.t2.b;
+                                          QUERY PLAN                                           
+-----------------------------------------------------------------------------------------------
+ Gather Motion 1:1  (slice1; segments: 1)  (cost=1.23..3.00 rows=10 width=16)
+   ->  Hash Join  (cost=1.23..2.80 rows=10 width=16)
+         Hash Cond: (t2.b = t1.a)
+         ->  Redistribute Motion 2:1  (slice2; segments: 2)  (cost=0.00..1.40 rows=20 width=8)
+               Hash Key: t2.b
+               ->  Seq Scan on t2  (cost=0.00..1.10 rows=10 width=8)
+         ->  Hash  (cost=1.10..1.10 rows=10 width=8)
+               ->  Seq Scan on t1  (cost=0.00..1.10 rows=10 width=8)
+ Optimizer: Postgres query optimizer
+(9 rows)
+
+explain select union_schema.t1.a, union_schema.t2.b
+  from union_schema.t1 join union_schema.t2
+    on union_schema.t1.a = union_schema.t2.b
+  union all
+  select * from union_schema.t3;
+                                             QUERY PLAN                                              
+-----------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)  (cost=1.23..1472.30 rows=86130 width=8)
+   ->  Append  (cost=1.23..323.90 rows=28710 width=8)
+         ->  Hash Join  (cost=1.23..2.80 rows=10 width=8)
+               Hash Cond: (t2.b = t1.a)
+               ->  Redistribute Motion 2:3  (slice2; segments: 2)  (cost=0.00..1.40 rows=20 width=4)
+                     Hash Key: t2.b
+                     Hash Module: 1
+                     ->  Seq Scan on t2  (cost=0.00..1.10 rows=10 width=4)
+               ->  Hash  (cost=1.10..1.10 rows=10 width=4)
+                     ->  Seq Scan on t1  (cost=0.00..1.10 rows=10 width=4)
+         ->  Seq Scan on t3  (cost=0.00..321.00 rows=28700 width=8)
+ Optimizer: Postgres query optimizer
+(12 rows)
+
+select * from union_schema.t1 join union_schema.t2
+  on union_schema.t1.a = union_schema.t2.b;
+ a  | b  | a  | b  
+----+----+----+----
+  2 |  2 |  2 |  2
+  3 |  3 |  3 |  3
+  4 |  4 |  4 |  4
+  6 |  6 |  6 |  6
+  7 |  7 |  7 |  7
+  8 |  8 |  8 |  8
+  9 |  9 |  9 |  9
+ 10 | 10 | 10 | 10
+  1 |  1 |  1 |  1
+  5 |  5 |  5 |  5
+(10 rows)
+
+select union_schema.t1.a, union_schema.t2.b
+  from union_schema.t1 join union_schema.t2
+    on union_schema.t1.a = union_schema.t2.b
+union all
+select * from union_schema.t3;
+ a  | b  
+----+----
+  2 |  2
+  3 |  3
+  4 |  4
+  6 |  6
+  7 |  7
+  8 |  8
+  9 |  9
+ 10 | 10
+  1 |  1
+  5 |  5
+(10 rows)
+
+truncate union_schema.t1, union_schema.t2;
+insert into union_schema.t1 select i, i from generate_series(1,20)i;
+insert into union_schema.t2 select i, i from generate_series(1,10)i;
+analyze union_schema.t1;
+analyze union_schema.t2;
+explain select * from union_schema.t1 join union_schema.t2
+    on union_schema.t1.a = union_schema.t2.b;
+                                             QUERY PLAN                                              
+-----------------------------------------------------------------------------------------------------
+ Gather Motion 1:1  (slice1; segments: 1)  (cost=1.32..2.90 rows=10 width=16)
+   ->  Hash Join  (cost=1.32..2.70 rows=10 width=16)
+         Hash Cond: (t1.a = t2.b)
+         ->  Seq Scan on t1  (cost=0.00..1.20 rows=20 width=8)
+         ->  Hash  (cost=1.20..1.20 rows=10 width=8)
+               ->  Redistribute Motion 2:1  (slice2; segments: 2)  (cost=0.00..1.20 rows=10 width=8)
+                     Hash Key: t2.b
+                     ->  Seq Scan on t2  (cost=0.00..1.05 rows=5 width=8)
+ Optimizer: Postgres query optimizer
+(9 rows)
+
+explain select union_schema.t1.a, union_schema.t2.b
+    from union_schema.t1 join union_schema.t2
+	  on union_schema.t1.a = union_schema.t2.b
+  union all
+  select * from union_schema.t3;
+                                                QUERY PLAN                                                 
+-----------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)  (cost=1.32..1472.20 rows=86130 width=8)
+   ->  Append  (cost=1.32..323.80 rows=28710 width=8)
+         ->  Hash Join  (cost=1.32..2.70 rows=10 width=8)
+               Hash Cond: (t1.a = t2.b)
+               ->  Seq Scan on t1  (cost=0.00..1.20 rows=20 width=4)
+               ->  Hash  (cost=1.20..1.20 rows=10 width=4)
+                     ->  Redistribute Motion 2:3  (slice2; segments: 2)  (cost=0.00..1.20 rows=10 width=4)
+                           Hash Key: t2.b
+                           Hash Module: 1
+                           ->  Seq Scan on t2  (cost=0.00..1.05 rows=5 width=4)
+         ->  Seq Scan on t3  (cost=0.00..321.00 rows=28700 width=8)
+ Optimizer: Postgres query optimizer
+(12 rows)
+
+select * from union_schema.t1 join union_schema.t2
+  on union_schema.t1.a = union_schema.t2.b;
+ a  | b  | a  | b  
+----+----+----+----
+  1 |  1 |  1 |  1
+  2 |  2 |  2 |  2
+  3 |  3 |  3 |  3
+  4 |  4 |  4 |  4
+  5 |  5 |  5 |  5
+  6 |  6 |  6 |  6
+  7 |  7 |  7 |  7
+  8 |  8 |  8 |  8
+  9 |  9 |  9 |  9
+ 10 | 10 | 10 | 10
+(10 rows)
+
+select union_schema.t1.a, union_schema.t2.b
+  from union_schema.t1 join union_schema.t2
+    on union_schema.t1.a = union_schema.t2.b
+union all
+select * from union_schema.t3;
+ a  | b  
+----+----
+  1 |  1
+  2 |  2
+  3 |  3
+  4 |  4
+  5 |  5
+  6 |  6
+  7 |  7
+  8 |  8
+  9 |  9
+ 10 | 10
+(10 rows)
+
+reset allow_system_table_mods;
 --
 -- Clean up
 --
 DROP TABLE IF EXISTS T_a1 CASCADE;
 DROP TABLE IF EXISTS T_b2 CASCADE;
 DROP TABLE IF EXISTS T_random CASCADE;
+DROP VIEW IF EXISTS v1_ncols CASCADE;
+DROP TABLE IF EXISTS t1_ncols CASCADE;
+DROP TABLE IF EXISTS t2_ncols CASCADE;
+DROP SCHEMA IF EXISTS union_schema CASCADE;
+NOTICE:  drop cascades to 3 other objects
+DETAIL:  drop cascades to table union_schema.t1
+drop cascades to table union_schema.t2
+drop cascades to table union_schema.t3

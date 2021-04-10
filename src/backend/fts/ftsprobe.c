@@ -4,7 +4,7 @@
  *	  Implementation of segment probing interface
  *
  * Portions Copyright (c) 2006-2011, Greenplum inc
- * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
  *
  *
  * IDENTIFICATION
@@ -44,7 +44,7 @@ FtsGetPeerSegment(CdbComponentDatabases *cdbs,
 	{
 		CdbComponentDatabaseInfo *segInfo = &cdbs->segment_db_info[i];
 
-		if (segInfo->segindex == content && segInfo->dbid != dbid)
+		if (segInfo->config->segindex == content && segInfo->config->dbid != dbid)
 		{
 			/* found it */
 			return segInfo;
@@ -148,6 +148,7 @@ static bool
 ftsConnectStart(fts_segment_info *ftsInfo)
 {
 	char conninfo[1024];
+	char *hostip;
 
 	/*
 	 * No events should be pending on the connection that hasn't started
@@ -162,8 +163,9 @@ ftsConnectStart(fts_segment_info *ftsInfo)
 				ftsInfo->state == FTS_SYNCREP_OFF_SEGMENT,
 				SEGMENT_IS_ACTIVE_PRIMARY(ftsInfo->primary_cdbinfo));
 
+	hostip = ftsInfo->primary_cdbinfo->config->hostip;
 	snprintf(conninfo, 1024, "host=%s port=%d gpconntype=%s",
-			 ftsInfo->primary_cdbinfo->hostip, ftsInfo->primary_cdbinfo->port,
+			 hostip ? hostip : "", ftsInfo->primary_cdbinfo->config->port,
 			 GPCONN_TYPE_FTS);
 	ftsInfo->conn = PQconnectStart(conninfo);
 
@@ -171,14 +173,14 @@ ftsConnectStart(fts_segment_info *ftsInfo)
 	{
 		elog(ERROR, "FTS: cannot create libpq connection object, possibly out"
 			 " of memory (content=%d, dbid=%d)",
-			 ftsInfo->primary_cdbinfo->segindex,
-			 ftsInfo->primary_cdbinfo->dbid);
+			 ftsInfo->primary_cdbinfo->config->segindex,
+			 ftsInfo->primary_cdbinfo->config->dbid);
 	}
 	if (ftsInfo->conn->status == CONNECTION_BAD)
 	{
 		elog(LOG, "FTS: cannot establish libpq connection to "
 			 "(content=%d, dbid=%d): %s",
-			 ftsInfo->primary_cdbinfo->segindex, ftsInfo->primary_cdbinfo->dbid,
+			 ftsInfo->primary_cdbinfo->config->segindex, ftsInfo->primary_cdbinfo->config->dbid,
 			 PQerrorMessage(ftsInfo->conn));
 		return false;
 	}
@@ -200,7 +202,8 @@ ftsConnectStart(fts_segment_info *ftsInfo)
 static void
 checkIfFailedDueToRecoveryInProgress(fts_segment_info *ftsInfo)
 {
-	if (strstr(PQerrorMessage(ftsInfo->conn), _(POSTMASTER_IN_RECOVERY_MSG)))
+	if (strstr(PQerrorMessage(ftsInfo->conn), _(POSTMASTER_IN_RECOVERY_MSG)) ||
+		strstr(PQerrorMessage(ftsInfo->conn), _(POSTMASTER_IN_STARTUP_MSG)))
 	{
 		XLogRecPtr tmpptr;
 		char *ptr = strstr(PQerrorMessage(ftsInfo->conn),
@@ -220,8 +223,8 @@ checkIfFailedDueToRecoveryInProgress(fts_segment_info *ftsInfo)
 				"invalid in-recovery message %s "
 				"(content=%d, dbid=%d) state=%d",
 				PQerrorMessage(ftsInfo->conn),
-				ftsInfo->primary_cdbinfo->segindex,
-				ftsInfo->primary_cdbinfo->dbid,
+				ftsInfo->primary_cdbinfo->config->segindex,
+				ftsInfo->primary_cdbinfo->config->dbid,
 				ftsInfo->state);
 			return;
 		}
@@ -240,21 +243,22 @@ checkIfFailedDueToRecoveryInProgress(fts_segment_info *ftsInfo)
 		{
 			elog(LOG, "FTS: detected segment is in recovery mode and not making progress (content=%d) "
 				 "primary dbid=%d, mirror dbid=%d",
-				 ftsInfo->primary_cdbinfo->segindex,
-				 ftsInfo->primary_cdbinfo->dbid,
-				 ftsInfo->mirror_cdbinfo->dbid);
+				 ftsInfo->primary_cdbinfo->config->segindex,
+				 ftsInfo->primary_cdbinfo->config->dbid,
+				 ftsInfo->mirror_cdbinfo->config->dbid);
 		}
 		else
 		{
 			ftsInfo->recovery_making_progress = true;
 			ftsInfo->xlogrecptr = tmpptr;
 			elogif(gp_log_fts >= GPVARS_VERBOSITY_VERBOSE, LOG,
-				 "FTS: detected segment is in recovery mode replayed (%s) (content=%d) "
-				 "primary dbid=%d, mirror dbid=%d",
-				 XLogLocationToString(tmpptr),
-				 ftsInfo->primary_cdbinfo->segindex,
-				 ftsInfo->mirror_cdbinfo->dbid,
-				 ftsInfo->mirror_cdbinfo->dbid);
+				   "FTS: detected segment is in recovery mode replayed (%X/%X) (content=%d) "
+				   "primary dbid=%d, mirror dbid=%d",
+				   (uint32) (tmpptr >> 32),
+				   (uint32) tmpptr,
+				   ftsInfo->primary_cdbinfo->config->segindex,
+				   ftsInfo->primary_cdbinfo->config->dbid,
+				   ftsInfo->mirror_cdbinfo->config->dbid);
 		}
 	}
 }
@@ -280,8 +284,8 @@ ftsConnect(fts_context *context)
 		elogif(gp_log_fts == GPVARS_VERBOSITY_DEBUG, LOG,
 			   "FTS: ftsConnect (content=%d, dbid=%d) state=%d, "
 			   "retry_count=%d, conn->status=%d",
-			   ftsInfo->primary_cdbinfo->segindex,
-			   ftsInfo->primary_cdbinfo->dbid,
+			   ftsInfo->primary_cdbinfo->config->segindex,
+			   ftsInfo->primary_cdbinfo->config->dbid,
 			   ftsInfo->state, ftsInfo->retry_count,
 			   ftsInfo->conn ? ftsInfo->conn->status : -1);
 		if (ftsInfo->conn && PQstatus(ftsInfo->conn) == CONNECTION_OK)
@@ -318,8 +322,8 @@ ftsConnect(fts_context *context)
 								   "FTS: established libpq connection "
 								   "(content=%d, dbid=%d) state=%d, "
 								   "retry_count=%d, conn->status=%d",
-								   ftsInfo->primary_cdbinfo->segindex,
-								   ftsInfo->primary_cdbinfo->dbid,
+								   ftsInfo->primary_cdbinfo->config->segindex,
+								   ftsInfo->primary_cdbinfo->config->dbid,
 								   ftsInfo->state, ftsInfo->retry_count,
 								   ftsInfo->conn->status);
 							ftsInfo->poll_events = POLLOUT;
@@ -347,8 +351,8 @@ ftsConnect(fts_context *context)
 							checkIfFailedDueToRecoveryInProgress(ftsInfo);
 							elog(LOG, "FTS: cannot establish libpq connection "
 								 "(content=%d, dbid=%d): %s, retry_count=%d",
-								 ftsInfo->primary_cdbinfo->segindex,
-								 ftsInfo->primary_cdbinfo->dbid,
+								 ftsInfo->primary_cdbinfo->config->segindex,
+								 ftsInfo->primary_cdbinfo->config->dbid,
 								 PQerrorMessage(ftsInfo->conn),
 								 ftsInfo->retry_count);
 							break;
@@ -356,8 +360,8 @@ ftsConnect(fts_context *context)
 						default:
 							elog(ERROR, "FTS: invalid response to PQconnectPoll"
 								 " (content=%d, dbid=%d): %s",
-								 ftsInfo->primary_cdbinfo->segindex,
-								 ftsInfo->primary_cdbinfo->dbid,
+								 ftsInfo->primary_cdbinfo->config->segindex,
+								 ftsInfo->primary_cdbinfo->config->dbid,
 								 PQerrorMessage(ftsInfo->conn));
 							break;
 					}
@@ -366,8 +370,8 @@ ftsConnect(fts_context *context)
 					elogif(gp_log_fts >= GPVARS_VERBOSITY_VERBOSE, LOG,
 						   "FTS: ftsConnect (content=%d, dbid=%d) state=%d, "
 						   "retry_count=%d, conn->status=%d pollfd.revents unset",
-						   ftsInfo->primary_cdbinfo->segindex,
-						   ftsInfo->primary_cdbinfo->dbid,
+						   ftsInfo->primary_cdbinfo->config->segindex,
+						   ftsInfo->primary_cdbinfo->config->dbid,
 						   ftsInfo->state, ftsInfo->retry_count,
 						   ftsInfo->conn ? ftsInfo->conn->status : -1);
 				break;
@@ -401,8 +405,8 @@ ftsCheckTimeout(fts_segment_info *ftsInfo, pg_time_t now)
 		elog(LOG,
 			 "FTS timeout detected for (content=%d, dbid=%d) "
 			 "state=%d, retry_count=%d,",
-			 ftsInfo->primary_cdbinfo->segindex,
-			 ftsInfo->primary_cdbinfo->dbid, ftsInfo->state,
+			 ftsInfo->primary_cdbinfo->config->segindex,
+			 ftsInfo->primary_cdbinfo->config->dbid, ftsInfo->state,
 			 ftsInfo->retry_count);
 		ftsInfo->state = nextFailedState(ftsInfo->state);
 	}
@@ -483,8 +487,8 @@ ftsPoll(fts_context *context)
 					 "(content=%d, dbid=%d) state=%d, retry_count=%d, "
 					 "libpq status=%d, asyncStatus=%d",
 					 ftsInfo->poll_revents, ftsInfo->poll_events,
-					 ftsInfo->primary_cdbinfo->segindex,
-					 ftsInfo->primary_cdbinfo->dbid, ftsInfo->state,
+					 ftsInfo->primary_cdbinfo->config->segindex,
+					 ftsInfo->primary_cdbinfo->config->dbid, ftsInfo->state,
 					 ftsInfo->retry_count, ftsInfo->conn->status,
 					 ftsInfo->conn->asyncStatus);
 			}
@@ -496,8 +500,8 @@ ftsPoll(fts_context *context)
 					 "(content=%d, dbid=%d) state=%d, retry_count=%d, "
 					 "libpq status=%d, asyncStatus=%d",
 					 ftsInfo->poll_revents, ftsInfo->poll_events,
-					 ftsInfo->primary_cdbinfo->segindex,
-					 ftsInfo->primary_cdbinfo->dbid, ftsInfo->state,
+					 ftsInfo->primary_cdbinfo->config->segindex,
+					 ftsInfo->primary_cdbinfo->config->dbid, ftsInfo->state,
 					 ftsInfo->retry_count, ftsInfo->conn->status,
 					 ftsInfo->conn->asyncStatus);
 			}
@@ -514,7 +518,8 @@ static void
 ftsSend(fts_context *context)
 {
 	fts_segment_info *ftsInfo;
-	const char *message;
+	const char *message_type;
+	char message[FTS_MSG_MAX_LEN];
 	int i;
 
 	for (i = 0; i < context->num_pairs; i++)
@@ -523,8 +528,8 @@ ftsSend(fts_context *context)
 		elogif(gp_log_fts == GPVARS_VERBOSITY_DEBUG, LOG,
 			   "FTS: ftsSend (content=%d, dbid=%d) state=%d, "
 			   "retry_count=%d, conn->asyncStatus=%d",
-			   ftsInfo->primary_cdbinfo->segindex,
-			   ftsInfo->primary_cdbinfo->dbid,
+			   ftsInfo->primary_cdbinfo->config->segindex,
+			   ftsInfo->primary_cdbinfo->config->dbid,
 			   ftsInfo->state, ftsInfo->retry_count,
 			   ftsInfo->conn ? ftsInfo->conn->asyncStatus : -1);
 		switch(ftsInfo->state)
@@ -541,11 +546,17 @@ ftsSend(fts_context *context)
 				    !(ftsInfo->poll_revents & POLLOUT))
 					break;
 				if (ftsInfo->state == FTS_PROBE_SEGMENT)
-					message = FTS_MSG_PROBE;
+					message_type = FTS_MSG_PROBE;
 				else if (ftsInfo->state == FTS_SYNCREP_OFF_SEGMENT)
-					message = FTS_MSG_SYNCREP_OFF;
+					message_type = FTS_MSG_SYNCREP_OFF;
 				else
-					message = FTS_MSG_PROMOTE;
+					message_type = FTS_MSG_PROMOTE;
+
+				snprintf(message, FTS_MSG_MAX_LEN, FTS_MSG_FORMAT,
+						 message_type,
+						 ftsInfo->primary_cdbinfo->config->dbid,
+						 ftsInfo->primary_cdbinfo->config->segindex);
+
 				if (PQsendQuery(ftsInfo->conn, message))
 				{
 					/*
@@ -556,8 +567,8 @@ ftsSend(fts_context *context)
 					ftsInfo->poll_events = POLLIN;
 					elogif(gp_log_fts >= GPVARS_VERBOSITY_VERBOSE, LOG,
 						   "FTS sent %s to (content=%d, dbid=%d), retry_count=%d",
-						   message, ftsInfo->primary_cdbinfo->segindex,
-						   ftsInfo->primary_cdbinfo->dbid, ftsInfo->retry_count);
+						   message, ftsInfo->primary_cdbinfo->config->segindex,
+						   ftsInfo->primary_cdbinfo->config->dbid, ftsInfo->retry_count);
 				}
 				else
 				{
@@ -565,8 +576,8 @@ ftsSend(fts_context *context)
 						 "FTS: failed to send %s to segment (content=%d, "
 						 "dbid=%d) state=%d, retry_count=%d, "
 						 "conn->asyncStatus=%d %s", message,
-						 ftsInfo->primary_cdbinfo->segindex,
-						 ftsInfo->primary_cdbinfo->dbid,
+						 ftsInfo->primary_cdbinfo->config->segindex,
+						 ftsInfo->primary_cdbinfo->config->dbid,
 						 ftsInfo->state, ftsInfo->retry_count,
 						 ftsInfo->conn->asyncStatus,
 						 PQerrorMessage(ftsInfo->conn));
@@ -588,38 +599,28 @@ probeRecordResponse(fts_segment_info *ftsInfo, PGresult *result)
 {
 	ftsInfo->result.isPrimaryAlive = true;
 
-	int *isMirrorAlive = (int *) PQgetvalue(result, 0,
-											Anum_fts_message_response_is_mirror_up);
-	Assert (isMirrorAlive);
-	ftsInfo->result.isMirrorAlive = *isMirrorAlive;
+	ftsInfo->result.isMirrorAlive = *PQgetvalue(result, 0,
+			Anum_fts_message_response_is_mirror_up);
 
-	int *isInSync = (int *) PQgetvalue(result, 0,
-								   Anum_fts_message_response_is_in_sync);
-	Assert (isInSync);
-	ftsInfo->result.isInSync = *isInSync;
+	ftsInfo->result.isInSync = *PQgetvalue(result, 0,
+			Anum_fts_message_response_is_in_sync);
 
-	int *isSyncRepEnabled = (int *) PQgetvalue(result, 0,
-											   Anum_fts_message_response_is_syncrep_enabled);
-	Assert (isSyncRepEnabled);
-	ftsInfo->result.isSyncRepEnabled = *isSyncRepEnabled;
+	ftsInfo->result.isSyncRepEnabled = *PQgetvalue(result, 0,
+			Anum_fts_message_response_is_syncrep_enabled);
 
-	int *isRoleMirror = (int *) PQgetvalue(result, 0,
-										   Anum_fts_message_response_is_role_mirror);
-	Assert (isRoleMirror);
-	ftsInfo->result.isRoleMirror = *isRoleMirror;
+	ftsInfo->result.isRoleMirror = *PQgetvalue(result, 0,
+			Anum_fts_message_response_is_role_mirror);
 
-	int *retryRequested = (int *) PQgetvalue(result, 0,
-											 Anum_fts_message_response_request_retry);
-	Assert (retryRequested);
-	ftsInfo->result.retryRequested = *retryRequested;
+	ftsInfo->result.retryRequested = *PQgetvalue(result, 0,
+			Anum_fts_message_response_request_retry);
 
-	elogif(gp_log_fts >= GPVARS_VERBOSITY_TERSE, LOG,
+	elogif(gp_log_fts >= GPVARS_VERBOSITY_DEBUG, LOG,
 		   "FTS: segment (content=%d, dbid=%d, role=%c) reported "
 		   "isMirrorUp %d, isInSync %d, isSyncRepEnabled %d, "
 		   "isRoleMirror %d, and retryRequested %d to the prober.",
-		   ftsInfo->primary_cdbinfo->segindex,
-		   ftsInfo->primary_cdbinfo->dbid,
-		   ftsInfo->primary_cdbinfo->role,
+		   ftsInfo->primary_cdbinfo->config->segindex,
+		   ftsInfo->primary_cdbinfo->config->dbid,
+		   ftsInfo->primary_cdbinfo->config->role,
 		   ftsInfo->result.isMirrorAlive,
 		   ftsInfo->result.isInSync,
 		   ftsInfo->result.isSyncRepEnabled,
@@ -645,8 +646,8 @@ ftsReceive(fts_context *context)
 		elogif(gp_log_fts == GPVARS_VERBOSITY_DEBUG, LOG,
 			   "FTS: ftsReceive (content=%d, dbid=%d) state=%d, "
 			   "retry_count=%d, conn->asyncStatus=%d",
-			   ftsInfo->primary_cdbinfo->segindex,
-			   ftsInfo->primary_cdbinfo->dbid,
+			   ftsInfo->primary_cdbinfo->config->segindex,
+			   ftsInfo->primary_cdbinfo->config->dbid,
 			   ftsInfo->state, ftsInfo->retry_count,
 			   ftsInfo->conn ? ftsInfo->conn->asyncStatus : -1);
 		switch(ftsInfo->state)
@@ -666,8 +667,8 @@ ftsReceive(fts_context *context)
 				{
 					elog(LOG, "FTS: failed to read from (content=%d, dbid=%d)"
 						 " state=%d, retry_count=%d, conn->asyncStatus=%d %s",
-						 ftsInfo->primary_cdbinfo->segindex,
-						 ftsInfo->primary_cdbinfo->dbid,
+						 ftsInfo->primary_cdbinfo->config->segindex,
+						 ftsInfo->primary_cdbinfo->config->dbid,
 						 ftsInfo->state, ftsInfo->retry_count,
 						 ftsInfo->conn->asyncStatus,
 						 PQerrorMessage(ftsInfo->conn));
@@ -677,15 +678,9 @@ ftsReceive(fts_context *context)
 				/* Parse the response. */
 				if (PQisBusy(ftsInfo->conn))
 				{
-					elog(LOG, "FTS: error parsing response from (content=%d, "
-						 "dbid=%d) state=%d, retry_count=%d, "
-						 "conn->asyncStatus=%d %s",
-						 ftsInfo->primary_cdbinfo->segindex,
-						 ftsInfo->primary_cdbinfo->dbid,
-						 ftsInfo->state, ftsInfo->retry_count,
-						 ftsInfo->conn->asyncStatus,
-						 PQerrorMessage(ftsInfo->conn));
-					ftsInfo->state = nextFailedState(ftsInfo->state);
+					/*
+					 * There is not enough data in the buffer.
+					 */
 					break;
 				}
 
@@ -699,8 +694,8 @@ ftsReceive(fts_context *context)
 					elog(LOG, "FTS: error getting results from (content=%d, "
 						 "dbid=%d) state=%d, retry_count=%d, "
 						 "conn->asyncStatus=%d conn->status=%d %s",
-						 ftsInfo->primary_cdbinfo->segindex,
-						 ftsInfo->primary_cdbinfo->dbid,
+						 ftsInfo->primary_cdbinfo->config->segindex,
+						 ftsInfo->primary_cdbinfo->config->dbid,
 						 ftsInfo->state, ftsInfo->retry_count,
 						 ftsInfo->conn->asyncStatus,
 						 ftsInfo->conn->status,
@@ -713,8 +708,8 @@ ftsReceive(fts_context *context)
 				{
 					elog(LOG, "FTS: error response from (content=%d, dbid=%d)"
 						 " state=%d, retry_count=%d, conn->asyncStatus=%d %s",
-						 ftsInfo->primary_cdbinfo->segindex,
-						 ftsInfo->primary_cdbinfo->dbid,
+						 ftsInfo->primary_cdbinfo->config->segindex,
+						 ftsInfo->primary_cdbinfo->config->dbid,
 						 ftsInfo->state, ftsInfo->retry_count,
 						 ftsInfo->conn->asyncStatus,
 						 PQresultErrorMessage(result));
@@ -733,8 +728,8 @@ ftsReceive(fts_context *context)
 					elog(LOG, "FTS: invalid response from (content=%d, dbid=%d)"
 						 " state=%d, retry_count=%d, expected %d tuple with "
 						 "%d fields, got %d tuples with %d fields",
-						 ftsInfo->primary_cdbinfo->segindex,
-						 ftsInfo->primary_cdbinfo->dbid,
+						 ftsInfo->primary_cdbinfo->config->segindex,
+						 ftsInfo->primary_cdbinfo->config->dbid,
 						 ftsInfo->state, ftsInfo->retry_count,
 						 FTS_MESSAGE_RESPONSE_NTUPLES,
 						 Natts_fts_message_response, ntuples, nfields);
@@ -773,8 +768,8 @@ retryForFtsFailed(fts_segment_info *ftsInfo, pg_time_t now)
 		elog(LOG, "FTS max (%d) retries exhausted "
 			"(content=%d, dbid=%d) state=%d",
 			ftsInfo->retry_count,
-			ftsInfo->primary_cdbinfo->segindex,
-			ftsInfo->primary_cdbinfo->dbid, ftsInfo->state);
+			ftsInfo->primary_cdbinfo->config->segindex,
+			ftsInfo->primary_cdbinfo->config->dbid, ftsInfo->state);
 		return;
 	}
 
@@ -790,8 +785,8 @@ retryForFtsFailed(fts_segment_info *ftsInfo, pg_time_t now)
 	elogif(gp_log_fts == GPVARS_VERBOSITY_DEBUG, LOG,
 		"FTS initialized retry start time to now "
 		"(content=%d, dbid=%d) state=%d",
-		ftsInfo->primary_cdbinfo->segindex,
-		ftsInfo->primary_cdbinfo->dbid, ftsInfo->state);
+		ftsInfo->primary_cdbinfo->config->segindex,
+		ftsInfo->primary_cdbinfo->config->dbid, ftsInfo->state);
 
 	PQfinish(ftsInfo->conn);
 	ftsInfo->conn = NULL;
@@ -801,7 +796,7 @@ retryForFtsFailed(fts_segment_info *ftsInfo, pg_time_t now)
 }
 
 /*
- * If retry attempts are available, transition the sgement to the start state
+ * If retry attempts are available, transition the segments to the start state
  * corresponding to their failure state.  If retries have exhausted, leave the
  * segment in the failure state.
  */
@@ -826,6 +821,7 @@ processRetry(fts_context *context)
 				if (!(ftsInfo->result.retryRequested &&
 					  SEGMENT_IS_ALIVE(ftsInfo->mirror_cdbinfo)))
 					break;
+				/* else, fallthrough */
 			case FTS_PROBE_FAILED:
 			case FTS_SYNCREP_OFF_FAILED:
 			case FTS_PROMOTE_FAILED:
@@ -844,8 +840,8 @@ processRetry(fts_context *context)
 				elogif(gp_log_fts >= GPVARS_VERBOSITY_VERBOSE, LOG,
 					   "FTS retrying attempt %d (content=%d, dbid=%d) "
 					   "state=%d", ftsInfo->retry_count,
-					   ftsInfo->primary_cdbinfo->segindex,
-					   ftsInfo->primary_cdbinfo->dbid, ftsInfo->state);
+					   ftsInfo->primary_cdbinfo->config->segindex,
+					   ftsInfo->primary_cdbinfo->config->dbid, ftsInfo->state);
 				if (ftsInfo->state == FTS_PROBE_RETRY_WAIT)
 					ftsInfo->state = FTS_PROBE_SEGMENT;
 				else if (ftsInfo->state == FTS_SYNCREP_OFF_RETRY_WAIT)
@@ -898,7 +894,7 @@ updateConfiguration(CdbComponentDatabaseInfo *primary,
 	 * Primary and mirror should always have the same mode in configuration,
 	 * either both reflecting in-sync or not in-sync.
 	 */
-	Assert(primary->mode == mirror->mode);
+	Assert(primary->config->mode == mirror->config->mode);
 
 	bool UpdateNeeded = UpdatePrimary || UpdateMirror;
 	/*
@@ -912,12 +908,12 @@ updateConfiguration(CdbComponentDatabaseInfo *primary,
 		GetTransactionSnapshot();
 
 		if (UpdatePrimary)
-			probeWalRepUpdateConfig(primary->dbid, primary->segindex,
+			probeWalRepUpdateConfig(primary->config->dbid, primary->config->segindex,
 									newPrimaryRole, IsPrimaryAlive,
 									IsInSync);
 
 		if (UpdateMirror)
-			probeWalRepUpdateConfig(mirror->dbid, mirror->segindex,
+			probeWalRepUpdateConfig(mirror->config->dbid, mirror->config->segindex,
 									newMirrorRole, IsMirrorAlive,
 									IsInSync);
 
@@ -929,24 +925,22 @@ updateConfiguration(CdbComponentDatabaseInfo *primary,
 		 * dispatcher, now that changes has been persisted to catalog.
 		 */
 		Assert(ftsProbeInfo);
-		ftsLock();
 		if (IsPrimaryAlive)
-			FTS_STATUS_SET_UP(ftsProbeInfo->fts_status[primary->dbid]);
+			FTS_STATUS_SET_UP(ftsProbeInfo->status[primary->config->dbid]);
 		else
-			FTS_STATUS_SET_DOWN(ftsProbeInfo->fts_status[primary->dbid]);
+			FTS_STATUS_SET_DOWN(ftsProbeInfo->status[primary->config->dbid]);
 
 		if (IsMirrorAlive)
-			FTS_STATUS_SET_UP(ftsProbeInfo->fts_status[mirror->dbid]);
+			FTS_STATUS_SET_UP(ftsProbeInfo->status[mirror->config->dbid]);
 		else
-			FTS_STATUS_SET_DOWN(ftsProbeInfo->fts_status[mirror->dbid]);
-		ftsUnlock();
+			FTS_STATUS_SET_DOWN(ftsProbeInfo->status[mirror->config->dbid]);
 	}
 
 	return UpdateNeeded;
 }
 
 /*
- * Process resonses from primary segments:
+ * Process responses from primary segments:
  * (a) Transition internal state so that segments can be messaged subsequently
  * (e.g. promotion and turning off syncrep).
  * (b) Update gp_segment_configuration catalog table, if needed.
@@ -1020,13 +1014,13 @@ processResponse(fts_context *context)
 						ftsInfo->state = FTS_SYNCREP_OFF_SEGMENT;
 						elogif(gp_log_fts >= GPVARS_VERBOSITY_VERBOSE, LOG,
 							   "FTS turning syncrep off on (content=%d, dbid=%d)",
-							   primary->segindex, primary->dbid);
+							   primary->config->segindex, primary->config->dbid);
 					}
 					else
 					{
 						elogif(gp_log_fts >= GPVARS_VERBOSITY_VERBOSE, LOG,
 							   "FTS skipping mirror down update for (content=%d) as retryRequested",
-							   primary->segindex);
+							   primary->config->segindex);
 						ftsInfo->state = FTS_RESPONSE_PROCESSED;
 					}
 				}
@@ -1044,7 +1038,7 @@ processResponse(fts_context *context)
 					Assert(!ftsInfo->result.isSyncRepEnabled);
 					elogif(gp_log_fts >= GPVARS_VERBOSITY_VERBOSE, LOG,
 						   "FTS resending promote request to (content=%d,"
-						   " dbid=%d)", primary->segindex, primary->dbid);
+						   " dbid=%d)", primary->config->segindex, primary->config->dbid);
 					ftsInfo->state = FTS_PROMOTE_SEGMENT;
 				}
 				else
@@ -1069,11 +1063,12 @@ processResponse(fts_context *context)
 				/* If primary is in recovery, do not mark it down and promote mirror */
 				if (ftsInfo->recovery_making_progress)
 				{
-					Assert(strstr(PQerrorMessage(ftsInfo->conn), _(POSTMASTER_IN_RECOVERY_MSG)));
+					Assert(strstr(PQerrorMessage(ftsInfo->conn), _(POSTMASTER_IN_RECOVERY_MSG)) ||
+						   strstr(PQerrorMessage(ftsInfo->conn), _(POSTMASTER_IN_STARTUP_MSG)));
 					elogif(gp_log_fts >= GPVARS_VERBOSITY_VERBOSE, LOG,
 						 "FTS: detected segment is in recovery mode and making "
 						 "progress (content=%d) primary dbid=%d, mirror dbid=%d",
-						 primary->segindex, primary->dbid, mirror->dbid);
+						 primary->config->segindex, primary->config->dbid, mirror->config->dbid);
 
 					ftsInfo->state = FTS_RESPONSE_PROCESSED;
 					break;
@@ -1111,7 +1106,7 @@ processResponse(fts_context *context)
 					elogif(gp_log_fts >= GPVARS_VERBOSITY_VERBOSE, LOG,
 						   "FTS promoting mirror (content=%d, dbid=%d) "
 						   "to be the new primary",
-						   mirror->segindex, mirror->dbid);
+						   mirror->config->segindex, mirror->config->dbid);
 					ftsInfo->state = FTS_PROMOTE_SEGMENT;
 					ftsInfo->primary_cdbinfo = mirror;
 					ftsInfo->mirror_cdbinfo = primary;
@@ -1120,7 +1115,7 @@ processResponse(fts_context *context)
 				{
 					elog(WARNING, "FTS double fault detected (content=%d) "
 						 "primary dbid=%d, mirror dbid=%d",
-						 primary->segindex, primary->dbid, mirror->dbid);
+						 primary->config->segindex, primary->config->dbid, mirror->config->dbid);
 					ftsInfo->state = FTS_RESPONSE_PROCESSED;
 				}
 				break;
@@ -1131,32 +1126,32 @@ processResponse(fts_context *context)
 				 * syncrep.  A worse alternative is to PANIC.
 				 */
 				elog(WARNING, "FTS failed to turn off syncrep on (content=%d,"
-					 " dbid=%d)", primary->segindex, primary->dbid);
+					 " dbid=%d)", primary->config->segindex, primary->config->dbid);
 				ftsInfo->state = FTS_RESPONSE_PROCESSED;
 				break;
 			case FTS_PROMOTE_FAILED:
 				elog(WARNING, "FTS double fault detected (content=%d) "
 					 "primary dbid=%d, mirror dbid=%d",
-					 primary->segindex, primary->dbid, mirror->dbid);
+					 primary->config->segindex, primary->config->dbid, mirror->config->dbid);
 				ftsInfo->state = FTS_RESPONSE_PROCESSED;
 				break;
 			case FTS_PROMOTE_SUCCESS:
 				elogif(gp_log_fts >= GPVARS_VERBOSITY_VERBOSE, LOG,
 					   "FTS mirror (content=%d, dbid=%d) promotion "
-					   "triggerred successfully",
-					   primary->segindex, primary->dbid);
+					   "triggered successfully",
+					   primary->config->segindex, primary->config->dbid);
 				ftsInfo->state = FTS_RESPONSE_PROCESSED;
 				break;
 			case FTS_SYNCREP_OFF_SUCCESS:
 				elogif(gp_log_fts >= GPVARS_VERBOSITY_VERBOSE, LOG,
 					   "FTS primary (content=%d, dbid=%d) notified to turn "
-					   "syncrep off", primary->segindex, primary->dbid);
+					   "syncrep off", primary->config->segindex, primary->config->dbid);
 				ftsInfo->state = FTS_RESPONSE_PROCESSED;
 				break;
 			default:
 				elog(ERROR, "FTS invalid internal state %d for (content=%d)"
 					 "primary dbid=%d, mirror dbid=%d", ftsInfo->state,
-					 primary->segindex, primary->dbid, mirror->dbid);
+					 primary->config->segindex, primary->config->dbid, mirror->config->dbid);
 				break;
 		}
 		/* Close connection and reset result for next message, if any. */
@@ -1203,8 +1198,8 @@ FtsWalRepInitProbeContext(CdbComponentDatabases *cdbs, fts_context *context)
 		if (!SEGMENT_IS_ACTIVE_PRIMARY(primary))
 			continue;
 		CdbComponentDatabaseInfo *mirror = FtsGetPeerSegment(cdbs,
-															 primary->segindex,
-															 primary->dbid);
+															 primary->config->segindex,
+															 primary->config->dbid);
 		/*
 		 * If there is no mirror under this primary, no need to probe.
 		 */
@@ -1230,7 +1225,7 @@ FtsWalRepInitProbeContext(CdbComponentDatabases *cdbs, fts_context *context)
 		ftsInfo->result.isSyncRepEnabled = false;
 		ftsInfo->result.retryRequested = false;
 		ftsInfo->result.isRoleMirror = false;
-		ftsInfo->result.dbid = primary->dbid;
+		ftsInfo->result.dbid = primary->config->dbid;
 		ftsInfo->state = FTS_PROBE_SEGMENT;
 		ftsInfo->recovery_making_progress = false;
 		ftsInfo->xlogrecptr = InvalidXLogRecPtr;
@@ -1286,14 +1281,15 @@ FtsWalRepMessageSegments(CdbComponentDatabases *cdbs)
 	 */
 	for (i = 0; i < context.num_pairs; i++)
 	{
-		insist_log((context.perSegInfos[i].conn == NULL),
-				   "FTS libpq connection left open (content=%d, dbid=%d)"
-				   " state=%d, retry_count=%d, conn->status=%d",
-				   context.perSegInfos[i].primary_cdbinfo->segindex,
-				   context.perSegInfos[i].primary_cdbinfo->dbid,
-				   context.perSegInfos[i].state,
-				   context.perSegInfos[i].retry_count,
-				   context.perSegInfos[i].conn->status);
+		if (context.perSegInfos[i].conn != NULL)
+			elog(ERROR,
+				 "FTS libpq connection left open (content=%d, dbid=%d)"
+				 " state=%d, retry_count=%d, conn->status=%d",
+				 context.perSegInfos[i].primary_cdbinfo->config->segindex,
+				 context.perSegInfos[i].primary_cdbinfo->config->dbid,
+				 context.perSegInfos[i].state,
+				 context.perSegInfos[i].retry_count,
+				 context.perSegInfos[i].conn->status);
 	}
 #endif
 	pfree(context.perSegInfos);

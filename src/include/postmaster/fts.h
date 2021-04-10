@@ -5,7 +5,7 @@
  *
  * Portions Copyright (c) 2005-2010, Greenplum Inc.
  * Portions Copyright (c) 2011, EMC Corp.
- * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
  *
  *
  * IDENTIFICATION
@@ -24,6 +24,20 @@
 #define	FTS_MSG_PROBE "PROBE"
 #define FTS_MSG_SYNCREP_OFF "SYNCREP_OFF"
 #define FTS_MSG_PROMOTE "PROMOTE"
+
+/*
+ * This is used for constructing string to store the full fts message request
+ * string from QD to QE. Format for which is defined using FTS_MSG_FORMAT and
+ * first part of it string to define type of fts message like FTS_MSG_PROBE,
+ * FTS_MSG_SYNCREP_OFF or FTS_MSG_PROMOTE.
+ */
+#define FTS_MSG_MAX_LEN 100
+
+/*
+ * If altering the fts message format, consider if FTS_MSG_MAX_LEN is enough
+ * to store the modified format.
+ */
+#define FTS_MSG_FORMAT "%s dbid=%d contid=%d"
 
 #define Natts_fts_message_response 5
 #define Anum_fts_message_response_is_mirror_up 0
@@ -120,11 +134,6 @@ typedef struct
 } FtsSegmentPairState;
 
 /*
- * FTS process interface
- */
-extern int ftsprobe_start(void);
-
-/*
  * Interface for checking if FTS is active
  */
 extern bool FtsIsActive(void);
@@ -135,4 +144,9 @@ extern bool FtsIsActive(void);
 extern void HandleFtsMessage(const char* query_string);
 extern void probeWalRepUpdateConfig(int16 dbid, int16 segindex, char role,
 									bool IsSegmentAlive, bool IsInSync);
+
+extern bool FtsProbeStartRule(Datum main_arg);
+extern void FtsProbeMain (Datum main_arg);
+extern pid_t FtsProbePID(void);
+
 #endif   /* FTS_H */

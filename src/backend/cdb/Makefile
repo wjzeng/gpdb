@@ -20,17 +20,16 @@ OBJS = cdbappendonlystorageformat.o \
 	   cdbcat.o cdbcopy.o \
 	   cdbdistributedsnapshot.o \
 	   cdbdistributedxid.o cdbdistributedxacts.o \
-	   cdbdoublylinked.o \
 	   cdbdtxcontextinfo.o \
 	   cdbfts.o \
 	   cdbgroup.o \
-	   cdbhash.o cdbheap.o \
+	   cdbgroupingpaths.o \
+	   cdbhash.o \
+	   cdblegacyhash.o \
 	   cdbllize.o cdblocaldistribxact.o \
 	   cdbappendonlyxlog.o \
 	   cdbmutate.o \
 	   cdboidsync.o \
-	   cdbpartindex.o \
-	   cdbpartition.o \
 	   cdbpath.o cdbpathlocus.o cdbpathtoplan.o \
 	   cdbpgdatabase.o \
 	   cdbplan.o cdbpullup.o \
@@ -41,7 +40,7 @@ OBJS = cdbappendonlystorageformat.o \
 	   cdbtm.o cdbtmutils.o \
 	   cdbutil.o \
 	   cdbvars.o cdbvarblock.o \
-	   partitionselection.o
+	   cdbdtxrecovery.o
 
 ifeq ($(PORTNAME),cygwin)
 .LIBPATTERNS := $(filter-out %.so,$(.LIBPATTERNS))

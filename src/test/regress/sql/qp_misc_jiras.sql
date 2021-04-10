@@ -6,25 +6,19 @@ create schema qp_misc_jiras;
 
 -- Test that "INSERT INTO SELECT * FROM <external table>" works.
 create table qp_misc_jiras.tbl3301_foo (c1 int);
-create external web table qp_misc_jiras.tbl3301_bar(like qp_misc_jiras.tbl3301_foo) execute 'echo 1' on master format 'csv';
+create external web table qp_misc_jiras.tbl3301_bar(like qp_misc_jiras.tbl3301_foo) execute 'echo 1' on coordinator format 'csv';
 
 insert into qp_misc_jiras.tbl3301_foo select * from qp_misc_jiras.tbl3301_bar;
 select * from qp_misc_jiras.tbl3301_foo;
 
--- Test that altering the datatype of an indexed column works (or rather,
--- that it throws an error, because it isn't supported on GPDB).
+-- Test that altering the datatype of an indexed column works
 create table qp_misc_jiras.tbl1318(dummy integer, aa text not null);
 create index tbl1318_daa on qp_misc_jiras.tbl1318(dummy,aa);
-alter table qp_misc_jiras.tbl1318 alter column aa type integer using  bit_length(aa);
+alter table qp_misc_jiras.tbl1318 alter column aa type integer using bit_length(aa);
 drop index qp_misc_jiras.tbl1318_daa;
-alter table qp_misc_jiras.tbl1318 alter column aa type integer using  bit_length(aa);
-drop table qp_misc_jiras.tbl1318;
-
-create table qp_misc_jiras.tbl1318(dummy integer, aa text not null);
 create index tbl1318_daa on qp_misc_jiras.tbl1318 using bitmap(dummy,aa);
-alter table qp_misc_jiras.tbl1318 alter column aa type integer using  bit_length(aa);
+alter table qp_misc_jiras.tbl1318 alter column aa type bigint using bit_length(aa::text);
 drop index qp_misc_jiras.tbl1318_daa;
-alter table qp_misc_jiras.tbl1318 alter column aa type integer using  bit_length(aa);
 drop table qp_misc_jiras.tbl1318;
 
 -- Test for the upstream bug with combocids:
@@ -540,9 +534,9 @@ group by n;
 select n
 from ( select row_number() over () from (values (0)) as t(x) ) as r(n)
 group by n;
-create external web table qp_misc_jiras.tbl4622_ext1 (i int, j int) execute 'echo " | 20" ' on master format 'text' (delimiter as E'|' null as ' ');
+create external web table qp_misc_jiras.tbl4622_ext1 (i int, j int) execute 'echo " | 20" ' on coordinator format 'text' (delimiter as E'|' null as ' ');
 select * from qp_misc_jiras.tbl4622_ext1;
-create external web table qp_misc_jiras.tbl4622_ext2 (i int, j int) execute 'echo "  | 20" ' on master format 'text' (delimiter as E'|' null as '  ');
+create external web table qp_misc_jiras.tbl4622_ext2 (i int, j int) execute 'echo "  | 20" ' on coordinator format 'text' (delimiter as E'|' null as '  ');
 select * from qp_misc_jiras.tbl4622_ext2;
 drop external web table qp_misc_jiras.tbl4622_ext1;
 drop external web table qp_misc_jiras.tbl4622_ext2;
@@ -567,9 +561,6 @@ set gp_interconnect_setup_timeout=3600;
 show gp_interconnect_setup_timeout;
 set gp_interconnect_setup_timeout=10000;
 set gp_interconnect_setup_timeout=4000;
-create schema tbl5352_test;
-select tablename from pg_tables where schemaname='tbl5352_test' and tablename not in( select partitiontablename from pg_partitions where partitionschemaname = 'tbl5352_test' );
-drop schema tbl5352_test;
 
 CREATE TABLE qp_misc_jiras.tbl5223_sales_fact(
 	   time     timestamp,
@@ -662,6 +653,7 @@ window w as (partition by product order by year*12+month
 order by year, product, sales; -- mvd 1,2->4
 
 drop table qp_misc_jiras.tbl5223_sales_fact;
+
 CREATE VIEW qp_misc_jiras.tbl4255_simple_v as SELECT 1 as value;
 CREATE VIEW qp_misc_jiras.tbl4255_union_v as SELECT 1 as value UNION ALL SELECT 2;
 
@@ -672,6 +664,7 @@ SELECT generate_series(1,3), * from qp_misc_jiras.tbl4255_union_v;
 
 drop view qp_misc_jiras.tbl4255_simple_v;
 drop view qp_misc_jiras.tbl4255_union_v;
+
 create table qp_misc_jiras.tbl5246_sale
 (       
         cn int not null,
@@ -699,9 +692,7 @@ insert into qp_misc_jiras.tbl5246_sale values
   ( 4, 40, 700, '1401-6-1', 1, 1),
   ( 4, 40, 800, '1401-6-1', 1, 1);
 
-
-
-explain select cn, count(*) over (order by dt range between '2 day'::interval preceding and 2 preceding) from qp_misc_jiras.tbl5246_sale;
+select cn, count(*) over (order by dt range between '2 day'::interval preceding and 2 preceding) from qp_misc_jiras.tbl5246_sale;
 
 drop table qp_misc_jiras.tbl5246_sale;
 
@@ -765,9 +756,9 @@ WHERE sale.cn=customer.cn
 GROUP BY CUBE((sale.dt),(newalias1,newalias2,newalias1),(sale.cn,sale.cn,sale.cn,newalias1),
 (sale.qty),(sale.pn,newalias3,sale.vn),(sale.vn,sale.vn,sale.prc),(sale.cn,newalias2)),sale.cn,sale.vn;
 
-
 drop table qp_misc_jiras.tbl4896_sale;
 drop table qp_misc_jiras.tbl4896_customer;
+
 create table qp_misc_jiras.tbl4703_test (i int, j int);
 insert into qp_misc_jiras.tbl4703_test select i, i%10 from generate_series(0, 9999) i;
 create index test_j on qp_misc_jiras.tbl4703_test(j);
@@ -780,9 +771,6 @@ create table qp_misc_jiras.tbl_694_1(c1 int, b1 box);
 select * from qp_misc_jiras.tbl_694_1;
 create table qp_misc_jiras.tbl_694_2 (like qp_misc_jiras.tbl_694_1);
 
-
-
-
 select * from qp_misc_jiras.tbl_694_2;
 insert into qp_misc_jiras.tbl_694_2 values(2,'(2,2),(2,2)');
 insert into qp_misc_jiras.tbl_694_2 values(2,'(2,2),(3,2)');
@@ -794,33 +782,15 @@ select * from qp_misc_jiras.tbl_694_1 join qp_misc_jiras.tbl_694_2 on qp_misc_ji
 
 drop table qp_misc_jiras.tbl_694_1;
 drop table qp_misc_jiras.tbl_694_2;
--- Postgres timestamp
-select '20081225 130000'::timestamp;
--- Teradata timestamp
-select '20081225130000'::timestamp;
-select * from ( select 'a' as a) x join (select 'a' as b) y on a=b;
-select * from ( ( select 'a' as a ) xx join (select 'a' as b) yy on a = b ) x join (select 'a' as c) y on a=c;
-select x.b from ( ( select 'a' as a ) xx join (select 'a' as b) yy on a = b ) x join (select 'a' as c) y on a=c;
+
+-- GPDB_10_MERGE_FIXME: Here we cast the unknown typed literal to text. After
+-- we move past postgres 10 we can drop the cast.
+select * from ( select 'a'::text as a) x join (select 'a'::text as b) y on a=b;
+select * from ( ( select 'a'::text as a ) xx join (select 'a'::text as b) yy on a = b ) x join (select 'a'::text as c) y on a=c;
+select x.b from ( ( select 'a'::text as a ) xx join (select 'a'::text as b) yy on a = b ) x join (select 'a'::text as c) y on a=c;
 create table qp_misc_jiras.tbl6027_test (i int, j bigint, k int, l int, m int);
 insert into qp_misc_jiras.tbl6027_test select i, i%100, i%123, i%234, i%345 from generate_series(1, 500) i;
 select j, sum(k), row_number() over (partition by j order by sum(k)) from qp_misc_jiras.tbl6027_test group by j order by j limit 10; -- order 1
-CREATE TABLE qp_misc_jiras.tbl6419_test(
-lstg_id numeric(38,0),
-icedt date,
-icehr smallint,
-cre_time timestamp without time zone,
-lstg_desc_txt text
-)
-WITH (appendonly=true, compresslevel=5) distributed by (lstg_id) PARTITION BY RANGE(cre_time)
-(
-START ('2009-05-26 00:00:00'::timestamp without time zone) 
-END ('2009-06-30 00:00:00'::timestamp without time zone) EVERY ('1 day'::interval) WITH (appendonly=true, compresslevel=5)
-);
-
-insert into qp_misc_jiras.tbl6419_test values( 123, '2009-06-01', 12, '2009-06-01 01:01:01', 'aaaaaa');
-select * from qp_misc_jiras.tbl6419_test where icedt::text = (select partitionrangestart FROM pg_partitions where tablename='test1' and schemaname='public' and partitionrank=1);
-select * from qp_misc_jiras.tbl6419_test where '2009-12-12'::date::text = (select 'test'::text);
-drop table qp_misc_jiras.tbl6419_test;
 
 CREATE TABLE qp_misc_jiras.m_ccr_mthy_cr_nds_t00
 (
@@ -1057,12 +1027,12 @@ drop table qp_misc_jiras.tbl6833_vac;
 drop table if exists qp_misc_jiras_foo;
 create table qp_misc_jiras_foo(x int) distributed by (x);
 
-SELECT t.attrnums, a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod),
+SELECT t.distkey, a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod),
 a.attnotnull, a.attnum, pg_catalog.col_description(a.attrelid, a.attnum)
 FROM pg_catalog.pg_class c
 LEFT outer JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
 left outer join pg_catalog.gp_distribution_policy t on localoid = c.oid
-left outer join pg_catalog.pg_attribute a on a.attrelid = c.oid and a.attnum in (select unnest(t.attrnums))
+left outer join pg_catalog.pg_attribute a on a.attrelid = c.oid and a.attnum in (select unnest(t.distkey))
 WHERE c.relname ~ '^(qp_misc_jiras_foo)$';
 
 
@@ -1105,12 +1075,6 @@ select get_ao_distribution('qp_misc_jiras.tbl7126_co');
 select get_ao_distribution('qp_misc_jiras.tbl7126_co_zlib3');
 
 -- end_ignore
-
-select gp_update_ao_master_stats('qp_misc_jiras.tbl7126_ao');
-select gp_update_ao_master_stats('qp_misc_jiras.tbl7126_ao_zlib3');
-select gp_update_ao_master_stats('qp_misc_jiras.tbl7126_co');
-select gp_update_ao_master_stats('qp_misc_jiras.tbl7126_co_zlib3');
-
 
 
 -- drop the objects created
@@ -1376,20 +1340,19 @@ create index tbl6874_a on qp_misc_jiras.tbl6874 using bitmap(a);
 drop index qp_misc_jiras.tbl6874_a;
 \d+ qp_misc_jiras.tbl6874
 drop table qp_misc_jiras.tbl6874;
-CREATE TABLE qp_misc_jiras.tbl7740_rank (id int, gender char(1), count char(1) )
+CREATE TYPE qp_misc_jiras.tbl7740_rank_partkey AS (gender char(1), count char(1));
+CREATE TABLE qp_misc_jiras.tbl7740_rank (id int, gender_count qp_misc_jiras.tbl7740_rank_partkey )
             DISTRIBUTED BY (id)
-            PARTITION BY LIST (gender,count)
-            ( PARTITION girls VALUES (('F','1')),
-              PARTITION boys VALUES (('M','1')),
+            PARTITION BY LIST (gender_count)
+            ( PARTITION girls VALUES (CAST('(F,1)' AS qp_misc_jiras.tbl7740_rank_partkey)),
+              PARTITION boys VALUES (CAST('(M,1)' AS qp_misc_jiras.tbl7740_rank_partkey)),
               DEFAULT PARTITION other );
 
-insert into qp_misc_jiras.tbl7740_rank values(1,'F','1');
-insert into qp_misc_jiras.tbl7740_rank values(1,'F','0');
-insert into qp_misc_jiras.tbl7740_rank values(1,'M','1');
-insert into qp_misc_jiras.tbl7740_rank values(1,'M','0');
--- start_ignore 
-alter table qp_misc_jiras.tbl7740_rank split default partition at (values(('F', '0'))) into (partition mother, partition other);
--- end_ignore
+insert into qp_misc_jiras.tbl7740_rank values(1,'(F,1)');
+insert into qp_misc_jiras.tbl7740_rank values(1,'(F,0)');
+insert into qp_misc_jiras.tbl7740_rank values(1,'(M,1)');
+insert into qp_misc_jiras.tbl7740_rank values(1,'(M,0)');
+alter table qp_misc_jiras.tbl7740_rank split default partition at ('(F,0)') into (partition mother, partition other);
 select * from qp_misc_jiras.tbl7740_rank_1_prt_girls;
 select * from qp_misc_jiras.tbl7740_rank_1_prt_boys;
 select * from qp_misc_jiras.tbl7740_rank_1_prt_mother;
@@ -1432,17 +1395,23 @@ SELECT * FROM qp_misc_jiras.one_of_every_data_type ORDER BY id,serial_col;
 -- Clean up.
 DROP TABLE IF EXISTS qp_misc_jiras.one_of_every_data_type; 
 
-create table qp_misc_jiras.tbl7553_test (i int, j int);
-insert into qp_misc_jiras.tbl7553_test values(1,2);
-explain select i as a, i as b from qp_misc_jiras.tbl7553_test group by grouping sets( (a, b), (a));
+-- FIXME: This test file is ported from cdbfast to ICG via commit
+-- 993bc9c911. The following case is just test grouping sets
+-- Now we have some test (regress/groupingsets) cases cover this.
+-- So I decide to remove them here. Leave a FIXME here since I think this
+-- test file needs to review to see if anything might be also
+-- removed.
+-- create table qp_misc_jiras.tbl7553_test (i int, j int);
+-- insert into qp_misc_jiras.tbl7553_test values(1,2);
+-- explain select i as a, i as b from qp_misc_jiras.tbl7553_test group by grouping sets( (a, b), (a));
 
-select i as a, i as b from qp_misc_jiras.tbl7553_test group by grouping sets( (a, b), (a)); 
+-- select i as a, i as b from qp_misc_jiras.tbl7553_test group by grouping sets( (a, b), (a)); 
 
-explain select j as a, j as b from qp_misc_jiras.tbl7553_test group by grouping sets( (a, b), (a)); 
+-- explain select j as a, j as b from qp_misc_jiras.tbl7553_test group by grouping sets( (a, b), (a)); 
 
-select j as a, j as b from qp_misc_jiras.tbl7553_test group by grouping sets( (a, b), (a)); 
+-- select j as a, j as b from qp_misc_jiras.tbl7553_test group by grouping sets( (a, b), (a)); 
 
-drop table qp_misc_jiras.tbl7553_test;
+-- drop table qp_misc_jiras.tbl7553_test;
 
 -- Check that a table created with CTAS "inherits" the distribution key from
 -- the source table.
@@ -1751,16 +1720,29 @@ select sum(z) as c from qp_misc_jiras.tbl7957_foo group by cube(z) order by c;
 
 drop table qp_misc_jiras.tbl7957_foo;
 
--- start_ignore
+--
+-- Test for MPP-6421, an old bug in GPDB 3.2.3.0.
+--
+-- Description of the bug from the original report:
+--
+-- Executing immutable functions that contain selects from a table as a
+-- non-superuser causes a SIGSEGV and a system core dump.  Executing the same
+-- function as a superuser does NOT cause the problem.  Functions that are not
+-- immutable do NOT cause the problem.  This problem seems to have been
+-- introduced in 3.2.3.0, it is NOT reproducible in versions earlier than
+-- that.  It is still reproducible in 3.3.0.1.  It is reproducible on both
+-- Solaris and Mac platforms.
+--
 CREATE SCHEMA mustan;
-
 CREATE TABLE mustan.test(
 	id int,
 	d date
 );
--- end_ignore
-	
 INSERT INTO mustan.test( id, d ) VALUES( 1, '20080101' ), (2, '20080102');
+
+CREATE USER regress_mustan NOLOGIN;
+GRANT USAGE ON SCHEMA mustan TO regress_mustan;
+GRANT SELECT ON mustan.test to regress_mustan;
 
 CREATE OR REPLACE FUNCTION mustan.f1() RETURNS DATE AS $$
 BEGIN
@@ -1829,6 +1811,7 @@ BEGIN
 END;
 $$LANGUAGE plpgsql immutable;
 
+SET SESSION AUTHORIZATION regress_mustan;
 
 select * from mustan.f1();
 select * from mustan.f2();
@@ -1838,6 +1821,11 @@ select * from mustan.f5();
 select * from mustan.f6( 2 );
 select * from mustan.f7( '20080102'::date );
 select * from mustan.f7( '20080102' );-- 
+
+-- Clean up
+RESET SESSION AUTHORIZATION;
+drop schema mustan cascade;
+drop user regress_mustan;
 
 
 -- start_ignore
@@ -1853,18 +1841,20 @@ reset enable_seqscan;
 reset gp_enable_agg_distinct; 
 reset gp_enable_agg_distinct_pruning;
 
-
-set enable_groupagg=off;
 -- both queries should use hashagg
 explain select count(distinct j) from (select t1.* from qp_misc_jiras.tbl5994_test t1, qp_misc_jiras.tbl5994_test t2 where t1.j = t2.j) tmp group by j;
 explain select count(distinct j) from (select t1.* from qp_misc_jiras.tbl5994_test t1, qp_misc_jiras.tbl5994_test t2 where t1.i = t2.i) tmp group by j;
 
+-- Try same two queries, with group agg.
 set enable_groupagg=on;
--- first query should use groupagg, and second one - hashagg
+set enable_hashagg=off;
 explain select count(distinct j) from (select t1.* from qp_misc_jiras.tbl5994_test t1, qp_misc_jiras.tbl5994_test t2 where t1.j = t2.j) tmp group by j;
 explain select count(distinct j) from (select t1.* from qp_misc_jiras.tbl5994_test t1, qp_misc_jiras.tbl5994_test t2 where t1.i = t2.i) tmp group by j;
 
+reset enable_groupagg;
+reset enable_hashagg;
 drop table qp_misc_jiras.tbl5994_test;
+
 CREATE TABLE qp_misc_jiras.tbl_8205 (
 text_col text,
 bigint_col bigint,
@@ -1883,30 +1873,9 @@ explain analyze select reltablespace  from pg_class where oid = (select reltoast
 select reltablespace from pg_class where oid = (select reltoastrelid from pg_class where relname='tbl_8205');
 
 drop table qp_misc_jiras.tbl_8205;
-
--- create sample table
-create table qp_misc_jiras.tbl2976(x int);
-insert into qp_misc_jiras.tbl2976 select generate_series(1,1000);
-
--- test cases
--- start_ignore
-select pg_relation_size(tablename) from pg_tables where schemaname ='qp_misc_jiras' and tablename = 'tbl2976'; -- This should work
-
-select pg_relation_size(oid) from pg_class where relname = 'tbl2976'; -- This should work
--- end_ignore
-create table qp_misc_jiras.tbl2976_3(x int) distributed by (x);
-
-drop table qp_misc_jiras.tbl2976;
-drop table qp_misc_jiras.tbl2976_3;
-create table qp_misc_jiras.tbl8258 (a int, b double precision)
-PARTITION BY RANGE(b)
-(START (1::double precision) END (100::double precision)
-EVERY ((10)::double precision),
-PARTITION p1 START (100::double precision) END (150::double precision));
-
-select pg_get_partition_def('qp_misc_jiras.tbl8258'::regclass, true);
-
-drop table qp_misc_jiras.tbl8258;
+reset enable_seqscan;
+reset enable_bitmapscan;
+reset enable_indexscan;
 
 reset statement_timeout;
 set statement_mem = '512MB';
@@ -1985,7 +1954,9 @@ drop table qp_misc_jiras.utable;
 -- end_ignore
 
 
-
+-- Test for an old planner bug, related to MPP group by planning,
+-- where EXPLAIN on this query produced a "bogus var" warning.
+-- (The code has been completely rewritten since, though)
 CREATE TABLE qp_misc_jiras.foo_6325 (
   foo_6325_attr text
 )
@@ -1995,6 +1966,8 @@ CREATE TABLE qp_misc_jiras.bar_6325 (
   bar_6325_attr text
 )
 DISTRIBUTED RANDOMLY;
+
+set enable_nestloop=on;
 
 -- force_explain
 
@@ -2078,7 +2051,6 @@ insert into qp_misc_jiras.tbl9613 values(1, 5);
 insert into qp_misc_jiras.tbl9613 values(1, 6);
 insert into qp_misc_jiras.tbl9613 values(1, 7);
 insert into qp_misc_jiras.tbl9613 values(1, 8);
-
 
 --
 -- First set of functions. These do not access external relations.
@@ -2186,6 +2158,7 @@ drop index qp_misc_jiras.bmap2_index;
 drop table qp_misc_jiras.badbitmapindex;
 drop table qp_misc_jiras.bmap2;
 
+-- Test for ancient bug that led to a crash in EXPLAIN (MPP-9957)
 CREATE TABLE qp_misc_jiras.ir_voice_sms_and_data (
     imsi_number character varying(35),
     ir_call_country_name character varying(35),
@@ -2198,7 +2171,7 @@ CREATE TABLE qp_misc_jiras.ir_voice_sms_and_data (
     ir_call_charged_item_code character(1)
 ) distributed randomly;
 
-
+set gp_motion_cost_per_row =0.1; -- to get a two-stage agg
 explain select
 case when ir_call_type_group_code in ('H', 'VH', 'PCB') then 'Thailland'
 else 'Unidentify' end || 'a'
@@ -2211,6 +2184,7 @@ case when ir_call_type_group_code in ('H', 'VH', 'PCB') then 'Thailland'
 else 'Unidentify' end
 ;
 DROP TABLE qp_misc_jiras.ir_voice_sms_and_data;
+reset gp_motion_cost_per_row;
 
 create table qp_misc_jiras.r
     (a int, b int, c int)
@@ -2282,14 +2256,14 @@ partition by range (partition_key)
 default partition default_partition,
 partition d_2010_09_28 start (date '2010-09-28') end (date '2010-09-29')
 );
-select relname, attrnums as distribution_attributes from gp_distribution_policy p, pg_class c where p.localoid = c.oid and relname like 'tbl1_tbl_11257%' ;
+select relname, distkey as distribution_attributes from gp_distribution_policy p, pg_class c where p.localoid = c.oid and relname like 'tbl1_tbl_11257%';
 -- start_ignore
 alter table qp_misc_jiras.tbl1_tbl_11257 split default partition
 start (date '2010-09-27' )
 end (date '2010-09-28')
 into (partition d_2010_09_27, partition default_partition);
 -- end_ignore
-select relname, attrnums as distribution_attributes from gp_distribution_policy p, pg_class c where p.localoid = c.oid and relname like 'tbl1_tbl_11257%' ;
+select relname, distkey as distribution_attributes from gp_distribution_policy p, pg_class c where p.localoid = c.oid and relname like 'tbl1_tbl_11257%';
 
 
 
@@ -2310,7 +2284,7 @@ select * from qp_misc_jiras.tbl2_tbl_11257;
 delete from qp_misc_jiras.tbl2_tbl_11257 where a=1 and b=2 and c=3;
 select * from qp_misc_jiras.tbl2_tbl_11257;
 insert into qp_misc_jiras.tbl2_tbl_11257 values(1,2,3); 
-select relname, attrnums as distribution_attributes from gp_distribution_policy p, pg_class c where p.localoid = c.oid and relname like 'tbl2_tbl_11257%' ;
+select relname, distkey as distribution_attributes from gp_distribution_policy p, pg_class c where p.localoid = c.oid and relname like 'tbl2_tbl_11257%';
 
 -- start_ignore
 alter table qp_misc_jiras.tbl2_tbl_11257 split default partition
@@ -2318,7 +2292,7 @@ start (3)
 end (4)
 into (partition p2, partition default_partition);
 -- end_ignore
-select relname, attrnums as distribution_attributes from gp_distribution_policy p, pg_class c where p.localoid = c.oid and relname like 'tbl2_tbl_11257%' ;
+select relname, distkey as distribution_attributes from gp_distribution_policy p, pg_class c where p.localoid = c.oid and relname like 'tbl2_tbl_11257%';
 
 delete from qp_misc_jiras.tbl2_tbl_11257 where a=1 and b=2 and c=3;
 select * from qp_misc_jiras.tbl2_tbl_11257;
@@ -2339,65 +2313,21 @@ select  * from qp_misc_jiras.test_heap where ctid='(0,1)' and gp_segment_id >= 0
 --
 create table qp_misc_jiras.test_ao (i int, j int) with (appendonly=true);
 insert into qp_misc_jiras.test_ao values (0, 0);
-explain select  * from qp_misc_jiras.test_ao where ctid='(33554432,32769)' and gp_segment_id >= 0;
-select  * from qp_misc_jiras.test_ao where ctid='(33554432,32769)' and gp_segment_id >= 0;
+explain select  * from qp_misc_jiras.test_ao where ctid='(33554432,2)' and gp_segment_id >= 0;
+select  * from qp_misc_jiras.test_ao where ctid='(33554432,2)' and gp_segment_id >= 0;
 
 --
 -- CO table. TidScan should not be used.
 --
 create table qp_misc_jiras.test_co (i int, j int) with (appendonly=true, orientation=column);
 insert into qp_misc_jiras.test_co values (0, 0);
-explain select  * from qp_misc_jiras.test_co where ctid='(33554432,32769)' and gp_segment_id >= 0;
-select  * from qp_misc_jiras.test_co where ctid='(33554432,32769)' and gp_segment_id >= 0;
+explain select  * from qp_misc_jiras.test_co where ctid='(33554432,2)' and gp_segment_id >= 0;
+select  * from qp_misc_jiras.test_co where ctid='(33554432,2)' and gp_segment_id >= 0;
 
 -- This is to verify MPP-10856: test gp_enable_explain_allstat
 set gp_enable_explain_allstat=on;
 insert into qp_misc_jiras.test_heap select i, i from generate_series(0, 99999) i;
 explain analyze select count(*) from qp_misc_jiras.test_heap;
-
--- start_ignore
--- This is to verify MPP-8946
--- ramans2 : Modifying queries to add filter on schema name to remove diffs in multi-node cdbfast runs
--- end_ignore
-
-
-create schema schema1;
-create schema schema2;
-create schema schema3;
-create table schema1.foo1 (i int) partition by range(i)  (start(1) end(2) every(1));
-create table schema2.foo2 (i int) partition by range(i)  (start(1) end(2) every(1));
-create table schema2.foo3 (i int) partition by range(i)  (start(1) end(2) every(1));
-create table schema3.foo4 (i int) partition by range(i)  (start(1) end(2) every(1));
-set statement_mem='1900MB';
-select * from pg_partitions where schemaname in ('schema1', 'schema2', 'schema3');
-
---
--- Case 1: query from MPP-7073.
--- expected 0 rows
---
-select * from pg_partitions p 
-   where not exists (select 1 from pg_partitions p2 where p2.schemaname = p.schemaname) and p.schemaname in ('schema1', 'schema2', 'schema3'); 
-
---
--- Case 2: modified form of Case 1 which returns non-zero results
--- expected 2 rows: (foo1 and foo4)
---
-select * from pg_partitions p 
-   where not exists (select 1 from pg_partitions p2 where p2.schemaname = p.schemaname and p2.tablename != p.tablename ) and p.schemaname in ('schema1', 'schema2', 'schema3'); 
-
---
--- Case 3: query from MPP-8946.
---
-select schemaname, tablename, partitionschemaname,
-       partitiontablename, partitionlevel 
-  from pg_partitions p1 
-  where partitionlevel > 0 
-    and partitionlevel < (select max(partitionlevel)
-                          from pg_partitions p2 where p2.tablename=p1.tablename)  and schemaname in ('schema1', 'schema2', 'schema3'); 
-
-drop schema schema1 cascade;
-drop schema schema2 cascade;
-drop schema schema3 cascade;
 
 -- This is the to verify MPP-9167:
 --	Gather Motion shows wrong row estimate compared to 3.3
@@ -2469,33 +2399,21 @@ alter table qp_misc_jiras.tbl13409_test set with (reorganize=foo) distributed by
 
 --Invalid integer value. def->arg
 alter table qp_misc_jiras.tbl13409_test set with (reorganize=123) distributed by (j);
-
 alter table qp_misc_jiras.tbl13409_test set with (reorganize="true");
-
 alter table qp_misc_jiras.tbl13409_test set with (reorganize="TRUE");
-
 alter table qp_misc_jiras.tbl13409_test set with (reorganize="FALSE");
-
 alter table qp_misc_jiras.tbl13409_test set with (reorganize="false");
 
-
 --Valid strings
-
 alter table qp_misc_jiras.tbl13409_test set with (reorganize=true);
-
 alter table qp_misc_jiras.tbl13409_test set with (reorganize=TRUE);
-
 alter table qp_misc_jiras.tbl13409_test set with (reorganize=FALSE);
-
 alter table qp_misc_jiras.tbl13409_test set with (reorganize=false);
-
 alter table qp_misc_jiras.tbl13409_test set with (reorganize='false');
-
 alter table qp_misc_jiras.tbl13409_test set with (reorganize='FALSE');
-
 alter table qp_misc_jiras.tbl13409_test set with (reorganize='TRUE');
-
 alter table qp_misc_jiras.tbl13409_test set with (reorganize='true');
+
 create table qp_misc_jiras.tbl13879_1 (a int) distributed by (a);
 insert into qp_misc_jiras.tbl13879_1 select generate_series(1,10);
 select * from qp_misc_jiras.tbl13879_1;
@@ -2507,6 +2425,7 @@ select * from qp_misc_jiras.tbl13879_2;
 select a, max(a) over (order by a range between current row and 2 following) as max from qp_misc_jiras.tbl13879_2;
 drop table qp_misc_jiras.tbl13879_1;
 drop table qp_misc_jiras.tbl13879_2;
+
 create table qp_misc_jiras.esc176_1 (id integer, seq integer, val double precision, clickdate timestamp without time zone) distributed by (id);
 insert into qp_misc_jiras.esc176_1 values (1,1,0.2,CURRENT_TIMESTAMP);
 insert into qp_misc_jiras.esc176_1 values (1,2,0.1,CURRENT_TIMESTAMP);
@@ -2531,6 +2450,7 @@ select id, seq, sum (val) over (partition by id order by clickdate range between
 select id, seq, sum(val) over (partition by id order by seq::numeric range between 0 following and 10 following), val from qp_misc_jiras.esc176_1;
 select id, seq, sum(val) over (partition by id order by seq::numeric range between 10 preceding and 0 preceding), val from qp_misc_jiras.esc176_1;
 drop table qp_misc_jiras.esc176_1;
+
 create table qp_misc_jiras.tbl13491_h(a int,str varchar)distributed by (a);
 alter table qp_misc_jiras.tbl13491_h alter column str set storage external;
 insert into qp_misc_jiras.tbl13491_h values (1, lpad('a', 100000, 'b'));
@@ -2541,28 +2461,14 @@ select str = lpad('a', 100000, 'b') from qp_misc_jiras.tbl13491_aocol;
 drop table qp_misc_jiras.tbl13491_h;
 select str = lpad('a', 100000, 'b') from qp_misc_jiras.tbl13491_aocol;
 drop table qp_misc_jiras.tbl13491_aocol;
--- start_ignore
-drop function if exists test();
-create table qp_misc_jiras._tbl10050_test (id int) distributed randomly;
--- end_ignore
-create function test()
-returns void
-as
-$$
-begin
-drop table if exists qp_misc_jiras._tbl10050_test;
-create table qp_misc_jiras._tbl10050_test (id int) distributed randomly;
-insert into qp_misc_jiras._tbl10050_test values (1);
-end;
-$$
-language plpgsql
-;
 
-select test();
-select test();
-select test();
-select test();
-
+--
+-- Test that rules with functions can be serialized correctly
+-- This is tested here because the rules tests are not enabled
+--
+create table  qp_misc_jiras.rules (a integer);
+create rule "_RETURN" as on select to qp_misc_jiras.rules do instead
+  select * from generate_series(1,5) x(a);
 
 --
 -- Test gp_enable_relsize_collection's effect on ORCA plan generation
@@ -2580,6 +2486,53 @@ explain select 1 as t1 where 1 <= ALL (select x from tbl_z);
 drop table if exists tbl_z;
 reset optimizer_metadata_caching;
 reset gp_enable_relsize_collection;
+
+-- orca should estimate more than 1 row
+-- even for real small frequency
+
+create table epsilon_test (b smallint);
+set allow_system_table_mods=on;
+
+UPDATE pg_class
+SET
+        relpages = 4901842::int,
+        reltuples = 495454000.0::real
+WHERE relname = 'epsilon_test';
+
+INSERT INTO pg_statistic VALUES (
+        'epsilon_test'::regclass,
+        1::smallint,
+	False::boolean,
+        0.0::real,
+        2::integer,
+        10.0::real,
+        1::smallint,
+        2::smallint,
+        0::smallint,
+        0::smallint,
+	0::smallint,
+        94::oid,
+        95::oid,
+        0::oid,
+        0::oid,
+	0::oid,
+	0::oid,
+	0::oid,
+	0::oid,
+	0::oid,
+	0::oid,
+        E'{0.259358,0.15047,0.124118,0.117294,0.117195,0.11612,0.115285}'::real[],
+        NULL::real[],
+        NULL::real[],
+        NULL::real[],
+	NULL::real[],
+        E'{25,7,143,6,107,10,21}'::int2[],
+        E'{0,30}'::int2[],
+        NULL::int2[],
+        NULL::int2[],
+	NULL::anyarray);
+
+explain select b from epsilon_test where b in (11,30) limit 30;
 
 -- start_ignore
 drop schema qp_misc_jiras cascade;

@@ -1,7 +1,7 @@
 #!/usr/bin/env perl
 #
 # Portions Copyright (c) 2006, 2007, 2008, 2009 Greenplum Inc
-# Portions Copyright (c) 2012-Present Pivotal Software, Inc.
+# Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
 #
 # Author: Jeffrey I Cohen
 #
@@ -155,8 +155,8 @@ Options:
 
 explain.pl reads EXPLAIN output from a text file (or standard
 input) and formats it in several ways.  The text file must contain
-output in one of the the following formats.  The first is a regular
-EXPLAIN format, starting the the QUERY PLAN header and ending with the
+output in one of the following formats.  The first is a regular
+EXPLAIN format, starting the QUERY PLAN header and ending with the
 number of rows in parentheses.  Indenting must be on:
 
                                                 QUERY PLAN                                                
@@ -244,7 +244,7 @@ correctly identify the left and right children.
 Jeffrey I Cohen
 
 Portions Copyright (c) 2006, 2007, 2008, 2009 GreenPlum.  All rights reserved.
-Portions Copyright (c) 2012-Present Pivotal Software, Inc.
+Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
 
 Address bug reports and comments to: bugs@greenplum.org
 

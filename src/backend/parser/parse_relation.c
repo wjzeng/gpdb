@@ -4,8 +4,8 @@
  *	  parser support routines dealing with relations
  *
  * Portions Copyright (c) 2006-2008, Greenplum inc
- * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -19,44 +19,49 @@
 #include <ctype.h>
 
 #include "access/htup_details.h"
+#include "access/relation.h"
 #include "access/sysattr.h"
+#include "access/table.h"
 #include "catalog/heap.h"
 #include "catalog/namespace.h"
-#include "catalog/catalog.h"
 #include "catalog/pg_proc_callback.h"
 #include "catalog/pg_type.h"
 #include "funcapi.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
-#include "nodes/relation.h"                 /* CdbRelColumnInfo */
-#include "optimizer/pathnode.h"             /* cdb_rte_find_pseudo_column() */
 #include "parser/parsetree.h"
+#include "parser/parse_enr.h"
 #include "parser/parse_relation.h"
 #include "parser/parse_type.h"
-#include "parser/parse_coerce.h"
+#include "storage/lmgr.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
+#include "utils/varlena.h"
 
+#include "cdb/cdbvars.h"
+
+
+#define MAX_FUZZY_DISTANCE				3
 
 static RangeTblEntry *scanNameSpaceForRefname(ParseState *pstate,
-						const char *refname, int location);
+											  const char *refname, int location);
 static RangeTblEntry *scanNameSpaceForRelid(ParseState *pstate, Oid relid,
-					  int location);
+											int location);
 static void check_lateral_ref_ok(ParseState *pstate, ParseNamespaceItem *nsitem,
-					 int location);
+								 int location);
 static void markRTEForSelectPriv(ParseState *pstate, RangeTblEntry *rte,
-					 int rtindex, AttrNumber col);
+								 int rtindex, AttrNumber col);
 static void expandRelation(Oid relid, Alias *eref,
-			   int rtindex, int sublevels_up,
-			   int location, bool include_dropped,
-			   List **colnames, List **colvars);
+						   int rtindex, int sublevels_up,
+						   int location, bool include_dropped,
+						   List **colnames, List **colvars);
 static void expandTupleDesc(TupleDesc tupdesc, Alias *eref,
-				int count, int offset,
-				int rtindex, int sublevels_up,
-				int location, bool include_dropped,
-				List **colnames, List **colvars);
+							int count, int offset,
+							int rtindex, int sublevels_up,
+							int location, bool include_dropped,
+							List **colnames, List **colvars);
 static int	specialAttNum(const char *attname);
 static bool isQueryUsingTempRelation_walker(Node *node, void *context);
 
@@ -286,6 +291,16 @@ isFutureCTE(ParseState *pstate, const char *refname)
 }
 
 /*
+ * Search the query's ephemeral named relation namespace for a relation
+ * matching the given unqualified refname.
+ */
+bool
+scanNameSpaceForENR(ParseState *pstate, const char *refname)
+{
+	return name_matches_visible_ENR(pstate, refname);
+}
+
+/*
  * searchRangeTableForRel
  *	  See if any RangeTblEntry could possibly match the RangeVar.
  *	  If so, return a pointer to the RangeTblEntry; else return NULL.
@@ -306,6 +321,7 @@ searchRangeTableForRel(ParseState *pstate, RangeVar *relation)
 	const char *refname = relation->relname;
 	Oid			relId = InvalidOid;
 	CommonTableExpr *cte = NULL;
+	bool		isenr = false;
 	Index		ctelevelsup = 0;
 	Index		levelsup;
 
@@ -322,11 +338,16 @@ searchRangeTableForRel(ParseState *pstate, RangeVar *relation)
 	 * unlocked.
 	 */
 	if (!relation->schemaname)
+	{
 		cte = scanNameSpaceForCTE(pstate, refname, &ctelevelsup);
-	if (!cte)
+		if (!cte)
+			isenr = scanNameSpaceForENR(pstate, refname);
+	}
+
+	if (!cte && !isenr)
 		relId = RangeVarGetRelid(relation, NoLock, true);
 
-	/* Now look for RTEs matching either the relation/CTE or the alias */
+	/* Now look for RTEs matching either the relation/CTE/ENR or the alias */
 	for (levelsup = 0;
 		 pstate != NULL;
 		 pstate = pstate->parentParseState, levelsup++)
@@ -345,6 +366,10 @@ searchRangeTableForRel(ParseState *pstate, RangeVar *relation)
 				cte != NULL &&
 				rte->ctelevelsup + levelsup == ctelevelsup &&
 				strcmp(rte->ctename, refname) == 0)
+				return rte;
+			if (rte->rtekind == RTE_NAMEDTUPLESTORE &&
+				isenr &&
+				strcmp(rte->enrname, refname) == 0)
 				return rte;
 
 			if (rte->eref != NULL &&
@@ -429,8 +454,8 @@ check_lateral_ref_ok(ParseState *pstate, ParseNamespaceItem *nsitem,
 
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_COLUMN_REFERENCE),
-			errmsg("invalid reference to FROM-clause entry for table \"%s\"",
-				   refname),
+				 errmsg("invalid reference to FROM-clause entry for table \"%s\"",
+						refname),
 				 (rte == pstate->p_target_rangetblentry) ?
 				 errhint("There is an entry for table \"%s\", but it cannot be referenced from this part of the query.",
 						 refname) :
@@ -530,6 +555,102 @@ GetCTEForRTE(ParseState *pstate, RangeTblEntry *rte, int rtelevelsup)
 }
 
 /*
+ * updateFuzzyAttrMatchState
+ *	  Using Levenshtein distance, consider if column is best fuzzy match.
+ */
+static void
+updateFuzzyAttrMatchState(int fuzzy_rte_penalty,
+						  FuzzyAttrMatchState *fuzzystate, RangeTblEntry *rte,
+						  const char *actual, const char *match, int attnum)
+{
+	int			columndistance;
+	int			matchlen;
+
+	/* Bail before computing the Levenshtein distance if there's no hope. */
+	if (fuzzy_rte_penalty > fuzzystate->distance)
+		return;
+
+	/*
+	 * Outright reject dropped columns, which can appear here with apparent
+	 * empty actual names, per remarks within scanRTEForColumn().
+	 */
+	if (actual[0] == '\0')
+		return;
+
+	/* Use Levenshtein to compute match distance. */
+	matchlen = strlen(match);
+	columndistance =
+		varstr_levenshtein_less_equal(actual, strlen(actual), match, matchlen,
+									  1, 1, 1,
+									  fuzzystate->distance + 1
+									  - fuzzy_rte_penalty,
+									  true);
+
+	/*
+	 * If more than half the characters are different, don't treat it as a
+	 * match, to avoid making ridiculous suggestions.
+	 */
+	if (columndistance > matchlen / 2)
+		return;
+
+	/*
+	 * From this point on, we can ignore the distinction between the RTE-name
+	 * distance and the column-name distance.
+	 */
+	columndistance += fuzzy_rte_penalty;
+
+	/*
+	 * If the new distance is less than or equal to that of the best match
+	 * found so far, update fuzzystate.
+	 */
+	if (columndistance < fuzzystate->distance)
+	{
+		/* Store new lowest observed distance for RTE */
+		fuzzystate->distance = columndistance;
+		fuzzystate->rfirst = rte;
+		fuzzystate->first = attnum;
+		fuzzystate->rsecond = NULL;
+		fuzzystate->second = InvalidAttrNumber;
+	}
+	else if (columndistance == fuzzystate->distance)
+	{
+		/*
+		 * This match distance may equal a prior match within this same range
+		 * table.  When that happens, the prior match may also be given, but
+		 * only if there is no more than two equally distant matches from the
+		 * RTE (in turn, our caller will only accept two equally distant
+		 * matches overall).
+		 */
+		if (AttributeNumberIsValid(fuzzystate->second))
+		{
+			/* Too many RTE-level matches */
+			fuzzystate->rfirst = NULL;
+			fuzzystate->first = InvalidAttrNumber;
+			fuzzystate->rsecond = NULL;
+			fuzzystate->second = InvalidAttrNumber;
+			/* Clearly, distance is too low a bar (for *any* RTE) */
+			fuzzystate->distance = columndistance - 1;
+		}
+		else if (AttributeNumberIsValid(fuzzystate->first))
+		{
+			/* Record as provisional second match for RTE */
+			fuzzystate->rsecond = rte;
+			fuzzystate->second = attnum;
+		}
+		else if (fuzzystate->distance <= MAX_FUZZY_DISTANCE)
+		{
+			/*
+			 * Record as provisional first match (this can occasionally occur
+			 * because previous lowest distance was "too low a bar", rather
+			 * than being associated with a real match)
+			 */
+			fuzzystate->rfirst = rte;
+			fuzzystate->first = attnum;
+		}
+	}
+}
+
+/*
  * scanRTEForColumn
  *	  Search the column names of a single RTE for the given name.
  *	  If found, return an appropriate Var node, else return NULL.
@@ -537,10 +658,14 @@ GetCTEForRTE(ParseState *pstate, RangeTblEntry *rte, int rtelevelsup)
  *
  * Side effect: if we find a match, mark the RTE as requiring read access
  * for the column.
+ *
+ * Additional side effect: if fuzzystate is non-NULL, check non-system columns
+ * for an approximate match and update fuzzystate accordingly.
  */
 Node *
-scanRTEForColumn(ParseState *pstate, RangeTblEntry *rte, char *colname,
-				 int location)
+scanRTEForColumn(ParseState *pstate, RangeTblEntry *rte, const char *colname,
+				 int location, int fuzzy_rte_penalty,
+				 FuzzyAttrMatchState *fuzzystate)
 {
 	Node	   *result = NULL;
 	int			attnum = 0;
@@ -558,12 +683,16 @@ scanRTEForColumn(ParseState *pstate, RangeTblEntry *rte, char *colname,
 	 * Should this somehow go wrong and we try to access a dropped column,
 	 * we'll still catch it by virtue of the checks in
 	 * get_rte_attribute_type(), which is called by make_var().  That routine
-	 * has to do a cache lookup anyway, so the check there is cheap.
+	 * has to do a cache lookup anyway, so the check there is cheap.  Callers
+	 * interested in finding match with shortest distance need to defend
+	 * against this directly, though.
 	 */
 	foreach(c, rte->eref->colnames)
 	{
+		const char *attcolname = strVal(lfirst(c));
+
 		attnum++;
-		if (strcmp(strVal(lfirst(c)), colname) == 0)
+		if (strcmp(attcolname, colname) == 0)
 		{
 			if (result)
 				ereport(ERROR,
@@ -576,6 +705,11 @@ scanRTEForColumn(ParseState *pstate, RangeTblEntry *rte, char *colname,
 			markVarForSelectPriv(pstate, var, rte);
 			result = (Node *) var;
 		}
+
+		/* Updating fuzzy match state, if provided. */
+		if (fuzzystate != NULL)
+			updateFuzzyAttrMatchState(fuzzy_rte_penalty, fuzzystate,
+									  rte, attcolname, colname, attnum);
 	}
 
 	/*
@@ -586,25 +720,44 @@ scanRTEForColumn(ParseState *pstate, RangeTblEntry *rte, char *colname,
 		return result;
 
 	/*
-	 * If the RTE represents a real table, consider system column names.
+	 * If the RTE represents a real relation, consider system column names.
+	 * Composites are only used for pseudo-relations like ON CONFLICT's
+	 * excluded.
 	 */
-	if (rte->rtekind == RTE_RELATION)
+	if (rte->rtekind == RTE_RELATION &&
+		rte->relkind != RELKIND_COMPOSITE_TYPE)
 	{
+		/* In GPDB, system columns like gp_segment_id, ctid, xmin/xmax seem to be
+		 * ambiguous for replicated table, replica in each segment has different
+		 * value of those columns, between sessions, different replicas are chosen
+		 * to provide data, so it's weird for users to see different system columns
+		 * between sessions. So for replicated table, we don't expose system columns
+		 * unless it's GP_ROLE_UTILITY for debug purpose.
+		 */
+		if (GpPolicyIsReplicated(GpPolicyFetch(rte->relid)) &&
+			Gp_role != GP_ROLE_UTILITY)
+			return result;
+
 		/* quick check to see if name could be a system column */
 		attnum = specialAttNum(colname);
 
 		/* In constraint check, no system column is allowed except tableOid */
-		/*
-		 * In GPDB, tableoid is not allowed either, because we've removed
-		 * HeapTupleData.t_tableOid field.
-		 * GPDB_94_MERGE_FIXME: Could we make that work somehow? Resurrect
-		 * t_tableOid, maybe? I think we'd need it for logical decoding as well.
-		 */
 		if (pstate->p_expr_kind == EXPR_KIND_CHECK_CONSTRAINT &&
-			attnum < InvalidAttrNumber /* && attnum != TableOidAttributeNumber */)
+			attnum < InvalidAttrNumber && attnum != TableOidAttributeNumber)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_COLUMN_REFERENCE),
 					 errmsg("system column \"%s\" reference in check constraint is invalid",
+							colname),
+					 parser_errposition(pstate, location)));
+
+		/*
+		 * In generated column, no system column is allowed except tableOid.
+		 */
+		if (pstate->p_expr_kind == EXPR_KIND_GENERATED_COLUMN &&
+			attnum < InvalidAttrNumber && attnum != TableOidAttributeNumber)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_COLUMN_REFERENCE),
+					 errmsg("cannot use system column \"%s\" in column generation expression",
 							colname),
 					 parser_errposition(pstate, location)));
 
@@ -641,7 +794,7 @@ scanRTEForColumn(ParseState *pstate, RangeTblEntry *rte, char *colname,
  *	  If localonly is true, only names in the innermost query are considered.
  */
 Node *
-colNameToVar(ParseState *pstate, char *colname, bool localonly,
+colNameToVar(ParseState *pstate, const char *colname, bool localonly,
 			 int location)
 {
 	Node	   *result = NULL;
@@ -665,7 +818,8 @@ colNameToVar(ParseState *pstate, char *colname, bool localonly,
 				continue;
 
 			/* use orig_pstate here to get the right sublevels_up */
-			newresult = scanRTEForColumn(orig_pstate, rte, colname, location);
+			newresult = scanRTEForColumn(orig_pstate, rte, colname, location,
+										 0, NULL);
 
 			if (newresult)
 			{
@@ -691,8 +845,8 @@ colNameToVar(ParseState *pstate, char *colname, bool localonly,
 
 /*
  * searchRangeTableForCol
- *	  See if any RangeTblEntry could possibly provide the given column name.
- *	  If so, return a pointer to the RangeTblEntry; else return NULL.
+ *	  See if any RangeTblEntry could possibly provide the given column name (or
+ *	  find the best match available).  Returns state with relevant details.
  *
  * This is different from colNameToVar in that it considers every entry in
  * the ParseState's rangetable(s), not only those that are currently visible
@@ -700,11 +854,31 @@ colNameToVar(ParseState *pstate, char *colname, bool localonly,
  * and it may give ambiguous results (there might be multiple equally valid
  * matches, but only one will be returned).  This must be used ONLY as a
  * heuristic in giving suitable error messages.  See errorMissingColumn.
+ *
+ * This function is also different in that it will consider approximate
+ * matches -- if the user entered an alias/column pair that is only slightly
+ * different from a valid pair, we may be able to infer what they meant to
+ * type and provide a reasonable hint.
+ *
+ * The FuzzyAttrMatchState will have 'rfirst' pointing to the best RTE
+ * containing the most promising match for the alias and column name.  If
+ * the alias and column names match exactly, 'first' will be InvalidAttrNumber;
+ * otherwise, it will be the attribute number for the match.  In the latter
+ * case, 'rsecond' may point to a second, equally close approximate match,
+ * and 'second' will contain the attribute number for the second match.
  */
-static RangeTblEntry *
-searchRangeTableForCol(ParseState *pstate, char *colname, int location)
+static FuzzyAttrMatchState *
+searchRangeTableForCol(ParseState *pstate, const char *alias, const char *colname,
+					   int location)
 {
 	ParseState *orig_pstate = pstate;
+	FuzzyAttrMatchState *fuzzystate = palloc(sizeof(FuzzyAttrMatchState));
+
+	fuzzystate->distance = MAX_FUZZY_DISTANCE + 1;
+	fuzzystate->rfirst = NULL;
+	fuzzystate->rsecond = NULL;
+	fuzzystate->first = InvalidAttrNumber;
+	fuzzystate->second = InvalidAttrNumber;
 
 	while (pstate != NULL)
 	{
@@ -713,14 +887,52 @@ searchRangeTableForCol(ParseState *pstate, char *colname, int location)
 		foreach(l, pstate->p_rtable)
 		{
 			RangeTblEntry *rte = (RangeTblEntry *) lfirst(l);
+			int			fuzzy_rte_penalty = 0;
 
-			if (scanRTEForColumn(orig_pstate, rte, colname, location))
-				return rte;
+			/*
+			 * Typically, it is not useful to look for matches within join
+			 * RTEs; they effectively duplicate other RTEs for our purposes,
+			 * and if a match is chosen from a join RTE, an unhelpful alias is
+			 * displayed in the final diagnostic message.
+			 */
+			if (rte->rtekind == RTE_JOIN)
+				continue;
+
+			/*
+			 * If the user didn't specify an alias, then matches against one
+			 * RTE are as good as another.  But if the user did specify an
+			 * alias, then we want at least a fuzzy - and preferably an exact
+			 * - match for the range table entry.
+			 */
+			if (alias != NULL)
+				fuzzy_rte_penalty =
+					varstr_levenshtein_less_equal(alias, strlen(alias),
+												  rte->eref->aliasname,
+												  strlen(rte->eref->aliasname),
+												  1, 1, 1,
+												  MAX_FUZZY_DISTANCE + 1,
+												  true);
+
+			/*
+			 * Scan for a matching column; if we find an exact match, we're
+			 * done.  Otherwise, update fuzzystate.
+			 */
+			if (scanRTEForColumn(orig_pstate, rte, colname, location,
+								 fuzzy_rte_penalty, fuzzystate)
+				&& fuzzy_rte_penalty == 0)
+			{
+				fuzzystate->rfirst = rte;
+				fuzzystate->first = InvalidAttrNumber;
+				fuzzystate->rsecond = NULL;
+				fuzzystate->second = InvalidAttrNumber;
+				return fuzzystate;
+			}
 		}
 
 		pstate = pstate->parentParseState;
 	}
-	return NULL;
+
+	return fuzzystate;
 }
 
 /*
@@ -746,7 +958,7 @@ markRTEForSelectPriv(ParseState *pstate, RangeTblEntry *rte,
 		rte->requiredPerms |= ACL_SELECT;
 		/* Must offset the attnum to fit in a bitmapset */
 		rte->selectedCols = bms_add_member(rte->selectedCols,
-								   col - FirstLowInvalidHeapAttributeNumber);
+										   col - FirstLowInvalidHeapAttributeNumber);
 	}
 	else if (rte->rtekind == RTE_JOIN)
 	{
@@ -759,12 +971,11 @@ markRTEForSelectPriv(ParseState *pstate, RangeTblEntry *rte,
 			JoinExpr   *j;
 
 			if (rtindex > 0 && rtindex <= list_length(pstate->p_joinexprs))
-				j = (JoinExpr *) list_nth(pstate->p_joinexprs, rtindex - 1);
+				j = list_nth_node(JoinExpr, pstate->p_joinexprs, rtindex - 1);
 			else
 				j = NULL;
 			if (j == NULL)
 				elog(ERROR, "could not find JoinExpr for whole-row reference");
-			Assert(IsA(j, JoinExpr));
 
 			/* Note: we can't see FromExpr here */
 			if (IsA(j->larg, RangeTblRef))
@@ -881,7 +1092,7 @@ buildRelationAliases(TupleDesc tupdesc, Alias *alias, Alias *eref)
 
 	for (varattno = 0; varattno < maxattrs; varattno++)
 	{
-		Form_pg_attribute attr = tupdesc->attrs[varattno];
+		Form_pg_attribute attr = TupleDescAttr(tupdesc, varattno);
 		Value	   *attrname;
 
 		if (attr->attisdropped)
@@ -963,12 +1174,17 @@ chooseScalarFunctionAlias(Node *funcexpr, char *funcname,
 /*
  * Open a table during parse analysis
  *
- * This is essentially the same as CdbOpenRelationRv, except that it caters
- * to some parser-specific error reporting needs.
+ * This is essentially just the same as table_openrv(), except that it caters
+ * to some parser-specific error reporting needs, notably that it arranges
+ * to include the RangeVar's parse location in any resulting error.
+ *
+ * Note: properly, lockmode should be declared LOCKMODE not int, but that
+ * would require importing storage/lock.h into parse_relation.h.  Since
+ * LOCKMODE is typedef'd as int anyway, that seems like overkill.
  */
 Relation
 parserOpenTable(ParseState *pstate, const RangeVar *relation,
-				int lockmode, bool nowait, bool *lockUpgraded)
+				int lockmode, bool *lockUpgraded)
 {
 	Relation	rel;
 	ParseCallbackState pcbstate;
@@ -978,7 +1194,14 @@ parserOpenTable(ParseState *pstate, const RangeVar *relation,
 
 	/* Look up the appropriate relation using namespace search */
 	relid = RangeVarGetRelid(relation, NoLock, true);
-	if (relid == InvalidOid)
+	/*
+	 * CdbTryOpenTable might return NULL (for example, if the table
+	 * is dropped by another transaction). Every time we invoke function
+	 * CdbTryOpenTable, we should check if the return value is NULL.
+	 */
+	rel = CdbTryOpenTable(relid, lockmode, lockUpgraded);
+
+	if (!RelationIsValid(rel))
 	{
 		if (relation->schemaname)
 			ereport(ERROR,
@@ -1008,7 +1231,6 @@ parserOpenTable(ParseState *pstate, const RangeVar *relation,
 								relation->relname)));
 		}
 	}
-	rel = CdbTryOpenRelation(relid, lockmode, nowait, lockUpgraded);
 
 	cancel_parser_errposition_callback(&pcbstate);
 	return rel;
@@ -1016,9 +1238,6 @@ parserOpenTable(ParseState *pstate, const RangeVar *relation,
 
 /*
  * Add an entry for a relation to the pstate's range table (p_rtable).
- *
- * If pstate is NULL, we just build an RTE and return it without adding it
- * to an rtable list.
  *
  * Note: formerly this checked for refname conflicts, but that's wrong.
  * Caller is responsible for checking for conflicts in the appropriate scope.
@@ -1033,54 +1252,77 @@ addRangeTableEntry(ParseState *pstate,
 	RangeTblEntry *rte = makeNode(RangeTblEntry);
 	char	   *refname = alias ? alias->aliasname : relation->relname;
 	LOCKMODE	lockmode = AccessShareLock;
-	bool		nowait = false;
 	LockingClause *locking;
 	Relation	rel;
-	ParseCallbackState pcbstate;
+
+	Assert(pstate != NULL);
 
 	rte->alias = alias;
 	rte->rtekind = RTE_RELATION;
 
 	/*
-	 * CDB: lock promotion around the locking clause is a little different
-	 * from postgres to allow for required lock promotion for distributed
-	 * AO tables.
-	 * select for update should lock the whole table, we do it here.
+	 * Identify the type of lock we'll need on this relation.  It's not the
+	 * query's target table (that case is handled elsewhere), so we need
+	 * either RowShareLock if it's locked by FOR UPDATE/SHARE, or plain
+	 * AccessShareLock otherwise.
+	 */
+	/*
+	 * Greenplum specific behavior:
+	 * The implementation of select statement with locking clause
+	 * (for update | no key update | share | key share) in postgres
+	 * is to hold RowShareLock on tables during parsing stage, and
+	 * generate a LockRows plan node for executor to lock the tuples.
+	 * It is not easy to lock tuples in Greenplum database, since
+	 * tuples may be fetched through motion nodes.
+	 *
+	 * But when Global Deadlock Detector is enabled, and the select
+	 * statement with locking clause contains only one table, we are
+	 * sure that there are no motions. For such simple cases, we could
+	 * make the behavior just the same as Postgres.
 	 */
 	locking = getLockedRefname(pstate, refname);
 	if (locking)
 	{
-		if (locking->strength >= LCS_FORNOKEYUPDATE)
-		{
-			Oid relid;
-			
-			relid = RangeVarGetRelid(relation, lockmode, false);
-			
-			rel = try_heap_open(relid, NoLock, true);
-			if (!rel)
-				elog(ERROR, "open relation(%u) fail", relid);
-			lockmode = IsSystemRelation(rel) ? RowExclusiveLock : ExclusiveLock;
-			heap_close(rel, NoLock);
-		}
-		else
-		{
-			lockmode = RowShareLock;
-		}
-		nowait = locking->noWait;
+		Oid relid;
+
+		relid = RangeVarGetRelid(relation, lockmode, false);
+
+		rel = try_table_open(relid, NoLock, true);
+		if (!rel)
+			elog(ERROR, "open relation(%u) fail", relid);
+
+		if (rel->rd_rel->relkind != RELKIND_RELATION ||
+			GpPolicyIsReplicated(rel->rd_cdbpolicy) ||
+			RelationIsAppendOptimized(rel))
+			pstate->p_canOptSelectLockingClause = false;
+
+		if (rel->rd_rel->relkind == RELKIND_MATVIEW)
+			ereport(ERROR,
+					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+					 errmsg("cannot lock rows in materialized view \"%s\"",
+							RelationGetRelationName(rel))));
+
+		lockmode = pstate->p_canOptSelectLockingClause ? RowShareLock : ExclusiveLock;
+		if (lockmode == ExclusiveLock && locking->waitPolicy != LockWaitBlock)
+			ereport(WARNING,
+					(errmsg("Upgrade the lockmode to ExclusiveLock on table(%s) and ingore the wait policy.",
+					 RelationGetRelationName(rel))));
+
+		heap_close(rel, NoLock);
+
 	}
+	else
+		lockmode = AccessShareLock;
 
 	/*
 	 * Get the rel's OID.  This access also ensures that we have an up-to-date
 	 * relcache entry for the rel.  Since this is typically the first access
-	 * to a rel in a statement, be careful to get the right access level
-	 * depending on whether we're doing SELECT FOR UPDATE/SHARE.
+	 * to a rel in a statement, we must open the rel with the proper lockmode.
 	 */
-	setup_parser_errposition_callback(&pcbstate, pstate, relation->location);
-	rel = parserOpenTable(pstate, relation, lockmode, nowait, NULL);
-	cancel_parser_errposition_callback(&pcbstate);
+	rel = parserOpenTable(pstate, relation, lockmode, NULL);
 	rte->relid = RelationGetRelid(rel);
 	rte->relkind = rel->rd_rel->relkind;
-
+	rte->rellockmode = lockmode;
 
 	/*
 	 * Build the list of effective column names using user-supplied aliases
@@ -1094,7 +1336,7 @@ addRangeTableEntry(ParseState *pstate,
 	 * so that the table can't be deleted or have its schema modified
 	 * underneath us.
 	 */
-	heap_close(rel, NoLock);
+	table_close(rel, NoLock);
 
 	/*
 	 * Set flags and access permissions.
@@ -1107,16 +1349,17 @@ addRangeTableEntry(ParseState *pstate,
 	rte->inFromCl = inFromCl;
 
 	rte->requiredPerms = ACL_SELECT;
-	rte->checkAsUser = InvalidOid;		/* not set-uid by default, either */
+	rte->checkAsUser = InvalidOid;	/* not set-uid by default, either */
 	rte->selectedCols = NULL;
-	rte->modifiedCols = NULL;
+	rte->insertedCols = NULL;
+	rte->updatedCols = NULL;
+	rte->extraUpdatedCols = NULL;
 
 	/*
 	 * Add completed RTE to pstate's range table list, but not to join list
 	 * nor namespace --- caller must do that if appropriate.
 	 */
-	if (pstate != NULL)
-		pstate->p_rtable = lappend(pstate->p_rtable, rte);
+	pstate->p_rtable = lappend(pstate->p_rtable, rte);
 
 	return rte;
 }
@@ -1126,10 +1369,20 @@ addRangeTableEntry(ParseState *pstate,
  *
  * This is just like addRangeTableEntry() except that it makes an RTE
  * given an already-open relation instead of a RangeVar reference.
+ *
+ * lockmode is the lock type required for query execution; it must be one
+ * of AccessShareLock, RowShareLock, or RowExclusiveLock depending on the
+ * RTE's role within the query.  The caller must hold that lock mode
+ * or a stronger one.
+ *
+ * Note: properly, lockmode should be declared LOCKMODE not int, but that
+ * would require importing storage/lock.h into parse_relation.h.  Since
+ * LOCKMODE is typedef'd as int anyway, that seems like overkill.
  */
 RangeTblEntry *
 addRangeTableEntryForRelation(ParseState *pstate,
 							  Relation rel,
+							  int lockmode,
 							  Alias *alias,
 							  bool inh,
 							  bool inFromCl)
@@ -1137,10 +1390,18 @@ addRangeTableEntryForRelation(ParseState *pstate,
 	RangeTblEntry *rte = makeNode(RangeTblEntry);
 	char	   *refname = alias ? alias->aliasname : RelationGetRelationName(rel);
 
+	Assert(pstate != NULL);
+
+	Assert(lockmode == AccessShareLock ||
+		   lockmode == RowShareLock ||
+		   lockmode == RowExclusiveLock);
+	Assert(CheckRelationLockedByMe(rel, lockmode, true));
+
 	rte->rtekind = RTE_RELATION;
 	rte->alias = alias;
 	rte->relid = RelationGetRelid(rel);
 	rte->relkind = rel->rd_rel->relkind;
+	rte->rellockmode = lockmode;
 
 	/*
 	 * Build the list of effective column names using user-supplied aliases
@@ -1160,16 +1421,17 @@ addRangeTableEntryForRelation(ParseState *pstate,
 	rte->inFromCl = inFromCl;
 
 	rte->requiredPerms = ACL_SELECT;
-	rte->checkAsUser = InvalidOid;		/* not set-uid by default, either */
+	rte->checkAsUser = InvalidOid;	/* not set-uid by default, either */
 	rte->selectedCols = NULL;
-	rte->modifiedCols = NULL;
+	rte->insertedCols = NULL;
+	rte->updatedCols = NULL;
+	rte->extraUpdatedCols = NULL;
 
 	/*
 	 * Add completed RTE to pstate's range table list, but not to join list
 	 * nor namespace --- caller must do that if appropriate.
 	 */
-	if (pstate != NULL)
-		pstate->p_rtable = lappend(pstate->p_rtable, rte);
+	pstate->p_rtable = lappend(pstate->p_rtable, rte);
 
 	return rte;
 }
@@ -1195,7 +1457,6 @@ addRangeTableEntryForSubquery(ParseState *pstate,
 	ListCell   *tlistitem;
 
 	rte->rtekind = RTE_SUBQUERY;
-	rte->relid = InvalidOid;
 	rte->subquery = subquery;
 	rte->alias = alias;
 
@@ -1240,7 +1501,9 @@ addRangeTableEntryForSubquery(ParseState *pstate,
 	rte->requiredPerms = 0;
 	rte->checkAsUser = InvalidOid;
 	rte->selectedCols = NULL;
-	rte->modifiedCols = NULL;
+	rte->insertedCols = NULL;
+	rte->updatedCols = NULL;
+	rte->extraUpdatedCols = NULL;
 
 	/*
 	 * Add completed RTE to pstate's range table list, but not to join list
@@ -1284,6 +1547,8 @@ addRangeTableEntryForFunction(ParseState *pstate,
 	int			natts,
 				totalatts;
 
+	Assert(pstate != NULL);
+
 	rte->rtekind = RTE_FUNCTION;
 	rte->relid = InvalidOid;
 	rte->subquery = NULL;
@@ -1324,7 +1589,7 @@ addRangeTableEntryForFunction(ParseState *pstate,
 		rtfunc->funccoltypes = NIL;
 		rtfunc->funccoltypmods = NIL;
 		rtfunc->funccolcollations = NIL;
-		rtfunc->funcparams = NULL;		/* not set until planning */
+		rtfunc->funcparams = NULL;	/* not set until planning */
 
 		/*
 		 * If the function has TABLE value expressions in its arguments then it must
@@ -1402,13 +1667,13 @@ addRangeTableEntryForFunction(ParseState *pstate,
 			Datum     d;
 			int       i;
 
-			Insist(TypeSupportsDescribe(funcrettype));
+			Assert(TypeSupportsDescribe(funcrettype));
 
 			funcDescribe = lookupProcCallback(func->funcid, PROMETHOD_DESCRIBE);
 			if (OidIsValid(funcDescribe))
 			{
 				FmgrInfo	flinfo;
-				FunctionCallInfoData fcinfo;
+				LOCAL_FCINFO(fcinfo, 1);
 
 				/*
 				 * Describe functions have the signature  d(internal) => internal
@@ -1419,12 +1684,12 @@ addRangeTableEntryForFunction(ParseState *pstate,
 				 */
 				rtfunc->funcuserdata = NULL;
 				fmgr_info(funcDescribe, &flinfo);
-				InitFunctionCallInfoData(fcinfo, &flinfo, 1, InvalidOid, (Node *) rtfunc, NULL);
-				fcinfo.arg[0] = PointerGetDatum(funcexpr);
-				fcinfo.argnull[0] = false;
+				InitFunctionCallInfoData(*fcinfo, &flinfo, 1, InvalidOid, (Node *) rtfunc, NULL);
+				fcinfo->args[0].value = PointerGetDatum(funcexpr);
+				fcinfo->args[0].isnull = false;
 
-				d = FunctionCallInvoke(&fcinfo);
-				if (fcinfo.isnull)
+				d = FunctionCallInvoke(fcinfo);
+				if (fcinfo->isnull)
 					elog(ERROR, "function %u returned NULL", flinfo.fn_oid);
 				tupdesc = (TupleDesc) DatumGetPointer(d);
 
@@ -1437,7 +1702,7 @@ addRangeTableEntryForFunction(ParseState *pstate,
 					functypclass = TYPEFUNC_COMPOSITE;
 					for (i = 0; i < tupdesc->natts; i++)
 					{
-						Form_pg_attribute attr = tupdesc->attrs[i];
+						Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
 
 						rtfunc->funccolnames	= lappend(rtfunc->funccolnames,
 														  makeString(pstrdup(NameStr(attr->attname))));
@@ -1463,7 +1728,7 @@ addRangeTableEntryForFunction(ParseState *pstate,
 						(errcode(ERRCODE_SYNTAX_ERROR),
 						 errmsg("a column definition list is only allowed for functions returning \"record\""),
 						 parser_errposition(pstate,
-										exprLocation((Node *) coldeflist))));
+											exprLocation((Node *) coldeflist))));
 		}
 		else
 		{
@@ -1474,7 +1739,8 @@ addRangeTableEntryForFunction(ParseState *pstate,
 						 parser_errposition(pstate, exprLocation(funcexpr))));
 		}
 
-		if (functypclass == TYPEFUNC_COMPOSITE)
+		if (functypclass == TYPEFUNC_COMPOSITE ||
+			functypclass == TYPEFUNC_COMPOSITE_DOMAIN)
 		{
 			/* Composite data type, e.g. a table's row type */
 			Assert(tupdesc);
@@ -1482,7 +1748,7 @@ addRangeTableEntryForFunction(ParseState *pstate,
 		else if (functypclass == TYPEFUNC_SCALAR)
 		{
 			/* Base data type, i.e. scalar */
-			tupdesc = CreateTemplateTupleDesc(1, false);
+			tupdesc = CreateTemplateTupleDesc(1);
 			TupleDescInitEntry(tupdesc,
 							   (AttrNumber) 1,
 							   chooseScalarFunctionAlias(funcexpr, funcname,
@@ -1499,7 +1765,7 @@ addRangeTableEntryForFunction(ParseState *pstate,
 			 * Use the column definition list to construct a tupdesc and fill
 			 * in the RangeTblFunction's lists.
 			 */
-			tupdesc = CreateTemplateTupleDesc(list_length(coldeflist), false);
+			tupdesc = CreateTemplateTupleDesc(list_length(coldeflist));
 			i = 1;
 			foreach(col, coldeflist)
 			{
@@ -1542,15 +1808,21 @@ addRangeTableEntryForFunction(ParseState *pstate,
 
 			/*
 			 * Ensure that the coldeflist defines a legal set of names (no
-			 * duplicates) and datatypes (no pseudo-types, for instance).
+			 * duplicates, but we needn't worry about system column names) and
+			 * datatypes.  Although we mostly can't allow pseudo-types, it
+			 * seems safe to allow RECORD and RECORD[], since values within
+			 * those type classes are self-identifying at runtime, and the
+			 * coldeflist doesn't represent anything that will be visible to
+			 * other sessions.
 			 */
-			CheckAttributeNamesTypes(tupdesc, RELKIND_COMPOSITE_TYPE, false);
+			CheckAttributeNamesTypes(tupdesc, RELKIND_COMPOSITE_TYPE,
+									 CHKATYPE_ANYRECORD);
 		}
 		else
 			ereport(ERROR,
 					(errcode(ERRCODE_DATATYPE_MISMATCH),
-			 errmsg("function \"%s\" in FROM has unsupported return type %s",
-					funcname, format_type_be(funcrettype)),
+					 errmsg("function \"%s\" in FROM has unsupported return type %s",
+							funcname, format_type_be(funcrettype)),
 					 parser_errposition(pstate, exprLocation(funcexpr))));
 
 		/* Finish off the RangeTblFunction and add it to the RTE's list */
@@ -1573,7 +1845,7 @@ addRangeTableEntryForFunction(ParseState *pstate,
 			totalatts++;
 
 		/* Merge the tuple descs of each function into a composite one */
-		tupdesc = CreateTemplateTupleDesc(totalatts, false);
+		tupdesc = CreateTemplateTupleDesc(totalatts);
 		natts = 0;
 		for (i = 0; i < nfuncs; i++)
 		{
@@ -1614,14 +1886,79 @@ addRangeTableEntryForFunction(ParseState *pstate,
 	rte->requiredPerms = 0;
 	rte->checkAsUser = InvalidOid;
 	rte->selectedCols = NULL;
-	rte->modifiedCols = NULL;
+	rte->insertedCols = NULL;
+	rte->updatedCols = NULL;
+	rte->extraUpdatedCols = NULL;
 
 	/*
 	 * Add completed RTE to pstate's range table list, but not to join list
 	 * nor namespace --- caller must do that if appropriate.
 	 */
-	if (pstate != NULL)
-		pstate->p_rtable = lappend(pstate->p_rtable, rte);
+	pstate->p_rtable = lappend(pstate->p_rtable, rte);
+
+	return rte;
+}
+
+/*
+ * Add an entry for a table function to the pstate's range table (p_rtable).
+ *
+ * This is much like addRangeTableEntry() except that it makes a tablefunc RTE.
+ */
+RangeTblEntry *
+addRangeTableEntryForTableFunc(ParseState *pstate,
+							   TableFunc *tf,
+							   Alias *alias,
+							   bool lateral,
+							   bool inFromCl)
+{
+	RangeTblEntry *rte = makeNode(RangeTblEntry);
+	char	   *refname = alias ? alias->aliasname : pstrdup("xmltable");
+	Alias	   *eref;
+	int			numaliases;
+
+	Assert(pstate != NULL);
+
+	rte->rtekind = RTE_TABLEFUNC;
+	rte->relid = InvalidOid;
+	rte->subquery = NULL;
+	rte->tablefunc = tf;
+	rte->coltypes = tf->coltypes;
+	rte->coltypmods = tf->coltypmods;
+	rte->colcollations = tf->colcollations;
+	rte->alias = alias;
+
+	eref = alias ? copyObject(alias) : makeAlias(refname, NIL);
+	numaliases = list_length(eref->colnames);
+
+	/* fill in any unspecified alias columns */
+	if (numaliases < list_length(tf->colnames))
+		eref->colnames = list_concat(eref->colnames,
+									 list_copy_tail(tf->colnames, numaliases));
+
+	rte->eref = eref;
+
+	/*
+	 * Set flags and access permissions.
+	 *
+	 * Tablefuncs are never checked for access rights (at least, not by the
+	 * RTE permissions mechanism).
+	 */
+	rte->lateral = lateral;
+	rte->inh = false;			/* never true for tablefunc RTEs */
+	rte->inFromCl = inFromCl;
+
+	rte->requiredPerms = 0;
+	rte->checkAsUser = InvalidOid;
+	rte->selectedCols = NULL;
+	rte->insertedCols = NULL;
+	rte->updatedCols = NULL;
+	rte->extraUpdatedCols = NULL;
+
+	/*
+	 * Add completed RTE to pstate's range table list, but not to join list
+	 * nor namespace --- caller must do that if appropriate.
+	 */
+	pstate->p_rtable = lappend(pstate->p_rtable, rte);
 
 	return rte;
 }
@@ -1634,7 +1971,9 @@ addRangeTableEntryForFunction(ParseState *pstate,
 RangeTblEntry *
 addRangeTableEntryForValues(ParseState *pstate,
 							List *exprs,
-							List *collations,
+							List *coltypes,
+							List *coltypmods,
+							List *colcollations,
 							Alias *alias,
 							bool lateral,
 							bool inFromCl)
@@ -1645,11 +1984,15 @@ addRangeTableEntryForValues(ParseState *pstate,
 	int			numaliases;
 	int			numcolumns;
 
+	Assert(pstate != NULL);
+
 	rte->rtekind = RTE_VALUES;
 	rte->relid = InvalidOid;
 	rte->subquery = NULL;
 	rte->values_lists = exprs;
-	rte->values_collations = collations;
+	rte->coltypes = coltypes;
+	rte->coltypmods = coltypmods;
+	rte->colcollations = colcollations;
 	rte->alias = alias;
 
 	eref = alias ? copyObject(alias) : makeAlias(refname, NIL);
@@ -1686,14 +2029,15 @@ addRangeTableEntryForValues(ParseState *pstate,
 	rte->requiredPerms = 0;
 	rte->checkAsUser = InvalidOid;
 	rte->selectedCols = NULL;
-	rte->modifiedCols = NULL;
+	rte->insertedCols = NULL;
+	rte->updatedCols = NULL;
+	rte->extraUpdatedCols = NULL;
 
 	/*
 	 * Add completed RTE to pstate's range table list, but not to join list
 	 * nor namespace --- caller must do that if appropriate.
 	 */
-	if (pstate != NULL)
-		pstate->p_rtable = lappend(pstate->p_rtable, rte);
+	pstate->p_rtable = lappend(pstate->p_rtable, rte);
 
 	return rte;
 }
@@ -1715,6 +2059,8 @@ addRangeTableEntryForJoin(ParseState *pstate,
 	Alias	   *eref;
 	int			numaliases;
 
+	Assert(pstate != NULL);
+
 	/*
 	 * Fail if join has too many columns --- we must be able to reference any
 	 * of the columns with an AttrNumber.
@@ -1732,10 +2078,7 @@ addRangeTableEntryForJoin(ParseState *pstate,
 	rte->joinaliasvars = aliasvars;
 	rte->alias = alias;
 
-	/* transform any Vars of type UNKNOWNOID if we can */
-	fixup_unknown_vars_in_exprlist(pstate, rte->joinaliasvars);
-
-	eref = alias ? (Alias *) copyObject(alias) : makeAlias("unnamed_join", NIL);
+	eref = alias ? copyObject(alias) : makeAlias("unnamed_join", NIL);
 	numaliases = list_length(eref->colnames);
 
 	/* fill in any unspecified alias columns */
@@ -1757,14 +2100,15 @@ addRangeTableEntryForJoin(ParseState *pstate,
 	rte->requiredPerms = 0;
 	rte->checkAsUser = InvalidOid;
 	rte->selectedCols = NULL;
-	rte->modifiedCols = NULL;
+	rte->insertedCols = NULL;
+	rte->updatedCols = NULL;
+	rte->extraUpdatedCols = NULL;
 
 	/*
 	 * Add completed RTE to pstate's range table list, but not to join list
 	 * nor namespace --- caller must do that if appropriate.
 	 */
-	if (pstate != NULL)
-		pstate->p_rtable = lappend(pstate->p_rtable, rte);
+	pstate->p_rtable = lappend(pstate->p_rtable, rte);
 
 	return rte;
 }
@@ -1788,6 +2132,8 @@ addRangeTableEntryForCTE(ParseState *pstate,
 	int			numaliases;
 	int			varattno;
 	ListCell   *lc;
+
+	Assert(pstate != NULL);
 
 	rte->rtekind = RTE_CTE;
 	rte->ctename = cte->ctename;
@@ -1813,14 +2159,14 @@ addRangeTableEntryForCTE(ParseState *pstate,
 			ctequery->returningList == NIL)
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("WITH query \"%s\" does not have a RETURNING clause",
-						cte->ctename),
+					 errmsg("WITH query \"%s\" does not have a RETURNING clause",
+							cte->ctename),
 					 parser_errposition(pstate, rv->location)));
 	}
 
-	rte->ctecoltypes = cte->ctecoltypes;
-	rte->ctecoltypmods = cte->ctecoltypmods;
-	rte->ctecolcollations = cte->ctecolcollations;
+	rte->coltypes = cte->ctecoltypes;
+	rte->coltypmods = cte->ctecoltypmods;
+	rte->colcollations = cte->ctecolcollations;
 
 	rte->alias = alias;
 	if (alias)
@@ -1857,14 +2203,120 @@ addRangeTableEntryForCTE(ParseState *pstate,
 	rte->requiredPerms = 0;
 	rte->checkAsUser = InvalidOid;
 	rte->selectedCols = NULL;
-	rte->modifiedCols = NULL;
+	rte->insertedCols = NULL;
+	rte->updatedCols = NULL;
+	rte->extraUpdatedCols = NULL;
 
 	/*
 	 * Add completed RTE to pstate's range table list, but not to join list
 	 * nor namespace --- caller must do that if appropriate.
 	 */
-	if (pstate != NULL)
-		pstate->p_rtable = lappend(pstate->p_rtable, rte);
+	pstate->p_rtable = lappend(pstate->p_rtable, rte);
+
+	return rte;
+}
+
+/*
+ * Add an entry for an ephemeral named relation reference to the pstate's
+ * range table (p_rtable).
+ *
+ * It is expected that the RangeVar, which up until now is only known to be an
+ * ephemeral named relation, will (in conjunction with the QueryEnvironment in
+ * the ParseState), create a RangeTblEntry for a specific *kind* of ephemeral
+ * named relation, based on enrtype.
+ *
+ * This is much like addRangeTableEntry() except that it makes an RTE for an
+ * ephemeral named relation.
+ */
+RangeTblEntry *
+addRangeTableEntryForENR(ParseState *pstate,
+						 RangeVar *rv,
+						 bool inFromCl)
+{
+	RangeTblEntry *rte = makeNode(RangeTblEntry);
+	Alias	   *alias = rv->alias;
+	char	   *refname = alias ? alias->aliasname : rv->relname;
+	EphemeralNamedRelationMetadata enrmd;
+	TupleDesc	tupdesc;
+	int			attno;
+
+	Assert(pstate != NULL);
+	enrmd = get_visible_ENR(pstate, rv->relname);
+	Assert(enrmd != NULL);
+
+	switch (enrmd->enrtype)
+	{
+		case ENR_NAMED_TUPLESTORE:
+			rte->rtekind = RTE_NAMEDTUPLESTORE;
+			break;
+
+		default:
+			elog(ERROR, "unexpected enrtype: %d", enrmd->enrtype);
+			return NULL;		/* for fussy compilers */
+	}
+
+	/*
+	 * Record dependency on a relation.  This allows plans to be invalidated
+	 * if they access transition tables linked to a table that is altered.
+	 */
+	rte->relid = enrmd->reliddesc;
+
+	/*
+	 * Build the list of effective column names using user-supplied aliases
+	 * and/or actual column names.
+	 */
+	tupdesc = ENRMetadataGetTupDesc(enrmd);
+	rte->eref = makeAlias(refname, NIL);
+	buildRelationAliases(tupdesc, alias, rte->eref);
+
+	/* Record additional data for ENR, including column type info */
+	rte->enrname = enrmd->name;
+	rte->enrtuples = enrmd->enrtuples;
+	rte->coltypes = NIL;
+	rte->coltypmods = NIL;
+	rte->colcollations = NIL;
+	for (attno = 1; attno <= tupdesc->natts; ++attno)
+	{
+		Form_pg_attribute att = TupleDescAttr(tupdesc, attno - 1);
+
+		if (att->attisdropped)
+		{
+			/* Record zeroes for a dropped column */
+			rte->coltypes = lappend_oid(rte->coltypes, InvalidOid);
+			rte->coltypmods = lappend_int(rte->coltypmods, 0);
+			rte->colcollations = lappend_oid(rte->colcollations, InvalidOid);
+		}
+		else
+		{
+			/* Let's just make sure we can tell this isn't dropped */
+			if (att->atttypid == InvalidOid)
+				elog(ERROR, "atttypid is invalid for non-dropped column in \"%s\"",
+					 rv->relname);
+			rte->coltypes = lappend_oid(rte->coltypes, att->atttypid);
+			rte->coltypmods = lappend_int(rte->coltypmods, att->atttypmod);
+			rte->colcollations = lappend_oid(rte->colcollations,
+											 att->attcollation);
+		}
+	}
+
+	/*
+	 * Set flags and access permissions.
+	 *
+	 * ENRs are never checked for access rights.
+	 */
+	rte->lateral = false;
+	rte->inh = false;			/* never true for ENRs */
+	rte->inFromCl = inFromCl;
+
+	rte->requiredPerms = 0;
+	rte->checkAsUser = InvalidOid;
+	rte->selectedCols = NULL;
+
+	/*
+	 * Add completed RTE to pstate's range table list, but not to join list
+	 * nor namespace --- caller must do that if appropriate.
+	 */
+	pstate->p_rtable = lappend(pstate->p_rtable, rte);
 
 	return rte;
 }
@@ -1922,7 +2374,7 @@ getLockedRefname(ParseState *pstate, const char *refname)
  * isSimplyUpdatableRelation
  *
  * The oid must reference a normal, heap relation. This disallows
- * AO, AO/CO, external tables, views, etc.
+ * AO, AO/CO, external tables, views, replicated table etc.
  *
  * If 'noerror' is true, function returns true/false. If 'noerror'
  * is false, throws an error if the relation is not simply updatable.
@@ -1938,7 +2390,7 @@ isSimplyUpdatableRelation(Oid relid, bool noerror)
 		if (!noerror)
 			ereport(ERROR,
 					(errcode(ERRCODE_UNDEFINED_OBJECT),
-					 errmsg("Invalid oid: %d is not simply updatable", relid)));
+					 errmsg("invalid oid: %d is not simply updatable", relid)));
 		return false;
 	}
 
@@ -1960,7 +2412,8 @@ isSimplyUpdatableRelation(Oid relid, bool noerror)
 			break;
 		}
 
-		if (rel->rd_rel->relkind != RELKIND_RELATION)
+		if (rel->rd_rel->relkind != RELKIND_RELATION &&
+			rel->rd_rel->relkind != RELKIND_PARTITIONED_TABLE)
 		{
 			if (!noerror)
 				ereport(ERROR,
@@ -1971,7 +2424,25 @@ isSimplyUpdatableRelation(Oid relid, bool noerror)
 			break;
 		}
 
-		if (rel->rd_rel->relstorage != RELSTORAGE_HEAP)
+		if (!RelationIsHeap(rel) &&
+			rel->rd_rel->relkind != RELKIND_PARTITIONED_TABLE)
+		{
+			if (!noerror)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("\"%s\" is not simply updatable",
+								RelationGetRelationName(rel))));
+			return_value = false;
+			break;
+		}
+
+		/*
+		 * A row in replicated table cannot be identified by (ctid + gp_segment_id)
+		 * in all replicas, for each row replica, the gp_segment_id is different,
+		 * the ctid is also not guaranteed to be the same, so it's not simply
+		 * updateable for CURRENT OF.
+		 */
+		if (GpPolicyIsReplicated(rel->rd_cdbpolicy))
 		{
 			if (!noerror)
 				ereport(ERROR,
@@ -1985,47 +2456,6 @@ isSimplyUpdatableRelation(Oid relid, bool noerror)
 
 	relation_close(rel, NoLock);
 	return return_value;
-}
-
-/*
- * extractSimplyUpdatableRTEIndex
- *  given a range table associated with a simply updatable range table,
- *    return the desired RangeTblEntry
- *
- * NOTE: The range table *MUST* belong to a simply updatable query.
- * 
- * The semantics of a simply updatable query demand a range table consisting
- * of exactly one logical table. Thus, for the simple case of a one-element
- * range table, we quickly return the index for the lone RTE.
- * However, we must also cope with inheritance, where an RTE requesting 
- * inheritance may have been expanded out into its child relations. In this
- * case, we seek to return the parent RTE.
- */
-Index
-extractSimplyUpdatableRTEIndex(List *rtable) 
-{
-	Assert(list_length(rtable) > 0);
-	if (list_length(rtable) == 1)
-		return 1;
-
-	/* 
-	 * This better be an inheritance case. 
-	 * Find the RTE with inh = true. 
-	 * Furthermore, we Insist that no other RTEs have inh = true. 
-	 */
-	Index 			temp, ret = 0;
-	ListCell        *lc;
-	foreach_with_count (lc, rtable, temp)
-	{
-		RangeTblEntry *rte = (RangeTblEntry *) lfirst(lc);
-		if (rte->inh)
-		{
-			Insist(ret == 0);	/* to be simply updatable, there cannot be more than 1 parent table */
-			ret = temp + 1;		/* the temp counter is zero indexed */
-		}
-	}
-	Insist(ret != 0);
-	return ret;
 }
 
 /*
@@ -2070,8 +2500,8 @@ addRTEtoQuery(ParseState *pstate, RangeTblEntry *rte,
  *
  * This creates lists of an RTE's column names (aliases if provided, else
  * real names) and Vars for each column.  Only user columns are considered.
- * If include_dropped is FALSE then dropped columns are omitted from the
- * results.  If include_dropped is TRUE then empty strings and NULL constants
+ * If include_dropped is false then dropped columns are omitted from the
+ * results.  If include_dropped is true then empty strings and NULL constants
  * (not Vars!) are returned for dropped columns.
  *
  * rtindex, sublevels_up, and location are the varno, varlevelsup, and location
@@ -2118,13 +2548,22 @@ expandRTE(RangeTblEntry *rte, int rtindex, int sublevels_up,
 					varattno++;
 					Assert(varattno == te->resno);
 
+					/*
+					 * In scenarios where columns have been added to a view
+					 * since the outer query was originally parsed, there can
+					 * be more items in the subquery tlist than the outer
+					 * query expects.  We should ignore such extra column(s)
+					 * --- compare the behavior for composite-returning
+					 * functions, in the RTE_FUNCTION case below.
+					 */
+					if (!aliasp_item)
+						break;
+
 					if (colnames)
 					{
-						/* Assume there is one alias per target item */
 						char	   *label = strVal(lfirst(aliasp_item));
 
 						*colnames = lappend(*colnames, makeString(pstrdup(label)));
-						aliasp_item = lnext(aliasp_item);
 					}
 
 					if (colvars)
@@ -2140,6 +2579,8 @@ expandRTE(RangeTblEntry *rte, int rtindex, int sublevels_up,
 
 						*colvars = lappend(*colvars, varnode);
 					}
+
+					aliasp_item = lnext(aliasp_item);
 				}
 			}
 			break;
@@ -2160,7 +2601,8 @@ expandRTE(RangeTblEntry *rte, int rtindex, int sublevels_up,
 					functypclass = get_expr_result_type(rtfunc->funcexpr,
 														&funcrettype,
 														&tupdesc);
-					if (functypclass == TYPEFUNC_COMPOSITE)
+					if (functypclass == TYPEFUNC_COMPOSITE ||
+						functypclass == TYPEFUNC_COMPOSITE_DOMAIN)
 					{
 						/* Composite data type, e.g. a table's row type */
 						Assert(tupdesc);
@@ -2261,46 +2703,6 @@ expandRTE(RangeTblEntry *rte, int rtindex, int sublevels_up,
 				}
 			}
 			break;
-		case RTE_VALUES:
-			{
-				/* Values RTE */
-				ListCell   *aliasp_item = list_head(rte->eref->colnames);
-				ListCell   *lcv;
-				ListCell   *lcc;
-
-				varattno = 0;
-				forboth(lcv, (List *) linitial(rte->values_lists),
-						lcc, rte->values_collations)
-				{
-					Node	   *col = (Node *) lfirst(lcv);
-					Oid			colcollation = lfirst_oid(lcc);
-
-					varattno++;
-					if (colnames)
-					{
-						/* Assume there is one alias per column */
-						char	   *label = strVal(lfirst(aliasp_item));
-
-						*colnames = lappend(*colnames,
-											makeString(pstrdup(label)));
-						aliasp_item = lnext(aliasp_item);
-					}
-
-					if (colvars)
-					{
-						Var		   *varnode;
-
-						varnode = makeVar(rtindex, varattno,
-										  exprType(col),
-										  exprTypmod(col),
-										  colcollation,
-										  sublevels_up);
-						varnode->location = location;
-						*colvars = lappend(*colvars, varnode);
-					}
-				}
-			}
-			break;
 		case RTE_JOIN:
 			{
 				/* Join RTE */
@@ -2370,17 +2772,21 @@ expandRTE(RangeTblEntry *rte, int rtindex, int sublevels_up,
 				}
 			}
 			break;
+		case RTE_TABLEFUNC:
+		case RTE_VALUES:
 		case RTE_CTE:
+		case RTE_NAMEDTUPLESTORE:
 			{
+				/* Tablefunc, Values, CTE, or ENR RTE */
 				ListCell   *aliasp_item = list_head(rte->eref->colnames);
 				ListCell   *lct;
 				ListCell   *lcm;
 				ListCell   *lcc;
 
 				varattno = 0;
-				forthree(lct, rte->ctecoltypes,
-						 lcm, rte->ctecoltypmods,
-						 lcc, rte->ctecolcollations)
+				forthree(lct, rte->coltypes,
+						 lcm, rte->coltypmods,
+						 lcc, rte->colcollations)
 				{
 					Oid			coltype = lfirst_oid(lct);
 					int32		coltypmod = lfirst_int(lcm);
@@ -2391,23 +2797,49 @@ expandRTE(RangeTblEntry *rte, int rtindex, int sublevels_up,
 					if (colnames)
 					{
 						/* Assume there is one alias per output column */
-						char	   *label = strVal(lfirst(aliasp_item));
+						if (OidIsValid(coltype))
+						{
+							char	   *label = strVal(lfirst(aliasp_item));
 
-						*colnames = lappend(*colnames, makeString(pstrdup(label)));
+							*colnames = lappend(*colnames,
+												makeString(pstrdup(label)));
+						}
+						else if (include_dropped)
+							*colnames = lappend(*colnames,
+												makeString(pstrdup("")));
+
 						aliasp_item = lnext(aliasp_item);
 					}
 
 					if (colvars)
 					{
-						Var		   *varnode;
+						if (OidIsValid(coltype))
+						{
+							Var		   *varnode;
 
-						varnode = makeVar(rtindex, varattno,
-										  coltype, coltypmod, colcoll,
-										  sublevels_up);
-						*colvars = lappend(*colvars, varnode);
+							varnode = makeVar(rtindex, varattno,
+											  coltype, coltypmod, colcoll,
+											  sublevels_up);
+							varnode->location = location;
+
+							*colvars = lappend(*colvars, varnode);
+						}
+						else if (include_dropped)
+						{
+							/*
+							 * It doesn't really matter what type the Const
+							 * claims to be.
+							 */
+							*colvars = lappend(*colvars,
+											   makeNullConst(INT4OID, -1,
+															 InvalidOid));
+						}
 					}
 				}
 			}
+			break;
+		case RTE_RESULT:
+			/* These expose no columns, so nothing to do */
 			break;
 		default:
 			elog(ERROR, "unrecognized RTE kind: %d", (int) rte->rtekind);
@@ -2465,7 +2897,7 @@ expandTupleDesc(TupleDesc tupdesc, Alias *eref, int count, int offset,
 	Assert(count <= tupdesc->natts);
 	for (varattno = 0; varattno < count; varattno++)
 	{
-		Form_pg_attribute attr = tupdesc->attrs[varattno];
+		Form_pg_attribute attr = TupleDescAttr(tupdesc, varattno);
 
 		if (attr->attisdropped)
 		{
@@ -2480,7 +2912,7 @@ expandTupleDesc(TupleDesc tupdesc, Alias *eref, int count, int offset,
 					 * what type the Const claims to be.
 					 */
 					*colvars = lappend(*colvars,
-									 makeNullConst(INT4OID, -1, InvalidOid));
+									   makeNullConst(INT4OID, -1, InvalidOid));
 				}
 			}
 			if (aliascell)
@@ -2566,7 +2998,7 @@ expandRelAttrs(ParseState *pstate, RangeTblEntry *rte,
 		markVarForSelectPriv(pstate, varnode, rte);
 	}
 
-	Assert(name == NULL && var == NULL);		/* lists not the same length? */
+	Assert(name == NULL && var == NULL);	/* lists not the same length? */
 
 	return te_list;
 }
@@ -2598,26 +3030,13 @@ get_rte_attribute_name(RangeTblEntry *rte, AttrNumber attnum)
 		return strVal(list_nth(rte->alias->colnames, attnum - 1));
 
 	/*
-	 * CDB: Pseudo columns have negative attribute numbers below the
-	 * lowest system attribute number.
-	 */
-	if (attnum <= FirstLowInvalidHeapAttributeNumber)
-	{
-		CdbRelColumnInfo   *rci = cdb_rte_find_pseudo_column(rte, attnum);
-
-		if (!rci)
-			goto bogus;
-		return rci->colname;
-	}
-
-    /*
 	 * If the RTE is a relation, go to the system catalogs not the
 	 * eref->colnames list.  This is a little slower but it will give the
 	 * right answer if the column has been renamed since the eref list was
 	 * built (which can easily happen for rules).
 	 */
 	if (rte->rtekind == RTE_RELATION)
-		return get_relid_attribute_name(rte->relid, attnum);
+		return get_attname(rte->relid, attnum, false);
 
 	/*
 	 * Otherwise use the column name from eref.  There should always be one.
@@ -2631,12 +3050,11 @@ get_rte_attribute_name(RangeTblEntry *rte, AttrNumber attnum)
     if (attnum < 0 &&
         attnum > FirstLowInvalidHeapAttributeNumber)
     {
-		Form_pg_attribute att_tup = SystemAttributeDefinition(attnum, true);
+		const FormData_pg_attribute *att_tup = SystemAttributeDefinition(attnum);
 
-		return NameStr(att_tup->attname);
+		return pstrdup(NameStr(att_tup->attname));
     }
 
-bogus:
 	/* else caller gave us a bogus attnum */
     name = (rte->eref && rte->eref->aliasname) ? rte->eref->aliasname
                                                : "*BOGUS*";
@@ -2665,7 +3083,7 @@ get_rte_attribute_type(RangeTblEntry *rte, AttrNumber attnum,
 				tp = SearchSysCache2(ATTNUM,
 									 ObjectIdGetDatum(rte->relid),
 									 Int16GetDatum(attnum));
-				if (!HeapTupleIsValid(tp))		/* shouldn't happen */
+				if (!HeapTupleIsValid(tp))	/* shouldn't happen */
 					elog(ERROR, "cache lookup failed for attribute %d of relation %u",
 						 attnum, rte->relid);
 				att_tup = (Form_pg_attribute) GETSTRUCT(tp);
@@ -2677,9 +3095,9 @@ get_rte_attribute_type(RangeTblEntry *rte, AttrNumber attnum,
 				if (att_tup->attisdropped)
 					ereport(ERROR,
 							(errcode(ERRCODE_UNDEFINED_COLUMN),
-					errmsg("column \"%s\" of relation \"%s\" does not exist",
-						   NameStr(att_tup->attname),
-						   get_rel_name(rte->relid))));
+							 errmsg("column \"%s\" of relation \"%s\" does not exist",
+									NameStr(att_tup->attname),
+									get_rel_name(rte->relid))));
 				*vartype = att_tup->atttypid;
 				*vartypmod = att_tup->atttypmod;
 				*varcollid = att_tup->attcollation;
@@ -2724,14 +3142,15 @@ get_rte_attribute_type(RangeTblEntry *rte, AttrNumber attnum,
 															&funcrettype,
 															&tupdesc);
 
-						if (functypclass == TYPEFUNC_COMPOSITE)
+						if (functypclass == TYPEFUNC_COMPOSITE ||
+							functypclass == TYPEFUNC_COMPOSITE_DOMAIN)
 						{
 							/* Composite data type, e.g. a table's row type */
 							Form_pg_attribute att_tup;
 
 							Assert(tupdesc);
 							Assert(attnum <= tupdesc->natts);
-							att_tup = tupdesc->attrs[attnum - 1];
+							att_tup = TupleDescAttr(tupdesc, attnum - 1);
 
 							/*
 							 * If dropped column, pretend it ain't there.  See
@@ -2793,22 +3212,6 @@ get_rte_attribute_type(RangeTblEntry *rte, AttrNumber attnum,
 								rte->eref->aliasname)));
 			}
 			break;
-		case RTE_VALUES:
-			{
-				/* Values RTE --- get type info from first sublist */
-				/* collation is stored separately, though */
-				List	   *collist = (List *) linitial(rte->values_lists);
-				Node	   *col;
-
-				if (attnum < 1 || attnum > list_length(collist))
-					elog(ERROR, "values list %s does not have attribute %d",
-						 rte->eref->aliasname, attnum);
-				col = (Node *) list_nth(collist, attnum - 1);
-				*vartype = exprType(col);
-				*vartypmod = exprTypmod(col);
-				*varcollid = list_nth_oid(rte->values_collations, attnum - 1);
-			}
-			break;
 		case RTE_JOIN:
 			{
 				/*
@@ -2824,14 +3227,36 @@ get_rte_attribute_type(RangeTblEntry *rte, AttrNumber attnum,
 				*varcollid = exprCollation(aliasvar);
 			}
 			break;
+		case RTE_TABLEFUNC:
+		case RTE_VALUES:
 		case RTE_CTE:
+		case RTE_NAMEDTUPLESTORE:
 			{
-				/* CTE RTE --- get type info from lists in the RTE */
-				Assert(attnum > 0 && attnum <= list_length(rte->ctecoltypes));
-				*vartype = list_nth_oid(rte->ctecoltypes, attnum - 1);
-				*vartypmod = list_nth_int(rte->ctecoltypmods, attnum - 1);
-				*varcollid = list_nth_oid(rte->ctecolcollations, attnum - 1);
+				/*
+				 * tablefunc, VALUES, CTE, or ENR RTE --- get type info from
+				 * lists in the RTE
+				 */
+				Assert(attnum > 0 && attnum <= list_length(rte->coltypes));
+				*vartype = list_nth_oid(rte->coltypes, attnum - 1);
+				*vartypmod = list_nth_int(rte->coltypmods, attnum - 1);
+				*varcollid = list_nth_oid(rte->colcollations, attnum - 1);
+
+				/* For ENR, better check for dropped column */
+				if (!OidIsValid(*vartype))
+					ereport(ERROR,
+							(errcode(ERRCODE_UNDEFINED_COLUMN),
+							 errmsg("column %d of relation \"%s\" does not exist",
+									attnum,
+									rte->eref->aliasname)));
 			}
+			break;
+		case RTE_RESULT:
+			/* this probably can't happen ... */
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_COLUMN),
+					 errmsg("column %d of relation \"%s\" does not exist",
+							attnum,
+							rte->eref->aliasname)));
 			break;
 		default:
 			elog(ERROR, "unrecognized RTE kind: %d", (int) rte->rtekind);
@@ -2860,7 +3285,7 @@ get_rte_attribute_is_dropped(RangeTblEntry *rte, AttrNumber attnum)
 				tp = SearchSysCache2(ATTNUM,
 									 ObjectIdGetDatum(rte->relid),
 									 Int16GetDatum(attnum));
-				if (!HeapTupleIsValid(tp))		/* shouldn't happen */
+				if (!HeapTupleIsValid(tp))	/* shouldn't happen */
 					elog(ERROR, "cache lookup failed for attribute %d of relation %u",
 						 attnum, rte->relid);
 				att_tup = (Form_pg_attribute) GETSTRUCT(tp);
@@ -2869,10 +3294,24 @@ get_rte_attribute_is_dropped(RangeTblEntry *rte, AttrNumber attnum)
 			}
 			break;
 		case RTE_SUBQUERY:
+		case RTE_TABLEFUNC:
 		case RTE_VALUES:
 		case RTE_CTE:
-			/* Subselect, Values, CTE RTEs never have dropped columns */
+
+			/*
+			 * Subselect, Table Functions, Values, CTE RTEs never have dropped
+			 * columns
+			 */
 			result = false;
+			break;
+		case RTE_NAMEDTUPLESTORE:
+			{
+				/* Check dropped-ness by testing for valid coltype */
+				if (attnum <= 0 ||
+					attnum > list_length(rte->coltypes))
+					elog(ERROR, "invalid varattno %d", attnum);
+				result = !OidIsValid((list_nth_oid(rte->coltypes, attnum - 1)));
+			}
 			break;
 		case RTE_JOIN:
 			{
@@ -2914,21 +3353,19 @@ get_rte_attribute_is_dropped(RangeTblEntry *rte, AttrNumber attnum)
 					if (attnum > atts_done &&
 						attnum <= atts_done + rtfunc->funccolcount)
 					{
-						TypeFuncClass functypclass;
-						Oid			funcrettype;
 						TupleDesc	tupdesc;
 
-						functypclass = get_expr_result_type(rtfunc->funcexpr,
-															&funcrettype,
-															&tupdesc);
-						if (functypclass == TYPEFUNC_COMPOSITE)
+						tupdesc = get_expr_result_tupdesc(rtfunc->funcexpr,
+														  true);
+						if (tupdesc)
 						{
 							/* Composite data type, e.g. a table's row type */
 							Form_pg_attribute att_tup;
 
 							Assert(tupdesc);
 							Assert(attnum - atts_done <= tupdesc->natts);
-							att_tup = tupdesc->attrs[attnum - atts_done - 1];
+							att_tup = TupleDescAttr(tupdesc,
+													attnum - atts_done - 1);
 							return att_tup->attisdropped;
 						}
 						/* Otherwise, it can't have any dropped columns */
@@ -2949,6 +3386,15 @@ get_rte_attribute_is_dropped(RangeTblEntry *rte, AttrNumber attnum)
 								rte->eref->aliasname)));
 				result = false; /* keep compiler quiet */
 			}
+			break;
+		case RTE_RESULT:
+			/* this probably can't happen ... */
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_COLUMN),
+					 errmsg("column %d of relation \"%s\" does not exist",
+							attnum,
+							rte->eref->aliasname)));
+			result = false;		/* keep compiler quiet */
 			break;
 		default:
 			elog(ERROR, "unrecognized RTE kind: %d", (int) rte->rtekind);
@@ -3007,7 +3453,7 @@ get_parse_rowmark(Query *qry, Index rtindex)
  *	Returns InvalidAttrNumber if the attr doesn't exist (or is dropped).
  *
  *	This should only be used if the relation is already
- *	heap_open()'ed.  Use the cache version get_attnum()
+ *	table_open()'ed.  Use the cache version get_attnum()
  *	for access to non-opened relations.
  */
 int
@@ -3015,9 +3461,9 @@ attnameAttNum(Relation rd, const char *attname, bool sysColOK)
 {
 	int			i;
 
-	for (i = 0; i < rd->rd_rel->relnatts; i++)
+	for (i = 0; i < RelationGetNumberOfAttributes(rd); i++)
 	{
-		Form_pg_attribute att = rd->rd_att->attrs[i];
+		Form_pg_attribute att = TupleDescAttr(rd->rd_att, i);
 
 		if (namestrcmp(&(att->attname), attname) == 0 && !att->attisdropped)
 			return i + 1;
@@ -3026,10 +3472,7 @@ attnameAttNum(Relation rd, const char *attname, bool sysColOK)
 	if (sysColOK)
 	{
 		if ((i = specialAttNum(attname)) != InvalidAttrNumber)
-		{
-			if (i != ObjectIdAttributeNumber || rd->rd_rel->relhasoids)
-				return i;
-		}
+			return i;
 	}
 
 	/* on failure */
@@ -3038,20 +3481,18 @@ attnameAttNum(Relation rd, const char *attname, bool sysColOK)
 
 /* specialAttNum()
  *
- * Check attribute name to see if it is "special", e.g. "oid".
+ * Check attribute name to see if it is "special", e.g. "xmin".
  * - thomas 2000-02-07
  *
  * Note: this only discovers whether the name could be a system attribute.
- * Caller needs to verify that it really is an attribute of the rel,
- * at least in the case of "oid", which is now optional.
+ * Caller needs to ensure that it really is an attribute of the rel.
  */
 static int
 specialAttNum(const char *attname)
 {
-	Form_pg_attribute sysatt;
+	const FormData_pg_attribute *sysatt;
 
-	sysatt = SystemAttributeByName(attname,
-								   true /* "oid" will be accepted */ );
+	sysatt = SystemAttributeByName(attname);
 	if (sysatt != NULL)
 		return sysatt->attnum;
 	return InvalidAttrNumber;
@@ -3062,29 +3503,29 @@ specialAttNum(const char *attname)
  * given attribute id, return name of that attribute
  *
  *	This should only be used if the relation is already
- *	heap_open()'ed.  Use the cache version get_atttype()
+ *	table_open()'ed.  Use the cache version get_atttype()
  *	for access to non-opened relations.
  */
-Name
+const NameData *
 attnumAttName(Relation rd, int attid)
 {
 	if (attid <= 0)
 	{
-		Form_pg_attribute sysatt;
+		const FormData_pg_attribute *sysatt;
 
-		sysatt = SystemAttributeDefinition(attid, rd->rd_rel->relhasoids);
+		sysatt = SystemAttributeDefinition(attid);
 		return &sysatt->attname;
 	}
 	if (attid > rd->rd_att->natts)
 		elog(ERROR, "invalid attribute number %d", attid);
-	return &rd->rd_att->attrs[attid - 1]->attname;
+	return &TupleDescAttr(rd->rd_att, attid - 1)->attname;
 }
 
 /*
  * given attribute id, return type of that attribute
  *
  *	This should only be used if the relation is already
- *	heap_open()'ed.  Use the cache version get_atttype()
+ *	table_open()'ed.  Use the cache version get_atttype()
  *	for access to non-opened relations.
  */
 Oid
@@ -3092,20 +3533,20 @@ attnumTypeId(Relation rd, int attid)
 {
 	if (attid <= 0)
 	{
-		Form_pg_attribute sysatt;
+		const FormData_pg_attribute *sysatt;
 
-		sysatt = SystemAttributeDefinition(attid, rd->rd_rel->relhasoids);
+		sysatt = SystemAttributeDefinition(attid);
 		return sysatt->atttypid;
 	}
 	if (attid > rd->rd_att->natts)
 		elog(ERROR, "invalid attribute number %d", attid);
-	return rd->rd_att->attrs[attid - 1]->atttypid;
+	return TupleDescAttr(rd->rd_att, attid - 1)->atttypid;
 }
 
 /*
  * given attribute id, return collation of that attribute
  *
- *	This should only be used if the relation is already heap_open()'ed.
+ *	This should only be used if the relation is already table_open()'ed.
  */
 Oid
 attnumCollationId(Relation rd, int attid)
@@ -3117,7 +3558,7 @@ attnumCollationId(Relation rd, int attid)
 	}
 	if (attid > rd->rd_att->natts)
 		elog(ERROR, "invalid attribute number %d", attid);
-	return rd->rd_att->attrs[attid - 1]->attcollation;
+	return TupleDescAttr(rd->rd_att, attid - 1)->attcollation;
 }
 
 /*
@@ -3160,11 +3601,11 @@ errorMissingRTE(ParseState *pstate, RangeVar *relation)
 	if (rte)
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_TABLE),
-			errmsg("invalid reference to FROM-clause entry for table \"%s\"",
-				   relation->relname),
+				 errmsg("invalid reference to FROM-clause entry for table \"%s\"",
+						relation->relname),
 				 (badAlias ?
-			errhint("Perhaps you meant to reference the table alias \"%s\".",
-					badAlias) :
+				  errhint("Perhaps you meant to reference the table alias \"%s\".",
+						  badAlias) :
 				  errhint("There is an entry for table \"%s\", but it cannot be referenced from this part of the query.",
 						  rte->eref->aliasname)),
 				 parser_errposition(pstate, relation->location)));
@@ -3184,41 +3625,74 @@ errorMissingRTE(ParseState *pstate, RangeVar *relation)
  */
 void
 errorMissingColumn(ParseState *pstate,
-				   char *relname, char *colname, int location)
+				   const char *relname, const char *colname, int location)
 {
-	RangeTblEntry *rte;
+	FuzzyAttrMatchState *state;
+	char	   *closestfirst = NULL;
 
 	/*
-	 * If relname was given, just play dumb and report it.  (In practice, a
-	 * bad qualification name should end up at errorMissingRTE, not here, so
-	 * no need to work hard on this case.)
-	 */
-	if (relname)
-		ereport(ERROR,
-				(errcode(ERRCODE_UNDEFINED_COLUMN),
-				 errmsg("column %s.%s does not exist", relname, colname),
-				 parser_errposition(pstate, location)));
-
-	/*
-	 * Otherwise, search the entire rtable looking for possible matches.  If
-	 * we find one, emit a hint about it.
+	 * Search the entire rtable looking for possible matches.  If we find one,
+	 * emit a hint about it.
 	 *
 	 * TODO: improve this code (and also errorMissingRTE) to mention using
 	 * LATERAL if appropriate.
 	 */
-	rte = searchRangeTableForCol(pstate, colname, location);
+	state = searchRangeTableForCol(pstate, relname, colname, location);
 
-	ereport(ERROR,
-			(errcode(ERRCODE_UNDEFINED_COLUMN),
-			 errmsg("column \"%s\" does not exist", colname),
-			 rte ? errhint("There is a column named \"%s\" in table \"%s\", but it cannot be referenced from this part of the query.",
-						   colname, rte->eref->aliasname) : 0,
-			 parser_errposition(pstate, location)));
+	/*
+	 * Extract closest col string for best match, if any.
+	 *
+	 * Infer an exact match referenced despite not being visible from the fact
+	 * that an attribute number was not present in state passed back -- this
+	 * is what is reported when !closestfirst.  There might also be an exact
+	 * match that was qualified with an incorrect alias, in which case
+	 * closestfirst will be set (so hint is the same as generic fuzzy case).
+	 */
+	if (state->rfirst && AttributeNumberIsValid(state->first))
+		closestfirst = strVal(list_nth(state->rfirst->eref->colnames,
+									   state->first - 1));
+
+	if (!state->rsecond)
+	{
+		/*
+		 * Handle case where there is zero or one column suggestions to hint,
+		 * including exact matches referenced but not visible.
+		 */
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_COLUMN),
+				 relname ?
+				 errmsg("column %s.%s does not exist", relname, colname) :
+				 errmsg("column \"%s\" does not exist", colname),
+				 state->rfirst ? closestfirst ?
+				 errhint("Perhaps you meant to reference the column \"%s.%s\".",
+						 state->rfirst->eref->aliasname, closestfirst) :
+				 errhint("There is a column named \"%s\" in table \"%s\", but it cannot be referenced from this part of the query.",
+						 colname, state->rfirst->eref->aliasname) : 0,
+				 parser_errposition(pstate, location)));
+	}
+	else
+	{
+		/* Handle case where there are two equally useful column hints */
+		char	   *closestsecond;
+
+		closestsecond = strVal(list_nth(state->rsecond->eref->colnames,
+										state->second - 1));
+
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_COLUMN),
+				 relname ?
+				 errmsg("column %s.%s does not exist", relname, colname) :
+				 errmsg("column \"%s\" does not exist", colname),
+				 errhint("Perhaps you meant to reference the column \"%s.%s\" or the column \"%s.%s\".",
+						 state->rfirst->eref->aliasname, closestfirst,
+						 state->rsecond->eref->aliasname, closestsecond),
+				 parser_errposition(pstate, location)));
+	}
 }
 
 
 /*
- * Examine a fully-parsed query, and return TRUE iff any relation underlying
+ * Examine a fully-parsed query, and return true iff any relation underlying
  * the query is a temporary relation (table, view, or materialized view).
  */
 bool
@@ -3244,10 +3718,10 @@ isQueryUsingTempRelation_walker(Node *node, void *context)
 
 			if (rte->rtekind == RTE_RELATION)
 			{
-				Relation	rel = heap_open(rte->relid, AccessShareLock);
+				Relation	rel = table_open(rte->relid, AccessShareLock);
 				char		relpersistence = rel->rd_rel->relpersistence;
 
-				heap_close(rel, AccessShareLock);
+				table_close(rel, AccessShareLock);
 				if (relpersistence == RELPERSISTENCE_TEMP)
 					return true;
 			}

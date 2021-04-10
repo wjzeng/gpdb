@@ -31,7 +31,7 @@
  * different) code.
  *
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -58,34 +58,52 @@
  */
 #define BGWORKER_BACKEND_DATABASE_CONNECTION		0x0002
 
+/*
+ * This class is used internally for parallel queries, to keep track of the
+ * number of active parallel workers and make sure we never launch more than
+ * max_parallel_workers parallel workers at the same time.  Third party
+ * background workers should not use this class.
+ */
+#define BGWORKER_CLASS_PARALLEL					0x0010
+/* add additional bgworker classes here */
+
 
 typedef void (*bgworker_main_type) (Datum main_arg);
+typedef bool (*bgworker_start_rule) (Datum rule_arg);
 
 /*
  * Points in time at which a bgworker can request to be started
+ *
+ * CDB: BgWorkerStart_DtxRecovering means worker can be started
+ * after postmaster started and before distributed transactions
+ * are recovered.
  */
 typedef enum
 {
 	BgWorkerStart_PostmasterStart,
+	BgWorkerStart_DtxRecovering,
 	BgWorkerStart_ConsistentState,
 	BgWorkerStart_RecoveryFinished
 } BgWorkerStartTime;
 
 #define BGW_DEFAULT_RESTART_INTERVAL	60
 #define BGW_NEVER_RESTART				-1
-#define BGW_MAXLEN						64
+#define BGW_MAXLEN						96
+#define BGW_EXTRALEN					128
 
 typedef struct BackgroundWorker
 {
 	char		bgw_name[BGW_MAXLEN];
+	char		bgw_type[BGW_MAXLEN];
 	int			bgw_flags;
 	BgWorkerStartTime bgw_start_time;
-	int			bgw_restart_time;		/* in seconds, or BGW_NEVER_RESTART */
-	bgworker_main_type bgw_main;
-	char		bgw_library_name[BGW_MAXLEN];	/* only if bgw_main is NULL */
-	char		bgw_function_name[BGW_MAXLEN];	/* only if bgw_main is NULL */
+	int			bgw_restart_time;	/* in seconds, or BGW_NEVER_RESTART */
+	char		bgw_library_name[BGW_MAXLEN];
+	char		bgw_function_name[BGW_MAXLEN];
 	Datum		bgw_main_arg;
+	char		bgw_extra[BGW_EXTRALEN];
 	pid_t		bgw_notify_pid; /* SIGUSR1 this backend on start/stop */
+	bgworker_start_rule bgw_start_rule; /* false: never be started */
 } BackgroundWorker;
 
 typedef enum BgwHandleStatus
@@ -104,14 +122,15 @@ extern void RegisterBackgroundWorker(BackgroundWorker *worker);
 
 /* Register a new bgworker from a regular backend */
 extern bool RegisterDynamicBackgroundWorker(BackgroundWorker *worker,
-								BackgroundWorkerHandle **handle);
+											BackgroundWorkerHandle **handle);
 
 /* Query the status of a bgworker */
 extern BgwHandleStatus GetBackgroundWorkerPid(BackgroundWorkerHandle *handle,
-					   pid_t *pidp);
+											  pid_t *pidp);
+extern BgwHandleStatus WaitForBackgroundWorkerStartup(BackgroundWorkerHandle *handle, pid_t *pid);
 extern BgwHandleStatus
-WaitForBackgroundWorkerStartup(BackgroundWorkerHandle *
-							   handle, pid_t *pid);
+			WaitForBackgroundWorkerShutdown(BackgroundWorkerHandle *);
+extern const char *GetBackgroundWorkerTypeByPid(pid_t pid);
 
 /* Terminate a bgworker */
 extern void TerminateBackgroundWorker(BackgroundWorkerHandle *handle);
@@ -128,10 +147,22 @@ extern PGDLLIMPORT BackgroundWorker *MyBgworkerEntry;
  * If dbname is NULL, connection is made to no specific database;
  * only shared catalogs can be accessed.
  */
-extern void BackgroundWorkerInitializeConnection(char *dbname, char *username);
+extern void BackgroundWorkerInitializeConnection(const char *dbname, const char *username, uint32 flags);
+
+/* Just like the above, but specifying database and user by OID. */
+extern void BackgroundWorkerInitializeConnectionByOid(Oid dboid, Oid useroid, uint32 flags);
+
+/*
+ * Flags to BackgroundWorkerInitializeConnection et al
+ *
+ *
+ * Allow bypassing datallowconn restrictions when connecting to database
+ */
+#define BGWORKER_BYPASS_ALLOWCONN 1
+
 
 /* Block/unblock signals in a background worker process */
 extern void BackgroundWorkerBlockSignals(void);
 extern void BackgroundWorkerUnblockSignals(void);
 
-#endif   /* BGWORKER_H */
+#endif							/* BGWORKER_H */

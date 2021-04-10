@@ -11,6 +11,8 @@ set intervalstyle='sql_standard';
 
 set gp_default_storage_options='checksum=off';
 
+\set HIDE_TABLEAM off
+
 --
 -- Table with rle_type different levels + delta columns
 --
@@ -352,6 +354,10 @@ Insert into delta_blocks select
 Select a1,a2,a6 from delta_blocks where a4 = '20:13:11.232421' order by a1 limit 10;
 
 
+-- The dl_bt_ix index is quite large, over 600 MB. Let's drop the table, along
+-- with the indexes, to keep the regression database size in check.
+drop table delta_blocks;
+
 --
 -- Table with  delta + none compression on some columns
 --
@@ -400,15 +406,15 @@ CREATE TABLE delta_one (a INT, b INT, c CHAR(100)) WITH (appendonly=true, orient
 DISTRIBUTED BY (b);
 
 \d+ delta_one
+INSERT INTO delta_one SELECT i as a, 0 as b, '' as c FROM generate_series(1, 100000) AS i;
 INSERT INTO delta_one SELECT i as a, 1 as b, '' as c FROM generate_series(1, 100000) AS i;
-INSERT INTO delta_one SELECT i as a, 2 as b, '' as c FROM generate_series(1, 100000) AS i;
 CREATE TABLE delta_two (a INT, b INT, c CHAR(100)) DISTRIBUTED BY (b);
 -- Populate delta_two such that at least one segment contains multiple
 -- occurences of the same value for a.
+INSERT INTO delta_two SELECT i as a, 0 as b, '' as c  FROM generate_series(1, 100000) AS i;
 INSERT INTO delta_two SELECT i as a, 1 as b, '' as c  FROM generate_series(1, 100000) AS i;
-INSERT INTO delta_two SELECT i as a, 2 as b, '' as c  FROM generate_series(1, 100000) AS i;
+INSERT INTO delta_two SELECT i as a, 0 as b, '' as c  FROM generate_series(1, 100000) AS i;
 INSERT INTO delta_two SELECT i as a, 1 as b, '' as c  FROM generate_series(1, 100000) AS i;
-INSERT INTO delta_two SELECT i as a, 2 as b, '' as c  FROM generate_series(1, 100000) AS i;
 ANALYZE delta_one;
 ANALYZE delta_two;
 
@@ -421,7 +427,7 @@ DELETE FROM delta_one USING delta_two WHERE delta_one.b = delta_two.b AND delta_
 -- configuration (1 segdb, 2 or more segdbs).
 
 SELECT distinct(a) FROM delta_one
-WHERE gp_segment_id = 2 AND delta_one.a IN (12, 80001, 1001)
+WHERE gp_segment_id = 1 AND delta_one.a IN (12, 80001, 1001)
 ORDER BY a;
 
 DELETE FROM delta_one USING delta_two WHERE delta_one.b = delta_two.b AND delta_one.a = delta_two.a AND
@@ -441,8 +447,8 @@ DROP TABLE IF EXISTS delta_two;
 -- Otherwise, we may not exercise the case of out-of-order updates.
 CREATE TABLE delta_one (a INT, b INT, c CHAR(100)) WITH (appendonly=true, orientation=column, compresstype=rle_type)
 DISTRIBUTED BY(b);
+INSERT INTO delta_one SELECT i as a, 0 as b, '' as c FROM generate_series(1, 100000) AS i;
 INSERT INTO delta_one SELECT i as a, 1 as b, '' as c FROM generate_series(1, 100000) AS i;
-INSERT INTO delta_one SELECT i as a, 2 as b, '' as c FROM generate_series(1, 100000) AS i;
 CREATE TABLE delta_two (a INT, b INT, c CHAR(100)) DISTRIBUTED BY(b);
 -- Insert unique values for delta_two.a so that we don't get "multiple
 -- updates to a row by the same query is not allowed" error later when
@@ -450,8 +456,8 @@ CREATE TABLE delta_two (a INT, b INT, c CHAR(100)) DISTRIBUTED BY(b);
 -- error is covered by the test case "doubleupdate_command.sql".
 
 
+INSERT INTO delta_two SELECT i as a, 0 as b, '' as c  FROM generate_series(1, 100000) AS i;
 INSERT INTO delta_two SELECT i as a, 1 as b, '' as c  FROM generate_series(1, 100000) AS i;
-INSERT INTO delta_two SELECT i as a, 2 as b, '' as c  FROM generate_series(1, 100000) AS i;
 ANALYZE delta_one;
 ANALYZE delta_two;
 
@@ -460,7 +466,7 @@ UPDATE delta_one SET a = 0 FROM delta_two WHERE delta_one.b = delta_two.b AND de
 (delta_two.a = 10 OR delta_two.a = 40000 OR delta_two.a = 20000);
 
 -- Ensure that tuples to be updated are all from the same GPDB segment.
-SELECT distinct(a) FROM delta_one WHERE gp_segment_id = 2 AND
+SELECT distinct(a) FROM delta_one WHERE gp_segment_id = 1 AND
 delta_one.a IN (12, 80001, 1001) ORDER BY a;
 
 UPDATE delta_one SET a = 1 FROM delta_two WHERE

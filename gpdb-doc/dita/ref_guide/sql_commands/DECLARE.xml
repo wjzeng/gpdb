@@ -17,6 +17,9 @@
         small number of rows at a time out of a larger query. Cursors can return data either in text
         or in binary format using <codeph><xref href="./FETCH.xml#topic1" type="topic" format="dita"
           /></codeph>. </p>
+      <note>This page describes usage of cursors at the SQL command level. If you are trying to use
+        cursors inside a PL/pgSQL function, the rules are different, see <xref
+          href="../../analytics/pl_sql.xml" scope="peer">PL/Sql</xref>.</note>
       <p>Normal cursors return data in text format, the same as a <codeph>SELECT</codeph> would
         produce. Since data is stored natively in binary format, the system must do a conversion to
         produce the text format. Once the information comes back in text form, the client
@@ -130,8 +133,8 @@
         be used within the current transaction. Thus, <codeph>DECLARE</codeph> without <codeph>WITH
           HOLD</codeph> is useless outside a transaction block: the cursor would survive only to the
         completion of the statement. Therefore Greenplum Database reports an error if this command
-        is used outside a transaction block. Use <codeph>BEGIN</codeph>, <codeph>COMMIT</codeph> and
-          <codeph>ROLLBACK</codeph> to define a transaction block.</p>
+        is used outside a transaction block. Use <codeph>BEGIN</codeph> and <codeph>COMMIT</codeph>
+        (or <codeph>ROLLBACK</codeph>) to define a transaction block.</p>
       <p>If <codeph>WITH HOLD</codeph> is specified and the transaction that created the cursor
         successfully commits, the cursor can continue to be accessed by subsequent transactions in
         the same session. (But if the creating transaction is aborted, the cursor is removed.) A

@@ -38,34 +38,30 @@
 20170830:00:35:33:440808 gpstop:sdw6:gpadmin-[INFO]:-----------------------------------------------------
 20170830:00:35:33:440808 gpstop:sdw6:gpadmin-[INFO]:-Successfully shutdown 6 of 6 segment instances 
 20170830:00:35:33:440808 gpstop:sdw6:gpadmin-[INFO]:-Database successfully shutdown with no errors reported
-20170830:00:35:33:440808 gpstop:sdw6:gpadmin-[INFO]:-Cleaning up leftover gpmmon process
-20170830:00:35:33:440808 gpstop:sdw6:gpadmin-[INFO]:-No leftover gpmmon process found
-20170830:00:35:33:440808 gpstop:sdw6:gpadmin-[INFO]:-Cleaning up leftover gpsmon processes
-20170830:00:35:33:440808 gpstop:sdw6:gpadmin-[INFO]:-No leftover gpsmon processes on some hosts. not attempting forceful termination on these hosts
 20170830:00:35:33:440808 gpstop:sdw6:gpadmin-[INFO]:-Cleaning up leftover shared memory
 20170830:00:35:33:440808 gpstop:sdw6:gpadmin-[INFO]:-Restarting System...
 
 -- end_ignore
 
 show gp_resource_manager;
-gp_resource_manager
--------------------
-group              
+ gp_resource_manager 
+---------------------
+ group               
 (1 row)
 show gp_resource_group_cpu_limit;
-gp_resource_group_cpu_limit
----------------------------
-0.9                        
+ gp_resource_group_cpu_limit 
+-----------------------------
+ 0.9                         
 (1 row)
 show gp_resource_group_memory_limit;
-gp_resource_group_memory_limit
-------------------------------
-0.9                           
+ gp_resource_group_memory_limit 
+--------------------------------
+ 0.9                            
 (1 row)
 show max_connections;
-max_connections
----------------
-40             
+ max_connections 
+-----------------
+ 40              
 (1 row)
 
 -- by default admin_group has concurrency set to -1 which leads to

@@ -3,7 +3,7 @@
  * session_state.h
  *	  This file contains declarations for session state information.
  *
- * Copyright (c) 2014-Present Pivotal Software, Inc.
+ * Copyright (c) 2014-Present VMware, Inc. or its affiliates.
  *
  *
  * IDENTIFICATION
@@ -95,6 +95,9 @@ typedef struct SessionState
 	 * Resource group per-session slot information.
 	 */
 	void *resGroupSlot;
+
+	/* gp_command_count of the latest cursor command in this session */
+	int latestCursorCommandId;
 
 #ifdef USE_ASSERT_CHECKING
 	/* If we modify the sessionId in ProcMppSessionId, this field is turned on */

@@ -5,7 +5,7 @@
  *
  * All the actual insertion logic is in spgdoinsert.c.
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -17,8 +17,11 @@
 #include "postgres.h"
 
 #include "access/genam.h"
-#include "access/heapam_xlog.h"
 #include "access/spgist_private.h"
+#include "access/spgxlog.h"
+#include "access/tableam.h"
+#include "access/xlog.h"
+#include "access/xloginsert.h"
 #include "catalog/index.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
@@ -30,11 +33,12 @@
 typedef struct
 {
 	SpGistState spgstate;		/* SPGiST's working state */
+	int64		indtuples;		/* total number of tuples indexed */
 	MemoryContext tmpCtx;		/* per-tuple temporary context */
 } SpGistBuildState;
 
 
-/* Callback to process one heap tuple during IndexBuildHeapScan */
+/* Callback to process one heap tuple during table_index_build_scan */
 static void
 spgistBuildCallback(Relation index, ItemPointer tupleId, Datum *values,
 					bool *isnull, bool tupleIsAlive, void *state)
@@ -57,6 +61,9 @@ spgistBuildCallback(Relation index, ItemPointer tupleId, Datum *values,
 		MemoryContextReset(buildstate->tmpCtx);
 	}
 
+	/* Update total tuple count */
+	buildstate->indtuples += 1;
+
 	MemoryContextSwitchTo(oldCtx);
 	MemoryContextReset(buildstate->tmpCtx);
 }
@@ -64,12 +71,9 @@ spgistBuildCallback(Relation index, ItemPointer tupleId, Datum *values,
 /*
  * Build an SP-GiST index.
  */
-Datum
-spgbuild(PG_FUNCTION_ARGS)
+IndexBuildResult *
+spgbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 {
-	Relation	heap = (Relation) PG_GETARG_POINTER(0);
-	Relation	index = (Relation) PG_GETARG_POINTER(1);
-	IndexInfo  *indexInfo = (IndexInfo *) PG_GETARG_POINTER(2);
 	IndexBuildResult *result;
 	double		reltuples;
 	SpGistBuildState buildstate;
@@ -101,23 +105,6 @@ spgbuild(PG_FUNCTION_ARGS)
 	SpGistInitBuffer(nullbuffer, SPGIST_LEAF | SPGIST_NULLS);
 	MarkBufferDirty(nullbuffer);
 
-	if (RelationNeedsWAL(index))
-	{
-		XLogRecPtr	recptr;
-		XLogRecData rdata;
-
-		/* WAL data is just the relfilenode */
-		rdata.data = (char *) &(index->rd_node);
-		rdata.len = sizeof(RelFileNode);
-		rdata.buffer = InvalidBuffer;
-		rdata.next = NULL;
-
-		recptr = XLogInsert(RM_SPGIST_ID, XLOG_SPGIST_CREATE_INDEX, &rdata);
-
-		PageSetLSN(BufferGetPage(metabuffer), recptr);
-		PageSetLSN(BufferGetPage(rootbuffer), recptr);
-		PageSetLSN(BufferGetPage(nullbuffer), recptr);
-	}
 
 	END_CRIT_SECTION();
 
@@ -130,46 +117,62 @@ spgbuild(PG_FUNCTION_ARGS)
 	 */
 	initSpGistState(&buildstate.spgstate, index);
 	buildstate.spgstate.isBuild = true;
+	buildstate.indtuples = 0;
 
 	buildstate.tmpCtx = AllocSetContextCreate(CurrentMemoryContext,
-										   "SP-GiST build temporary context",
-											  ALLOCSET_DEFAULT_MINSIZE,
-											  ALLOCSET_DEFAULT_INITSIZE,
-											  ALLOCSET_DEFAULT_MAXSIZE);
+											  "SP-GiST build temporary context",
+											  ALLOCSET_DEFAULT_SIZES);
 
-	reltuples = IndexBuildScan(heap, index, indexInfo, true,
-								   spgistBuildCallback, (void *) &buildstate);
+	reltuples = table_index_build_scan(heap, index, indexInfo, true, true,
+									   spgistBuildCallback, (void *) &buildstate,
+									   NULL);
 
 	MemoryContextDelete(buildstate.tmpCtx);
 
 	SpGistUpdateMetaPage(index);
 
-	result = (IndexBuildResult *) palloc0(sizeof(IndexBuildResult));
-	result->heap_tuples = result->index_tuples = reltuples;
+	/*
+	 * We didn't write WAL records as we built the index, so if WAL-logging is
+	 * required, write all pages to the WAL now.
+	 */
+	if (RelationNeedsWAL(index))
+	{
+		log_newpage_range(index, MAIN_FORKNUM,
+						  0, RelationGetNumberOfBlocks(index),
+						  true);
+	}
 
-	PG_RETURN_POINTER(result);
+	result = (IndexBuildResult *) palloc0(sizeof(IndexBuildResult));
+	result->heap_tuples = reltuples;
+	result->index_tuples = buildstate.indtuples;
+
+	return result;
 }
 
 /*
  * Build an empty SPGiST index in the initialization fork
  */
-Datum
-spgbuildempty(PG_FUNCTION_ARGS)
+void
+spgbuildempty(Relation index)
 {
-	Relation	index = (Relation) PG_GETARG_POINTER(0);
 	Page		page;
 
 	/* Construct metapage. */
 	page = (Page) palloc(BLCKSZ);
 	SpGistInitMetapage(page);
 
-	/* Write the page.  If archiving/streaming, XLOG it. */
+	/*
+	 * Write the page and log it unconditionally.  This is important
+	 * particularly for indexes created on tablespaces and databases whose
+	 * creation happened after the last redo pointer as recovery removes any
+	 * of their existing content when the corresponding create records are
+	 * replayed.
+	 */
 	PageSetChecksumInplace(page, SPGIST_METAPAGE_BLKNO);
 	smgrwrite(index->rd_smgr, INIT_FORKNUM, SPGIST_METAPAGE_BLKNO,
 			  (char *) page, true);
-	if (XLogIsNeeded())
-		log_newpage(&index->rd_smgr->smgr_rnode.node, INIT_FORKNUM,
-					SPGIST_METAPAGE_BLKNO, page, false);
+	log_newpage(&index->rd_smgr->smgr_rnode.node, INIT_FORKNUM,
+				SPGIST_METAPAGE_BLKNO, page, true);
 
 	/* Likewise for the root page. */
 	SpGistInitPage(page, SPGIST_LEAF);
@@ -177,9 +180,8 @@ spgbuildempty(PG_FUNCTION_ARGS)
 	PageSetChecksumInplace(page, SPGIST_ROOT_BLKNO);
 	smgrwrite(index->rd_smgr, INIT_FORKNUM, SPGIST_ROOT_BLKNO,
 			  (char *) page, true);
-	if (XLogIsNeeded())
-		log_newpage(&index->rd_smgr->smgr_rnode.node, INIT_FORKNUM,
-					SPGIST_ROOT_BLKNO, page, true);
+	log_newpage(&index->rd_smgr->smgr_rnode.node, INIT_FORKNUM,
+				SPGIST_ROOT_BLKNO, page, true);
 
 	/* Likewise for the null-tuples root page. */
 	SpGistInitPage(page, SPGIST_LEAF | SPGIST_NULLS);
@@ -187,9 +189,8 @@ spgbuildempty(PG_FUNCTION_ARGS)
 	PageSetChecksumInplace(page, SPGIST_NULL_BLKNO);
 	smgrwrite(index->rd_smgr, INIT_FORKNUM, SPGIST_NULL_BLKNO,
 			  (char *) page, true);
-	if (XLogIsNeeded())
-		log_newpage(&index->rd_smgr->smgr_rnode.node, INIT_FORKNUM,
-					SPGIST_NULL_BLKNO, page, true);
+	log_newpage(&index->rd_smgr->smgr_rnode.node, INIT_FORKNUM,
+				SPGIST_NULL_BLKNO, page, true);
 
 	/*
 	 * An immediate sync is required even if we xlog'd the pages, because the
@@ -197,34 +198,24 @@ spgbuildempty(PG_FUNCTION_ARGS)
 	 * checkpoint may have moved the redo pointer past our xlog record.
 	 */
 	smgrimmedsync(index->rd_smgr, INIT_FORKNUM);
-
-	PG_RETURN_VOID();
 }
 
 /*
  * Insert one new tuple into an SPGiST index.
  */
-Datum
-spginsert(PG_FUNCTION_ARGS)
+bool
+spginsert(Relation index, Datum *values, bool *isnull,
+		  ItemPointer ht_ctid, Relation heapRel,
+		  IndexUniqueCheck checkUnique,
+		  IndexInfo *indexInfo)
 {
-	Relation	index = (Relation) PG_GETARG_POINTER(0);
-	Datum	   *values = (Datum *) PG_GETARG_POINTER(1);
-	bool	   *isnull = (bool *) PG_GETARG_POINTER(2);
-	ItemPointer ht_ctid = (ItemPointer) PG_GETARG_POINTER(3);
-
-#ifdef NOT_USED
-	Relation	heapRel = (Relation) PG_GETARG_POINTER(4);
-	IndexUniqueCheck checkUnique = (IndexUniqueCheck) PG_GETARG_INT32(5);
-#endif
 	SpGistState spgstate;
 	MemoryContext oldCtx;
 	MemoryContext insertCtx;
 
 	insertCtx = AllocSetContextCreate(CurrentMemoryContext,
 									  "SP-GiST insert temporary context",
-									  ALLOCSET_DEFAULT_MINSIZE,
-									  ALLOCSET_DEFAULT_INITSIZE,
-									  ALLOCSET_DEFAULT_MAXSIZE);
+									  ALLOCSET_DEFAULT_SIZES);
 	oldCtx = MemoryContextSwitchTo(insertCtx);
 
 	initSpGistState(&spgstate, index);
@@ -247,5 +238,5 @@ spginsert(PG_FUNCTION_ARGS)
 	MemoryContextDelete(insertCtx);
 
 	/* return false since we've not done any unique check */
-	PG_RETURN_BOOL(false);
+	return false;
 }

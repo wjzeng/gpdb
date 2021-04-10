@@ -3,10 +3,13 @@
  */
 #include "postgres.h"
 
+#include <limits.h>
+
 #include "btree_gist.h"
 #include "btree_utils_num.h"
 #include "utils/builtins.h"
 #include "utils/datetime.h"
+#include "utils/float.h"
 
 typedef struct
 {
@@ -19,6 +22,7 @@ typedef struct
 */
 PG_FUNCTION_INFO_V1(gbt_ts_compress);
 PG_FUNCTION_INFO_V1(gbt_tstz_compress);
+PG_FUNCTION_INFO_V1(gbt_ts_fetch);
 PG_FUNCTION_INFO_V1(gbt_ts_union);
 PG_FUNCTION_INFO_V1(gbt_ts_picksplit);
 PG_FUNCTION_INFO_V1(gbt_ts_consistent);
@@ -37,7 +41,7 @@ PG_FUNCTION_INFO_V1(gbt_ts_same);
 
 
 static bool
-gbt_tsgt(const void *a, const void *b)
+gbt_tsgt(const void *a, const void *b, FmgrInfo *flinfo)
 {
 	const Timestamp *aa = (const Timestamp *) a;
 	const Timestamp *bb = (const Timestamp *) b;
@@ -48,7 +52,7 @@ gbt_tsgt(const void *a, const void *b)
 }
 
 static bool
-gbt_tsge(const void *a, const void *b)
+gbt_tsge(const void *a, const void *b, FmgrInfo *flinfo)
 {
 	const Timestamp *aa = (const Timestamp *) a;
 	const Timestamp *bb = (const Timestamp *) b;
@@ -59,7 +63,7 @@ gbt_tsge(const void *a, const void *b)
 }
 
 static bool
-gbt_tseq(const void *a, const void *b)
+gbt_tseq(const void *a, const void *b, FmgrInfo *flinfo)
 {
 	const Timestamp *aa = (const Timestamp *) a;
 	const Timestamp *bb = (const Timestamp *) b;
@@ -70,7 +74,7 @@ gbt_tseq(const void *a, const void *b)
 }
 
 static bool
-gbt_tsle(const void *a, const void *b)
+gbt_tsle(const void *a, const void *b, FmgrInfo *flinfo)
 {
 	const Timestamp *aa = (const Timestamp *) a;
 	const Timestamp *bb = (const Timestamp *) b;
@@ -81,7 +85,7 @@ gbt_tsle(const void *a, const void *b)
 }
 
 static bool
-gbt_tslt(const void *a, const void *b)
+gbt_tslt(const void *a, const void *b, FmgrInfo *flinfo)
 {
 	const Timestamp *aa = (const Timestamp *) a;
 	const Timestamp *bb = (const Timestamp *) b;
@@ -93,7 +97,7 @@ gbt_tslt(const void *a, const void *b)
 
 
 static int
-gbt_tskey_cmp(const void *a, const void *b)
+gbt_tskey_cmp(const void *a, const void *b, FmgrInfo *flinfo)
 {
 	tsKEY	   *ia = (tsKEY *) (((const Nsrt *) a)->t);
 	tsKEY	   *ib = (tsKEY *) (((const Nsrt *) b)->t);
@@ -107,7 +111,7 @@ gbt_tskey_cmp(const void *a, const void *b)
 }
 
 static float8
-gbt_ts_dist(const void *a, const void *b)
+gbt_ts_dist(const void *a, const void *b, FmgrInfo *flinfo)
 {
 	const Timestamp *aa = (const Timestamp *) a;
 	const Timestamp *bb = (const Timestamp *) b;
@@ -152,11 +156,7 @@ ts_dist(PG_FUNCTION_ARGS)
 
 		p->day = INT_MAX;
 		p->month = INT_MAX;
-#ifdef HAVE_INT64_TIMESTAMP
-		p->time = INT64CONST(0x7FFFFFFFFFFFFFFF);
-#else
-		p->time = DBL_MAX;
-#endif
+		p->time = PG_INT64_MAX;
 		PG_RETURN_INTERVAL_P(p);
 	}
 	else
@@ -180,11 +180,7 @@ tstz_dist(PG_FUNCTION_ARGS)
 
 		p->day = INT_MAX;
 		p->month = INT_MAX;
-#ifdef HAVE_INT64_TIMESTAMP
-		p->time = INT64CONST(0x7FFFFFFFFFFFFFFF);
-#else
-		p->time = DBL_MAX;
-#endif
+		p->time = PG_INT64_MAX;
 		PG_RETURN_INTERVAL_P(p);
 	}
 
@@ -200,27 +196,11 @@ tstz_dist(PG_FUNCTION_ARGS)
  **************************************************/
 
 
-static Timestamp
+static inline Timestamp
 tstz_to_ts_gmt(TimestampTz ts)
 {
-	Timestamp	gmt;
-	int			val,
-				tz;
-
-	gmt = ts;
-	DecodeSpecial(0, "gmt", &val);
-
-	if (ts < DT_NOEND && ts > DT_NOBEGIN)
-	{
-		tz = val * 60;
-
-#ifdef HAVE_INT64_TIMESTAMP
-		gmt -= (tz * INT64CONST(1000000));
-#else
-		gmt -= tz;
-#endif
-	}
-	return gmt;
+	/* No timezone correction is needed, since GMT is offset 0 by definition */
+	return (Timestamp) ts;
 }
 
 
@@ -228,9 +208,8 @@ Datum
 gbt_ts_compress(PG_FUNCTION_ARGS)
 {
 	GISTENTRY  *entry = (GISTENTRY *) PG_GETARG_POINTER(0);
-	GISTENTRY  *retval = NULL;
 
-	PG_RETURN_POINTER(gbt_num_compress(retval, entry, &tinfo));
+	PG_RETURN_POINTER(gbt_num_compress(entry, &tinfo));
 }
 
 
@@ -252,7 +231,7 @@ gbt_tstz_compress(PG_FUNCTION_ARGS)
 		r->lower = r->upper = gmt;
 		gistentryinit(*retval, PointerGetDatum(r),
 					  entry->rel, entry->page,
-					  entry->offset, FALSE);
+					  entry->offset, false);
 	}
 	else
 		retval = entry;
@@ -260,6 +239,13 @@ gbt_tstz_compress(PG_FUNCTION_ARGS)
 	PG_RETURN_POINTER(retval);
 }
 
+Datum
+gbt_ts_fetch(PG_FUNCTION_ARGS)
+{
+	GISTENTRY  *entry = (GISTENTRY *) PG_GETARG_POINTER(0);
+
+	PG_RETURN_POINTER(gbt_num_fetch(entry, &tinfo));
+}
 
 Datum
 gbt_ts_consistent(PG_FUNCTION_ARGS)
@@ -280,7 +266,7 @@ gbt_ts_consistent(PG_FUNCTION_ARGS)
 	key.upper = (GBT_NUMKEY *) &kkk->upper;
 
 	PG_RETURN_BOOL(
-				   gbt_num_consistent(&key, (void *) &query, &strategy, GIST_LEAF(entry), &tinfo)
+				   gbt_num_consistent(&key, (void *) &query, &strategy, GIST_LEAF(entry), &tinfo, fcinfo->flinfo)
 		);
 }
 
@@ -298,7 +284,7 @@ gbt_ts_distance(PG_FUNCTION_ARGS)
 	key.upper = (GBT_NUMKEY *) &kkk->upper;
 
 	PG_RETURN_FLOAT8(
-			gbt_num_distance(&key, (void *) &query, GIST_LEAF(entry), &tinfo)
+					 gbt_num_distance(&key, (void *) &query, GIST_LEAF(entry), &tinfo, fcinfo->flinfo)
 		);
 }
 
@@ -323,7 +309,7 @@ gbt_tstz_consistent(PG_FUNCTION_ARGS)
 	qqq = tstz_to_ts_gmt(query);
 
 	PG_RETURN_BOOL(
-				   gbt_num_consistent(&key, (void *) &qqq, &strategy, GIST_LEAF(entry), &tinfo)
+				   gbt_num_consistent(&key, (void *) &qqq, &strategy, GIST_LEAF(entry), &tinfo, fcinfo->flinfo)
 		);
 }
 
@@ -343,7 +329,7 @@ gbt_tstz_distance(PG_FUNCTION_ARGS)
 	qqq = tstz_to_ts_gmt(query);
 
 	PG_RETURN_FLOAT8(
-			  gbt_num_distance(&key, (void *) &qqq, GIST_LEAF(entry), &tinfo)
+					 gbt_num_distance(&key, (void *) &qqq, GIST_LEAF(entry), &tinfo, fcinfo->flinfo)
 		);
 }
 
@@ -355,7 +341,7 @@ gbt_ts_union(PG_FUNCTION_ARGS)
 	void	   *out = palloc(sizeof(tsKEY));
 
 	*(int *) PG_GETARG_POINTER(1) = sizeof(tsKEY);
-	PG_RETURN_POINTER(gbt_num_union((void *) out, entryvec, &tinfo));
+	PG_RETURN_POINTER(gbt_num_union((void *) out, entryvec, &tinfo, fcinfo->flinfo));
 }
 
 
@@ -378,7 +364,7 @@ gbt_ts_penalty(PG_FUNCTION_ARGS)
 				newdbl[2];
 
 	/*
-	 * We are allways using "double" timestamps here. Precision should be good
+	 * We are always using "double" timestamps here. Precision should be good
 	 * enough.
 	 */
 	orgdbl[0] = ((double) origentry->lower);
@@ -402,9 +388,9 @@ Datum
 gbt_ts_picksplit(PG_FUNCTION_ARGS)
 {
 	PG_RETURN_POINTER(gbt_num_picksplit(
-									(GistEntryVector *) PG_GETARG_POINTER(0),
-									  (GIST_SPLITVEC *) PG_GETARG_POINTER(1),
-										&tinfo
+										(GistEntryVector *) PG_GETARG_POINTER(0),
+										(GIST_SPLITVEC *) PG_GETARG_POINTER(1),
+										&tinfo, fcinfo->flinfo
 										));
 }
 
@@ -415,6 +401,6 @@ gbt_ts_same(PG_FUNCTION_ARGS)
 	tsKEY	   *b2 = (tsKEY *) PG_GETARG_POINTER(1);
 	bool	   *result = (bool *) PG_GETARG_POINTER(2);
 
-	*result = gbt_num_same((void *) b1, (void *) b2, &tinfo);
+	*result = gbt_num_same((void *) b1, (void *) b2, &tinfo, fcinfo->flinfo);
 	PG_RETURN_POINTER(result);
 }

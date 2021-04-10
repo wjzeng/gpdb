@@ -8,7 +8,7 @@
  * be a measurable performance gain from doing this, but that might change
  * in the future as we add more options.
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -22,7 +22,8 @@
 #include "catalog/pg_tablespace.h"
 #include "commands/tablespace.h"
 #include "miscadmin.h"
-#include "optimizer/cost.h"
+#include "optimizer/optimizer.h"
+#include "storage/bufmgr.h"
 #include "utils/catcache.h"
 #include "utils/hsearch.h"
 #include "utils/inval.h"
@@ -81,10 +82,9 @@ InitializeTableSpaceCache(void)
 	MemSet(&ctl, 0, sizeof(ctl));
 	ctl.keysize = sizeof(Oid);
 	ctl.entrysize = sizeof(TableSpaceCacheEntry);
-	ctl.hash = oid_hash;
 	TableSpaceCacheHash =
 		hash_create("TableSpace cache", 16, &ctl,
-					HASH_ELEM | HASH_FUNCTION);
+					HASH_ELEM | HASH_BLOBS);
 
 	/* Make sure we've initialized CacheMemoryContext. */
 	if (!CacheMemoryContext)
@@ -173,6 +173,10 @@ get_tablespace(Oid spcid)
 /*
  * get_tablespace_page_costs
  *		Return random and/or sequential page costs for a given tablespace.
+ *
+ *		This value is not locked by the transaction, so this value may
+ *		be changed while a SELECT that has used these values for planning
+ *		is still executing.
  */
 void
 get_tablespace_page_costs(Oid spcid,
@@ -198,4 +202,22 @@ get_tablespace_page_costs(Oid spcid,
 		else
 			*spc_seq_page_cost = spc->opts->seq_page_cost;
 	}
+}
+
+/*
+ * get_tablespace_io_concurrency
+ *
+ *		This value is not locked by the transaction, so this value may
+ *		be changed while a SELECT that has used these values for planning
+ *		is still executing.
+ */
+int
+get_tablespace_io_concurrency(Oid spcid)
+{
+	TableSpaceCacheEntry *spc = get_tablespace(spcid);
+
+	if (!spc->opts || spc->opts->effective_io_concurrency < 0)
+		return effective_io_concurrency;
+	else
+		return spc->opts->effective_io_concurrency;
 }

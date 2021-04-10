@@ -27,7 +27,6 @@ alter table addcol1
    add column b varchar default 'I am in a small content varblock';
 
 -- verification on master catalog
--- TODO: How to run this on segments, through a TINC test?
 -- Moreover, gp_toolkit schema is not populated in regression database
 -- select segno,column_num,physical_segno,tupcount,modcount,state
 --    from gp_toolkit.__gp_aocsseg(aocs_oid('addcol1')) order by segno,column_num;
@@ -60,7 +59,7 @@ insert into addcol1 select i, 'abc', 22*i/7, -i from generate_series(1,10)i;
 
 -- add columns with compression (dense and bulk dense content varblocks)
 alter table addcol1
-   add column e float default 22/7::float encoding (compresstype=RLE_TYPE),
+   add column e float default to_char((22/7::float), '9.99999999999999')::float encoding (compresstype=RLE_TYPE),
    add column f int default 20 encoding (compresstype=zlib);
 select * from addcol1 where a < 2 and a > -4 order by a,c;
 select a,f from addcol1 where a > 20 and a < 25 order by a,c;
@@ -286,7 +285,7 @@ alter table addcol1_renamed rename to addcol1;
 -- try renaming columns and see if stuff still works
 alter table addcol1 rename column f to f_renamed;
 alter table addcol1 alter column f_renamed set default 10;
-select adsrc from pg_attrdef pdef, pg_attribute pattr
+select pg_get_expr(adbin, adrelid) from pg_attrdef pdef, pg_attribute pattr
     where pdef.adrelid='addcol1'::regclass and pdef.adrelid=pattr.attrelid and pdef.adnum=pattr.attnum and pattr.attname='f_renamed';
 insert into addcol1 values (999);
 select a, f_renamed from addcol1 where a = 999;
@@ -333,26 +332,25 @@ alter table addcol1 reset (appendonly, compresslevel, fillfactor);
 create table alter_aocs_part_table (a int, b int) with (appendonly=true, orientation=column) distributed by (a)
     partition by range(b) (start (1) end (5) exclusive every (1), default partition foo);
 insert into alter_aocs_part_table values (generate_series(1,10), generate_series(1,10));
-alter table alter_aocs_part_table drop partition for (rank(1));
+alter table alter_aocs_part_table drop partition for (1);
 alter table alter_aocs_part_table split default partition start(6) inclusive end(7) exclusive;
 alter table alter_aocs_part_table split default partition start(6) inclusive end(8) exclusive;
 alter table alter_aocs_part_table split default partition start(7) inclusive end(8) exclusive;
-select partitionrangestart, partitionstartinclusive, partitionrangeend, partitionendinclusive, partitionisdefault
-    from pg_partitions where tablename = 'alter_aocs_part_table';
+\d+ alter_aocs_part_table
 create table alter_aocs_ao_table (a int, b int) with (appendonly=true) distributed by (a);
 insert into alter_aocs_ao_table values (2,2);
-alter table alter_aocs_part_table exchange partition for (rank(1)) with table alter_aocs_ao_table;
+alter table alter_aocs_part_table exchange partition for (2) with table alter_aocs_ao_table;
 create table alter_aocs_heap_table (a int, b int) distributed by (a);
 insert into alter_aocs_heap_table values (3,3);
-alter table alter_aocs_part_table exchange partition for (rank(2)) with table alter_aocs_heap_table;
+alter table alter_aocs_part_table exchange partition for (3) with table alter_aocs_heap_table;
 
 -- Test truncating and exchanging partition and then rolling back
 begin work;
 create table alter_aocs_ptable_exchange (a int, b int) with (appendonly=true, orientation=column) distributed by (a);
 insert into alter_aocs_ptable_exchange values (3,3), (3,3), (3,3);
-alter table alter_aocs_part_table truncate partition for (rank(2));
+alter table alter_aocs_part_table truncate partition for (3);
 select count(*) from alter_aocs_part_table;
-alter table alter_aocs_part_table exchange partition for (rank(2)) with table alter_aocs_ptable_exchange;
+alter table alter_aocs_part_table exchange partition for (3) with table alter_aocs_ptable_exchange;
 select count(*) from alter_aocs_part_table;
 rollback work;
 select count(*) from alter_aocs_part_table;
@@ -377,10 +375,13 @@ alter table aocs_multi_level_part_table add partition part3 start(date '2010-01-
 
 -- Add default partition (defaults to heap storage unless set with AO)
 alter table aocs_multi_level_part_table add default partition yearYYYY (default subpartition def);
-select count(*) from pg_appendonly where relid='aocs_multi_level_part_table_1_prt_yearyyyy'::regclass;
+SELECT am.amname FROM pg_class c LEFT JOIN pg_am am ON (c.relam = am.oid)
+WHERE c.relname = 'aocs_multi_level_part_table_1_prt_yearyyyy_2_prt_def';
+
 alter table aocs_multi_level_part_table drop partition yearYYYY;
 alter table aocs_multi_level_part_table add default partition yearYYYY with (appendonly=true, orientation=column) (default subpartition def);
-select count(*) from pg_appendonly where relid='aocs_multi_level_part_table_1_prt_yearyyyy'::regclass;
+SELECT am.amname FROM pg_class c LEFT JOIN pg_am am ON (c.relam = am.oid)
+WHERE c.relname = 'aocs_multi_level_part_table_1_prt_yearyyyy_2_prt_def';
 
 -- index on atts 1, 4
 create index ao_mlp_idx on aocs_multi_level_part_table(date, amount);
@@ -392,7 +393,7 @@ select indexname from pg_indexes where tablename='aocs_multi_level_part_table';
 select * from aocs_multi_level_part_table;
 truncate aocs_multi_level_part_table_1_prt_part1_2_prt_asia;
 select * from aocs_multi_level_part_table;
-alter table aocs_multi_level_part_table truncate partition for (rank(1));
+alter table aocs_multi_level_part_table truncate partition for ('02-02-2008');
 select * from aocs_multi_level_part_table;
 alter table aocs_multi_level_part_table alter partition part2 truncate partition usa;
 select * from aocs_multi_level_part_table;
@@ -434,3 +435,40 @@ reset enable_indexscan;
 -- (e.g. column_compression).
 set client_min_messages='WARNING';
 drop schema aocs_addcol cascade;
+
+-- Test case: alter column on a table after reorganize
+-- For an AOCS table with columns using rle_type compression, the
+-- implementation of 'reorganize' at 62d66c063fd did not set compression type
+-- for dropped columns. This led to an error 'Bad datum stream Dense block
+-- version'.
+create table aocs_with_compress(a smallint, b smallint, c smallint) with (appendonly=true, orientation=column, compresstype=rle_type);
+insert into aocs_with_compress values (1, 1, 1), (2, 2, 2);
+alter table aocs_with_compress drop column b;
+alter table aocs_with_compress set with (reorganize=true);
+-- The following operation must not fail
+alter table aocs_with_compress alter column c type integer;
+
+-- test case: alter AOCS table add column, the preference of the storage setting is: the encoding clause > table setting > gp_default_storage_options
+CREATE TABLE aocs_alter_add_col(a int) WITH (appendonly=true, orientation=column, compresstype=rle_type, compresslevel=4, blocksize=65536);
+SET gp_default_storage_options ='compresstype=zlib, compresslevel=2';
+-- use statement encoding 
+ALTER TABLE aocs_alter_add_col ADD COLUMN b int ENCODING(compresstype=zlib, compresslevel=3, blocksize=16384);
+-- use table setting
+ALTER TABLE aocs_alter_add_col ADD COLUMN c int;
+RESET gp_default_storage_options;
+-- use table setting
+ALTER TABLE aocs_alter_add_col ADD COLUMN d int;
+\d+ aocs_alter_add_col
+DROP TABLE aocs_alter_add_col;
+
+CREATE TABLE aocs_alter_add_col_no_compress(a int) WITH (appendonly=true, orientation=column);
+SET gp_default_storage_options ='compresstype=zlib, compresslevel=2, blocksize=8192';
+-- use statement encoding
+ALTER TABLE aocs_alter_add_col_no_compress ADD COLUMN b int ENCODING(compresstype=rle_type, compresslevel=3, blocksize=16384);
+-- use gp_default_storage_options
+ALTER TABLE aocs_alter_add_col_no_compress ADD COLUMN c int;
+RESET gp_default_storage_options;
+-- use default value 
+ALTER TABLE aocs_alter_add_col_no_compress ADD COLUMN d int;
+\d+ aocs_alter_add_col_no_compress 
+DROP TABLE aocs_alter_add_col_no_compress;

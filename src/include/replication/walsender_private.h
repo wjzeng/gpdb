@@ -3,7 +3,7 @@
  * walsender_private.h
  *	  Private definitions from replication/walsender.c.
  *
- * Portions Copyright (c) 2010-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2010-2019, PostgreSQL Global Development Group
  *
  * src/include/replication/walsender_private.h
  *
@@ -24,15 +24,23 @@ typedef enum WalSndState
 	WALSNDSTATE_STARTUP = 0,
 	WALSNDSTATE_BACKUP,
 	WALSNDSTATE_CATCHUP,
-	WALSNDSTATE_STREAMING
+	WALSNDSTATE_STREAMING,
+	WALSNDSTATE_STOPPING
 } WalSndState;
 
 /*
  * Each walsender has a WalSnd struct in shared memory.
+ *
+ * This struct is protected by 'mutex', with two exceptions: one is
+ * sync_standby_priority as noted below.  The other exception is that some
+ * members are only written by the walsender process itself, and thus that
+ * process is free to read those members without holding spinlock.  pid and
+ * needreload always require the spinlock to be held for all accesses.
  */
 typedef struct WalSnd
 {
-	pid_t		pid;			/* this walsender's process id, or 0 */
+	pid_t		pid;			/* this walsender's PID, or 0 if not active */
+
 	WalSndState state;			/* this walsender's state */
 	XLogRecPtr	sentPtr;		/* WAL has been sent up to this point */
 	bool		sendKeepalive;	/* do we send keepalives on this connection? */
@@ -67,14 +75,19 @@ typedef struct WalSnd
 	 */
 	XLogRecPtr	xlogCleanUpTo;
 
+	/* Measured lag times, or -1 for unknown/none. */
+	TimeOffset	writeLag;
+	TimeOffset	flushLag;
+	TimeOffset	applyLag;
+
 	/* Protects shared variables shown above. */
 	slock_t		mutex;
 
 	/*
-	 * Latch used by backends to wake up this walsender when it has work to
-	 * do.
+	 * Pointer to the walsender's latch. Used by backends to wake up this
+	 * walsender when it has work to do. NULL if the walsender isn't active.
 	 */
-	Latch		latch;
+	Latch	   *latch;
 
 	/*
 	 * The priority order of the standby managed by this WALSender, as listed
@@ -83,13 +96,16 @@ typedef struct WalSnd
 	 */
 	int			sync_standby_priority;
 
-	bool		synchronous;
+	/*
+	 * Timestamp of the last message received from standby.
+	 */
+	TimestampTz replyTime;
 
 	/*
-	 * Records time, either during initialization or due to disconnection.
-	 * This helps to detect time passed since mirror didn't connect.
+	 * Indicates whether the WalSnd represents a connection with a Greenplum
+	 * mirror in streaming mode
 	 */
-	pg_time_t   replica_disconnected_at;
+	bool 		is_for_gp_walreceiver;
 } WalSnd;
 
 extern WalSnd *MyWalSnd;
@@ -149,7 +165,7 @@ typedef struct
 	 */
 	WalSndError error;
 
-	WalSnd		walsnds[1];		/* VARIABLE LENGTH ARRAY */
+	WalSnd		walsnds[FLEXIBLE_ARRAY_MEMBER];
 } WalSndCtlData;
 
 extern WalSndCtlData *WalSndCtl;
@@ -163,10 +179,12 @@ extern void WalSndSetState(WalSndState state);
  */
 extern int	replication_yyparse(void);
 extern int	replication_yylex(void);
-extern void replication_yyerror(const char *str);
+extern void replication_yyerror(const char *str) pg_attribute_noreturn();
 extern void replication_scanner_init(const char *query_string);
 extern void replication_scanner_finish(void);
 
 extern Node *replication_parse_result;
 
-#endif   /* _WALSENDER_PRIVATE_H */
+#define GP_WALRECEIVER_APPNAME "gp_walreceiver"
+
+#endif							/* _WALSENDER_PRIVATE_H */

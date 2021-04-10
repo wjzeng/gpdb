@@ -67,19 +67,54 @@ select distinct a from (select  distinct 'A' from (select 'C' from (select disti
 --
 CREATE TABLE test1 (id int);
 insert into test1 values (1);
-CREATE EXTERNAL WEB TABLE test2 (id int) EXECUTE 'echo 2' ON MASTER FORMAT 'csv';
+CREATE EXTERNAL WEB TABLE test2 (id int) EXECUTE 'echo 2' ON COORDINATOR FORMAT 'csv';
 
 (SELECT 'test1' as branch, id FROM test1 LIMIT 1)
 union
 (SELECT 'test2' as branch, id FROM test2);
 
--- The plan you currently get for this has a Motion to move the data from the single QE to
--- QD. That's a bit silly, it would probably make more sense to pull all the data to the QD
--- in the first place, and execute the Limit in the QD, to avoid the extra Motion. But this
--- is hopefully a pretty rare case.
 explain (SELECT 'test1' as branch, id FROM test1 LIMIT 1)
 union
 (SELECT 'test2' as branch, id FROM test2);
+
+--
+-- Test pulling up distribution key expression, when the different branches
+-- of a UNION ALL have different typmods.
+--
+create table pullup_distkey_test(
+    a character varying,
+    b character varying(30)
+) distributed by (b);
+
+insert into pullup_distkey_test values ('foo', 'bar');
+
+with base as
+(
+  select a, b from pullup_distkey_test
+  union all
+  select 'xx' as a, 'bar' as b
+)
+select a from base
+union all
+select a from base where a = 'foo';
+
+--
+-- Test union all two replicated tables with different numsegments
+--
+create table rep2(c1 int, c2 int) distributed replicated;
+create table rep3(c1 int, c2 int) distributed replicated;
+set allow_system_table_mods = on;
+update gp_distribution_policy set numsegments = 2
+  where localoid = 'rep2'::regclass;
+select localoid::regclass, policytype, numsegments
+  from gp_distribution_policy
+  where localoid::regclass in ('rep2', 'rep3');
+explain select * from rep2 union all select * from rep3;
+select * from rep2 union all select * from rep3;
+reset allow_system_table_mods;
+drop table rep2;
+drop table rep3;
+
 
 --
 -- Setup
@@ -101,7 +136,7 @@ CREATE TABLE T_random (c1 int, c2 int);
 INSERT INTO T_random SELECT i, i%5 from generate_series(1,30) i;
 
 --start_ignore
-create language plpythonu;
+create language plpython3u;
 --end_ignore
 
 create or replace function count_operator(query text, operator text) returns int as
@@ -115,7 +150,7 @@ for i in range(len(rv)):
         result = result+1
 return result
 $$
-language plpythonu;
+language plpython3u;
 
 --
 -- N-ary UNION ALL results
@@ -540,6 +575,90 @@ UNION
 (SELECT a FROM t2_setop EXCEPT SELECT a FROM t1_setop ORDER BY a)
 ORDER BY a;
 
+create table t1_ncols(a int, b int, c text, d date) distributed by (a);
+create table t2_ncols(a smallint, b bigint, c varchar(20), d date) distributed by (c, b)
+ partition by range (a) (start (0) end (8) every (4));
+create view v1_ncols(id, a, b, c, d) as select 1,* from t1_ncols union all select 2,* from t2_ncols;
+
+insert into t1_ncols values (1, 11, 'one', '2001-01-01');
+
+insert into t2_ncols values (2, 22, 'two', '2002-02-02');
+insert into t2_ncols values (4, 44, 'four','2004-04-04');
+
+select b from t1_ncols union all select a from t2_ncols;
+select a+100, b, d from t1_ncols union select b, a+200, d from t2_ncols order by 1;
+select c, a from v1_ncols;
+
+with cte1(aa, b, c, d) as (select a*100, b, c, d from t1_ncols union select * from t2_ncols)
+select x.aa/100 aaa, x.c, y.c from cte1 x join cte1 y on x.aa=y.aa;
+
+select from t2_ncols union select * from t2_ncols;
+
+-- Test the result of union of 2 tables distributed on different number of segments
+-- start_ignore
+drop schema if exists union_schema CASCADE;
+-- end_ignore
+create schema union_schema;
+create table union_schema.t1(a int, b int);
+create table union_schema.t2(a int, b int);
+create table union_schema.t3(a int, b int);
+
+set allow_system_table_mods = on;
+update gp_distribution_policy set numsegments = 1
+  where localoid = 'union_schema.t1'::regclass::oid;
+update gp_distribution_policy set numsegments = 2
+  where localoid = 'union_schema.t2'::regclass::oid;
+select relname, policytype, numsegments, distkey
+  from pg_class, gp_distribution_policy, pg_namespace ns
+  where pg_class.oid = localoid and relnamespace = ns.oid
+    and nspname = 'union_schema'
+    and relname in ('t1', 't2', 't3')
+  order by relname;
+
+insert into union_schema.t1 select i, i from generate_series(1,10)i;
+insert into union_schema.t2 select i, i from generate_series(1,20)i;
+analyze union_schema.t1;
+analyze union_schema.t2;
+
+explain select * from union_schema.t1 join union_schema.t2
+    on union_schema.t1.a = union_schema.t2.b;
+explain select union_schema.t1.a, union_schema.t2.b
+  from union_schema.t1 join union_schema.t2
+    on union_schema.t1.a = union_schema.t2.b
+  union all
+  select * from union_schema.t3;
+
+select * from union_schema.t1 join union_schema.t2
+  on union_schema.t1.a = union_schema.t2.b;
+select union_schema.t1.a, union_schema.t2.b
+  from union_schema.t1 join union_schema.t2
+    on union_schema.t1.a = union_schema.t2.b
+union all
+select * from union_schema.t3;
+
+truncate union_schema.t1, union_schema.t2;
+insert into union_schema.t1 select i, i from generate_series(1,20)i;
+insert into union_schema.t2 select i, i from generate_series(1,10)i;
+analyze union_schema.t1;
+analyze union_schema.t2;
+
+explain select * from union_schema.t1 join union_schema.t2
+    on union_schema.t1.a = union_schema.t2.b;
+explain select union_schema.t1.a, union_schema.t2.b
+    from union_schema.t1 join union_schema.t2
+	  on union_schema.t1.a = union_schema.t2.b
+  union all
+  select * from union_schema.t3;
+
+select * from union_schema.t1 join union_schema.t2
+  on union_schema.t1.a = union_schema.t2.b;
+select union_schema.t1.a, union_schema.t2.b
+  from union_schema.t1 join union_schema.t2
+    on union_schema.t1.a = union_schema.t2.b
+union all
+select * from union_schema.t3;
+
+reset allow_system_table_mods;
 --
 -- Clean up
 --
@@ -547,3 +666,7 @@ ORDER BY a;
 DROP TABLE IF EXISTS T_a1 CASCADE;
 DROP TABLE IF EXISTS T_b2 CASCADE;
 DROP TABLE IF EXISTS T_random CASCADE;
+DROP VIEW IF EXISTS v1_ncols CASCADE;
+DROP TABLE IF EXISTS t1_ncols CASCADE;
+DROP TABLE IF EXISTS t2_ncols CASCADE;
+DROP SCHEMA IF EXISTS union_schema CASCADE;

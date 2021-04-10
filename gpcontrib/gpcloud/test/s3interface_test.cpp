@@ -135,9 +135,7 @@ TEST_F(S3InterfaceServiceTest, HeadResponseWithRetriesAndFail) {
 
     EXPECT_CALL(mockRESTfulService, head(_, _))
         .Times(S3_REQUEST_MAX_RETRIES)
-        .WillOnce(Throw(S3ConnectionError("")))
-        .WillOnce(Throw(S3ConnectionError("")))
-        .WillOnce(Throw(S3ConnectionError("")));
+        .WillRepeatedly(Throw(S3ConnectionError("")));
 
     EXPECT_THROW(this->headResponseWithRetries(url, headers), S3FailedAfterRetry);
 }
@@ -399,6 +397,11 @@ TEST_F(S3InterfaceServiceTest, checkSmallFile) {
     EXPECT_EQ(S3_COMPRESSION_PLAIN, this->checkCompressionType(s3Url.getFullUrlForCurl()));
 }
 
+TEST_F(S3InterfaceServiceTest, checkItsDeflateCompressed) {
+    S3Url s3Url("https://s3-us-west-2.amazonaws.com/s3test.pivotal.io/whatever.deflate");
+    EXPECT_EQ(S3_COMPRESSION_DEFLATE, this->checkCompressionType(s3Url));
+}
+
 TEST_F(S3InterfaceServiceTest, checkItsGzipCompressed) {
     vector<uint8_t> raw;
     raw.resize(4);
@@ -474,7 +477,7 @@ TEST_F(S3InterfaceServiceTest, HeadResponseWithHeadResponseFail) {
     S3Url s3Url("https://s3-us-west-2.amazonaws.com/s3test.pivotal.io/whatever");
 
     EXPECT_CALL(mockRESTfulService, head(_, _))
-        .Times(3)
+        .Times(S3_REQUEST_MAX_RETRIES)
         .WillRepeatedly(Throw(S3ConnectionError("")));
 
     EXPECT_THROW(this->checkKeyExistence(s3Url), S3FailedAfterRetry);

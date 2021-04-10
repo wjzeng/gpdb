@@ -447,6 +447,14 @@ explain SELECT * FROM multiset_5( TABLE( SELECT * from example_r) );
 explain SELECT * FROM multiset_5( TABLE( SELECT * FROM example_r SCATTER by a||b) );
 explain SELECT * FROM multiset_5( TABLE( SELECT * FROM example_r SCATTER by b, a, a||b) );
 explain SELECT * FROM multiset_5( TABLE( SELECT * FROM example_r SCATTER RANDOMLY) );
+explain SELECT * FROM multiset_5( TABLE (SELECT DISTINCT a, b FROM example) );
+explain SELECT * FROM multiset_5( TABLE (SELECT DISTINCT a, b FROM example SCATTER BY a) );
+explain SELECT * FROM multiset_5( TABLE (SELECT DISTINCT a / 2, b FROM example SCATTER BY a / 2) );
+explain SELECT * FROM multiset_5( TABLE (SELECT DISTINCT a, b FROM example SCATTER BY b) );
+explain SELECT * FROM multiset_5( TABLE (SELECT DISTINCT a, b FROM example ORDER BY b, a SCATTER RANDOMLY) );
+explain SELECT * FROM multiset_5( TABLE (SELECT DISTINCT a, b FROM example ORDER BY a, b SCATTER BY a) );
+explain SELECT * FROM multiset_5( TABLE (SELECT DISTINCT a, b FROM example ORDER BY b, a SCATTER BY b) );
+explain SELECT * FROM multiset_5( TABLE (SELECT DISTINCT a, b FROM example ORDER BY b, a LIMIT 2 SCATTER RANDOMLY) );
 explain SELECT * FROM multiset_5( TABLE( SELECT count(*)::integer, 'hello'::text from example_r ) );
 explain SELECT * FROM example_r WHERE (10, 'hello') in (SELECT * FROM multiset_5( TABLE( SELECT count(*)::integer, 'hello'::text from example_r )));
 explain SELECT * FROM multiset_5( TABLE( SELECT * from example_v) );
@@ -553,7 +561,7 @@ CREATE FUNCTION multi_args(a anytable, x int) RETURNS SETOF example
 -- In select list requires some extra setrefs logic in planning
 SELECT *, generate_series(1,2) FROM multi_args( TABLE(SELECT 1::int, 'hello'::text), 2);
 
--- Note the extra "Result" node when the srf is in the select list
+-- Note the extra "ProjectSet" node when the srf is in the select list
 explain SELECT *, generate_series(1,2) FROM multi_args( TABLE(SELECT 1::int, 'hello'::text), 2);
 explain SELECT * FROM multi_args( TABLE(SELECT 1::int, 'hello'::text), 2);
 
@@ -583,7 +591,7 @@ SELECT * FROM multiset_5( TABLE( SELECT 1::integer, 'hello'::text) ) as tf;
 -- ============================================
 -- start_ignore
 -- These may have been created by previous test
-create language plpythonu;
+create language plpython3u;
 -- end_ignore
 
 CREATE FUNCTION tf_sql(anytable) returns int AS $$ SELECT 1 $$ language sql CONTAINS SQL;
@@ -594,7 +602,7 @@ BEGIN
 END;
 $$ language plpgsql NO SQL;
 
-CREATE FUNCTION tf_python(anytable) returns int AS $$ return 1 $$ language plpythonu NO SQL;
+CREATE FUNCTION tf_python(anytable) returns int AS $$ return 1 $$ language plpython3u NO SQL;
 
 
 -- ====================================

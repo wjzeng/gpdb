@@ -2,11 +2,11 @@
 -- SETUP: Helper functions for query plan verification
 --
 -- The helper functions are written in python.
-create or replace language plpythonu;
+create or replace language plpython3u;
 -- While we're at it, test that CREATE OR REPLACE LANGUAGE works when
 -- the language exists already (we had a little bug at one point, where
 -- the "OR REPLACE" was not dispatched to segments, and this failed)
-create or replace language plpythonu;
+create or replace language plpython3u;
 --start_ignore
 drop schema if exists bfv_legacy cascade;
 NOTICE:  schema "bfv_legacy" does not exist, skipping
@@ -21,7 +21,7 @@ first_line = rv[0]['QUERY PLAN']
 row_width = int(first_line[first_line.find('width=')+6:first_line.rfind(')')])
 return row_width > -1
 $$
-language plpythonu;
+language plpython3u;
 create or replace function count_operator(explain_query text, op_name text) returns int as
 $$
 rv = plpy.execute(explain_query)
@@ -32,7 +32,7 @@ for i in range(len(rv)):
         result = result+1
 return result
 $$
-language plpythonu;
+language plpython3u;
 --
 -- aggregate width should be non-zero
 --
@@ -105,10 +105,10 @@ col_with_constraint numeric UNIQUE
 create table bfv_legacy_B as select * from bfv_legacy_A;
 NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column(s) named 'col_with_constraint' as the Greenplum Database data distribution key for this table.
 HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
-select localoid::regclass, attrnums from gp_distribution_policy p left join pg_class c on (p.localoid = c.oid) where c.relname in ('bfv_legacy_a', 'bfv_legacy_b') order by 1,2;
-   localoid   | attrnums 
---------------+----------
- bfv_legacy_a | {3}
- bfv_legacy_b | {3}
+select localoid::regclass, distkey from gp_distribution_policy p left join pg_class c on (p.localoid = c.oid) where c.relname in ('bfv_legacy_a', 'bfv_legacy_b') order by 1,2;
+   localoid   | distkey 
+--------------+---------
+ bfv_legacy_a | 3
+ bfv_legacy_b | 3
 (2 rows)
 

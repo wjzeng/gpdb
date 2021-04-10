@@ -3,7 +3,7 @@
  * ftsmessagehandler.c
  *	  Implementation of handling of FTS messages
  *
- * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
  *
  *
  * IDENTIFICATION
@@ -15,8 +15,10 @@
 
 #include <sys/stat.h>
 #include <unistd.h>
+#include <replication/slot.h>
 
 #include "access/xlog.h"
+#include "cdb/cdbvars.h"
 #include "libpq/pqformat.h"
 #include "libpq/libpq.h"
 #include "postmaster/fts.h"
@@ -33,7 +35,7 @@
  * Check if we can smoothly read and write to data directory.
  *
  * O_DIRECT flag requires buffer to be OS/FS block aligned.
- * Best to have it IO Block alligned henece using BLCKSZ
+ * Best to have it IO Block aligned hence using BLCKSZ
  */
 static bool
 checkIODataDirectory(void)
@@ -44,15 +46,14 @@ checkIODataDirectory(void)
 	char *data = palloc0(size);
 
 	/*
-	 * Buffer needs to be alligned to BLOCK_SIZE for reads and writes if using O_DIRECT
+	 * Buffer needs to be aligned to BLOCK_SIZE for reads and writes if using O_DIRECT
 	 */
 	char* dataAligned = (char *) TYPEALIGN(BLCKSZ, data);
 
 	errno = 0;
 	bool failure = false;
 
-	fd = BasicOpenFile(FTS_PROBE_FILE_NAME, O_RDWR | PG_O_DIRECT | O_EXCL,
-                                           S_IRUSR | S_IWUSR);
+	fd = BasicOpenFile(FTS_PROBE_FILE_NAME, O_RDWR | PG_O_DIRECT);
 	do
 	{
 		if (fd < 0)
@@ -60,8 +61,7 @@ checkIODataDirectory(void)
 			if (errno == ENOENT)
 			{
 				elog(LOG, "FTS: \"%s\" file doesn't exist, creating it once.", FTS_PROBE_FILE_NAME);
-				fd = BasicOpenFile(FTS_PROBE_FILE_NAME, O_RDWR | O_CREAT | O_EXCL,
-                                           S_IRUSR | S_IWUSR);
+				fd = BasicOpenFile(FTS_PROBE_FILE_NAME, O_RDWR | O_CREAT | O_EXCL);
 				if (fd < 0)
 				{
 					failure = true;
@@ -80,6 +80,15 @@ checkIODataDirectory(void)
 						failure = true;
 					}
 				}
+			}
+			else if (errno == EINVAL)
+			{
+				ereport(WARNING, (errcode_for_file_access(),
+						errmsg("FTS: could not open file \"%s\" (%m)", FTS_PROBE_FILE_NAME)),
+						errdetail("Possibly because the file system does not "
+								  "support O_DIRECT (e.g. tmpfs does not). "
+								  "Skipping IO check anyway."));
+				failure = false;
 			}
 			else
 			{
@@ -134,7 +143,8 @@ checkIODataDirectory(void)
 		}
 	} while (0);
 
-	if (fd > 0)
+	pfree(data);
+	if (fd >= 0)
 	{
 		close(fd);
 
@@ -156,11 +166,10 @@ checkIODataDirectory(void)
 				errmsg("could not unlink file \"%s\": %m", FTS_PROBE_FILE_NAME)));
 		}
 	}
-	pfree(data);
 
 	if (failure)
 		ereport(ERROR,
-				(errmsg("disk IO check during FTS probe failed.")));
+				(errmsg("disk IO check during FTS probe failed")));
 
 	return failure;
 }
@@ -169,8 +178,6 @@ static void
 SendFtsResponse(FtsResponse *response, const char *messagetype)
 {
 	StringInfoData buf;
-
-	initStringInfo(&buf);
 
 	BeginCommand(messagetype, DestRemote);
 
@@ -273,19 +280,6 @@ HandleFtsWalRepProbe(void)
 			/* Syncrep is enabled now, so respond accordingly. */
 			response.IsSyncRepEnabled = true;
 		}
-
-		/*
-		 * Precautionary action: Unlink PROMOTE_SIGNAL_FILE if incase it
-		 * exists. This is to avoid driving to any incorrect conclusions when
-		 * this segment starts acting as mirror or gets copied over using
-		 * pg_basebackup.
-		 */
-		// GPDB_93_MERGE_FIXME: should we check for FALLBACK_PROMOTE_SIGNAL_FILE, too?
-		if (CheckPromoteSignal())
-		{
-			unlink(PROMOTE_SIGNAL_FILE);
-			elog(LOG, "found and hence deleted '%s' file", PROMOTE_SIGNAL_FILE);
-		}
 	}
 
 	/*
@@ -319,6 +313,56 @@ HandleFtsWalRepSyncRepOff(void)
 }
 
 static void
+CreateReplicationSlotOnPromote(const char *name)
+{
+	int             i;
+
+	Assert(MyReplicationSlot == NULL);
+
+	/*
+	 * Check for name collision, and identify an allocatable slot.  We need to
+	 * hold ReplicationSlotControlLock in shared mode for this, so that nobody
+	 * else can change the in_use flags while we're looking at them.
+	 */
+	LWLockAcquire(ReplicationSlotControlLock, LW_SHARED);
+	for (i = 0; i < max_replication_slots; i++)
+	{
+		ReplicationSlot *s = &ReplicationSlotCtl->replication_slots[i];
+
+		if (s->in_use && strcmp(name, NameStr(s->data.name)) == 0)
+			MyReplicationSlot = s;
+	}
+	LWLockRelease(ReplicationSlotControlLock);
+
+	if (MyReplicationSlot == NULL)
+	{
+		ereport(LOG, (errmsg("creating replication slot %s", name)));
+		ReplicationSlotCreate(name, false, RS_PERSISTENT);
+	}
+	else
+		ereport(LOG, (errmsg("replication slot %s exists", name)));
+
+	/*
+	 * Only on promote signal replication slot is created on mirror. If
+	 * node was acting as mirror, no replication slot should exists on it.
+	 * Hence, no-zero restart_lsn means was set by previous attempt on promote
+	 * signal and hence no need to overwrite the same.
+	 */
+	if (MyReplicationSlot->data.restart_lsn == 0)
+	{
+		/* Starting reserving WAL right away for pg_rewind to work later */
+		ReplicationSlotReserveWal();
+		/* Write this slot to disk */
+		ReplicationSlotMarkDirty();
+		ReplicationSlotSave();
+		if (MyReplicationSlot->active_pid != 0)
+			ReplicationSlotRelease();
+	}
+
+	MyReplicationSlot = NULL;
+}
+
+static void
 HandleFtsWalRepPromote(void)
 {
 	FtsResponse response = {
@@ -338,8 +382,22 @@ HandleFtsWalRepPromote(void)
 	 * idempotent way.
 	 */
 	DBState state = GetCurrentDBState();
-	if (state == DB_IN_STANDBY_MODE)
+	if (state == DB_IN_ARCHIVE_RECOVERY)
+	{
+		/*
+		 * Reset sync_standby_names on promotion. This is to avoid commits
+		 * hanging/waiting for replication till next FTS probe. Next FTS probe
+		 * will detect this node to be not in sync and reset the same which
+		 * can take a min. Since we know on mirror promotion its marked as not
+		 * in sync in gp_segment_configuration, best to right away clean the
+		 * sync_standby_names.
+		 */
+		UnsetSyncStandbysDefined();
+
+		CreateReplicationSlotOnPromote(INTERNAL_WAL_REPLICATION_SLOT_NAME);
+
 		SignalPromote();
+	}
 	else
 	{
 		elog(LOG, "ignoring promote request, walreceiver not running,"
@@ -352,7 +410,35 @@ HandleFtsWalRepPromote(void)
 void
 HandleFtsMessage(const char* query_string)
 {
-	SIMPLE_FAULT_INJECTOR(FtsHandleMessage);
+	int dbid;
+	int contid;
+	char message_type[FTS_MSG_MAX_LEN];
+	int error_level;
+
+	if (sscanf(query_string, FTS_MSG_FORMAT,
+			   message_type, &dbid, &contid) != 3)
+	{
+		ereport(ERROR,
+				(errmsg("received invalid FTS query: %s", query_string)));
+	}
+
+#ifdef USE_ASSERT_CHECKING
+	error_level = FATAL;
+#else
+	error_level = WARNING;
+#endif
+
+	if (dbid != GpIdentity.dbid)
+		ereport(error_level,
+				(errmsg("message type: %s received dbid:%d doesn't match this segments configured dbid:%d",
+						message_type, dbid, GpIdentity.dbid)));
+
+	if (contid != GpIdentity.segindex)
+		ereport(error_level,
+				(errmsg("message type: %s received contentid:%d doesn't match this segments configured contentid:%d",
+						message_type, contid, GpIdentity.segindex)));
+
+	SIMPLE_FAULT_INJECTOR("fts_handle_message");
 
 	if (strncmp(query_string, FTS_MSG_PROBE,
 				strlen(FTS_MSG_PROBE)) == 0)

@@ -5,27 +5,8 @@
 
 #include "../runaway_cleaner.c"
 
-#define EXPECT_ELOG(LOG_LEVEL)     \
-    will_be_called(elog_start); \
-	expect_any(elog_start, filename); \
-	expect_any(elog_start, lineno); \
-	expect_any(elog_start, funcname); \
-	if (LOG_LEVEL < ERROR) \
-	{ \
-    	will_be_called(elog_finish); \
-	} \
-    else \
-    { \
-    	will_be_called_with_sideeffect(elog_finish, &_ExceptionalCondition, NULL);\
-    } \
-	expect_value(elog_finish, elevel, LOG_LEVEL); \
-	expect_any(elog_finish, fmt); \
-
 #define EXPECT_EREPORT(LOG_LEVEL)     \
 	expect_any(errstart, elevel); \
-	expect_any(errstart, filename); \
-	expect_any(errstart, lineno); \
-	expect_any(errstart, funcname); \
 	expect_any(errstart, domain); \
 	if (LOG_LEVEL < ERROR) \
 	{ \
@@ -33,13 +14,12 @@
 	} \
     else \
     { \
-    	will_return_with_sideeffect(errstart, false, &_ExceptionalCondition, NULL);\
-    } \
+    	will_return_with_sideeffect(errstart, false, &_ExceptionalCondition, NULL); \
+    }
 
 #define CHECK_FOR_RUNAWAY_CLEANUP_MEMORY_LOGGING() \
 	will_be_called(write_stderr); \
 	expect_any(write_stderr, fmt); \
-	will_be_called(MemoryAccounting_SaveToLog); \
 	will_be_called(MemoryContextStats); \
 	expect_any(MemoryContextStats, context); \
 
@@ -62,6 +42,7 @@ InitFakeSessionState(int activeProcessCount, int cleanupCountdown, RunawayStatus
 	MySessionState->spinLock = 0;
 }
 
+#undef  PG_RE_THROW
 #define PG_RE_THROW() siglongjmp(*PG_exception_stack, 1)
 
 /*
@@ -69,7 +50,7 @@ InitFakeSessionState(int activeProcessCount, int cleanupCountdown, RunawayStatus
  * function by re-throwing the exception, essentially falling
  * back to the next available PG_CATCH();
  */
-void
+static void
 _ExceptionalCondition()
 {
      PG_RE_THROW();
@@ -79,7 +60,7 @@ _ExceptionalCondition()
  * Checks if RunawayCleaner_StartCleanup() does not start cleanup if
  * the current session is not a runaway
  */
-void
+static void
 test__RunawayCleaner_StartCleanup__IgnoresNonRunaway(void **state)
 {
 	InitFakeSessionState(2 /* activeProcessCount */,
@@ -100,7 +81,7 @@ test__RunawayCleaner_StartCleanup__IgnoresNonRunaway(void **state)
  * Checks if RunawayCleaner_StartCleanup() does not execute a duplicate
  * cleanup for the same runaway event that it already started cleaning up
  */
-void
+static void
 test__RunawayCleaner_StartCleanup__IgnoresDuplicateCleanup(void **state)
 {
 	InitFakeSessionState(2 /* activeProcessCount */,
@@ -123,7 +104,7 @@ test__RunawayCleaner_StartCleanup__IgnoresDuplicateCleanup(void **state)
  * all conditions are met (i.e., no commit is in progress and vmem tracker
  * is initialized) and runaway session is "primary"
  */
-void
+static void
 test__RunawayCleaner_StartCleanup__StartsPrimaryCleanupIfPossible(void **state)
 {
 	InitFakeSessionState(2 /* activeProcessCount */,
@@ -148,14 +129,6 @@ test__RunawayCleaner_StartCleanup__StartsPrimaryCleanupIfPossible(void **state)
 	/* We need a valid gp_command_count to execute cleanup */
 	gp_command_count = 1;
 	will_return(IsTransactionState, true);
-
-#ifdef FAULT_INJECTOR
-	expect_value(FaultInjector_InjectFaultIfSet, identifier, RunawayCleanup);
-	expect_value(FaultInjector_InjectFaultIfSet, ddlStatement, DDLNotSpecified);
-	expect_value(FaultInjector_InjectFaultIfSet, databaseName, "");
-	expect_value(FaultInjector_InjectFaultIfSet, tableName, "");
-	will_be_called(FaultInjector_InjectFaultIfSet);
-#endif
 
 	EXPECT_EREPORT(ERROR);
 
@@ -189,7 +162,7 @@ test__RunawayCleaner_StartCleanup__StartsPrimaryCleanupIfPossible(void **state)
  * all conditions are met (i.e., no commit is in progress and vmem tracker
  * is initialized) and runaway session is "secondary"
  */
-void
+static void
 test__RunawayCleaner_StartCleanup__StartsSecondaryCleanupIfPossible(void **state)
 {
 	InitFakeSessionState(2 /* activeProcessCount */,
@@ -215,14 +188,6 @@ test__RunawayCleaner_StartCleanup__StartsSecondaryCleanupIfPossible(void **state
 	gp_command_count = 1;
 	will_return(superuser, false);
 	will_return(IsTransactionState, true);
-
-#ifdef FAULT_INJECTOR
-	expect_value(FaultInjector_InjectFaultIfSet, identifier, RunawayCleanup);
-	expect_value(FaultInjector_InjectFaultIfSet, ddlStatement, DDLNotSpecified);
-	expect_value(FaultInjector_InjectFaultIfSet, databaseName, "");
-	expect_value(FaultInjector_InjectFaultIfSet, tableName, "");
-	will_be_called(FaultInjector_InjectFaultIfSet);
-#endif
 
 	EXPECT_EREPORT(ERROR);
 
@@ -255,7 +220,7 @@ test__RunawayCleaner_StartCleanup__StartsSecondaryCleanupIfPossible(void **state
 /*
  * Checks if RunawayCleaner_StartCleanup() ignores cleanup if in critical section
  */
-void
+static void
 test__RunawayCleaner_StartCleanup__IgnoresCleanupInCriticalSection(void **state)
 {
 	InitFakeSessionState(2 /* activeProcessCount */,
@@ -298,7 +263,7 @@ test__RunawayCleaner_StartCleanup__IgnoresCleanupInCriticalSection(void **state)
 /*
  * Checks if RunawayCleaner_StartCleanup() ignores cleanup if interrupts are held off
  */
-void
+static void
 test__RunawayCleaner_StartCleanup__IgnoresCleanupInHoldoffInterrupt(void **state)
 {
 	InitFakeSessionState(2 /* activeProcessCount */,
@@ -341,7 +306,7 @@ test__RunawayCleaner_StartCleanup__IgnoresCleanupInHoldoffInterrupt(void **state
 /*
  * Checks if RunawayCleaner_StartCleanup() ignores cleanup if outside of any transaction
  */
-void
+static void
 test__RunawayCleaner_StartCleanup__IgnoresCleanupOutsideAnyTransaction(void **state)
 {
 	InitFakeSessionState(2 /* activeProcessCount */,
@@ -389,7 +354,7 @@ test__RunawayCleaner_StartCleanup__IgnoresCleanupOutsideAnyTransaction(void **st
  * Checks if RunawayCleaner_RunawayCleanupDoneForProcess() ignores cleanupCountdown
  * if optional cleanup
  */
-void
+static void
 test__RunawayCleaner_RunawayCleanupDoneForProcess__IgnoresCleanupIfNotRequired(void **state)
 {
 #define CLEANUP_COUNTDOWN 2
@@ -459,7 +424,7 @@ test__RunawayCleaner_RunawayCleanupDoneForProcess__IgnoresCleanupIfNotRequired(v
  * Checks if RunawayCleaner_RunawayCleanupDoneForProcess ignores duplicate cleanup
  * for a single runaway event
  */
-void
+static void
 test__RunawayCleaner_RunawayCleanupDoneForProcess__IgnoresDuplicateCalls(void **state)
 {
 	InitFakeSessionState(2 /* activeProcessCount */,
@@ -489,7 +454,7 @@ test__RunawayCleaner_RunawayCleanupDoneForProcess__IgnoresDuplicateCalls(void **
  * for a single runaway event by properly updating beginCleanupRunawayVersion and
  * endCleanupRunawayVersion
  */
-void
+static void
 test__RunawayCleaner_RunawayCleanupDoneForProcess__PreventsDuplicateCleanup(void **state)
 {
 	InitFakeSessionState(2 /* activeProcessCount */,
@@ -529,7 +494,7 @@ test__RunawayCleaner_RunawayCleanupDoneForProcess__PreventsDuplicateCleanup(void
  * Checks if RunawayCleaner_RunawayCleanupDoneForProcess reactivates a process
  * if the deactivation process triggers cleanup for a pending runaway event
  */
-void
+static void
 test__RunawayCleaner_RunawayCleanupDoneForProcess__UndoDeactivation(void **state)
 {
 	InitFakeSessionState(2 /* activeProcessCount */,
@@ -573,7 +538,7 @@ test__RunawayCleaner_RunawayCleanupDoneForProcess__UndoDeactivation(void **state
  * Checks if RunawayCleaner_RunawayCleanupDoneForProcess reactivates the runaway detector
  * once all the processes of the runaway session are done cleaning
  */
-void
+static void
 test__RunawayCleaner_RunawayCleanupDoneForProcess__ReactivatesRunawayDetection(void **state)
 {
 	InitFakeSessionState(2 /* activeProcessCount */,
@@ -632,7 +597,7 @@ test__RunawayCleaner_RunawayCleanupDoneForProcess__ReactivatesRunawayDetection(v
 /*
  * Checks if RunawayCleaner_RunawayCleanupDoneForSession reactivates the runaway detector
  */
-void
+static void
 test__RunawayCleaner_RunawayCleanupDoneForSession__ResetsRunawayFlagAndReactivateRunawayDetector(void **state)
 {
 	InitFakeSessionState(2 /* activeProcessCount */,

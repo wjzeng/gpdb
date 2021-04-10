@@ -35,50 +35,56 @@
 
     <section id="file_system">
       <title>File System</title>
-      <p>XFS is the file system used for Greenplum Database data directories. XFS should be mounted
-        with the following mount options:
+      <p>XFS is the file system used for Greenplum Database data directories. On RHEL/CentOS
+        systems, mount XFS volumes with the following mount options:
         <codeblock>rw,nodev,noatime,nobarrier,inode64</codeblock></p>
+      <p>The <codeph>nobarrier</codeph> option is not supported on Ubuntu systems. Use only the
+        options:<codeblock>rw,nodev,noatime,inode64</codeblock></p>
     </section>
-    <section id="port_config">
-      <title>Port Configuration</title>
-      <p>Set up <codeph>ip_local_port_range</codeph> so it does not conflict with the Greenplum
-        Database port ranges. For example, setting this range in
-          <systemoutput>/etc/sysctl.conf</systemoutput>:
-        <codeblock>net.ipv4.ip_local_port_range = 10000  65535</codeblock></p>
-      <p>you could set the Greenplum Database base port numbers to these
+    <section id="port_config"><p>See the <xref href="../install_guide/prep_os.html#topic3"
+          format="dita" scope="peer">recommended OS parameter settings</xref> in the <cite>Greenplum
+          Database Installation Guide</cite> for further details.</p><title>Port
+        Configuration</title><p>Set up <codeph>ip_local_port_range</codeph> so it does not conflict
+        with the Greenplum Database port ranges. For example, setting this range in
+          <codeph>/etc/sysctl.conf</codeph>:
+        <codeblock>net.ipv4.ip_local_port_range = 10000  65535</codeblock></p><p>you could set the
+        Greenplum Database base port numbers to these
         values.<codeblock>PORT_BASE = 6000
-MIRROR_PORT_BASE = 7000
-REPLICATION_PORT_BASE = 8000
-MIRROR_REPLICATION_PORT_BASE = 9000</codeblock></p>
-    </section>
-    <section id="io_config">
-      <title>I/O Configuration</title>
-      <p>Set the blockdev read-ahead size to 16384 on the devices that contain data directories.
-        This command sets the read-ahead size for <codeph>/dev/sdb</codeph>.</p>
-      <codeblock># /sbin/blockdev --setra 16384 /dev/sdb</codeblock>
-      <p>This command returns the read-ahead size for <codeph>/dev/sdb</codeph>.</p>
-      <codeblock># /sbin/blockdev --getra /dev/sdb
-16384</codeblock>
-      <p>The deadline IO scheduler should be set for all data directory devices. </p>
-      <codeblock> # cat /sys/block/sdb/queue/scheduler
- noop anticipatory [deadline] cfq </codeblock>
-      <p>The maximum number of OS files and processes should be increased in the
+MIRROR_PORT_BASE = 7000</codeblock></p>See the <xref
+        href="../install_guide/prep_os.html#topic3" format="dita" scope="peer">Recommended OS
+        Parameters Settings</xref> in the <cite>Greenplum Database Installation Guide</cite> for
+      further details.</section>
+    <section id="io_config"><title>I/O Configuration</title><p>Set the blockdev read-ahead size to
+        16384 on the devices that contain data directories. This command sets the read-ahead size
+        for <codeph>/dev/sdb</codeph>.
+        </p><codeblock># /sbin/blockdev --setra 16384 /dev/sdb</codeblock><p>This command returns
+        the read-ahead size for
+      <codeph>/dev/sdb</codeph>.</p><codeblock># /sbin/blockdev --getra /dev/sdb
+16384</codeblock>See
+      the <xref href="../install_guide/prep_os.html#topic3" format="dita" scope="peer">Recommended
+        OS Parameters Settings</xref> in the <cite>Greenplum Database Installation Guide</cite> for
+      further details.<p>The deadline IO scheduler should be set for all data directory devices.
+        </p><codeblock> # cat /sys/block/sdb/queue/scheduler
+ noop anticipatory [deadline] cfq </codeblock><p>The
+        maximum number of OS files and processes should be increased in the
           <codeph>/etc/security/limits.conf</codeph> file.
-        <codeblock>* soft  nofile 65536
-* hard  nofile 65536
+        <codeblock>* soft  nofile 524288
+* hard  nofile 524288
 * soft  nproc 131072
-* hard  nproc 131072</codeblock></p>
-      <p>Enable core files output to a known location and make sure <codeph>limits.conf</codeph>
-        allows core files.
+* hard  nproc 131072</codeblock></p><p>Enable
+        core files output to a known location and make sure <codeph>limits.conf</codeph> allows core
+        files.
         <codeblock>kernel.core_pattern = /var/core/core.%h.%t
 # grep core /etc/security/limits.conf  
-* soft  core unlimited</codeblock></p>
-    </section>
+* soft  core unlimited</codeblock></p></section>
     <section id="os_mem_config">
       <title>OS Memory Configuration</title>
       <p>The Linux sysctl <codeph>vm.overcommit_memory</codeph> and
           <codeph>vm.overcommit_ratio</codeph> variables affect how the operating system manages
-        memory allocation. These variables should be set as follows: </p>
+        memory allocation. See the <xref href="../install_guide/prep_os.xml#topic3__sysctl_file"
+          scope="peer" format="dita"><codeph>/etc/sysctl.conf</codeph></xref> file parameters
+        guidelines in the <cite>Greenplum Datatabase Installation Guide</cite> for further
+        details.</p>
       <p><codeph>vm.overcommit_memory</codeph> determines the method the OS uses for determining how
         much memory can be allocated to processes. This should be always set to 2, which is the only
         safe setting for the database. <note>For information on configuration of overcommit memory,
@@ -103,16 +109,15 @@ MIRROR_REPLICATION_PORT_BASE = 9000</codeblock></p>
       <title>Shared Memory Settings </title>
       <p>Greenplum Database uses shared memory to communicate between <codeph>postgres</codeph>
         processes that are part of the same <codeph>postgres</codeph> instance. The following shared
-        memory settings should be set in <codeph>sysctl</codeph> and are rarely modified.</p>
-      <codeblock>kernel.shmmax = 500000000
+        memory settings should be set in <codeph>sysctl</codeph> and are rarely modified. See the
+          <xref format="dita" href="../install_guide/prep_os.xml#topic3__sysctl_file" scope="peer"
+            ><codeph>sysctl.conf </codeph></xref> file parameters in the <cite>Greenplum Database
+          Installation Guide</cite> for further details.</p>
+      <codeblock>kernel.shmmax = 810810728448
 kernel.shmmni = 4096
-kernel.shmall = 4000000000</codeblock>
+kernel.shmall = 197951838</codeblock>
     </section>
-    <section id="gpcheck">
-      <title>Validate the Operating System </title>
-      <p>Run <codeph>gpcheck</codeph> to validate the operating system configuration. See
-          <codeph>gpcheck</codeph> in the <i>Greenplum Database Utility Guide</i>.</p>
-    </section>
+    <p>See <xref href="../install_guide/prep_os.xml#topic3/shared_memory_pages" format="dita">Setting the Greenplum Recommended OS Parameters</xref> for more details.</p>
     <section id="host_segs">
       <title>Number of Segments per Host</title>
       <p>Determining the number of segments to execute on each segment host has immense impact on
@@ -226,10 +231,9 @@ kernel.shmall = 4000000000</codeblock>
       </ul>
       <p>See the <i>Greenplum Database Reference Guide</i> for descriptions of the columns in these
         views.</p>
-      <p>The <codeph>gp_workfile_compress_algorithm</codeph> configuration parameter specifies a
-        compression algorithm to apply to spill files. It can have the value <codeph>none</codeph>
-        (the default) or <codeph>zlib</codeph>. Setting this parameter to <codeph>zlib</codeph> can
-        improve performance when spill files are used.</p>
+      <p>The <codeph>gp_workfile_compression</codeph> configuration parameter specifies whether
+        the spill files are compressed. It is <codeph>off</codeph> by default. Enabling compression
+        can improve performance when spill files are used.</p>
     </section>
   </body>
 </topic>

@@ -2,7 +2,7 @@
 #
 # Makefile for the postgres backend
 #
-# Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+# Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
 # Portions Copyright (c) 1994, Regents of the University of California
 #
 # src/backend/Makefile
@@ -17,14 +17,15 @@ subdir = src/backend
 top_builddir = ../..
 include $(top_builddir)/src/Makefile.global
 
-BLD_TOP = $(top_builddir)/gpAux
+SUBDIRS = access bootstrap catalog parser commands executor foreign lib libpq \
+	main nodes optimizer partitioning port postmaster \
+	regex replication rewrite \
+	statistics storage tcop tsearch utils $(top_builddir)/src/timezone \
+	jit
 
-SUBDIRS = access bootstrap catalog parser commands executor foreign \
-	fts lib libpq main nodes optimizer port postmaster regex \
-	replication rewrite storage tcop tsearch utils $(top_builddir)/src/timezone cdb
-
+SUBDIRS += fts cdb
 ifeq ($(enable_orca),yes)
-SUBDIRS += gpopt
+SUBDIRS += gporca gpopt
 endif
 
 include $(srcdir)/common.mk
@@ -32,8 +33,8 @@ include $(srcdir)/common.mk
 # As of 1/2010:
 # The probes.o file is necessary for dtrace support on Solaris, and on recent
 # versions of systemtap.  (Older systemtap releases just produce an empty
-# file, but that's okay.)  However, OS X's dtrace doesn't use it and doesn't
-# even recognize the -G option.  So, build probes.o except on Darwin.
+# file, but that's okay.)  However, macOS's dtrace doesn't use it and doesn't
+# even recognize the -G option.  So, build probes.o except on macOS.
 # This might need adjustment as other platforms add dtrace support.
 ifneq ($(PORTNAME), darwin)
 ifeq ($(enable_dtrace), yes)
@@ -49,8 +50,8 @@ LDOPTS = -Z
 endif
 
 # We put libpgport and libpgcommon into OBJS, so remove it from LIBS; also add
-# libldap
-LIBS := $(filter-out -lpgport -lpgcommon, $(LIBS)) $(LDAP_LIBS_BE)
+# libldap and ICU
+LIBS := $(filter-out -lpgport -lpgcommon, $(LIBS)) $(LDAP_LIBS_BE) $(ICU_LIBS)
 
 # The backend doesn't need everything that's in LIBS, however
 LIBS := $(filter-out -lreadline -ledit -ltermcap -lncurses -lcurses, $(LIBS))
@@ -58,16 +59,20 @@ LIBS := $(filter-out -lreadline -ledit -ltermcap -lncurses -lcurses, $(LIBS))
 # Greenplum uses threads in the backend
 LIBS := $(LIBS) -lpthread
 
+ifeq ($(with_systemd),yes)
+LIBS += -lsystemd
+endif
+
 ##########################################################################
 
-all: submake-libpgport submake-schemapg postgres $(POSTGRES_IMP)
+all: submake-libpgport submake-catalog-headers submake-utils-headers postgres $(POSTGRES_IMP)
 
 ifneq ($(PORTNAME), cygwin)
 ifneq ($(PORTNAME), win32)
 ifneq ($(PORTNAME), aix)
 
 postgres: $(OBJS)
-	$(CXX) $(CFLAGS) $(LDFLAGS) $(LDFLAGS_EX) $(export_dynamic) $(call expand_subsys,$^) $(LIBS) -o $@
+	$(CXX) $(CXXFLAGS) $(call expand_subsys,$^) $(LDFLAGS) $(LDFLAGS_EX) $(export_dynamic) $(LIBS) -o $@
 
 endif
 endif
@@ -76,15 +81,12 @@ endif
 ifeq ($(PORTNAME), cygwin)
 
 postgres: $(OBJS)
-	$(CXX) $(CFLAGS) $(LDFLAGS) $(LDFLAGS_EX) $(export_dynamic) -Wl,--stack,$(WIN32_STACK_RLIMIT) -Wl,--export-all-symbols -Wl,--out-implib=libpostgres.a $(call expand_subsys,$^) $(LIBS) -o $@
+	$(CXX) $(CXXFLAGS) $(call expand_subsys,$^) $(LDFLAGS) $(LDFLAGS_EX) $(export_dynamic) -Wl,--stack,$(WIN32_STACK_RLIMIT) -Wl,--export-all-symbols -Wl,--out-implib=libpostgres.a $(LIBS) -o $@
 
-# There is no correct way to write a rule that generates two files.
-# Rules with two targets don't have that meaning, they are merely
-# shorthand for two otherwise separate rules.  To be safe for parallel
-# make, we must chain the dependencies like this.  The semicolon is
-# important, otherwise make will choose some built-in rule.
-
-libpostgres.a: postgres ;
+# libpostgres.a is actually built in the preceding rule, but we need this to
+# ensure it's newer than postgres; see notes in src/backend/parser/Makefile
+libpostgres.a: postgres
+	touch $@
 
 endif # cygwin
 
@@ -92,16 +94,19 @@ ifeq ($(PORTNAME), win32)
 LIBS += -lsecur32
 
 postgres: $(OBJS) $(WIN32RES)
-	$(CXX) $(CFLAGS) $(LDFLAGS) $(LDFLAGS_EX) -Wl,--stack=$(WIN32_STACK_RLIMIT) -Wl,--export-all-symbols -Wl,--out-implib=libpostgres.a $(call expand_subsys,$(OBJS)) $(WIN32RES) $(LIBS) -o $@$(X)
+	$(CXX) $(CXXFLAGS) $(call expand_subsys,$(OBJS)) $(WIN32RES) $(LDFLAGS) $(LDFLAGS_EX) -Wl,--stack=$(WIN32_STACK_RLIMIT) -Wl,--export-all-symbols -Wl,--out-implib=libpostgres.a $(LIBS) -o $@$(X)
 
-libpostgres.a: postgres ;
+# libpostgres.a is actually built in the preceding rule, but we need this to
+# ensure it's newer than postgres; see notes in src/backend/parser/Makefile
+libpostgres.a: postgres
+	touch $@
 
 endif # win32
 
 ifeq ($(PORTNAME), aix)
 
 postgres: $(POSTGRES_IMP)
-	$(CXX) $(CFLAGS) $(LDFLAGS) $(LDFLAGS_EX) $(call expand_subsys,$(OBJS)) -Wl,-bE:$(top_builddir)/src/backend/$(POSTGRES_IMP) $(LIBS) -o $@
+	$(CXX) $(CXXFLAGS) $(call expand_subsys,$(OBJS)) $(LDFLAGS) $(LDFLAGS_EX) -Wl,-bE:$(top_builddir)/src/backend/$(POSTGRES_IMP) $(LIBS) -Wl,-brtllib -o $@
 
 $(POSTGRES_IMP): $(OBJS)
 	$(LD) $(LDREL) $(LDOUT) SUBSYS.o $(call expand_subsys,$^)
@@ -118,44 +123,40 @@ endif
 
 endif # aix
 
-# Update the commonly used headers before building the subdirectories
-$(SUBDIRS:%=%-recursive): $(top_builddir)/src/include/parser/gram.h $(top_builddir)/src/include/catalog/schemapg.h $(top_builddir)/src/include/utils/fmgroids.h $(top_builddir)/src/include/utils/errcodes.h $(top_builddir)/src/include/utils/probes.h
-
-# run this unconditionally to avoid needing to know its dependencies here:
-submake-schemapg:
-	$(MAKE) -C catalog schemapg.h
-
-# src/port needs a convenient way to force errcodes.h to get built
-submake-errcodes: $(top_builddir)/src/include/utils/errcodes.h
-
-.PHONY: submake-schemapg submake-errcodes
-
-catalog/schemapg.h: | submake-schemapg
-
 $(top_builddir)/src/port/libpgport_srv.a: | submake-libpgport
 
 
 # The postgres.o target is needed by the rule in Makefile.global that
 # creates the exports file when MAKE_EXPORTS = true.
 postgres.o: $(OBJS)
-	$(CXX) $(LDREL) $(LDFLAGS) $(LDFLAGS_EX) $(call expand_subsys,$^) $(LIBS) -o $@
+	$(CXX) $(LDREL) $(call expand_subsys,$^) $(LDFLAGS) $(LDFLAGS_EX) $(LIBS) -o $@
 
 
 # The following targets are specified in make commands that appear in
 # the make files in our subdirectories. Note that it's important we
 # match the dependencies shown in the subdirectory makefiles!
+# Also, in cases where a subdirectory makefile generates two files in
+# what's really one step, such as bison producing both gram.h and gram.c,
+# we must request making the one that is shown as the secondary (dependent)
+# output, else the timestamp on it might be wrong.  By project convention,
+# the .h file is the dependent one for bison output, so we need only request
+# that; but in other cases, request both for safety.
 
 parser/gram.h: parser/gram.y
 	$(MAKE) -C parser gram.h
 
-utils/fmgroids.h: utils/Gen_fmgrtab.pl catalog/Catalog.pm $(top_srcdir)/src/include/catalog/pg_proc.h $(top_srcdir)/src/include/catalog/pg_proc_gp.h
-	$(MAKE) -C utils fmgroids.h
+storage/lmgr/lwlocknames.h: storage/lmgr/generate-lwlocknames.pl storage/lmgr/lwlocknames.txt
+	$(MAKE) -C storage/lmgr lwlocknames.h lwlocknames.c
 
-utils/errcodes.h: utils/generate-errcodes.pl utils/errcodes.txt
-	$(MAKE) -C utils errcodes.h
+# run this unconditionally to avoid needing to know its dependencies here:
+submake-catalog-headers:
+	$(MAKE) -C catalog distprep generated-header-symlinks
 
-utils/probes.h: utils/probes.d
-	$(MAKE) -C utils probes.h
+# run this unconditionally to avoid needing to know its dependencies here:
+submake-utils-headers:
+	$(MAKE) -C utils distprep generated-header-symlinks
+
+.PHONY: submake-catalog-headers submake-utils-headers
 
 # Make symlinks for these headers in the include directory. That way
 # we can cut down on the -I options. Also, a symlink is automatically
@@ -168,30 +169,19 @@ utils/probes.h: utils/probes.d
 # will be in the build tree, so a simple ../.. reference won't work.
 # For headers generated during regular builds, we prefer a relative symlink.
 
+.PHONY: generated-headers
+
+generated-headers: $(top_builddir)/src/include/parser/gram.h $(top_builddir)/src/include/storage/lwlocknames.h submake-catalog-headers submake-utils-headers
+
 $(top_builddir)/src/include/parser/gram.h: parser/gram.h
 	prereqdir=`cd '$(dir $<)' >/dev/null && pwd` && \
 	  cd '$(dir $@)' && rm -f $(notdir $@) && \
 	  $(LN_S) "$$prereqdir/$(notdir $<)" .
 
-$(top_builddir)/src/include/catalog/schemapg.h: catalog/schemapg.h
+$(top_builddir)/src/include/storage/lwlocknames.h: storage/lmgr/lwlocknames.h
 	prereqdir=`cd '$(dir $<)' >/dev/null && pwd` && \
 	  cd '$(dir $@)' && rm -f $(notdir $@) && \
 	  $(LN_S) "$$prereqdir/$(notdir $<)" .
-
-$(top_builddir)/src/include/utils/errcodes.h: utils/errcodes.h
-	prereqdir=`cd '$(dir $<)' >/dev/null && pwd` && \
-	  cd '$(dir $@)' && rm -f $(notdir $@) && \
-	  $(LN_S) "$$prereqdir/$(notdir $<)" .
-
-$(top_builddir)/src/include/utils/fmgroids.h: utils/fmgroids.h
-	prereqdir=`cd '$(dir $<)' >/dev/null && pwd` && \
-	  cd '$(dir $@)' && rm -f $(notdir $@) && \
-	  $(LN_S) "$$prereqdir/$(notdir $<)" .
-
-$(top_builddir)/src/include/utils/probes.h: utils/probes.h
-	cd '$(dir $@)' && rm -f $(notdir $@) && \
-	    $(LN_S) "../../../$(subdir)/utils/probes.h" .
-
 
 utils/probes.o: utils/probes.d $(SUBDIROBJS)
 	$(DTRACE) $(DTRACEFLAGS) -C -G -s $(call expand_subsys,$^) -o $@
@@ -203,9 +193,11 @@ utils/probes.o: utils/probes.d $(SUBDIROBJS)
 distprep:
 	$(MAKE) -C parser	gram.c gram.h scan.c
 	$(MAKE) -C bootstrap	bootparse.c bootscanner.c
-	$(MAKE) -C catalog	schemapg.h postgres.bki postgres.description postgres.shdescription
-	$(MAKE) -C replication	repl_gram.c repl_scanner.c
-	$(MAKE) -C utils	fmgrtab.c fmgroids.h errcodes.h
+	$(MAKE) -C catalog	distprep
+	$(MAKE) -C replication	repl_gram.c repl_scanner.c syncrep_gram.c syncrep_scanner.c
+	$(MAKE) -C storage/lmgr	lwlocknames.h lwlocknames.c
+	$(MAKE) -C utils	distprep
+	$(MAKE) -C utils/adt	jsonpath_gram.c jsonpath_scan.c
 	$(MAKE) -C utils/misc	guc-file.c
 	$(MAKE) -C utils/sort	qsort_tuple.c
 
@@ -225,12 +217,20 @@ endif
 endif
 	$(MAKE) -C catalog install-data
 	$(MAKE) -C tsearch install-data
+	$(MAKE) -C utils install-data
 	$(INSTALL_DATA) $(srcdir)/libpq/pg_hba.conf.sample '$(DESTDIR)$(datadir)/pg_hba.conf.sample'
 	$(INSTALL_DATA) $(srcdir)/libpq/pg_ident.conf.sample '$(DESTDIR)$(datadir)/pg_ident.conf.sample'
 	$(INSTALL_DATA) $(srcdir)/utils/misc/postgresql.conf.sample '$(DESTDIR)$(datadir)/postgresql.conf.sample'
-	$(INSTALL_DATA) $(srcdir)/access/transam/recovery.conf.sample '$(DESTDIR)$(datadir)/recovery.conf.sample'
 ifeq ($(enable_orca), yes)
+	$(MAKE) -C gporca $@ INSTLOC=$(DESTDIR)$(libdir)
 	$(MAKE) -C gpopt $@ INSTLOC=$(DESTDIR)$(libdir)
+endif
+
+ifeq ($(with_llvm), yes)
+install-bin: install-postgres-bitcode
+
+install-postgres-bitcode: $(OBJS) all
+	$(call install_llvm_module,postgres,$(call expand_subsys, $(filter-out $(top_builddir)/src/timezone/objfiles.txt, $(SUBDIROBJS))))
 endif
 
 install-bin: postgres $(POSTGRES_IMP) installdirs
@@ -286,20 +286,19 @@ endif
 endif
 	$(MAKE) -C catalog uninstall-data
 	$(MAKE) -C tsearch uninstall-data
+	$(MAKE) -C utils uninstall-data
 	rm -f '$(DESTDIR)$(datadir)/pg_hba.conf.sample' \
 	      '$(DESTDIR)$(datadir)/pg_ident.conf.sample' \
-              '$(DESTDIR)$(datadir)/postgresql.conf.sample' \
-	      '$(DESTDIR)$(datadir)/recovery.conf.sample'
+	      '$(DESTDIR)$(datadir)/postgresql.conf.sample'
+ifeq ($(with_llvm), yes)
+	$(call uninstall_llvm_module,postgres)
+endif
 
 
 ##########################################################################
 
 clean:
-	rm -f $(LOCALOBJS) postgres$(X) $(POSTGRES_IMP) \
-		$(top_builddir)/src/include/parser/gram.h \
-		$(top_builddir)/src/include/catalog/schemapg.h \
-		$(top_builddir)/src/include/utils/fmgroids.h \
-		$(top_builddir)/src/include/utils/probes.h
+	rm -f $(LOCALOBJS) postgres$(X) $(POSTGRES_IMP)
 ifeq ($(PORTNAME), cygwin)
 	rm -f postgres.dll libpostgres.a
 endif
@@ -308,24 +307,24 @@ ifeq ($(PORTNAME), win32)
 endif
 
 distclean: clean
-	rm -f port/tas.s port/dynloader.c port/pg_sema.c port/pg_shmem.c \
-	      port/pg_latch.c
+	rm -f port/tas.s port/pg_sema.c port/pg_shmem.c
 
 maintainer-clean: distclean
+	$(MAKE) -C catalog $@
+	$(MAKE) -C utils $@
 	rm -f bootstrap/bootparse.c \
 	      bootstrap/bootscanner.c \
 	      parser/gram.c \
 	      parser/gram.h \
 	      parser/scan.c \
-	      catalog/schemapg.h \
-	      catalog/postgres.bki \
-	      catalog/postgres.description \
-	      catalog/postgres.shdescription \
 	      replication/repl_gram.c \
 	      replication/repl_scanner.c \
-	      utils/fmgroids.h \
-	      utils/fmgrtab.c \
-	      utils/errcodes.h \
+	      replication/syncrep_gram.c \
+	      replication/syncrep_scanner.c \
+	      storage/lmgr/lwlocknames.c \
+	      storage/lmgr/lwlocknames.h \
+	      utils/adt/jsonpath_gram.c \
+	      utils/adt/jsonpath_scan.c \
 	      utils/misc/guc-file.c \
 	      utils/sort/qsort_tuple.c
 
@@ -338,4 +337,4 @@ maintainer-clean: distclean
 # are up to date.  It saves the time of doing all the submakes.
 .PHONY: quick
 quick: $(OBJS)
-	$(CXX) $(CFLAGS) $(LDFLAGS) $(LDFLAGS_EX) $(export_dynamic) $(call expand_subsys,$^) $(LIBS) -o postgres
+	$(CXX) $(CXXFLAGS) $(call expand_subsys,$^) $(LDFLAGS) $(LDFLAGS_EX) $(export_dynamic) $(LIBS) -o postgres

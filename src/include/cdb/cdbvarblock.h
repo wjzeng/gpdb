@@ -79,7 +79,7 @@
  *       }
  *        
  * Portions Copyright (c) 2007, greenplum inc
- * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
  *
  *
  * IDENTIFICATION
@@ -308,13 +308,6 @@ extern int VarBlockMakerItemCount(
 extern VarBlockByteLen VarBlockMakerFinish(
     VarBlockMaker *varBlockMaker);
 
-/*
- * Reset the VarBlock maker so it can make another one
- * using the same inputs as given to VarBlockMakerInit.
- */
-extern void VarBlockMakerReset(
-    VarBlockMaker *varBlockMaker);
-
 // -----------------------------------------------------------------------------
 
 /*
@@ -339,14 +332,6 @@ extern VarBlockCheckError VarBlockIsValid(
  * Return a string message for the last check error.
  */
 char *VarBlockGetCheckErrorStr(void);
-
-/*
- * Given a pointer to a VarBlock with at least VARBLOCK_HEADER_LEN bytes
- * present, return the length of the whole block.
- */
-VarBlockByteLen VarBlockLenFromHeader(
-    uint8               *buffer,
-    VarBlockByteLen     peekLen);
 
 // -----------------------------------------------------------------------------
 

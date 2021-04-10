@@ -4,7 +4,7 @@
   <title>About Full Text Search</title>
   <shortdesc>This topic provides an overview of Greenplum Database full text search, basic text
     search expressions, configuring, and customizing text search. Greenplum Database full text
-    search is compared with Pivotal GPText. </shortdesc>
+    search is compared with Tanzu Greenplum Text. </shortdesc>
   <body>
     <p>This section contains the following subtopics:</p>
     <ul id="ul_djv_rww_4fb">
@@ -21,8 +21,8 @@
         the query. </p>
       <p>Greenplum Database provides a data type <codeph>tsvector</codeph> to store preprocessed
         documents, and a data type <codeph>tsquery</codeph> to store processed queries (<xref
-          href="../../ref_guide/data_types.xml#topic1/text-search-types"/>). There are many
-        functions and operators available for these data types (<xref
+          href="../../ref_guide/datatype-textsearch.xml"/>). There are many functions and operators
+        available for these data types (<xref
           href="../../ref_guide/function-summary.xml#topic_vpj_ss1_lfb"/>), the most important of
         which is the match operator <codeph>@@</codeph>, which we introduce in <xref
           href="#intro/basic-text-matching" format="dita"/>. Full text searches can be accelerated
@@ -215,9 +215,9 @@ text @@ text</codeblock>
         chapter.</p>
     </section>
   <section id="gptext">
-    <title>Comparing Greenplum Database Text Search with Pivotal GPText</title>
+    <title>Comparing Greenplum Database Text Search with Tanzu Greenplum Text</title>
       <p>Greenplum Database text search is PostgreSQL text search ported to the Greenplum Database
-        MPP platform. Pivotal also offers Pivotal GPText, which integrates Greenplum Database with
+        MPP platform. VMware also offers Tanzu Greenplum Text, which integrates Greenplum Database with
         the Apache Solr text search platform. GPText installs an Apache Solr cluster alongside your
         Greenplum Database cluster and provides Greenplum Database functions you can use to create
         Solr indexes, query them, and receive results in the database session.</p>

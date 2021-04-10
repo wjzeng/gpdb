@@ -632,29 +632,66 @@ order by t;
 (9 rows)
 
 ---- 6 -- Exclude clause ----
--- MPP-13628: exclude clause doesn't work
 select vn, sum(vn) over (w)
 from sale
 window w as (order by vn rows between unbounded preceding and unbounded following exclude CURRENT ROW);
-ERROR:  window EXCLUDE clause not yet implemented
+ vn | sum 
+----+-----
+ 10 | 400
+ 20 | 390
+ 30 | 380
+ 30 | 380
+ 30 | 380
+ 30 | 380
+ 40 | 370
+ 40 | 370
+ 40 | 370
+ 40 | 370
+ 50 | 360
+ 50 | 360
+(12 rows)
+
 select vn, sum(vn) over (w)
 from sale
 window w as (order by vn rows between unbounded preceding and unbounded following exclude GROUP);
-ERROR:  window EXCLUDE clause not yet implemented
+ vn | sum 
+----+-----
+ 10 | 400
+ 20 | 390
+ 30 | 290
+ 30 | 290
+ 30 | 290
+ 30 | 290
+ 40 | 250
+ 40 | 250
+ 40 | 250
+ 40 | 250
+ 50 | 310
+ 50 | 310
+(12 rows)
+
 select vn, sum(vn) over (w)
 from sale
 window w as (order by vn rows between unbounded preceding and unbounded following exclude TIES);
-ERROR:  window EXCLUDE clause not yet implemented
+ vn | sum 
+----+-----
+ 10 | 410
+ 20 | 410
+ 30 | 320
+ 30 | 320
+ 30 | 320
+ 30 | 320
+ 40 | 290
+ 40 | 290
+ 40 | 290
+ 40 | 290
+ 50 | 360
+ 50 | 360
+(12 rows)
+
 select vn, sum(vn) over (w)
 from sale
 window w as (order by vn rows between unbounded preceding and unbounded following exclude NO OTHERS);
-ERROR:  window EXCLUDE clause not yet implemented
--- MPP-14244: add guc to ignore exclude clause so the above won't error.
--- Note: produces the wrong answer, we will probably want to remove this once we fix the MPP-13628
-set gp_ignore_window_exclude = true;
-select vn, sum(vn) over (w)
-from sale
-window w as (order by vn rows between unbounded preceding and unbounded following exclude GROUP);
  vn | sum 
 ----+-----
  10 | 410
@@ -1601,7 +1638,7 @@ from sale_ord;
                Merge Key: ord, cn
                ->  Sort  (cost=0.00..5.43 rows=6 width=12)
                      Sort Key: ord, cn
-                     ->  Table Scan on sale_ord  (cost=0.00..0.07 rows=6 width=12)
+                     ->  Seq Scan on sale_ord  (cost=0.00..0.07 rows=6 width=12)
  Settings:  optimizer=on
 (9 rows)
 
@@ -8342,4 +8379,27 @@ FROM
 -------
      2
 (1 row)
+
+-- check SRF in WindowAgg's targetlist can be handled correctly
+explain (costs off)
+select unnest(array[a,a]), rank() over (order by a) from generate_series(2,3) a;
+                     QUERY PLAN                     
+----------------------------------------------------
+ Result
+   ->  WindowAgg
+         Order By: generate_series
+         ->  Sort
+               Sort Key: generate_series
+               ->  Function Scan on generate_series
+ Optimizer: Pivotal Optimizer (GPORCA) version 3.30.0
+(7 rows)
+
+select unnest(array[a,a]), rank() over (order by a) from generate_series(2,3) a;
+ unnest | rank 
+--------+------
+      2 |    1
+      2 |    1
+      3 |    2
+      3 |    2
+(4 rows)
 

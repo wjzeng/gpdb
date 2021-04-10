@@ -3,7 +3,7 @@
  * cdbappendonlystorageformat.c
  *
  * Portions Copyright (c) 2007-2009, Greenplum inc
- * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
  *
  *
  * IDENTIFICATION
@@ -12,7 +12,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
-#include "storage/gp_compress.h"
+
 #include "cdb/cdbappendonlystorage_int.h"
 #include "cdb/cdbappendonlystorage.h"
 #include "cdb/cdbappendonlystorageformat.h"
@@ -196,7 +196,7 @@ AppendOnlyStorageFormat_AddBlockHeaderChecksums(
 			case AoHeaderKind_NonBulkDenseContent:
 				elog(LOG,
 					 "Append-Only storage make with checksums block header result: block_bytes_0_3 0x%X, block_bytes_4_7 0x%X, "
-					 "header checksum 0x%X, block checksum 0x%X, overallBlockLen %d",
+					 "header checksum 0x%08X, block checksum 0x%08X, overallBlockLen %d",
 					 blockHeader->smallcontent_bytes_0_3,
 					 blockHeader->smallcontent_bytes_4_7,
 					 *headerChecksumPtr,
@@ -217,7 +217,7 @@ AppendOnlyStorageFormat_AddBlockHeaderChecksums(
 						 "Append-Only storage make with checksums Bulk Dense Content header result: "
 						 "bulkdensecontent_bytes_0_3 0x%X, bulkdensecontent_bytes_4_7 0x%X "
 						 "bulkdensecontent_ext_bytes_0_3 0x%X, bulkdensecontent_ext_bytes_4_7 0x%X, "
-						 "header checksum 0x%X, block checksum 0x%X, overallBlockLen %d",
+						 "header checksum 0x%08X, block checksum 0x%08X, overallBlockLen %d",
 						 bulkDenseHeader->bulkdensecontent_bytes_0_3,
 						 bulkDenseHeader->bulkdensecontent_bytes_4_7,
 						 bulkDenseHeaderExt->bulkdensecontent_ext_bytes_0_3,
@@ -230,7 +230,7 @@ AppendOnlyStorageFormat_AddBlockHeaderChecksums(
 
 			default:
 				ereport(ERROR,
-						(errmsg("Unexpected Append-Only header kind %d",
+						(errmsg("unexpected Append-Only header kind %d",
 								headerKind)));
 				break;
 		}
@@ -342,8 +342,6 @@ AppendOnlyStorageFormat_SmallContentHeaderStr(
 	pg_crc32   *headerChecksumPtr = NULL;
 	pg_crc32	headerChecksum;
 
-	StringInfoData buf;
-
 	Assert(headerPtr != NULL);
 
 	blockHeader = (AOSmallContentHeader *) headerPtr;
@@ -382,35 +380,29 @@ AppendOnlyStorageFormat_SmallContentHeaderStr(
 		headerChecksum = 0;
 	}
 
-	initStringInfo(&buf);
-	appendStringInfo(
-					 &buf,
-					 "Append-Only storage Small Content header: "
-					 "smallcontent_bytes_0_3 0x%X, smallcontent_bytes_4_7 0x%X, "
-					 "headerKind = %d, "
-					 "executorBlockKind = %d, "
-					 "rowCount = %d, usingChecksums = %s, header checksum 0x%X, block checksum 0x%X, "
-					 "dataLength %d, compressedLength %d, overallBlockLen %d",
-					 blockHeader->smallcontent_bytes_0_3,
-					 blockHeader->smallcontent_bytes_4_7,
-					 aoHeaderKind,
-					 executorBlockKind,
-					 rowCount,
-					 (usingChecksums ? "true" : "false"),
-					 headerChecksum,
-					 blockChecksum,
-					 dataLength,
-					 compressedLength,
-					 overallBlockLen);
-
-	return buf.data;
+	return psprintf("Append-Only storage Small Content header: "
+					"smallcontent_bytes_0_3 0x%X, smallcontent_bytes_4_7 0x%X, "
+					"headerKind = %d, "
+					"executorBlockKind = %d, "
+					"rowCount = %d, usingChecksums = %s, header checksum 0x%08X, block checksum 0x%08X, "
+					"dataLength %d, compressedLength %d, overallBlockLen %d",
+					blockHeader->smallcontent_bytes_0_3,
+					blockHeader->smallcontent_bytes_4_7,
+					aoHeaderKind,
+					executorBlockKind,
+					rowCount,
+					(usingChecksums ? "true" : "false"),
+					headerChecksum,
+					blockChecksum,
+					dataLength,
+					compressedLength,
+					overallBlockLen);
 }
 
 char *
 AppendOnlyStorageFormat_LargeContentHeaderStr(
 											  uint8 *headerPtr,
-											  bool usingChecksums,
-											  int version)
+											  bool usingChecksums)
 {
 	AOLargeContentHeader *blockHeader;
 	AoHeaderKind aoHeaderKind;
@@ -427,8 +419,6 @@ AppendOnlyStorageFormat_LargeContentHeaderStr(
 	pg_crc32	blockChecksum;
 	pg_crc32   *headerChecksumPtr = NULL;
 	pg_crc32	headerChecksum;
-
-	StringInfoData buf;
 
 	Assert(headerPtr != NULL);
 
@@ -464,27 +454,22 @@ AppendOnlyStorageFormat_LargeContentHeaderStr(
 		headerChecksum = 0;
 	}
 
-	initStringInfo(&buf);
-	appendStringInfo(
-					 &buf,
-					 "Append-Only storage Large Content header: "
-					 "largecontent_bytes_0_3 0x%X, largecontent_bytes_4_7 0x%X, "
-					 "headerKind = %d, "
-					 "executorBlockKind = %d, "
-					 "rowCount = %d, usingChecksums = %s, header checksum 0x%X, block checksum 0x%X, "
-					 "largeContentLength %d, overallBlockLen %d",
-					 blockHeader->largecontent_bytes_0_3,
-					 blockHeader->largecontent_bytes_4_7,
-					 aoHeaderKind,
-					 executorBlockKind,
-					 rowCount,
-					 (usingChecksums ? "true" : "false"),
-					 headerChecksum,
-					 blockChecksum,
-					 largeContentLength,
-					 overallBlockLen);
-
-	return buf.data;
+	return psprintf("Append-Only storage Large Content header: "
+					"largecontent_bytes_0_3 0x%X, largecontent_bytes_4_7 0x%X, "
+					"headerKind = %d, "
+					"executorBlockKind = %d, "
+					"rowCount = %d, usingChecksums = %s, header checksum 0x%08X, block checksum 0x%08X, "
+					"largeContentLength %d, overallBlockLen %d",
+					blockHeader->largecontent_bytes_0_3,
+					blockHeader->largecontent_bytes_4_7,
+					aoHeaderKind,
+					executorBlockKind,
+					rowCount,
+					(usingChecksums ? "true" : "false"),
+					headerChecksum,
+					blockChecksum,
+					largeContentLength,
+					overallBlockLen);
 }
 
 char *
@@ -508,8 +493,6 @@ AppendOnlyStorageFormat_NonBulkDenseContentHeaderStr(
 	pg_crc32	blockChecksum;
 	pg_crc32   *headerChecksumPtr = NULL;
 	pg_crc32	headerChecksum;
-
-	StringInfoData buf;
 
 	Assert(headerPtr != NULL);
 
@@ -547,27 +530,22 @@ AppendOnlyStorageFormat_NonBulkDenseContentHeaderStr(
 		headerChecksum = 0;
 	}
 
-	initStringInfo(&buf);
-	appendStringInfo(
-					 &buf,
-					 "Append-Only storage Large Content header: "
-					 "nonbulkdensecontent_bytes_0_3 0x%X, nonbulkdensecontent_bytes_4_7 0x%X, "
-					 "headerKind = %d, "
-					 "executorBlockKind = %d, "
-					 "rowCount = %d, usingChecksums = %s, header checksum 0x%X, block checksum 0x%X, "
-					 "dataLength %d, overallBlockLen %d",
-					 blockHeader->nonbulkdensecontent_bytes_0_3,
-					 blockHeader->nonbulkdensecontent_bytes_4_7,
-					 aoHeaderKind,
-					 executorBlockKind,
-					 rowCount,
-					 (usingChecksums ? "true" : "false"),
-					 headerChecksum,
-					 blockChecksum,
-					 dataLength,
-					 overallBlockLen);
-
-	return buf.data;
+	return psprintf("Append-Only storage Large Content header: "
+					"nonbulkdensecontent_bytes_0_3 0x%X, nonbulkdensecontent_bytes_4_7 0x%X, "
+					"headerKind = %d, "
+					"executorBlockKind = %d, "
+					"rowCount = %d, usingChecksums = %s, header checksum 0x%08X, block checksum 0x%08X, "
+					"dataLength %d, overallBlockLen %d",
+					blockHeader->nonbulkdensecontent_bytes_0_3,
+					blockHeader->nonbulkdensecontent_bytes_4_7,
+					aoHeaderKind,
+					executorBlockKind,
+					rowCount,
+					(usingChecksums ? "true" : "false"),
+					headerChecksum,
+					blockChecksum,
+					dataLength,
+					overallBlockLen);
 }
 
 char *
@@ -594,8 +572,6 @@ AppendOnlyStorageFormat_BulkDenseContentHeaderStr(
 	pg_crc32	blockChecksum;
 	pg_crc32   *headerChecksumPtr = NULL;
 	pg_crc32	headerChecksum;
-
-	StringInfoData buf;
 
 	Assert(headerPtr != NULL);
 
@@ -645,31 +621,26 @@ AppendOnlyStorageFormat_BulkDenseContentHeaderStr(
 		headerChecksum = 0;
 	}
 
-	initStringInfo(&buf);
-	appendStringInfo(
-					 &buf,
-					 "Append-Only storage Bulk Dense Content header: "
-					 "bulkdensecontent_bytes_0_3 0x%X, bulkdensecontent_bytes_4_7 0x%X, "
-					 "bulkdensecontent_ext_bytes_0_3 0x%X, bulkdensecontent_ext_bytes_4_7 0x%X, "
-					 "headerKind = %d, "
-					 "executorBlockKind = %d, "
-					 "rowCount = %d, usingChecksums = %s, header checksum 0x%X, block checksum 0x%X, "
-					 "dataLength %d, compressedLength %d, overallBlockLen %d",
-					 blockHeader->bulkdensecontent_bytes_0_3,
-					 blockHeader->bulkdensecontent_bytes_4_7,
-					 extHeader->bulkdensecontent_ext_bytes_0_3,
-					 extHeader->bulkdensecontent_ext_bytes_4_7,
-					 aoHeaderKind,
-					 executorBlockKind,
-					 rowCount,
-					 (usingChecksums ? "true" : "false"),
-					 headerChecksum,
-					 blockChecksum,
-					 dataLength,
-					 compressedLength,
-					 overallBlockLen);
-
-	return buf.data;
+	return psprintf("Append-Only storage Bulk Dense Content header: "
+					"bulkdensecontent_bytes_0_3 0x%X, bulkdensecontent_bytes_4_7 0x%X, "
+					"bulkdensecontent_ext_bytes_0_3 0x%X, bulkdensecontent_ext_bytes_4_7 0x%X, "
+					"headerKind = %d, "
+					"executorBlockKind = %d, "
+					"rowCount = %d, usingChecksums = %s, header checksum 0x%08X, block checksum 0x%08X, "
+					"dataLength %d, compressedLength %d, overallBlockLen %d",
+					blockHeader->bulkdensecontent_bytes_0_3,
+					blockHeader->bulkdensecontent_bytes_4_7,
+					extHeader->bulkdensecontent_ext_bytes_0_3,
+					extHeader->bulkdensecontent_ext_bytes_4_7,
+					aoHeaderKind,
+					executorBlockKind,
+					rowCount,
+					(usingChecksums ? "true" : "false"),
+					headerChecksum,
+					blockChecksum,
+					dataLength,
+					compressedLength,
+					overallBlockLen);
 }
 
 char *
@@ -698,8 +669,7 @@ AppendOnlyStorageFormat_BlockHeaderStr(
 		case AoHeaderKind_LargeContent:
 			str = AppendOnlyStorageFormat_LargeContentHeaderStr(
 																headerPtr,
-																usingChecksums,
-																version);
+																usingChecksums);
 			break;
 
 		case AoHeaderKind_NonBulkDenseContent:
@@ -717,17 +687,8 @@ AppendOnlyStorageFormat_BlockHeaderStr(
 			break;
 
 		default:
-			{
-				StringInfoData buf;
-
-				initStringInfo(&buf);
-				appendStringInfo(
-								 &buf,
-								 "Append-Only storage header kind %d unknown",
-								 aoHeaderKind);
-
-				str = buf.data;
-			}
+			str = psprintf("Append-Only storage header kind %d unknown",
+						   aoHeaderKind);
 			break;
 	}
 
@@ -739,7 +700,7 @@ AppendOnlyStorageFormat_BlockHeaderStr(
  *
  * Add an errdetail() line showing the Append-Only Storage block header.
  */
-int
+void
 errdetail_appendonly_storage_smallcontent_header(
 												 uint8 *headerPtr,
 												 bool usingChecksums,
@@ -755,8 +716,6 @@ errdetail_appendonly_storage_smallcontent_header(
 	errdetail("%s", str);
 
 	pfree(str);
-
-	return 0;
 }
 
 /*
@@ -764,7 +723,7 @@ errdetail_appendonly_storage_smallcontent_header(
  *
  * Add an errdetail() line showing the Append-Only Storage block header.
  */
-int
+void
 errdetail_appendonly_storage_largecontent_header(
 												 uint8 *headerPtr,
 												 bool usingChecksums,
@@ -774,14 +733,11 @@ errdetail_appendonly_storage_largecontent_header(
 
 	str = AppendOnlyStorageFormat_LargeContentHeaderStr(
 														headerPtr,
-														usingChecksums,
-														version);
+														usingChecksums);
 
 	errdetail("%s", str);
 
 	pfree(str);
-
-	return 0;
 }
 
 
@@ -790,7 +746,7 @@ errdetail_appendonly_storage_largecontent_header(
  *
  * Add an errdetail() line showing the Append-Only Storage block header.
  */
-int
+void
 errdetail_appendonly_storage_nonbulkdensecontent_header(
 														uint8 *headerPtr,
 														bool usingChecksums,
@@ -806,8 +762,6 @@ errdetail_appendonly_storage_nonbulkdensecontent_header(
 	errdetail("%s", str);
 
 	pfree(str);
-
-	return 0;
 }
 
 /*
@@ -815,7 +769,7 @@ errdetail_appendonly_storage_nonbulkdensecontent_header(
  *
  * Add an errdetail() line showing the Append-Only Storage block header.
  */
-int
+void
 errdetail_appendonly_storage_bulkdensecontent_header(
 													 uint8 *headerPtr,
 													 bool usingChecksums,
@@ -831,8 +785,6 @@ errdetail_appendonly_storage_bulkdensecontent_header(
 	errdetail("%s", str);
 
 	pfree(str);
-
-	return 0;
 }
 
 /*
@@ -840,7 +792,7 @@ errdetail_appendonly_storage_bulkdensecontent_header(
  *
  * Add an errdetail() line showing the Append-Only Storage content (Small, Large, Dense) header.
  */
-int
+void
 errdetail_appendonly_storage_content_header(
 											uint8 *header,
 											bool usingChecksum,
@@ -855,21 +807,25 @@ errdetail_appendonly_storage_content_header(
 	switch (aoHeaderKind)
 	{
 		case AoHeaderKind_SmallContent:
-			return errdetail_appendonly_storage_smallcontent_header(header, usingChecksum, version);
+			errdetail_appendonly_storage_smallcontent_header(header, usingChecksum, version);
+			break;
 
 		case AoHeaderKind_LargeContent:
-			return errdetail_appendonly_storage_largecontent_header(header, usingChecksum, version);
+			errdetail_appendonly_storage_largecontent_header(header, usingChecksum, version);
+			break;
 
 		case AoHeaderKind_NonBulkDenseContent:
-			return errdetail_appendonly_storage_nonbulkdensecontent_header(header, usingChecksum, version);
+			errdetail_appendonly_storage_nonbulkdensecontent_header(header, usingChecksum, version);
+			break;
 
 		case AoHeaderKind_BulkDenseContent:
-			return errdetail_appendonly_storage_bulkdensecontent_header(header, usingChecksum, version);
+			errdetail_appendonly_storage_bulkdensecontent_header(header, usingChecksum, version);
+			break;
 
 		default:
-			return errdetail(
-							 "Append-Only storage header kind %d unknown",
-							 aoHeaderKind);
+			errdetail(
+				"Append-Only storage header kind %d unknown",
+				aoHeaderKind);
 	}
 }
 
@@ -1170,59 +1126,61 @@ AppendOnlyStorageFormat_MakeBulkDenseContentHeader(
 																  &checkCompressedLen);
 		if (checkError != AOHeaderCheckOk)
 			ereport(ERROR,
-					(errmsg("Problem making append-only storage header of type bulk dense content. Header check error %d, detail '%s'",
-							(int) checkError,
-							AppendOnlyStorageFormat_GetHeaderCheckErrorStr())));
+					(errmsg("problem making append-only storage header of type bulk dense content"),
+					 errdetail("Header check error %d, detail: '%s'",
+							   (int) checkError,
+							   AppendOnlyStorageFormat_GetHeaderCheckErrorStr())));
 
 		if (checkOverallBlockLen != checkBlockLimitLen)
 			ereport(ERROR,
-					(errmsg("Problem making append-only storage header of type bulk dense content. Found block length %d, expected %d",
-							checkOverallBlockLen,
-							checkBlockLimitLen)));
+					(errmsg("problem making append-only storage header of type bulk dense content"),
+					 errdetail("Found block length %d, expected %d",
+							   checkOverallBlockLen, checkBlockLimitLen)));
 		if (checkOffset != checkHeaderLen)
 			ereport(ERROR,
-					(errmsg("Problem making append-only storage header of type bulk dense content. Found data offset %d, expected %d",
-							checkOffset,
-							checkHeaderLen)));
+					(errmsg("problem making append-only storage header of type bulk dense content"),
+					 errdetail("Found data offset %d, expected %d",
+							   checkOffset, checkHeaderLen)));
 		if (checkUncompressedLen != dataLength)
 			ereport(ERROR,
-					(errmsg("Problem making append-only storage header of type bulk dense content. Found uncompressed length %d, expected %d",
-							checkUncompressedLen,
-							dataLength)));
+					(errmsg("problem making append-only storage header of type bulk dense content"),
+					 errdetail("Found uncompressed length %d, expected %d",
+							   checkUncompressedLen, dataLength)));
 		if (checkExecutorBlockKind != executorKind)
 			ereport(ERROR,
-					(errmsg("Problem making append-only storage header of type bulk dense content. Found executor kind %d, expected %d",
-							checkExecutorBlockKind,
-							executorKind)));
+					(errmsg("problem making append-only storage header of type bulk dense content"),
+					 errdetail("Found executor kind %d, expected %d",
+							   checkExecutorBlockKind, executorKind)));
 		if (checkHasFirstRowNum != hasFirstRowNum)
 			ereport(ERROR,
-					(errmsg("Problem making append-only storage header of type bulk dense content. Found has first row number flag %s, expected %s",
-							(checkHasFirstRowNum ? "true" : "false"),
-							(hasFirstRowNum ? "true" : "false"))));
+					(errmsg("problem making append-only storage header of type bulk dense content"),
+					 errdetail("Found has first row number flag %s, expected %s",
+							   (checkHasFirstRowNum ? "true" : "false"),
+							   (hasFirstRowNum ? "true" : "false"))));
 		if (hasFirstRowNum)
 		{
 			if (checkFirstRowNum != firstRowNum)
 				ereport(ERROR,
-						(errmsg("Problem making append-only storage header of type bulk dense content. "
-								"Found first row number " INT64_FORMAT ", expected " INT64_FORMAT,
-								checkFirstRowNum,
-								firstRowNum)));
+						(errmsg("problem making append-only storage header of type bulk dense content"),
+						 errdetail("Found first row number " INT64_FORMAT ", expected " INT64_FORMAT,
+								   checkFirstRowNum, firstRowNum)));
 		}
 		if (checkRowCount != rowCount)
 			ereport(ERROR,
-					(errmsg("Problem making append-only storage header of type bulk dense content. Found row count %d, expected %d",
-							checkRowCount,
-							rowCount)));
+					(errmsg("problem making append-only storage header of type bulk dense content"),
+					 errdetail("Found row count %d, expected %d",
+							   checkRowCount, rowCount)));
 		if (checkIsCompressed != isCompressed)
 			ereport(ERROR,
-					(errmsg("Problem making append-only storage header of type bulk dense content. Found is compressed flag %s, expected %s",
-							(checkIsCompressed ? "true" : "false"),
-							(isCompressed ? "true" : "false"))));
+					(errmsg("problem making append-only storage header of type bulk dense content"),
+					 errdetail("Found is compressed flag %s, expected %s",
+							   (checkIsCompressed ? "true" : "false"),
+							   (isCompressed ? "true" : "false"))));
 		if (checkCompressedLen != compressedLength)
 			ereport(ERROR,
-					(errmsg("Problem making append-only storage header of type bulk dense content. Found data length %d, expected %d",
-							checkCompressedLen,
-							dataLength)));
+					(errmsg("problem making append-only storage header of type bulk dense content"),
+					 errdetail("Found data length %d, expected %d",
+							   checkCompressedLen, dataLength)));
 	}
 #endif
 }

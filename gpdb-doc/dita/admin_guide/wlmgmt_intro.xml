@@ -59,9 +59,9 @@
               large memory allocation requests.</li>
           </ul></p>
         <p>The physical RAM and OS configuration are usually managed by the platform team and system
-          administrators. <ph>See the <cite>Greenplum Database Installation
-              Guide</cite> for the recommended kernel parameter settings.</ph>
-        </p>
+        administrators. See the <xref href="../install_guide/prep_os.html#topic3" format="dita"
+          scope="peer">Greenplum Database Installation Guide</xref> for the recommended kernel
+        parameters and for how to set the <codeph>/etc/sysctl.conf</codeph> file parameters.</p>
         <p>The amount of memory to reserve for the operating system and other processes is workload
           dependent. The minimum recommendation for operating system memory is 32GB, but if there is
           much concurrency in Greenplum Database, increasing to 64GB of reserved memory may be
@@ -81,7 +81,7 @@
 
       <sectiondiv>
         <p><b>Configuring vm.overcommit_ratio when Resource Group-Based Resource Management is Active</b></p>
-        <p>When resource group-based resource management is active, the operating system <codeph>vm.overcommit_ratio</codeph> default value is a good starting point. Tune as necessary. If your memory utilization is too low, increase the value; if your memory or swap usage is too high, decrease the setting.</p>
+        <p>When resource group-based resource management is active, tune the operating system <codeph>vm.overcommit_ratio</codeph> as necessary. If your memory utilization is too low, increase the value; if your memory or swap usage is too high, decrease the setting.</p>
       </sectiondiv>
       <sectiondiv>
         <p><b>Configuring vm.overcommit_ratio when Resource Queue-Based Resource Management is Active</b></p>

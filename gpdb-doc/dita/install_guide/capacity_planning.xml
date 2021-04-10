@@ -9,18 +9,23 @@
   <topic id="topic2" xml:lang="en">
     <title id="jh159441">Calculating Usable Disk Capacity</title>
     <body>
-      <p>To calculate how much data a Greenplum Database system can hold, you determine the usable
-        disk capacity per segment host and then multiply that by the number of segment hosts in your
-        Greenplum Database array. Start with the raw capacity of the physical disks on a segment
-        host that are available for data storage (<varname>raw_capacity</varname>), which is:</p>
+      <p>To calculate how much data a Greenplum Database system can hold, you have to calculate the
+        usable disk capacity per segment host and then multiply that by the number of segment hosts
+        in your Greenplum Database array. Start with the raw capacity of the physical disks on a
+        segment host that are available for data storage (<varname>raw_capacity</varname>), which
+        is:</p>
       <codeblock><varname>disk_size</varname> * <varname>number_of_disks</varname></codeblock>
       <p>Account for file system formatting overhead (roughly 10 percent) and the RAID level you are
         using. For example, if using RAID-10, the calculation would be:</p>
       <codeblock>(<varname>raw_capacity</varname> * 0.9) / 2 = <varname>formatted_disk_space</varname></codeblock>
-      <p>For optimal performance, do not completely fill your disks to
-        capacity, but run at 70% or lower. So with this in mind, calculate the usable disk space as
-        follows:</p>
+      <p>For optimal performance, do not completely fill your disks to capacity, but run at 70% or
+        lower. So with this in mind, calculate the usable disk space as follows:</p>
       <codeblock><varname>formatted_disk_space</varname> * 0.7 = <varname>usable_disk_space</varname></codeblock>
+      <p>Using only 70% of your disk space allows Greenplum Database to use the other 30% for
+        temporary and transaction files on the same disks. If your host systems have a separate disk
+        system that can be used for temporary and transaction files, you can specify a tablespace
+        that Greenplum Database uses for the files. Moving the location of the files might improve
+        performance depending on the performance of the disk system.</p>
       <p>Once you have formatted RAID disk arrays and accounted for the maximum recommended capacity
           (<varname>usable_disk_space</varname>), you will need to calculate how much storage is
         actually available for user data (<codeph>U</codeph>). If using Greenplum Database mirrors
@@ -39,12 +44,12 @@
         specifying that they reside on different tablespaces.</p>
       <p>In the <i>Greenplum Database Administrator Guide</i>, see these topics:</p>
       <ul>
-        <li id="jh161458">"Managing Workload and Resources" for information about workload
+        <li id="jh161458"><xref href="../admin_guide/partV.xml"/> for information about workload
           management </li>
-        <li id="jh161469">"Creating and Managing Tablespaces" for information about moving the
-          location of temporary files </li>
-        <li id="jh161162">"Monitoring System State" for information about monitoring Greenplum
-          Database disk space usage</li>
+        <li id="jh161469"><xref href="../admin_guide/ddl/ddl-tablespace.xml"/> for information about
+          moving the location of temporary and transaction files </li>
+        <li id="jh161162"><xref href="../admin_guide/managing/monitor.xml#topic3"/> for information
+          about monitoring Greenplum Database disk space usage</li>
       </ul>
     </body>
   </topic>
@@ -83,17 +88,17 @@
         files and metadata:</p>
       <ul>
         <li id="jh159754"><b>System Metadata</b> — For each Greenplum Database segment instance
-          (primary or mirror) or master instance running on a host, estimate approximately 20 MB for
+          (primary or mirror) or coordinator instance running on a host, estimate approximately 20 MB for
           the system catalogs and metadata. </li>
         <li id="jh159758"><b>Write Ahead Log</b> — For each Greenplum Database segment (primary or
-          mirror) or master instance running on a host, allocate space for the write ahead log
+          mirror) or coordinator instance running on a host, allocate space for the write ahead log
           (WAL). The WAL is divided into segment files of 64 MB each. At most, the number of WAL
           files will be: <codeblock>2 * <varname>checkpoint_segments</varname> + 1</codeblock><p>You
             can use this to estimate space requirements for WAL. The default
               <varname>checkpoint_segments</varname> setting for a Greenplum Database instance is 8,
-            meaning 1088 MB WAL space allocated for each segment or master instance on a
+            meaning 1088 MB WAL space allocated for each segment or coordinator instance on a
           host.</p></li>
-        <li id="jh159765"><b>Greenplum Database Log Files</b> — Each segment instance and the master
+        <li id="jh159765"><b>Greenplum Database Log Files</b> — Each segment instance and the coordinator
           instance generates database log files, which will grow over time. Sufficient space should
           be allocated for these log files, and some type of log rotation facility should be used to
           ensure that to log files do not grow too large. </li>
@@ -102,7 +107,7 @@
           utilize the system resources of those hosts. The resource consumption of the data
           collection agent processes on these hosts is minimal and should not significantly impact
           database performance. Historical data collected by the collection agents is stored in its
-          own Command Center database (named <codeph>gpperfmon</codeph>) within your Greenplum
+          own Command Center database within your Greenplum
           Database system. Collected data is distributed just like regular database data, so you
           will need to account for disk space in the data directory locations of your Greenplum
           segment instances. The amount of space required depends on the amount of historical data

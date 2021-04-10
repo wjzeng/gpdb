@@ -1,7 +1,4 @@
 -- Tests FTS can handle DNS error.
-create extension if not exists gp_inject_fault;
-CREATE
-
 -- start_matchsubs
 -- m/^ERROR:  Error on receive from .*: server closed the connection unexpectedly/
 -- s/^ERROR:  Error on receive from .*: server closed the connection unexpectedly/ERROR: server closed the connection unexpectedly/
@@ -45,20 +42,20 @@ CREATE
 (exited with code 0)
 
 -- start_ignore
-create language plpythonu;
+create language plpython3u;
 CREATE
 -- end_ignore
 
 create or replace function pg_ctl(datadir text, command text) returns text as $$ import subprocess 
 cmd = 'pg_ctl -D %s ' % datadir if command in ('stop'): cmd = cmd + '-w -m immediate %s' % command else: return 'Invalid command input' 
-return subprocess.check_output(cmd, stderr=subprocess.STDOUT, shell=True).replace('.', '') $$ language plpythonu;
+return subprocess.check_output(cmd, stderr=subprocess.STDOUT, shell=True).replace('.', '') $$ language plpython3u;
 CREATE
 
 -- no segment down.
 select count(*) from gp_segment_configuration where status = 'd';
-count
------
-0    
+ count 
+-------
+ 0     
 (1 row)
 
 1:BEGIN;
@@ -89,31 +86,31 @@ CREATE
 -- process. As if that happens, due to race condition will not trigger
 -- the fault and fail the test.
 select gp_request_fts_probe_scan();
-gp_request_fts_probe_scan
--------------------------
-t                        
+ gp_request_fts_probe_scan 
+---------------------------
+ t                         
 (1 row)
 -- stop a primary in order to trigger a mirror promotion
 select pg_ctl((select datadir from gp_segment_configuration c where c.role='p' and c.content=0), 'stop');
-pg_ctl                                              
-----------------------------------------------------
-waiting for server to shut down done
-server stopped
-
+ pg_ctl                                               
+------------------------------------------------------
+ waiting for server to shut down done 
+ server stopped 
+  
 (1 row)
 
 -- trigger failover
 select gp_request_fts_probe_scan();
-gp_request_fts_probe_scan
--------------------------
-t                        
+ gp_request_fts_probe_scan 
+---------------------------
+ t                         
 (1 row)
 
 -- verify a segment is down
 select count(*) from gp_segment_configuration where status = 'd';
-count
------
-1    
+ count 
+-------
+ 1     
 (1 row)
 -- session 1: in no transaction and no temp table created, it's safe to
 --            update cdb_component_dbs and use the new promoted primary
@@ -131,8 +128,8 @@ DETAIL:
 -- session 3: in transaction and has a cursor, cann't update
 --            cdb_component_dbs, following query should fail
 3:FETCH ALL FROM c1;
-c1|c2
---+--
+ c1 | c2 
+----+----
 (0 rows)
 3:END;
 ERROR:  Error on receive from seg0 127.0.0.1:25432 pid=30374: server closed the connection unexpectedly
@@ -301,9 +298,6 @@ DO
 20180920:05:00:41:030745 gprecoverseg:gpdbvm:gpadmin-[INFO]:-==============================END ANOTHER RECOVER==========================================
 20180920:05:00:41:030745 gprecoverseg:gpdbvm:gpadmin-[INFO]:-******************************************************************
 20180920:05:00:41:030745 gprecoverseg:gpdbvm:gpadmin-[INFO]:-The rebalance operation has completed successfully.
-20180920:05:00:41:030745 gprecoverseg:gpdbvm:gpadmin-[INFO]:-There is a resynchronization running in the background to bring all
-20180920:05:00:41:030745 gprecoverseg:gpdbvm:gpadmin-[INFO]:-segments in sync.
-20180920:05:00:41:030745 gprecoverseg:gpdbvm:gpadmin-[INFO]:-Use gpstate -e to check the resynchronization progress.
 20180920:05:00:41:030745 gprecoverseg:gpdbvm:gpadmin-[INFO]:-******************************************************************
 
 -- end_ignore
@@ -315,9 +309,9 @@ DO
 
 -- verify no segment is down after recovery
 select count(*) from gp_segment_configuration where status = 'd';
-count
------
-0    
+ count 
+-------
+ 0     
 (1 row)
 
 !\retcode gpconfig -r gp_fts_probe_retries --masteronly;

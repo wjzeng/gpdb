@@ -3,7 +3,7 @@
  * vacuumlo.c
  *	  This removes orphaned large objects from a database.
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -21,10 +21,12 @@
 #include <termios.h>
 #endif
 
+#include "catalog/pg_class_d.h"
+
+#include "fe_utils/connect.h"
 #include "libpq-fe.h"
 #include "pg_getopt.h"
-
-#define atooid(x)  ((Oid) strtoul((x), NULL, 10))
+#include "getopt_long.h"
 
 #define BUFSIZE			1024
 
@@ -47,7 +49,7 @@ struct _param
 	long		transaction_limit;
 };
 
-static int	vacuumlo(const char *database, const struct _param * param);
+static int	vacuumlo(const char *database, const struct _param *param);
 static void usage(const char *progname);
 
 
@@ -56,7 +58,7 @@ static void usage(const char *progname);
  * This vacuums LOs of one database. It returns 0 on success, -1 on failure.
  */
 static int
-vacuumlo(const char *database, const struct _param * param)
+vacuumlo(const char *database, const struct _param *param)
 {
 	PGconn	   *conn;
 	PGresult   *res,
@@ -65,13 +67,17 @@ vacuumlo(const char *database, const struct _param * param)
 	long		matched;
 	long		deleted;
 	int			i;
-	static char *password = NULL;
 	bool		new_pass;
 	bool		success = true;
+	static bool have_password = false;
+	static char password[100];
 
 	/* Note: password can be carried over from a previous call */
-	if (param->pg_prompt == TRI_YES && password == NULL)
-		password = simple_prompt("Password: ", 100, false);
+	if (param->pg_prompt == TRI_YES && !have_password)
+	{
+		simple_prompt("Password: ", password, sizeof(password), false);
+		have_password = true;
+	}
 
 	/*
 	 * Start the connection.  Loop until we have a password if requested by
@@ -91,7 +97,7 @@ vacuumlo(const char *database, const struct _param * param)
 		keywords[2] = "user";
 		values[2] = param->pg_user;
 		keywords[3] = "password";
-		values[3] = password;
+		values[3] = have_password ? password : NULL;
 		keywords[4] = "dbname";
 		values[4] = database;
 		keywords[5] = "fallback_application_name";
@@ -110,11 +116,12 @@ vacuumlo(const char *database, const struct _param * param)
 
 		if (PQstatus(conn) == CONNECTION_BAD &&
 			PQconnectionNeedsPassword(conn) &&
-			password == NULL &&
+			!have_password &&
 			param->pg_prompt != TRI_NO)
 		{
 			PQfinish(conn);
-			password = simple_prompt("Password: ", 100, false);
+			simple_prompt("Password: ", password, sizeof(password), false);
+			have_password = true;
 			new_pass = true;
 		}
 	} while (new_pass);
@@ -135,11 +142,8 @@ vacuumlo(const char *database, const struct _param * param)
 			fprintf(stdout, "Test run: no large objects will be removed!\n");
 	}
 
-	/*
-	 * Don't get fooled by any non-system catalogs
-	 */
-	res = PQexec(conn, "SET search_path = pg_catalog");
-	if (PQresultStatus(res) != PGRES_COMMAND_OK)
+	res = PQexec(conn, ALWAYS_SECURE_SEARCH_PATH_SQL);
+	if (PQresultStatus(res) != PGRES_TUPLES_OK)
 	{
 		fprintf(stderr, "Failed to set search_path:\n");
 		fprintf(stderr, "%s", PQerrorMessage(conn));
@@ -194,9 +198,6 @@ vacuumlo(const char *database, const struct _param * param)
 	 * table formed above is ignored, and pg_largeobject will be too. If
 	 * either of these were scanned, obviously we'd end up with nothing to
 	 * delete...
-	 *
-	 * NOTE: the system oid column is ignored, as it has attnum < 1. This
-	 * shouldn't matter for correctness, but it saves time.
 	 */
 	buf[0] = '\0';
 	strcat(buf, "SELECT s.nspname, c.relname, a.attname ");
@@ -206,7 +207,7 @@ vacuumlo(const char *database, const struct _param * param)
 	strcat(buf, "      AND a.atttypid = t.oid ");
 	strcat(buf, "      AND c.relnamespace = s.oid ");
 	strcat(buf, "      AND t.typname in ('oid', 'lo') ");
-	strcat(buf, "      AND c.relkind in ('r', 'm')");
+	strcat(buf, "      AND c.relkind in (" CppAsString2(RELKIND_RELATION) ", " CppAsString2(RELKIND_MATVIEW) ")");
 	strcat(buf, "      AND s.nspname !~ '^pg_'");
 	res = PQexec(conn, buf);
 	if (PQresultStatus(res) != PGRES_TUPLES_OK)
@@ -237,9 +238,15 @@ vacuumlo(const char *database, const struct _param * param)
 
 		if (!schema || !table || !field)
 		{
-			fprintf(stderr, "Out of memory\n");
+			fprintf(stderr, "%s", PQerrorMessage(conn));
 			PQclear(res);
 			PQfinish(conn);
+			if (schema != NULL)
+				PQfreemem(schema);
+			if (table != NULL)
+				PQfreemem(table);
+			if (field != NULL)
+				PQfreemem(field);
 			return -1;
 		}
 
@@ -256,6 +263,9 @@ vacuumlo(const char *database, const struct _param * param)
 			PQclear(res2);
 			PQclear(res);
 			PQfinish(conn);
+			PQfreemem(schema);
+			PQfreemem(table);
+			PQfreemem(field);
 			return -1;
 		}
 		PQclear(res2);
@@ -304,7 +314,7 @@ vacuumlo(const char *database, const struct _param * param)
 
 	deleted = 0;
 
-	while (1)
+	do
 	{
 		res = PQexec(conn, buf);
 		if (PQresultStatus(res) != PGRES_TUPLES_OK)
@@ -342,8 +352,7 @@ vacuumlo(const char *database, const struct _param * param)
 					if (PQtransactionStatus(conn) == PQTRANS_INERROR)
 					{
 						success = false;
-						PQclear(res);
-						break;
+						break;	/* out of inner for-loop */
 					}
 				}
 				else
@@ -381,7 +390,7 @@ vacuumlo(const char *database, const struct _param * param)
 		}
 
 		PQclear(res);
-	}
+	} while (success);
 
 	/*
 	 * That's all folks!
@@ -422,30 +431,45 @@ usage(const char *progname)
 	printf("%s removes unreferenced large objects from databases.\n\n", progname);
 	printf("Usage:\n  %s [OPTION]... DBNAME...\n\n", progname);
 	printf("Options:\n");
-	printf("  -l LIMIT       commit after removing each LIMIT large objects\n");
-	printf("  -n             don't remove large objects, just show what would be done\n");
-	printf("  -v             write a lot of progress messages\n");
-	printf("  -V, --version  output version information, then exit\n");
-	printf("  -?, --help     show this help, then exit\n");
+	printf("  -l, --limit=LIMIT         commit after removing each LIMIT large objects\n");
+	printf("  -n, --dry-run             don't remove large objects, just show what would be done\n");
+	printf("  -v, --verbose             write a lot of progress messages\n");
+	printf("  -V, --version             output version information, then exit\n");
+	printf("  -?, --help                show this help, then exit\n");
 	printf("\nConnection options:\n");
-	printf("  -h HOSTNAME    database server host or socket directory\n");
-	printf("  -p PORT        database server port\n");
-	printf("  -U USERNAME    user name to connect as\n");
-	printf("  -w             never prompt for password\n");
-	printf("  -W             force password prompt\n");
+	printf("  -h, --host=HOSTNAME       database server host or socket directory\n");
+	printf("  -p, --port=PORT           database server port\n");
+	printf("  -U, --username=USERNAME   user name to connect as\n");
+	printf("  -w, --no-password         never prompt for password\n");
+	printf("  -W, --password            force password prompt\n");
 	printf("\n");
-	printf("Report bugs to <pgsql-bugs@postgresql.org>.\n");
+	printf("Report bugs to <pgsql-bugs@lists.postgresql.org>.\n");
 }
 
 
 int
 main(int argc, char **argv)
 {
+	static struct option long_options[] = {
+		{"host", required_argument, NULL, 'h'},
+		{"limit", required_argument, NULL, 'l'},
+		{"dry-run", no_argument, NULL, 'n'},
+		{"port", required_argument, NULL, 'p'},
+		{"username", required_argument, NULL, 'U'},
+		{"verbose", no_argument, NULL, 'v'},
+		{"version", no_argument, NULL, 'V'},
+		{"no-password", no_argument, NULL, 'w'},
+		{"password", no_argument, NULL, 'W'},
+		{"help", no_argument, NULL, '?'},
+		{NULL, 0, NULL, 0}
+	};
+
 	int			rc = 0;
 	struct _param param;
 	int			c;
 	int			port;
 	const char *progname;
+	int			optindex;
 
 	progname = get_progname(argv[0]);
 
@@ -474,25 +498,15 @@ main(int argc, char **argv)
 		}
 	}
 
-	while (1)
+	while ((c = getopt_long(argc, argv, "h:l:np:U:vwW", long_options, &optindex)) != -1)
 	{
-		c = getopt(argc, argv, "h:l:U:p:vnwW");
-		if (c == -1)
-			break;
-
 		switch (c)
 		{
 			case '?':
 				fprintf(stderr, _("Try \"%s --help\" for more information.\n"), progname);
 				exit(1);
-			case ':':
-				exit(1);
-			case 'v':
-				param.verbose = 1;
-				break;
-			case 'n':
-				param.dry_run = 1;
-				param.verbose = 1;
+			case 'h':
+				param.pg_host = pg_strdup(optarg);
 				break;
 			case 'l':
 				param.transaction_limit = strtol(optarg, NULL, 10);
@@ -504,14 +518,9 @@ main(int argc, char **argv)
 					exit(1);
 				}
 				break;
-			case 'U':
-				param.pg_user = strdup(optarg);
-				break;
-			case 'w':
-				param.pg_prompt = TRI_NO;
-				break;
-			case 'W':
-				param.pg_prompt = TRI_YES;
+			case 'n':
+				param.dry_run = 1;
+				param.verbose = 1;
 				break;
 			case 'p':
 				port = strtol(optarg, NULL, 10);
@@ -520,11 +529,23 @@ main(int argc, char **argv)
 					fprintf(stderr, "%s: invalid port number: %s\n", progname, optarg);
 					exit(1);
 				}
-				param.pg_port = strdup(optarg);
+				param.pg_port = pg_strdup(optarg);
 				break;
-			case 'h':
-				param.pg_host = strdup(optarg);
+			case 'U':
+				param.pg_user = pg_strdup(optarg);
 				break;
+			case 'v':
+				param.verbose = 1;
+				break;
+			case 'w':
+				param.pg_prompt = TRI_NO;
+				break;
+			case 'W':
+				param.pg_prompt = TRI_YES;
+				break;
+			default:
+				fprintf(stderr, _("Try \"%s --help\" for more information.\n"), progname);
+				exit(1);
 		}
 	}
 

@@ -1,7 +1,6 @@
 -- Check if retry logic handles errors correctly.  The retry logic had
 -- a bug where error state wasn't cleaned up correctly during retries,
 -- leading to PANIC due to ERRORDATA_STACK_SIZE exeeded.
-set dtx_phase2_retry_count = 11;
 -- Set a fault on one of the QEs such that an error is raised exactly
 -- 10 times at the beginning of 2nd phase of 2PC.
 -- ERRORDATA_STACK_SIZE is defined as 10.  By erroring out 10 times,
@@ -12,7 +11,6 @@ set dtx_phase2_retry_count = 11;
 --
 -- COMMIT_PREPARED
 --
-create extension if not exists gp_inject_fault;
 select gp_inject_fault('finish_prepared_start_of_function', 'error', '', '', '', 1, 10, 0, dbid)
 from gp_segment_configuration where role = 'p' and status = 'u' and content = 1;
 begin;

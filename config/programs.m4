@@ -1,6 +1,24 @@
 # config/programs.m4
 
 
+# PGAC_PATH_PROGS
+# ---------------
+# This wrapper for AC_PATH_PROGS behaves like that macro except when
+# VARIABLE is already set; in that case we just accept the value verbatim.
+# (AC_PATH_PROGS would accept it only if it looks like an absolute path.)
+# A desirable future improvement would be to convert a non-absolute-path
+# input into absolute form.
+AC_DEFUN([PGAC_PATH_PROGS],
+[if test -z "$$1"; then
+  AC_PATH_PROGS($@)
+else
+  # Report the value of $1 in configure's output in all cases.
+  AC_MSG_CHECKING([for $1])
+  AC_MSG_RESULT([$$1])
+fi
+])
+
+
 # PGAC_PATH_BISON
 # ---------------
 # Look for Bison, set the output variable BISON to its path if found.
@@ -8,10 +26,7 @@
 # Note we do not accept other implementations of yacc.
 
 AC_DEFUN([PGAC_PATH_BISON],
-[# Let the user override the search
-if test -z "$BISON"; then
-  AC_PATH_PROGS(BISON, bison)
-fi
+[PGAC_PATH_PROGS(BISON, bison)
 
 if test "$BISON"; then
   pgac_bison_version=`$BISON --version 2>/dev/null | sed q`
@@ -41,7 +56,7 @@ if test -z "$BISON"; then
 *** PostgreSQL then you do not need to worry about this, because the Bison
 *** output is pre-generated.)])
 fi
-# We don't need AC_SUBST(BISON) because AC_PATH_PROG did it
+dnl We don't need AC_SUBST(BISON) because PGAC_PATH_PROGS did it
 AC_SUBST(BISONFLAGS)
 ])# PGAC_PATH_BISON
 
@@ -116,6 +131,34 @@ AC_SUBST(FLEXFLAGS)
 
 
 
+# PGAC_LDAP_SAFE
+# --------------
+# PostgreSQL sometimes loads libldap_r and plain libldap into the same
+# process.  Check for OpenLDAP versions known not to tolerate doing so; assume
+# non-OpenLDAP implementations are safe.  The dblink test suite exercises the
+# hazardous interaction directly.
+
+AC_DEFUN([PGAC_LDAP_SAFE],
+[AC_CACHE_CHECK([for compatible LDAP implementation], [pgac_cv_ldap_safe],
+[AC_COMPILE_IFELSE([AC_LANG_PROGRAM(
+[#include <ldap.h>
+#if !defined(LDAP_VENDOR_VERSION) || \
+     (defined(LDAP_API_FEATURE_X_OPENLDAP) && \
+      LDAP_VENDOR_VERSION >= 20424 && LDAP_VENDOR_VERSION <= 20431)
+choke me
+#endif], [])],
+[pgac_cv_ldap_safe=yes],
+[pgac_cv_ldap_safe=no])])
+
+if test "$pgac_cv_ldap_safe" != yes; then
+  AC_MSG_WARN([
+*** With OpenLDAP versions 2.4.24 through 2.4.31, inclusive, each backend
+*** process that loads libpq (via WAL receiver, dblink, or postgres_fdw) and
+*** also uses LDAP will crash on exit.])
+fi])
+
+
+
 # PGAC_CHECK_READLINE
 # -------------------
 # Check for the readline library and dependent libraries, either
@@ -172,14 +215,14 @@ fi
 
 AC_DEFUN([PGAC_VAR_RL_COMPLETION_APPEND_CHARACTER],
 [AC_CACHE_CHECK([for rl_completion_append_character], pgac_cv_var_rl_completion_append_character,
-[AC_TRY_LINK([#include <stdio.h>
+[AC_LINK_IFELSE([AC_LANG_PROGRAM([#include <stdio.h>
 #ifdef HAVE_READLINE_READLINE_H
 # include <readline/readline.h>
 #elif defined(HAVE_READLINE_H)
 # include <readline.h>
 #endif
 ],
-[rl_completion_append_character = 'x';],
+[rl_completion_append_character = 'x';])],
 [pgac_cv_var_rl_completion_append_character=yes],
 [pgac_cv_var_rl_completion_append_character=no])])
 if test x"$pgac_cv_var_rl_completion_append_character" = x"yes"; then
@@ -201,7 +244,8 @@ AC_DEFUN([PGAC_CHECK_GETTEXT],
                  [AC_MSG_ERROR([a gettext implementation is required for NLS])])
   AC_CHECK_HEADER([libintl.h], [],
                   [AC_MSG_ERROR([header file <libintl.h> is required for NLS])])
-  AC_CHECK_PROGS(MSGFMT, msgfmt)
+  PGAC_PATH_PROGS(MSGFMT, msgfmt)
+  AC_ARG_VAR(MSGFMT, [msgfmt program for NLS])dnl
   if test -z "$MSGFMT"; then
     AC_MSG_ERROR([msgfmt is required for NLS])
   fi
@@ -210,8 +254,8 @@ AC_DEFUN([PGAC_CHECK_GETTEXT],
     pgac_cv_msgfmt_flags=-c
 fi])
   AC_SUBST(MSGFMT_FLAGS, $pgac_cv_msgfmt_flags)
-  AC_CHECK_PROGS(MSGMERGE, msgmerge)
-  AC_CHECK_PROGS(XGETTEXT, xgettext)
+  PGAC_PATH_PROGS(MSGMERGE, msgmerge)
+  PGAC_PATH_PROGS(XGETTEXT, xgettext)
 ])# PGAC_CHECK_GETTEXT
 
 
@@ -280,30 +324,3 @@ else
   AC_MSG_ERROR([apr-1-config is required for gpfdist, unable to find binary])
 fi
 ]) # GPAC_PATH_APR_1_CONFIG
-
-# GPAC_PATH_APU_1_CONFIG
-# ----------------------
-# Check for apu-1-config, used by gpperfmon
-AC_DEFUN([GPAC_PATH_APU_1_CONFIG],
-[
-if test x"$with_apu_config" != x; then
-  APU_1_CONFIG=$with_apu_config
-fi
-if test -z "$APU_1_CONFIG"; then
-  AC_PATH_PROGS(APU_1_CONFIG, apu-1-config)
-fi
-
-if test -n "$APU_1_CONFIG"; then
-  gpac_apu_1_config_version=`$APU_1_CONFIG --version 2>/dev/null | sed q`
-  if test -z "$gpac_apu_1_config_version"; then
-    AC_MSG_ERROR([apu-1-config is required for gpperfmon, unable to identify version])
-  fi
-  AC_MSG_NOTICE([using apu-1-config $gpac_apu_1_config_version])
-  apu_includes=`"$APU_1_CONFIG" --includes`
-  apu_link_ld_libs=`"$APU_1_CONFIG" --link-ld --libs`
-  AC_SUBST(apu_includes)
-  AC_SUBST(apu_link_ld_libs)
-else
-  AC_MSG_ERROR([apu-1-config is required for gpperfmon, unable to find binary])
-fi
-]) # GPAC_PATH_APU_1_CONFIG

@@ -12,31 +12,13 @@
 #include "fmgr.h"
 #include "libpq/pqformat.h"		/* needed for send/recv functions */
 
-
 PG_MODULE_MAGIC;
 
 typedef struct Complex
 {
 	double		x;
 	double		y;
-}	Complex;
-
-/*
- * Since we use V1 function calling convention, all these functions have
- * the same signature as far as C is concerned.  We provide these prototypes
- * just to forestall warnings when compiled with gcc -Wmissing-prototypes.
- */
-Datum		complex_in(PG_FUNCTION_ARGS);
-Datum		complex_out(PG_FUNCTION_ARGS);
-Datum		complex_recv(PG_FUNCTION_ARGS);
-Datum		complex_send(PG_FUNCTION_ARGS);
-Datum		complex_add(PG_FUNCTION_ARGS);
-Datum		complex_abs_lt(PG_FUNCTION_ARGS);
-Datum		complex_abs_le(PG_FUNCTION_ARGS);
-Datum		complex_abs_eq(PG_FUNCTION_ARGS);
-Datum		complex_abs_ge(PG_FUNCTION_ARGS);
-Datum		complex_abs_gt(PG_FUNCTION_ARGS);
-Datum		complex_abs_cmp(PG_FUNCTION_ARGS);
+}			Complex;
 
 
 /*****************************************************************************
@@ -56,8 +38,8 @@ complex_in(PG_FUNCTION_ARGS)
 	if (sscanf(str, " ( %lf , %lf )", &x, &y) != 2)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-				 errmsg("invalid input syntax for complex: \"%s\"",
-						str)));
+				 errmsg("invalid input syntax for type %s: \"%s\"",
+						"complex", str)));
 
 	result = (Complex *) palloc(sizeof(Complex));
 	result->x = x;

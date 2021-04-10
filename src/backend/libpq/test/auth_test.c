@@ -13,13 +13,10 @@
 static void
 pg_authid_search_will_return(const char *user_name, HeapTuple retval)
 {
-	expect_value(SearchSysCache, cacheId, AUTHNAME);
-	expect_string(SearchSysCache, key1, user_name);
-	expect_any(SearchSysCache, key2);
-	expect_any(SearchSysCache, key3);
-	expect_any(SearchSysCache, key4);
+	expect_value(SearchSysCache1, cacheId, AUTHNAME);
+	expect_string(SearchSysCache1, key1, user_name);
 
-	will_return(SearchSysCache, retval);
+	will_return(SearchSysCache1, retval);
 
 	if (retval != NULL)
 	{
@@ -45,7 +42,7 @@ pg_authid_tuple_attribute_will_be(HeapTuple tuple, AttrNumber attr, Datum retval
 }
 
 /* Unit tests for check_valid_until_for_gssapi() function */
-void
+static void
 test_checkValidUntilForGssapi_returns_error_for_nonexistent_user(void **state)
 {
 	int			result;
@@ -58,7 +55,7 @@ test_checkValidUntilForGssapi_returns_error_for_nonexistent_user(void **state)
 	assert_true(result == STATUS_ERROR);
 }
 
-void
+static void
 test_checkValidUntilForGssapi_returns_ok_for_user_with_null_validuntil(void **state)
 {
 	int			result;
@@ -73,7 +70,7 @@ test_checkValidUntilForGssapi_returns_ok_for_user_with_null_validuntil(void **st
 	assert_true(result == STATUS_OK);
 }
 
-void
+static void
 test_checkValidUntilForGssapi_returns_error_for_user_with_expired_validuntil(void **state)
 {
 	int			result;
@@ -89,7 +86,7 @@ test_checkValidUntilForGssapi_returns_error_for_user_with_expired_validuntil(voi
 	assert_true(result == STATUS_ERROR);
 }
 
-void
+static void
 test_checkValidUntilForGssapi_returns_ok_for_user_with_unexpired_validuntil(void **state)
 {
 	int			result;

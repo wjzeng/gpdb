@@ -17,7 +17,6 @@ include $(top_builddir)/src/Makefile.global
 
 # files to build into backend
 OBJS= localtime.o strftime.o pgtz.o
-OBJS += gptime.o
 
 # files needed to build zic utility program
 ZICOBJS= zic.o $(WIN32RES)
@@ -28,6 +27,9 @@ TZDATAFILES = $(srcdir)/data/tzdata.zi
 # which zone should determine the DST rules (not the specific UTC offset!)
 # for POSIX-style timezone specs
 POSIXRULES = US/Eastern
+
+# any custom options you might want to pass to zic while installing data files
+ZIC_OPTIONS =
 
 # use system timezone data?
 ifneq (,$(with_system_tzdata))
@@ -53,7 +55,7 @@ zic: $(ZICOBJS) | submake-libpgport
 
 install: all installdirs
 ifeq (,$(with_system_tzdata))
-	$(ZIC) -d '$(DESTDIR)$(datadir)/timezone' -p '$(POSIXRULES)' $(TZDATAFILES)
+	$(ZIC) -d '$(DESTDIR)$(datadir)/timezone' -p '$(POSIXRULES)' $(ZIC_OPTIONS) $(TZDATAFILES)
 endif
 	$(MAKE) -C tznames $@
 

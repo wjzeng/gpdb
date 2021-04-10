@@ -4,19 +4,34 @@
  *	  Routines to preprocess the parse tree target list
  *
  * For INSERT and UPDATE queries, the targetlist must contain an entry for
- * each attribute of the target relation in the correct order.  For all query
+ * each attribute of the target relation in the correct order.  For UPDATE and
+ * DELETE queries, it must also contain junk tlist entries needed to allow the
+ * executor to identify the rows to be updated or deleted.  For all query
  * types, we may need to add junk tlist entries for Vars used in the RETURNING
  * list and row ID information needed for SELECT FOR UPDATE locking and/or
  * EvalPlanQual checking.
  *
- * NOTE: the rewriter's rewriteTargetListIU and rewriteTargetListUD
- * routines also do preprocessing of the targetlist.  The division of labor
- * between here and there is a bit arbitrary and historical.
+ * The query rewrite phase also does preprocessing of the targetlist (see
+ * rewriteTargetListIU).  The division of labor between here and there is
+ * partially historical, but it's not entirely arbitrary.  In particular,
+ * consider an UPDATE across an inheritance tree.  What rewriteTargetListIU
+ * does need be done only once (because it depends only on the properties of
+ * the parent relation).  What's done here has to be done over again for each
+ * child relation, because it depends on the properties of the child, which
+ * might be of a different relation type, or have more columns and/or a
+ * different column order than the parent.
+ *
+ * The fact that rewriteTargetListIU sorts non-resjunk tlist entries by column
+ * position, which expand_targetlist depends on, violates the above comment
+ * because the sorting is only valid for the parent relation.  In inherited
+ * UPDATE cases, adjust_inherited_tlist runs in between to take care of fixing
+ * the tlists for child tables to keep expand_targetlist happy.  We do it like
+ * that because it's faster in typical non-inherited cases.
  *
  *
  * Portions Copyright (c) 2006-2008, Greenplum inc
- * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -27,25 +42,28 @@
 
 #include "postgres.h"
 
-#include "access/heapam.h"
 #include "access/sysattr.h"
-#include "catalog/gp_policy.h"     /* CDB: POLICYTYPE_PARTITIONED */
-#include "catalog/pg_inherits_fn.h"
+#include "access/table.h"
 #include "catalog/pg_type.h"
 #include "nodes/makefuncs.h"
-#include "optimizer/plancat.h"
+#include "optimizer/optimizer.h"
 #include "optimizer/prep.h"
 #include "optimizer/tlist.h"
 #include "parser/parsetree.h"
 #include "parser/parse_coerce.h"
-#include "parser/parse_relation.h"
-#include "utils/lsyscache.h"
+#include "rewrite/rewriteHandler.h"
 #include "utils/rel.h"
 
+#include "catalog/gp_distribution_policy.h"     /* CDB: POLICYTYPE_PARTITIONED */
+#include "catalog/pg_inherits.h"
+#include "optimizer/plancat.h"
+#include "parser/parse_relation.h"
+#include "utils/lsyscache.h"
 
 static List *expand_targetlist(PlannerInfo *root, List *tlist, int command_type,
-				  Index result_relation, List *range_table);
-static List *supplement_simply_updatable_targetlist(List *range_table,
+							   Index result_relation, Relation rel);
+static List *supplement_simply_updatable_targetlist(PlannerInfo *root,
+													List *range_table,
 													List *tlist);
 
 
@@ -54,46 +72,72 @@ static List *supplement_simply_updatable_targetlist(List *range_table,
  *	  Driver for preprocessing the parse tree targetlist.
  *
  *	  Returns the new targetlist.
+ *
+ * As a side effect, if there's an ON CONFLICT UPDATE clause, its targetlist
+ * is also preprocessed (and updated in-place).
  */
 List *
-preprocess_targetlist(PlannerInfo *root, List *tlist)
+preprocess_targetlist(PlannerInfo *root)
 {
 	Query	   *parse = root->parse;
 	int			result_relation = parse->resultRelation;
 	List	   *range_table = parse->rtable;
 	CmdType		command_type = parse->commandType;
+	RangeTblEntry *target_rte = NULL;
+	Relation	target_relation = NULL;
+	List	   *tlist;
 	ListCell   *lc;
-	RangeTblEntry *rte = NULL;
 
 	/*
-	 * Sanity check: if there is a result relation, it'd better be a real
-	 * relation not a subquery.  Else parser or rewriter messed up.
+	 * If there is a result relation, open it so we can look for missing
+	 * columns and so on.  We assume that previous code already acquired at
+	 * least AccessShareLock on the relation, so we need no lock here.
 	 */
 	if (result_relation)
 	{
-		rte = rt_fetch(result_relation, range_table);
+		target_rte = rt_fetch(result_relation, range_table);
 
-		if (rte->subquery != NULL || rte->relid == InvalidOid)
-			elog(ERROR, "subquery cannot be result relation");
+		/*
+		 * Sanity check: it'd better be a real relation not, say, a subquery.
+		 * Else parser or rewriter messed up.
+		 */
+		if (target_rte->rtekind != RTE_RELATION)
+			elog(ERROR, "result relation must be a regular relation");
+
+		target_relation = table_open(target_rte->relid, NoLock);
 	}
+	else
+		Assert(command_type == CMD_SELECT);
+
+	/*
+	 * For UPDATE/DELETE, add any junk column(s) needed to allow the executor
+	 * to identify the rows to be updated or deleted.  Note that this step
+	 * scribbles on parse->targetList, which is not very desirable, but we
+	 * keep it that way to avoid changing APIs used by FDWs.
+	 */
+	if (command_type == CMD_UPDATE || command_type == CMD_DELETE)
+		rewriteTargetListUD(parse, target_rte, target_relation);
 
 	/*
 	 * for heap_form_tuple to work, the targetlist must match the exact order
 	 * of the attributes. We also need to fill in any missing attributes. -ay
 	 * 10/94
 	 */
+	tlist = parse->targetList;
 	if (command_type == CMD_INSERT || command_type == CMD_UPDATE)
 		tlist = expand_targetlist(root, tlist, command_type,
-								  result_relation, range_table);
+								  result_relation, target_relation);
 
 	/* simply updatable cursors */
-	if (root->glob->simplyUpdatable)
-		tlist = supplement_simply_updatable_targetlist(range_table, tlist);
+	if (root->glob->simplyUpdatableRel != InvalidOid)
+		tlist = supplement_simply_updatable_targetlist(root, range_table, tlist);
 
 	/*
 	 * Add necessary junk columns for rowmarked rels.  These values are needed
 	 * for locking of rels selected FOR UPDATE/SHARE, and to do EvalPlanQual
-	 * rechecking.  See comments for PlanRowMark in plannodes.h.
+	 * rechecking.  See comments for PlanRowMark in plannodes.h.  If you
+	 * change this stanza, see also expand_inherited_rtentry(), which has to
+	 * be able to add on junk columns equivalent to these.
 	 */
 	foreach(lc, root->rowMarks)
 	{
@@ -106,9 +150,9 @@ preprocess_targetlist(PlannerInfo *root, List *tlist)
 		if (rc->rti != rc->prti)
 			continue;
 
-		if (rc->markType != ROW_MARK_COPY)
+		if (rc->allMarkTypes & ~(1 << ROW_MARK_COPY))
 		{
-			/* It's a regular table, so fetch its TID */
+			/* Need to fetch TID */
 			var = makeVar(rc->rti,
 						  SelfItemPointerAttributeNumber,
 						  TIDOID,
@@ -121,32 +165,32 @@ preprocess_targetlist(PlannerInfo *root, List *tlist)
 								  pstrdup(resname),
 								  true);
 			tlist = lappend(tlist, tle);
-
-			/* if parent of inheritance tree, need the tableoid too */
-			if (rc->isParent)
-			{
-				var = makeVar(rc->rti,
-							  TableOidAttributeNumber,
-							  OIDOID,
-							  -1,
-							  InvalidOid,
-							  0);
-				snprintf(resname, sizeof(resname), "tableoid%u", rc->rowmarkId);
-				tle = makeTargetEntry((Expr *) var,
-									  list_length(tlist) + 1,
-									  pstrdup(resname),
-									  true);
-				tlist = lappend(tlist, tle);
-			}
 		}
-		else
+		if (rc->allMarkTypes & (1 << ROW_MARK_COPY))
 		{
-			/* Not a table, so we need the whole row as a junk var */
+			/* Need the whole row as a junk var */
 			var = makeWholeRowVar(rt_fetch(rc->rti, range_table),
 								  rc->rti,
 								  0,
 								  false);
 			snprintf(resname, sizeof(resname), "wholerow%u", rc->rowmarkId);
+			tle = makeTargetEntry((Expr *) var,
+								  list_length(tlist) + 1,
+								  pstrdup(resname),
+								  true);
+			tlist = lappend(tlist, tle);
+		}
+
+		/* If parent of inheritance tree, always fetch the tableoid too. */
+		if (rc->isParent)
+		{
+			var = makeVar(rc->rti,
+						  TableOidAttributeNumber,
+						  OIDOID,
+						  -1,
+						  InvalidOid,
+						  0);
+			snprintf(resname, sizeof(resname), "tableoid%u", rc->rowmarkId);
 			tle = makeTargetEntry((Expr *) var,
 								  list_length(tlist) + 1,
 								  pstrdup(resname),
@@ -168,7 +212,8 @@ preprocess_targetlist(PlannerInfo *root, List *tlist)
 		ListCell   *l;
 
 		vars = pull_var_clause((Node *) parse->returningList,
-							   PVC_RECURSE_AGGREGATES,
+							   PVC_RECURSE_AGGREGATES |
+							   PVC_RECURSE_WINDOWFUNCS |
 							   PVC_INCLUDE_PLACEHOLDERS);
 		foreach(l, vars)
 		{
@@ -179,7 +224,7 @@ preprocess_targetlist(PlannerInfo *root, List *tlist)
 				var->varno == result_relation)
 				continue;		/* don't need it */
 
-			if (tlist_member((Node *) var, tlist))
+			if (tlist_member((Expr *) var, tlist))
 				continue;		/* already got it */
 
 			tle = makeTargetEntry((Expr *) var,
@@ -192,8 +237,23 @@ preprocess_targetlist(PlannerInfo *root, List *tlist)
 		list_free(vars);
 	}
 
+	/*
+	 * If there's an ON CONFLICT UPDATE clause, preprocess its targetlist too
+	 * while we have the relation open.
+	 */
+	if (parse->onConflict)
+		parse->onConflict->onConflictSet =
+			expand_targetlist(root, parse->onConflict->onConflictSet,
+							  CMD_UPDATE,
+							  result_relation,
+							  target_relation);
+
+	if (target_relation)
+		table_close(target_relation, NoLock);
+
 	return tlist;
 }
+
 
 /*****************************************************************************
  *
@@ -209,11 +269,10 @@ preprocess_targetlist(PlannerInfo *root, List *tlist)
  */
 static List *
 expand_targetlist(PlannerInfo *root, List *tlist, int command_type,
-				  Index result_relation, List *range_table)
+				  Index result_relation, Relation rel)
 {
 	List	   *new_tlist = NIL;
 	ListCell   *tlist_item;
-	Relation	rel;
 	int			attrno,
 				numattrs;
 	Bitmapset  *changed_cols = NULL;
@@ -225,17 +284,13 @@ expand_targetlist(PlannerInfo *root, List *tlist, int command_type,
 	 * order; but we have to insert TLEs for any missing attributes.
 	 *
 	 * Scan the tuple description in the relation's relcache entry to make
-	 * sure we have all the user attributes in the right order.  We assume
-	 * that the rewriter already acquired at least AccessShareLock on the
-	 * relation, so we need no lock here.
+	 * sure we have all the user attributes in the right order.
 	 */
-	rel = heap_open(getrelid(result_relation, range_table), NoLock);
-
 	numattrs = RelationGetNumberOfAttributes(rel);
 
 	for (attrno = 1; attrno <= numattrs; attrno++)
 	{
-		Form_pg_attribute att_tup = rel->rd_att->attrs[attrno - 1];
+		Form_pg_attribute att_tup = TupleDescAttr(rel->rd_att, attrno - 1);
 		TargetEntry *new_tle = NULL;
 
 		if (tlist_item != NULL)
@@ -314,14 +369,14 @@ expand_targetlist(PlannerInfo *root, List *tlist, int command_type,
 													  attcollation,
 													  att_tup->attlen,
 													  (Datum) 0,
-													  true,		/* isnull */
+													  true, /* isnull */
 													  att_tup->attbyval);
 						new_expr = coerce_to_domain(new_expr,
 													InvalidOid, -1,
 													atttype,
+													COERCION_IMPLICIT,
 													COERCE_IMPLICIT_CAST,
 													-1,
-													false,
 													false);
 					}
 					else
@@ -332,7 +387,7 @@ expand_targetlist(PlannerInfo *root, List *tlist, int command_type,
 													  InvalidOid,
 													  sizeof(int32),
 													  (Datum) 0,
-													  true,		/* isnull */
+													  true, /* isnull */
 													  true /* byval */ );
 					}
 					break;
@@ -354,7 +409,7 @@ expand_targetlist(PlannerInfo *root, List *tlist, int command_type,
 													  InvalidOid,
 													  sizeof(int32),
 													  (Datum) 0,
-													  true,		/* isnull */
+													  true, /* isnull */
 													  true /* byval */ );
 					}
 					break;
@@ -378,12 +433,16 @@ expand_targetlist(PlannerInfo *root, List *tlist, int command_type,
 	/*
 	 * If an UPDATE can move the tuples from one segment to another, we will
 	 * need to create a Split Update node for it. The node is created later
-	 * in the planning, but if it's needed, we must ensure that the target
-	 * list contains all the original values of each distribution key column,
-	 * because the Split Update needs them as input. The old distribution
-	 * key columns come in the target list after all the new values, and
-	 * before the 'ctid' and other resjunk columns. (The logic in
-	 * process_targetlist_for_splitupdate() relies on that order.)
+	 * in the planning, but if it's needed, and the table has OIDs, we must
+	 * ensure that the target list contains the old OID so that the Split
+	 * Update can copy it to the new tuple.
+	 *
+	 * GPDB_96_MERGE_FIXME: we used to copy all old distribution key columns,
+	 * but we only need this for the OID now. Can we desupport Split Updates
+	 * on tables with OIDs, and get rid of this?
+	 *
+	 * GPDB_12_MERGE_FIXME: Tables with special OIDS is now gone. We can
+	 * definitely get rid of this now.
 	 */
 	if (command_type == CMD_UPDATE)
 	{
@@ -406,61 +465,8 @@ expand_targetlist(PlannerInfo *root, List *tlist, int command_type,
 			}
 		}
 
-		if (key_col_updated || root->parse->needReshuffle)
+		if (key_col_updated)
 		{
-			/*
-			 * Yes, this is a split update.
-			 * Updating a hash column is a split update, of course.
-			 * We should note that current reshuffle implementation
-			 * is based on split-update, so if the query is a reshuffle
-			 * query, it is also a split-update even if we are reshuffling
-			 * a random distributed table.
-			 *
-			 * For each column that was changed, add the original column value
-			 * to the target list, if it's not there already.
-			 */
-			int			i;
-
-			for (i = 0; i < targetPolicy->nattrs; i++)
-			{
-				AttrNumber	keycolidx = targetPolicy->attrs[i];
-				Var		   *origvar;
-				Form_pg_attribute att_tup = rel->rd_att->attrs[keycolidx - 1];
-
-				origvar = makeVar(result_relation,
-								  keycolidx,
-								  att_tup->atttypid,
-								  att_tup->atttypmod,
-								  att_tup->attcollation,
-								  0);
-				TargetEntry *new_tle = makeTargetEntry((Expr *) origvar,
-													   attrno,
-													   NameStr(att_tup->attname),
-													   true);
-				new_tlist = lappend(new_tlist, new_tle);
-				attrno++;
-			}
-
-			/* Also add the old OID to the tlist, if the table has OIDs. */
-			if (rel->rd_rel->relhasoids)
-			{
-				TargetEntry *new_tle;
-				Var		   *oidvar;
-
-				oidvar = makeVar(result_relation,
-								 ObjectIdAttributeNumber,
-								 OIDOID,
-								 -1,
-								 InvalidOid,
-								 0);
-				new_tle = makeTargetEntry((Expr *) oidvar,
-										  attrno,
-										  "oid",
-										  true);
-				new_tlist = lappend(new_tlist, new_tle);
-				attrno++;
-			}
-
 			/*
 			 * Since we just went through a lot of work to determine whether a
 			 * Split Update is needed, memorize that in the PlannerInfo, so that
@@ -495,8 +501,6 @@ expand_targetlist(PlannerInfo *root, List *tlist, int command_type,
 		attrno++;
 		tlist_item = lnext(tlist_item);
 	}
-
-	heap_close(rel, NoLock);
 
 	return new_tlist;
 }
@@ -534,9 +538,20 @@ get_plan_rowmark(List *rowmarks, Index rtindex)
  * available in the tuple itself.
  */
 static List *
-supplement_simply_updatable_targetlist(List *range_table, List *tlist)
+supplement_simply_updatable_targetlist(PlannerInfo *root, List *range_table, List *tlist)
 {
-	Index varno = extractSimplyUpdatableRTEIndex(range_table);
+	/*
+	 * We determined that this is simply updatable earlier already. Simply
+	 * updatable implies that there is exactly one range table entry.
+	 * (More might be added later by expanding partitioned tables, but not
+	 * yet.) So we should not get here.
+	 */
+	if (list_length(range_table) != 1)
+	{
+		Assert(false);
+		root->glob->simplyUpdatableRel = InvalidOid;
+	}
+	Index varno = 1;
 
 	/* ctid */
 	Var         *varCtid = makeVar(varno,
@@ -556,7 +571,7 @@ supplement_simply_updatable_targetlist(List *range_table, List *tlist)
 				vartypeid 	= InvalidOid;
 	int32       type_mod 	= -1;
 	Oid			type_coll	= InvalidOid;
-	reloid = getrelid(varno, range_table);
+	reloid = rt_fetch(varno, range_table)->relid;
 	get_atttypetypmodcoll(reloid, GpSegmentIdAttributeNumber,
 						  &vartypeid, &type_mod, &type_coll);
 	Var         *varSegid = makeVar(varno,

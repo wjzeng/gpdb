@@ -10,14 +10,14 @@
  * Particularly, the case when the current visimap entry has already
  * been stashed at least once.
  */
-void
+static void
 test__AppendOnlyVisimapDelete_Finish_outoforder(void **state)
 {
 	AppendOnlyVisiMapDeleteKey key;
 	AppendOnlyVisiMapDeleteData val;
 	AppendOnlyVisimapDelete visiMapDelete;
 	AppendOnlyVisimap visiMap;
-	bool		found;
+	int found = true;
 
 	visiMapDelete.visiMap = &visiMap;
 	visiMap.visimapEntry.segmentFileNum = 2;
@@ -49,14 +49,14 @@ test__AppendOnlyVisimapDelete_Finish_outoforder(void **state)
 	expect_value(hash_search, action, HASH_FIND);
 	expect_any(hash_search, keyPtr);
 	expect_any(hash_search, foundPtr);
-	will_assign_value(hash_search, foundPtr, true);
+	will_assign_value(hash_search, foundPtr, found);
 	will_return(hash_search, &val);
 
 	expect_any(hash_destroy, hashp);
 	will_be_called(hash_destroy);
 
-	expect_any(ExecWorkFile_Close, workfile);
-	will_return(ExecWorkFile_Close, 0);
+	expect_any(BufFileClose, file);
+	will_return(BufFileClose, 0);
 
 	expect_any(hash_get_num_entries, hashp);
 	will_return(hash_get_num_entries, 0);

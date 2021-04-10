@@ -4,7 +4,7 @@
  *	  Core support for opening external relations via a URL with curl
  *
  * Portions Copyright (c) 2007-2008, Greenplum inc
- * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
  *
  * IDENTIFICATION
  *	  src/backend/access/external/url_curl.c
@@ -21,6 +21,7 @@
 #include <arpa/inet.h>
 
 #include <curl/curl.h>
+#include <time.h>
 
 #include "cdb/cdbsreh.h"
 #include "cdb/cdbutil.h"
@@ -96,7 +97,6 @@ typedef struct
 
 } URL_CURL_FILE;
 
-
 #if BYTE_ORDER == BIG_ENDIAN
 #define local_htonll(n)  (n)
 #define local_ntohll(n)  (n)
@@ -114,7 +114,6 @@ typedef struct
  *
  *  SSL Params
  *	extssl_protocol  CURL_SSLVERSION_TLSv1 				
- *  extssl_cipher 	 TLS_RSA_WITH_AES_128_CBC_SHA
  *  extssl_verifycert 	1
  *  extssl_verifyhost 	2
  *  extssl_no_verifycert 	0
@@ -128,7 +127,6 @@ typedef struct
  */
 
 const static int extssl_protocol  = CURL_SSLVERSION_TLSv1;
-const char* extssl_cipher = "AES128-SHA";
 const static int extssl_verifycert = 1;
 const static int extssl_verifyhost = 2;
 const static int extssl_no_verifycert = 0;
@@ -150,9 +148,13 @@ static char curl_Error_Buffer[CURL_ERROR_SIZE];
 
 static void gp_proto0_write_done(URL_CURL_FILE *file);
 static void extract_http_domain(char* i_path, char* o_domain, int dlen);
+static char * make_url(const char *url, bool is_ipv6);
 
 /* we use a global one for convenience */
 static CURLM *multi_handle = 0;
+
+static int
+fill_buffer(URL_CURL_FILE *curl, int want);
 
 /*
  * A helper macro, to call curl_easy_setopt(), and ereport() if it fails.
@@ -219,7 +221,7 @@ destroy_curlhandle(curlhandle_t *h)
 			CURLMcode e = curl_multi_remove_handle(multi_handle, h->handle);
 
 			if (CURLM_OK != e)
-				elog(WARNING, "internal error curl_multi_remove_handle (%d - %s)", e, curl_easy_strerror(e));
+				elog(LOG, "internal error curl_multi_remove_handle (%d - %s)", e, curl_easy_strerror(e));
 			h->in_multi_handle = false;
 		}
 
@@ -259,7 +261,7 @@ url_curl_abort_callback(ResourceReleasePhase phase,
 		if (curr->owner == CurrentResourceOwner)
 		{
 			if (isCommit)
-				elog(WARNING, "url_curl reference leak: %p still referenced", curr);
+				elog(LOG, "url_curl reference leak: %p still referenced", curr);
 
 			destroy_curlhandle(curr);
 		}
@@ -443,6 +445,10 @@ check_response(URL_CURL_FILE *file, int *rc, char **response_string)
 			/* get the os level errno, and string representation of it */
 			if (curl_easy_getinfo(curl, CURLINFO_OS_ERRNO, &oserrno) == CURLE_OK)
 			{
+				if (oserrno == EHOSTUNREACH)
+				{
+					return oserrno;
+				}
 				if (oserrno != 0)
 					snprintf(connmsg, sizeof connmsg, "error code = %d (%s)",
 							 (int) oserrno, strerror((int)oserrno));
@@ -450,8 +456,8 @@ check_response(URL_CURL_FILE *file, int *rc, char **response_string)
 
 			ereport(ERROR,
 					(errcode(ERRCODE_CONNECTION_FAILURE),
-					 errmsg("connection with gpfdist failed for %s. "
-							"effective url: %s. %s\n%s", file->common.url, effective_url,
+					 errmsg("connection with gpfdist failed for \"%s\", effective url: \"%s\": %s; %s",
+							file->common.url, effective_url,
 							(oserrno != 0 ? connmsg : ""),
 							(curl_Error_Buffer[0] != '\0' ? curl_Error_Buffer : ""))));
 		}
@@ -541,77 +547,46 @@ get_gpfdist_status(URL_CURL_FILE *file)
 	curl_easy_cleanup(status_handle);
 }
 
-/**
- * Send curl request and check response.
- * If failed, will retry multiple times.
- * Return true if succeed, false otherwise.
- */
-static void
-gp_curl_easy_perform_backoff_and_check_response(URL_CURL_FILE *file)
-{
-	int 		response_code;
-	char	   *response_string = NULL;
+/* Return true to retry */
+typedef bool (*perform_func)(URL_CURL_FILE *file);
 
+static void
+gp_perform_backoff_and_check_response(URL_CURL_FILE *file, perform_func perform)
+{
 	/* retry in case server return timeout error */
 	unsigned int wait_time = 1;
 	unsigned int retry_count = 0;
-	/* retry at most twice(300 seconds * 2) when CURLE_OPERATION_TIMEDOUT happens */
-	unsigned int timeout_count = 0;
+	/* retry at most 300s by default when any error happens */
+	time_t start_time = time(NULL);
+	time_t now;
+	time_t end_time = start_time + gpfdist_retry_timeout;
 
 	while (true)
 	{
+		if (!perform(file))
+		{
+			return;
+		}
 		/*
-		 * Use backoff policy to call curl_easy_perform to fix following error
-		 * when work load is high:
-		 *	- 'could not connect to server'
-		 *	- gpfdist return timeout (HTTP 408)
-		 * By default it will wait at most 127 seconds before abort.
-		 * 1 + 2 + 4 + 8 + 16 + 32 + 64 = 127
+		 * Retry until end_time is reached
 		 */
-		CURLcode e = curl_easy_perform(file->curl->handle);
-		if (CURLE_OK != e)
+		now = time(NULL);
+		if (now >= end_time)
 		{
-			elog(WARNING, "%s error (%d - %s)", file->curl_url, e, curl_easy_strerror(e));
-			if (CURLE_OPERATION_TIMEDOUT == e)
-			{
-				timeout_count++;
-			}
-		}
-		else
-		{
-			/* check the response from server */                                              	
-			response_code = check_response(file, &response_code, &response_string);
-			switch (response_code)
-			{
-				case 0:
-					/* Success! */
-					return;
-
-				case FDIST_TIMEOUT:
-					break;
-
-				default:
-					ereport(ERROR,
-							(errcode(ERRCODE_CONNECTION_FAILURE),
-							 errmsg("error while getting response from gpfdist on %s (code %d, msg %s)",
-									file->curl_url, response_code, response_string)));
-			}
-			if (response_string)
-				pfree(response_string);
-			response_string = NULL;
-		}
-
-		if (wait_time > MAX_TRY_WAIT_TIME || timeout_count >= 2)
-		{
+			elog(LOG, "abort writing data to gpfdist, wait_time = %d, duration = %ld, gpfdist_retry_timeout = %d",
+				wait_time, now - start_time, gpfdist_retry_timeout);
 			ereport(ERROR,
 					(errcode(ERRCODE_CONNECTION_FAILURE),
-					 errmsg("error when writing data to gpfdist %s, quit after %d tries",
+					 errmsg("error when connecting to gpfdist %s, quit after %d tries",
 							file->curl_url, retry_count+1)));
 		}
 		else
 		{
-			elog(WARNING, "failed to send request to gpfdist (%s), will retry after %d seconds", file->curl_url, wait_time);
 			unsigned int for_wait = 0;
+			wait_time = wait_time > MAX_TRY_WAIT_TIME ? MAX_TRY_WAIT_TIME : wait_time;
+			/* For last retry before end_time */
+			wait_time = wait_time > end_time - now ? end_time - now : wait_time;
+			elog(LOG, "failed to send request to gpfdist (%s), will retry after %d seconds", file->curl_url, wait_time);
 			while (for_wait++ < wait_time)
 			{
 				pg_usleep(1000000);
@@ -623,6 +598,92 @@ gp_curl_easy_perform_backoff_and_check_response(URL_CURL_FILE *file)
 	}
 }
 
+static bool multi_perform_work(URL_CURL_FILE *file)
+{
+	int 		response_code;
+	char	   *response_string = NULL;
+	int e;
+	char *effective_url;
+
+	if (CURLE_OK != (e = curl_multi_add_handle(multi_handle, file->curl->handle)))
+	{
+		if (CURLM_CALL_MULTI_PERFORM != e)
+			elog(ERROR, "internal error: curl_multi_add_handle failed (%d - %s)",
+				 e, curl_easy_strerror(e));
+	}
+	file->curl->in_multi_handle = true;
+
+	while (CURLM_CALL_MULTI_PERFORM ==
+		   (e = curl_multi_perform(multi_handle, &file->still_running)));
+	if (e != CURLE_OK)
+		elog(ERROR, "internal error: curl_multi_perform failed (%d - %s)",
+			 e, curl_easy_strerror(e));
+	/* read some bytes to make sure the connection is established */
+	fill_buffer(file, 1);
+
+	/* check the connection for GET request */
+	int code = check_response(file, &response_code, &response_string);
+	switch (code)
+	{
+		case 0:
+			return false;
+		case EHOSTUNREACH:
+			curl_easy_getinfo(file->curl->handle, CURLINFO_EFFECTIVE_URL, &effective_url);
+			elog(LOG, "gpfdist request failed on seg%d, error: %s, effective url %s",
+				GpIdentity.segindex, strerror(EHOSTUNREACH), effective_url);
+			curl_multi_remove_handle(multi_handle, file->curl->handle);
+			curl_multi_cleanup(multi_handle);
+			multi_handle = curl_multi_init();
+			return true;
+		default:
+			ereport(ERROR,
+					(errcode(ERRCODE_CONNECTION_FAILURE),
+					 errmsg("could not open \"%s\" for reading", file->common.url),
+					 errdetail("Unexpected response from gpfdist server: %d - %s",
+							   response_code, response_string)));
+	}
+}
+
+static bool easy_perform_work(URL_CURL_FILE *file)
+{
+	int 		response_code;
+	char	   *response_string = NULL;
+	/*
+	 * Use backoff policy to call curl_easy_perform to fix following error
+	 * when work load is high:
+	 *	- 'could not connect to server'
+	 *	- gpfdist return timeout (HTTP 408)
+	 * By default it will wait at least gpfdist_retry_timeout seconds before abort.
+	 */
+	CURLcode e = curl_easy_perform(file->curl->handle);
+	if (CURLE_OK != e)
+	{
+		elog(LOG, "%s response (%d - %s)", file->curl_url, e, curl_easy_strerror(e));
+	}
+	else
+	{
+		/* check the response from server */
+		response_code = check_response(file, &response_code, &response_string);
+		switch (response_code)
+		{
+			case 0:
+				/* Success! */
+				return false;
+			case FDIST_TIMEOUT:
+				elog(LOG, "%s timeout from gpfdist", file->curl_url);
+				break;
+			default:
+				ereport(ERROR,
+						(errcode(ERRCODE_CONNECTION_FAILURE),
+						 errmsg("error while getting response from gpfdist on %s (code %d, msg %s)",
+								file->curl_url, response_code, response_string)));
+		}
+		if (response_string)
+			pfree(response_string);
+		response_string = NULL;
+	}
+	return true;
+}
 
 /*
  * fill_buffer
@@ -669,23 +730,39 @@ fill_buffer(URL_CURL_FILE *curl, int want)
 						e, curl_easy_strerror(e));
 		}
 
-		if (maxfd <= 0)
+		if (maxfd == 0)
 		{
 			elog(LOG, "curl_multi_fdset set maxfd = %d", maxfd);
 			curl->still_running = 0;
 			break;
 		}
-		nfds = select(maxfd+1, &fdread, &fdwrite, &fdexcep, &timeout);
-
+		/* When libcurl returns -1 in max_fd, it is because libcurl currently does something
+		 * that isn't possible for your application to monitor with a socket and unfortunately
+		 * you can then not know exactly when the current action is completed using select().
+		 * You then need to wait a while before you proceed and call curl_multi_perform anyway
+		 */
+		if (maxfd == -1)
+		{
+			elog(DEBUG2, "curl_multi_fdset set maxfd = %d", maxfd);
+			pg_usleep(100000);
+			// to call curl_multi_perform
+			nfds = 1;
+		}
+		else
+		{
+			nfds = select(maxfd+1, &fdread, &fdwrite, &fdexcep, &timeout);
+		}
 		if (nfds == -1)
 		{
+			int save_errno = errno;
 			if (errno == EINTR || errno == EAGAIN)
 			{
-				elog(DEBUG2, "select failed on curl_multi_fdset (maxfd %d) (%d - %s)", maxfd, errno, strerror(errno));
+				elog(DEBUG2, "select failed on curl_multi_fdset (maxfd %d) (%d - %s)", maxfd,
+					 save_errno, strerror(save_errno));
 				continue;
 			}
 			elog(ERROR, "internal error: select failed on curl_multi_fdset (maxfd %d) (%d - %s)",
-				 maxfd, errno, strerror(errno));
+				 maxfd, save_errno, strerror(save_errno));
 		}
 		else if (nfds == 0)
 		{
@@ -836,19 +913,18 @@ local_strstr(const char *str1, const char *str2)
 }
 
 /*
- * This function purpose is to make sure that the URL string contains a
- * numerical IP address.  The input URL is in the parameter url. The output
- * result URL is in the output parameter - buf.  When parameter - url already
- * contains a numerical ip, then output parameter - buf will be a copy of url.
- * For this case calling getDnsAddress method inside make_url, will serve the
- * purpose of IP validation.  But when parameter - url will contain a domain
- * name, then the domain name substring will be changed to a numerical ip
- * address in the buf output parameter.
+ * make_url
+ *				Address resolve a URL to contain only IP number
  *
- * Returns the length of the converted URL string, excluding null-terminator.
+ * Resolve the hostname in the URL to an IP number, and return a new URL with
+ * the same scheme and parameters using the resolved IP address. If the passed
+ * url is using an IP number, the return value will be a copy of the input.
+ * The output is a palloced string, it's the callers responsibility to free it
+ * when no longer needed. This function will error out in case a URL cannot be
+ * formed, NULL or an empty string are never returned.
  */
-static int
-make_url(const char *url, char *buf, bool is_ipv6)
+static char *
+make_url(const char *url, bool is_ipv6)
 {
 	char *authority_start = local_strstr(url, "//");
 	char *authority_end;
@@ -857,10 +933,9 @@ make_url(const char *url, char *buf, bool is_ipv6)
 	char hostname[HOST_NAME_SIZE];
 	char *hostip = NULL;
 	char portstr[9];
-	int len;
-	char *p;
 	int port = 80; /* default for http */
 	bool  domain_resolved_to_ipv6 = false;
+	StringInfoData buf;
 
 	if (!authority_start)
 		elog(ERROR, "illegal url '%s'", url);
@@ -891,8 +966,8 @@ make_url(const char *url, char *buf, bool is_ipv6)
 			len = authority_end - hostname_end;
 			if (len > 8)
 				ereport(ERROR,
-						(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-						 errmsg("<port> substring size must not exceed %d characters", 8)));
+						(errcode(ERRCODE_SYNTAX_ERROR),
+						 errmsg("<port> substring size must not exceed 8 characters")));
 
 			memcpy(portstr, hostname_end + 1, len);
 			portstr[len] = '\0';
@@ -916,8 +991,8 @@ make_url(const char *url, char *buf, bool is_ipv6)
 			int len = authority_end - hostname_end;
 			if (len > 8)
 				ereport(ERROR,
-						(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-						 errmsg("<port> substring size must not exceed %d characters", 8)));
+						(errcode(ERRCODE_SYNTAX_ERROR),
+						 errmsg("<port> substring size must not exceed 8 characters")));
 
 			memcpy(portstr, hostname_end + 1, len);
 			portstr[len] = '\0';
@@ -927,7 +1002,7 @@ make_url(const char *url, char *buf, bool is_ipv6)
 
 	if (!port)
 		ereport(ERROR,
-				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				(errcode(ERRCODE_SYNTAX_ERROR),
 				 errmsg("<port> substring must contain only digits")));	
 
 	if (hostname_end - hostname_start >= sizeof(hostname))
@@ -938,8 +1013,13 @@ make_url(const char *url, char *buf, bool is_ipv6)
 
 	hostip = getDnsAddress(hostname, port, ERROR);
 
+	if (hostip == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_CONNECTION_FAILURE),
+				 errmsg("hostname cannot be resolved '%s'", url)));
+
 	/*
-	 * test for the case where the URL originaly contained a domain name
+	 * test for the case where the URL originally contained a domain name
 	 * (so is_ipv6 was set to false) but the DNS resolution in getDnsAddress
 	 * returned an IPv6 address so know we also have to put the square
 	 * brackets [..] in the URL string.
@@ -947,41 +1027,18 @@ make_url(const char *url, char *buf, bool is_ipv6)
 	if (strchr(hostip, ':') != NULL && !is_ipv6)
 		domain_resolved_to_ipv6 = true;
 
-	if (!buf)
-	{
-		int len = strlen(url) - strlen(hostname) + strlen(hostip);
-		if (domain_resolved_to_ipv6)
-			len += 2; /* for the square brackets */
-		return len;
-	}
+	initStringInfo(&buf);
 
-	p = buf;
-	len = hostname_start - url;
-	strncpy(p, url, len);
-	p += len;
-	url += len;
-
-	len = strlen(hostname);
-	url += len;
-
-	len = strlen(hostip);
+	for (int i = 0; i < (hostname_start - url); i++)
+		appendStringInfoChar(&buf, *(url + i));
 	if (domain_resolved_to_ipv6)
-	{
-		*p = '[';
-		p++;
-	}
-	strncpy(p, hostip, len);
-	p += len;
+		appendStringInfoChar(&buf, '[');
+	appendStringInfoString(&buf, hostip);
 	if (domain_resolved_to_ipv6)
-	{
-		*p = ']';
-		p++;
-	}
+		appendStringInfoChar(&buf, ']');
+	appendStringInfoString(&buf, url + (strlen(hostname) + (hostname_start - url)));
 
-	strcpy(p, url);
-	p += strlen(url);
-
-	return p - buf;
+	return buf.data;
 }
 
 /*
@@ -996,7 +1053,7 @@ extract_http_domain(char *i_path, char *o_domain, int dlen)
 	char* p_st = (char*)local_strstr(i_path, "//");
 	p_st = p_st + 2;
 	char* p_en = strchr(p_st, '/');
-	
+
 	domsz = p_en - p_st;
 	cpsz = ( domsz < dlen ) ? domsz : dlen;
 	memcpy(o_domain, p_st, cpsz);
@@ -1007,7 +1064,7 @@ url_has_ipv6_format (char *url)
 {
 	bool is6 = false;
 	char *ipv6 = local_strstr(url, "://[");
-	
+
 	if ( ipv6 )
 		ipv6 = strchr(ipv6, ']');
 	if ( ipv6 )
@@ -1020,27 +1077,28 @@ static int
 is_file_exists(const char* filename)
 {
 	FILE* file;
-    if ((file = fopen(filename, "r")) > 0)
-    {
-        fclose(file);
-        return 1;
-    }
-    return 0;
+	file = fopen(filename, "r");
+	if (file)
+	{
+		fclose(file);
+		return 1;
+	}
+	return 0;
 }
 
 URL_FILE *
 url_curl_fopen(char *url, bool forwrite, extvar_t *ev, CopyState pstate)
 {
 	URL_CURL_FILE *file;
-	int			sz;
 	int         ip_mode;
 	int 		e;
 	bool		is_ipv6 = url_has_ipv6_format(url);
+	char	   *tmp;
 
 	/* Reset curl_Error_Buffer */
 	curl_Error_Buffer[0] = '\0';
 
-	Assert (IS_HTTP_URI(url) || IS_GPFDIST_URI(url) || IS_GPFDISTS_URI(url));
+	Assert(IS_HTTP_URI(url) || IS_GPFDIST_URI(url) || IS_GPFDISTS_URI(url));
 
 	if (!url_curl_resowner_callback_registered)
 	{
@@ -1048,9 +1106,7 @@ url_curl_fopen(char *url, bool forwrite, extvar_t *ev, CopyState pstate)
 		url_curl_resowner_callback_registered = true;
 	}
 
-	sz = make_url(url, NULL, is_ipv6);
-	if (sz < 0)
-		elog(ERROR, "illegal URL: %s", url);
+	tmp = make_url(url, is_ipv6);
 
 	file = (URL_CURL_FILE *) palloc0(sizeof(URL_CURL_FILE));
 	file->common.type = CFTYPE_CURL;
@@ -1058,19 +1114,15 @@ url_curl_fopen(char *url, bool forwrite, extvar_t *ev, CopyState pstate)
 	file->for_write = forwrite;
 	file->curl = create_curlhandle();
 
+	/*
+	 * We need to call is_url_ipv6 for the case where inside make_url
+	 * function a domain name was transformed to an IPv6 address.
+	 */
+	if (!is_ipv6)
+		is_ipv6 = url_has_ipv6_format(tmp);
+
 	if (!IS_GPFDISTS_URI(url))
-	{
-		file->curl_url = (char *) palloc0(sz + 1);
-
-		make_url(file->common.url, file->curl_url, is_ipv6);
-
-		/*
-		 * We need to call is_url_ipv6 for the case where inside make_url function
-		 * a domain name was transformed to an IPv6 address.
-		 */
-		if ( !is_ipv6 )
-			is_ipv6 = url_has_ipv6_format(file->curl_url);
-	}
+		file->curl_url = tmp;
 	else
 	{
 		/*
@@ -1080,18 +1132,10 @@ url_curl_fopen(char *url, bool forwrite, extvar_t *ev, CopyState pstate)
 		 * not resolve the hostname in this case. I have decided
 		 * to not resolve it anyway and let libcurl do the work.
 		 */
-		char* tmp_resolved;
-
 		file->curl_url = pstrdup(file->common.url);
-
-		tmp_resolved = palloc0(sz + 1);
-		make_url(file->common.url, tmp_resolved, is_ipv6);
-			
-		/* keep the same ipv6 logic here */
-		if ( !is_ipv6 )
-			is_ipv6 = url_has_ipv6_format(tmp_resolved);
+		pfree(tmp);
 	}
-		
+
 	if (IS_GPFDIST_URI(file->curl_url) || IS_GPFDISTS_URI(file->curl_url))
 	{
 		/* replace gpfdist:// with http:// or gpfdists:// with https://
@@ -1122,7 +1166,7 @@ url_curl_fopen(char *url, bool forwrite, extvar_t *ev, CopyState pstate)
 	/* 'file' is the application variable that gets passed to write_callback */
 	CURL_EASY_SETOPT(file->curl->handle, CURLOPT_WRITEDATA, file);
 
-	if ( !is_ipv6 )
+	if (!is_ipv6)
 		ip_mode = CURL_IPRESOLVE_V4;
 	else
 		ip_mode = CURL_IPRESOLVE_V6;
@@ -1158,7 +1202,8 @@ url_curl_fopen(char *url, bool forwrite, extvar_t *ev, CopyState pstate)
 	{
 		// TIMEOUT for POST only, GET is single HTTP request,
 		// probablity take long time.
-		CURL_EASY_SETOPT(file->curl->handle, CURLOPT_TIMEOUT, 300L);
+		elog(LOG, "gpfdist_retry_timeout = %d", gpfdist_retry_timeout);
+		CURL_EASY_SETOPT(file->curl->handle, CURLOPT_TIMEOUT, (long)gpfdist_retry_timeout);
 
 		/*init sequence number*/
 		file->seq_number = 1;
@@ -1206,7 +1251,7 @@ url_curl_fopen(char *url, bool forwrite, extvar_t *ev, CopyState pstate)
 	 */
 	if (IS_GPFDISTS_URI(url))
 	{
-		Insist(PointerIsValid(DataDir));
+		Assert(PointerIsValid(DataDir));
 		elog(LOG,"trying to load certificates from %s", DataDir);
 
 		/* curl will save its last error in curlErrorBuffer */
@@ -1223,7 +1268,7 @@ url_curl_fopen(char *url, bool forwrite, extvar_t *ev, CopyState pstate)
 
 			if (!is_file_exists(extssl_cer_full))
 				ereport(ERROR,
-						(errcode(errcode_for_file_access()),
+						(errcode_for_file_access(),
 						 errmsg("could not open certificate file \"%s\": %m",
 								extssl_cer_full)));
 
@@ -1244,7 +1289,7 @@ url_curl_fopen(char *url, bool forwrite, extvar_t *ev, CopyState pstate)
 
 			if (!is_file_exists(extssl_key_full))
 				ereport(ERROR,
-						(errcode(errcode_for_file_access()),
+						(errcode_for_file_access(),
 						 errmsg("could not open private key file \"%s\": %m",
 								extssl_key_full)));
 
@@ -1259,7 +1304,7 @@ url_curl_fopen(char *url, bool forwrite, extvar_t *ev, CopyState pstate)
 
 			if (!is_file_exists(extssl_cas_full))
 				ereport(ERROR,
-						(errcode(errcode_for_file_access()),
+						(errcode_for_file_access(),
 						 errmsg("could not open private key file \"%s\": %m",
 								extssl_cas_full)));
 
@@ -1274,11 +1319,11 @@ url_curl_fopen(char *url, bool forwrite, extvar_t *ev, CopyState pstate)
 		CURL_EASY_SETOPT(file->curl->handle, CURLOPT_SSL_VERIFYHOST,
 				(long)(verify_gpfdists_cert ? extssl_verifyhost : extssl_no_verifyhost));
 
-		/* set ciphersuite */
-		CURL_EASY_SETOPT(file->curl->handle, CURLOPT_SSL_CIPHER_LIST, extssl_cipher);
-
 		/* set protocol */
 		CURL_EASY_SETOPT(file->curl->handle, CURLOPT_SSLVERSION, extssl_protocol);
+
+		/* disable session ID cache */
+		CURL_EASY_SETOPT(file->curl->handle, CURLOPT_SSL_SESSIONID_CACHE, 0);
 
 		/* set debug */
 		if (CURLE_OK != (e = curl_easy_setopt(file->curl->handle, CURLOPT_VERBOSE, (long)extssl_libcurldebug)))
@@ -1312,34 +1357,7 @@ url_curl_fopen(char *url, bool forwrite, extvar_t *ev, CopyState pstate)
 	 */
 	if (!forwrite)
 	{
-		int			response_code;
-		char	   *response_string;
-
-		if (CURLE_OK != (e = curl_multi_add_handle(multi_handle, file->curl->handle)))
-		{
-			if (CURLM_CALL_MULTI_PERFORM != e)
-				elog(ERROR, "internal error: curl_multi_add_handle failed (%d - %s)",
-					 e, curl_easy_strerror(e));
-		}
-		file->curl->in_multi_handle = true;
-
-		while (CURLM_CALL_MULTI_PERFORM ==
-			   (e = curl_multi_perform(multi_handle, &file->still_running)));
-
-		if (e != CURLE_OK)
-			elog(ERROR, "internal error: curl_multi_perform failed (%d - %s)",
-				 e, curl_easy_strerror(e));
-
-		/* read some bytes to make sure the connection is established */
-		fill_buffer(file, 1);
-
-		/* check the connection for GET request */
-		if (check_response(file, &response_code, &response_string))
-			ereport(ERROR,
-					(errcode(ERRCODE_CONNECTION_FAILURE),
-					 errmsg("could not open \"%s\" for reading", file->common.url),
-					 errdetail("Unexpected response from gpfdist server: %d - %s",
-							   response_code, response_string)));
+		gp_perform_backoff_and_check_response(file, multi_perform_work);
 	}
 	else
 	{
@@ -1348,7 +1366,7 @@ url_curl_fopen(char *url, bool forwrite, extvar_t *ev, CopyState pstate)
 		CURL_EASY_SETOPT(file->curl->handle, CURLOPT_POSTFIELDSIZE, 0);
 
 		/* post away and check response, retry if failed (timeout or * connect error) */
-		gp_curl_easy_perform_backoff_and_check_response(file);
+		gp_perform_backoff_and_check_response(file, easy_perform_work);
 		file->seq_number++;
 	}
 
@@ -1489,7 +1507,7 @@ gp_proto1_read(char *buf, int bufsz, URL_CURL_FILE *file, CopyState pstate, char
 		if (n == 0)
 			ereport(ERROR,
 					(errcode(ERRCODE_CONNECTION_FAILURE),
-					 errmsg("gpfdist error: server closed connection.")));
+					 errmsg("gpfdist error: server closed connection")));
 
 		if (n < 5)
 			ereport(ERROR,
@@ -1562,7 +1580,8 @@ gp_proto1_read(char *buf, int bufsz, URL_CURL_FILE *file, CopyState pstate, char
 
 				memcpy(fname, file->in.ptr + file->in.bot, len);
 				fname[len] = 0;
-				snprintf(pstate->cdbsreh->filename, sizeof pstate->cdbsreh->filename,"%s [%s]", pstate->filename, fname);
+				snprintf(pstate->cdbsreh->filename, sizeof pstate->cdbsreh->filename, "%s [%s]",
+						 file->common.url, fname);
 			}
 
 			file->in.bot += len;
@@ -1634,8 +1653,8 @@ gp_proto1_read(char *buf, int bufsz, URL_CURL_FILE *file, CopyState pstate, char
 		if (!file->still_running)
 			ereport(ERROR,
 					(errcode(ERRCODE_CONNECTION_FAILURE),
-					 errmsg("gpfdist server closed connection."),
-					 errhint("This is not a GPDB defect.  \nThe root cause is an overload of the ETL host or "
+					 errmsg("gpfdist server closed connection"),
+					 errhint("The root cause is likely to be an overload of the ETL host or "
 							 "a temporary network glitch between the database and the ETL host "
 							 "causing the connection between the gpfdist and database to disconnect.")));
 	}
@@ -1664,7 +1683,7 @@ gp_proto0_write(URL_CURL_FILE *file, CopyState pstate)
 
 	if (nbytes == 0)
 		return;
-	
+
 	/* post binary data */
 	CURL_EASY_SETOPT(file->curl->handle, CURLOPT_POSTFIELDS, buf);
 
@@ -1677,7 +1696,7 @@ gp_proto0_write(URL_CURL_FILE *file, CopyState pstate)
 
 	replace_httpheader(file, "X-GP-SEQ", seq);
 
-	gp_curl_easy_perform_backoff_and_check_response(file);
+	gp_perform_backoff_and_check_response(file, easy_perform_work);
 	file->seq_number++;
 }
 
@@ -1695,7 +1714,7 @@ gp_proto0_write_done(URL_CURL_FILE *file)
 	CURL_EASY_SETOPT(file->curl->handle, CURLOPT_POSTFIELDSIZE, 0);
 
 	/* post away! */
-	gp_curl_easy_perform_backoff_and_check_response(file);
+	gp_perform_backoff_and_check_response(file, easy_perform_work);
 }
 
 static size_t

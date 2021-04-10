@@ -1,11 +1,12 @@
 from mock import *
-from gp_unittest import *
+from .gp_unittest import *
 from gppylib.operations.package import IsVersionCompatible, ListPackages, MigratePackages, AlreadyInstalledError, \
-    ARCHIVE_PATH, SyncPackages, CleanGppkg
+    ARCHIVE_PATH, SyncPackages, CleanGppkg, linux_distribution_id, linux_distribution_version
 from gppylib.mainUtils import ExceptionNoStackTraceNeeded
 
 import os
 import pickle
+import tempfile
 
 
 class IsVersionCompatibleTestCase(GpTestCase):
@@ -16,7 +17,7 @@ class IsVersionCompatibleTestCase(GpTestCase):
              'postupdate': [],
              'pkgname': 'plperl',
              'description': 'some description.',
-             'postinstall': [{'Master': "some reason to restart database"}],
+             'postinstall': [{'Coordinator': "some reason to restart database"}],
              'postuninstall': [],
              'abspath': 'plperl-ossv5.12.4_pv1.3_gpdb4.3-rhel5-x86_64.gppkg',
              'preinstall': [],
@@ -83,7 +84,7 @@ class ListPackagesTestCase(GpTestCase):
 
     def test__execute_fail_raise_error_with_no_gppkg_postfix(self):
         self.mock_list_files_by_pattern_run.return_value = ['sample']
-        with self.assertRaisesRegexp(Exception, "unable to parse sample as a gppkg"):
+        with self.assertRaisesRegex(Exception, "unable to parse sample as a gppkg"):
             self.subject.execute()
 
 
@@ -94,11 +95,15 @@ class MigratePackagesTestCase(GpTestCase):
             patch('os.makedirs'),
             patch('os.listdir'),
             patch('gppylib.operations.package.InstallPackageLocally'),
+            patch('gppylib.operations.package.InstallDebPackageLocally'),
             patch('gppylib.operations.package.CleanGppkg'),
             patch('gppylib.operations.package.logger', return_value=Mock(spec=['log', 'info', 'debug', 'error'])),
         ])
 
-        self.mock_install_package_locally = self.get_mock_from_apply_patch('InstallPackageLocally')
+        if linux_distribution_id() == 'ubuntu':
+            self.mock_install_package_locally = self.get_mock_from_apply_patch('InstallDebPackageLocally')
+        else:
+            self.mock_install_package_locally = self.get_mock_from_apply_patch('InstallPackageLocally')
         self.mock_listdir = self.get_mock_from_apply_patch('listdir')
         self.mock_logger = self.get_mock_from_apply_patch('logger')
         self.os_path_samefile = self.get_mock_from_apply_patch('samefile')
@@ -115,7 +120,7 @@ class MigratePackagesTestCase(GpTestCase):
         subject = MigratePackages(**self.args)
 
         expected_raise = "The target GPHOME, %s, must match the current \$GPHOME used to launch gppkg." % self.args['to_gphome']
-        with self.assertRaisesRegexp(ExceptionNoStackTraceNeeded, expected_raise):
+        with self.assertRaisesRegex(ExceptionNoStackTraceNeeded, expected_raise):
             subject.execute()
 
     def test__execute_identical_source_target_raises(self):
@@ -123,7 +128,7 @@ class MigratePackagesTestCase(GpTestCase):
         subject = MigratePackages(**self.args)
 
         expected_raise = "The source and target GPHOMEs, %s => %s, must differ for packages to be migrated." % (self.args['from_gphome'], self.args['to_gphome'])
-        with self.assertRaisesRegexp(ExceptionNoStackTraceNeeded, expected_raise):
+        with self.assertRaisesRegex(ExceptionNoStackTraceNeeded, expected_raise):
             subject.execute()
 
     def test__execute_finds_no_packages(self):
@@ -140,7 +145,7 @@ class MigratePackagesTestCase(GpTestCase):
         subject.execute()
 
         log_messages = [args[1][0] for args in self.mock_logger.method_calls]
-        self.assertIn('The following packages will be migrated: %s' % ", ".join(self.mock_listdir.return_value), log_messages)
+        self.assertIn('The following packages will be migrated: %s' % ", ".join(['sample.gppkg', 'sample2.gppkg', 'another-long-one.gppkg']), log_messages)
         self.assertIn('The package migration has completed.', log_messages)
 
     def test__execute_catches_AlreadyInstalledError(self):
@@ -151,7 +156,7 @@ class MigratePackagesTestCase(GpTestCase):
         subject = MigratePackages(**self.args)
         subject.execute()
         log_messages = [args[1][0] for args in self.mock_logger.method_calls]
-        self.assertIn('The following packages will be migrated: %s' % ", ".join(self.mock_listdir.return_value), log_messages)
+        self.assertIn('The following packages will be migrated: %s' % ", ".join(['sample.gppkg', 'sample2.gppkg', 'another-long-one.gppkg']), log_messages)
         self.assertIn('sample.gppkg is already installed.', log_messages)
         self.assertIn('The package migration has completed.', log_messages)
 
@@ -165,9 +170,9 @@ class MigratePackagesTestCase(GpTestCase):
         subject = MigratePackages(**self.args)
         subject.execute()
         log_messages = [args[1][0] for args in self.mock_logger.method_calls]
-        self.assertIn('The following packages will be migrated: %s' % ", ".join(self.mock_listdir.return_value), log_messages)
+        self.assertIn('The following packages will be migrated: %s' % ", ".join(['sample.gppkg', 'sample2.gppkg', 'another-long-one.gppkg']), log_messages)
         self.assertIn('Failed to migrate %s from %s' % (os.path.join(self.args['from_gphome'], ARCHIVE_PATH),
-                                                        self.mock_listdir.return_value[1]), log_messages)
+                                                        'sample2.gppkg'), log_messages)
         self.assertIn('The package migration has completed.', log_messages)
 
 
@@ -230,7 +235,7 @@ class SyncPackagesTestCase(GpTestCase):
         log_messages = [args[1][0] for args in self.mock_logger.method_calls]
         self.assertNotIn('The packages on %s are consistent.' % hostname, log_messages)
 
-    def test__execute_uninstall_on_segments_when_package_is_missing_on_master(self):
+    def test__execute_uninstall_on_segments_when_package_is_missing_on_coordinator(self):
         self.check_dir_mock.return_value.run.return_value = False
         self.check_remote_dir_mock.return_value.run.return_value = False
         self.make_dir_mock.return_value.run.return_value = None
@@ -245,7 +250,7 @@ class SyncPackagesTestCase(GpTestCase):
         self.assertEqual(self.make_remote_dir_mock.call_count, 1)
 
         log_messages = [args[1][0] for args in self.mock_logger.method_calls]
-        self.assertIn('The following packages will be uninstalled on localhost: zing.gppkg, ga.gppkg', log_messages)
+        self.assertIn('The following packages will be uninstalled on localhost: ga.gppkg, zing.gppkg', log_messages)
         self.assertNotIn('The packages on %s are consistent.' % hostname, log_messages)
 
 
@@ -263,8 +268,55 @@ class CleanGppkgTestCase(GpTestCase):
         self.sync_packages_mock.return_value.get_ret.side_effect = [Exception('first failure'), Exception('second failure')]
         subject = CleanGppkg("localhost", ["fiction", "fairytale"])
 
-        with self.assertRaisesRegexp(Exception, "SyncPackages failed:\nfirst failure\nsecond failure"):
+        with self.assertRaisesRegex(Exception, "SyncPackages failed:\nfirst failure\nsecond failure"):
             subject.execute()
+
+class PlatformLinuxDistributionTestCase(GpTestCase):
+
+    def test_linux_distribution_is_ubuntu_18_04(self):
+        with tempfile.NamedTemporaryFile(mode='w+t') as f:
+            #taken from /etc/os-release on an Ubuntu system.
+            f.writelines(['NAME="Ubuntu"\n', 'VERSION="18.04.5 LTS (Bionic Beaver)"\n', 'ID=ubuntu\n',
+                          'ID_LIKE=debian\n', 'PRETTY_NAME="Ubuntu 18.04.5 LTS"\n', 'VERSION_ID="18.04"\n',
+                          'HOME_URL="https://www.ubuntu.com/"\n', 'SUPPORT_URL="https://help.ubuntu.com/"\n',
+                          'BUG_REPORT_URL="https://bugs.launchpad.net/ubuntu/"\n',
+                          'PRIVACY_POLICY_URL="https://www.ubuntu.com/legal/terms-and-policies/privacy-policy"\n',
+                          'VERSION_CODENAME=bionic\n', 'UBUNTU_CODENAME=bionic\n'])
+            f.seek(0)
+
+            self.assertEqual(linux_distribution_id(f.name), 'ubuntu')
+            self.assertEqual(linux_distribution_version(f.name), '18.04')
+
+    def test_linux_distribution_is_ubuntu_20_04(self):
+        with tempfile.NamedTemporaryFile(mode='w+t') as f:
+            #taken from /etc/os-release on an Ubuntu system.
+            f.writelines(['NAME="Ubuntu"\n', 'VERSION="20.04.1 LTS (Focal Fossa)"\n', 'ID=ubuntu\n', 'ID_LIKE=debian\n',
+                          'PRETTY_NAME="Ubuntu 20.04.1 LTS"\n', 'VERSION_ID="20.04"\n',
+                          'HOME_URL="https://www.ubuntu.com/"\n', 'SUPPORT_URL="https://help.ubuntu.com/"\n',
+                          'BUG_REPORT_URL="https://bugs.launchpad.net/ubuntu/"\n',
+                          'PRIVACY_POLICY_URL="https://www.ubuntu.com/legal/terms-and-policies/privacy-policy"\n',
+                          'VERSION_CODENAME=focal\n', 'UBUNTU_CODENAME=focal\n'])
+            f.seek(0)
+
+            self.assertEqual(linux_distribution_id(f.name), 'ubuntu')
+            self.assertEqual(linux_distribution_version(f.name), '20.04')
+
+    def test_linux_distribution_is_centos_8(self):
+        with tempfile.NamedTemporaryFile(mode='w+t') as f:
+            #taken from /etc/os-release on an centos system.
+            f.writelines(['NAME="CentOS Linux"\n', 'VERSION="8"\n', 'ID="centos"\n', 'ID_LIKE="rhel fedora"\n',
+                          'VERSION_ID="8"\n', 'PLATFORM_ID="platform:el8"\n', 'PRETTY_NAME="CentOS Linux 8"\n',
+                          'ANSI_COLOR="0;31"\n', 'CPE_NAME="cpe:/o:centos:centos:8"\n',
+                          'HOME_URL="https://centos.org/"\n', 'BUG_REPORT_URL="https://bugs.centos.org/"\n',
+                          'CENTOS_MANTISBT_PROJECT="CentOS-8"\n', 'CENTOS_MANTISBT_PROJECT_VERSION="8"\n'])
+            f.seek(0)
+
+            self.assertEqual(linux_distribution_id(f.name), 'centos')
+            self.assertEqual(linux_distribution_version(f.name), '8')
+
+    def test_linux_distribuion_unknown_if_os_release_file_empty(self):
+        self.assertEqual(linux_distribution_id('non_existent_file'), 'unknown')
+        self.assertEqual(linux_distribution_version('non_existent_file'), 'unknown')
 
 
 if __name__ == '__main__':

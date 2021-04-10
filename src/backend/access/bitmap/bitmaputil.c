@@ -5,7 +5,7 @@
  *
  * Portions Copyright (c) 2007-2010 Greenplum Inc
  * Portions Copyright (c) 2010-2012 EMC Corporation
- * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
  * Portions Copyright (c) 2006-2008, PostgreSQL Global Development Group
  * 
  *
@@ -16,12 +16,16 @@
  */
 
 #include "postgres.h"
-#include "miscadmin.h"
 
 #include "access/genam.h"
 #include "access/bitmap.h"
+#include "access/bitmap_private.h"
+#include "access/bitmap_xlog.h"
 #include "access/heapam.h"
 #include "access/reloptions.h"
+#include "access/relscan.h"
+#include "miscadmin.h"
+#include "storage/bufmgr.h"
 
 static void _bitmap_findnextword(BMBatchWords* words, uint64 nextReadNo);
 static void _bitmap_resetWord(BMBatchWords *words, uint32 prevStartNo);
@@ -97,10 +101,10 @@ _bitmap_get_metapage_data(Relation rel, Buffer metabuf)
 	if (metapage->bm_version != BITMAP_VERSION)
 	{
 		ereport(ERROR,
-				(0,
-				 errmsg("The disk format for %s is not valid for this version of "
-						"Greenplum Database. Use REINDEX %s to update this index",
-						RelationGetRelationName(rel), RelationGetRelationName(rel))));
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("the disk format for \"%s\" is not valid for this version of Greenplum Database",
+						RelationGetRelationName(rel)),
+				 errhint("Use REINDEX to update this index.")));
 	}
 
 	return metapage;
@@ -255,6 +259,11 @@ _bitmap_findnexttids(BMBatchWords *words, BMIterateResult *result,
 	bool done = false;
 
 	result->nextTidLoc = result->numOfTids = 0;
+
+	_bitmap_catchup_to_next_tid(words, result);
+
+	Assert(words->firstTid == result->nextTid);
+
 	while (words->nwords > 0 && result->numOfTids < maxTids && !done)
 	{
 		uint8 oldScanPos = result->lastScanPos;
@@ -289,7 +298,7 @@ _bitmap_findnexttids(BMBatchWords *words, BMIterateResult *result,
 			{
 				/* explain the fill word */
 				for (bitNo = 0; bitNo < BM_HRL_WORD_SIZE; bitNo++)
-					result->nextTids[result->numOfTids++] = ++result->nextTid;
+					result->nextTids[result->numOfTids++] = result->nextTid++;
 
 				nfillwords--;
 				/* update fill word to reflect expansion */
@@ -324,15 +333,15 @@ _bitmap_findnexttids(BMBatchWords *words, BMIterateResult *result,
 				w = words->cwords[result->lastScanWordNo];
 				result->lastScanPos = _bitmap_find_bitset(w, oldScanPos);
 
-				/* did we fine a bit set in this word? */
+				/* did we find a bit set in this word? */
 				if (result->lastScanPos != 0)
 				{
-					result->nextTid += (result->lastScanPos - oldScanPos);
-					result->nextTids[result->numOfTids++] = result->nextTid;
+					uint64 tid = result->nextTid + result->lastScanPos -1;
+					result->nextTids[result->numOfTids++] = tid;
 				}
 				else
 				{
-					result->nextTid += BM_HRL_WORD_SIZE - oldScanPos;
+					result->nextTid += BM_HRL_WORD_SIZE;
 					/* start scanning a new word */
 					words->nwords--;
 					result->lastScanWordNo++;
@@ -340,6 +349,85 @@ _bitmap_findnexttids(BMBatchWords *words, BMIterateResult *result,
 				}
 				oldScanPos = result->lastScanPos;
 			}
+		}
+	}
+}
+
+/*
+ * _bitmap_catchup_to_next_tid - Catch up to the nextTid we need to check
+ * from last iteration.
+ *
+ * Normally words->firstTid should equal to result->nextTid. But there
+ * are exceptions:
+ * 1: When the concurrent insert causes bitmap items from previous full page
+ * to spill over to current page in the window when we (the read transaction)
+ * had released the lock on the previous page and not locked the current page.
+ * More details see read_words in bitmapsearch.c.
+ * Related to issue: https://github.com/greenplum-db/gpdb/issues/11308
+ * 2. Or when running bitmap heap scan path on bitmap index, since we always
+ * try to read from a table block's start tid. See pull_stream.
+ */
+void
+_bitmap_catchup_to_next_tid(BMBatchWords *words, BMIterateResult *result)
+{
+	if (words->firstTid >= result->nextTid)
+		return;
+
+	/*
+	 * Iterate each word until catch up to the next tid to search.
+	 */
+	for(; result->lastScanWordNo < words->nwords && words->firstTid < result->nextTid;
+		result->lastScanWordNo++)
+	{
+		if (IS_FILL_WORD(words->hwords, result->lastScanWordNo))
+		{
+			BM_HRL_WORD word = words->cwords[result->lastScanWordNo];
+			uint64	fillLength = FILL_LENGTH(word);
+
+			/*
+			 * XXX: weird, why the word marks as compresed but the word is 0?
+			 */
+			if (word == 0)
+			{
+				fillLength = 1;
+				/* Skip all empty bits, this may cause words->firstTid > result->nextTid */
+				words->firstTid = fillLength * BM_HRL_WORD_SIZE;
+				words->nwords--;
+
+				/* reset next tid to skip all empty words */
+				if (words->firstTid > result->nextTid)
+					result->nextTid = words->firstTid;
+				continue;
+			}
+			else
+			{
+				while (fillLength > 0 && words->firstTid < result->nextTid)
+				{
+					/* update fill word to reflect expansion */
+					words->cwords[result->lastScanWordNo]--;
+					words->firstTid += BM_HRL_WORD_SIZE;
+					fillLength--;
+				}
+
+				/* comsume all the fill words, try to fetch next words */
+				if (fillLength == 0)
+				{
+					words->nwords--;
+					continue;
+				}
+
+				/*
+				* Catch up the next tid to search, but there still fill words.
+				* Return current state.
+				*/
+				if (words->firstTid >= result->nextTid)
+					return;
+			}
+		}
+		else
+		{
+			words->firstTid += BM_HRL_WORD_SIZE;
+			words->nwords--;
 		}
 	}
 }
@@ -502,7 +590,7 @@ static uint64
 fast_forward(uint32 nbatches, BMBatchWords **batches, BMBatchWords *result)
 {
 	int i;
-	uint64 min_tid = ~0;
+	uint64 min_fill_len = MAX_FILL_LENGTH;
 	uint64 fast_forward_words = 0;
 
 	Assert(result != NULL);
@@ -510,7 +598,16 @@ fast_forward(uint32 nbatches, BMBatchWords **batches, BMBatchWords *result)
 
 	for (i = 0; i < nbatches; i++)
 	{
-		BM_HRL_WORD word = batches[i]->cwords[batches[i]->startNo];
+		BM_HRL_WORD word;
+
+		/*
+		 * Fast forward the read batch from a rearrage bitmap index page.
+		 * Since words->nwordsread may get set to a new value in read_words().
+		 * See bitmapsearch.c read_words for more details.
+		 */
+		_bitmap_findnextword(batches[i], batches[i]->nextread);
+
+		word = batches[i]->cwords[batches[i]->startNo];
 
 		/* if we find a matching tid in one of the batches, nothing to do */
 		if (CUR_WORD_IS_FILL(batches[i]) && GET_FILL_BIT(word) == 1)
@@ -519,14 +616,13 @@ fast_forward(uint32 nbatches, BMBatchWords **batches, BMBatchWords *result)
 			return batches[0]->nextread;
 		else if (CUR_WORD_IS_FILL(batches[i]) && GET_FILL_BIT(word) == 0)
 		{
-			uint64 batch_tid = batches[i]->firstTid +
-				(FILL_LENGTH(word) * BM_HRL_WORD_SIZE);
+			uint64 fill_len = FILL_LENGTH(word);
 
 			/* adjust down */
-			if (batch_tid < min_tid)
+			if (fill_len < min_fill_len)
 			{
-				min_tid = batch_tid;
-				fast_forward_words = FILL_LENGTH(word);
+				min_fill_len = fill_len;
+				fast_forward_words = fill_len;
 			}
 		}
 	}
@@ -786,7 +882,6 @@ _bitmap_find_bitset(BM_HRL_WORD word, uint8 lastPos)
 void
 _bitmap_begin_iterate(BMBatchWords *words, BMIterateResult *result)
 {
-	result->nextTid = words->firstTid;
 	result->lastScanPos = 0;
 	result->lastScanWordNo = words->startNo;
 	result->numOfTids = 0;
@@ -803,7 +898,6 @@ _bitmap_log_metapage(Relation rel, ForkNumber fork, Page page)
 
 	xl_bm_metapage*		xlMeta;
 	XLogRecPtr			recptr;
-	XLogRecData			rdata[1];
 
 	xlMeta = (xl_bm_metapage *)
 		palloc(MAXALIGN(sizeof(xl_bm_metapage)));
@@ -813,12 +907,10 @@ _bitmap_log_metapage(Relation rel, ForkNumber fork, Page page)
 	xlMeta->bm_lov_indexId = metapage->bm_lov_indexId;
 	xlMeta->bm_lov_lastpage = metapage->bm_lov_lastpage;
 
-	rdata[0].buffer = InvalidBuffer;
-	rdata[0].data = (char*)xlMeta;
-	rdata[0].len = MAXALIGN(sizeof(xl_bm_metapage));
-	rdata[0].next = NULL;
-			
-	recptr = XLogInsert(RM_BITMAP_ID, XLOG_BITMAP_INSERT_META, rdata);
+	XLogBeginInsert();
+	XLogRegisterData((char*)xlMeta, MAXALIGN(sizeof(xl_bm_metapage)));
+
+	recptr = XLogInsert(RM_BITMAP_ID, XLOG_BITMAP_INSERT_META);
 
 	PageSetLSN(page, recptr);
 	pfree(xlMeta);
@@ -833,7 +925,6 @@ _bitmap_log_bitmap_lastwords(Relation rel, Buffer lovBuffer,
 {
 	xl_bm_bitmap_lastwords	xlLastwords;
 	XLogRecPtr				recptr;
-	XLogRecData				rdata[2];
 
 	xlLastwords.bm_node = rel->rd_node;
 	xlLastwords.bm_last_compword = lovItem->bm_last_compword;
@@ -844,21 +935,20 @@ _bitmap_log_bitmap_lastwords(Relation rel, Buffer lovBuffer,
 	xlLastwords.bm_lov_blkno = BufferGetBlockNumber(lovBuffer);
 	xlLastwords.bm_lov_offset = lovOffset;
 
-	rdata[0].buffer = InvalidBuffer;
-	rdata[0].data = (char*)&xlLastwords;
-	rdata[0].len = sizeof(xl_bm_bitmap_lastwords);
-	rdata[0].next =  &(rdata[1]);
+	XLogBeginInsert();
+	XLogRegisterData((char*)&xlLastwords, sizeof(xl_bm_bitmap_lastwords));
+	XLogRegisterBuffer(0, lovBuffer, REGBUF_STANDARD);
 
-	rdata[1].buffer = lovBuffer;
-	rdata[1].data = NULL;
-	rdata[1].len = 0;
-	rdata[1].buffer_std = true;
-	rdata[1].next = NULL;
-
-	recptr = XLogInsert(RM_BITMAP_ID, XLOG_BITMAP_INSERT_BITMAP_LASTWORDS, 
-						rdata);
+	recptr = XLogInsert(RM_BITMAP_ID, XLOG_BITMAP_INSERT_BITMAP_LASTWORDS);
 
 	PageSetLSN(BufferGetPage(lovBuffer), recptr);
+
+	/*
+	 * WAL consistency checking
+	 */
+#ifdef DUMP_BITMAPAM_INSERT_RECORDS
+	_dump_page("insert", XactLastRecEnd, &rel->rd_node, lovBuffer);
+#endif
 }
 
 /*
@@ -872,7 +962,6 @@ _bitmap_log_lovitem(Relation rel, ForkNumber fork, Buffer lovBuffer, OffsetNumbe
 
 	xl_bm_lovitem	xlLovItem;
 	XLogRecPtr		recptr;
-	XLogRecData		rdata[3];
 
 	Assert(BufferGetBlockNumber(lovBuffer) > 0);
 
@@ -883,33 +972,15 @@ _bitmap_log_lovitem(Relation rel, ForkNumber fork, Buffer lovBuffer, OffsetNumbe
 	memcpy(&(xlLovItem.bm_lovItem), lovItem, sizeof(BMLOVItemData));
 	xlLovItem.bm_is_new_lov_blkno = is_new_lov_blkno;
 
-	rdata[0].buffer = InvalidBuffer;
-	rdata[0].data = (char*)&xlLovItem;
-	rdata[0].len = sizeof(xl_bm_lovitem);
-	rdata[0].next = &(rdata[1]);
+	XLogBeginInsert();
+	XLogRegisterData((char*)&xlLovItem, sizeof(xl_bm_lovitem));
+	XLogRegisterBuffer(0, lovBuffer, REGBUF_STANDARD);
 
-	rdata[1].buffer = lovBuffer;
-	rdata[1].data = NULL;
-	rdata[1].len = 0;
-	rdata[1].buffer_std = true;
-
-	if (!is_new_lov_blkno)
-	{
-		rdata[1].next = NULL; 
-	}
-	else
-	{
-		rdata[1].next = &(rdata[2]);
-
-		rdata[2].buffer = metabuf;
-		rdata[2].data = NULL;
-		rdata[2].len = 0;
-		rdata[2].buffer_std = false;
-		rdata[2].next = NULL;
-	}
+	if (is_new_lov_blkno)
+		XLogRegisterBuffer(1, metabuf, 0);
 
 	recptr = XLogInsert(RM_BITMAP_ID, 
-						XLOG_BITMAP_INSERT_LOVITEM, rdata);
+						XLOG_BITMAP_INSERT_LOVITEM);
 
 	if (is_new_lov_blkno)
 	{
@@ -928,86 +999,87 @@ _bitmap_log_lovitem(Relation rel, ForkNumber fork, Buffer lovBuffer, OffsetNumbe
  * _bitmap_log_bitmapwords() -- log new bitmap words to be inserted.
  */
 void
-_bitmap_log_bitmapwords(Relation rel, Buffer bitmapBuffer, Buffer lovBuffer,
-						OffsetNumber lovOffset, BMTIDBuffer* buf,
-						uint64 words_written, uint64 tidnum, BlockNumber nextBlkno,
-						bool isLast, bool isFirst)
+_bitmap_log_bitmapwords(Relation rel,
+						BMTIDBuffer *buf,
+						bool init_first_page, List *xl_bm_bitmapword_pages, List *bitmapBuffers,
+						Buffer lovBuffer, OffsetNumber lovOffset, uint64 tidnum)
 {
-	Page				bitmapPage;
-	BMBitmapOpaque		bitmapPageOpaque;
-	xl_bm_bitmapwords  *xlBitmapWords;
-	XLogRecPtr			recptr;
-	XLogRecData			rdata[2];
-	uint64*				lastTids;
-	BM_HRL_WORD*		cwords;
-	BM_HRL_WORD*		hwords;
-	int					lastTids_size;
-	int					cwords_size;
-	int					hwords_size;
-	Page lovPage = BufferGetPage(lovBuffer);
+	XLogRecPtr	recptr;
+	int			rdata_no = 0;
+	Page		lovPage = BufferGetPage(lovBuffer);
+	xl_bm_bitmapwords xlBitmapWords;
+	ListCell   *lcp;
+	ListCell   *lcb;
+	bool		init_page;
+	int			num_bm_pages = list_length(xl_bm_bitmapword_pages);
 
-	lastTids_size = buf->curword * sizeof(uint64);
-	cwords_size = buf->curword * sizeof(BM_HRL_WORD);
-	hwords_size = (BM_CALC_H_WORDS(buf->curword)) *
-		sizeof(BM_HRL_WORD);
+	Assert(list_length(bitmapBuffers) == num_bm_pages);
+	if (num_bm_pages > MAX_BITMAP_PAGES_PER_INSERT)
+		elog(ERROR, "too many bitmap pages in one insert batch");
 
-	bitmapPage = BufferGetPage(bitmapBuffer);
-	bitmapPageOpaque =
-		(BMBitmapOpaque)PageGetSpecialPointer(bitmapPage);
+	MemSet(&xlBitmapWords, 0, sizeof(xlBitmapWords));
 
-	xlBitmapWords = (xl_bm_bitmapwords *)
-		palloc0(MAXALIGN(sizeof(xl_bm_bitmapwords)) + MAXALIGN(lastTids_size) +
-				MAXALIGN(cwords_size) + MAXALIGN(hwords_size));
+	xlBitmapWords.bm_node = rel->rd_node;
+	xlBitmapWords.bm_num_pages = list_length(xl_bm_bitmapword_pages);
+	xlBitmapWords.bm_init_first_page = init_first_page;
 
-	xlBitmapWords->bm_node = rel->rd_node;
-	xlBitmapWords->bm_blkno = BufferGetBlockNumber(bitmapBuffer);
-	xlBitmapWords->bm_next_blkno = nextBlkno;
-	xlBitmapWords->bm_last_tid = bitmapPageOpaque->bm_last_tid_location;
-	xlBitmapWords->bm_lov_blkno = BufferGetBlockNumber(lovBuffer);
-	xlBitmapWords->bm_lov_offset = lovOffset;
-	xlBitmapWords->bm_last_compword = buf->last_compword;
-	xlBitmapWords->bm_last_word = buf->last_word;
-	xlBitmapWords->lov_words_header =
+	xlBitmapWords.bm_lov_blkno = BufferGetBlockNumber(lovBuffer);
+	xlBitmapWords.bm_lov_offset = lovOffset;
+	xlBitmapWords.bm_last_compword = buf->last_compword;
+	xlBitmapWords.bm_last_word = buf->last_word;
+	xlBitmapWords.lov_words_header =
 		(buf->is_last_compword_fill) ? 2 : 0;
-	xlBitmapWords->bm_last_setbit = tidnum;
-	xlBitmapWords->bm_is_last = isLast;
-	xlBitmapWords->bm_is_first = isFirst;
+	xlBitmapWords.bm_last_setbit = tidnum;
 
-	xlBitmapWords->bm_start_wordno = buf->start_wordno;
-	xlBitmapWords->bm_words_written = words_written;
-	xlBitmapWords->bm_num_cwords = buf->curword;
-	lastTids = (uint64*)(((char*)xlBitmapWords) +
-						 MAXALIGN(sizeof(xl_bm_bitmapwords)));
-	memcpy(lastTids, buf->last_tids,
-		   buf->curword * sizeof(uint64));
+	XLogBeginInsert();
+	XLogRegisterData((char *) &xlBitmapWords, sizeof(xl_bm_bitmapwords));
+	XLogRegisterBuffer(0, lovBuffer, REGBUF_STANDARD);
 
-	cwords = (BM_HRL_WORD*)(((char*)xlBitmapWords) +
-							MAXALIGN(sizeof(xl_bm_bitmapwords)) + MAXALIGN(lastTids_size));
-	memcpy(cwords, buf->cwords, cwords_size);
-	hwords = (BM_HRL_WORD*)(((char*)xlBitmapWords) +
-						 MAXALIGN(sizeof(xl_bm_bitmapwords)) + MAXALIGN(lastTids_size) +
-						 MAXALIGN(cwords_size));
-	memcpy(hwords, buf->hwords, hwords_size);
+	rdata_no = 1;
 
-	rdata[0].buffer = InvalidBuffer;
-	rdata[0].data = (char*)xlBitmapWords;
-	rdata[0].len = MAXALIGN(sizeof(xl_bm_bitmapwords)) + MAXALIGN(lastTids_size) +
-					MAXALIGN(cwords_size) + MAXALIGN(hwords_size);
-    rdata[0].next =  &(rdata[1]);
+	/* Write per-page structs */
+	init_page = init_first_page;
+	forboth(lcp, xl_bm_bitmapword_pages, lcb, bitmapBuffers)
+	{
+		xl_bm_bitmapwords_perpage *xlBitmapwordsPage = lfirst(lcp);
+		Buffer		bitmapBuffer = lfirst_int(lcb);
+		Page		bitmapPage = BufferGetPage(bitmapBuffer);
+		BMBitmap	bitmap;
 
-    rdata[1].buffer = lovBuffer;
-    rdata[1].data = NULL;
-    rdata[1].len = 0;
-    rdata[1].buffer_std = true;
-    rdata[1].next = NULL;
+		bitmap = (BMBitmap) PageGetContentsMaxAligned(bitmapPage);
 
-	recptr = XLogInsert(RM_BITMAP_ID, XLOG_BITMAP_INSERT_WORDS, rdata);
+		Assert(BufferIsValid(bitmapBuffer));
 
-	PageSetLSN(bitmapPage, recptr);
+		XLogRegisterBuffer(rdata_no, bitmapBuffer, 0);
 
+		XLogRegisterBufData(rdata_no, (char *) xlBitmapwordsPage, sizeof(xl_bm_bitmapwords_perpage));
+		XLogRegisterBufData(rdata_no, (char *) &bitmap->hwords[xlBitmapwordsPage->bmp_start_hword_no],
+							xlBitmapwordsPage->bmp_num_hwords * sizeof(BM_HRL_WORD));
+		XLogRegisterBufData(rdata_no, (char *) &bitmap->cwords[xlBitmapwordsPage->bmp_start_cword_no],
+							xlBitmapwordsPage->bmp_num_cwords * sizeof(BM_HRL_WORD));
+		rdata_no++;
+	}
+
+	recptr = XLogInsert(RM_BITMAP_ID, XLOG_BITMAP_INSERT_WORDS);
+
+	foreach(lcb, bitmapBuffers)
+	{
+		Buffer		bitmapBuffer = lfirst_int(lcb);
+
+		PageSetLSN(BufferGetPage(bitmapBuffer), recptr);
+	}
 	PageSetLSN(lovPage, recptr);
 
-	pfree(xlBitmapWords);
+	/*
+	 * WAL consistency checking
+	 */
+#ifdef DUMP_BITMAPAM_INSERT_RECORDS
+	_dump_page("insert", XactLastRecEnd, &rel->rd_node, lovBuffer);
+	foreach(lcb, bitmapBuffers)
+	{
+		_dump_page("insert", XactLastRecEnd, &rel->rd_node, (Buffer) lfirst_int(lcb));
+	}
+#endif
 }
 
 /*
@@ -1021,7 +1093,6 @@ _bitmap_log_updateword(Relation rel, Buffer bitmapBuffer, int word_no)
 	BMBitmap			bitmap;
 	xl_bm_updateword	xlBitmapWord;
 	XLogRecPtr			recptr;
-	XLogRecData			rdata[2];
 
 	bitmapPage = BufferGetPage(bitmapBuffer);
 	bitmap = (BMBitmap) PageGetContentsMaxAligned(bitmapPage);
@@ -1037,18 +1108,11 @@ _bitmap_log_updateword(Relation rel, Buffer bitmapBuffer, int word_no)
 		 xlBitmapWord.bm_word_no, xlBitmapWord.bm_cword,
 		 xlBitmapWord.bm_hword);
 
-	rdata[0].buffer = InvalidBuffer;
-	rdata[0].data = (char*)&xlBitmapWord;
-	rdata[0].len = sizeof(xl_bm_updateword);
-	rdata[0].next =  &(rdata[1]);
+	XLogBeginInsert();
+	XLogRegisterData((char*)&xlBitmapWord, sizeof(xl_bm_updateword));
+	XLogRegisterBuffer(0, bitmapBuffer, REGBUF_STANDARD);
 
-	rdata[1].buffer = bitmapBuffer;
-	rdata[1].data = NULL;
-	rdata[1].len = 0;
-	rdata[1].buffer_std = true;
-	rdata[1].next = NULL;
-
-	recptr = XLogInsert(RM_BITMAP_ID, XLOG_BITMAP_UPDATEWORD, rdata);
+	recptr = XLogInsert(RM_BITMAP_ID, XLOG_BITMAP_UPDATEWORD);
 
 	PageSetLSN(bitmapPage, recptr);
 }
@@ -1076,8 +1140,6 @@ _bitmap_log_updatewords(Relation rel,
 
 	xl_bm_updatewords	xlBitmapWords;
 	XLogRecPtr			recptr;
-	XLogRecData			rdata[4];
-
 
 	firstPage = BufferGetPage(firstBuffer);
 	firstBitmap = (BMBitmap) PageGetContentsMaxAligned(firstPage);
@@ -1121,52 +1183,22 @@ _bitmap_log_updatewords(Relation rel,
 	xlBitmapWords.bm_lov_offset = lovOffset;
 	xlBitmapWords.bm_new_lastpage = new_lastpage;
 
-	rdata[0].buffer = InvalidBuffer;
-	rdata[0].data = (char*)&xlBitmapWords;
-	rdata[0].len = sizeof(xl_bm_updatewords);
-	rdata[0].next =  &(rdata[1]);
+	XLogBeginInsert();
+	XLogRegisterData((char*)&xlBitmapWords, sizeof(xl_bm_updatewords));
+	XLogRegisterBuffer(0, firstBuffer, REGBUF_STANDARD);
 
-	rdata[1].buffer = firstBuffer;
-	rdata[1].data = NULL;
-	rdata[1].len = 0;
-	rdata[1].buffer_std = true;
-	if (!BufferIsValid(secondBuffer))
-	{
-		rdata[1].next = NULL;
-	}
-	else
-	{
-		rdata[1].next =  &(rdata[2]);
-		rdata[2].buffer = secondBuffer;
-		rdata[2].data = NULL;
-		rdata[2].len = 0;
-		rdata[2].buffer_std = true;
-		rdata[2].next = NULL;
-	}
+	if (BufferIsValid(secondBuffer))
+		XLogRegisterBuffer(1, secondBuffer, REGBUF_STANDARD);
 
 	if (new_lastpage)
 	{
 		if (!BufferIsValid(secondBuffer))
-		{
-			rdata[1].next =  &(rdata[2]);
-			rdata[2].buffer = lovBuffer;
-			rdata[2].data = NULL;
-			rdata[2].len = 0;
-			rdata[2].buffer_std = true;
-			rdata[2].next = NULL;
-		}
+			XLogRegisterBuffer(1, lovBuffer, REGBUF_STANDARD);
 		else
-		{
-			rdata[2].next =  &(rdata[3]);
-			rdata[3].buffer = lovBuffer;
-			rdata[3].data = NULL;
-			rdata[3].len = 0;
-			rdata[3].buffer_std = true;
-			rdata[3].next = NULL;
-		}
+			XLogRegisterBuffer(2, lovBuffer, REGBUF_STANDARD);
 	}
 
-	recptr = XLogInsert(RM_BITMAP_ID, XLOG_BITMAP_UPDATEWORDS, rdata);
+	recptr = XLogInsert(RM_BITMAP_ID, XLOG_BITMAP_UPDATEWORDS);
 
 	PageSetLSN(firstPage, recptr);
 
@@ -1183,16 +1215,92 @@ _bitmap_log_updatewords(Relation rel,
 	}
 }
 
-Datum
-bmoptions(PG_FUNCTION_ARGS)
-{
-	Datum		reloptions = PG_GETARG_DATUM(0);
-	bool		validate = PG_GETARG_BOOL(1);
-	bytea	   *result;
 
-	result = default_reloptions(reloptions, validate,
-								RELOPT_KIND_BITMAP);
-	if (result)
-		PG_RETURN_BYTEA_P(result);
-	PG_RETURN_NULL();
+/*
+ * WAL consistency checking helper.
+ *
+ * This can be used to dump an image of a page to a file, after inserting
+ * or replaying a WAL record. The output is *extremely* voluminous, but
+ * it's a very useful tool for tracking WAL-related bugs. To use, create
+ * a cluster with mirroring enabled. Add _dump_page() calls in the routine
+ * that writes a certain WAL record type, and in the corresponding WAL
+ * replay routine. Run a test workload. This produces a bmdump_* file
+ * in the master and the mirror. Run 'diff' to compare them: if the WAL
+ * replay recreated the same changes that were made on the master, the
+ * files should be identical.
+ */
+#ifdef DUMP_BITMAPAM_INSERT_RECORDS
+#include "cdb/cdbvars.h"
+FILE *dump_file = NULL;
+void
+_dump_page(char *file, XLogRecPtr recptr, RelFileNode *relfilenode, Buffer buf)
+{
+	int			i;
+	unsigned char *p;
+	int			zerossince = 0;
+
+	if (!dump_file)
+	{
+		dump_file = fopen(psprintf("bmdump_%d_%s", GpIdentity.segindex, file), "a");
+		if (!dump_file)
+		{
+			elog(WARNING, "could not open dump file %s", file);
+			return;
+		}
+	}
+
+	fprintf(dump_file, "LSN %X/%08X relfilenode %u/%u/%u blk %u\n",
+			(uint32) (recptr >> 32), (uint32) recptr,
+			relfilenode->spcNode,
+			relfilenode->dbNode,
+			relfilenode->relNode,
+			BufferGetBlockNumber(buf));
+
+	p = (unsigned char *) BufferGetPage(buf);
+	zerossince = 0;
+	for (i = 0; i < BLCKSZ; i+=32)
+	{
+		int			j;
+		bool		allzeros;
+
+		allzeros = true;
+		for (j = 0; j < 32; j++)
+		{
+			if (p[i+j] != 0)
+			{
+				allzeros = false;
+				break;
+			}
+		}
+		if (allzeros)
+			continue;
+
+		if (zerossince < i)
+		{
+			fprintf(dump_file, "LSN %X/%08X %04x-%04x: zeros\n",
+					(uint32) (recptr >> 32), (uint32) recptr,
+					zerossince, i);
+		}
+		fprintf(dump_file,
+				"LSN %X/%08X %04x: "
+				"%02x%02x%02x%02x %02x%02x%02x%02x "
+				"%02x%02x%02x%02x %02x%02x%02x%02x "
+				"%02x%02x%02x%02x %02x%02x%02x%02x "
+				"%02x%02x%02x%02x %02x%02x%02x%02x\n",
+				(uint32) (recptr >> 32), (uint32) recptr, i,
+				p[i+ 0], p[i+ 1], p[i+ 2], p[i+ 3], p[i+ 4], p[i+ 5], p[i+ 6], p[i+ 7],
+				p[i+ 8], p[i+ 9], p[i+10], p[i+11], p[i+12], p[i+13], p[i+14], p[i+15],
+				p[i+16], p[i+17], p[i+18], p[i+19], p[i+20], p[i+21], p[i+22], p[i+23],
+				p[i+24], p[i+25], p[i+26], p[i+27], p[i+28], p[i+29], p[i+30], p[i+31]);
+		zerossince = i+32;
+	}
+	if (zerossince != BLCKSZ)
+	{
+		fprintf(dump_file, "LSN %X/%08X %02x-%02x: zeros\n",
+				(uint32) (recptr >> 32), (uint32) recptr,
+				zerossince, BLCKSZ);
+	}
+
+	fflush(dump_file);
 }
+#endif

@@ -7,7 +7,7 @@
  *
  * Prototypes for functions in commands/comment.c
  *
- * Copyright (c) 1999-2014, PostgreSQL Global Development Group
+ * Copyright (c) 1999-2019, PostgreSQL Global Development Group
  *
  *-------------------------------------------------------------------------
  */
@@ -15,6 +15,7 @@
 #ifndef COMMENT_H
 #define COMMENT_H
 
+#include "catalog/objectaddress.h"
 #include "nodes/parsenodes.h"
 
 /*------------------------------------------------------------------
@@ -29,16 +30,16 @@
  *------------------------------------------------------------------
  */
 
-extern Oid	CommentObject(CommentStmt *stmt);
+extern ObjectAddress CommentObject(CommentStmt *stmt);
 
 extern void DeleteComments(Oid oid, Oid classoid, int32 subid);
 
-extern void CreateComments(Oid oid, Oid classoid, int32 subid, char *comment);
+extern void CreateComments(Oid oid, Oid classoid, int32 subid, const char *comment);
 
 extern void DeleteSharedComments(Oid oid, Oid classoid);
 
-extern void CreateSharedComments(Oid oid, Oid classoid, char *comment);
+extern void CreateSharedComments(Oid oid, Oid classoid, const char *comment);
 
 extern char *GetComment(Oid oid, Oid classoid, int32 subid);
 
-#endif   /* COMMENT_H */
+#endif							/* COMMENT_H */

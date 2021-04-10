@@ -8,7 +8,7 @@
  *    (pg_aoseg_<reloid>).
  *
  * Portions Copyright (c) 2008-2010, Greenplum Inc.
- * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
  * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
@@ -19,36 +19,38 @@
  */
 #include "postgres.h"
 
+#include "access/table.h"
+#include "access/heapam.h"
 #include "catalog/aoseg.h"
 #include "catalog/pg_opclass.h"
 #include "catalog/aocatalog.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
+#include "utils/syscache.h"
 
 
 void
-AlterTableCreateAoSegTable(Oid relOid, bool is_part_child, bool is_part_parent)
+AlterTableCreateAoSegTable(Oid relOid)
 {
 	TupleDesc	tupdesc;
 	Relation	rel;
 	const char *prefix;
+	Relation	class_rel;
+	HeapTuple	reltup;
 
 	/*
 	 * Grab an exclusive lock on the target table, which we will NOT release
 	 * until end of transaction.  (This is probably redundant in all present
 	 * uses...)
 	 */
-	if (is_part_child)
-		rel = heap_open(relOid, NoLock);
-	else
-		rel = heap_open(relOid, AccessExclusiveLock);
+	rel = table_open(relOid, AccessExclusiveLock);
 
 	if(RelationIsAoRows(rel))
 	{
 		prefix = "pg_aoseg";
 
 		/* this is pretty painful...  need a tuple descriptor */
-		tupdesc = CreateTemplateTupleDesc(8, false);
+		tupdesc = CreateTemplateTupleDesc(8);
 		TupleDescInitEntry(tupdesc, (AttrNumber) 1,
 						"segno",
 						INT4OID,
@@ -116,7 +118,7 @@ AlterTableCreateAoSegTable(Oid relOid, bool is_part_child, bool is_part_parent)
 		 * state (smallint)         -- state of the segment file
 		 */
 
-		tupdesc = CreateTemplateTupleDesc(7, false);
+		tupdesc = CreateTemplateTupleDesc(7);
 
 		TupleDescInitEntry(tupdesc, (AttrNumber) 1,
 						   "segno",
@@ -149,13 +151,39 @@ AlterTableCreateAoSegTable(Oid relOid, bool is_part_child, bool is_part_parent)
 	}
 	else
 	{
-		heap_close(rel, NoLock);
+		table_close(rel, NoLock);
 		return;
 	}
 
 	(void) CreateAOAuxiliaryTable(rel, prefix, RELKIND_AOSEGMENTS,
 								  tupdesc,
-								  NULL, NIL, NULL, NULL, is_part_parent);
+								  NULL, NIL, NULL, NULL);
 
-	heap_close(rel, NoLock);
+	/*
+	 * Store the toast table's OID in the parent relation's pg_class row
+	 */
+	class_rel = table_open(RelationRelationId, RowExclusiveLock);
+
+	reltup = SearchSysCacheCopy(RELOID,
+								ObjectIdGetDatum(relOid),
+								0, 0, 0);
+	if (!HeapTupleIsValid(reltup))
+		elog(ERROR, "cache lookup failed for relation %u", relOid);
+
+	if (!IsBootstrapProcessingMode())
+	{
+		/* normal case, use a transactional update */
+		CatalogTupleUpdate(class_rel, &reltup->t_self, reltup);
+	}
+	else
+	{
+		/* While bootstrapping, we cannot UPDATE, so overwrite in-place */
+		heap_inplace_update(class_rel, reltup);
+	}
+
+	heap_freetuple(reltup);
+
+	table_close(class_rel, RowExclusiveLock);
+
+	table_close(rel, NoLock);
 }

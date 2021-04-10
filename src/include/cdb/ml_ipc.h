@@ -3,7 +3,7 @@
  *	  Motion Layer IPC Layer.
  *
  * Portions Copyright (c) 2005-2008, Greenplum inc
- * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
  *
  *
  * IDENTIFICATION
@@ -117,7 +117,7 @@ extern void SetupInterconnect(struct EState *estate);
  *
  */
 extern void TeardownInterconnect(ChunkTransportState *transportStates,
-								 bool forceEOS, bool hasError);
+								 bool hasErrors);
 
 extern void WaitInterconnectQuit(void);
 
@@ -297,15 +297,12 @@ extern void putTransportDirectBuffer(ChunkTransportState *transportStates,
 
 
 extern ChunkTransportStateEntry *createChunkTransportState(ChunkTransportState *transportStates,
-														   Slice *sendSlice,
-														   Slice *recvSlice,
-														   int numPrimaryConns);
+														   ExecSlice *sendSlice,
+														   ExecSlice *recvSlice,
+														   int numConns);
 
 extern ChunkTransportStateEntry *removeChunkTransportState(ChunkTransportState *transportStates,
 														   int16 motNodeID);
-
-extern void forceEosToPeers(ChunkTransportState    *transportStates,
-							int                     motNodeID);
 
 extern TupleChunkListItem RecvTupleChunk(MotionConn *conn, ChunkTransportState *transportStates);
 
@@ -318,11 +315,12 @@ extern void WaitInterconnectQuitUDPIFC(void);
 extern void SetupTCPInterconnect(EState *estate);
 extern void SetupUDPIFCInterconnect(EState *estate);
 extern void TeardownTCPInterconnect(ChunkTransportState *transportStates,
-								 bool forceEOS, bool hasError);
+									bool hasErrors);
 extern void TeardownUDPIFCInterconnect(ChunkTransportState *transportStates,
-								 bool forceEOS);
+								 bool hasErrors);
 
 extern uint32 getActiveMotionConns(void);
-extern void adjustMasterRouting(Slice *recvSlice);
+
+extern char *format_sockaddr(struct sockaddr_storage *sa, char *buf, size_t len);
 
 #endif   /* ML_IPC_H */

@@ -69,15 +69,16 @@ FROM (SELECT count(*) c, gp_segment_id FROM facts GROUP BY 2) AS a;</codeblock>
               of 0.1 indicates  10% skew, a value of 0.5 indicates 50% skew, and so on. Tables that
               have more than10% skew should have their distribution policies evaluated.</li>
           </ul></p>
-          <section>
-            <title>Considerations for Randomly Distributed Tables</title>
-            <p>When you create a table with random distribution (<codeph>DISTRIBUTED RANDOMLY</codeph>),
-              Greenplum Database distributes the data you insert or copy into the table in a
-              round-robin fashion. Greenplum Database starts a new instance of a round-robin
-              cycle for each insert or copy operation. As such, single tuple inserts into a
-              randomly distributed table are assigned to the first segment and will result
-              in data skew. Greenplum Database more evenly distributes data from bulk inserts.</p>
-          </section>
+      <section id="section_unk_dpf_kgb">
+        <title>Considerations for Replicated Tables</title>
+        <p>When you create a replicated table (with the <codeph>CREATE TABLE</codeph> clause
+            <codeph>DISTRIBUTED REPLICATED</codeph>), Greenplum Database distributes every table row
+          to every segment instance. Replicated table data is evenly distributed because every
+          segment has the same rows. A query that uses the <codeph>gp_segment_id</codeph> system
+          column on a replicated table to verify evenly distributed data, will fail because
+          Greenplum Database does not allow queries to reference replicated tables' system
+          columns.</p>
+      </section>
         </body>
       </topic>
       <topic id="topic3">
@@ -104,7 +105,6 @@ FROM (SELECT count(*) c, gp_segment_id FROM facts GROUP BY 2) AS a;</codeblock>
      1 | template1
  10898 | template0
  38817 | pws
- 39682 | gpperfmon
 (6 rows)
 </codeblock></p></li>
           <li>Run a <codeph>gpssh</codeph> command to check file sizes across all of the segment
@@ -179,7 +179,7 @@ gpadmin  15673 27471 28 12:05 ?        00:12:59 postgres: port 40003, sbaskin bd
         172.28.12.250(21813) con699238 seg45 cmd32 slice10 MPPEXEC SELECT
 root     29622 29566  0 12:50 pts/16   00:00:00 grep 15673</codeblock>
           </li>
-          <li>On the master, check the <codeph>pg_log</codeph> log file for the user in the previous
+          <li>On the master, check the <codeph>log</codeph> log file for the user in the previous
             command (<codeph>sbaskin</codeph>), connection (<codeph>con699238</codeph>, and command
               (<codeph>cmd32</codeph>). The line in the log file with these three values
               <i>should</i> be the line that contains the query, but occasionally, the command

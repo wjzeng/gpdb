@@ -6,8 +6,8 @@
  *
  *
  * Portions Copyright (c) 2005-2009, Greenplum inc
- * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/executor/execdesc.h
@@ -19,22 +19,56 @@
 
 #include "nodes/execnodes.h"
 #include "tcop/dest.h"
-#include "gpmon/gpmon.h"
 
 struct CdbExplain_ShowStatCtx;  /* private, in "cdb/cdbexplain.c" */
 
 
-/* GangType enumeration is used in several structures related to CDB
- * slice plan support.
+/*
+ * SerializedParams is used to serialize external query parameters
+ * (PARAM_EXTERN) and executor parameters (PARAM_EXEC), when dispatching
+ * a query from QD to QEs.
  */
-typedef enum GangType
+typedef struct SerializedParamExternData
 {
-	GANGTYPE_UNALLOCATED,       /* a root slice executed by the qDisp */
-	GANGTYPE_ENTRYDB_READER,    /* a 1-gang with read access to the entry db */
-	GANGTYPE_SINGLETON_READER,	/* a 1-gang to read the segment dbs */
-	GANGTYPE_PRIMARY_READER,    /* a 1-gang or N-gang to read the segment dbs */
-	GANGTYPE_PRIMARY_WRITER		/* the N-gang that can update the segment dbs */
-} GangType;
+	/* Fields from ParamExternData */
+	Datum		value;			/* parameter value */
+	bool		isnull;			/* is it NULL? */
+	uint16		pflags;			/* flag bits, see above */
+	Oid			ptype;			/* parameter's datatype, or 0 */
+
+	/* Extra information about the type */
+	int16		plen;
+	bool		pbyval;
+} SerializedParamExternData;
+
+typedef struct SerializedParamExecData
+{
+	/* Fields from ParamExecData */
+	Datum		value;			/* parameter value */
+	bool		isnull;			/* is it NULL? */
+
+	/* Is this parameter included? */
+	bool		isvalid;
+
+	/* Extra information about the type */
+	int16		plen;
+	bool		pbyval;
+} SerializedParamExecData;
+
+typedef struct SerializedParams
+{
+	NodeTag		type;
+
+	int			nExternParams;
+	SerializedParamExternData *externParams;
+
+	int			nExecParams;
+	SerializedParamExecData *execParams;
+
+	/* Transient record types used in the params */
+	List	   *transientTypes;
+
+} SerializedParams;
 
 /*
  * MPP Plan Slice information
@@ -44,10 +78,8 @@ typedef enum GangType
  * a gang of processes. Some gangs have a worker process on each of several
  * databases, others have a single worker.
  */
-typedef struct Slice
+typedef struct ExecSlice
 {
-	NodeTag		type;
-
 	/*
 	 * The index in the global slice table of this slice. The root slice of
 	 * the main plan is always 0. Slices that have senders at their local
@@ -69,6 +101,12 @@ typedef struct Slice
 	int			parentIndex;
 
 	/*
+	 * nominal # of segments, for hash calculations. Can be different from
+	 * gangSize, if direct dispatch.
+	 */
+	int			planNumSegments;
+
+	/*
 	 * An integer list of indices in the global slice table (origin  0)
 	 * of the child slices of this slice, or -1 if this is a leaf slice.
 	 * A child slice corresponds to a receiving motion in this slice.
@@ -79,18 +117,12 @@ typedef struct Slice
 	GangType	gangType;
 
 	/*
-	 * How many gang members needed?
+	 * A list of segment ids who will execute this slice.
 	 *
 	 * It is set before the process lists below and used to decide how
 	 * to initialize them.
 	 */
-	int			gangSize;
-
-	/*
-	 * directDispatch->isDirectDispatch should ONLY be set for a slice
-	 * when it requires an n-gang.
-	 */
-	DirectDispatchInfo directDispatch;
+	List		*segments;
 
 	struct Gang *primaryGang;
 
@@ -98,40 +130,37 @@ typedef struct Slice
 	 * A list of CDBProcess nodes corresponding to the worker processes
 	 * allocated to implement this plan slice.
 	 *
-	 * The number of processes must agree with the the plan slice to be
+	 * The number of processes must agree with the plan slice to be
 	 * implemented.
 	 */
 	List		*primaryProcesses;
 	/* A bitmap to identify which QE should execute this slice */
 	Bitmapset	*processesMap;
-	/* A list of segment ids who will execute this slice */
-	List		*segments;
-} Slice;
+} ExecSlice;
 
 /*
  * The SliceTable is a list of Slice structures organized into root slices
  * and motion slices as follows:
  *
  * Slice 0 is the root slice of plan as a whole.
- * Slices 1 through nMotion are motion slices with a sending motion at
- *  the root of the slice.
- * Slices nMotion+1 and on are root slices of initPlans.
  *
- * There may be unused slices in case the plan contains subplans that
- * are  not initPlans.  (This won't happen unless MPP decides to support
- * subplans similarly to PostgreSQL, which isn't the current plan.)
+ * The rest root slices of initPlans, or sub-slices of the root slice or one
+ * of the initPlan roots.
  */
 typedef struct SliceTable
 {
 	NodeTag		type;
 
-	int			nMotions;		/* The number Motion nodes in the entire plan */
-	int			nInitPlans;		/* The number of initplan slices allocated */
 	int			localSlice;		/* Index of the slice to execute. */
-	List	   *slices;			/* List of slices */
+	int			numSlices;
+	ExecSlice  *slices;			/* Array of slices, indexed by SliceIndex */
+
+	bool		hasMotions;		/* Are there any Motion nodes anywhere in the plan? */
+
 	int			instrument_options;	/* OR of InstrumentOption flags */
 	uint32		ic_instance_id;
 } SliceTable;
+
 
 /*
  * Holds information about a cursor's current position.
@@ -161,10 +190,17 @@ typedef struct QueryDispatchDesc
 	NodeTag		type;
 
 	/*
+	 * Copies of external query parameters (QueryDesc->params) and current
+	 * executor interal parameters (estate->es_param_exec_vals), in a format
+	 * that's suitable for serialization.
+	 */
+	SerializedParams *paramInfo;
+
+	/*
 	 * For a SELECT INTO statement, this stores the tablespace to use for the
 	 * new table and related auxiliary tables.
 	 */
-	char		*intoTableSpaceName;
+	CreateStmt *intoCreateStmt;
 
 	/*
 	 * Oids to use, for new objects created in a CREATE command.
@@ -212,10 +248,19 @@ typedef struct
 	char	   *objname;		/* object name (e.g. relation name) */
 	Oid			keyOid1;		/* generic OID field, meaning depends on object type */
 	Oid			keyOid2;		/* 2nd generic OID field, meaning depends on object type */
+	Oid			keyOid3;		/* 3rd generic OID field, meaning depends on object type */
+	Oid			keyOid4;		/* 4th generic OID field, meaning depends on object type */
 
 	Oid			oid;			/* OID to assign */
 
 } OidAssignment;
+
+/*
+ * Special value stored in OidAssignment.catalog, when the entry is used to
+ * store the choice of index name for a partitioned index, instead of the
+ * choice of an OID like normally.
+ */
+#define INDEX_NAME_ASSIGNMENT		1
 
 /* ----------------
  *		query descriptor:
@@ -232,23 +277,25 @@ typedef struct QueryDesc
 {
 	/* These fields are provided by CreateQueryDesc */
 	CmdType		operation;		/* CMD_SELECT, CMD_UPDATE, etc. */
-	PlannedStmt *plannedstmt;	/* planner's output, or null if utility */
-	Node	   *utilitystmt;	/* utility statement, or null */
+	PlannedStmt *plannedstmt;	/* planner's output (could be utility, too) */
 	const char *sourceText;		/* source text of the query */
 	Snapshot	snapshot;		/* snapshot to use for query */
 	Snapshot	crosscheck_snapshot;	/* crosscheck for RI update/delete */
 	DestReceiver *dest;			/* the destination for tuple output */
 	ParamListInfo params;		/* param values being passed in */
-	int			instrument_options;		/* OR of InstrumentOption flags */
+	QueryEnvironment *queryEnv; /* query environment passed in */
+	int			instrument_options; /* OR of InstrumentOption flags */
 
 	/* These fields are set by ExecutorStart */
 	TupleDesc	tupDesc;		/* descriptor for result tuples */
 	EState	   *estate;			/* executor's query-wide state */
 	PlanState  *planstate;		/* tree of per-plan-node state */
 
+	/* This field is set by ExecutorRun */
+	bool		already_executed;	/* true if previously executed */
+
 	/* This field is set by ExecutorEnd after collecting cdbdisp results */
 	uint64		es_processed;	/* # of tuples processed */
-	Oid			es_lastoid;		/* oid of row inserted */
 	bool		extended_query;   /* simple or extended query protocol? */
 	char		*portal_name;	/* NULL for unnamed portal */
 
@@ -257,31 +304,20 @@ typedef struct QueryDesc
 	/* CDB: EXPLAIN ANALYZE statistics */
 	struct CdbExplain_ShowStatCtx  *showstatctx;
 
-	/* Gpmon */
-	gpmon_packet_t *gpmon_pkt;
-
 	/* This is always set NULL by the core system, but plugins can change it */
 	struct Instrumentation *totaltime;	/* total time spent in ExecutorRun */
-
-	/* The overall memory consumption account (i.e., outside of an operator) */
-	MemoryAccountIdType memoryAccountId;
 } QueryDesc;
 
 /* in pquery.c */
 extern QueryDesc *CreateQueryDesc(PlannedStmt *plannedstmt,
-				const char *sourceText,
-				Snapshot snapshot,
-				Snapshot crosscheck_snapshot,
-				DestReceiver *dest,
-				ParamListInfo params,
-				int instrument_options);
-
-extern QueryDesc *CreateUtilityQueryDesc(Node *utilitystmt,
-					   const char *sourceText,
-					   Snapshot snapshot,
-					   DestReceiver *dest,
-					   ParamListInfo params);
+								  const char *sourceText,
+								  Snapshot snapshot,
+								  Snapshot crosscheck_snapshot,
+								  DestReceiver *dest,
+								  ParamListInfo params,
+								  QueryEnvironment *queryEnv,
+								  int instrument_options);
 
 extern void FreeQueryDesc(QueryDesc *qdesc);
 
-#endif   /* EXECDESC_H  */
+#endif							/* EXECDESC_H  */

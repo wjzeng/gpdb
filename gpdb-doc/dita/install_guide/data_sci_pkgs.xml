@@ -1,10 +1,11 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE topic PUBLIC "-//OASIS//DTD DITA Topic//EN" "topic.dtd">
 <topic id="topic_dscipkg">
-  <title>Installing the Data Science Packages</title>
+  <title>Installing Optional Extensions</title>
   <titlealts>
     <!--HTML-only page-->
-    <navtitle>Installing the Data Science Packages</navtitle>
+    <navtitle>Installing Optional Extensions</navtitle>
   </titlealts>
-  <shortdesc>Information about installing the Greenplum Database Python and R Data Science Packages.</shortdesc>
+  <shortdesc>Information about installing optional Greenplum Database extensions and packages, such
+    as the Procedural Language extensions and the Python and R Data Science Packages.</shortdesc>
 </topic>

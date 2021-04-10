@@ -2,6 +2,7 @@ set optimizer_print_missing_stats = off;
 --
 -- Cursor regression tests
 --
+
 BEGIN;
 
 DECLARE foo1 SCROLL CURSOR FOR SELECT * FROM tenk1 ORDER BY unique2;
@@ -164,9 +165,9 @@ COMMIT;
 
 FETCH FROM foo25;
 
---FETCH BACKWARD FROM foo25;
+--FETCH BACKWARD FROM foo25; -- backwards scans not supported in GPDB
 
---FETCH ABSOLUTE -1 FROM foo25;
+--FETCH ABSOLUTE -1 FROM foo25; -- backwards scans not supported in GPDB
 
 SELECT name, statement, is_holdable, is_binary, is_scrollable FROM pg_cursors;
 
@@ -207,6 +208,7 @@ ROLLBACK;
 -- in particular we want to see what happens during commit of a holdable
 -- cursor
 --
+
 create temp table tt1(f1 int);
 
 create function count_tt1_v() returns int8 as
@@ -312,17 +314,17 @@ DECLARE c1 CURSOR FOR SELECT f1, f2 FROM uctest;
 FETCH c1;
 UPDATE uctest SET f1 = f1 + 10 WHERE CURRENT OF c1;
 SELECT f1, f2 FROM uctest;
-UPDATE uctest SET f1 = f1 + 10 WHERE CURRENT OF c1; -- currently broken on GPDB! (does nothing)
+UPDATE uctest SET f1 = f1 + 10 WHERE CURRENT OF c1;
 SELECT f1, f2 FROM uctest;
 -- insensitive cursor should not show effects of updates or deletes
---FETCH RELATIVE 0 FROM c1;
-DELETE FROM uctest WHERE CURRENT OF c1; -- currently broken on GPDB! (does nothing)
+--FETCH RELATIVE 0 FROM c1; -- backwards scans not supported in GPDB
+DELETE FROM uctest WHERE CURRENT OF c1;
 SELECT f1, f2 FROM uctest;
 DELETE FROM uctest WHERE CURRENT OF c1; -- no-op
 SELECT f1, f2 FROM uctest;
 UPDATE uctest SET f1 = f1 + 10 WHERE CURRENT OF c1; -- no-op
 SELECT f1, f2 FROM uctest;
---FETCH RELATIVE 0 FROM c1;
+--FETCH RELATIVE 0 FROM c1; -- backwards scans not supported in GPDB
 ROLLBACK;
 SELECT f1, f2 FROM uctest;
 
@@ -331,9 +333,9 @@ DECLARE c1 CURSOR FOR SELECT f1, f2 FROM uctest FOR UPDATE;
 FETCH c1;
 UPDATE uctest SET f1 = f1 + 10 WHERE CURRENT OF c1;
 SELECT f1, f2 FROM uctest;
-UPDATE uctest SET f1 = f1 + 10 WHERE CURRENT OF c1; -- currently broken on GPDB! (does nothing)
+UPDATE uctest SET f1 = f1 + 10 WHERE CURRENT OF c1;
 SELECT f1, f2 FROM uctest;
-DELETE FROM uctest WHERE CURRENT OF c1; -- currently broken on GPDB! (does nothing)
+DELETE FROM uctest WHERE CURRENT OF c1;
 SELECT f1, f2 FROM uctest;
 DELETE FROM uctest WHERE CURRENT OF c1; -- no-op
 SELECT f1, f2 FROM uctest;
@@ -425,6 +427,43 @@ DECLARE c1 CURSOR FOR SELECT * FROM LOWER('TEST');
 FETCH ALL FROM c1;
 COMMIT;
 
+-- Check WHERE CURRENT OF with an index-only scan
+BEGIN;
+EXPLAIN (costs off)
+DECLARE c1 CURSOR FOR SELECT stringu1 FROM onek WHERE stringu1 = 'DZAAAA';
+DECLARE c1 CURSOR FOR SELECT stringu1 FROM onek WHERE stringu1 = 'DZAAAA';
+FETCH FROM c1;
+DELETE FROM onek WHERE CURRENT OF c1;
+SELECT stringu1 FROM onek WHERE stringu1 = 'DZAAAA';
+ROLLBACK;
+
+-- start_ignore
+-- ignore the block, because cursor can only scan forward
+-- Check behavior with rewinding to a previous child scan node,
+-- as per bug #15395
+BEGIN;
+CREATE TABLE current_check (currentid int, payload text);
+CREATE TABLE current_check_1 () INHERITS (current_check);
+CREATE TABLE current_check_2 () INHERITS (current_check);
+INSERT INTO current_check_1 SELECT i, 'p' || i FROM generate_series(1,9) i;
+INSERT INTO current_check_2 SELECT i, 'P' || i FROM generate_series(10,19) i;
+
+DECLARE c1 SCROLL CURSOR FOR SELECT * FROM current_check;
+
+-- This tests the fetch-backwards code path
+FETCH ABSOLUTE 12 FROM c1;
+FETCH ABSOLUTE 8 FROM c1;
+DELETE FROM current_check WHERE CURRENT OF c1 RETURNING *;
+
+-- This tests the ExecutorRewind code path
+FETCH ABSOLUTE 13 FROM c1;
+FETCH ABSOLUTE 1 FROM c1;
+DELETE FROM current_check WHERE CURRENT OF c1 RETURNING *;
+
+SELECT * FROM current_check;
+ROLLBACK;
+-- end_ignore
+
 -- Make sure snapshot management works okay, per bug report in
 -- 235395b90909301035v7228ce63q392931f15aa74b31@mail.gmail.com
 
@@ -472,3 +511,43 @@ fetch all from c;
 move backward all in c;
 fetch all from c;
 rollback;
+
+-- Check handling of non-backwards-scan-capable plans with scroll cursors
+begin;
+explain (costs off) declare c1 cursor for select (select 42) as x;
+explain (costs off) declare c1 scroll cursor for select (select 42) as x;
+declare c1 scroll cursor for select (select 42) as x;
+fetch all in c1;
+fetch backward all in c1;
+rollback;
+begin;
+explain (costs off) declare c2 cursor for select generate_series(1,3) as g;
+explain (costs off) declare c2 scroll cursor for select generate_series(1,3) as g;
+declare c2 scroll cursor for select generate_series(1,3) as g;
+fetch all in c2;
+fetch backward all in c2;
+rollback;
+
+-- gpdb: Test executor should return NULL directly during commit for holdable
+-- cursor if previously executor has emitted all tuples. We've seen two issues
+-- below.
+
+-- Assert failure:
+-- DETAIL:  FailedAssertion("!(!((heap)->bh_size == 0) && heap->bh_has_heap_property)", File: "binaryheap.c", Line: 161)
+CREATE TABLE foo1_tbl (a int);
+INSERT INTO foo1_tbl values(2);
+BEGIN;
+DECLARE foo1 CURSOR WITH HOLD FOR SELECT * FROM foo1_tbl ORDER BY a;
+FETCH ALL FROM foo1;
+COMMIT;
+FETCH ALL FROM foo1;
+CLOSE foo1;
+DROP TABLE foo1_tbl;
+
+-- ERROR:  cannot execute squelched plan node of type: 232 (execProcnode.c:887)
+BEGIN;
+DECLARE foo2 CURSOR WITH HOLD FOR SELECT relname, spcname FROM pg_catalog.pg_tablespace t, pg_catalog.pg_class c where c.reltablespace = t.oid AND c.relname = 'foo1_tbl';
+FETCH ALL FROM foo2;
+COMMIT;
+FETCH ALL FROM foo2;
+CLOSE foo2;

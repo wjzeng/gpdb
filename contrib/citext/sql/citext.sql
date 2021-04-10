@@ -4,6 +4,11 @@
 
 CREATE EXTENSION citext;
 
+-- Check whether any of our opclasses fail amvalidate
+SELECT amname, opcname
+FROM pg_opclass opc LEFT JOIN pg_am am ON am.oid = opcmethod
+WHERE opc.oid >= 16384 AND NOT amvalidate(opc.oid);
+
 -- Test the operators and indexing functions
 
 -- Test = and <>.
@@ -72,7 +77,7 @@ SELECT 'B'::citext <= 'a'::varchar AS t;  -- varchar wins.
 SELECT 'a'::citext >  'B'::varchar AS t;  -- varchar wins.
 SELECT 'a'::citext >= 'B'::varchar AS t;  -- varchar wins.
 
--- A couple of longer examlpes to ensure that we don't get any issues with bad
+-- A couple of longer examples to ensure that we don't get any issues with bad
 -- conversions to char[] in the c code. Yes, I did do this.
 
 SELECT 'aardvark'::citext = 'aardvark'::citext AS t;
@@ -84,16 +89,23 @@ SELECT citext_cmp('aardvark'::citext, 'aardVark'::citext) AS zero;
 SELECT citext_cmp('AARDVARK'::citext, 'AARDVARK'::citext) AS zero;
 SELECT citext_cmp('B'::citext, 'a'::citext) > 0 AS true;
 
+-- Check the citext_hash() and citext_hash_extended() function explicitly.
+SELECT v as value, citext_hash(v)::bit(32) as standard,
+       citext_hash_extended(v, 0)::bit(32) as extended0,
+       citext_hash_extended(v, 1)::bit(32) as extended1
+FROM   (VALUES (NULL::citext), ('PostgreSQL'), ('eIpUEtqmY89'), ('AXKEJBTK'),
+       ('muop28x03'), ('yi3nm0d73')) x(v)
+WHERE  citext_hash(v)::bit(32) != citext_hash_extended(v, 0)::bit(32)
+       OR citext_hash(v)::bit(32) = citext_hash_extended(v, 1)::bit(32);
+
 -- Do some tests using a table and index.
 
 CREATE TEMP TABLE try (
-   a text,
-   name citext,
-   UNIQUE (a, name)
-) DISTRIBUTED BY (a);
+   name citext PRIMARY KEY
+);
 
-INSERT INTO try (a, name)
-VALUES ('a', 'a'), ('a','ab'), ('â','â'), ('aba','aba'), ('b','b'), ('ba','ba'), ('bab','bab'), ('AZ','AZ');
+INSERT INTO try (name)
+VALUES ('a'), ('ab'), ('â'), ('aba'), ('b'), ('ba'), ('bab'), ('AZ');
 
 SELECT name, 'a' = name AS eq_a   FROM try WHERE name <> 'â';
 SELECT name, 'a' = name AS t      FROM try where name = 'a';
@@ -102,18 +114,18 @@ SELECT name, 'A' = name AS t      FROM try where name = 'A';
 SELECT name, 'A' = name AS t      FROM try where name = 'A';
 
 -- expected failures on duplicate key
-INSERT INTO try (a,name) VALUES ('a','a');
-INSERT INTO try (a,name) VALUES ('a','A');
-INSERT INTO try (a,name) VALUES ('a','aB');
+INSERT INTO try (name) VALUES ('a');
+INSERT INTO try (name) VALUES ('A');
+INSERT INTO try (name) VALUES ('aB');
 
--- Make sure that citext_smaller() and citext_lager() work properly.
-SELECT citext_smaller( 'aa'::citext, 'ab'::citext ) = 'aa' AS t;
-SELECT citext_smaller( 'AAAA'::citext, 'bbbb'::citext ) = 'AAAA' AS t;
+-- Make sure that citext_smaller() and citext_larger() work properly.
+SELECT citext_smaller( 'ab'::citext, 'ac'::citext ) = 'ab' AS t;
+SELECT citext_smaller( 'ABC'::citext, 'bbbb'::citext ) = 'ABC' AS t;
 SELECT citext_smaller( 'aardvark'::citext, 'Aaba'::citext ) = 'Aaba' AS t;
 SELECT citext_smaller( 'aardvark'::citext, 'AARDVARK'::citext ) = 'AARDVARK' AS t;
 
-SELECT citext_larger( 'aa'::citext, 'ab'::citext ) = 'ab' AS t;
-SELECT citext_larger( 'AAAA'::citext, 'bbbb'::citext ) = 'bbbb' AS t;
+SELECT citext_larger( 'ab'::citext, 'ac'::citext ) = 'ac' AS t;
+SELECT citext_larger( 'ABC'::citext, 'bbbb'::citext ) = 'bbbb' AS t;
 SELECT citext_larger( 'aardvark'::citext, 'Aaba'::citext ) = 'aardvark' AS t;
 
 -- Test aggregate functions and sort ordering
@@ -123,9 +135,8 @@ CREATE TEMP TABLE srt (
 );
 
 INSERT INTO srt (name)
-VALUES ('aardvark'),
-       ('AAA'),
-       ('aba'),
+VALUES ('abb'),
+       ('ABA'),
        ('ABC'),
        ('abd');
 
@@ -133,11 +144,11 @@ CREATE INDEX srt_name ON srt (name);
 
 -- Check the min() and max() aggregates, with and without index.
 set enable_seqscan = off;
-SELECT MIN(name) AS "AAA" FROM srt;
+SELECT MIN(name) AS "ABA" FROM srt;
 SELECT MAX(name) AS abd FROM srt;
 reset enable_seqscan;
 set enable_indexscan = off;
-SELECT MIN(name) AS "AAA" FROM srt;
+SELECT MIN(name) AS "ABA" FROM srt;
 SELECT MAX(name) AS abd FROM srt;
 reset enable_indexscan;
 
@@ -150,11 +161,11 @@ SELECT name FROM srt ORDER BY name;
 reset enable_indexscan;
 
 -- Test assignment casts.
-SELECT LOWER(name) as aaa FROM srt WHERE name = 'AAA'::text;
-SELECT LOWER(name) as aaa FROM srt WHERE name = 'AAA'::varchar;
-SELECT LOWER(name) as aaa FROM srt WHERE name = 'AAA'::bpchar;
-SELECT LOWER(name) as aaa FROM srt WHERE name = 'AAA';
-SELECT LOWER(name) as aaa FROM srt WHERE name = 'AAA'::citext;
+SELECT LOWER(name) as aba FROM srt WHERE name = 'ABA'::text;
+SELECT LOWER(name) as aba FROM srt WHERE name = 'ABA'::varchar;
+SELECT LOWER(name) as aba FROM srt WHERE name = 'ABA'::bpchar;
+SELECT LOWER(name) as aba FROM srt WHERE name = 'ABA';
+SELECT LOWER(name) as aba FROM srt WHERE name = 'ABA'::citext;
 
 -- LIKE should be case-insensitive
 SELECT name FROM srt WHERE name     LIKE '%a%' ORDER BY name;
@@ -595,6 +606,18 @@ SELECT md5( name ) = md5( name::text ) AS t FROM srt;
 SELECT quote_ident( name ) = quote_ident( name::text ) AS t FROM srt;
 SELECT quote_literal( name ) = quote_literal( name::text ) AS t FROM srt;
 
+SELECT regexp_match('foobarbequebaz'::citext, '(bar)(beque)') = ARRAY[ 'bar', 'beque' ] AS t;
+SELECT regexp_match('foobarbequebaz'::citext, '(BAR)(BEQUE)') = ARRAY[ 'bar', 'beque' ] AS t;
+SELECT regexp_match('foobarbequebaz'::citext, '(BAR)(BEQUE)'::citext) = ARRAY[ 'bar', 'beque' ] AS t;
+SELECT regexp_match('foobarbequebaz'::citext, '(BAR)(BEQUE)'::citext, '') = ARRAY[ 'bar', 'beque' ] AS t;
+SELECT regexp_match('foobarbequebaz'::citext, '(BAR)(BEQUE)', '') = ARRAY[ 'bar', 'beque' ] AS t;
+SELECT regexp_match('foobarbequebaz', '(BAR)(BEQUE)'::citext, '') = ARRAY[ 'bar', 'beque' ] AS t;
+SELECT regexp_match('foobarbequebaz'::citext, '(BAR)(BEQUE)'::citext, ''::citext) = ARRAY[ 'bar', 'beque' ] AS t;
+-- c forces case-sensitive
+SELECT regexp_match('foobarbequebaz'::citext, '(BAR)(BEQUE)'::citext, 'c'::citext) = ARRAY[ 'bar', 'beque' ] AS "no result";
+-- g is not allowed
+SELECT regexp_match('foobarbequebazmorebarbequetoo'::citext, '(BAR)(BEQUE)'::citext, 'g') AS "error";
+
 SELECT regexp_matches('foobarbequebaz'::citext, '(bar)(beque)') = ARRAY[ 'bar', 'beque' ] AS t;
 SELECT regexp_matches('foobarbequebaz'::citext, '(BAR)(BEQUE)') = ARRAY[ 'bar', 'beque' ] AS t;
 SELECT regexp_matches('foobarbequebaz'::citext, '(BAR)(BEQUE)'::citext) = ARRAY[ 'bar', 'beque' ] AS t;
@@ -603,7 +626,9 @@ SELECT regexp_matches('foobarbequebaz'::citext, '(BAR)(BEQUE)', '') = ARRAY[ 'ba
 SELECT regexp_matches('foobarbequebaz', '(BAR)(BEQUE)'::citext, '') = ARRAY[ 'bar', 'beque' ] AS t;
 SELECT regexp_matches('foobarbequebaz'::citext, '(BAR)(BEQUE)'::citext, ''::citext) = ARRAY[ 'bar', 'beque' ] AS t;
 -- c forces case-sensitive
-SELECT regexp_matches('foobarbequebaz'::citext, '(BAR)(BEQUE)'::citext, 'c'::citext) = ARRAY[ 'bar', 'beque' ] AS "null";
+SELECT regexp_matches('foobarbequebaz'::citext, '(BAR)(BEQUE)'::citext, 'c'::citext) = ARRAY[ 'bar', 'beque' ] AS "no rows";
+-- g allows multiple output rows
+SELECT regexp_matches('foobarbequebazmorebarbequetoo'::citext, '(BAR)(BEQUE)'::citext, 'g'::citext) AS "two rows";
 
 SELECT regexp_replace('Thomas'::citext, '.[mN]a.',         'M') = 'ThM' AS t;
 SELECT regexp_replace('Thomas'::citext, '.[MN]A.',         'M') = 'ThM' AS t;
@@ -657,12 +682,12 @@ SELECT split_part('abcTdefTghi'::citext, 't', 2) = 'def' AS t;
 SELECT split_part('abcTdefTghi'::citext, 't'::citext, 2) = 'def' AS t;
 SELECT split_part('abcTdefTghi', 't'::citext, 2) = 'def' AS t;
 
-SELECT strpos('high'::citext, 'ig'        ) = 2 AS t;
-SELECT strpos('high',         'ig'::citext) = 2 AS t;
-SELECT strpos('high'::citext, 'ig'::citext) = 2 AS t;
-SELECT strpos('high'::citext, 'IG'        ) = 2 AS t;
-SELECT strpos('high',         'IG'::citext) = 2 AS t;
-SELECT strpos('high'::citext, 'IG'::citext) = 2 AS t;
+SELECT strpos('high'::citext, 'gh'        ) = 3 AS t;
+SELECT strpos('high',         'gh'::citext) = 3 AS t;
+SELECT strpos('high'::citext, 'gh'::citext) = 3 AS t;
+SELECT strpos('high'::citext, 'GH'        ) = 3 AS t;
+SELECT strpos('high',         'GH'::citext) = 3 AS t;
+SELECT strpos('high'::citext, 'GH'::citext) = 3 AS t;
 
 -- to_ascii() does not support UTF-8.
 -- to_hex() takes a numeric argument.
@@ -722,7 +747,8 @@ CREATE TABLE citext_table (
 INSERT INTO citext_table (name)
   VALUES ('one'), ('two'), ('three'), (NULL), (NULL);
 CREATE MATERIALIZED VIEW citext_matview AS
-  SELECT * FROM citext_table;
+  SELECT * FROM citext_table
+DISTRIBUTED BY (id);
 CREATE UNIQUE INDEX citext_matview_id
   ON citext_matview (id);
 SELECT *
@@ -736,3 +762,84 @@ SELECT *
   WHERE t.id IS NULL OR m.id IS NULL;
 REFRESH MATERIALIZED VIEW CONCURRENTLY citext_matview;
 SELECT * FROM citext_matview ORDER BY id;
+
+-- test citext_pattern_cmp() function explicitly.
+SELECT citext_pattern_cmp('aardvark'::citext, 'aardvark'::citext) AS zero;
+SELECT citext_pattern_cmp('aardvark'::citext, 'aardVark'::citext) AS zero;
+SELECT citext_pattern_cmp('AARDVARK'::citext, 'AARDVARK'::citext) AS zero;
+SELECT citext_pattern_cmp('B'::citext, 'a'::citext) > 0 AS true;
+SELECT citext_pattern_cmp('a'::citext, 'B'::citext) < 0 AS true;
+SELECT citext_pattern_cmp('A'::citext, 'b'::citext) < 0 AS true;
+SELECT citext_pattern_cmp('ABCD'::citext, 'abc'::citext) > 0 AS true;
+SELECT citext_pattern_cmp('ABC'::citext, 'abcd'::citext) < 0 AS true;
+
+-- test operator functions
+-- lt
+SELECT citext_pattern_lt('a'::citext, 'b'::citext) AS true;
+SELECT citext_pattern_lt('A'::citext, 'b'::citext) AS true;
+SELECT citext_pattern_lt('a'::citext, 'B'::citext) AS true;
+SELECT citext_pattern_lt('b'::citext, 'a'::citext) AS false;
+SELECT citext_pattern_lt('B'::citext, 'a'::citext) AS false;
+SELECT citext_pattern_lt('b'::citext, 'A'::citext) AS false;
+-- le
+SELECT citext_pattern_le('a'::citext, 'a'::citext) AS true;
+SELECT citext_pattern_le('a'::citext, 'A'::citext) AS true;
+SELECT citext_pattern_le('A'::citext, 'a'::citext) AS true;
+SELECT citext_pattern_le('A'::citext, 'A'::citext) AS true;
+SELECT citext_pattern_le('a'::citext, 'B'::citext) AS true;
+SELECT citext_pattern_le('A'::citext, 'b'::citext) AS true;
+SELECT citext_pattern_le('a'::citext, 'B'::citext) AS true;
+SELECT citext_pattern_le('b'::citext, 'a'::citext) AS false;
+SELECT citext_pattern_le('B'::citext, 'a'::citext) AS false;
+SELECT citext_pattern_le('b'::citext, 'A'::citext) AS false;
+-- gt
+SELECT citext_pattern_gt('a'::citext, 'b'::citext) AS false;
+SELECT citext_pattern_gt('A'::citext, 'b'::citext) AS false;
+SELECT citext_pattern_gt('a'::citext, 'B'::citext) AS false;
+SELECT citext_pattern_gt('b'::citext, 'a'::citext) AS true;
+SELECT citext_pattern_gt('B'::citext, 'a'::citext) AS true;
+SELECT citext_pattern_gt('b'::citext, 'A'::citext) AS true;
+-- ge
+SELECT citext_pattern_ge('a'::citext, 'a'::citext) AS true;
+SELECT citext_pattern_ge('a'::citext, 'A'::citext) AS true;
+SELECT citext_pattern_ge('A'::citext, 'a'::citext) AS true;
+SELECT citext_pattern_ge('A'::citext, 'A'::citext) AS true;
+SELECT citext_pattern_ge('a'::citext, 'B'::citext) AS false;
+SELECT citext_pattern_ge('A'::citext, 'b'::citext) AS false;
+SELECT citext_pattern_ge('a'::citext, 'B'::citext) AS false;
+SELECT citext_pattern_ge('b'::citext, 'a'::citext) AS true;
+SELECT citext_pattern_ge('B'::citext, 'a'::citext) AS true;
+SELECT citext_pattern_ge('b'::citext, 'A'::citext) AS true;
+
+-- Multi-byte tests below are disabled like the sanity tests above.
+-- Uncomment to run them.
+
+-- Test ~<~ and ~<=~
+SELECT 'a'::citext ~<~  'B'::citext AS t;
+SELECT 'b'::citext ~<~  'A'::citext AS f;
+-- SELECT 'à'::citext ~<~  'À'::citext AS f;
+SELECT 'a'::citext ~<=~ 'B'::citext AS t;
+SELECT 'a'::citext ~<=~ 'A'::citext AS t;
+-- SELECT 'à'::citext ~<=~ 'À'::citext AS t;
+
+-- Test ~>~ and ~>=~
+SELECT 'B'::citext ~>~  'a'::citext AS t;
+SELECT 'b'::citext ~>~  'A'::citext AS t;
+-- SELECT 'à'::citext ~>~  'À'::citext AS f;
+SELECT 'B'::citext ~>~  'b'::citext AS f;
+SELECT 'B'::citext ~>=~ 'b'::citext AS t;
+-- SELECT 'à'::citext ~>=~ 'À'::citext AS t;
+
+-- Test implicit casting. citext casts to text, but not vice-versa.
+SELECT 'B'::citext ~<~  'a'::text AS t;  -- text wins.
+SELECT 'B'::citext ~<=~ 'a'::text AS t;  -- text wins.
+
+SELECT 'a'::citext ~>~  'B'::text AS t;  -- text wins.
+SELECT 'a'::citext ~>=~ 'B'::text AS t;  -- text wins.
+
+-- Test implicit casting. citext casts to varchar, but not vice-versa.
+SELECT 'B'::citext ~<~  'a'::varchar AS t;  -- varchar wins.
+SELECT 'B'::citext ~<=~ 'a'::varchar AS t;  -- varchar wins.
+
+SELECT 'a'::citext ~>~  'B'::varchar AS t;  -- varchar wins.
+SELECT 'a'::citext ~>=~ 'B'::varchar AS t;  -- varchar wins.

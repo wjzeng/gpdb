@@ -7,7 +7,7 @@
  * buffers efficiency.
  *        
  * Portions Copyright (c) 2007, greenplum inc
- * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
+ * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
  *
  *
  * IDENTIFICATION
@@ -31,10 +31,13 @@ typedef struct BufferedAppend
 	/*
 	 * Large-write memory level members.
 	 */
-    int32      			 maxBufferLen;
+
+    /* AO block size plus additional space cost of compression algorithm */
+    int32      			 maxBufferWithCompressionOverrrunLen;
+    /* buffer will be flushed to disk when maxLargeWriteLen is reached  */
     int32      			 maxLargeWriteLen;
 
-	uint8                *memory;
+    uint8                *memory;
     int32                memoryLen;
 
     uint8                *largeWriteMemory;
@@ -84,7 +87,7 @@ typedef struct BufferedAppend
  * large write lengths.
  */
 extern int32 BufferedAppendMemoryLen(
-    int32                maxBufferLen,
+    int32                maxBufferWithCompressionOverrrunLen,
     int32                maxLargeWriteLen);
 
 /*
@@ -97,7 +100,7 @@ extern void BufferedAppendInit(
 	BufferedAppend *bufferedAppend,
 	uint8          *memory,
 	int32          memoryLen,
-	int32          maxBufferLen,
+	int32          maxBufferWithCompressionOverrrunLen,
 	int32          maxLargeWriteLen,
 	char           *relationName);
 
@@ -162,7 +165,8 @@ extern void BufferedAppendCancelLastBuffer(
 extern void BufferedAppendFinishBuffer(
     BufferedAppend       *bufferedAppend,
     int32                usedLen,
-    int32				 usedLen_uncompressed);
+    int32				 usedLen_uncompressed,
+    bool 				 needsWAL);
 
 /*
  * Flushes the current file for append.  Caller is responsible for closing
@@ -171,7 +175,8 @@ extern void BufferedAppendFinishBuffer(
 extern void BufferedAppendCompleteFile(
     BufferedAppend	*bufferedAppend,
     int64 			*fileLen,
-    int64 			*fileLen_uncompressed);
+    int64 			*fileLen_uncompressed,
+    bool 			needsWAL);
 
 
 /*

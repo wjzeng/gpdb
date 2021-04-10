@@ -1,3 +1,7 @@
+-- start_matchsubs
+-- m/^LOG.*PartitionSelector/
+-- s/^LOG.*PartitionSelector/PartitionSelector/
+-- end_matchsubs
 -- start_ignore
 DROP DATABASE IF EXISTS incrementalanalyze;
 CREATE DATABASE incrementalanalyze;
@@ -72,7 +76,6 @@ CREATE TABLE foo (
     c53_uuidzarray uuid[],
     c54_tsqueryarray tsquery[],
     c55_jsonarray json[],
-    c56_xmlarray xml[],
     c57_pointarray point[],
     c58_linesegarray lseg[],
     c59_patharray path[],
@@ -109,7 +112,6 @@ CREATE TYPE input_fields AS
     uuidzarray uuid[],
     tsqueryarray tsquery[],
     jsonarray json[],
-    xmlarray xml[],
     pointarray point[],
     linesegarray lseg[],
     patharray path[],
@@ -150,7 +152,6 @@ BEGIN
         ARRAY['11111111-1111-1111-1111-1111111111' || (i % 6) || (i % 6), '11111111-1111-1111-1111-1111111111' || ((i + 1) % 6) || ((i + 1) % 6)]::uuid[],
         ARRAY['foo' || (i % 6) || ' & rat', 'rat' || (i % 6) || ' & foo']::tsquery[],
         ARRAY['{"a": "b"}', '{"c": "d"}']::json[],
-        ARRAY['<a></a>', '<b></b>']::xml[],
         ARRAY[point(i, i + 1), point(i + 2, i + 3)],
         ARRAY[lseg(point(i, i + 1), point(i + 2, i + 3)), lseg(point(i + 4, i + 5), point(i + 6, i + 7))],
         ARRAY[path(polygon(box(point(i + 1, i + 2), point(i + 3, i + 4)))), path(polygon(box(point(i + 1, i + 2), point(i + 3, i + 4))))],
@@ -680,7 +681,11 @@ SET client_min_messages = 'log';
 -- the leaf partitions does not have any stats for it, yet
 ALTER TABLE foo ADD COLUMN c int;
 INSERT INTO foo SELECT i, i%9, i%100 FROM generate_series(1,500)i;
-ANALYZE rootpartition foo;
+-- start_matchsubs
+-- m/gp_acquire_sample_rows([^,]+, [^,]+, .+)/
+-- s/gp_acquire_sample_rows([^,]+, [^,]+, .+)/gp_acquire_sample_rows()/
+-- end_matchsubs
+ANALYZE VERBOSE rootpartition foo;
 -- Testing auto merging root statistics for all columns
 -- where column attnums are differents due to dropped columns
 -- and split partitions.
@@ -779,13 +784,13 @@ CREATE TABLE incr_analyze_test (
     b character varying,
     c date
 )
-WITH (appendonly=true, compresslevel=5, orientation=row, compresstype=zlib) DISTRIBUTED BY (a) PARTITION BY RANGE(c)
+WITH (appendonly=true, orientation=row) DISTRIBUTED BY (a) PARTITION BY RANGE(c)
           (
           START ('2018-01-01'::date) END ('2018-01-02'::date) EVERY ('1 day'::interval) WITH (tablename='incr_analyze_test_1_prt_1', appendonly=true, compresslevel=3, orientation=column, compresstype=ZLIB ),
           START ('2018-01-02'::date) END ('2018-01-03'::date) EVERY ('1 day'::interval) WITH (tablename='incr_analyze_test_1_prt_2', appendonly=true, compresslevel=1, orientation=column, compresstype=RLE_TYPE ),
-          START ('2018-01-03'::date) END ('2018-01-04'::date) EVERY ('1 day'::interval) WITH (tablename='incr_analyze_test_1_prt_3', appendonly=true, compresslevel=1, orientation=column, compresstype=QUICKLZ ),
+          START ('2018-01-03'::date) END ('2018-01-04'::date) EVERY ('1 day'::interval) WITH (tablename='incr_analyze_test_1_prt_3', appendonly=true, compresslevel=1, orientation=column, compresstype=ZLIB ),
           START ('2018-01-04'::date) END ('2018-01-05'::date) EVERY ('1 day'::interval) WITH (tablename='incr_analyze_test_1_prt_4', appendonly=true, compresslevel=1, orientation=row, compresstype=ZLIB ),
-          START ('2018-01-05'::date) END ('2018-01-06'::date) EVERY ('1 day'::interval) WITH (tablename='incr_analyze_test_1_prt_5', appendonly=true, compresslevel=1, orientation=row, compresstype=QUICKLZ ),
+          START ('2018-01-05'::date) END ('2018-01-06'::date) EVERY ('1 day'::interval) WITH (tablename='incr_analyze_test_1_prt_5', appendonly=true, compresslevel=1, orientation=row, compresstype=ZLIB ),
           START ('2018-01-06'::date) END ('2018-01-07'::date) EVERY ('1 day'::interval) WITH (tablename='incr_analyze_test_1_prt_6', appendonly=false)
           );
 
@@ -796,3 +801,54 @@ INSERT INTO incr_analyze_test SELECT s, md5(s::varchar), '2018-01-02' FROM gener
 ANALYZE incr_analyze_test_1_prt_2;
 SELECT tablename, attname, null_frac, n_distinct, most_common_vals, most_common_freqs, histogram_bounds FROM pg_stats WHERE tablename like 'incr_analyze_test%' ORDER BY attname,tablename;
 SELECT relname, relpages, reltuples FROM pg_class WHERE relname LIKE 'incr_analyze_test%' ORDER BY relname;
+-- Test merging of stats if an empty partition contains relpages > 0
+-- Do not collect samples while merging stats
+DROP TABLE IF EXISTS foo;
+CREATE TABLE foo (a int, b int) PARTITION BY RANGE (b) (START (0) END (6) EVERY (3));
+INSERT INTO foo SELECT i,i%3 FROM generate_series(1,10)i;
+ANALYZE foo_1_prt_1;
+ANALYZE foo_1_prt_2;
+SET allow_system_table_mods = on;
+UPDATE pg_class set relpages=3 WHERE relname='foo_1_prt_2';
+RESET allow_system_table_mods;
+analyze verbose rootpartition foo;
+-- ensure relpages is correctly set after analyzing
+analyze foo_1_prt_2;
+select reltuples, relpages from pg_class where relname ='foo_1_prt_2';
+-- Test application of column-wise statistics setting to the number of MCVs and histogram bounds on partitioned table
+DROP TABLE IF EXISTS foo;
+CREATE TABLE foo (a int) PARTITION BY RANGE (a) (START (0) END (10) EVERY (5));
+-- fill foo with even numbers twice as large than odd ones to avoid fully even distribution of 'a' attribute and hence empty MCV/MCF
+INSERT INTO foo SELECT i%10 FROM generate_series(0, 100) i;
+INSERT INTO foo SELECT i%10 FROM generate_series(0, 100) i WHERE i%2 = 0;
+-- default_statistics_target is 4
+ALTER TABLE foo ALTER COLUMN a SET STATISTICS 5;
+ANALYZE foo;
+SELECT array_length(most_common_vals, 1), array_length(most_common_freqs, 1), array_length(histogram_bounds, 1) FROM pg_stats WHERE tablename = 'foo' AND attname = 'a';
+
+-- Make sure a simple heap table does not store HLL values
+CREATE TABLE simple_table_no_hll (a int);
+INSERT INTO simple_table_no_hll SELECT generate_series(1,10);
+ANALYZE simple_table_no_hll;
+SELECT staattnum, stakind1, stakind2, stakind3, stakind4, stakind5,
+       stavalues1, stavalues2, stavalues3, stavalues4, stavalues5
+FROM pg_statistic WHERE starelid = 'simple_table_no_hll'::regclass;
+
+-- Make sure analyze rootpartition option works in an option list
+set optimizer_analyze_root_partition to off;
+DROP TABLE IF EXISTS foo;
+CREATE TABLE foo(a int) PARTITION BY RANGE(a) (start (0) INCLUSIVE END (20) EVERY (10));
+INSERT INTO foo values (5),(15);
+ANALYZE (verbose, rootpartition off) foo;
+
+-- root should not have stats
+SELECT count(*) from pg_statistic where starelid='foo'::regclass;
+
+-- root should have stats
+ANALYZE (verbose, rootpartition on) foo;
+SELECT count(*) from pg_statistic where starelid='foo'::regclass;
+
+-- Make sure analyze hll fullscan option works in an option list
+ANALYZE (verbose, fullscan on) foo;
+ANALYZE (verbose, fullscan off) foo;
+reset optimizer_analyze_root_partition;
