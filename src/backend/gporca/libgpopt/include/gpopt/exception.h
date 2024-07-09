@@ -37,12 +37,13 @@ enum ExMinor
 	ExmiUnsatisfiedRequiredProperties,
 	ExmiEvalUnsupportedScalarExpr,
 	ExmiCTEProducerConsumerMisAligned,
+	ExmiNoStats,
 
 	ExmiSentinel
 };
 
 // message initialization for GPOS exceptions
-gpos::GPOS_RESULT EresExceptionInit(gpos::CMemoryPool *mp);
+void EresExceptionInit(gpos::CMemoryPool *mp);
 
 }  // namespace gpopt
 

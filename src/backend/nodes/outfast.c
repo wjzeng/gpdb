@@ -454,6 +454,7 @@ _outCreateDomainStmt(StringInfo str, CreateDomainStmt *node)
 	WRITE_NODE_TYPE("CREATEDOMAINSTMT");
 	WRITE_NODE_FIELD(domainname);
 	WRITE_NODE_FIELD(typeName);
+	WRITE_NODE_FIELD(collClause);
 	WRITE_NODE_FIELD(constraints);
 }
 
@@ -467,6 +468,14 @@ _outAlterDomainStmt(StringInfo str, AlterDomainStmt *node)
 	WRITE_NODE_FIELD(def);
 	WRITE_ENUM_FIELD(behavior, DropBehavior);
 	WRITE_BOOL_FIELD(missing_ok);
+}
+
+static void
+_outAlterDatabaseStmt(StringInfo str, AlterDatabaseStmt *node)
+{
+	WRITE_NODE_TYPE("ALTERDATABASESTMT");
+	WRITE_STRING_FIELD(dbname);
+	WRITE_NODE_FIELD(options);
 }
 
 static void
@@ -547,6 +556,10 @@ _outAExpr(StringInfo str, A_Expr *node)
 
 			break;
 		case AEXPR_DISTINCT:
+
+			WRITE_NODE_FIELD(name);
+			break;
+		case AEXPR_NOT_DISTINCT:
 
 			WRITE_NODE_FIELD(name);
 			break;
@@ -976,6 +989,9 @@ _outNode(StringInfo str, void *obj)
 			case T_SeqScan:
 				_outSeqScan(str, obj);
 				break;
+			case T_DynamicSeqScan:
+				_outDynamicSeqScan(str, obj);
+				break;
 			case T_SampleScan:
 				_outSampleScan(str, obj);
 				break;
@@ -991,6 +1007,9 @@ _outNode(StringInfo str, void *obj)
 			case T_ForeignScan:
 				_outForeignScan(str, obj);
 				break;
+			case T_DynamicForeignScan:
+				_outDynamicForeignScan(str, obj);
+				break;
 			case T_CustomScan:
 				_outCustomScan(str, obj);
 				break;
@@ -1003,11 +1022,23 @@ _outNode(StringInfo str, void *obj)
 			case T_IndexOnlyScan:
 				_outIndexOnlyScan(str, obj);
 				break;
+			case T_DynamicIndexScan:
+				_outDynamicIndexScan(str, obj);
+				break;
+			case T_DynamicIndexOnlyScan:
+				_outDynamicIndexOnlyScan(str, obj);
+				break;
 			case T_BitmapIndexScan:
 				_outBitmapIndexScan(str, obj);
 				break;
+			case T_DynamicBitmapIndexScan:
+				_outDynamicBitmapIndexScan(str, obj);
+				break;
 			case T_BitmapHeapScan:
 				_outBitmapHeapScan(str, obj);
+				break;
+			case T_DynamicBitmapHeapScan:
+				_outDynamicBitmapHeapScan(str, obj);
 				break;
 			case T_TidScan:
 				_outTidScan(str, obj);
@@ -1464,6 +1495,9 @@ _outNode(StringInfo str, void *obj)
 				break;
 			case T_CreateDomainStmt:
 				_outCreateDomainStmt(str, obj);
+				break;
+			case T_AlterDatabaseStmt:
+				_outAlterDatabaseStmt(str, obj);
 				break;
 			case T_AlterDomainStmt:
 				_outAlterDomainStmt(str, obj);

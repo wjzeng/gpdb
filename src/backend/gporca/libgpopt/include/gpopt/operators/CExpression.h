@@ -32,10 +32,10 @@ namespace gpopt
 {
 // cleanup function for arrays
 class CExpression;
-typedef CDynamicPtrArray<CExpression, CleanupRelease> CExpressionArray;
+using CExpressionArray = CDynamicPtrArray<CExpression, CleanupRelease>;
 
 // array of arrays of expression pointers
-typedef CDynamicPtrArray<CExpressionArray, CleanupRelease> CExpressionArrays;
+using CExpressionArrays = CDynamicPtrArray<CExpressionArray, CleanupRelease>;
 
 class CGroupExpression;
 class CDrvdPropPlan;
@@ -107,11 +107,6 @@ private:
 	void PrintProperties(IOstream &os, CPrintPrefix &pfx) const;
 
 #endif	// GPOS_DEBUG
-
-#if 0
-	// check if the expression satisfies partition enforcer condition
-	BOOL FValidPartEnforcers(CDrvdPropCtxtPlan *pdpctxtplan);
-#endif
 
 	// check if the distributions of all children are compatible
 	BOOL FValidChildrenDistribution(CDrvdPropCtxtPlan *pdpctxtplan);
@@ -256,7 +251,6 @@ public:
 	// compare entire expression rooted here
 	BOOL Matches(CExpression *pexpr) const;
 
-#ifdef GPOS_DEBUG
 	// match against given pattern
 	BOOL FMatchPattern(CExpression *pexpr) const;
 
@@ -269,7 +263,6 @@ public:
 	// debug print; for interactive debugging sessions only
 	// prints expression properties as well
 	void DbgPrintWithProperties() const;
-#endif	// GPOS_DEBUG
 
 	// check if the expression satisfies given required properties
 	BOOL FValidPlan(const CReqdPropPlan *prpp, CDrvdPropCtxtPlan *pdpctxtplan);
@@ -297,7 +290,7 @@ public:
 	CFunctionProp *DeriveFunctionProperties();
 	CFunctionalDependencyArray *DeriveFunctionalDependencies();
 	CPartInfo *DerivePartitionInfo();
-	CTableDescriptor *DeriveTableDescriptor();
+	CTableDescriptorHashSet *DeriveTableDescriptor();
 
 	// Scalar property accessors - derived as needed
 	CColRefSet *DeriveDefinedColumns();
@@ -310,6 +303,9 @@ public:
 	ULONG DeriveTotalDistinctAggs();
 	BOOL DeriveHasMultipleDistinctAggs();
 	BOOL DeriveHasScalarArrayCmp();
+	BOOL DeriveHasScalarFuncProject();
+	BOOL DeriveContainsOnlyReplicationSafeAggFuncs();
+	ULONG DeriveTotalOrderedAggs();
 
 };	// class CExpression
 
@@ -322,16 +318,15 @@ operator<<(IOstream &os, CExpression &expr)
 }
 
 // hash map from ULONG to expression
-typedef CHashMap<ULONG, CExpression, gpos::HashValue<ULONG>,
-				 gpos::Equals<ULONG>, CleanupDelete<ULONG>,
-				 CleanupRelease<CExpression> >
-	UlongToExprMap;
+using UlongToExprMap =
+	CHashMap<ULONG, CExpression, gpos::HashValue<ULONG>, gpos::Equals<ULONG>,
+			 CleanupDelete<ULONG>, CleanupRelease<CExpression>>;
 
 // map iterator
-typedef CHashMapIter<ULONG, CExpression, gpos::HashValue<ULONG>,
-					 gpos::Equals<ULONG>, CleanupDelete<ULONG>,
-					 CleanupRelease<CExpression> >
-	UlongToExprMapIter;
+using UlongToExprMapIter =
+	CHashMapIter<ULONG, CExpression, gpos::HashValue<ULONG>,
+				 gpos::Equals<ULONG>, CleanupDelete<ULONG>,
+				 CleanupRelease<CExpression>>;
 
 }  // namespace gpopt
 

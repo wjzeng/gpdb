@@ -406,6 +406,8 @@ typedef struct ModifyTable
 	Index		exclRelRTI;		/* RTI of the EXCLUDED pseudo relation */
 	List	   *exclRelTlist;	/* tlist of the EXCLUDED pseudo relation */
 	List	   *isSplitUpdates;
+
+	bool		forceTupleRouting; /* dynamic scans require tuple routing */
 } ModifyTable;
 
 struct PartitionPruneInfo;		/* forward reference to struct below */
@@ -601,6 +603,33 @@ typedef struct IndexScan
 	ScanDirection indexorderdir;	/* forward or backward or don't care */
 } IndexScan;
 
+/*
+ * DynamicIndexScan
+ *   Scan a list of indexes that will be determined at run time.
+ *   The primary application of this operator is to be used
+ *   for partition tables.
+*/
+typedef struct DynamicIndexScan
+{
+	/* Fields shared with a normal IndexScan. Must be first! */
+	IndexScan	indexscan;
+
+	/*
+	 * List of partition OIDs to scan.
+	 */
+	List	   *partOids;
+
+	/* Info for run-time subplan pruning; NULL if we're not doing that */
+	struct PartitionPruneInfo *part_prune_info;
+
+	/*
+	 * Info for run-time join pruning, using Partition Selector nodes.
+	 * These param IDs contain additional Bitmapsets containing selected
+	 * partitions.
+	 */
+	List	   *join_prune_paramids;
+} DynamicIndexScan;
+
 /* ----------------
  *		index-only scan node
  *
@@ -608,17 +637,28 @@ typedef struct IndexScan
  * index-only scan, in which the data comes from the index not the heap.
  * Because of this, *all* Vars in the plan node's targetlist, qual, and
  * index expressions reference index columns and have varno = INDEX_VAR.
- * Hence we do not need separate indexqualorig and indexorderbyorig lists,
- * since their contents would be equivalent to indexqual and indexorderby.
+ *
+ * We could almost use indexqual directly against the index's output tuple
+ * when rechecking lossy index operators, but that won't work for quals on
+ * index columns that are not retrievable.  Hence, recheckqual is needed
+ * for rechecks: it expresses the same condition as indexqual, but using
+ * only index columns that are retrievable.  (We will not generate an
+ * index-only scan if this is not possible.  An example is that if an
+ * index has table column "x" in a retrievable index column "ind1", plus
+ * an expression f(x) in a non-retrievable column "ind2", an indexable
+ * query on f(x) will use "ind2" in indexqual and f(ind1) in recheckqual.
+ * Without the "ind1" column, an index-only scan would be disallowed.)
+ *
+ * We don't currently need a recheckable equivalent of indexorderby,
+ * because we don't support lossy operators in index ORDER BY.
  *
  * To help EXPLAIN interpret the index Vars for display, we provide
  * indextlist, which represents the contents of the index as a targetlist
  * with one TLE per index column.  Vars appearing in this list reference
  * the base table, and this is the only field in the plan node that may
- * contain such Vars.
- *
- * GPDB: We need indexqualorig to determine direct dispatch, however there
- * is no need to dispatch it.
+ * contain such Vars.  Also, for the convenience of setrefs.c, TLEs in
+ * indextlist are marked as resjunk if they correspond to columns that
+ * the index AM cannot reconstruct.
  * ----------------
  */
 typedef struct IndexOnlyScan
@@ -626,11 +666,38 @@ typedef struct IndexOnlyScan
 	Scan		scan;
 	Oid			indexid;		/* OID of index to scan */
 	List	   *indexqual;		/* list of index quals (usually OpExprs) */
-	List	   *indexqualorig;	/* the same in original form (GPDB keeps it) */
 	List	   *indexorderby;	/* list of index ORDER BY exprs */
 	List	   *indextlist;		/* TargetEntry list describing index's cols */
 	ScanDirection indexorderdir;	/* forward or backward or don't care */
+	List	   *recheckqual;	/* index quals in recheckable form */
 } IndexOnlyScan;
+
+/*
+ * DynamicIndexOnlyScan
+ *   Scan a list of indexes that will be determined at run time.
+ *   The primary application of this operator is to be used
+ *   for partition tables.
+*/
+typedef struct DynamicIndexOnlyScan
+{
+	/* Fields shared with a normal IndexOnlyScan. Must be first! */
+	IndexOnlyScan	indexscan;
+
+	/*
+	 * List of partition OIDs to scan.
+	 */
+	List	   *partOids;
+
+	/* Info for run-time subplan pruning; NULL if we're not doing that */
+	struct PartitionPruneInfo *part_prune_info;
+
+	/*
+	 * Info for run-time join pruning, using Partition Selector nodes.
+	 * These param IDs contain additional Bitmapsets containing selected
+	 * partitions.
+	 */
+	List	   *join_prune_paramids;
+} DynamicIndexOnlyScan;
 
 /* ----------------
  *		bitmap index scan node
@@ -660,6 +727,17 @@ typedef struct BitmapIndexScan
 	List	   *indexqualorig;	/* the same in original form */
 } BitmapIndexScan;
 
+/*
+ * DynamicBitmapIndexScan
+ *   Scan a list of indexes that will be determined at run time.
+ *   For use with partitioned tables.
+*/
+typedef struct DynamicBitmapIndexScan
+{
+	/* Fields shared with a normal BitmapIndexScan. Must be first! */
+	BitmapIndexScan biscan;
+} DynamicBitmapIndexScan;
+
 /* ----------------
  *		bitmap sequential scan node
  *
@@ -674,6 +752,58 @@ typedef struct BitmapHeapScan
 	Scan		scan;
 	List	   *bitmapqualorig; /* index quals, in standard expr form */
 } BitmapHeapScan;
+
+/*
+ * DynamicBitmapHeapScan
+ *   Scan a list of tables that will be determined at run time.
+ *
+ * Dynamic counterpart of a BitmapHeapScan, for use with partitioned tables.
+ */
+typedef struct DynamicBitmapHeapScan
+{
+	BitmapHeapScan bitmapheapscan;
+
+	/*
+	 * List of partition OIDs to scan.
+	 */
+	List	   *partOids;
+
+	/* Info for run-time subplan pruning; NULL if we're not doing that */
+	struct PartitionPruneInfo *part_prune_info;
+
+	/*
+	 * Info for run-time join pruning, using Partition Selector nodes.
+	 * These param IDs contain additional Bitmapsets containing selected
+	 * partitions.
+	 */
+	List	   *join_prune_paramids;
+} DynamicBitmapHeapScan;
+
+/*
+ * DynamicSeqScan
+ *   Scan a list of tables that will be determined at run time.
+ */
+typedef struct DynamicSeqScan
+{
+	/* Fields shared with a normal SeqScan. Must be first! */
+	SeqScan		seqscan;
+
+	/*
+	 * List of partition OIDs to scan.
+	 */
+	List	   *partOids;
+
+	/* Info for run-time subplan pruning; NULL if we're not doing that */
+	struct PartitionPruneInfo *part_prune_info;
+
+	/*
+	 * Info for run-time join pruning, using Partition Selector nodes.
+	 * These param IDs contain additional Bitmapsets containing selected
+	 * partitions.
+	 */
+	List	   *join_prune_paramids;
+
+} DynamicSeqScan;
 
 /* ----------------
  *		tid scan node
@@ -806,15 +936,15 @@ typedef struct WorkTableScan
 typedef struct ExternalScanInfo
 {
 	NodeTag		type;
-	List		*uriList;       /* data uri or null for each segment  */
-	char		fmtType;        /* data format type                   */
-	bool		isMasterOnly;   /* true for EXECUTE on master seg only */
-	int			rejLimit;       /* reject limit (-1 for no sreh)      */
-	bool		rejLimitInRows; /* true if ROWS false if PERCENT      */
-	char		logErrors;      /* 't', 'p' to log errors into file. 'p' makes persistent error log */
-	int			encoding;		/* encoding of external table data    */
-	uint32      scancounter;	/* counter incr per scan node created */
-	List	   *extOptions;		/* external options */
+	List		*uriList;            /* data uri or null for each segment  */
+	char		fmtType;             /* data format type                   */
+	bool		isCoordinatorOnly;   /* true for EXECUTE on coordinator seg only */
+	int			rejLimit;            /* reject limit (-1 for no sreh)      */
+	bool		rejLimitInRows;      /* true if ROWS false if PERCENT      */
+	char		logErrors;           /* 't', 'p' to log errors into file. 'p' makes persistent error log */
+	int			encoding;		     /* encoding of external table data    */
+	uint32      scancounter;	     /* counter incr per scan node created */
+	List	   *extOptions;		     /* external options */
 } ExternalScanInfo;
 
 /* ----------------
@@ -862,6 +992,33 @@ typedef struct ForeignScan
 	bool		fsSystemCol;	/* true if any "system column" is needed */
 } ForeignScan;
 
+/*
+ * DynamicForeignScan
+ *   Scan a list of tables that will be determined at run time.
+ */
+typedef struct DynamicForeignScan
+{
+	/* Fields shared with a normal ForeignScan. Must be first! */
+	ForeignScan		foreignscan;
+
+	/*
+	 * List of partition OIDs to scan.
+	 */
+	List	   *partOids;
+
+	/* Info for run-time subplan pruning; NULL if we're not doing that */
+	struct PartitionPruneInfo *part_prune_info;
+
+	/*
+	 * Info for run-time join pruning, using Partition Selector nodes.
+	 * These param IDs contain additional Bitmapsets containing selected
+	 * partitions.
+	 */
+	List	   *join_prune_paramids;
+
+	/* list of fdw_privates for each partition's foreign scan */
+	List	*fdw_private_list;
+} DynamicForeignScan;
 /* ----------------
  *	   CustomScan node
  *
@@ -926,7 +1083,6 @@ typedef struct Join
 	List	   *joinqual;		/* JOIN quals (in addition to plan.qual) */
 
 	bool		prefetch_inner; /* to avoid deadlock in MPP */
-	bool		prefetch_joinqual; /* to avoid deadlock in MPP */
 } Join;
 
 /* ----------------
@@ -995,6 +1151,14 @@ typedef struct HashJoin
 	Join		join;
 	List	   *hashclauses;
 	List	   *hashqualclauses;
+	List	   *hashoperators;
+	List	   *hashcollations;
+
+	/*
+	 * List of expressions to be hashed for tuples from the outer plan, to
+	 * perform lookups in the hashtable over the inner plan.
+	 */
+	List	   *hashkeys;
 } HashJoin;
 
 #define SHARE_ID_NOT_SHARED (-1)
@@ -1032,6 +1196,9 @@ typedef struct ShareInputScan
 
 	/* Number of consumer slices participating, not including the producer. */
 	int			nconsumers;
+
+	/* Discard the scan output? True for ORCA CTE producer, false otherwise. */
+	bool        discard_output;
 } ShareInputScan;
 
 /* ----------------
@@ -1057,8 +1224,6 @@ typedef struct Sort
 	Oid		   *sortOperators;	/* OIDs of operators to sort them by */
 	Oid		   *collations;		/* OIDs of collations */
 	bool	   *nullsFirst;		/* NULLS FIRST/LAST directions */
-    /* CDB */
-	bool		noduplicates;   /* TRUE if sort should discard duplicates */
 } Sort;
 
 /* ---------------
@@ -1082,8 +1247,6 @@ typedef struct Agg
 	AggSplit	aggsplit;		/* agg-splitting mode, see nodes.h */
 	int			numCols;		/* number of grouping columns */
 	AttrNumber *grpColIdx;		/* their indexes in the target list */
-	bool		combineStates;	/* input tuples contain transition states */
-	bool		finalizeAggs;	/* should we call the finalfn on agg states? */
 	Oid		   *grpOperators;	/* equality operators to compare with */
 	Oid		   *grpCollations;
 	long		numGroups;		/* estimated number of groups in input */
@@ -1248,6 +1411,12 @@ typedef struct Hash
 {
 	Plan		plan;
 	bool		rescannable;            /* CDB: true => save rows for rescan */
+
+	/*
+	 * List of expressions to be hashed for tuples from Hash's outer plan,
+	 * needed to put them into the hashtable.
+	 */
+	List	   *hashkeys;		/* hash keys for the hashjoin condition */
 	Oid			skewTable;		/* outer join key's table OID, or InvalidOid */
 	AttrNumber	skewColumn;		/* outer join key's column #, or zero */
 	bool		skewInherit;	/* is outer join rel an inheritance tree? */
@@ -1357,7 +1526,6 @@ typedef struct SplitUpdate
 {
 	Plan		plan;
 	AttrNumber	actionColIdx;		/* index of action column into the target list */
-	AttrNumber	tupleoidColIdx;		/* index of tuple oid column into the target list */
 	List		*insertColIdx;		/* list of columns to INSERT into the target list */
 	List		*deleteColIdx;		/* list of columns to DELETE into the target list */
 
@@ -1477,7 +1645,6 @@ typedef struct PlanRowMark
 	LockClauseStrength strength;	/* LockingClause's strength, or LCS_NONE */
 	LockWaitPolicy waitPolicy;	/* NOWAIT and SKIP LOCKED options */
 	bool		isParent;		/* true if this is a "dummy" parent entry */
-	bool        canOptSelectLockingClause; /* Whether can do some optimization on select with locking clause */
 } PlanRowMark;
 
 

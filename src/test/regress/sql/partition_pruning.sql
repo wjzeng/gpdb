@@ -7,10 +7,24 @@
 -- the planner and the rest of the system, so the expected output can need
 -- updating, as the system improves.
 --
+-- start_matchsubs
+-- m/\(cost=.*\)/
+-- s/\(cost=.*\)//
+-- end_matchsubs
 
--- GPDB_12_MERGE_FIXME: Many of these queries are no longer able to constraint
--- exclusion, like we used to on GPDB 6. Not sure what we should do about it.
--- See https://github.com/greenplum-db/gpdb/issues/10287.
+-- Create test table with two partitions, for values equal to '1' and values equal to '2'.
+create table parttab (n numeric, t text)
+  partition by list (n)(partition one values ('1'), partition two values('2'));
+
+-- Insert three rows. They're all equal to '1', but different number of zeros after decimal point.
+insert into parttab values
+  ('1', 'one'),
+  ('1.0', 'one point zero'),
+  ('1.00', 'one point zero zero');
+
+-- select rows whose text representation is three characters long. This should return the '1.0' row.
+select * from parttab where length(n::text) = 3;
+explain select * from parttab where length(n::text) = 3;
 
 -- Use index scans when possible. That exercises more code, and allows us to
 -- spot the cases where the planner cannot use even when it exists.
@@ -617,87 +631,45 @@ select * from mytable where ZeroFunc(i)=0 and i=-1 order by i;
 drop function ZeroFunc(int) cascade;
 drop table mytable cascade;
 
-
--- start_ignore
-create language plpython3u;
--- end_ignore
-
-
--- @description Tests for static partition selection (MPP-24709, GPSQL-2879)
--- GPDB_12_MERGE_FIXME: this function extract the number such as [5,10] out of
--- the string "Partition selected: 5 out of 10". We have temporarily broken
--- that when we reimplemented dynamic seq scan. Currently only the number of
--- selected partitions is avalable, get the total number of partitions back
--- post merge.
-create or replace function get_selected_parts(explain_query text) returns text as
-$$
-import re
-rv = plpy.execute(explain_query)
-search_text = 'Dynamic Seq Scan on '
-result = []
-result.append(0)
-result.append(0)
-selected = 0
-out_of = 0
-pattern = re.compile(r"\s+Number of partitions to scan: (?P<selected>\d+)")
-for i in range(len(rv)):
-    cur_line = rv[i]['QUERY PLAN']
-    if search_text.lower() in cur_line.lower():
-        j = i+1
-        temp_line = rv[j]['QUERY PLAN']
-        while (not pattern.match(temp_line)):
-            j += 1
-            if j == len(rv) - 1:
-                break
-            temp_line = rv[j]['QUERY PLAN']
-
-        else:
-            selected += int(pattern.match(temp_line).group('selected'))
-result[0] = selected
-result[1] = out_of
-return result
-$$
-language plpython3u;
-
 drop table if exists partprune_foo;
 create table partprune_foo(a int, b int, c int) partition by range (b) (start (1) end (101) every (10));
 insert into partprune_foo select g % 5 + 1, g + 1, g % 10 + 1 from generate_series(0, 99) g;
 analyze partprune_foo;
 
-select get_selected_parts('explain select * from partprune_foo;');
+explain select * from partprune_foo;
 select * from partprune_foo;
 
-select get_selected_parts('explain select * from partprune_foo where b = 35;');
+explain select * from partprune_foo where b = 35;
 select * from partprune_foo where b = 35;
 
-select get_selected_parts('explain select * from partprune_foo where b < 35;');
+explain select * from partprune_foo where b < 35;
 select * from partprune_foo where b < 35;
 
-select get_selected_parts('explain select * from partprune_foo where b in (5, 6, 14, 23);');
+explain select * from partprune_foo where b in (5, 6, 14, 23);
 select * from partprune_foo where b in (5, 6, 14, 23);
 
-select get_selected_parts('explain select * from partprune_foo where b < 15 or b > 60;');
+explain select * from partprune_foo where b < 15 or b > 60;
 select * from partprune_foo where b < 15 or b > 60;
 
-select get_selected_parts('explain select * from partprune_foo where b = 150;');
+explain select * from partprune_foo where b = 150;
 select * from partprune_foo where b = 150;
 
-select get_selected_parts('explain select * from partprune_foo where b = a*5;');
+explain select * from partprune_foo where b = a*5;
 select * from partprune_foo where b = a*5;
 
 -- Test with IN() lists
 -- Number of elements > threshold, partition elimination is not performed
 set optimizer_array_expansion_threshold = 3;
-select get_selected_parts('explain select * from partprune_foo where b in (5, 6, 14, 23);');
+explain select * from partprune_foo where b in (5, 6, 14, 23);
 select * from partprune_foo where b in (5, 6, 14, 23);
 
 reset optimizer_array_expansion_threshold;
 
 -- Test "ANY (<array>)" syntax.
-select get_selected_parts($$ explain select * from partprune_foo where b = ANY ('{5, 6, 14}') $$);
+explain select * from partprune_foo where b = ANY ('{5, 6, 14}');
 select * from partprune_foo where b = ANY ('{5, 6, 14}');
 
-select get_selected_parts($$ explain select * from partprune_foo where b < ANY ('{12, 14, 11}') $$);
+explain select * from partprune_foo where b < ANY ('{12, 14, 11}');
 select * from partprune_foo where b < ANY ('{12, 14, 11}');
 
 
@@ -724,36 +696,36 @@ insert into DATE_PARTS select i, extract(year from dt), extract(month from dt), 
 
 -- Expected total parts => 4 * 1 * 4 => 16: 
 -- TODO #141973839: we selected extra parts because of disjunction: 32 parts: 4 * 2 * 4
-select get_selected_parts('explain analyze select * from DATE_PARTS where month between 1 and 3;');
+explain analyze select * from DATE_PARTS where month between 1 and 3;
 
 -- Expected total parts => 4 * 2 * 4 => 32: 
 -- TODO #141973839: we selected extra parts because of disjunction: 48 parts: 4 * 3 * 4
-select get_selected_parts('explain analyze select * from DATE_PARTS where month between 1 and 4;');
+explain analyze select * from DATE_PARTS where month between 1 and 4;
 
 -- Expected total parts => 1 * 2 * 4 => 8: 
 -- TODO #141973839: we selected extra parts because of disjunction: 24 parts: 2 * 3 * 4
-select get_selected_parts('explain analyze select * from DATE_PARTS where year = 2003 and month between 1 and 4;');
+explain analyze select * from DATE_PARTS where year = 2003 and month between 1 and 4;
 
 -- 1 :: 5 :: 4 => 20 // Only default for year
-select get_selected_parts('explain analyze select * from DATE_PARTS where year = 1999;');
+explain analyze select * from DATE_PARTS where year = 1999;
 
 -- 4 :: 1 :: 4 => 16 // Only default for month
-select get_selected_parts('explain analyze select * from DATE_PARTS where month = 13;');
+explain analyze select * from DATE_PARTS where month = 13;
 
 -- 1 :: 1 :: 4 => 4 // Default for both year and month
-select get_selected_parts('explain analyze select * from DATE_PARTS where year = 1999 and month = 13;');
+explain analyze select * from DATE_PARTS where year = 1999 and month = 13;
 
 -- 4 :: 5 :: 1 => 20 // Only default part for day
-select get_selected_parts('explain analyze select * from DATE_PARTS where day = 40;');
+explain analyze select * from DATE_PARTS where day = 40;
 
 -- General predicate
 -- TODO #141973839. We expected 112 parts: (month = 1) =>   4 * 1 * 4 => 16, month > 3 => 4 * 4 * 4 => 64, month in (0, 1, 2) => 4 * 1 * 4 => 16, month is NULL => 4 * 1 * 4 => 16.
 -- However, we selected 128 parts: (month = 1) =>   4 * 1 * 4 => 16, month > 3 => 4 * 4 * 4 => 64, month in (0, 1, 2) => 4 * 2 * 4 => 32, month is NULL => 4 * 1 * 4 => 16.
-select get_selected_parts('explain analyze select * from DATE_PARTS where month = 1 union all select * from DATE_PARTS where month > 3 union all select * from DATE_PARTS where month in (0,1,2) union all select * from DATE_PARTS where month is null;');
+explain analyze select * from DATE_PARTS where month = 1 union all select * from DATE_PARTS where month > 3 union all select * from DATE_PARTS where month in (0,1,2) union all select * from DATE_PARTS where month is null;
 
 -- Equality predicate
 -- 16 partitions => 4 from year x 1 from month x 4 from days.
-select get_selected_parts('explain analyze select * from DATE_PARTS where month = 3;');  -- Not working (it only produces general)
+explain analyze select * from DATE_PARTS where month = 3;  -- Not working (it only produces general)
 
 -- More Equality and General Predicates ---
 create table foo(a int, b int)
@@ -762,7 +734,7 @@ partition by list (b)
 
 -- General predicate
 -- Total 6 parts. b = 1: 1 part, b > 3: 2 parts, b in (0, 1): 2 parts. b is null: 1 part
-select get_selected_parts('explain analyze select * from foo where b = 1 union all select * from foo where b > 3 union all select * from foo where b in (0,1) union all select * from foo where b is null;');
+explain analyze select * from foo where b = 1 union all select * from foo where b > 3 union all select * from foo where b in (0,1) union all select * from foo where b is null;
 
 drop table if exists pt;
 CREATE TABLE pt (id int, gender varchar(2)) 
@@ -774,7 +746,7 @@ PARTITION BY LIST (gender)
 
 -- General filter
 -- TODO #141916623. Expecting 6 parts, but optimizer plan selects 7 parts. The 6 parts breakdown is: gender = 'F': 1 part, gender < 'M': 2 parts (including default), gender in ('F', F'M'): 2 parts, gender is null => 1 part
-select get_selected_parts('explain analyze select * from pt where gender = ''F'' union all select * from pt where gender < ''M'' union all select * from pt where gender in (''F'', ''FM'') union all select * from pt where gender is null;');
+explain analyze select * from pt where gender = 'F' union all select * from pt where gender < 'M' union all select * from pt where gender in ('F', 'FM') union all select * from pt where gender is null;
 
 -- DML
 -- Non-default part
@@ -837,7 +809,7 @@ EXCHANGE PARTITION FOR ('usa') WITH TABLE sales_exchange_part ;
 ANALYZE sales;
 
 -- TODO: #141973839. Expected 10 parts, currently selecting 15 parts. First level: 4 parts + 1 default. Second level 2 parts. Total 10 parts.
-select get_selected_parts('explain analyze select * from sales where region = ''usa'' or region = ''asia'';');
+explain analyze select * from sales where region = 'usa' or region = 'asia';
 select * from sales where region = 'usa' or region = 'asia';
 
 -- Test DynamicIndexScan with extra filter
@@ -870,14 +842,167 @@ insert into bar values(1, NULL); --p1
 
 -- In-equality
 -- 8 parts: All 4 parts on first level and each will have 2 range parts 
-select get_selected_parts('explain analyze select * from bar where j>0.02;');
+explain analyze select * from bar where j>0.02;
 -- 6 parts: Excluding 1 list parts at first level. So, 3 at first level and each has 2 at second level.
-select get_selected_parts('explain analyze select * from bar where j>2.8;');
+explain analyze select * from bar where j>2.8;
 
 -- Distinct From
 -- 6 parts: Everything except 1 part that contains 5.6.
-select get_selected_parts('explain analyze select * from bar where j is distinct from 5.6;');
+explain analyze select * from bar where j is distinct from 5.6;
 -- 8 parts: NULL is shared with others on p1. So, all 8 parts.
-select get_selected_parts('explain analyze select * from bar where j is distinct from NULL;');
+explain analyze select * from bar where j is distinct from NULL;
+
+
+-- Table partitioned by boolean column
+CREATE TABLE pt_bool_tab
+(
+  col1 int,
+  col2 bool
+)
+distributed by (col1)
+partition by list(col2)
+(
+  partition part1 values(true),
+  partition part2 values(false)
+);
+
+INSERT INTO pt_bool_tab SELECT i, true FROM generate_series(1,3)i;
+INSERT INTO pt_bool_tab SELECT i, false FROM generate_series(1,2)i;
+
+EXPLAIN SELECT * FROM pt_bool_tab WHERE col2 IS true;
+SELECT * FROM pt_bool_tab WHERE col2 IS true;
+EXPLAIN SELECT * FROM pt_bool_tab WHERE col2 IS false;
+SELECT * FROM pt_bool_tab WHERE col2 IS false;
+EXPLAIN SELECT * FROM pt_bool_tab WHERE col2 IS NULL;
+SELECT * FROM pt_bool_tab WHERE col2 IS NULL;
+EXPLAIN SELECT * FROM pt_bool_tab WHERE col2 IS unknown;
+SELECT * FROM pt_bool_tab WHERE col2 IS unknown;
+EXPLAIN SELECT * FROM pt_bool_tab WHERE col2 IS NOT true;
+SELECT * FROM pt_bool_tab WHERE col2 IS NOT true;
+EXPLAIN SELECT * FROM pt_bool_tab WHERE col2 IS NOT false;
+SELECT * FROM pt_bool_tab WHERE col2 IS NOT false;
+EXPLAIN SELECT * FROM pt_bool_tab WHERE col2 IS NOT unknown;
+SELECT * FROM pt_bool_tab WHERE col2 IS NOT unknown;
+EXPLAIN SELECT * FROM pt_bool_tab WHERE col2 IS NOT NULL;
+SELECT * FROM pt_bool_tab WHERE col2 IS NOT NULL;
+
+EXPLAIN SELECT * FROM pt_bool_tab WHERE (not col2) IS true;
+SELECT * FROM pt_bool_tab WHERE (not col2) IS true;
+EXPLAIN SELECT * FROM pt_bool_tab WHERE (not col2) IS false;
+SELECT * FROM pt_bool_tab WHERE (not col2) IS false;
+EXPLAIN SELECT * FROM pt_bool_tab WHERE (not col2) IS NULL;
+SELECT * FROM pt_bool_tab WHERE (not col2) IS NULL;
+EXPLAIN SELECT * FROM pt_bool_tab WHERE (not col2) IS unknown;
+SELECT * FROM pt_bool_tab WHERE (not col2) IS unknown;
+EXPLAIN SELECT * FROM pt_bool_tab WHERE (not col2) IS NOT true;
+SELECT * FROM pt_bool_tab WHERE (not col2) IS NOT true;
+EXPLAIN SELECT * FROM pt_bool_tab WHERE (not col2) IS NOT false;
+SELECT * FROM pt_bool_tab WHERE (not col2) IS NOT false;
+EXPLAIN SELECT * FROM pt_bool_tab WHERE (not col2) IS NOT unknown;
+SELECT * FROM pt_bool_tab WHERE (not col2) IS NOT unknown;
+EXPLAIN SELECT * FROM pt_bool_tab WHERE (not col2) IS NOT NULL;
+SELECT * FROM pt_bool_tab WHERE (not col2) IS NOT NULL;
+
+CREATE TABLE pt_bool_tab_df
+(
+  col1 int,
+  col2 bool
+)
+distributed by (col1)
+partition by list(col2)
+(
+  partition part1 values(true),
+  partition part2 values(false),
+  default partition def
+);
+
+INSERT INTO pt_bool_tab_df SELECT i, true FROM generate_series(1,3)i;
+INSERT INTO pt_bool_tab_df SELECT i, false FROM generate_series(1,2)i;
+INSERT INTO pt_bool_tab_df SELECT i, NULL FROM generate_series(1,1)i;
+
+EXPLAIN SELECT * FROM pt_bool_tab_df WHERE col2 IS true;
+SELECT * FROM pt_bool_tab_df WHERE col2 IS true;
+EXPLAIN SELECT * FROM pt_bool_tab_df WHERE col2 IS false;
+SELECT * FROM pt_bool_tab_df WHERE col2 IS false;
+EXPLAIN SELECT * FROM pt_bool_tab_df WHERE col2 IS NULL;
+SELECT * FROM pt_bool_tab_df WHERE col2 IS NULL;
+EXPLAIN SELECT * FROM pt_bool_tab_df WHERE col2 IS unknown;
+SELECT * FROM pt_bool_tab_df WHERE col2 IS unknown;
+EXPLAIN SELECT * FROM pt_bool_tab_df WHERE col2 IS NOT true;
+SELECT * FROM pt_bool_tab_df WHERE col2 IS NOT true;
+EXPLAIN SELECT * FROM pt_bool_tab_df WHERE col2 IS NOT false;
+SELECT * FROM pt_bool_tab_df WHERE col2 IS NOT false;
+EXPLAIN SELECT * FROM pt_bool_tab_df WHERE col2 IS NOT unknown;
+SELECT * FROM pt_bool_tab_df WHERE col2 IS NOT unknown;
+EXPLAIN SELECT * FROM pt_bool_tab_df WHERE col2 IS NOT NULL;
+SELECT * FROM pt_bool_tab_df WHERE col2 IS NOT NULL;
+
+EXPLAIN SELECT * FROM pt_bool_tab_df WHERE (not col2) IS true;
+SELECT * FROM pt_bool_tab_df WHERE (not col2) IS true;
+EXPLAIN SELECT * FROM pt_bool_tab_df WHERE (not col2) IS false;
+SELECT * FROM pt_bool_tab_df WHERE (not col2) IS false;
+EXPLAIN SELECT * FROM pt_bool_tab_df WHERE (not col2) IS NULL;
+SELECT * FROM pt_bool_tab_df WHERE (not col2) IS NULL;
+EXPLAIN SELECT * FROM pt_bool_tab_df WHERE (not col2) IS unknown;
+SELECT * FROM pt_bool_tab_df WHERE (not col2) IS unknown;
+EXPLAIN SELECT * FROM pt_bool_tab_df WHERE (not col2) IS NOT true;
+SELECT * FROM pt_bool_tab_df WHERE (not col2) IS NOT true;
+EXPLAIN SELECT * FROM pt_bool_tab_df WHERE (not col2) IS NOT false;
+SELECT * FROM pt_bool_tab_df WHERE (not col2) IS NOT false;
+EXPLAIN SELECT * FROM pt_bool_tab_df WHERE (not col2) IS NOT unknown;
+SELECT * FROM pt_bool_tab_df WHERE (not col2) IS NOT unknown;
+EXPLAIN SELECT * FROM pt_bool_tab_df WHERE (not col2) IS NOT NULL;
+SELECT * FROM pt_bool_tab_df WHERE (not col2) IS NOT NULL;
+
+
+CREATE TABLE pt_bool_tab_null
+(
+  col1 int,
+  col2 bool
+)
+distributed by (col1)
+partition by list(col2)
+(
+  partition part1 values(true),
+  partition part2 values(false),
+  partition part3 values(null)
+);
+INSERT INTO pt_bool_tab_null SELECT i, true FROM generate_series(1,3)i;
+INSERT INTO pt_bool_tab_null SELECT i, false FROM generate_series(1,2)i;
+INSERT INTO pt_bool_tab_null SELECT i, NULL FROM generate_series(1,1)i;
+
+EXPLAIN SELECT * FROM pt_bool_tab_null WHERE col2 IS true;
+SELECT * FROM pt_bool_tab_null WHERE col2 IS true;
+EXPLAIN SELECT * FROM pt_bool_tab_null WHERE col2 IS false;
+SELECT * FROM pt_bool_tab_null WHERE col2 IS false;
+EXPLAIN SELECT * FROM pt_bool_tab_null WHERE col2 IS NULL;
+SELECT * FROM pt_bool_tab_null WHERE col2 IS NULL;
+EXPLAIN SELECT * FROM pt_bool_tab_null WHERE col2 IS unknown;
+SELECT * FROM pt_bool_tab_null WHERE col2 IS unknown;
+EXPLAIN SELECT * FROM pt_bool_tab_null WHERE col2 IS NOT true;
+SELECT * FROM pt_bool_tab_null WHERE col2 IS NOT true;
+EXPLAIN SELECT * FROM pt_bool_tab_null WHERE col2 IS NOT false;
+SELECT * FROM pt_bool_tab_null WHERE col2 IS NOT false;
+EXPLAIN SELECT * FROM pt_bool_tab_null WHERE col2 IS NOT unknown;
+SELECT * FROM pt_bool_tab_null WHERE col2 IS NOT unknown;
+EXPLAIN SELECT * FROM pt_bool_tab_null WHERE col2 IS NOT NULL;
+SELECT * FROM pt_bool_tab_null WHERE col2 IS NOT NULL;
+
+EXPLAIN SELECT * FROM pt_bool_tab_null WHERE (not col2) IS true;
+SELECT * FROM pt_bool_tab_null WHERE (not col2) IS true;
+EXPLAIN SELECT * FROM pt_bool_tab_null WHERE (not col2) IS false;
+SELECT * FROM pt_bool_tab_null WHERE (not col2) IS false;
+EXPLAIN SELECT * FROM pt_bool_tab_null WHERE (not col2) IS NULL;
+SELECT * FROM pt_bool_tab_null WHERE (not col2) IS NULL;
+EXPLAIN SELECT * FROM pt_bool_tab_null WHERE (not col2) IS unknown;
+SELECT * FROM pt_bool_tab_null WHERE (not col2) IS unknown;
+EXPLAIN SELECT * FROM pt_bool_tab_null WHERE (not col2) IS NOT true;
+SELECT * FROM pt_bool_tab_null WHERE (not col2) IS NOT true;
+EXPLAIN SELECT * FROM pt_bool_tab_null WHERE (not col2) IS NOT false;
+SELECT * FROM pt_bool_tab_null WHERE (not col2) IS NOT false;
+EXPLAIN SELECT * FROM pt_bool_tab_null WHERE (not col2) IS NOT unknown;
+SELECT * FROM pt_bool_tab_null WHERE (not col2) IS NOT unknown;
+EXPLAIN SELECT * FROM pt_bool_tab_null WHERE (not col2) IS NOT NULL;
+SELECT * FROM pt_bool_tab_null WHERE (not col2) IS NOT NULL;
 
 RESET ALL;

@@ -29,8 +29,8 @@ class CParseHandlerManager;
 class CParseHandlerBase;
 
 // dynamic arrays of parse handlers
-typedef CDynamicPtrArray<CParseHandlerBase, CleanupDelete>
-	CParseHandlerBaseArray;
+using CParseHandlerBaseArray =
+	CDynamicPtrArray<CParseHandlerBase, CleanupDelete>;
 
 XERCES_CPP_NAMESPACE_USE
 
@@ -43,6 +43,7 @@ enum EDxlParseHandlerType
 	EdxlphStatisticsConfig,
 	EdxlphCTEConfig,
 	EdxlphHint,
+	EdxlphPlanHint,
 	EdxlphWindowOids,
 	EdxlphTraceFlags,
 	EdxlphPlan,

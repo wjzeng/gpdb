@@ -48,6 +48,7 @@ class MD5Calc {
 
 class Config {
    public:
+    Config(const string& filename, const string& url, const char *datadir);
     Config(const string& filename);
     ~Config();
     bool SectionExist(const string& sec);
@@ -79,5 +80,7 @@ void SignRequestV4(const string& method, HTTPHeaders* headers, const string& ori
 string GetOptS3(const string& options, const string& key);
 
 string TruncateOptions(const string& url_with_options);
+
+string ReplaceNewlineWithSpace(const string &urlWithOptions);
 
 #endif  // __S3_UTILS_H__

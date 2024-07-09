@@ -23,11 +23,13 @@ struct pg_result;                   /* PGresult ... #include "libpq-fe.h" */
 struct SegmentDatabaseDescriptor;   /* #include "cdb/cdbconn.h" */
 struct StringInfoData;              /* #include "lib/stringinfo.h" */
 struct PQExpBufferData;             /* #include "libpq-int.h" */
+struct PGnotify;                    /* PGnotify ... #include "libpq-fe.h" */
 
 typedef struct CdbPgResults
 {
 	struct pg_result **pg_results;
 	int numResults;
+	int numDispatches; /* the number of dispatched QE, from CdbDispatchResults.resultCount */
 }CdbPgResults;
 
 /*
@@ -78,7 +80,7 @@ typedef struct CdbDispatchResult
 	 * successfully); or -1.
 	 * Pass to cdbconn_getResult().
 	 */
-	int okindex;        
+	int okindex;
 
 	/*
 	 * array of ptr to PGresult
@@ -94,6 +96,12 @@ typedef struct CdbDispatchResult
 	/* true => busy in dispatch thread */
 	bool stillRunning;
 
+	/*
+	 * true => received specified acknowledge message from libpq.
+	 * Should set to false before receive new message
+	 */
+	bool receivedAckMsg;
+
 	/* type of signal sent */
 	DispatchWaitMode sentSignal;
 
@@ -107,8 +115,14 @@ typedef struct CdbDispatchResult
 	/* num rows rejected in SREH mode */
 	int	numrowsrejected;
 
-	/* num rows completed in COPY FROM ON SEGMENT */
+	/* num rows completed in COPY FROM */
 	int	numrowscompleted;
+
+	/*
+	 * queue for acknowledge NOTIFY messages, get freed for
+	 * each cdbdisp_waitDispatchAckMessage call
+	 */
+	struct PGnotify *ackPGNotifies;
 } CdbDispatchResult;
 
 /*

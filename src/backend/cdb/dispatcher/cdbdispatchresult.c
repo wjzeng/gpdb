@@ -75,6 +75,20 @@ cdbdisp_makeResult(struct CdbDispatchResults *meleeResults,
 	dispatchResult->error_message = createPQExpBuffer();
 	dispatchResult->numrowsrejected = 0;
 	dispatchResult->numrowscompleted = 0;
+	dispatchResult->ackPGNotifies = NULL;
+
+#ifdef FAULT_INJECTOR
+	if (SIMPLE_FAULT_INJECTOR("make_dispatch_result_error") == FaultInjectorTypeSkip)
+	{
+		/*
+		 * Inject a fault to simulate the createPQExpBuffer return NULL (maybe because of
+		 * malloc failure, this will lead to enter the below if block and return NULL in
+		 * this function. We need to test this code path to verify the gang clean up code
+		 * is correct.
+		 */
+		dispatchResult->resultbuf = NULL;
+	}
+#endif
 
 	if (PQExpBufferBroken(dispatchResult->resultbuf) ||
 		PQExpBufferBroken(dispatchResult->error_message))
@@ -155,18 +169,34 @@ void
 cdbdisp_resetResult(CdbDispatchResult *dispatchResult)
 {
 	PQExpBuffer buf = dispatchResult->resultbuf;
-	PGresult  **begp = (PGresult **) buf->data;
-	PGresult  **endp = (PGresult **) (buf->data + buf->len);
-	PGresult  **p;
-
 	/*
-	 * Free the PGresult objects.
-	 */
-	for (p = begp; p < endp; ++p)
+	* the resultbuf may be empty due to oom, set in cdbdisp_makeResult()
+ 	* Related to issue: https://github.com/greenplum-db/gpdb/issues/12399
+	*/
+	if (buf)
 	{
-		Assert(*p != NULL);
-		PQclear(*p);
+		PGresult  **begp = (PGresult **) buf->data;
+		PGresult  **endp = (PGresult **) (buf->data + buf->len);
+		PGresult  **p;
+
+		/*
+		 * Free the PGresult objects.
+		 */
+		for (p = begp; p < endp; ++p)
+		{
+			Assert(*p != NULL);
+			PQclear(*p);
+		}
 	}
+
+	PGnotify* pgnotify = (PGnotify *) dispatchResult->ackPGNotifies;
+	while (pgnotify)
+	{
+		PGnotify* temp = pgnotify;
+		pgnotify = temp->next;
+		PQfreemem(temp);
+	}
+	dispatchResult->ackPGNotifies = NULL;
 
 	/*
 	 * Reset summary indicators.
@@ -179,6 +209,7 @@ cdbdisp_resetResult(CdbDispatchResult *dispatchResult)
 	 */
 	dispatchResult->hasDispatched = false;
 	dispatchResult->stillRunning = false;
+	dispatchResult->receivedAckMsg = false;
 	dispatchResult->sentSignal = DISPATCH_WAIT_NONE;
 	dispatchResult->wasCanceled = false;
 
@@ -790,6 +821,8 @@ cdbdisp_returnResults(CdbDispatchResults *primaryResults, CdbPgResults *cdb_pgre
 
 	/* tell the caller how many sets we're returning. */
 	cdb_pgresults->numResults = nresults;
+	/* set the number of dispatched QE */
+	cdb_pgresults->numDispatches = primaryResults->resultCount;
 }
 
 /*
@@ -799,14 +832,10 @@ bool
 cdbdisp_checkResultsErrcode(struct CdbDispatchResults *meleeResults)
 {
 	if (meleeResults == NULL)
-	{
 		return false;
-	}
 
 	if (meleeResults->errcode)
-	{
 		return true;
-	}
 
 	return false;
 }

@@ -19,20 +19,22 @@ for executing this set of commands.
 
 from queue import Queue, Empty
 from threading import Thread
-
+from collections import OrderedDict
 import os
 import signal
+import socket
 import subprocess
 import sys
 import time
 
 from gppylib import gplog
 from gppylib import gpsubprocess
-from pg import DB
 
 logger = gplog.get_default_logger()
 
 GPHOME = os.environ.get('GPHOME')
+
+CMD_CACHE = {}
 
 # Maximum retries if sshd rejects the connection due to too many
 # unauthenticated connections.
@@ -66,6 +68,7 @@ class WorkerPool(object):
             self.workers.append(w)
             w.start()
         self.numWorkers = numWorkers
+        self.logger.debug("WorkerPool() initialized with %d workers" % self.numWorkers)
 
     ###
     def getNumWorkers(self):
@@ -439,7 +442,7 @@ class LocalExecutionContext(ExecutionContext):
         self.stdin = stdin
         pass
 
-    def execute(self, cmd, wait=True, pickled=False):
+    def execute(self, cmd, wait=True, pickled=False, start_new_session=False):
         # prepend env. variables from ExcecutionContext.propagate_env_map
         # e.g. Given {'FOO': 1, 'BAR': 2}, we'll produce "FOO=1 BAR=2 ..."
 
@@ -448,10 +451,11 @@ class LocalExecutionContext(ExecutionContext):
         for k in keys:
             cmd.cmdStr = "%s=%s && %s" % (k, cmd.propagate_env_map[k], cmd.cmdStr)
 
-        # executable='/bin/bash' is to ensure the shell is bash.  bash isn't the
+        # executable=(path of bash) is to ensure the shell is bash.  bash isn't the
         # actual command executed, but the shell that command string runs under.
         self.proc = gpsubprocess.Popen(cmd.cmdStr, env=None, shell=True,
-                                       executable='/bin/bash',
+                                       start_new_session=start_new_session,
+                                       executable=findCmdInPath("bash"),
                                        stdin=subprocess.PIPE,
                                        stderr=subprocess.PIPE,
                                        stdout=subprocess.PIPE, close_fds=True)
@@ -489,7 +493,7 @@ class RemoteExecutionContext(LocalExecutionContext):
         else:
             self.gphome = GPHOME
 
-    def execute(self, cmd, pickled=False):
+    def execute(self, cmd, pickled=False, start_new_session=False):
         # prepend env. variables from ExcecutionContext.propagate_env_map
         # e.g. Given {'FOO': 1, 'BAR': 2}, we'll produce "FOO=1 BAR=2 ..."
         self.__class__.trail.add(self.targetHost)
@@ -501,22 +505,27 @@ class RemoteExecutionContext(LocalExecutionContext):
 
         # Escape \ and  " for remote execution
         cmd.cmdStr = cmd.cmdStr.replace('\\','\\\\').replace('"', '\\"')
-        cmd.cmdStr = "ssh -o StrictHostKeyChecking=no -o ServerAliveInterval=60 " \
-                     "{targethost} \"{gphome} {cmdstr}\"".format(targethost=self.targetHost,
-                                                                 gphome=". %s/greenplum_path.sh;" % self.gphome,
-                                                                 cmdstr=cmd.cmdStr)
-        LocalExecutionContext.execute(self, cmd, pickled=pickled)
-        if (cmd.get_results().stderr.startswith('ssh_exchange_identification: Connection closed by remote host')):
-            self.__retry(cmd)
-        pass
 
-    def __retry(self, cmd, count=0):
+        localhost = socket.gethostname()
+        if localhost != self.targetHost:
+            cmd.cmdStr = "ssh -o StrictHostKeyChecking=no -o ServerAliveInterval=60 " \
+                         "{targethost} \"{gphome} {cmdstr}\"".format(targethost=self.targetHost,
+                                                                     gphome=". %s/greenplum_path.sh;" % self.gphome,
+                                                                     cmdstr=cmd.cmdStr)
+        else:
+            cmd.cmdStr = "bash -c \"{gphome} {cmdstr}\"".format(gphome=". %s/greenplum_path.sh;" % self.gphome,
+                                                                cmdstr=cmd.cmdStr)
+        LocalExecutionContext.execute(self, cmd, pickled=pickled, start_new_session=start_new_session)
+        if (cmd.get_stderr().startswith('ssh_exchange_identification: Connection closed by remote host')):
+            self.__retry(cmd, 0, pickled)
+
+    def __retry(self, cmd, count, pickled):
         if count == SSH_MAX_RETRY:
             return
         time.sleep(SSH_RETRY_DELAY)
-        LocalExecutionContext.execute(self, cmd, pickled=pickled)
-        if (cmd.get_results().stderr.startswith('ssh_exchange_identification: Connection closed by remote host')):
-            self.__retry(cmd, count + 1)
+        LocalExecutionContext.execute(self, cmd, pickled)
+        if (cmd.get_stderr().startswith('ssh_exchange_identification: Connection closed by remote host')):
+            self.__retry(cmd, count + 1, pickled)
 
 class Command(object):
     """ TODO:
@@ -527,7 +536,7 @@ class Command(object):
     exec_context = None
     propagate_env_map = {}  # specific environment variables for this command instance
 
-    def __init__(self, name, cmdStr, ctxt=LOCAL, remoteHost=None, stdin=None, gphome=None, pickled=False):
+    def __init__(self, name, cmdStr, ctxt=LOCAL, remoteHost=None, stdin=None, gphome=None, pickled=False, start_new_session=False):
         self.name = name
         self.cmdStr = cmdStr
         self.exec_context = createExecutionContext(ctxt, remoteHost, stdin=stdin,
@@ -535,6 +544,7 @@ class Command(object):
         self.remoteHost = remoteHost
         self.logger = gplog.get_default_logger()
         self.pickled = pickled
+        self.start_new_session = start_new_session
 
     def __str__(self):
         if self.results:
@@ -545,12 +555,12 @@ class Command(object):
     # Start a process that will execute the command but don't wait for
     # it to complete.  Return the Popen object instead.
     def runNoWait(self):
-        self.exec_context.execute(self, wait=False, pickled=self.pickled)
+        self.exec_context.execute(self, wait=False, pickled=self.pickled, start_new_session=self.start_new_session)
         return self.exec_context.proc
 
     def run(self, validateAfter=False):
         self.logger.debug("Running Command: %s" % self.cmdStr)
-        self.exec_context.execute(self, pickled=self.pickled)
+        self.exec_context.execute(self, pickled=self.pickled, start_new_session=self.start_new_session)
 
         if validateAfter:
             self.validate()
@@ -627,7 +637,46 @@ class SQLCommand(Command):
 
         # if self.conn is not set we cannot cancel.
         if self.cancel_conn:
-            DB(self.cancel_conn).cancel()
+            self.cancel_conn.cancel()
+
+class CommandNotFoundException(Exception):
+    def __init__(self, cmd, paths):
+        self.cmd = cmd
+        self.paths = paths
+
+    def __str__(self):
+        return "Could not locate command: '%s' in this set of paths: %s" % (self.cmd, repr(self.paths))
+
+
+def findCmdInPath(cmd, missing_ok=False):
+    # ---------------command path--------------------
+    CMDPATH = ['/usr/kerberos/bin', '/usr/sfw/bin', '/opt/sfw/bin', '/usr/local/bin', '/bin',
+               '/usr/bin', '/sbin', '/usr/sbin', '/usr/ucb', '/sw/bin', '/opt/Navisphere/bin']
+    CMDPATH = CMDPATH + os.environ['PATH'].split(os.pathsep)
+
+    if GPHOME:
+        CMDPATH.append(GPHOME)
+
+    # remove duplicate paths
+    unique_paths = OrderedDict.fromkeys(CMDPATH)
+    CMDPATH = list(unique_paths.keys())
+
+    if cmd not in CMD_CACHE:
+        for p in CMDPATH:
+            f = os.path.join(p, cmd)
+            if os.path.exists(f):
+                CMD_CACHE[cmd] = f
+                return f
+
+        # missing_ok is just suppressing the critical log message. This function
+        # still raises an exception and leaves the client to decide whether to
+        # consume the error.
+        if not missing_ok:
+            logger.critical('Command %s not found' % cmd)
+        search_path = CMDPATH[:]
+        raise CommandNotFoundException(cmd, search_path)
+    else:
+        return CMD_CACHE[cmd]
 
 
 def run_remote_commands(name, commands):

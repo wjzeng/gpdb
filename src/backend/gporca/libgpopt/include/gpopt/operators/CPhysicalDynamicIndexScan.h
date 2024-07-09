@@ -22,7 +22,6 @@ namespace gpopt
 class CTableDescriptor;
 class CIndexDescriptor;
 class CName;
-class CPartConstraint;
 
 //---------------------------------------------------------------------------
 //	@class:
@@ -41,6 +40,9 @@ private:
 	// order
 	COrderSpec *m_pos;
 
+	// Number of predicate not applicable on the index
+	ULONG m_ulUnindexedPredColCount;
+
 public:
 	CPhysicalDynamicIndexScan(const CPhysicalDynamicIndexScan &) = delete;
 
@@ -51,7 +53,8 @@ public:
 							  CColRefArray *pdrgpcrOutput, ULONG scan_id,
 							  CColRef2dArray *pdrgpdrgpcrPart, COrderSpec *pos,
 							  IMdIdArray *partition_mdids,
-							  ColRefToUlongMapArray *root_col_mapping_per_part);
+							  ColRefToUlongMapArray *root_col_mapping_per_part,
+							  ULONG ulUnindexedPredColCount);
 
 	// dtor
 	~CPhysicalDynamicIndexScan() override;
@@ -83,6 +86,13 @@ public:
 
 	// match function
 	BOOL Matches(COperator *pop) const override;
+
+	// number of predicate not applicable on the index
+	ULONG
+	ResidualPredicateSize() const
+	{
+		return m_ulUnindexedPredColCount;
+	}
 
 	//-------------------------------------------------------------------------------------
 	// Derived Plan Properties

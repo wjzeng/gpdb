@@ -23,9 +23,12 @@
 #include "gpopt/base/CUtils.h"
 #include "gpopt/operators/CPredicateUtils.h"
 #include "gpopt/operators/CScalarArray.h"
+#include "gpopt/operators/CScalarBooleanTest.h"
 #include "gpopt/operators/CScalarIdent.h"
 #include "gpopt/operators/CScalarIsDistinctFrom.h"
+#include "naucrates/base/IDatumBool.h"
 #include "naucrates/md/IMDScalarOp.h"
+#include "naucrates/md/IMDTypeBool.h"
 
 using namespace gpopt;
 
@@ -75,7 +78,27 @@ CConstraintInterval::~CConstraintInterval()
 BOOL
 CConstraintInterval::FContradiction() const
 {
-	return (!m_fIncludesNull && 0 == m_pdrgprng->Size());
+	if (!m_fIncludesNull && 0 == m_pdrgprng->Size())
+	{
+		return true;
+	}
+
+	// Constraint on boolean column is special case because only 2 values exist
+	// in the domain space [0,1]. If both ends are exclude then the constraint
+	// is a contradiction.
+	if (m_pcr->RetrieveType()->GetDatumType() == IMDType::EtiBool &&
+		m_pdrgprng->Size() == 1 && !m_fIncludesNull)
+	{
+		if ((*m_pdrgprng)[0]->EriLeft() == CRange::EriExcluded &&
+			(*m_pdrgprng)[0]->EriRight() == CRange::EriExcluded &&
+			(*m_pdrgprng)[0]->PdatumLeft() != nullptr &&
+			(*m_pdrgprng)[0]->PdatumRight() != nullptr)
+		{
+			return true;
+		}
+	}
+
+	return false;
 }
 
 //---------------------------------------------------------------------------
@@ -112,6 +135,25 @@ CConstraintInterval::PcnstrCopyWithRemappedColumns(
 
 //---------------------------------------------------------------------------
 //	@function:
+//		CConstraintInterval::GetConstraintOnSegmentId
+//
+//	@doc:
+//		Returns the constraint for system column gp_segment_id
+//
+//---------------------------------------------------------------------------
+
+CConstraint *
+CConstraintInterval::GetConstraintOnSegmentId() const
+{
+	if (FConstraintOnSegmentId())
+	{
+		return (CConstraint *) this;
+	}
+
+	return nullptr;
+}
+//---------------------------------------------------------------------------
+//	@function:
 //		CConstraintInterval::PciIntervalFromScalarExpr
 //
 //	@doc:
@@ -140,10 +182,9 @@ CConstraintInterval::PcnstrCopyWithRemappedColumns(
 //
 //---------------------------------------------------------------------------
 CConstraintInterval *
-CConstraintInterval::PciIntervalFromScalarExpr(CMemoryPool *mp,
-											   CExpression *pexpr,
-											   CColRef *colref,
-											   BOOL infer_nulls_as)
+CConstraintInterval::PciIntervalFromScalarExpr(
+	CMemoryPool *mp, CExpression *pexpr, CColRef *colref, BOOL infer_nulls_as,
+	IMDIndex::EmdindexType access_method)
 {
 	GPOS_ASSERT(nullptr != pexpr);
 	GPOS_ASSERT(pexpr->Pop()->FScalar());
@@ -154,14 +195,21 @@ CConstraintInterval::PciIntervalFromScalarExpr(CMemoryPool *mp,
 	switch (pexpr->Pop()->Eopid())
 	{
 		case COperator::EopScalarNullTest:
-			pci = PciIntervalFromScalarNullTest(mp, pexpr, colref);
+			pci = PciIntervalFromScalarNullAndUnknownTest(mp, pexpr, colref);
+			break;
+		case COperator::EopScalarBooleanTest:
+			pci = PciIntervalFromScalarBooleanTest(mp, pexpr, colref);
 			break;
 		case COperator::EopScalarBoolOp:
-			pci =
-				PciIntervalFromScalarBoolOp(mp, pexpr, colref, infer_nulls_as);
+			pci = PciIntervalFromScalarBoolOp(mp, pexpr, colref, infer_nulls_as,
+											  access_method);
+			break;
+		case COperator::EopScalarIdent:
+			pci = PciIntervalFromScalarIdent(mp, colref, infer_nulls_as);
 			break;
 		case COperator::EopScalarCmp:
-			pci = PciIntervalFromScalarCmp(mp, pexpr, colref, infer_nulls_as);
+			pci = PciIntervalFromScalarCmp(mp, pexpr, colref, infer_nulls_as,
+										   access_method);
 			break;
 		case COperator::EopScalarIsDistinctFrom:
 			pci = PciIntervalFromScalarIDF(mp, pexpr, colref);
@@ -353,25 +401,44 @@ CConstraintInterval::PciIntervalFromConstraint(CMemoryPool *mp,
 
 //---------------------------------------------------------------------------
 //	@function:
-//		CConstraintInterval::PciIntervalFromScalarNullTest
+//		CConstraintInterval::PciIntervalFromScalarNullAndUnknownTest
 //
 //	@doc:
-//		Create interval from scalar null test
+//		Create interval from scalar null test & unknown test
+//
+//		Returns an empty interval includes null, appropriate for
+//		"is null" and "is unknown"
+//
+//		For "is not null",
+//		PciComplement will be invoked by PciIntervalFromScalarBoolOp
+//		For "is not unknown",
+//		PciComplement will be invoked by PciIntervalFromScalarBooleanTest
+//
+//		Notice: this function only supports cases where the child is an
+//		identifier now, otherwise, it will return nullptr
 //
 //---------------------------------------------------------------------------
 CConstraintInterval *
-CConstraintInterval::PciIntervalFromScalarNullTest(CMemoryPool *mp,
-												   CExpression *pexpr,
-												   CColRef *colref)
+CConstraintInterval::PciIntervalFromScalarNullAndUnknownTest(CMemoryPool *mp,
+															 CExpression *pexpr,
+															 CColRef *colref)
 {
 	GPOS_ASSERT(nullptr != pexpr);
-	GPOS_ASSERT(CUtils::FScalarNullTest(pexpr));
+	// let (is null & is not null) and (is unknown & is not unknown) in
+	GPOS_ASSERT(CUtils::FScalarNullTest(pexpr) ||
+				(CUtils::FScalarBooleanTest(pexpr) &&
+				 (CScalarBooleanTest::PopConvert(pexpr->Pop())->Ebt() ==
+					  CScalarBooleanTest::EbtIsUnknown ||
+				  CScalarBooleanTest::PopConvert(pexpr->Pop())->Ebt() ==
+					  CScalarBooleanTest::EbtIsNotUnknown)));
 
 	// child of comparison operator
 	CExpression *pexprChild = (*pexpr)[0];
 
 	// TODO:  - May 28, 2012; add support for other expression forms
 	// besides (ident is null)
+	// think about how to differ ((ident is true) is null) from (ident is null)
+	// when ident is null
 
 	if (CUtils::FScalarIdent(pexprChild))
 	{
@@ -384,6 +451,106 @@ CConstraintInterval::PciIntervalFromScalarNullTest(CMemoryPool *mp,
 	}
 
 	return nullptr;
+}
+
+//---------------------------------------------------------------------------
+//	@function:
+//		CConstraintInterval::PciIntervalFromScalarBooleanTest
+//
+//	@doc:
+//		Create interval from scalar null test
+//
+//		This is the table about results of boolean tests &
+//		some other boolean operators
+//
+//		Parameter		T	F	NULL
+//		----------------------------
+//		is true			T	F	F
+//		is not false	T	F	T
+//		is false		F	T	F
+//		is not true		F	T	T
+//		is unknown		F	F	T
+//		is not unknown	T	T	F
+//		----------------------------
+//		expr			T	F	infer_nulls_as
+//		not				F	T	infer_nulls_as
+//		is null			F	F	T
+//		is not null		T	T	F
+//
+//		So, we treat
+//		(is true / is not false)	as	expr with infer_nulls_as
+//		(is false / is not true)	as	not with infer_nulls_as
+//		is unknown 					as	is null
+//		is not unknown 				as	is not null
+//
+//---------------------------------------------------------------------------
+CConstraintInterval *
+CConstraintInterval::PciIntervalFromScalarBooleanTest(CMemoryPool *mp,
+													  CExpression *pexpr,
+													  CColRef *colref)
+{
+	GPOS_ASSERT(nullptr != pexpr);
+	GPOS_ASSERT(CUtils::FScalarBooleanTest(pexpr));
+
+	CScalarBooleanTest *pop = CScalarBooleanTest::PopConvert(pexpr->Pop());
+	GPOS_ASSERT(nullptr != pop);
+
+	bool fIncludesNull = false;
+	switch (pop->Ebt())
+	{
+		case CScalarBooleanTest::EbtIsTrue:
+		case CScalarBooleanTest::EbtIsNotFalse:
+		{
+			if (pop->Ebt() == CScalarBooleanTest::EbtIsNotFalse)
+			{
+				fIncludesNull = true;
+			}
+
+			return PciIntervalFromScalarExpr(mp, (*pexpr)[0], colref,
+											 fIncludesNull);
+		}
+		case CScalarBooleanTest::EbtIsNotTrue:
+		case CScalarBooleanTest::EbtIsFalse:
+		{
+			if (pop->Ebt() == CScalarBooleanTest::EbtIsNotTrue)
+			{
+				fIncludesNull = true;
+			}
+
+			CConstraintInterval *pciChild = PciIntervalFromScalarExpr(
+				mp, (*pexpr)[0], colref, !fIncludesNull);
+			if (nullptr == pciChild)
+			{
+				return nullptr;
+			}
+
+			CConstraintInterval *pciNot = pciChild->PciComplement(mp);
+			pciChild->Release();
+			return pciNot;
+		}
+		case CScalarBooleanTest::EbtIsUnknown:
+		{
+			return PciIntervalFromScalarNullAndUnknownTest(mp, pexpr, colref);
+		}
+		case CScalarBooleanTest::EbtIsNotUnknown:
+		{
+			CConstraintInterval *pciNullTest =
+				PciIntervalFromScalarNullAndUnknownTest(mp, pexpr, colref);
+			if (nullptr == pciNullTest)
+			{
+				return nullptr;
+			}
+
+			CConstraintInterval *pciNot = pciNullTest->PciComplement(mp);
+			pciNullTest->Release();
+			return pciNot;
+		}
+		default:
+		{
+			GPOS_ASSERT(false && "Unknown boolean test type");
+			return nullptr;
+		}
+	}
 }
 
 
@@ -427,10 +594,9 @@ CConstraintInterval::PciIntervalFromColConstCmp(CMemoryPool *mp,
 //
 //---------------------------------------------------------------------------
 CConstraintInterval *
-CConstraintInterval::PciIntervalFromScalarCmp(CMemoryPool *mp,
-											  CExpression *pexpr,
-											  CColRef *colref,
-											  BOOL infer_nulls_as)
+CConstraintInterval::PciIntervalFromScalarCmp(
+	CMemoryPool *mp, CExpression *pexpr, CColRef *colref, BOOL infer_nulls_as,
+	IMDIndex::EmdindexType access_method)
 {
 	GPOS_ASSERT(nullptr != pexpr);
 	GPOS_ASSERT(CUtils::FScalarCmp(pexpr) || CUtils::FScalarArrayCmp(pexpr));
@@ -439,6 +605,27 @@ CConstraintInterval::PciIntervalFromScalarCmp(CMemoryPool *mp,
 	// besides (column relop const)
 	if (CPredicateUtils::FCompareIdentToConst(pexpr))
 	{
+		// For a const predicate to be converted to an interval, the operator
+		// has to belong to the ident's opfamily and const's opfamily. Note
+		// here we don't differentiate the ident and const sides. This is
+		// because the opfamily check runs the same code path for ident and
+		// const expressions. In practice, we should mostly see the expression
+		// in the form of `ident op const` here, cause preprocessor flips
+		// `const op ident` whenever the operator is commutative.
+		if (GPOS_FTRACE(EopttraceConsiderOpfamiliesForDistribution))
+		{
+			CExpression *pexprLeft = (*pexpr)[0];
+			CExpression *pexprRight = (*pexpr)[1];
+
+			if (!CPredicateUtils::FOpInOpfamily(pexprLeft, pexpr,
+												access_method) ||
+				!CPredicateUtils::FOpInOpfamily(pexprRight, pexpr,
+												access_method))
+			{
+				return nullptr;
+			}
+		}
+
 		// column
 #ifdef GPOS_DEBUG
 		CScalarIdent *popScId;
@@ -540,10 +727,9 @@ CConstraintInterval::PciIntervalFromScalarIDF(CMemoryPool *mp,
 //
 //---------------------------------------------------------------------------
 CConstraintInterval *
-CConstraintInterval::PciIntervalFromScalarBoolOp(CMemoryPool *mp,
-												 CExpression *pexpr,
-												 CColRef *colref,
-												 BOOL infer_nulls_as)
+CConstraintInterval::PciIntervalFromScalarBoolOp(
+	CMemoryPool *mp, CExpression *pexpr, CColRef *colref, BOOL infer_nulls_as,
+	IMDIndex::EmdindexType access_method)
 {
 	GPOS_ASSERT(nullptr != pexpr);
 	GPOS_ASSERT(CUtils::FScalarBoolOp(pexpr));
@@ -555,11 +741,11 @@ CConstraintInterval::PciIntervalFromScalarBoolOp(CMemoryPool *mp,
 	{
 		case CScalarBoolOp::EboolopAnd:
 			return PciIntervalFromScalarBoolAnd(mp, pexpr, colref,
-												infer_nulls_as);
+												infer_nulls_as, access_method);
 
 		case CScalarBoolOp::EboolopOr:
 			return PciIntervalFromScalarBoolOr(mp, pexpr, colref,
-											   infer_nulls_as);
+											   infer_nulls_as, access_method);
 
 		case CScalarBoolOp::EboolopNot:
 		{
@@ -581,6 +767,33 @@ CConstraintInterval::PciIntervalFromScalarBoolOp(CMemoryPool *mp,
 
 //---------------------------------------------------------------------------
 //	@function:
+//		CConstraintInterval::PciIntervalFromScalarIdent
+//
+//	@doc:
+//		Create interval from boolean scalar ident
+//
+//---------------------------------------------------------------------------
+CConstraintInterval *
+CConstraintInterval::PciIntervalFromScalarIdent(CMemoryPool *mp,
+												CColRef *colref,
+												BOOL infer_nulls_as)
+{
+	GPOS_ASSERT(colref->RetrieveType()->GetDatumType() == IMDType::EtiBool);
+
+	CRangeArray *pdrngprng = GPOS_NEW(mp) CRangeArray(mp);
+	CMDAccessor *md_accessor = COptCtxt::PoctxtFromTLS()->Pmda();
+	const IMDTypeBool *pmdtypebool = md_accessor->PtMDType<IMDTypeBool>();
+	IDatumBool *datum =
+		pmdtypebool->CreateBoolDatum(mp, true, false /*is_null*/);
+	pdrngprng->Append(GPOS_NEW(mp) CRange(COptCtxt::PoctxtFromTLS()->Pcomp(),
+										  IMDType::EcmptEq, datum));
+
+	return GPOS_NEW(mp) CConstraintInterval(mp, colref, pdrngprng,
+											infer_nulls_as /*fIncludesNull*/);
+}
+
+//---------------------------------------------------------------------------
+//	@function:
 //		CConstraintInterval::PciIntervalFromScalarBoolOr
 //
 //	@doc:
@@ -588,10 +801,9 @@ CConstraintInterval::PciIntervalFromScalarBoolOp(CMemoryPool *mp,
 //
 //---------------------------------------------------------------------------
 CConstraintInterval *
-CConstraintInterval::PciIntervalFromScalarBoolOr(CMemoryPool *mp,
-												 CExpression *pexpr,
-												 CColRef *colref,
-												 BOOL infer_nulls_as)
+CConstraintInterval::PciIntervalFromScalarBoolOr(
+	CMemoryPool *mp, CExpression *pexpr, CColRef *colref, BOOL infer_nulls_as,
+	IMDIndex::EmdindexType access_method)
 {
 	GPOS_ASSERT(nullptr != pexpr);
 	GPOS_ASSERT(CUtils::FScalarBoolOp(pexpr));
@@ -605,8 +817,8 @@ CConstraintInterval::PciIntervalFromScalarBoolOr(CMemoryPool *mp,
 		GPOS_NEW(mp) CConstraintIntervalArray(mp);
 	for (ULONG ul = 0; ul < arity; ul++)
 	{
-		CConstraintInterval *pciChild =
-			PciIntervalFromScalarExpr(mp, (*pexpr)[ul], colref, infer_nulls_as);
+		CConstraintInterval *pciChild = PciIntervalFromScalarExpr(
+			mp, (*pexpr)[ul], colref, infer_nulls_as, access_method);
 
 		if (nullptr == pciChild)
 		{
@@ -666,10 +878,9 @@ CConstraintInterval::PciIntervalFromScalarBoolOr(CMemoryPool *mp,
 //
 //---------------------------------------------------------------------------
 CConstraintInterval *
-CConstraintInterval::PciIntervalFromScalarBoolAnd(CMemoryPool *mp,
-												  CExpression *pexpr,
-												  CColRef *colref,
-												  BOOL infer_nulls_as)
+CConstraintInterval::PciIntervalFromScalarBoolAnd(
+	CMemoryPool *mp, CExpression *pexpr, CColRef *colref, BOOL infer_nulls_as,
+	IMDIndex::EmdindexType access_method)
 {
 	GPOS_ASSERT(nullptr != pexpr);
 	GPOS_ASSERT(CUtils::FScalarBoolOp(pexpr));
@@ -679,12 +890,12 @@ CConstraintInterval::PciIntervalFromScalarBoolAnd(CMemoryPool *mp,
 	const ULONG arity = pexpr->Arity();
 	GPOS_ASSERT(0 < arity);
 
-	CConstraintInterval *pci =
-		PciIntervalFromScalarExpr(mp, (*pexpr)[0], colref, infer_nulls_as);
+	CConstraintInterval *pci = PciIntervalFromScalarExpr(
+		mp, (*pexpr)[0], colref, infer_nulls_as, access_method);
 	for (ULONG ul = 1; ul < arity; ul++)
 	{
-		CConstraintInterval *pciChild =
-			PciIntervalFromScalarExpr(mp, (*pexpr)[ul], colref, infer_nulls_as);
+		CConstraintInterval *pciChild = PciIntervalFromScalarExpr(
+			mp, (*pexpr)[ul], colref, infer_nulls_as, access_method);
 		// here is where we will return a NULL child from not being able to create a
 		// CConstraint interval from the ScalarExpr
 		if (nullptr != pciChild && nullptr != pci)
@@ -1246,12 +1457,30 @@ CConstraintInterval::PciUnbounded(CMemoryPool *mp, const CColRef *colref,
 	}
 
 	mdid->AddRef();
-	CRange *prange = GPOS_NEW(mp) CRange(
-		mdid, COptCtxt::PoctxtFromTLS()->Pcomp(), nullptr /*ppointLeft*/,
-		CRange::EriExcluded, nullptr /*ppointRight*/, CRange::EriExcluded);
 
 	CRangeArray *pdrgprng = GPOS_NEW(mp) CRangeArray(mp);
-	pdrgprng->Append(prange);
+	if (colref->RetrieveType()->GetDatumType() == IMDType::EtiBool)
+	{
+		// valid boolean constraint values must map in the range [0, 1]
+		CMDAccessor *md_accessor = COptCtxt::PoctxtFromTLS()->Pmda();
+		const IMDTypeBool *pmdtypebool = md_accessor->PtMDType<IMDTypeBool>();
+		CRange *prange = GPOS_NEW(mp)
+			CRange(mdid, COptCtxt::PoctxtFromTLS()->Pcomp(),
+				   pmdtypebool->CreateBoolDatum(
+					   mp, false, false /*is_null*/) /*ppointLeft*/,
+				   CRange::EriIncluded,
+				   pmdtypebool->CreateBoolDatum(
+					   mp, true, false /*is_null*/) /*ppointRight*/,
+				   CRange::EriIncluded);
+		pdrgprng->Append(prange);
+	}
+	else
+	{
+		CRange *prange = GPOS_NEW(mp) CRange(
+			mdid, COptCtxt::PoctxtFromTLS()->Pcomp(), nullptr /*ppointLeft*/,
+			CRange::EriExcluded, nullptr /*ppointRight*/, CRange::EriExcluded);
+		pdrgprng->Append(prange);
+	}
 
 	return GPOS_NEW(mp)
 		CConstraintInterval(mp, colref, pdrgprng, fIncludesNull);

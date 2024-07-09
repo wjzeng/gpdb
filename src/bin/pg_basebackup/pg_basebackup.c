@@ -94,6 +94,7 @@ static int	compresslevel = 0;
 static IncludeWal includewal = STREAM_WAL;
 static bool fastcheckpoint = false;
 static bool writerecoveryconf = false;
+static bool writeconffilesonly = false;
 static bool do_sync = true;
 static int	standby_message_timeout = 10 * 1000;	/* 10 sec = default */
 static pg_time_t last_progress_report = 0;
@@ -119,6 +120,9 @@ static char *excludes[MAX_EXCLUDE];
 static int	num_exclude_from = 0;
 static char *excludefroms[MAX_EXCLUDE];
 static int target_gp_dbid = 0;
+
+/* GUC */
+static char *log_directory = NULL;
 
 /* Progress counters */
 static uint64 totalsize;
@@ -149,10 +153,12 @@ static PQExpBuffer recoveryconfcontents = NULL;
 /* Function headers */
 static void usage(void);
 static void verify_dir_is_empty_or_create(char *dirname, bool *created, bool *found);
-static void progress_report(int tablespacenum, const char *filename, bool force);
+static void progress_report(int tablespacenum, const char *filename, bool force,
+							bool finished);
 
 static void ReceiveTarFile(PGconn *conn, PGresult *res, int rownum);
 static void ReceiveAndUnpackTarFile(PGconn *conn, PGresult *res, int rownum);
+static void GetLogDirectory(PGconn *conn);
 static void BaseBackup(void);
 
 static bool reached_end_position(XLogRecPtr segendpos, uint32 timeline,
@@ -161,6 +167,8 @@ static bool reached_end_position(XLogRecPtr segendpos, uint32 timeline,
 static const char *get_tablespace_mapping(const char *dir);
 static void tablespace_list_append(const char *arg);
 static void WriteInternalConfFile(void);
+
+static char *run_simple_query(PGconn *conn, const char *sql);
 
 static void
 cleanup_directories_atexit(void)
@@ -338,6 +346,8 @@ usage(void)
 			 "                         (in kB/s, or use suffix \"k\" or \"M\")\n"));
 	printf(_("  -R, --write-recovery-conf\n"
 			 "                         write configuration for replication\n"));
+	printf(_("  -o, --write-conf-files-only\n"
+			 "                         write configuration files only\n"));
 	printf(_("  -T, --tablespace-mapping=OLDDIR=NEWDIR\n"
 			 "                         relocate tablespace in OLDDIR to NEWDIR\n"));
 	printf(_("      --waldir=WALDIR    location for the write-ahead log directory\n"));
@@ -494,15 +504,18 @@ LogStreamerMain(logstreamer_param *param)
 #endif
 	stream.standby_message_timeout = standby_message_timeout;
 	stream.synchronous = false;
-	stream.do_sync = do_sync;
+	/* fsync happens at the end of pg_basebackup for all data */
+	stream.do_sync = false;
 	stream.mark_done = true;
 	stream.partial_suffix = NULL;
 	stream.replication_slot = replication_slot;
 
 	if (format == 'p')
-		stream.walmethod = CreateWalDirectoryMethod(param->xlog, 0, do_sync);
+		stream.walmethod = CreateWalDirectoryMethod(param->xlog, 0,
+													stream.do_sync);
 	else
-		stream.walmethod = CreateWalTarMethod(param->xlog, compresslevel, do_sync);
+		stream.walmethod = CreateWalTarMethod(param->xlog, compresslevel,
+											  stream.do_sync);
 
 	if (!ReceiveXlogStream(param->bgconn, &stream))
 
@@ -720,11 +733,15 @@ verify_dir_is_empty_or_create(char *dirname, bool *created, bool *found)
  * Print a progress report based on the global variables. If verbose output
  * is enabled, also print the current file name.
  *
- * Progress report is written at maximum once per second, unless the
- * force parameter is set to true.
+ * Progress report is written at maximum once per second, unless the force
+ * parameter is set to true.
+ *
+ * If finished is set to true, this is the last progress report. The cursor
+ * is moved to the next line.
  */
 static void
-progress_report(int tablespacenum, const char *filename, bool force)
+progress_report(int tablespacenum, const char *filename,
+				bool force, bool finished)
 {
 	int			percent;
 	char		totaldone_str[32];
@@ -735,7 +752,7 @@ progress_report(int tablespacenum, const char *filename, bool force)
 		return;
 
 	now = time(NULL);
-	if (now == last_progress_report && !force)
+	if (now == last_progress_report && !force && !finished)
 		return;					/* Max once per second */
 
 	last_progress_report = now;
@@ -806,10 +823,11 @@ progress_report(int tablespacenum, const char *filename, bool force)
 				totaldone_str, totalsize_str, percent,
 				tablespacenum, tablespacecount);
 
-	if (isatty(fileno(stderr)))
-		fprintf(stderr, "\r");
-	else
-		fprintf(stderr, "\n");
+	/*
+	 * Stay on the same line if reporting to a terminal and we're not done
+	 * yet.
+	 */
+	fputc((!finished && isatty(fileno(stderr))) ? '\r' : '\n', stderr);
 }
 
 static int32
@@ -906,8 +924,12 @@ writeTarData(
 #ifdef HAVE_LIBZ
 	if (ztarfile != NULL)
 	{
+		errno = 0;
 		if (gzwrite(ztarfile, buf, r) != r)
 		{
+			/* if write didn't set errno, assume problem is no disk space */
+			if (errno == 0)
+				errno = ENOSPC;
 			pg_log_error("could not write to compressed file \"%s\": %s",
 						 current_file, get_gz_error(ztarfile));
 			exit(1);
@@ -916,8 +938,12 @@ writeTarData(
 	else
 #endif
 	{
+		errno = 0;
 		if (fwrite(buf, r, 1, tarfile) != 1)
 		{
+			/* if write didn't set errno, assume problem is no disk space */
+			if (errno == 0)
+				errno = ENOSPC;
 			pg_log_error("could not write to file \"%s\": %m", current_file);
 			exit(1);
 		}
@@ -1145,7 +1171,12 @@ ReceiveTarFile(PGconn *conn, PGresult *res, int rownum)
 									time(NULL));
 
 					WRITE_TAR_DATA(header, sizeof(header));
-					WRITE_TAR_DATA(zerobuf, 511);
+
+					/*
+					 * we don't need to pad out to a multiple of the tar block
+					 * size here, because the file is zero length, which is a
+					 * multiple of any block size.
+					 */
 				}
 			}
 
@@ -1155,10 +1186,11 @@ ReceiveTarFile(PGconn *conn, PGresult *res, int rownum)
 #ifdef HAVE_LIBZ
 			if (ztarfile != NULL)
 			{
+				errno = 0;		/* in case gzclose() doesn't set it */
 				if (gzclose(ztarfile) != 0)
 				{
-					pg_log_error("could not close compressed file \"%s\": %s",
-								 filename, get_gz_error(ztarfile));
+					pg_log_error("could not close compressed file \"%s\": %m",
+								 filename);
 					exit(1);
 				}
 			}
@@ -1356,16 +1388,17 @@ ReceiveTarFile(PGconn *conn, PGresult *res, int rownum)
 			}
 		}
 		totaldone += r;
-		progress_report(rownum, filename, false);
+		progress_report(rownum, filename, false, false);
 	}							/* while (1) */
-	progress_report(rownum, filename, true);
+	progress_report(rownum, filename, true, false);
 
 	if (copybuf != NULL)
 		PQfreemem(copybuf);
 
-	/* sync the resulting tar file, errors are not considered fatal */
-	if (do_sync && strcmp(basedir, "-") != 0)
-		(void) fsync_fname(filename, false);
+	/*
+	 * Do not sync the resulting tar file yet, all files are synced once at
+	 * the end.
+	 */
 }
 
 
@@ -1412,6 +1445,7 @@ ReceiveAndUnpackTarFile(PGconn *conn, PGresult *res, int rownum)
 	bool		basetablespace;
 	char	   *copybuf = NULL;
 	FILE	   *file = NULL;
+	char		log_directory_path[MAXPGPATH];
 
 	basetablespace = PQgetisnull(res, rownum, 0);
 	if (basetablespace)
@@ -1555,10 +1589,12 @@ ReceiveAndUnpackTarFile(PGconn *conn, PGresult *res, int rownum)
 						 * streammode was used then it may have already copied
 						 * new xlog files into pg_xlog directory.
 						 */
+						snprintf(log_directory_path, sizeof(log_directory_path), "/%s", log_directory);
 						if (pg_str_endswith(filename, "/pg_log") ||
 							pg_str_endswith(filename, "/log") ||
 							pg_str_endswith(filename, "/pg_wal") ||
-							pg_str_endswith(filename, "/pg_xlog"))
+							pg_str_endswith(filename, "/pg_xlog") ||
+							pg_str_endswith(filename, log_directory_path))
 							continue;
 
 						rmtree(filename, true);
@@ -1686,13 +1722,17 @@ ReceiveAndUnpackTarFile(PGconn *conn, PGresult *res, int rownum)
 				continue;
 			}
 
+			errno = 0;
 			if (fwrite(copybuf, r, 1, file) != 1)
 			{
+				/* if write didn't set errno, assume problem is no disk space */
+				if (errno == 0)
+					errno = ENOSPC;
 				pg_log_error("could not write to file \"%s\": %m", filename);
 				exit(1);
 			}
 			totaldone += r;
-			progress_report(rownum, filename, false);
+			progress_report(rownum, filename, false, false);
 
 			current_len_left -= r;
 			if (current_len_left == 0 && current_padding == 0)
@@ -1708,7 +1748,7 @@ ReceiveAndUnpackTarFile(PGconn *conn, PGresult *res, int rownum)
 			}
 		}						/* continuing data in existing file */
 	}							/* loop over all data blocks */
-	progress_report(rownum, filename, true);
+	progress_report(rownum, filename, true, false);
 
 	if (file != NULL)
 	{
@@ -1798,11 +1838,17 @@ build_exclude_list(void)
 
 	if (PQExpBufferDataBroken(buf))
 	{
-		pg_log_error("out of memory\n");
+		pg_log_error("out of memory");
 		exit(1);
 	}
 
 	return buf.data;
+}
+
+static void
+GetLogDirectory(PGconn *conn)
+{
+	log_directory = run_simple_query(conn, "SHOW log_directory");
 }
 
 static void
@@ -1986,7 +2032,7 @@ BaseBackup(void)
 			char	   *path = unconstify(char *, get_tablespace_mapping(PQgetvalue(res, i, 1)));
 			char path_with_subdir[MAXPGPATH];
 
-			sprintf(path_with_subdir, "%s/%d/%s", path, target_gp_dbid, GP_TABLESPACE_VERSION_DIRECTORY);
+			snprintf(path_with_subdir, MAXPGPATH, "%s/%d/%s", path, target_gp_dbid, GP_TABLESPACE_VERSION_DIRECTORY);
 
 			verify_dir_is_empty_or_create(path_with_subdir, &made_tablespace_dirs, &found_tablespace_dirs);
 		}
@@ -2041,11 +2087,7 @@ BaseBackup(void)
 	}							/* Loop over all tablespaces */
 
 	if (showprogress)
-	{
-		progress_report(PQntuples(res), NULL, true);
-		if (isatty(fileno(stderr)))
-			fprintf(stderr, "\n");	/* Need to move to next line */
-	}
+		progress_report(PQntuples(res), NULL, true, true);
 
 	PQclear(res);
 
@@ -2185,9 +2227,9 @@ BaseBackup(void)
 
 	/*
 	 * Make data persistent on disk once backup is completed. For tar format
-	 * once syncing the parent directory is fine, each tar file created per
-	 * tablespace has been already synced. In plain format, all the data of
-	 * the base directory is synced, taking into account all the tablespaces.
+	 * sync the parent directory and all its contents as each tar file was not
+	 * synced after being completed.  In plain format, all the data of the
+	 * base directory is synced, taking into account all the tablespaces.
 	 * Errors are not considered fatal.
 	 */
 	if (do_sync)
@@ -2197,7 +2239,7 @@ BaseBackup(void)
 		if (format == 't')
 		{
 			if (strcmp(basedir, "-") != 0)
-				(void) fsync_fname(basedir, true);
+				(void) fsync_dir_recurse(basedir);
 		}
 		else
 		{
@@ -2222,6 +2264,7 @@ main(int argc, char **argv)
 		{"create-slot", no_argument, NULL, 'C'},
 		{"max-rate", required_argument, NULL, 'r'},
 		{"write-recovery-conf", no_argument, NULL, 'R'},
+		{"write-conf-files-only", no_argument, NULL, 'o'},
 		{"slot", required_argument, NULL, 'S'},
 		{"tablespace-mapping", required_argument, NULL, 'T'},
 		{"wal-method", required_argument, NULL, 'X'},
@@ -2275,7 +2318,7 @@ main(int argc, char **argv)
 	num_exclude_from = 0;
 	atexit(cleanup_directories_atexit);
 
-	while ((c = getopt_long(argc, argv, "CD:F:r:RT:xX:l:zZ:d:c:h:p:U:s:S:wWvPE:",
+	while ((c = getopt_long(argc, argv, "CD:F:o:r:RT:xX:l:zZ:d:c:h:p:U:s:S:wWvPE:",
 							long_options, &option_index)) != -1)
 	{
 		switch (c)
@@ -2293,10 +2336,13 @@ main(int argc, char **argv)
 					format = 't';
 				else
 				{
-					pg_log_error("invalid output format \"%s\", must be \"plain\" or \"tar\"\n",
+					pg_log_error("invalid output format \"%s\", must be \"plain\" or \"tar\"",
 								 optarg);
 					exit(1);
 				}
+				break;
+			case 'o':
+				writeconffilesonly = true;
 				break;
 			case 'r':
 				maxrate = parse_max_rate(optarg);
@@ -2365,7 +2411,7 @@ main(int argc, char **argv)
 				compresslevel = atoi(optarg);
 				if (compresslevel < 0 || compresslevel > 9)
 				{
-					pg_log_error("invalid compression level \"%s\"\n", optarg);
+					pg_log_error("invalid compression level \"%s\"", optarg);
 					exit(1);
 				}
 				break;
@@ -2565,6 +2611,25 @@ main(int argc, char **argv)
 		}
 	}
 
+	if (writeconffilesonly)
+	{
+		if(create_slot)
+		{
+			pg_log_error("--create_slot cannot be used with --write-conf-files-only");
+			fprintf(stderr, _("Try \"%s --help\" for more information.\n"),
+					progname);
+			exit(1);
+		}
+
+		if(writerecoveryconf)
+		{
+			pg_log_error("--write-recovery-conf cannot be used with --write-conf-files-only");
+			fprintf(stderr, _("Try \"%s --help\" for more information.\n"),
+					progname);
+			exit(1);
+		}
+	}
+
 #ifndef HAVE_LIBZ
 	if (compresslevel != 0)
 	{
@@ -2581,6 +2646,17 @@ main(int argc, char **argv)
 		exit(1);
 	}
 	atexit(disconnect_atexit);
+
+	/* To only write recovery.conf and internal.auto.conf files,
+	   one of the usecase is gprecoverseg differential recovery (there can be others in future)
+	*/
+	if (writeconffilesonly)
+	{
+		WriteInternalConfFile();
+		WriteRecoveryConfig(conn, basedir, GenerateRecoveryConfig(conn, replication_slot));
+		success = true;
+		return 0;
+	}
 
 	/*
 	 * Set umask so that directories/files are created with the same
@@ -2642,6 +2718,8 @@ main(int argc, char **argv)
 		free(linkloc);
 	}
 
+	GetLogDirectory(conn);
+
 	BaseBackup();
 
 	success = true;
@@ -2674,4 +2752,27 @@ WriteInternalConfFile(void)
 	}
 
 	fclose(cf);
+}
+
+static char *
+run_simple_query(PGconn *conn, const char *sql)
+{
+	PGresult   *res;
+	char	   *result;
+
+	res = PQexec(conn, sql);
+
+	if (PQresultStatus(res) != PGRES_TUPLES_OK)
+		pg_log_error("error running query (%s) in source server: %s",
+				 sql, PQresultErrorMessage(res));
+
+	/* sanity check the result set */
+	if (PQnfields(res) != 1 || PQntuples(res) != 1 || PQgetisnull(res, 0, 0))
+		pg_log_error("unexpected result set from query");
+
+	result = pg_strdup(PQgetvalue(res, 0, 0));
+
+	PQclear(res);
+
+	return result;
 }

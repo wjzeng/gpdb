@@ -1,0 +1,11 @@
+-- start_ignore
+\! gpconfig -c gp_resource_manager -v none
+20230110:23:11:33:399571 gpconfig:ubuntu:gpadmin-[INFO]:-completed successfully with parameters '-c gp_resource_manager -v none'
+-- end_ignore
+\! echo $?
+0
+-- start_ignore
+\! gpstop -raf
+-- end_ignore
+\! echo $?
+0

@@ -82,19 +82,19 @@ CPredicateUtilsTest::EresUnittest_Conjunctions()
 	// break into conjuncts
 	CExpressionArray *pdrgpexprExtract =
 		CPredicateUtils::PdrgpexprConjuncts(mp, pexprConjunction);
-	GPOS_ASSERT(pdrgpexprExtract->Size() == ulConjs);
+	GPOS_UNITTEST_ASSERT(pdrgpexprExtract->Size() == ulConjs);
 
 	// collapse into single conjunct
 	CExpression *pexpr =
 		CPredicateUtils::PexprConjunction(mp, pdrgpexprExtract);
-	GPOS_ASSERT(nullptr != pexpr);
-	GPOS_ASSERT(CUtils::FScalarConstTrue(pexpr));
+	GPOS_UNITTEST_ASSERT(nullptr != pexpr);
+	GPOS_UNITTEST_ASSERT(CUtils::FScalarConstTrue(pexpr));
 	pexpr->Release();
 
 	// collapse empty input array to conjunct
 	CExpression *pexprSingleton =
 		CPredicateUtils::PexprConjunction(mp, nullptr /*pdrgpexpr*/);
-	GPOS_ASSERT(nullptr != pexprSingleton);
+	GPOS_UNITTEST_ASSERT(nullptr != pexprSingleton);
 	pexprSingleton->Release();
 
 	pexprConjunction->Release();
@@ -113,7 +113,7 @@ CPredicateUtilsTest::EresUnittest_Conjunctions()
 	CExpression *pexprConj =
 		CPredicateUtils::PexprConjunction(mp, pexprCmp1, pexprCmp2);
 	pdrgpexprExtract = CPredicateUtils::PdrgpexprConjuncts(mp, pexprConj);
-	GPOS_ASSERT(2 == pdrgpexprExtract->Size());
+	GPOS_UNITTEST_ASSERT(2 == pdrgpexprExtract->Size());
 	pdrgpexprExtract->Release();
 
 	pexprCmp1->Release();
@@ -161,19 +161,19 @@ CPredicateUtilsTest::EresUnittest_Disjunctions()
 	// break into disjuncts
 	CExpressionArray *pdrgpexprExtract =
 		CPredicateUtils::PdrgpexprDisjuncts(mp, pexprDisjunction);
-	GPOS_ASSERT(pdrgpexprExtract->Size() == ulDisjs);
+	GPOS_UNITTEST_ASSERT(pdrgpexprExtract->Size() == ulDisjs);
 
 	// collapse into single disjunct
 	CExpression *pexpr =
 		CPredicateUtils::PexprDisjunction(mp, pdrgpexprExtract);
-	GPOS_ASSERT(nullptr != pexpr);
-	GPOS_ASSERT(CUtils::FScalarConstFalse(pexpr));
+	GPOS_UNITTEST_ASSERT(nullptr != pexpr);
+	GPOS_UNITTEST_ASSERT(CUtils::FScalarConstFalse(pexpr));
 	pexpr->Release();
 
 	// collapse empty input array to disjunct
 	CExpression *pexprSingleton =
 		CPredicateUtils::PexprDisjunction(mp, nullptr /*pdrgpexpr*/);
-	GPOS_ASSERT(nullptr != pexprSingleton);
+	GPOS_UNITTEST_ASSERT(nullptr != pexprSingleton);
 	pexprSingleton->Release();
 
 	pexprDisjunction->Release();
@@ -184,21 +184,21 @@ CPredicateUtilsTest::EresUnittest_Disjunctions()
 	CColRefSetIter crsi(*pcrs);
 
 	BOOL fAdvance GPOS_ASSERTS_ONLY = crsi.Advance();
-	GPOS_ASSERT(fAdvance);
+	GPOS_UNITTEST_ASSERT(fAdvance);
 	CColRef *pcr1 = crsi.Pcr();
 
 #ifdef GPOS_DEBUG
 	fAdvance =
 #endif
 		crsi.Advance();
-	GPOS_ASSERT(fAdvance);
+	GPOS_UNITTEST_ASSERT(fAdvance);
 	CColRef *pcr2 = crsi.Pcr();
 
 #ifdef GPOS_DEBUG
 	fAdvance =
 #endif
 		crsi.Advance();
-	GPOS_ASSERT(fAdvance);
+	GPOS_UNITTEST_ASSERT(fAdvance);
 	CColRef *pcr3 = crsi.Pcr();
 
 	CExpression *pexprCmp1 =
@@ -211,7 +211,7 @@ CPredicateUtilsTest::EresUnittest_Disjunctions()
 		CExpression *pexprDisj =
 			CPredicateUtils::PexprDisjunction(mp, pexprCmp1, pexprCmp2);
 		pdrgpexprExtract = CPredicateUtils::PdrgpexprDisjuncts(mp, pexprDisj);
-		GPOS_ASSERT(2 == pdrgpexprExtract->Size());
+		GPOS_UNITTEST_ASSERT(2 == pdrgpexprExtract->Size());
 		pdrgpexprExtract->Release();
 		pexprDisj->Release();
 	}
@@ -235,7 +235,7 @@ CPredicateUtilsTest::EresUnittest_Disjunctions()
 		CExpression *pexprDisj =
 			CPredicateUtils::PexprDisjunction(mp, pdrgpexpr);
 		pdrgpexprExtract = CPredicateUtils::PdrgpexprDisjuncts(mp, pexprDisj);
-		GPOS_ASSERT(4 == pdrgpexprExtract->Size());
+		GPOS_UNITTEST_ASSERT(4 == pdrgpexprExtract->Size());
 		pdrgpexprExtract->Release();
 		pexprDisj->Release();
 	}
@@ -292,7 +292,7 @@ CPredicateUtilsTest::EresUnittest_PlainEqualities()
 	// generate a non-equality predicate between two column reference
 	CExpression *pexprScIdentInequality = CUtils::PexprScalarCmp(
 		mp, pcrLeft, pcrRight, CWStringConst(GPOS_WSZ_LIT("<")),
-		GPOS_NEW(mp) CMDIdGPDB(GPDB_INT4_LT_OP));
+		GPOS_NEW(mp) CMDIdGPDB(IMDId::EmdidGeneral, GPDB_INT4_LT_OP));
 
 	pexprScIdentInequality->AddRef();
 	pdrgpexprOriginal->Append(pexprScIdentInequality);
@@ -305,12 +305,12 @@ CPredicateUtilsTest::EresUnittest_PlainEqualities()
 
 	pdrgpexprOriginal->Append(pexprScIdentConstEquality);
 
-	GPOS_ASSERT(3 == pdrgpexprOriginal->Size());
+	GPOS_UNITTEST_ASSERT(3 == pdrgpexprOriginal->Size());
 
 	CExpressionArray *pdrgpexprResult =
 		CPredicateUtils::PdrgpexprPlainEqualities(mp, pdrgpexprOriginal);
 
-	GPOS_ASSERT(1 == pdrgpexprResult->Size());
+	GPOS_UNITTEST_ASSERT(1 == pdrgpexprResult->Size());
 
 	// clean up
 	pdrgpexprOriginal->Release();
@@ -348,7 +348,8 @@ CPredicateUtilsTest::EresUnittest_Implication()
 
 	// generate a two cascaded joins
 	CWStringConst strName1(GPOS_WSZ_LIT("Rel1"));
-	CMDIdGPDB *pmdid1 = GPOS_NEW(mp) CMDIdGPDB(GPOPT_TEST_REL_OID1, 1, 1);
+	CMDIdGPDB *pmdid1 =
+		GPOS_NEW(mp) CMDIdGPDB(IMDId::EmdidRel, GPOPT_TEST_REL_OID1, 1, 1);
 	CTableDescriptor *ptabdesc1 =
 		CTestUtils::PtabdescCreate(mp, 3, pmdid1, CName(&strName1));
 	CWStringConst strAlias1(GPOS_WSZ_LIT("Rel1"));
@@ -356,7 +357,8 @@ CPredicateUtilsTest::EresUnittest_Implication()
 		CTestUtils::PexprLogicalGet(mp, ptabdesc1, &strAlias1);
 
 	CWStringConst strName2(GPOS_WSZ_LIT("Rel2"));
-	CMDIdGPDB *pmdid2 = GPOS_NEW(mp) CMDIdGPDB(GPOPT_TEST_REL_OID2, 1, 1);
+	CMDIdGPDB *pmdid2 =
+		GPOS_NEW(mp) CMDIdGPDB(IMDId::EmdidRel, GPOPT_TEST_REL_OID2, 1, 1);
 	CTableDescriptor *ptabdesc2 =
 		CTestUtils::PtabdescCreate(mp, 3, pmdid2, CName(&strName2));
 	CWStringConst strAlias2(GPOS_WSZ_LIT("Rel2"));
@@ -364,7 +366,8 @@ CPredicateUtilsTest::EresUnittest_Implication()
 		CTestUtils::PexprLogicalGet(mp, ptabdesc2, &strAlias2);
 
 	CWStringConst strName3(GPOS_WSZ_LIT("Rel3"));
-	CMDIdGPDB *pmdid3 = GPOS_NEW(mp) CMDIdGPDB(GPOPT_TEST_REL_OID3, 1, 1);
+	CMDIdGPDB *pmdid3 =
+		GPOS_NEW(mp) CMDIdGPDB(IMDId::EmdidRel, GPOPT_TEST_REL_OID3, 1, 1);
 	CTableDescriptor *ptabdesc3 =
 		CTestUtils::PtabdescCreate(mp, 3, pmdid3, CName(&strName3));
 	CWStringConst strAlias3(GPOS_WSZ_LIT("Rel3"));
@@ -412,8 +415,8 @@ CPredicateUtilsTest::EresUnittest_Implication()
 	CExpressionArray *pdrgpexprNewConjuncts =
 		CPredicateUtils::PdrgpexprConjuncts(mp, pexprMinimizedPred);
 
-	GPOS_ASSERT(pdrgpexprNewConjuncts->Size() <
-				pdrgpexprOriginalConjuncts->Size());
+	GPOS_UNITTEST_ASSERT(pdrgpexprNewConjuncts->Size() <
+						 pdrgpexprOriginalConjuncts->Size());
 
 	// clean up
 	pdrgpexprOriginalConjuncts->Release();

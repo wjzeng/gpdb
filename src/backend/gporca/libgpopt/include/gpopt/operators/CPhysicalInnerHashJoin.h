@@ -55,7 +55,9 @@ public:
 	CPhysicalInnerHashJoin(CMemoryPool *mp,
 						   CExpressionArray *pdrgpexprOuterKeys,
 						   CExpressionArray *pdrgpexprInnerKeys,
-						   IMdIdArray *hash_opfamilies = nullptr);
+						   IMdIdArray *hash_opfamilies,
+						   BOOL is_null_aware = true,
+						   CXform::EXformId origin_xform = CXform::ExfSentinel);
 
 	// dtor
 	~CPhysicalInnerHashJoin() override;
@@ -88,6 +90,13 @@ public:
 	CDistributionSpec *PdsDerive(CMemoryPool *mp,
 								 CExpressionHandle &exprhdl) const override;
 
+	CPartitionPropagationSpec *PppsRequired(
+		CMemoryPool *mp, CExpressionHandle &exprhdl,
+		CPartitionPropagationSpec *pppsRequired, ULONG child_index,
+		CDrvdPropArray *pdrgpdpCtxt, ULONG ulOptReq) const override;
+
+	CPartitionPropagationSpec *PppsDerive(
+		CMemoryPool *mp, CExpressionHandle &exprhdl) const override;
 };	// class CPhysicalInnerHashJoin
 
 }  // namespace gpopt

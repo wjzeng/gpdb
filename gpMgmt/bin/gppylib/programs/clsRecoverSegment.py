@@ -19,20 +19,20 @@
 from gppylib.mainUtils import *
 
 from optparse import OptionGroup
-import os, sys, signal, time
+import glob, os, sys, signal, shutil, time, re
 from contextlib import closing
 
 from gppylib import gparray, gplog, userinput, utils
 from gppylib.util import gp_utils
 from gppylib.commands import gp, pg, unix
-from gppylib.commands.base import Command, WorkerPool
+from gppylib.commands.base import Command, WorkerPool, REMOTE
 from gppylib.db import dbconn
 from gppylib.gpparseopts import OptParser, OptChecker
-from gppylib.operations.detect_unreachable_hosts import get_unreachable_segment_hosts
+from gppylib.operations.detect_unreachable_hosts import get_unreachable_segment_hosts, update_unreachable_flag_for_segments
 from gppylib.operations.startSegments import *
 from gppylib.operations.buildMirrorSegments import *
 from gppylib.operations.rebalanceSegments import GpSegmentRebalanceOperation
-from gppylib.operations.update_pg_hba_conf import config_primaries_for_replication
+from gppylib.operations.update_pg_hba_on_segments import update_pg_hba_on_segments
 from gppylib.programs import programIoUtils
 from gppylib.system import configurationInterface as configInterface
 from gppylib.system.environment import GpCoordinatorEnvironment
@@ -42,79 +42,13 @@ from gppylib.operations.utils import ParallelOperation
 from gppylib.operations.package import SyncPackages
 from gppylib.heapchecksum import HeapChecksum
 from gppylib.mainUtils import ExceptionNoStackTraceNeeded
+from gppylib.programs.clsRecoverSegment_triples import RecoveryTripletsFactory
 
 logger = gplog.get_default_logger()
 
-
-class PortAssigner:
-    """
-    Used to assign new ports to segments on a host
-
-    Note that this could be improved so that we re-use ports for segments that are being recovered but this
-      does not seem necessary.
-
-    """
-
-    MAX_PORT_EXCLUSIVE = 65536
-
-    def __init__(self, gpArray):
-        #
-        # determine port information for recovering to a new host --
-        #   we need to know the ports that are in use and the valid range of ports
-        #
-        segments = gpArray.getDbList()
-        ports = [seg.getSegmentPort() for seg in segments if seg.isSegmentQE()]
-        if len(ports) > 0:
-            self.__minPort = min(ports)
-        else:
-            raise Exception("No segment ports found in array.")
-        self.__usedPortsByHostName = {}
-
-        byHost = GpArray.getSegmentsByHostName(segments)
-        for hostName, segments in byHost.items():
-            usedPorts = self.__usedPortsByHostName[hostName] = {}
-            for seg in segments:
-                usedPorts[seg.getSegmentPort()] = True
-
-    def findAndReservePort(self, hostName, address):
-        """
-        Find a port not used by any postmaster process.
-        When found, add an entry:  usedPorts[port] = True   and return the port found
-        Otherwise raise an exception labeled with the given address
-        """
-        if hostName not in self.__usedPortsByHostName:
-            self.__usedPortsByHostName[hostName] = {}
-        usedPorts = self.__usedPortsByHostName[hostName]
-
-        minPort = self.__minPort
-        for port in range(minPort, PortAssigner.MAX_PORT_EXCLUSIVE):
-            if port not in usedPorts:
-                usedPorts[port] = True
-                return port
-        raise Exception("Unable to assign port on %s" % address)
-
-
-# -------------------------------------------------------------------------
-
-class RemoteQueryCommand(Command):
-    def __init__(self, qname, query, hostname, port, dbname=None):
-        self.qname = qname
-        self.query = query
-        self.hostname = hostname
-        self.port = port
-        self.dbname = dbname or os.environ.get('PGDATABASE', None) or 'template1'
-        self.res = None
-
-    def get_results(self):
-        return self.res
-
-    def run(self):
-        logger.debug('Executing query (%s:%s) for segment (%s:%s) on database (%s)' % (
-            self.qname, self.query, self.hostname, self.port, self.dbname))
-        with closing(dbconn.connect(dbconn.DbURL(hostname=self.hostname, port=self.port, dbname=self.dbname),
-                            utility=True)) as conn:
-            self.res = dbconn.query(conn, self.query).fetchall()
-# -------------------------------------------------------------------------
+# Upper bound and lower bound for max-rate
+MAX_RATE_LOWER = 32
+MAX_RATE_UPPER = 1048576
 
 class GpRecoverSegmentProgram:
     #
@@ -126,6 +60,7 @@ class GpRecoverSegmentProgram:
         self.__options = options
         self.__pool = None
         self.logger = logger
+        self.termination_requested = False
 
         # If user did not specify a value for showProgressInplace and
         # stdout is a tty then send escape sequences to gprecoverseg
@@ -149,12 +84,24 @@ class GpRecoverSegmentProgram:
     def outputToFile(self, mirrorBuilder, gpArray, fileName):
         lines = []
 
+        # Entry for a failed segment will be commented if failed segment host is unreachable to inform the user about
+        # those unreachable hosts. As we know gprecoverseg skips the recovery of a segment if host is unreachable so if
+        # the user wants to recover it to another host, they can do so by uncommenting the line and adding the
+        # failover details.
+        lines.append("# If any entry is commented, please know that it belongs to failed segment which is unreachable."
+                     "\n# If you need to recover them, please modify the segment entry and add failover details "
+                     "\n# (failed_addresss|failed_port|failed_dataDirectory<space>failover_addresss|failover_port|failover_dataDirectory) "
+                     "to recover it to another host.\n")
+
         # one entry for each failure
         for mirror in mirrorBuilder.getMirrorsToBuild():
             output_str = ""
             seg = mirror.getFailedSegment()
             addr = canonicalize_address(seg.getSegmentAddress())
             output_str += ('%s|%d|%s' % (addr, seg.getSegmentPort(), seg.getSegmentDataDirectory()))
+            if seg.unreachable:
+                # Entry is commented if failed segment host is unreachable
+                output_str = "#{}".format(output_str)
 
             seg = mirror.getFailoverSegment()
             if seg is not None:
@@ -167,280 +114,31 @@ class GpRecoverSegmentProgram:
             lines.append(output_str)
         writeLinesToFile(fileName, lines)
 
-    def _getParsedRow(self, filename, lineno, line):
-        groups = line.split()  # NOT line.split(' ') due to MPP-15675
-        if len(groups) not in [1, 2]:
-            msg = "line %d of file %s: expected 1 or 2 groups but found %d" % (lineno, filename, len(groups))
-            raise ExceptionNoStackTraceNeeded(msg)
-        parts = groups[0].split('|')
-        if len(parts) != 3:
-            msg = "line %d of file %s: expected 3 parts on failed segment group, obtained %d" % (
-                lineno, filename, len(parts))
-            raise ExceptionNoStackTraceNeeded(msg)
-        address, port, datadir = parts
-        check_values(lineno, address=address, port=port, datadir=datadir)
-        row = {
-            'failedAddress': address,
-            'failedPort': port,
-            'failedDataDirectory': datadir,
-            'lineno': lineno
-        }
-        if len(groups) == 2:
-            parts2 = groups[1].split('|')
-            if len(parts2) != 3:
-                msg = "line %d of file %s: expected 3 parts on new segment group, obtained %d" % (
-                    lineno, filename, len(parts2))
-                raise ExceptionNoStackTraceNeeded(msg)
-            address2, port2, datadir2 = parts2
-            check_values(lineno, address=address2, port=port2, datadir=datadir2)
-            row.update({
-                'newAddress': address2,
-                'newPort': port2,
-                'newDataDirectory': datadir2
-            })
+    def getRecoveryActionsBasedOnOptions(self, gpEnv, gpArray):
+        if self.__options.rebalanceSegments:
+            return GpSegmentRebalanceOperation(gpEnv, gpArray, self.__options.parallelDegree, self.__options.parallelPerHost, self.__options.disableReplayLag, self.__options.replayLag)
 
-        return row
+        instance = RecoveryTripletsFactory.instance(gpArray, self.__options.recoveryConfigFile, self.__options.newRecoverHosts, self.__options.outputSampleConfigFile, self.__options.parallelDegree)
 
-    def getRecoveryActionsFromConfigFile(self, gpArray):
-        """
-        getRecoveryActionsFromConfigFile
-
-        returns: a tuple (segments in change tracking disabled mode which are unable to recover, GpMirrorListToBuild object
-                 containing information of segments which are able to recover)
-        """
-        filename = self.__options.recoveryConfigFile
-        rows = []
-        with open(filename) as f:
-            for lineno, line in line_reader(f):
-                rows.append(self._getParsedRow(filename, lineno, line))
-
-        allAddresses = [row["newAddress"] for row in rows if "newAddress" in row]
-
-        failedSegments = []
-        failoverSegments = []
-        for row in rows:
-            # find the failed segment
-            failedAddress = row['failedAddress']
-            failedPort = row['failedPort']
-            failedDataDirectory = normalizeAndValidateInputPath(row['failedDataDirectory'],
-                                                                "config file", row['lineno'])
-            failedSegment = None
-            for segment in gpArray.getDbList():
-                if (segment.getSegmentAddress() == failedAddress
-                        and str(segment.getSegmentPort()) == failedPort
-                        and segment.getSegmentDataDirectory() == failedDataDirectory):
-
-                    if failedSegment is not None:
-                        # this could be an assertion -- configuration should not allow multiple entries!
-                        raise Exception(("A segment to recover was found twice in configuration.  "
-                                         "This segment is described by address|port|directory '%s|%s|%s' "
-                                         "on the input line: %s") %
-                                        (failedAddress, failedPort, failedDataDirectory, row['lineno']))
-                    failedSegment = segment
-
-            if failedSegment is None:
-                raise Exception("A segment to recover was not found in configuration.  " \
-                                "This segment is described by address|port|directory '%s|%s|%s' on the input line: %s" %
-                                (failedAddress, failedPort, failedDataDirectory, row['lineno']))
-
-            failoverSegment = None
-            if "newAddress" in row:
-                """
-                When the second set was passed, the caller is going to tell us to where we need to failover, so
-                  build a failover segment
-                """
-                # these two lines make it so that failoverSegment points to the object that is registered in gparray
-                failoverSegment = failedSegment
-                failedSegment = failoverSegment.copy()
-
-                address = row["newAddress"]
-                try:
-                    port = int(row["newPort"])
-                except ValueError:
-                    raise Exception('Config file format error, invalid number value in line: %s' % (row['lineno']))
-
-                dataDirectory = normalizeAndValidateInputPath(row["newDataDirectory"], "config file",
-                                                              row['lineno'])
-                # FIXME: hostname probably should not be address, but to do so, "hostname" should be added to gpaddmirrors config file
-                # FIXME: This appears identical to __getMirrorsToBuildFromConfigFilein clsAddMirrors
-                hostName = address
-
-                # now update values in failover segment
-                failoverSegment.setSegmentAddress(address)
-                failoverSegment.setSegmentHostName(hostName)
-                failoverSegment.setSegmentPort(port)
-                failoverSegment.setSegmentDataDirectory(dataDirectory)
-
-            # this must come AFTER the if check above because failedSegment can be adjusted to
-            #   point to a different object
-            failedSegments.append(failedSegment)
-            failoverSegments.append(failoverSegment)
-
-        peersForFailedSegments = self.findAndValidatePeersForFailedSegments(gpArray, failedSegments)
-
-        segs = []
-        segs_with_persistent_mirroring_disabled = []
-        for index, failedSegment in enumerate(failedSegments):
-            peerForFailedSegment = peersForFailedSegments[index]
-
-            peerForFailedSegmentDbId = peerForFailedSegment.getSegmentDbId()
-
-            if failedSegment.unreachable:
-                continue
-
-            segs.append(GpMirrorToBuild(failedSegment, peerForFailedSegment, failoverSegments[index],
-                                        self.__options.forceFullResynchronization))
-
-        self._output_segments_with_persistent_mirroring_disabled(segs_with_persistent_mirroring_disabled)
-
-        return GpMirrorListToBuild(segs, self.__pool, self.__options.quiet,
-                                   self.__options.parallelDegree, forceoverwrite=True,
-                                   progressMode=self.getProgressMode())
-
-    def findAndValidatePeersForFailedSegments(self, gpArray, failedSegments):
-        dbIdToPeerMap = gpArray.getDbIdToPeerMap()
-        peersForFailedSegments = [dbIdToPeerMap.get(seg.getSegmentDbId()) for seg in failedSegments]
-
-        for i in range(len(failedSegments)):
-            peer = peersForFailedSegments[i]
-            if peer is None:
-                raise Exception("No peer found for dbid %s" % failedSegments[i].getSegmentDbId())
-            elif peer.isSegmentDown():
-                raise Exception(
-                    "Both segments for content %s are down; Try restarting Greenplum DB and running %s again." %
-                    (peer.getSegmentContentId(), getProgramName()))
-        return peersForFailedSegments
-
-    def getRecoveryActionsFromConfiguration(self, gpEnv, gpArray):
-        """
-        getRecoveryActionsFromConfiguration
-
-        returns: a tuple (segments in change tracking disabled mode which are unable to recover, GpMirrorListToBuild object
-                 containing information of segments which are able to recover)
-        """
-        segments = gpArray.getSegDbList()
-
-        failedSegments = [seg for seg in segments if seg.isSegmentDown()]
-        peersForFailedSegments = self.findAndValidatePeersForFailedSegments(gpArray, failedSegments)
-
-        # Dictionaries used for building mapping to new hosts
-        recoverAddressMap = {}
-        recoverHostMap = {}
-        interfaceHostnameWarnings = []
-
-        # Check if the array is a "standard" array
-        (isStandardArray, _ignore) = gpArray.isStandardArray()
-
-        recoverHostIdx = 0
-
-        if self.__options.newRecoverHosts and len(self.__options.newRecoverHosts) > 0:
-            for seg in failedSegments:
-                segAddress = seg.getSegmentAddress()
-                segHostname = seg.getSegmentHostName()
-
-                # Haven't seen this hostname before so we put it on a new host
-                if segHostname not in recoverHostMap:
-                    try:
-                        recoverHostMap[segHostname] = self.__options.newRecoverHosts[recoverHostIdx]
-                    except:
-                        # If we get here, not enough hosts were specified in the -p option.  Need 1 new host
-                        # per 1 failed host.
-                        raise Exception('Not enough new recovery hosts given for recovery.')
-                    recoverHostIdx += 1
-
-                if isStandardArray:
-                    # We have a standard array configuration, so we'll try to use the same
-                    # interface naming convention.  If this doesn't work, we'll correct it
-                    # below during ping failure
-                    segInterface = segAddress[segAddress.rfind('-'):]
-                    destAddress = recoverHostMap[segHostname] + segInterface
-                    destHostname = recoverHostMap[segHostname]
-                else:
-                    # Non standard configuration so we won't make assumptions on
-                    # naming.  Instead we'll use the hostname passed in for both
-                    # hostname and address and flag for warning later.
-                    destAddress = recoverHostMap[segHostname]
-                    destHostname = recoverHostMap[segHostname]
-
-                # Save off the new host/address for this address.
-                recoverAddressMap[segAddress] = (destHostname, destAddress)
-
-            for key in list(recoverAddressMap.keys()):
-                (newHostname, newAddress) = recoverAddressMap[key]
-                try:
-                    unix.Ping.local("ping new address", newAddress)
-                except:
-                    # new address created is invalid, so instead use same hostname for address
-                    self.logger.info("Ping of %s failed, Using %s for both hostname and address.", newAddress, newHostname)
-                    newAddress = newHostname
-                recoverAddressMap[key] = (newHostname, newAddress)
-
-            if len(self.__options.newRecoverHosts) != recoverHostIdx:
-                interfaceHostnameWarnings.append("The following recovery hosts were not needed:")
-                for h in self.__options.newRecoverHosts[recoverHostIdx:]:
-                    interfaceHostnameWarnings.append("\t%s" % h)
-
-        portAssigner = PortAssigner(gpArray)
-
-        forceFull = self.__options.forceFullResynchronization
-
-        segs = []
-        segs_with_persistent_mirroring_disabled = []
-        for i in range(len(failedSegments)):
-
-            failoverSegment = None
-            failedSegment = failedSegments[i]
-            liveSegment = peersForFailedSegments[i]
-
-            if self.__options.newRecoverHosts and len(self.__options.newRecoverHosts) > 0:
-                (newRecoverHost, newRecoverAddress) = recoverAddressMap[failedSegment.getSegmentAddress()]
-                # these two lines make it so that failoverSegment points to the object that is registered in gparray
-                failoverSegment = failedSegment
-                failedSegment = failoverSegment.copy()
-                failoverSegment.setSegmentHostName(newRecoverHost)
-                failoverSegment.setSegmentAddress(newRecoverAddress)
-                port = portAssigner.findAndReservePort(newRecoverHost, newRecoverAddress)
-                failoverSegment.setSegmentPort(port)
-
-            if failedSegment.unreachable:
-                continue
-
-            segs.append(GpMirrorToBuild(failedSegment, liveSegment, failoverSegment, forceFull))
-
-        self._output_segments_with_persistent_mirroring_disabled(segs_with_persistent_mirroring_disabled)
+        segs = [GpMirrorToBuild(t.failed, t.live, t.failover, self.__options.forceFullResynchronization, self.__options.differentialResynchronization, t.recovery_type) for t in instance.getTriplets()]
 
         return GpMirrorListToBuild(segs, self.__pool, self.__options.quiet,
                                    self.__options.parallelDegree,
-                                   interfaceHostnameWarnings,
+                                   instance.getInterfaceHostnameWarnings(),
                                    forceoverwrite=True,
-                                   progressMode=self.getProgressMode())
-
-    def _output_segments_with_persistent_mirroring_disabled(self, segs_persistent_mirroring_disabled=None):
-        if segs_persistent_mirroring_disabled:
-            self.logger.warn('Segments with dbid %s not recovered; persistent mirroring state is disabled.' %
-                             (', '.join(str(seg_id) for seg_id in segs_persistent_mirroring_disabled)))
-
-    def getRecoveryActionsBasedOnOptions(self, gpEnv, gpArray):
-        if self.__options.rebalanceSegments:
-            return GpSegmentRebalanceOperation(gpEnv, gpArray)
-        elif self.__options.recoveryConfigFile is not None:
-            return self.getRecoveryActionsFromConfigFile(gpArray)
-        else:
-            return self.getRecoveryActionsFromConfiguration(gpEnv, gpArray)
+                                   progressMode=self.getProgressMode(),
+                                   parallelPerHost=self.__options.parallelPerHost,
+                                   maxRate=self.__options.maxRate)
 
     def syncPackages(self, new_hosts):
         # The design decision here is to squash any exceptions resulting from the
         # synchronization of packages. We should *not* disturb the user's attempts to recover.
         try:
             self.logger.info('Syncing Greenplum Database extensions')
-            operations = [SyncPackages(host) for host in new_hosts]
-            ParallelOperation(operations, self.__options.parallelDegree).run()
-            # introspect outcomes
-            for operation in operations:
-                operation.get_ret()
+            SyncPackages().run()
         except:
             self.logger.exception('Syncing of Greenplum Database extensions has failed.')
-            self.logger.warning('Please run gppkg --clean after successful segment recovery.')
+            self.logger.warning('Please run `gppkg sync` after successful segment recovery.')
 
     def displayRecovery(self, mirrorBuilder, gpArray):
         self.logger.info('Greenplum instance recovery parameters')
@@ -480,7 +178,11 @@ class GpRecoverSegmentProgram:
 
                 tabLog = TableLogger()
 
-                syncMode = "Full" if toRecover.isFullSynchronization() else "Incremental"
+                syncMode = "Incremental"
+                if toRecover.isFullSynchronization():
+                    syncMode = "Full"
+                elif toRecover.isDifferentialSynchronization():
+                    syncMode = "Differential"
                 tabLog.info(["Synchronization mode", "= " + syncMode])
                 programIoUtils.appendSegmentInfoForOutput("Failed", gpArray, toRecover.getFailedSegment(), tabLog)
                 programIoUtils.appendSegmentInfoForOutput("Recovery Source", gpArray, toRecover.getLiveSegment(),
@@ -491,6 +193,10 @@ class GpRecoverSegmentProgram:
                                                               toRecover.getFailoverSegment(), tabLog)
                 else:
                     tabLog.info(["Recovery Target", "= in-place"])
+
+                if syncMode == "Full" and mirrorBuilder.getMaxTransferRate() is not None:
+                    tabLog.info(["Maximum Transfer Rate", "= " + mirrorBuilder.getMaxTransferRate()])
+
                 tabLog.outputTable()
 
                 i = i + 1
@@ -524,6 +230,14 @@ class GpRecoverSegmentProgram:
                                "primary %s    failover target: %s"
                                % (self.__getSimpleSegmentLabel(src), self.__getSimpleSegmentLabel(dest)))
 
+            if not toRecover.isFullSynchronization() and mirrorBuilder.getMaxTransferRate() is not None:
+                #
+                # For Incremental/Differential recovery, when max-rate option is provided,
+                # warn the user that only Full recovery supports max-rate option
+                #
+                res.append(" --max-rate flag is only supported with segments undergoing Full recovery (-F). "
+                           "Other modes of recovery will use the entire available network bandwidth.")
+
         for warning in mirrorBuilder.getAdditionalWarnings():
             res.append(warning)
 
@@ -535,24 +249,106 @@ class GpRecoverSegmentProgram:
             res = dbconn.query(conn, "SELECT datname FROM PG_DATABASE WHERE datname != 'template0'")
             return res.fetchall()
 
-    def run(self):
-        if self.__options.parallelDegree < 1 or self.__options.parallelDegree > 64:
+    def validateMaxRate(self):
+        """
+        Validate the max-rate input provided by the user.
+        Numeric part of max-rate can be a whole/decimal number with an optional suffix of either 'k' or 'M'
+        Valid range is from 32kbps to 1048576kbps(1024Mbps)
+
+        Below regex pattern validates the max-rate which can be a whole/decimal number with an optional unit suffix.
+        Valid match patterns - '12', '12.34A', '123.45'
+        Invalid match patterns - ABC', '.', '12 34'
+
+        """
+        pattern = r'^\s*([\d\.]+)([a-zA-Z]?)\s*$'
+        match = re.match(pattern, self.__options.maxRate)
+
+        if match:
+            rateVal, rateSuffix = match.groups()
+
+            rateVal = float(rateVal)
+            if(rateVal <= 0):
+                raise ProgramArgumentValidationException("Transfer rate must be greater than zero")
+
+            if rateSuffix == 'M':
+               rateVal *= 1024
+            elif rateSuffix and rateSuffix != 'k':
+               raise ProgramArgumentValidationException("Invalid --max-rate unit: {0}".format(rateSuffix))
+
+            if rateVal < MAX_RATE_LOWER or rateVal > MAX_RATE_UPPER:
+                raise ProgramArgumentValidationException("transfer rate {0} is out of range".format(self.__options.maxRate))
+        else:
+            raise ProgramArgumentValidationException("transfer rate {0} is not a valid value".format(self.__options.maxRate))
+        return
+
+    def validateRecoveryParams(self):
+        if self.__options.parallelDegree < 1 or self.__options.parallelDegree > gp.MAX_COORDINATOR_NUM_WORKERS:
             raise ProgramArgumentValidationException(
-                "Invalid parallelDegree provided with -B argument: %d" % self.__options.parallelDegree)
-
-        self.__pool = WorkerPool(self.__options.parallelDegree)
-        gpEnv = GpCoordinatorEnvironment(self.__options.coordinatorDataDirectory, True)
-
+                "Invalid parallelDegree value provided with -B argument: %d" % self.__options.parallelDegree)
+        if self.__options.parallelPerHost < 1 or self.__options.parallelPerHost > gp.MAX_SEGHOST_NUM_WORKERS:
+            raise ProgramArgumentValidationException(
+                "Invalid parallelPerHost value provided with -b argument: %d" % self.__options.parallelPerHost)
         # verify "where to recover" options
         optionCnt = 0
         if self.__options.newRecoverHosts is not None:
             optionCnt += 1
-        if self.__options.recoveryConfigFile is not None:
-            optionCnt += 1
         if self.__options.rebalanceSegments:
             optionCnt += 1
         if optionCnt > 1:
-            raise ProgramArgumentValidationException("Only one of -i, -p, and -r may be specified")
+            raise ProgramArgumentValidationException("Only one of -p and -r may be specified")
+        if optionCnt > 0 and self.__options.recoveryConfigFile is not None:
+            raise ProgramArgumentValidationException("Only one of -i, -p and -r may be specified")
+
+        if optionCnt > 0 and self.__options.differentialResynchronization:
+            raise ProgramArgumentValidationException("Only one of -p, -r and --differential may be specified")
+
+        # verify "mode to recover" options
+        if self.__options.forceFullResynchronization and self.__options.differentialResynchronization:
+            raise ProgramArgumentValidationException("Only one of -F and --differential may be specified")
+
+        # verify differential supported options
+        if self.__options.differentialResynchronization and self.__options.outputSampleConfigFile:
+            raise ProgramArgumentValidationException("Invalid -o provided with --differential argument")
+
+        if self.__options.recoveryConfigFile and self.__options.outputSampleConfigFile:
+            raise ProgramArgumentValidationException("Invalid -i provided with -o argument")
+
+        if self.__options.rebalanceSegments and self.__options.outputSampleConfigFile:
+            raise ProgramArgumentValidationException("Invalid -r provided with -o argument")
+
+        if self.__options.disableReplayLag and not self.__options.rebalanceSegments:
+            raise ProgramArgumentValidationException("--disable-replay-lag should be used only with -r")
+
+        # Verify if full recovery option provided along with rebalance and recovery to new host option
+        if self.__options.forceFullResynchronization:
+            if self.__options.rebalanceSegments:
+                raise ProgramArgumentValidationException("-F option is not supported with -r option")
+            if self.__options.newRecoverHosts is not None:
+                raise ProgramArgumentValidationException("-F option is not supported with -p option")
+
+        # Checking rsync version before performing a differential recovery operation.
+        # the --info=progress2 option, which provides whole file transfer progress, requires rsync 3.1.0 or above
+        min_rsync_ver = "3.1.0"
+        if self.__options.differentialResynchronization and not unix.validate_rsync_version(min_rsync_ver):
+            raise ProgramArgumentValidationException("To perform a differential recovery, a minimum rsync version "
+                                                         "of {0} is required. Please ensure that rsync is updated to "
+                                                         "version {0} or higher.".format(min_rsync_ver))
+
+        # Verify max-rate supported options
+        if self.__options.maxRate and self.__options.rebalanceSegments:
+            self.logger.warn(" -r flag does not support the use of --max-rate, hence --max-rate will be ignored")
+        if self.__options.outputSampleConfigFile and self.__options.maxRate:
+            self.logger.warn(" -o flag does not support the use of --max-rate, hence --max-rate will be ignored")
+
+        # Validate max-rate value, if provided as an option
+        if self.__options.maxRate:
+            self.validateMaxRate()
+        return
+
+    def run(self):
+        self.validateRecoveryParams()
+        self.__pool = WorkerPool(self.__options.parallelDegree)
+        gpEnv = GpCoordinatorEnvironment(self.__options.coordinatorDataDirectory, True)
 
         faultProberInterface.getFaultProber().initializeProber(gpEnv.getCoordinatorPort())
 
@@ -560,21 +356,14 @@ class GpRecoverSegmentProgram:
 
         gpArray = confProvider.loadSystemConfig(useUtilityMode=False)
 
-        num_workers = min(len(gpArray.get_hostlist()), self.__options.parallelDegree)
-        hosts = set(gpArray.get_hostlist(includeCoordinator=False))
-        unreachable_hosts = get_unreachable_segment_hosts(hosts, num_workers)
-        for i, segmentPair in enumerate(gpArray.segmentPairs):
-            if segmentPair.primaryDB.getSegmentHostName() in unreachable_hosts:
-                logger.warning("Not recovering segment %d because %s is unreachable" % (segmentPair.primaryDB.dbid, segmentPair.primaryDB.getSegmentHostName()))
-                gpArray.segmentPairs[i].primaryDB.unreachable = True
-
-            if segmentPair.mirrorDB.getSegmentHostName() in unreachable_hosts:
-                logger.warning("Not recovering segment %d because %s is unreachable" % (segmentPair.mirrorDB.dbid, segmentPair.mirrorDB.getSegmentHostName()))
-                gpArray.segmentPairs[i].mirrorDB.unreachable = True
-
         if not gpArray.hasMirrors:
             raise ExceptionNoStackTraceNeeded(
                 'GPDB Mirroring replication is not configured for this Greenplum Database instance.')
+
+        num_workers = min(len(gpArray.get_hostlist()), self.__options.parallelDegree)
+        hosts = set(gpArray.get_hostlist(includeCoordinator=False))
+        unreachable_hosts = get_unreachable_segment_hosts(hosts, num_workers)
+        update_unreachable_flag_for_segments(gpArray, unreachable_hosts)
 
         # We have phys-rep/filerep mirrors.
 
@@ -628,6 +417,7 @@ class GpRecoverSegmentProgram:
         elif len(mirrorBuilder.getMirrorsToBuild()) == 0:
             self.logger.info('No segments to recover')
         else:
+            #TODO this already happens in buildMirrors function
             mirrorBuilder.checkForPortAndDirectoryConflicts(gpArray)
             self.validate_heap_checksum_consistency(gpArray, mirrorBuilder)
 
@@ -644,37 +434,69 @@ class GpRecoverSegmentProgram:
             if new_hosts:
                 self.syncPackages(new_hosts)
 
-            config_primaries_for_replication(gpArray, self.__options.hba_hostnames)
-            if not mirrorBuilder.buildMirrors("recover", gpEnv, gpArray):
+            contentsToUpdate = [seg.getLiveSegment().getSegmentContentId() for seg in mirrorBuilder.getMirrorsToBuild()]
+            update_pg_hba_on_segments(gpArray, self.__options.hba_hostnames, self.__options.parallelDegree, contentsToUpdate)
+
+            def signal_handler(sig, frame):
+                signal_name = signal.Signals(sig).name
+                logger.warn("Recieved {0} signal, terminating gprecoverseg".format(signal_name))
+
+                # Confirm with the user if they really want to terminate with CTRL-C.
+                if signal_name == "SIGINT":
+                    prompt_text = "\nIt is not recommended to terminate a recovery procedure midway. However, if you choose to proceed, you will need " \
+                                  "to run either gprecoverseg --differential or gprecoverseg -F to start a new recovery process the next time."
+
+                    if not userinput.ask_yesno(prompt_text, "Continue terminating gprecoverseg", 'N'):
+                        return
+
+                self.termination_requested = True
+                self.shutdown(current_hosts)
+
+                # Reset the signal handlers
+                signal.signal(signal.SIGINT, signal.SIG_DFL)
+                signal.signal(signal.SIGTERM, signal.SIG_DFL)
+
+            signal.signal(signal.SIGINT, signal_handler)
+            signal.signal(signal.SIGTERM, signal_handler)
+
+            # SSH disconnections send a SIGHUP signal to all the processes running in that session.
+            # Ignoring this signal so that gprecoverseg does not terminate due to such issues.
+            signal.signal(signal.SIGHUP, signal.SIG_IGN)
+
+            if not mirrorBuilder.recover_mirrors(gpEnv, gpArray):
+                if self.termination_requested:
+                    self.logger.error("gprecoverseg process was interrupted by the user.")
+                if self.__options.differentialResynchronization:
+                    self.logger.error("gprecoverseg differential recovery failed. Please check the gpsegrecovery.py log"
+                                      " file and rsync log file for more details.")
+                else:
+                    self.logger.error("gprecoverseg failed. Please check the output for more details.")
                 sys.exit(1)
 
-            self.trigger_fts_probe(port=gpEnv.getCoordinatorPort())
+            if self.termination_requested:
+                self.logger.info("Not able to terminate the recovery process since it has been completed successfully.")
 
+            self.logger.info("********************************")
+            self.logger.info("Future gprecoverseg executions might remove the currently created pg_basebackup/pg_rewind/rsync "
+                             "progress files, please save these files if needed.")
             self.logger.info("********************************")
             self.logger.info("Segments successfully recovered.")
             self.logger.info("********************************")
 
+            self.logger.info("Recovered mirror segments need to sync WAL with primary segments.")
+            self.logger.info("Use 'gpstate -e' to check progress of WAL sync remaining bytes")
+
         sys.exit(0)
-
-    def trigger_fts_probe(self, port=0):
-        self.logger.info('Triggering FTS probe')
-        conn = dbconn.connect(dbconn.DbURL(port=port))
-
-        # XXX Perform two probe scans in a row, to work around a known
-        # race where gp_request_fts_probe_scan() can return early during the
-        # first call. Remove this duplication once that race is fixed.
-        for _ in range(2):
-            dbconn.execSQL(conn,"SELECT gp_request_fts_probe_scan()")
-        conn.close()
 
     def validate_heap_checksum_consistency(self, gpArray, mirrorBuilder):
         live_segments = [target.getLiveSegment() for target in mirrorBuilder.getMirrorsToBuild()]
+        failed_segments = [target.getFailedSegment() for target in mirrorBuilder.getMirrorsToBuild()]
         if len(live_segments) == 0:
             self.logger.info("No checksum validation necessary when there are no segments to recover.")
             return
 
-        heap_checksum = HeapChecksum(gpArray, num_workers=len(live_segments), logger=self.logger)
-        successes, failures = heap_checksum.get_segments_checksum_settings(live_segments)
+        heap_checksum = HeapChecksum(gpArray, num_workers=min(self.__options.parallelDegree, len(live_segments)), logger=self.logger)
+        successes, failures = heap_checksum.get_segments_checksum_settings(live_segments + failed_segments)
         # go forward if we have at least one segment that has replied
         if len(successes) == 0:
             raise Exception("No segments responded to ssh query for heap checksum validation.")
@@ -696,6 +518,20 @@ class GpRecoverSegmentProgram:
             self.__pool.haltWork()  # \  MPP-13489, CR-2572
             self.__pool.joinWorkers()  # > all three of these appear necessary
             self.__pool.join()  # /  see MPP-12633, CR-2252 as well
+
+    def shutdown(self, hosts):
+        
+        # Clear out the existing pool to stop any pending recovery process
+        while not self.__pool.isDone():
+
+            for host in hosts:
+                try:
+                    logger.debug("Terminating recovery process on host {0}".format(host))
+                    cmd = Command(name="terminate recovery process",
+                                cmdStr="ps ux | grep -E 'gpsegsetuprecovery|gpsegrecovery' | grep -vE 'ssh|grep|bash' | awk '{print $ 2}' | xargs -r kill", remoteHost=host, ctxt=REMOTE)
+                    cmd.run(validateAfter=True)
+                except ExecutionError as e:
+                    logger.error("Not able to terminate recovery process on host {0}: {1}".format(host, e))
 
     # -------------------------------------------------------------------------
 
@@ -747,14 +583,32 @@ class GpRecoverSegmentProgram:
                          dest="forceFullResynchronization",
                          metavar="<forceFullResynchronization>",
                          help="Force full segment resynchronization")
-        addTo.add_option("-B", None, type="int", default=16,
+        addTo.add_option('--differential', None, default=False, action='store_true',
+                         dest="differentialResynchronization",
+                         metavar="<differentialResynchronization>",
+                         help="differential segment resynchronization")
+        addTo.add_option("-B", None, type="int", default=gp.DEFAULT_COORDINATOR_NUM_WORKERS,
                          dest="parallelDegree",
                          metavar="<parallelDegree>",
-                         help="Max # of workers to use for building recovery segments.  [default: %default]")
+                         help="Max number of hosts to operate on in parallel. Valid values are: 1-%d"
+                              % gp.MAX_COORDINATOR_NUM_WORKERS)
+        addTo.add_option("-b", None, type="int", default=gp.DEFAULT_SEGHOST_NUM_WORKERS,
+                         dest="parallelPerHost",
+                         metavar="<parallelPerHost>",
+                         help="Max number of segments per host to operate on in parallel. Valid values are: 1-%d"
+                              % gp.MAX_SEGHOST_NUM_WORKERS)
+
         addTo.add_option("-r", None, default=False, action='store_true',
                          dest='rebalanceSegments', help='Rebalance synchronized segments.')
+        addTo.add_option("--replay-lag", None, type="float", default=gp.ALLOWED_REPLAY_LAG,
+                         dest="replayLag",
+                         metavar="<replayLag>", help='Allowed replay lag on mirror, lag should be provided in GBs')
+        addTo.add_option("--disable-replay-lag", None, default=False, action='store_true',
+                         dest='disableReplayLag', help='Disable replay lag check when rebalancing segments')
         addTo.add_option('', '--hba-hostnames', action='store_true', dest='hba_hostnames',
                          help='use hostnames instead of CIDR in pg_hba.conf')
+        addTo.add_option('--max-rate', type='string', dest='maxRate', metavar='<maxRate>',
+                          help='Maximum Rate of data transfer')
 
         parser.set_defaults()
         return parser

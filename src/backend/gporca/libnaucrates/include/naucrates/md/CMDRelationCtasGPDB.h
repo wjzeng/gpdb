@@ -48,7 +48,7 @@ private:
 	CMemoryPool *m_mp;
 
 	// DXL for object
-	const CWStringDynamic *m_dxl_str;
+	const CWStringDynamic *m_dxl_str = nullptr;
 
 	// relation mdid
 	IMDId *m_mdid;
@@ -61,9 +61,6 @@ private:
 
 	// is this a temporary relation
 	BOOL m_is_temp_table;
-
-	// does this table have oids
-	BOOL m_has_oids;
 
 	// storage type
 	Erelstoragetype m_rel_storage_type;
@@ -111,7 +108,7 @@ public:
 	// ctor
 	CMDRelationCtasGPDB(
 		CMemoryPool *mp, IMDId *mdid, CMDName *mdname_schema, CMDName *mdname,
-		BOOL fTemporary, BOOL fHasOids, Erelstoragetype rel_storage_type,
+		BOOL fTemporary, Erelstoragetype rel_storage_type,
 		Ereldistrpolicy rel_distr_policy, CMDColumnArray *mdcol_array,
 		ULongPtrArray *distr_col_array, IMdIdArray *distr_opfamilies,
 		IMdIdArray *distr_opclasses, ULongPtr2dArray *keyset_array,
@@ -122,11 +119,7 @@ public:
 	~CMDRelationCtasGPDB() override;
 
 	// accessors
-	const CWStringDynamic *
-	GetStrRepr() const override
-	{
-		return m_dxl_str;
-	}
+	const CWStringDynamic *GetStrRepr() override;
 
 	// the metadata id
 	IMDId *MDId() const override;
@@ -140,13 +133,6 @@ public:
 	// distribution policy (none, hash, random)
 	Ereldistrpolicy GetRelDistribution() const override;
 
-	// does this table have oids
-	BOOL
-	HasOids() const override
-	{
-		return m_has_oids;
-	}
-
 	// is this a temp relation
 	BOOL
 	IsTemporary() const override
@@ -159,6 +145,12 @@ public:
 	RetrieveRelStorageType() const override
 	{
 		return m_rel_storage_type;
+	}
+
+	Erelaoversion
+	GetRelAOVersion() const override
+	{
+		return IMDRelation::GetCurrentAOVersion();
 	}
 
 	// CTAS storage options
@@ -216,13 +208,6 @@ public:
 		return 0;
 	}
 
-	// number of triggers
-	ULONG
-	TriggerCount() const override
-	{
-		return 0;
-	}
-
 	// return the absolute position of the given attribute position excluding dropped columns
 	ULONG
 	NonDroppedColAt(ULONG pos) const override
@@ -244,14 +229,6 @@ public:
 	) const override
 	{
 		GPOS_ASSERT("CTAS tables have no indexes");
-		return nullptr;
-	}
-
-	// retrieve the id of the metadata cache trigger at the given position
-	IMDId *TriggerMDidAt(ULONG	// pos
-	) const override
-	{
-		GPOS_ASSERT("CTAS tables have no triggers");
 		return nullptr;
 	}
 
@@ -278,6 +255,19 @@ public:
 	GetVarTypeModArray() const
 	{
 		return m_vartypemod_array;
+	}
+
+	IMDId *
+	ForeignServer() const override
+	{
+		return nullptr;
+	}
+
+	CDouble
+	Rows() const override
+	{
+		GPOS_ASSERT("Function should not be called for CTAS tables");
+		return 0;
 	}
 
 #ifdef GPOS_DEBUG

@@ -64,6 +64,11 @@ extern Selectivity clauselist_selectivity(PlannerInfo *root,
 										  List *clauses,
 										  int varRelid,
 										  JoinType jointype,
+										  SpecialJoinInfo *sjinfo);									  
+extern Selectivity clauselist_selectivity_extended(PlannerInfo *root,
+										  List *clauses,
+										  int varRelid,
+										  JoinType jointype,
 										  SpecialJoinInfo *sjinfo,
 										  bool use_damping);
 extern Selectivity clauselist_selectivity_simple(PlannerInfo *root,
@@ -80,6 +85,7 @@ extern Selectivity clauselist_selectivity_simple(PlannerInfo *root,
 extern PGDLLIMPORT double seq_page_cost;
 extern PGDLLIMPORT double random_page_cost;
 extern PGDLLIMPORT double cpu_tuple_cost;
+extern PGDLLIMPORT double gp_cpu_decompress_cost;
 extern PGDLLIMPORT double cpu_index_tuple_cost;
 extern PGDLLIMPORT double cpu_operator_cost;
 extern PGDLLIMPORT double parallel_tuple_cost;
@@ -89,6 +95,8 @@ extern PGDLLIMPORT int effective_cache_size;
 /* in path/indxpath.c: */
 
 extern bool is_pseudo_constant_for_index(Node *expr, IndexOptInfo *index);
+extern bool is_pseudo_constant_for_index_new(PlannerInfo *root, Node *expr,
+											 IndexOptInfo *index);
 
 /* in plan/planner.c: */
 
@@ -180,6 +188,8 @@ extern SortGroupClause *get_sortgroupref_clause_noerr(Index sortref,
 
 extern Bitmapset *pull_varnos(Node *node);
 extern Bitmapset *pull_varnos_of_level(Node *node, int levelsup);
+extern Bitmapset *pull_varnos_new(PlannerInfo *root, Node *node);
+extern Bitmapset *pull_varnos_of_level_new(PlannerInfo *root, Node *node, int levelsup);
 extern void pull_varattnos(Node *node, Index varno, Bitmapset **varattnos);
 extern List *pull_vars_of_level(Node *node, int levelsup);
 extern bool contain_var_clause(Node *node);

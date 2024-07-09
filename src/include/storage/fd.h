@@ -77,10 +77,6 @@ extern int	max_safe_fds;
 extern File PathNameOpenFile(const char *fileName, int fileFlags);
 extern File PathNameOpenFilePerm(const char *fileName, int fileFlags, mode_t fileMode);
 
-extern File OpenNamedTemporaryFile(const char *fileName,
-								   bool create,
-								   bool delOnClose,
-								   bool interXact);
 extern File OpenTemporaryFile(bool interXact, const char *filePrefix);
 extern void FileClose(File file);
 extern int	FilePrefetch(File file, off_t offset, int amount, uint32 wait_event_info);
@@ -154,6 +150,7 @@ extern void fsync_fname(const char *fname, bool isdir);
 extern int	durable_rename(const char *oldfile, const char *newfile, int loglevel);
 extern int	durable_unlink(const char *fname, int loglevel);
 extern int	durable_link_or_rename(const char *oldfile, const char *newfile, int loglevel);
+extern void SyncAllXLogFiles(void);
 extern void SyncDataDirectory(void);
 extern int	data_sync_elevel(int elevel);
 
@@ -163,11 +160,8 @@ extern int gp_retry_close(int fd);
 #define PG_TEMP_FILES_DIR "pgsql_tmp"
 #define PG_TEMP_FILE_PREFIX "pgsql_tmp"
 
-extern char *GetTempFilePath(const char *filename, bool createdir);
-
 extern const char *FileGetFilename(File file);
 
 extern void FileSetIsWorkfile(File file);
-extern void FileSetIsTempFile(File file, bool isTempFile);
 
 #endif							/* FD_H */

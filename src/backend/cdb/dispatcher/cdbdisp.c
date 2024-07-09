@@ -24,6 +24,8 @@
 #include "executor/execUtils.h"
 #include "libpq-fe.h"
 #include "libpq-int.h"
+#include "libpq/libpq.h"
+#include "libpq/pqformat.h"
 #include "cdb/cdbfts.h"
 #include "cdb/cdbgang.h"
 #include "cdb/cdbsreh.h"
@@ -91,6 +93,29 @@ cdbdisp_waitDispatchFinish(struct CdbDispatcherState *ds)
 {
 	if (pDispatchFuncs->waitDispatchFinish != NULL)
 		(pDispatchFuncs->waitDispatchFinish) (ds);
+}
+
+/*
+ * cdbdisp_checkDispatchAckMessage:
+ *
+ * On QD, check if any expected acknowledge messages from QEs have arrived.
+ * In some cases, QD needs to check or wait the expected acknowledge messages
+ * from QEs, e.g. when defining a parallel retrieve cursor, so that QD can
+ * know if QEs run as expected.
+ *
+ * message: specifies the expected ACK message to check.
+ * timeout_sec: the second that the dispatcher waits for the ack messages at most.
+ *       0 means checking immediately, and -1 means waiting until all ack
+ *       messages are received.
+ */
+bool
+cdbdisp_checkDispatchAckMessage(struct CdbDispatcherState *ds,
+							   const char *message, int timeout_sec)
+{
+	if (pDispatchFuncs == NULL || pDispatchFuncs->checkAckMessage == NULL)
+		return false;
+
+	return (pDispatchFuncs->checkAckMessage) (ds, message, timeout_sec);
 }
 
 /*
@@ -255,7 +280,7 @@ CdbDispatchHandleError(struct CdbDispatcherState *ds)
 			if (error != NULL)
 			{
 				FlushErrorState();
-				ReThrowError(error);
+				ThrowErrorData(error);
 			}
 		}
 		PG_CATCH();
@@ -304,6 +329,7 @@ cdbdisp_makeDispatcherState(bool isExtendedQuery)
 #endif
 	handle->dispatcherState->allocatedGangs = NIL;
 	handle->dispatcherState->largestGangSize = 0;
+	handle->dispatcherState->rootGangSize = 0;
 	handle->dispatcherState->destroyIdleReaderGang = false;
 
 	return handle->dispatcherState;
@@ -390,7 +416,8 @@ cdbdisp_destroyDispatcherState(CdbDispatcherState *ds)
 	ds->allocatedGangs = NIL;
 	ds->dispatchParams = NULL;
 	ds->primaryResults = NULL;
-	ds->largestGangSize= 0;
+	ds->largestGangSize = 0;
+	ds->rootGangSize = 0;
 
 	if (h != NULL)
 		destroy_dispatcher_handle(h);
@@ -411,25 +438,26 @@ cdbdisp_checkForCancel(CdbDispatcherState *ds)
 }
 
 /*
- * Return a file descriptor to wait for events from the QEs after dispatching
- * a query.
+ * Return all file descriptors to wait for events from the QEs after
+ * dispatching a query.
+ *
+ * nsocks is the returned socket fds number (as an output param):
+ *
+ * Return value is the array of socket fds.
+ * It will be palloced in pDispatchFuncs->getWaitSocketFd(), and contains
+ * all waiting socket fds. (Note: caller need to pfree it)
  *
  * This is intended for use with cdbdisp_checkForCancel(). First call
- * cdbdisp_getWaitSocketFd(), and wait on that socket to become readable
+ * cdbdisp_getWaitSocketFds(), and wait on that sockets to become readable
  * e.g. with select() or poll(). When it becomes readable, call
  * cdbdisp_checkForCancel() to process the incoming data, and repeat.
- *
- * XXX: This returns only one fd, but we might be waiting for results from
- * multiple QEs. In that case, this returns arbitrarily one of them. You
- * should still have a timeout, and call cdbdisp_checkForCancel()
- * periodically, to process results from the other QEs.
  */
-int
-cdbdisp_getWaitSocketFd(CdbDispatcherState *ds)
+int *
+cdbdisp_getWaitSocketFds(CdbDispatcherState *ds, int *nsocks)
 {
-	if (pDispatchFuncs == NULL || pDispatchFuncs->getWaitSocketFd == NULL)
-		return -1;
-	return (pDispatchFuncs->getWaitSocketFd) (ds);
+	if (pDispatchFuncs == NULL || pDispatchFuncs->getWaitSocketFds == NULL)
+		return NULL;
+	return (pDispatchFuncs->getWaitSocketFds) (ds, nsocks);
 }
 
 dispatcher_handle_t *

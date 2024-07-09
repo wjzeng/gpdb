@@ -40,13 +40,13 @@ transfer_all_new_tablespaces(DbInfoArr *old_db_arr, DbInfoArr *new_db_arr,
 	switch (user_opts.transfer_mode)
 	{
 		case TRANSFER_MODE_CLONE:
-			pg_log(PG_REPORT, "Cloning user relation files\n");
+			prep_status_progress("Cloning user relation files");
 			break;
 		case TRANSFER_MODE_COPY:
-			pg_log(PG_REPORT, "Copying user relation files\n");
+			prep_status_progress("Copying user relation files");
 			break;
 		case TRANSFER_MODE_LINK:
-			pg_log(PG_REPORT, "Linking user relation files\n");
+			prep_status_progress("Linking user relation files");
 			break;
 	}
 
@@ -56,8 +56,12 @@ transfer_all_new_tablespaces(DbInfoArr *old_db_arr, DbInfoArr *new_db_arr,
 	 * NULL tablespace path, which matches all tablespaces.  In parallel mode,
 	 * we pass the default tablespace and all user-created tablespaces and let
 	 * those operations happen in parallel.
+	 *
+	 * GPDB: Disable pg_upgrade's broken parallel tablespace transfer to make the rest
+	 * of the parallelism from the --jobs flag usable now to get a performance
+	 * boost.
 	 */
-	if (user_opts.jobs <= 1)
+	if (true) /* (user_opts.jobs <= 1) */
 		parallel_transfer_all_new_dbs(old_db_arr, new_db_arr, old_pgdata,
 									  new_pgdata, NULL);
 	else
@@ -149,16 +153,7 @@ static void
 transfer_single_new_db(FileNameMap *maps, int size, char *old_tablespace)
 {
 	int			mapnum;
-	bool		vm_crashsafe_match = true;
 	bool		vm_must_add_frozenbit = false;
-
-	/*
-	 * Do the old and new cluster disagree on the crash-safetiness of the vm
-	 * files?  If so, do not copy them.
-	 */
-	if (old_cluster.controldata.cat_ver < VISIBILITY_MAP_CRASHSAFE_CAT_VER &&
-		new_cluster.controldata.cat_ver >= VISIBILITY_MAP_CRASHSAFE_CAT_VER)
-		vm_crashsafe_match = false;
 
 	/*
 	 * Do we need to rewrite visibilitymap?
@@ -183,16 +178,11 @@ transfer_single_new_db(FileNameMap *maps, int size, char *old_tablespace)
 				/* transfer primary file */
 				transfer_relfile(&maps[mapnum], "", vm_must_add_frozenbit);
 
-				/* fsm/vm files added in PG 8.4 */
-				if (GET_MAJOR_VERSION(old_cluster.major_version) >= 804)
-				{
-					/*
-					 * Copy/link any fsm and vm files, if they exist
-					 */
-					transfer_relfile(&maps[mapnum], "_fsm", vm_must_add_frozenbit);
-					if (vm_crashsafe_match)
-						transfer_relfile(&maps[mapnum], "_vm", vm_must_add_frozenbit);
-				}
+				/*
+				 * Copy/link any fsm and vm files, if they exist
+				 */
+				transfer_relfile(&maps[mapnum], "_fsm", vm_must_add_frozenbit);
+				transfer_relfile(&maps[mapnum], "_vm", vm_must_add_frozenbit);
 			}
 		}
 	}
@@ -231,13 +221,12 @@ transfer_relfile(FileNameMap *map, const char *type_suffix, bool vm_must_add_fro
  * file (the one without an extent suffix) for a relation is also fatal, since
  * we expect that to exist for both heap and AO tables in any case.
  *
- * TODO: verify that AO tables must always have a segment zero.
+ * GPDB_UPGRADE_FIXME: verify that AO tables must always have a segment zero.
  */
 static bool
 transfer_relfile_segment(int segno, FileNameMap *map,
 						 const char *type_suffix, bool vm_must_add_frozenbit)
 {
-	const char *msg;
 	char		old_file[MAXPGPATH * 3];
 	char		new_file[MAXPGPATH * 3];
 	char		extent_suffix[65];
@@ -291,28 +280,6 @@ transfer_relfile_segment(int segno, FileNameMap *map,
 
 	/* Copying files might take some time, so give feedback. */
 	pg_log(PG_STATUS, "%s", old_file);
-
-	/*
-	 * If the user requested to add checksums, it is taken care of during
-	 * the heap conversion. Thus, we don't need to explicitly test for that
-	 * here as we do for plain copy.
-	 */
-	if (map->gpdb4_heap_conversion_needed)
-	{
-		pg_log(PG_VERBOSE, "copying and converting \"%s\" to \"%s\"\n",
-				old_file, new_file);
-
-		if ((msg = convert_gpdb4_heap_file(old_file, new_file,
-						map->has_numerics, map->atts, map->natts)) != NULL)
-			pg_log(PG_FATAL, "error while copying and converting relation \"%s.%s\" (\"%s\" to \"%s\"): %s\n",
-					map->nspname, map->relname, old_file, new_file, msg);
-
-		/*
-		 * XXX before the split into transfer_relfile_segment(), this simply
-		 * returned from transfer_relfile() directly. Was that correct?
-		 */
-		return true;
-	}
 
 	/* Rewrite visibility map if needed */
 	if (vm_must_add_frozenbit && (strcmp(type_suffix, "_vm") == 0))

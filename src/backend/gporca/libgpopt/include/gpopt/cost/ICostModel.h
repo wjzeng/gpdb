@@ -36,8 +36,8 @@ using namespace gpmd;
 using namespace gpnaucrates;
 
 // dynamic array of cost model params
-typedef CDynamicPtrArray<ICostModelParams::SCostParam, CleanupDelete>
-	ICostModelParamsArray;
+using ICostModelParamsArray =
+	CDynamicPtrArray<ICostModelParams::SCostParam, CleanupDelete>;
 
 //---------------------------------------------------------------------------
 //	@class:
@@ -97,6 +97,20 @@ public:
 		GetNDVs(const CColRef *colref)
 		{
 			return m_pstats->GetNDVs(colref);
+		}
+
+		// look up the number of distinct values of a particular column
+		CDouble
+		GetNullFreq(const CColRef *colref)
+		{
+			return m_pstats->GetNullFreq(colref);
+		}
+
+		// root stats getter
+		IStatistics *
+		Pstats()
+		{
+			return m_pstats;
 		}
 	};	// class CCostingStats
 

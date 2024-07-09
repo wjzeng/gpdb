@@ -1,21 +1,28 @@
 --
 -- ORCA tests
 --
+-- start_matchsubs
+-- m/\(cost=.*\)/
+-- s/\(cost=.*\)//
+--
+-- m/\(slice\d+; segments: \d+\)/
+-- s/\(slice\d+; segments: \d+\)//
+-- end_matchsubs
 
 -- show version
 SELECT count(*) from gp_opt_version();
 
 -- Mask out Log & timestamp for orca message that has feature not supported.
 -- start_matchsubs
--- m/^LOG.*\"Feature/
--- s/^LOG.*\"Feature/\"Feature/
+-- m/^LOG.*\"Falling/
+-- s/^LOG.*\"Falling/\"Falling/
 -- end_matchsubs
 
 -- fix the number of segments for Orca
 set optimizer_segments = 3;
 
-set optimizer_enable_master_only_queries = on;
--- master only tables
+set optimizer_enable_coordinator_only_queries = on;
+-- coordinator only tables
 
 create schema orca;
 -- start_ignore
@@ -538,7 +545,6 @@ insert into orca.t_date values('01-03-2012'::date,7,'tag1','tag2');
 insert into orca.t_date values('01-03-2012'::date,8,'tag1','tag2');
 insert into orca.t_date values('01-03-2012'::date,9,'tag1','tag2');
 
-set optimizer_enable_partial_index=on;
 set optimizer_enable_space_pruning=off;
 set optimizer_enable_constant_expression_evaluation=on;
 -- start_ignore
@@ -587,7 +593,6 @@ select * from orca.t_text where user_id=9;
 reset optimizer_enable_space_pruning;
 set optimizer_enumerate_plans=off;
 reset optimizer_enable_constant_expression_evaluation;
-reset optimizer_enable_partial_index;
 
 -- test that constant expression evaluation works with integers
 drop table if exists orca.t_ceeval_ints;
@@ -604,7 +609,6 @@ insert into orca.t_ceeval_ints values(3, 100, 'tag1', 'tag2');
 insert into orca.t_ceeval_ints values(4, 101, 'tag1', 'tag2');
 insert into orca.t_ceeval_ints values(5, 102, 'tag1', 'tag2');
 
-set optimizer_enable_partial_index=on;
 set optimizer_enable_space_pruning=off;
 set optimizer_enable_constant_expression_evaluation=on;
 set optimizer_use_external_constant_expression_evaluation_for_ints = on;
@@ -618,7 +622,6 @@ reset optimizer_enable_space_pruning;
 reset optimizer_enumerate_plans;
 reset optimizer_use_external_constant_expression_evaluation_for_ints;
 reset optimizer_enable_constant_expression_evaluation;
-reset optimizer_enable_partial_index;
 
 -- test project elements in TVF
 
@@ -1513,8 +1516,6 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql volatile;
 
--- force_explain
-set optimizer_segments = 3;
 explain
 select c.cid cid,
        c.firstname firstname,
@@ -1523,7 +1524,7 @@ select c.cid cid,
 from cust c, sales s, datedim d
 where c.cid = s.cid and s.date_sk = d.date_sk and
       ((d.year = 2001 and lower(s.type) = 't1' and plusone(d.moy) = 5) or (d.moy = 4 and upper(s.type) = 'T2'));
-reset optimizer_segments;
+
 -- Bitmap indexes
 drop table if exists orca.bm_test;
 create table orca.bm_test (i int, t text);
@@ -1550,7 +1551,7 @@ alter table orca.bm_dyn_test drop column to_be_dropped;
 alter table orca.bm_dyn_test add partition part5 values(5);
 insert into orca.bm_dyn_test values(2, 5, '2');
 
-set optimizer_enable_bitmapscan=on;
+set optimizer_enable_dynamicbitmapscan=on;
 -- start_ignore
 analyze orca.bm_dyn_test;
 -- end_ignore
@@ -1778,16 +1779,6 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql volatile;
 
--- start_ignore
-select disable_xform('CXformInnerJoin2DynamicIndexGetApply');
-select disable_xform('CXformInnerJoin2HashJoin');
-select disable_xform('CXformInnerJoin2IndexGetApply');
-select disable_xform('CXformInnerJoin2NLJoin');
--- end_ignore
-
-set optimizer_enable_partial_index=on;
-set optimizer_enable_indexjoin=on;
-
 -- force_explain
 set optimizer_segments = 3;
 EXPLAIN
@@ -1799,17 +1790,6 @@ WHERE tq.sym = tt.symbol AND
       tt.event_ts <  tq.end_ts
 GROUP BY 1
 ORDER BY 1 asc ;
-reset optimizer_segments;
-reset optimizer_enable_constant_expression_evaluation;
-reset optimizer_enable_indexjoin;
-reset optimizer_enable_partial_index;
-
--- start_ignore
-select enable_xform('CXformInnerJoin2DynamicIndexGetApply');
-select enable_xform('CXformInnerJoin2HashJoin');
-select enable_xform('CXformInnerJoin2IndexGetApply');
-select enable_xform('CXformInnerJoin2NLJoin');
--- end_ignore
 
 -- MPP-25661: IndexScan crashing for qual with reference to outer tuple
 drop table if exists idxscan_outer;
@@ -1962,6 +1942,7 @@ CREATE INDEX btree_test_index ON btree_test(a);
 set optimizer_enable_tablescan = off;
 -- start_ignore
 select disable_xform('CXformSelect2IndexGet');
+select disable_xform('CXformSelect2IndexOnlyGet');
 -- end_ignore
 EXPLAIN SELECT * FROM btree_test WHERE a in (1, 47);
 EXPLAIN SELECT * FROM btree_test WHERE a in ('2', 47);
@@ -1973,6 +1954,7 @@ EXPLAIN SELECT * FROM btree_test WHERE a in (1, 2, 47) AND b > 1;
 SELECT * FROM btree_test WHERE a in (1, 2, 47) AND b > 1;
 -- start_ignore
 select enable_xform('CXformSelect2IndexGet');
+select enable_xform('CXformSelect2IndexOnlyGet');
 -- end_ignore
 reset optimizer_enable_tablescan;
 
@@ -2052,6 +2034,12 @@ CREATE FUNCTION func_array_nonarray_enum(ANYARRAY, ANYNONARRAY, ANYENUM) RETURNS
 AS $$ SELECT $1[1]; $$ LANGUAGE SQL STABLE;
 SELECT * FROM func_array_nonarray_enum(ARRAY['blue'::rainbow, 'red'::rainbow], 'red'::rainbow, 'yellow'::rainbow);
 DROP FUNCTION IF EXISTS func_array_nonarray_enum(ANYARRAY, ANYNONARRAY, ANYENUM);
+
+--TVF accepts ANYENUM, ANYELEMENT, ANYELEMENT return ANYENUM, ANYARRAY
+CREATE FUNCTION return_enum_as_array(ANYENUM, ANYELEMENT, ANYELEMENT) RETURNS TABLE (ae ANYENUM, aa ANYARRAY)
+AS $$ SELECT $1, array[$2, $3] $$ LANGUAGE SQL STABLE;
+SELECT * FROM return_enum_as_array('red'::rainbow, 'yellow'::rainbow, 'blue'::rainbow);
+DROP FUNCTION IF EXISTS return_enum_as_array(ANYENUM, ANYELEMENT, ANYELEMENT);
 
 -- start_ignore
 drop table foo;
@@ -2173,7 +2161,7 @@ select count(*) from wst0 where exists (select 1, rank() over (order by wst1.a1)
 
 --
 -- Test to ensure sane behavior when DML queries are optimized by ORCA by
--- enforcing a non-master gather motion, controlled by
+-- enforcing a non-coordinator gather motion, controlled by
 -- optimizer_enable_gather_on_segment_for_DML GUC
 --
 
@@ -2342,7 +2330,7 @@ analyze ds_part;
 analyze non_part1;
 analyze non_part2;
 SELECT * FROM ds_part, non_part2 WHERE ds_part.c = non_part2.e AND non_part2.f = 10 AND a IN ( SELECT b + 1 FROM non_part1);
-explain SELECT * FROM ds_part, non_part2 WHERE ds_part.c = non_part2.e AND non_part2.f = 10 AND a IN ( SELECT b + 1 FROM non_part1);
+explain analyze SELECT * FROM ds_part, non_part2 WHERE ds_part.c = non_part2.e AND non_part2.f = 10 AND a IN ( SELECT b + 1 FROM non_part1);
 
 SELECT *, a IN ( SELECT b + 1 FROM non_part1) FROM ds_part, non_part2 WHERE ds_part.c = non_part2.e AND non_part2.f = 10 AND a IN ( SELECT b FROM non_part1);
 CREATE INDEX ds_idx ON ds_part(a);
@@ -2399,6 +2387,11 @@ insert into tc values (1, 'b'), (1, 'B');
 insert into tt values (1, 'b'), (1, 'B');
 
 select * from tc, tt where c = v;
+
+-- bitmap scan on bitmap index
+create index tc_idx on tc using bitmap(c);
+select * from tc where c='a';
+explain select * from tc where c='a';
 
 -- test gpexpand phase 1
 -- right now, these will fall back to planner
@@ -2553,6 +2546,7 @@ EXPLAIN SELECT a, b FROM btab_old_hash LEFT OUTER JOIN atab_old_hash ON a |=| b;
 SELECT a, b FROM btab_old_hash LEFT OUTER JOIN atab_old_hash ON a |=| b;
 
 set optimizer_expand_fulljoin = on;
+select disable_xform('CXformFullOuterJoin2HashJoin');
 EXPLAIN SELECT a, b FROM atab_old_hash FULL JOIN btab_old_hash ON a |=| b;
 SELECT a, b FROM atab_old_hash FULL JOIN btab_old_hash ON a |=| b;
 reset optimizer_expand_fulljoin;
@@ -2576,15 +2570,17 @@ ANALYZE foo3;
 set optimizer_join_order=query;
 -- we ignore enable/disable_xform statements as their output will differ if the server is compiled without Orca (the xform won't exist)
 -- start_ignore
-select disable_xform('CXformInnerJoin2HashJoin');
+select disable_xform('CXformLeftOuterJoin2HashJoin');
+select disable_xform('CXformImplementInnerJoin');
 -- end_ignore
 
-EXPLAIN SELECT 1 FROM foo1, foo2 WHERE foo1.a = foo2.a AND foo2.c = 3 AND foo2.b IN (SELECT b FROM foo3);
-SELECT 1 FROM foo1, foo2 WHERE foo1.a = foo2.a AND foo2.c = 3 AND foo2.b IN (SELECT b FROM foo3);
+EXPLAIN SELECT 1 FROM foo1 left join foo2 on foo1.a = foo2.a AND foo2.c = 3 AND foo2.b IN (SELECT b FROM foo3);
+SELECT 1 FROM foo1 left join foo2 on foo1.a = foo2.a AND foo2.c = 3 AND foo2.b IN (SELECT b FROM foo3);
 
 reset optimizer_join_order;
 -- start_ignore
-select enable_xform('CXformInnerJoin2HashJoin');
+select enable_xform('CXformLeftOuterJoin2HashJoin');
+select enable_xform('CXformImplementInnerJoin');
 -- end_ignore
 -- Test that duplicate sensitive redistributes don't have invalid projection (eg: element that can't be hashed)
 drop table if exists t55;
@@ -2640,6 +2636,16 @@ every (interval '1 day'));
 insert into sales select i, i%100, i%1000, timestamp '2010-01-01 00:00:00' + i * interval '1 day' from generate_series(1,20) i;
 select * from sales where sales_ts::date != '2010-01-05' order by sales_ts;
 
+-- validate lossy cast logic can handle BCCs
+drop table if exists part_tbl_varchar;
+CREATE TABLE part_tbl_varchar(a varchar(15) NOT NULL, b varchar(8) NOT NULL)
+DISTRIBUTED BY (a)
+PARTITION BY RANGE(b) (start('v1') end('v5'), start('v5') end('v9'), default partition def);
+
+insert into part_tbl_varchar values ('v3','v3'), ('v5','v5');
+
+select * from part_tbl_varchar where b between 'v3' and 'v4';
+
 -- test n-ary inner and left joins with outer references
 drop table if exists tcorr1, tcorr2;
 
@@ -2651,7 +2657,6 @@ insert into tcorr2 values (1,1);
 analyze tcorr1;
 analyze tcorr2;
 
-set optimizer_trace_fallback to on;
 
 explain
 select *
@@ -2796,7 +2801,6 @@ analyze tbitmap;
 set optimizer_join_order = query;
 set optimizer_enable_hashjoin = off;
 set optimizer_enable_groupagg = off;
-set optimizer_trace_fallback = on;
 set enable_sort = off;
 
 -- 1 simple btree
@@ -2904,9 +2908,14 @@ analyze roj2;
 set optimizer_enable_motion_redistribute=off;
 select count(*), t2.c from roj1 t1 left join roj2 t2 on t1.a = t2.c group by t2.c;
 explain (costs off) select count(*), t2.c from roj1 t1 left join roj2 t2 on t1.a = t2.c group by t2.c;
+
+-- check that ROJ can be disabled via GUC
+set optimizer_enable_right_outer_join=off;
+explain (costs off) select count(*), t2.c from roj1 t1 left join roj2 t2 on t1.a = t2.c group by t2.c;
+reset optimizer_enable_right_outer_join;
+
 reset optimizer_enable_motion_redistribute;
 
-reset optimizer_trace_fallback;
 reset enable_sort;
 
 -- simple check for btree indexes on AO tables
@@ -2932,7 +2941,6 @@ analyze t_ao_btree;
 analyze tpart_ao_btree;
 analyze tpart_dim;
 
-set optimizer_trace_fallback to on;
 set optimizer_enable_hashjoin to off;
 
 -- this should use a bitmap scan on the btree index
@@ -2946,15 +2954,14 @@ explain (costs off) select * from tpart_dim d join tpart_ao_btree f on d.a=f.a w
 select disable_xform('CXformSelect2BitmapBoolOp');
 select disable_xform('CXformSelect2DynamicBitmapBoolOp');
 select disable_xform('CXformJoin2BitmapIndexGetApply');
-select disable_xform('CXformInnerJoin2NLJoin');
+set optimizer_enable_nljoin=off;
 -- end_ignore
 
 -- Make sure we don't allow a regular (btree) index scan or index join for an AO table
 -- We disabled hash join, and bitmap index joins, NLJs, so this should leave ORCA no other choices
--- expect a sequential scan, not an index scan, from these two queries
+-- other than an index-only scan or sequential scan.
 explain (costs off) select * from t_ao_btree where a = 3 and b = 3;
 explain (costs off) select * from tpart_ao_btree where a = 3 and b = 3;
--- expect a fallback for all four of these queries
 select * from tpart_dim d join t_ao_btree f on d.a=f.a where d.b=1;
 select * from tpart_dim d join tpart_ao_btree f on d.a=f.a where d.b=1;
 
@@ -2962,14 +2969,13 @@ select * from tpart_dim d join tpart_ao_btree f on d.a=f.a where d.b=1;
 select enable_xform('CXformSelect2BitmapBoolOp');
 select enable_xform('CXformSelect2DynamicBitmapBoolOp');
 select enable_xform('CXformJoin2BitmapIndexGetApply');
-select enable_xform('CXformInnerJoin2NLJoin');
+reset optimizer_enable_nljoin;
 -- end_ignore
+
 reset optimizer_enable_hashjoin;
-reset optimizer_trace_fallback;
 
 -- Tests converted from MDPs that use tables partitioned on text columns and similar types,
 -- which can't be handled in ORCA MDPs, since they would require calling the GPDB executor
-set optimizer_trace_fallback = on;
 
 -- GroupingOnSameTblCol-2.mdp
 -- from dxl
@@ -3025,6 +3031,7 @@ default partition def);
 create INDEX y_idx on y (j);
 
 set optimizer_enable_indexjoin=on;
+set optimizer_enable_dynamicindexscan=on;
 explain (costs off) select count(*) from x, y where (x.i > y.j AND x.j <= y.i);
 reset optimizer_enable_indexjoin;
 
@@ -3186,8 +3193,526 @@ ORDER BY to_char(order_datetime,'YYYY-Q')
 ,      item_shipment_status_code
 ;
 
-reset optimizer_trace_fallback;
+-- test partioned table with no partitions
+create table no_part (a int, b int) partition by list (a) distributed by (b);
+select * from no_part;
 
+-- test casting with setops
+with v(year) as (
+    select 2019::float8 + dx from (VALUES (-1), (0), (0), (1), (1)) t(dx)
+  except
+    select 2019::int)
+select * from v where year > 1;
+
+with v(year) as (
+    select 2019::float8 + dx from (VALUES (-1), (0), (0), (1), (1)) t(dx)
+  except all
+    select 2019::int)
+select * from v where year > 1;
+
+with v(year) as (
+    select 2019::float8 + dx from (VALUES (-1), (0), (0), (1), (1)) t(dx)
+  intersect
+    select 2019::int)
+select * from v where year > 1;
+
+with v(year) as (
+    select 2019::float8 + dx from (VALUES (-1), (0), (0), (1), (1)) t(dx)
+  intersect all
+    select 2019::int)
+select * from v where year > 1;
+
+
+create table sqall_t1(a int) distributed by (a);
+insert into sqall_t1 values (1), (2), (3);
+set optimizer_join_order='query';
+select * from sqall_t1 where a not in (
+	    select b.a from sqall_t1 a left join sqall_t1 b on false);
+reset optimizer_join_order;
+
+create table tt_varchar(
+	data character varying
+) distributed by (data);
+insert into tt_varchar values('test');
+create table tt_int(
+	id integer
+) distributed by (id);
+insert into tt_int values(1);
+
+set optimizer_enforce_subplans = 1;
+-- test collation in subplan testexpr
+select data from tt_varchar where data > any(select id::text from tt_int);
+-- test implicit coerce via io
+CREATE CAST (integer AS text) WITH INOUT AS IMPLICIT;
+select data from tt_varchar where data > any(select id from tt_int);
+
+DROP CAST (integer AS text);
+reset optimizer_enforce_subplans;
+
+create table left_outer_index_nl_foo (a integer, b integer, c integer) distributed randomly;
+create table left_outer_index_nl_bar (a integer, b integer, c integer) distributed randomly;
+create index left_outer_index_nl_bar_idx on left_outer_index_nl_bar using btree (b);
+
+insert into left_outer_index_nl_foo select i, i, i from generate_series(1, 4)i;
+insert into left_outer_index_nl_bar select i, i, i from generate_series(2, 6)i;
+
+analyze left_outer_index_nl_foo;
+analyze left_outer_index_nl_bar;
+
+set optimizer_enable_hashjoin=off;
+set enable_nestloop=on;
+set enable_hashjoin=off;
+
+--- verify that the inner half of a left outer nested loop join is non-randomly distributed
+explain select r.a, r.b, r.c, l.c from left_outer_index_nl_foo r left outer join left_outer_index_nl_bar l on r.b=l.b;
+select r.a, r.b, r.c, l.c from left_outer_index_nl_foo r left outer join left_outer_index_nl_bar l on r.b=l.b;
+
+create table left_outer_index_nl_foo_hash (a integer, b integer, c text);
+create table left_outer_index_nl_bar_hash (a integer, b integer, c text);
+create index left_outer_index_nl_bar_hash_idx on left_outer_index_nl_bar_hash using btree (b);
+
+insert into left_outer_index_nl_foo_hash select i, i, i from generate_series(1, 4)i;
+insert into left_outer_index_nl_bar_hash select i, i, i from generate_series(2, 6)i;
+
+analyze left_outer_index_nl_foo_hash;
+analyze left_outer_index_nl_bar_hash;
+
+--- verify that the inner half of a left outer nested loop join is non-randomly distributed
+explain select r.a, r.b, r.c, l.c from left_outer_index_nl_foo_hash r left outer join left_outer_index_nl_bar l on r.b=l.b;
+select r.a, r.b, r.c, l.c from left_outer_index_nl_foo_hash r left outer join left_outer_index_nl_bar l on r.b=l.b;
+
+--- verify that a motion is introduced such that joins on each segment are internal to that segment (distributed by join key)
+explain select r.a, r.b, r.c, l.c from left_outer_index_nl_foo_hash r left outer join left_outer_index_nl_bar_hash l on r.b=l.b;
+select r.a, r.b, r.c, l.c from left_outer_index_nl_foo_hash r left outer join left_outer_index_nl_bar_hash l on r.b=l.b;
+
+create table left_outer_index_nl_foo_repl (a integer, b integer, c integer) distributed replicated;
+create table left_outer_index_nl_bar_repl (a integer, b integer, c integer) distributed replicated;
+create index left_outer_index_nl_bar_repl_idx on left_outer_index_nl_bar_repl using btree (b);
+
+insert into left_outer_index_nl_foo_repl select i, i, i from generate_series(1, 4)i;
+insert into left_outer_index_nl_bar_repl select i, i, i from generate_series(2, 6)i;
+
+analyze left_outer_index_nl_foo_repl;
+analyze left_outer_index_nl_bar_repl;
+
+--- replicated on both sides shouldn't require a motion
+explain select r.a, r.b, r.c, l.c from left_outer_index_nl_foo_repl r left outer join left_outer_index_nl_bar_repl l on r.b=l.b;
+select r.a, r.b, r.c, l.c from left_outer_index_nl_foo_repl r left outer join left_outer_index_nl_bar_repl l on r.b=l.b;
+
+--- outer side replicated, inner side hashed can have interesting cases (gather + join on one segment of inner side and redistribute + join + gather are both valid)
+explain select r.a, r.b, r.c, l.c from left_outer_index_nl_foo_repl r left outer join left_outer_index_nl_bar_hash l on r.b=l.b;
+select r.a, r.b, r.c, l.c from left_outer_index_nl_foo_repl r left outer join left_outer_index_nl_bar_hash l on r.b=l.b;
+
+reset optimizer_enable_hashjoin;
+reset enable_nestloop;
+reset enable_hashjoin;
+
+--- IS DISTINCT FROM FALSE previously simplified to IS TRUE, returning incorrect results for some hash anti joins
+--- the following tests were added to verify the behavior is correct
+CREATE TABLE tt1 (a int, b int);
+CREATE TABLE tt2 (c int, d int);
+
+INSERT INTO tt1 VALUES (1, NULL), (2, 2), (3, 4), (NULL, 5);
+INSERT INTO tt2 VALUES (1, 1), (2, NULL), (4, 4), (NULL, 2);
+
+ANALYZE tt1;
+ANALYZE tt2;
+
+EXPLAIN SELECT b FROM tt1 WHERE NOT EXISTS (SELECT * FROM tt2 WHERE (tt2.d = tt1.b) IS DISTINCT FROM false);
+SELECT b FROM tt1 WHERE NOT EXISTS (SELECT * FROM tt2 WHERE (tt2.d = tt1.b) IS DISTINCT FROM false);
+
+EXPLAIN SELECT b FROM tt1 WHERE NOT EXISTS (SELECT * FROM tt2 WHERE (tt2.d = tt1.b) IS DISTINCT FROM true);
+SELECT b FROM tt1 WHERE NOT EXISTS (SELECT * FROM tt2 WHERE (tt2.d = tt1.b) IS DISTINCT FROM true);
+
+EXPLAIN SELECT b FROM tt1 WHERE NOT EXISTS (SELECT * FROM tt2 WHERE (tt1.b = tt2.d) IS DISTINCT FROM NULL);
+SELECT b FROM tt1 WHERE NOT EXISTS (SELECT * FROM tt2 WHERE (tt1.b = tt2.d) IS DISTINCT FROM NULL);
+
+--- optimizer_xform_bind_threshold should limit the search space and quickly
+--- generate a plan (<100ms, but if this GUC is not set it will take minutes to
+--- optimize)
+create table binding (a int) distributed by (a);
+set optimizer_xform_bind_threshold=100;
+
+set statement_timeout = '15s';
+select a in (
+       select a from binding as t1 where a in (
+           select a from binding as t2 where a in (
+               select a from binding as t3 where a in (
+                   select a from binding as t4 join binding as t5 using(a) group by t4.a
+                   union
+                   select a from binding as t4 join binding as t5 using(a) group by t4.a
+                   union
+                   select a from binding as t4 join binding as t5 using(a) group by t4.a
+               )
+           )
+       )
+   ) from binding;
+reset optimizer_xform_bind_threshold;
+reset statement_timeout;
+
+-- an agg of a non-SRF with a nested SRF should be treated as a SRF, the
+-- optimizer must not eliminate the SRF or it can produce incorrect results
+create table nested_srf(a text);
+insert into nested_srf values ('abc,def,ghi');
+
+select * from (select regexp_split_to_table((a)::text, ','::text) from nested_srf)a;
+select count(*) from (select regexp_split_to_table((a)::text, ','::text) from nested_srf)a;
+
+select * from (select trim(regexp_split_to_table((a)::text, ','::text)) from nested_srf)a;
+select count(*) from (select trim(regexp_split_to_table((a)::text, ','::text)) from nested_srf)a;
+
+select count(*) from (select trim( case when a!='abc' then  (regexp_split_to_table((a)::text, ','::text)) else ' ' end) from nested_srf)a;
+select count(*) from (select trim(coalesce(regexp_split_to_table((a)::text, ','::text),'')) from nested_srf)a;
+select count(regexp_split_to_table((a)::text, ','::text)) from nested_srf;
+
+truncate nested_srf;
+insert into nested_srf values (NULL);
+
+select * from (select trim(regexp_split_to_table((a)::text, ','::text)) from nested_srf)a;
+select count(*) from (select trim(regexp_split_to_table((a)::text, ','::text)) from nested_srf)a;
+
+--- if the inner child is already distributed on the join column, orca should
+--- not place any motion on the inner child
+CREATE TABLE tone (a int, b int, c int);
+insert into tone select i,i,i from generate_series(1, 10) i;
+ANALYZE tone;
+SET optimizer_enable_hashjoin=off;
+EXPLAIN (COSTS OFF) SELECT * FROM tone t1 LEFT OUTER JOIN tone t2 ON t1.a = t2.a;
+SELECT * FROM tone t1 LEFT OUTER JOIN tone t2 ON t1.a = t2.a;
+
+--- if the inner child is not distributed on the join column, orca should
+--- redistribute the inner child
+EXPLAIN (COSTS OFF) SELECT * FROM tone t1 LEFT OUTER JOIN tone t2 ON t1.a = t2.b;
+SELECT * FROM tone t1 LEFT OUTER JOIN tone t2 ON t1.a = t2.b;
+EXPLAIN (COSTS OFF) SELECT * FROM tone t1 LEFT OUTER JOIN (SELECT 1+t2.b as b from tone t2) t2 ON t1.a = t2.b;
+SELECT * FROM tone t1 LEFT OUTER JOIN (SELECT 1+t2.b as b from tone t2) t2 ON t1.a = t2.b;
+
+
+--- if the join condition does not involve a simple scalar ident, orca must
+--- broadcast the inner child
+EXPLAIN (COSTS OFF) SELECT * FROM tone t1 LEFT OUTER JOIN tone t2 ON t1.a = t2.b-t1.a;
+SELECT * FROM tone t1 LEFT OUTER JOIN tone t2 ON t1.a = t2.b-t1.a;
+
+--- orca should broadcast the inner child if the guc is set off
+SET optimizer_enable_redistribute_nestloop_loj_inner_child=off;
+EXPLAIN (COSTS OFF) SELECT * FROM tone t1 LEFT OUTER JOIN tone t2 ON t1.a = t2.b;
+SELECT * FROM tone t1 LEFT OUTER JOIN tone t2 ON t1.a = t2.b;
+
+EXPLAIN (COSTS OFF) SELECT * FROM tone t1 LEFT OUTER JOIN tone t2 ON t1.a = t2.a;
+SELECT * FROM tone t1 LEFT OUTER JOIN tone t2 ON t1.a = t2.a;
+RESET optimizer_enable_redistribute_nestloop_loj_inner_child;
+RESET optimizer_enable_hashjoin;
+
+--- Test if orca can produce the correct plan for CTAS
+CREATE TABLE dist_tab_a (a varchar(15)) DISTRIBUTED BY(a);
+INSERT INTO dist_tab_a VALUES('1 '), ('2  '), ('3    ');
+CREATE TABLE dist_tab_b (a char(15), b bigint) DISTRIBUTED BY(a);
+INSERT INTO dist_tab_b VALUES('1 ', 1), ('2  ', 2), ('3    ', 3);
+EXPLAIN CREATE TABLE result_tab AS
+	(SELECT a.a, b.b FROM dist_tab_a a LEFT JOIN dist_tab_b b ON a.a=b.a) DISTRIBUTED BY(a);
+CREATE TABLE result_tab AS
+	(SELECT a.a, b.b FROM dist_tab_a a LEFT JOIN dist_tab_b b ON a.a=b.a) DISTRIBUTED BY(a);
+SELECT gp_segment_id, * FROM result_tab;
+DROP TABLE IF EXISTS dist_tab_a;
+DROP TABLE IF EXISTS dist_tab_b;
+DROP TABLE IF EXISTS result_tab;
+
+-- Test ORCA not falling back to Postgres planner during
+-- SimplifySelectOnOuterJoin stage. Previously, we could get assertion error
+-- trying to EberEvaluate() strict function with zero arguments.
+-- Postgres planner will fold our function, because it has additional
+-- eval_const_expressions() call for subplan. ORCA has only one call to
+-- fold_constants() at the very beginning and doesn't perform folding later.
+CREATE TABLE join_null_rej1(i int);
+CREATE TABLE join_null_rej2(i int);
+
+INSERT INTO join_null_rej1(i) VALUES (1), (2), (3);
+INSERT INTO join_null_rej2 SELECT i FROM join_null_rej1;
+
+CREATE OR REPLACE FUNCTION join_null_rej_func() RETURNS int AS $$
+BEGIN
+    RETURN 5;
+END;
+$$ LANGUAGE plpgsql STABLE STRICT;
+
+EXPLAIN (COSTS OFF) SELECT (
+    SELECT count(*) cnt
+    FROM join_null_rej1 t1
+    LEFT JOIN join_null_rej2 t2 ON t1.i = t2.i
+    WHERE t2.i < join_null_rej_func()
+);
+-- Optional, but let's check we get same result for both, folded and
+-- not folded join_null_rej_func() function.
+SELECT (
+    SELECT count(*) cnt
+    FROM join_null_rej1 t1
+    LEFT JOIN join_null_rej2 t2 ON t1.i = t2.i
+    WHERE t2.i < join_null_rej_func()
+);
+-- Check Sort node placed under GatherMerge in case we use Update from Select
+-- with window function. Placing Sort node upper and executing it on one
+-- segment can lead to slow query execution and can consume all spills for
+-- heavy datasets. Sort node should be on it's place for both, Postgres
+-- optimizer and ORCA.
+create table window_agg_test(i int, j int) distributed randomly;
+explain
+update window_agg_test t
+set i = tt.i 
+from (select (min(i) over (order by j)) as i, j from window_agg_test) tt
+where t.j = tt.j;
+
+----------------------------------
+-- Test ORCA support for const TVF
+----------------------------------
+create type complex_t as (r float8, i float8);
+-- Nested composite
+create type quad as (c1 complex_t, c2 complex_t);
+create function quad_func_cast() returns quad immutable as $$ select ((1.1,null),(2.2,null))::quad $$ language sql;
+explain select c1 from quad_func_cast();
+explain select c2 from quad_func_cast();
+explain select (c1).r from quad_func_cast();
+explain select (c2).i from quad_func_cast();
+select c1 from quad_func_cast();
+select c2 from quad_func_cast();
+select (c1).r from quad_func_cast();
+select (c2).i from quad_func_cast();
+
+create type mix_type as (a text, b integer, c bool);
+create function mix_func_cast() returns mix_type immutable as $$ select ('column1', 1, true)::mix_type $$ language sql;
+explain select a from mix_func_cast();
+explain select b from mix_func_cast();
+explain select c from mix_func_cast();
+select a from mix_func_cast();
+select b from mix_func_cast();
+select c from mix_func_cast();
+
+----------------------------------
+-- Test ORCA support for FIELDSELECT
+----------------------------------
+create type comp_type as ( a text, b numeric, c int, d float, e int);
+create table comp_table(id int, item comp_type) distributed by (id);
+create table comp_part (id int, item comp_type) distributed by (id) partition by range(id) (start(1) end(4) every(1));
+insert into comp_table values (1, ROW('GP', 10.5, 10, 10.5, 20)), (2, ROW('VM',20.5, 20, 10.5, 20)), (3, ROW('DB',10.5, 10, 10.5, 10));
+insert into comp_part values (1, ROW('GP', 10.5, 10, 10.5, 20)), (2, ROW('VM',20.5, 20, 10.5, 20)), (3, ROW('DB',10.5, 10, 10.5, 10));
+analyze comp_table;
+analyze comp_part;
+
+select sum((item).b) from comp_table where (item).c=20;
+explain (costs off) select sum((item).b) from comp_table where (item).c=20;
+
+select distinct (item).b from comp_table where (item).c=20;
+explain (costs off) select distinct (item).b from comp_table where (item).c=20;
+
+-- verify the query output using predicate with the same composite type
+select (item).a from comp_table where (item).c=20 and (item).e >10;
+explain (costs off) select (item).a from comp_table where (item).c=20 and (item).e >10;
+
+-- verify the query output using predicate with the different composite type
+select * from comp_table where (item).c>(item).d;
+explain (costs off) select * from comp_table where (item).c>(item).d ;
+
+-- verify the query output by using a composite type in a join query
+select (x.item).a from comp_table x join comp_table y on (x.item).c=(y.item).c;
+explain (costs off) select (x.item).a from comp_table x join comp_table y on (x.item).c=(y.item).c;
+
+-- verify the query output by using a composite type in a TVF query
+select (x.item).a, (select count(*) from generate_series(1, (x.item).c)) from comp_table x;
+explain (costs off) select (x.item).a, (select count(*) from generate_series(1, (x.item).c)) from comp_table x;
+
+-- verify the query output by using a composite type in a cte query
+with cte1 as (select * from comp_table where (item).c>10) select id, (item).a, (item).b, (item).c, (item).e from cte1;
+explain (costs off) with cte1 as (select * from comp_table where (item).c>10) select id, (item).a, (item).b, (item).c, (item).e from cte1;
+
+-- verify the query output by using a composite type in a  subquery
+select (item).a from comp_table where (item).c=10 and (item).e IN (SELECT (item).e FROM comp_table WHERE (item).c = 10);
+explain (costs off) select (item).a from comp_table where (item).c=10 and (item).e IN (SELECT (item).e FROM comp_table WHERE (item).c = 10);
+
+-- verify the query output by using a composite type in a partition table query
+select (x.item).a from comp_part x join comp_part y on (X.item).c=(Y.item).c;
+explain (costs off) select (x.item).a from comp_part x join comp_part y on (X.item).c=(Y.item).c;
+
+-- clean up
+drop table comp_table;
+drop table comp_part;
+drop type comp_type;
+
+-- the query with empty CTE producer target list should fall back to Postgres
+-- optimizer without any error on build without asserts
+drop table if exists empty_cte_tl_test;
+create table empty_cte_tl_test(id int);
+
+with cte as (
+  select from empty_cte_tl_test
+)
+select * 
+from empty_cte_tl_test
+where id in(select id from cte);
+
+-- test that we use default cardinality estimate (40) for non-comparable types
+create table ts_tbl (ts timestamp);
+create index ts_tbl_idx on ts_tbl(ts);
+insert into ts_tbl select to_timestamp('99991231'::text, 'YYYYMMDD'::text) from generate_series(1,100);
+analyze ts_tbl;
+explain select * from ts_tbl where ts = to_timestamp('99991231'::text, 'YYYYMMDD'::text);
+
+-- Test ORCA support for implicit array coerce cast
+-- ORCA should generate a valid plan passing along the cast function as part of ArrayCoerceExpr
+-- While execution thin insert query fails due to the mismatch of column length.
+create table array_coerce_foo (a int, b varchar(2)[]);
+create table array_coerce_bar (a int, b varchar(10)[]);
+
+insert into array_coerce_bar values (1, ARRAY['abcde']);
+explain insert into array_coerce_foo select * from array_coerce_bar;
+insert into array_coerce_foo select * from array_coerce_bar;
+
+-- These testcases will fallback to postgres when "PexprConvert2In" is enabled if
+-- underlying issues are not fixed
+create table baz (a int,b int);
+explain select baz.* from baz where
+baz.a=1 OR
+baz.b = 1 OR baz.b = 2 OR baz.b = 3 OR baz.b = 4 OR baz.b = 5 OR baz.b = 6 OR baz.b = 7 OR baz.b = 8 OR baz.b = 9 OR baz.b = 10 OR
+baz.b = 11 OR baz.b = 12 OR baz.b = 13 OR baz.b = 14 OR baz.b = 15 OR baz.b = 16 OR baz.b = 17 OR baz.b = 18 OR baz.b = 19 OR baz.b = 20;
+drop table baz;
+create table baz ( a varchar);
+explain select * from baz where baz.a::bpchar='b' or baz.a='c';
+drop table baz;
+
+-- While retrieving the columns width in partitioned tables, inherited stats i.e.
+-- stats that cover all the child tables should be used
+
+-- start_ignore
+create language plpython3u;
+-- end_ignore
+create or replace function check_col_width(query text, operator text, width text) returns int as
+$$
+rv = plpy.execute('EXPLAIN '+ query)
+search_text_1 = operator
+search_text_2 = width
+result = 0
+for i in range(len(rv)):
+    cur_line = rv[i]['QUERY PLAN']
+    if search_text_1 in cur_line and search_text_2 in cur_line:
+        result = result+1
+return result
+$$
+language plpython3u;
+
+create table testPartWidth (a numeric(7,2), b numeric(7,2)) distributed by (a)
+partition by range(a) (start(0.0) end(4.0) every(2.0));
+insert into testPartWidth values (0.001,0.001),(2.123,2.123);
+analyze testPartWidth;
+
+--------------------------------------------------------------------------------
+-- The below query shows the column width of 'a' and 'b'
+-- select attname,avg_width from pg_stats where tablename='testPartWidth';
+-- attname | avg_width
+-- ---------+-----------
+--  a       |         5
+--  b       |         5
+--------------------------------------------------------------------------------
+select check_col_width('select a from testPartWidth;','Dynamic Seq Scan','width=5') = 1;
+select check_col_width('select b from testPartWidth;','Dynamic Seq Scan','width=5') = 1;
+select check_col_width('select a from testPartWidth;','Append','width=5') = 1;
+select check_col_width('select a from testPartWidth;','Append','width=5') = 1;
+drop function check_col_width(query text, operator text, width text);
+
+---------------------------------------------------------------------------------
+-- Test cast from INT[] to TEXT[]
+CREATE TABLE array_coerceviaio(a INT[]) distributed randomly;
+INSERT INTO array_coerceviaio values(ARRAY[1, 2, 3]);
+
+EXPLAIN SELECT CAST(a AS TEXT[]) FROM array_coerceviaio;
+SELECT CAST(a AS TEXT[]) FROM array_coerceviaio;
+
+---------------------------------------------------------------------------------
+DROP TABLE IF EXISTS schema_test_table;
+CREATE TABLE schema_test_table(a numeric, b numeric(5,2), c char(10) NOT NULL) distributed by (a);
+-- In 7x, redundant Result nodes in planned_stmt are being removed by ORCA,
+-- which caused the loss of typmod info of column type in plan.
+-- Below query is used by external libraries to fetch schema of table.
+-- Test that the typmod of column type is correct in explain plan.
+EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM schema_test_table WHERE 1=0;
+---------------------------------------------------------------------------------
+
+---------------------------------------------------------------------------------
+-- Test ALL NULL scalar array compare 
+create table DatumSortedSet_core (a int, b character varying NOT NULL) distributed by (a);
+explain select * from DatumSortedSet_core where b in (NULL, NULL);
+---------------------------------------------------------------------------------
+
+-- Test fill argtypes of PopAggFunc
+-- start_ignore
+drop table if exists foo;
+drop table if exists bar;
+-- end_ignore
+
+set optimizer_enable_eageragg = on;
+create table foo (j1 int, g1 int, s1 int);
+insert into foo select i%10, i %10, i from generate_series(1,100) i;
+create table bar (j2 int, g2 int, s2 int);
+insert into bar select i%1, i %10, i from generate_series(1,10) i;
+analyze foo;
+analyze bar;
+
+explain (costs off) select max(s1) from foo inner join bar on j1 = j2 group by g1;
+drop table foo;
+drop table bar;
+reset optimizer_enable_eageragg;
+
+-- Testcases to validate the behavior of the GUC gp_max_system_slices
+
+-- start_ignore
+drop table if exists foo;
+drop table if exists bar;
+-- end_ignore
+
+create table foo (a int, b int) distributed by(a);
+create table bar (a int, b int) distributed by(a);
+
+-- gp_max_slices : 0 (unlimited) and gp_max_system_slices : 0 (unlimited)
+explain (costs off) select foo.a, foo.b from foo, bar where foo.b=bar.b;
+
+-- gp_max_slices : 1 and gp_max_system_slices : 0 (unlimited)
+-- Query should generate an error because the number of slices in the query exceeds the gp_max_slices
+set gp_max_slices=1;
+explain (costs off) select foo.a, foo.b from foo, bar where foo.b=bar.b;
+
+-- gp_max_slices : 0 (unlimited) and gp_max_system_slices : 1
+-- Query should generate an error because the number of slices in the query exceeds the gp_max_system_slices
+set gp_max_system_slices=1;
+reset gp_max_slices;
+explain (costs off) select foo.a, foo.b from foo, bar where foo.b=bar.b;
+reset gp_max_system_slices;
+
+-- Ensure that a regular user cannot set the GUC gp_max_system_slices
+create user ruser;
+set session authorization ruser;
+set gp_max_system_slices=10;
+reset session authorization;
+
+-- Test that set returning function with multiple columns works with explain
+CREATE FUNCTION srf_attnum() RETURNS TABLE(v1 int, v2 int)
+    LANGUAGE plpgsql NO SQL
+    AS $_$
+BEGIN
+    DROP TABLE IF EXISTS tbl_2_cols;
+    CREATE TEMP TABLE tbl_2_cols (col1 int, col2 int) DISTRIBUTED RANDOMLY;
+    RETURN QUERY SELECT * from tbl_2_cols;
+END;
+$_$;
+explain select distinct v1 from srf_attnum();
+select distinct v1 from srf_attnum();
+explain select distinct v2 from srf_attnum();
+select distinct v2 from srf_attnum();
+
+drop user ruser;
+drop table foo, bar;
+
+-- ensure shared scan producer returns 0 rows
+create table cte_test(a int);
+insert into cte_test select i from generate_series(1,10)i;
+analyze cte_test;
+explain (analyze, costs off, summary off, timing off) with cte as (select * from cte_test) select * from cte union all select * from cte;
 -- start_ignore
 DROP SCHEMA orca CASCADE;
 -- end_ignore

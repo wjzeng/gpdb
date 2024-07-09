@@ -66,13 +66,14 @@ CIndexDescriptorTest::EresUnittest_Basic()
 					 CTestUtils::GetCostModel(mp));
 
 	CWStringConst strName(GPOS_WSZ_LIT("MyTable"));
-	CMDIdGPDB *mdid = GPOS_NEW(mp) CMDIdGPDB(GPOPT_MDCACHE_TEST_OID, 1, 1);
+	CMDIdGPDB *mdid =
+		GPOS_NEW(mp) CMDIdGPDB(IMDId::EmdidRel, GPOPT_MDCACHE_TEST_OID, 1, 1);
 	CTableDescriptor *ptabdesc =
 		CTestUtils::PtabdescCreate(mp, 10, mdid, CName(&strName));
 
 	// get the index associated with the table
 	const IMDRelation *pmdrel = mda.RetrieveRel(ptabdesc->MDId());
-	GPOS_ASSERT(0 < pmdrel->IndexCount());
+	GPOS_UNITTEST_ASSERT(0 < pmdrel->IndexCount());
 
 	// create an index descriptor
 	IMDId *pmdidIndex = pmdrel->IndexMDidAt(0);	 // get the first index

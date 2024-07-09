@@ -15,8 +15,11 @@
 #define GPDXL_CDXLPhysicalAppend_H
 
 #include "gpos/base.h"
+#include "gpos/common/CBitSet.h"
+#include "gpos/common/CDynamicPtrArray.h"
 
 #include "naucrates/dxl/operators/CDXLPhysical.h"
+#include "naucrates/dxl/operators/CDXLTableDescr.h"
 
 namespace gpdxl
 {
@@ -41,10 +44,10 @@ class CDXLPhysicalAppend : public CDXLPhysical
 {
 private:
 	// is the append node used in an update/delete statement
-	BOOL m_used_in_upd_del;
+	BOOL m_used_in_upd_del = false;
 
 	// TODO:  - Apr 12, 2011; find a better name (and comments) for this variable
-	BOOL m_is_zapped;
+	BOOL m_is_zapped = false;
 
 public:
 	CDXLPhysicalAppend(const CDXLPhysicalAppend &) = delete;

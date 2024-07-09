@@ -960,7 +960,7 @@ LOCATION
 FORMAT 'text'
 (
         DELIMITER AS ','
-)
+) LOG ERRORS SEGMENT REJECT LIMIT 2
 ;
 SELECT count(*) FROM ext_test;
 ERROR:  gpfdist error - line too long in file @abs_srcdir@/data/gpfdist2/longline.txt near (0 bytes)  (seg1 slice1 172.17.0.4:25433 pid=36416)
@@ -1187,6 +1187,143 @@ EXECUTE ext_simple_bar(1);
 ROLLBACK;
 DEALLOCATE ext_simple_bar;
 DROP EXTERNAL TABLE ext_simple;
+-- test 27 using a .zst file
+CREATE EXTERNAL TABLE ext_lineitem (
+                L_ORDERKEY INT8,
+                L_PARTKEY INTEGER,
+                L_SUPPKEY INTEGER,
+                L_LINENUMBER integer,
+                L_QUANTITY decimal,
+                L_EXTENDEDPRICE decimal,
+                L_DISCOUNT decimal,
+                L_TAX decimal,
+                L_RETURNFLAG CHAR(1),
+                L_LINESTATUS CHAR(1),
+                L_SHIPDATE date,
+                L_COMMITDATE date,
+                L_RECEIPTDATE date,
+                L_SHIPINSTRUCT CHAR(25),
+                L_SHIPMODE CHAR(10),
+                L_COMMENT VARCHAR(44)
+                )
+LOCATION
+(
+      'gpfdist://@hostname@:7070/gpfdist2/lineitem.tbl.zst'
+)
+FORMAT 'text'
+(
+        DELIMITER AS '|'
+)
+;
+SELECT count(*) FROM ext_lineitem;
+   256
+
+CREATE WRITABLE EXTERNAL TABLE ext_lineitem_out (
+                L_ORDERKEY INT8,
+                L_PARTKEY INTEGER,
+                L_SUPPKEY INTEGER,
+                L_LINENUMBER integer,
+                L_QUANTITY decimal,
+                L_EXTENDEDPRICE decimal,
+                L_DISCOUNT decimal,
+                L_TAX decimal,
+                L_RETURNFLAG CHAR(1),
+                L_LINESTATUS CHAR(1),
+                L_SHIPDATE date,
+                L_COMMITDATE date,
+                L_RECEIPTDATE date,
+                L_SHIPINSTRUCT CHAR(25),
+                L_SHIPMODE CHAR(10),
+                L_COMMENT VARCHAR(44)
+                )
+LOCATION
+(
+      'gpfdist://@hostname@:7070/gpfdist2/lineitem.tbl.out.zst'
+)
+FORMAT 'text'
+(
+        DELIMITER AS '|'
+)
+;
+INSERT INTO ext_lineitem_out select * from ext_lineitem;
+CREATE EXTERNAL TABLE ext_lineitem_in (
+                L_ORDERKEY INT8,
+                L_PARTKEY INTEGER,
+                L_SUPPKEY INTEGER,
+                L_LINENUMBER integer,
+                L_QUANTITY decimal,
+                L_EXTENDEDPRICE decimal,
+                L_DISCOUNT decimal,
+                L_TAX decimal,
+                L_RETURNFLAG CHAR(1),
+                L_LINESTATUS CHAR(1),
+                L_SHIPDATE date,
+                L_COMMITDATE date,
+                L_RECEIPTDATE date,
+                L_SHIPINSTRUCT CHAR(25),
+                L_SHIPMODE CHAR(10),
+                L_COMMENT VARCHAR(44)
+                )
+LOCATION
+(
+      'gpfdist://@hostname@:7070/gpfdist2/lineitem.tbl.out.zst'
+)
+FORMAT 'text'
+(
+        DELIMITER AS '|'
+)
+;
+select count(*) from ext_lineitem_in;
+   256
+
+DROP EXTERNAL TABLE ext_lineitem_in;
+DROP EXTERNAL TABLE ext_lineitem_out;
+DROP EXTERNAL TABLE ext_lineitem;
+-- test gz file with multiple chunk
+CREATE EXTERNAL TABLE gz_multi_chunk(a text) LOCATION('gpfdist://@hostname@:7070/gpfdist2/gz_multi_chunk.tbl.gz') FORMAT 'csv';
+SELECT count(*) FROM gz_multi_chunk;
+  2200
+
+-- a small gz file with 2 chunks
+CREATE EXTERNAL TABLE gz_multi_chunk_2(
+   "created_time_millis" bigint,
+   "account" integer,
+   "visit_msb_id" bigint,
+   "visit_lsb_id" bigint,
+   "event_name" varchar(255),
+   "event_value" decimal(12,4)
+)
+LOCATION('gpfdist://@hostname@:7070/gpfdist2/gz_multi_chunk_2.tbl.gz') FORMAT 'csv';
+SELECT count(*) FROM gz_multi_chunk_2;
+     2
+
+-- test the bug of auto-quote for key words
+-- please refer to issue-16753
+CREATE TABLE test_quote (id bigint, item text, price int);
+CREATE TABLE test_quote_input AS (
+        select id, item, price, 
+        gp_segment_id as segment,
+        current_timestamp as time 
+        from test_quote order by id);
+INSERT INTO test_quote values(1, 'xyz', 1);
+CREATE WRITABLE EXTERNAL TABLE test_quote_writable (LIKE test_quote_input) 
+LOCATION('gpfdist://@hostname@:7070/gpfdist2/test_quote.csv') 
+FORMAT 'CSV' (FORCE QUOTE id, item, price, segment, time);
+INSERT INTO test_quote_writable (
+        select id, item, price, 
+        gp_segment_id as segment,
+        current_timestamp as time 
+        from test_quote order by id);
+CREATE READABLE EXTERNAL TABLE test_quote_readable (LIKE test_quote_input) 
+LOCATION('gpfdist://@hostname@:7070/gpfdist2/test_quote.csv') 
+FORMAT 'CSV' (FORCE NOT NULL id, item, price, segment, time);
+SELECT count(*) FROM test_quote_readable;
+     1
+
+DROP TABLE test_quote;
+DROP TABLE test_quote_input;
+DROP EXTERNAL TABLE test_quote_writable;
+DROP EXTERNAL TABLE test_quote_readable;
 -- start_ignore
 select * from gpfdist2_stop;
  stopping...

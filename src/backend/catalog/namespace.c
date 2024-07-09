@@ -55,6 +55,7 @@
 #include "parser/parse_func.h"
 #include "storage/ipc.h"
 #include "storage/lmgr.h"
+#include "storage/procarray.h"
 #include "storage/sinvaladt.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
@@ -64,6 +65,7 @@
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/snapmgr.h"
 #include "utils/syscache.h"
 #include "utils/varlena.h"
 
@@ -780,13 +782,23 @@ RelationIsVisible(Oid relid)
 
 /*
  * TypenameGetTypid
+ *		Wrapper for binary compatibility.
+ */
+Oid
+TypenameGetTypid(const char *typname)
+{
+	return TypenameGetTypidExtended(typname, true);
+}
+
+/*
+ * TypenameGetTypidExtended
  *		Try to resolve an unqualified datatype name.
  *		Returns OID if type found in search path, else InvalidOid.
  *
  * This is essentially the same as RelnameGetRelid.
  */
 Oid
-TypenameGetTypid(const char *typname)
+TypenameGetTypidExtended(const char *typname, bool temp_ok)
 {
 	Oid			typid;
 	ListCell   *l;
@@ -796,6 +808,9 @@ TypenameGetTypid(const char *typname)
 	foreach(l, activeSearchPath)
 	{
 		Oid			namespaceId = lfirst_oid(l);
+
+		if (!temp_ok && namespaceId == myTempNamespace)
+			continue;			/* do not look in temp namespace */
 
 		typid = GetSysCacheOid2(TYPENAMENSP, Anum_pg_type_oid,
 								PointerGetDatum(typname),
@@ -3086,11 +3101,33 @@ makeRangeVarFromNameList(List *names)
 			break;
 		case 2:
 			rel->schemaname = strVal(linitial(names));
+
+			/* GPDB: When QD generates query tree and serializes it to string
+			 * and sends it to QE, and QE will deserialize it to a plan tree.
+			 * In this process, Greenplum will not consider the difference
+			 * between NULL and an empty string, so if the original value is
+			 * a NULL, QE may deserialize it to an empty string, which could
+			 * lead to error in the following process.
+			 */
+			if (rel->schemaname && strlen(rel->schemaname) == 0)
+				rel->schemaname = NULL;
+
 			rel->relname = strVal(lsecond(names));
 			break;
 		case 3:
 			rel->catalogname = strVal(linitial(names));
 			rel->schemaname = strVal(lsecond(names));
+
+			/* GPDB: When QD generates query tree and serializes it to string
+			 * and sends it to QE, and QE will deserialize it to a plan tree.
+			 * In this process, Greenplum will not consider the difference
+			 * between NULL and an empty string, so if the original value is
+			 * a NULL, QE may deserialize it to an empty string, which could
+			 * lead to error in the following process.
+			 */
+			if (rel->schemaname && strlen(rel->schemaname) == 0)
+				rel->schemaname = NULL;
+
 			rel->relname = strVal(lthird(names));
 			break;
 		default:
@@ -3258,16 +3295,23 @@ isOtherTempNamespace(Oid namespaceId)
 }
 
 /*
- * isTempNamespaceInUse - is the given namespace owned and actively used
+ * checkTempNamespaceStatus - is the given namespace owned and actively used
  * by a backend?
  *
  * Note: this can be used while scanning relations in pg_class to detect
  * orphaned temporary tables or namespaces with a backend connected to a
  * given database.  The result may be out of date quickly, so the caller
  * must be careful how to handle this information.
+ *
+ * GPDB: we should not use the current version (same as upstream) of this
+ * function, as GPDB might have session ID instead of backend ID in the temp
+ * namespace name. We could check the running sessions just like checking the
+ * backends, but that would require frequently acquiring ProcArrayLock which we
+ * should avoid. Currently, we use an alternative isTempNamespaceMustBeIdle()
+ * for autovacuum which is the only use case of this function.
  */
-bool
-isTempNamespaceInUse(Oid namespaceId)
+TempNamespaceStatus
+checkTempNamespaceStatus(Oid namespaceId)
 {
 	PGPROC	   *proc;
 	int			backendId;
@@ -3276,25 +3320,90 @@ isTempNamespaceInUse(Oid namespaceId)
 
 	backendId = GetTempNamespaceBackendId(namespaceId);
 
-	if (backendId == InvalidBackendId ||
-		backendId == MyBackendId)
-		return false;
+	/* No such namespace, or its name shows it's not temp? */
+	if (backendId == InvalidBackendId)
+		return TEMP_NAMESPACE_NOT_TEMP;
 
 	/* Is the backend alive? */
 	proc = BackendIdGetProc(backendId);
 	if (proc == NULL)
-		return false;
+		return TEMP_NAMESPACE_IDLE;
 
 	/* Is the backend connected to the same database we are looking at? */
 	if (proc->databaseId != MyDatabaseId)
-		return false;
+		return TEMP_NAMESPACE_IDLE;
 
 	/* Does the backend own the temporary namespace? */
 	if (proc->tempNamespaceId != namespaceId)
+		return TEMP_NAMESPACE_IDLE;
+
+	/* Yup, so namespace is busy */
+	return TEMP_NAMESPACE_IN_USE;
+}
+
+/*
+ * A GPDB alternative to current use case of checkTempNamespaceStatus (i.e.
+ * autovacuum). It has two differences:
+ *
+ * 1. consider session IDs as well as backend IDs in the namespace name, which
+ *    is passed in by the caller;
+ * 2. do not return exact status but only indicate whether the namespace *must*
+ *    be an idle temp namespace. See notes below.
+ *
+ * Note that, due to worry about holding ProcArrayLock for too long, we require
+ * the caller to take a snapshot of all procs and their session IDs beforehand.
+ * Therefore, we do not check proc->databaseId or proc->tempNamespaceId of those 
+ * procs, because we might be looking at some pretty outdated ones. As long as
+ * the session ID matches we think the temp namespace "might be" in-use, hence
+ * return false. The outcome is just to skip dropping the table this time, which
+ * is fine.
+ */
+bool
+isTempNamespaceMustBeIdle(Oid namespaceId, HTAB *aliveSessions)
+{
+	PGPROC 		*proc;
+	int 		suffix_id;
+
+	Assert(OidIsValid(MyDatabaseId));
+	Assert(aliveSessions);
+
+	/* Either backendId or gp_session_id */
+	suffix_id = GetTempNamespaceBackendId(namespaceId);
+
+	/* No such namespace, or its name shows it's not temp? */
+	if (suffix_id == InvalidBackendId)
 		return false;
 
-	/* all good to go */
+	/* Is it an alive session? */
+	if (hash_search(aliveSessions, &suffix_id, HASH_FIND, NULL))
+		return false;
+
+	/* Not an alive session ID, is it a valid backend? */
+	proc = BackendIdGetProc(suffix_id);
+	if (proc != NULL && suffix_id != MyBackendId) {
+		/*
+		 * Is the backend connected to the same database we are looking at?
+		 * and does the backend own the temporary namespace?
+		 */
+		if (proc->databaseId == MyDatabaseId && proc->tempNamespaceId == namespaceId)
+			return false;
+	}
+
+	/* Otherwise, the temp namespace must be idle */
 	return true;
+}
+
+/*
+ * isTempNamespaceInUse - oversimplified, deprecated version of
+ * checkTempNamespaceStatus
+ *
+ * GPDB: since checkTempNamespaceStatus is not usable, we should not use this 
+ * function as well (see comment for checkTempNamespaceStatus).
+ */
+bool
+isTempNamespaceInUse(Oid namespaceId)
+{
+	return checkTempNamespaceStatus(namespaceId) == TEMP_NAMESPACE_IN_USE;
 }
 
 /*
@@ -3303,12 +3412,7 @@ isTempNamespaceInUse(Oid namespaceId)
  * that owns it.  Temporary-toast-table namespaces are included, too.
  * If it isn't a temp namespace, return InvalidBackendId.
  *
- * FIXME: This function doesn't work or useful in GPDB (only useful for
- * utility mode temp tables which are none or rare). Since the temp namespace
- * for QD and QE is using gp_session_id as suffix instead of backendID.
- * Function needs to be modified to work for GPDB. Maybe checking if
- * gp_session_id is active in system or not currently. Only user of this
- * function is autovacuum process so far so the impact is low.
+ * GPDB: the number could be a session ID instead of a backend ID.
  */
 int
 GetTempNamespaceBackendId(Oid namespaceId)
@@ -3348,6 +3452,8 @@ GetTempToastNamespace(void)
  *
  * This is used for conveying state to a parallel worker, and is not meant
  * for general-purpose access.
+ *
+ * GPDB: also used when dispatch MPP query
  */
 void
 GetTempNamespaceState(Oid *tempNamespaceId, Oid *tempToastNamespaceId)
@@ -3385,6 +3491,30 @@ SetTempNamespaceState(Oid tempNamespaceId, Oid tempToastNamespaceId)
 	 */
 
 	baseSearchPathValid = false;	/* may need to rebuild list */
+}
+
+/*
+ * like SetTempNamespaceState, but the process running normally
+ *
+ * GPDB: used to set session level temporary namespace after reader gang launched.
+ */
+void
+SetTempNamespaceStateAfterBoot(Oid tempNamespaceId, Oid tempToastNamespaceId)
+{
+	Assert(Gp_role == GP_ROLE_EXECUTE);
+
+	/* writer gang will do InitTempTableNamespace(), ignore the dispatch on writer gang */
+	if (Gp_is_writer)
+		return;
+
+	/* skip rebuild search path if search path is correct and valid */
+	if (tempNamespaceId == myTempNamespace && myTempToastNamespace == tempToastNamespaceId)
+		return;
+
+	myTempNamespace = tempNamespaceId;
+	myTempToastNamespace = tempToastNamespaceId;
+
+	baseSearchPathValid = false;	/* need to rebuild list */
 }
 
 
@@ -3493,6 +3623,10 @@ OverrideSearchPathMatchesCurrent(OverrideSearchPath *path)
 
 /*
  * PushOverrideSearchPath - temporarily override the search path
+ *
+ * Do not use this function; almost any usage introduces a security
+ * vulnerability.  It exists for the benefit of legacy code running in
+ * non-security-sensitive environments.
  *
  * We allow nested overrides, hence the push/pop terminology.  The GUC
  * search_path variable is ignored while an override is active.
@@ -4014,7 +4148,7 @@ InitTempTableNamespace(void)
 	 * Do not allow a Hot Standby session to make temp tables.  Aside from
 	 * problems with modifying the system catalogs, there is a naming
 	 * conflict: pg_temp_N belongs to the session with BackendId N on the
-	 * master, not to a hot standby session with the same BackendId.  We
+	 * primary, not to a hot standby session with the same BackendId.  We
 	 * should not be able to get here anyway due to XactReadOnly checks, but
 	 * let's just make real sure.  Note that this also backstops various
 	 * operations that allow XactReadOnly transactions to modify temp tables;
@@ -4077,7 +4211,7 @@ InitTempTableNamespace(void)
 	 * it. (We assume there is no need to clean it out if it does exist, since
 	 * dropping a parent table should make its toast table go away.)
 	 * (in GPDB, though, we drop and recreate it anyway, to make sure it has
-	 * the same OID on master and segments.)
+	 * the same OID on coordinator and segments.)
 	 */
 	snprintf(namespaceName, sizeof(namespaceName),
 			 "pg_toast_temp_%s%d", session_infix, session_suffix);
@@ -4168,6 +4302,28 @@ DropTempTableNamespaceForResetSession(Oid namespaceOid)
 }
 
 /*
+ * Remove temp namespace entry from pg_namespace.
+ */
+void
+DropTempTableNamespaceEntryForResetSession(Oid namespaceOid, Oid toastNamespaceOid)
+{
+	if (IsTransactionOrTransactionBlock())
+		elog(ERROR, "Called within a transaction");
+
+	StartTransactionCommand();
+
+	/* Make sure the temp namespace is valid. */
+	if (SearchSysCacheExists1(NAMESPACEOID,
+							  ObjectIdGetDatum(namespaceOid)))
+	{
+		RemoveSchemaById(namespaceOid);
+		RemoveSchemaById(toastNamespaceOid);
+	}
+
+	CommitTransactionCommand();
+}
+
+/*
  * Called by CreateSchemaCommand when creating a temporary schema 
  */
 void
@@ -4211,6 +4367,7 @@ ResetTempNamespace(void)
 	cancel_before_shmem_exit(RemoveTempRelationsCallback, 0);
 
 	myTempNamespace = InvalidOid;
+	myTempToastNamespace = InvalidOid;
 	myTempNamespaceSubID = InvalidSubTransactionId;
 	baseSearchPathValid = false;	/* need to rebuild list */
 
@@ -4402,6 +4559,7 @@ RemoveTempRelationsCallback(int code, Datum arg)
 		/* Need to ensure we have a usable transaction. */
 		AbortOutOfAnyTransaction();
 		StartTransactionCommand();
+		PushActiveSnapshot(GetTransactionSnapshot());
 
 		/* 
 		 * Make sure that the schema hasn't been removed. We must do this after
@@ -4419,6 +4577,7 @@ RemoveTempRelationsCallback(int code, Datum arg)
 				 myTempNamespace); 
 		}
 
+		PopActiveSnapshot();
 		CommitTransactionCommand();
 	}
 }
@@ -4555,7 +4714,8 @@ TempNamespaceValid(bool error_if_removed)
 		if (SearchSysCacheExists1(NAMESPACEOID,
 								  ObjectIdGetDatum(myTempNamespace)))
 			return true;
-		else if (Gp_role != GP_ROLE_EXECUTE && error_if_removed) 
+		else if (Gp_role != GP_ROLE_EXECUTE && error_if_removed)
+		{
 			/*
 			 * We might call this on QEs if we're dropping our own
 			 * session's temp table schema. However, we want the
@@ -4566,6 +4726,7 @@ TempNamespaceValid(bool error_if_removed)
 					(errcode(ERRCODE_UNDEFINED_SCHEMA),
 					 errmsg("temporary table schema removed while session "
 							"still in progress")));
+		}
 	}
 	return false;
 }

@@ -14,6 +14,7 @@ import time
 import pprint
 from optparse import Option, OptionGroup, OptionParser, OptionValueError, SUPPRESS_USAGE
 import socket
+from gppylib.mainUtils import parseStatusLine
 
 try:
     from gppylib.gpparseopts import OptParser, OptChecker
@@ -33,6 +34,7 @@ try:
     from gppylib.gp_era import GpEraFile
     from gppylib.operations.utils import ParallelOperation, RemoteOperation
     from gppylib.operations.rebalanceSegments import ReconfigDetectionSQLQueryCommand
+    from gppylib.operations.detect_unreachable_hosts import get_unreachable_segment_hosts
 except ImportError as e:
     sys.exit('ERROR: Cannot import modules.  Please check that you have sourced greenplum_path.sh.  Detail: ' + str(e))
 
@@ -253,6 +255,8 @@ class GpStop:
         gp.check_permissions(self.user)
         self._read_postgresqlconf()
         self._check_db_running()
+        if self._is_db_shutting_down():
+            self._handle_shutdown_state()
         self._build_gparray()
         if self.onlyThisHost:
             self._is_hostname_valid()
@@ -311,6 +315,60 @@ class GpStop:
         logger.info("Obtaining Segment details from coordinator...")
         self.dburl = dbconn.DbURL(port=self.port, dbname='template1')
         self.gparray = GpArray.initFromCatalog(self.dburl, utility=True)
+
+    def _handle_shutdown_state(self):
+        """
+        Handle the scenario where the Greenplum database is in shutting down state.
+        """
+        # Check if gpstop is called with -u option
+        if self.sighup:
+            logger.fatal("Cannot send SIGHUP to postmaster as the database is shutting down. "
+                         "Please run 'gpstop' to complete the shutdown process.")
+            sys.exit(1)
+
+        # Prompt user for mode selection
+        mode_selection = userinput.ask_string("Please select fast or immediate mode to complete the shutdown:",
+                                              "['(f)ast_mode', '(i)mmediate_mode']", 'f',
+                                              ['f', 'i'])
+        logger.info("Your choice was '{0}'".format(mode_selection))
+        self.mode = 'fast' if mode_selection == 'f' else 'immediate'
+
+        # Stop the coordinator processes stuck in shutting down state
+        logger.info("Stopping the coordinator to finish the database shutdown")
+        try:
+            cmd = gp.CoordinatorStop("stopping coordinator", self.coordinator_datadir, mode='immediate')
+            cmd.run(validateAfter=True)
+        except Exception as exc:
+            raise Exception("Unable to stop the coordinator: {0}".format(exc))
+
+        # Starting the cluster in coordinator_only mode. It is required to gather segment information
+        # in subsequent steps in order to continue the normal gpstop workflow.
+        self._start_db_coordinatoronly()
+
+    def _is_db_shutting_down(self):
+        """
+        Check if the Greenplum database is in the process of shutting down.
+        Returns True if the database is shutting down.
+        """
+        try:
+            self.dburl = dbconn.DbURL(port=self.port, dbname='template1')
+            with closing(dbconn.connect(self.dburl, utility=True)) as conn:
+                pass  # Nothing to do here, as we are only testing the database connection
+        except Exception as exc:
+            if "the database system is shutting down" in str(exc):
+                logger.warning("The database is currently in the process of shutting down.")
+                return True
+
+    def _start_db_coordinatoronly(self):
+        """
+        Starting the cluster in coordinator-only mode.
+        """
+        logger.info("Running gpstart in coordinator_only mode.")
+        try:
+            cmd = gp.GpStart("running gpstart -am", coordinatorOnly=True)
+            cmd.run(validateAfter=True)
+        except Exception as exc:
+            raise Exception("Unable to start the cluster in coordinator_only mode: {0}".format(exc))
 
     class _SigIntHandler(object):
         def __init__(self):
@@ -417,6 +475,10 @@ class GpStop:
         e = GpEraFile(self.coordinator_datadir, logger=get_logger_if_verbose())
         e.end_era()
 
+        # Get a list of postgres processes running before stopping the server
+        postgres_pids = gp.get_postgres_segment_processes(self.coordinator_datadir, self.gparray.coordinator.hostname)
+        logger.debug("Postgres processes running on coordinator host: {0}".format(postgres_pids))
+
         try:
             if self.mode == 'smart':
                 self._stop_coordinator_smart()
@@ -448,10 +510,10 @@ class GpStop:
                         if os.path.exists(lockfile):
                             logger.info("Clearing segment instance lock files")
                             os.remove(lockfile)
+
+        # Use the process list and make sure that all the processes are killed at the end
         logger.info('Attempting forceful termination of any leftover coordinator process')
-        (succeeded, mypid, file_datadir) = pg.ReadPostmasterTempFile.local("Read coordinator tmp file",
-                                                                           self.dburl.pgport).getResults()
-        unix.kill_9_segment_processes(self.coordinator_datadir, self.dburl.pgport, mypid)
+        unix.kill_9_segment_processes(self.coordinator_datadir, postgres_pids, self.gparray.coordinator.hostname)
 
         logger.debug("Successfully shutdown the Coordinator instance in admin mode")
 
@@ -463,6 +525,14 @@ class GpStop:
 
         if self.gparray.standbyCoordinator:
             standby = self.gparray.standbyCoordinator
+
+            if get_unreachable_segment_hosts([standby.hostname], 1):
+                logger.warning("Standby is unreachable, skipping shutdown on standby")
+                return True
+
+            # Get a list of postgres processes running before stopping the server
+            postgres_pids = gp.get_postgres_segment_processes(standby.datadir, standby.hostname)
+            logger.debug("Postgres processes running on standby host: {0}".format(postgres_pids))
 
             logger.info("Stopping coordinator standby host %s mode=%s" % (standby.hostname, self.mode))
             try:
@@ -493,10 +563,10 @@ class GpStop:
                     return True
                 else:
                     logger.error('Failed to stop standby. Attempting forceful termination of standby process')
-                    (succeeded, mypid, file_datadir) = pg.ReadPostmasterTempFile.remote("Read standby tmp file",
-                                                                                        self.dburl.pgport,
-                                                                                        standby.hostname).getResults()
-                    unix.kill_9_segment_processes(self.coordinator_datadir, self.dburl.pgport, mypid)
+
+                    # Use the process list and make sure that all the processes are killed at the end
+                    unix.kill_9_segment_processes(standby.datadir, postgres_pids, standby.hostname)
+
                     if not pg.DbStatus.remote('checking status of standby coordinator instance', standby, standby.hostname):
                         logger.info("Successfully shutdown coordinator standby process on %s" % standby.hostname)
                         return True
@@ -595,10 +665,7 @@ class GpStop:
                 lines = cmdout.split('\n')
                 for line in lines:
                     if line.startswith("STATUS"):
-                        fields = line.split('--')
-                        dir = fields[1].split(':')[1]
-                        started = fields[2].split(':')[1]
-                        reasonStr = fields[3].split(':')[1]
+                        reasonStr, started, dir = parseStatusLine(line, isStop=True)[1:]
 
                         if started.lower() == 'false':
                             success = False
@@ -904,6 +971,17 @@ class GpStop:
                       logfileDirectory=logfileDirectory,
                       onlyThisHost=options.only_this_host)
 
+    @staticmethod
+    def mainOptions():
+        """
+        This method returns a dictionary instructing simple_main to check for
+        a gpstop.lock file under COORDINATOR_DATA_DIRECTORY in order to prevent
+        the customer from running multiple instances of gpstop.
+        """
+        return {'pidlockpath': 'gpstop.lock', 'parentpidvar': 'GPSTOPPID'}
 
 if __name__ == '__main__':
-    simple_main(GpStop.createParser, GpStop.createProgram)
+    simple_main(GpStop.createParser, GpStop.createProgram, GpStop.mainOptions())
+
+
+

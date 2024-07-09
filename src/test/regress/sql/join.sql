@@ -1,45 +1,3 @@
--- start_ignore
--- GPDB_12_MERGE_FIXME: there are multiple assertion failures arround the theme of
--- 1) empty target list
--- 2) the following assertion:
--- INFO:  GPORCA failed to produce a plan, falling back to planner
--- DETAIL:  CHistogram.cpp:1850: Failed assertion: result_buckets->Size() == desired_num_buckets
--- Stack trace:
--- 1    0x000055b39d2c8b8a gpos::CException::Raise + 278
--- 2    0x000055b39d3c973e gpnaucrates::CHistogram::CombineBuckets + 2860
--- 3    0x000055b39d3c8846 gpnaucrates::CHistogram::MakeUnionAllHistogramNormalize + 2262
--- 4    0x000055b39d3d36d3 gpnaucrates::CLeftOuterJoinStatsProcessor::MakeLOJHistogram + 1137
--- 5    0x000055b39d3d309b gpnaucrates::CLeftOuterJoinStatsProcessor::CalcLOJoinStatsStatic + 511
--- 6    0x000055b39d3da218 gpnaucrates::CStatistics::CalcLOJoinStats + 52
--- 7    0x000055b39d3cf762 gpnaucrates::CJoinStatsProcessor::CalcAllJoinStats + 1190
--- 8    0x000055b39d3d0d47 gpnaucrates::CJoinStatsProcessor::DeriveJoinStats + 575
--- 9    0x000055b39d4c1891 gpopt::CLogicalJoin::PstatsDerive + 51
--- 10   0x000055b39d495890 gpopt::CExpressionHandle::DeriveRootStats + 428
--- 11   0x000055b39d495cf0 gpopt::CExpressionHandle::DeriveStats + 1032
--- 12   0x000055b39d53714d gpopt::CGroupExpression::PstatsRecursiveDerive + 435
--- 13   0x000055b39d52937e gpopt::CGroup::PstatsRecursiveDerive + 702
--- 14   0x000055b39d495bb7 gpopt::CExpressionHandle::DeriveStats + 719
--- 15   0x000055b39d53714d gpopt::CGroupExpression::PstatsRecursiveDerive + 435
--- 16   0x000055b39d529037 gpopt::CGroup::EspDerive + 541
--- 17   0x000055b39d529836 gpopt::CGroup::PgexprBestPromise + 208
--- 18   0x000055b39d529327 gpopt::CGroup::PstatsRecursiveDerive + 615
--- 19   0x000055b39d4967f1 gpopt::CExpressionHandle::DeriveStats + 333
--- 20   0x000055b39d462e7b gpopt::CEngine::DeriveStats + 143
--- 21   0x000055b39d462d3d gpopt::CEngine::DeriveStats + 323
--- 22   0x000055b39d466077 gpopt::CEngine::FinalizeExploration + 123
--- 23   0x000055b39d545067 gpopt::CJobGroupExploration::EevtExploreChildren + 203
--- 24   0x000055b39d5459b6 gpopt::CJobStateMachine + 370
--- 25   0x000055b39d545120 gpopt::CJobGroupExploration::FExecute + 120
--- 26   0x000055b39d55ba8e gpopt::CScheduler::FExecute + 156
--- 27   0x000055b39d55b3d0 gpopt::CScheduler::ExecuteJobs + 164
--- 28   0x000055b39d55b324 gpopt::CScheduler::Run + 54
--- 29   0x000055b39d467539 gpopt::CEngine::Optimize + 981
--- 30   0x000055b39d522aab gpopt::COptimizer::PexprOptimize + 115
--- 31   0x000055b39d5223d8 gpopt::COptimizer::PdxlnOptimize + 1414
--- We should fix them within ORCA post merge.
-SET optimizer TO off;
--- end_ignore
-
 --
 -- JOIN
 -- Test JOIN clauses
@@ -565,6 +523,12 @@ select * from t1 left join t2 on (t1.a = t2.a);
 
 select t1.x from t1 join t3 on (t1.a = t3.x);
 
+-- Test matching of locking clause with wrong alias
+
+select t1.*, t2.*, unnamed_join.* from
+  t1 join t2 on (t1.a = t2.a), t3 as unnamed_join
+  for update of unnamed_join;
+
 --
 -- regression test for 8.1 merge right join bug
 --
@@ -968,6 +932,40 @@ where
 order by 1,2;
 
 --
+-- variant where a PlaceHolderVar is needed at a join, but not above the join
+--
+-- TODO_LATERAL: failed to generate plan
+-- If the left path needs params of outer path.
+-- We can not add any motion above left path.
+-- however, in right join, we can not add broadcast motion above right path.
+-- So We can not add proper motion to generate path for right join,
+-- And hit the error: could not devise a query plan for the given query.
+explain (costs off)
+select * from
+  int4_tbl as i41,
+  lateral
+    (select 1 as x from
+      (select i41.f1 as lat,
+              i42.f1 as loc from
+         int8_tbl as i81, int4_tbl as i42) as ss1
+      right join int4_tbl as i43 on (i43.f1 > 1)
+      where ss1.loc = ss1.lat) as ss2
+where i41.f1 > 0;
+
+select * from
+  int4_tbl as i41,
+  lateral
+    (select 1 as x from
+      (select i41.f1 as lat,
+              i42.f1 as loc from
+         int8_tbl as i81, int4_tbl as i42) as ss1
+      right join int4_tbl as i43 on (i43.f1 > 1)
+      where ss1.loc = ss1.lat) as ss2
+where i41.f1 > 0;
+
+select * from int4_tbl a inner join int4_tbl b on false;
+
+--
 -- test the corner cases FULL JOIN ON TRUE and FULL JOIN ON FALSE
 --
 select * from int4_tbl a full join int4_tbl b on true;
@@ -1082,6 +1080,38 @@ select t1.unique2, t1.stringu1, t2.unique1, t2.stringu2 from
   left join tenk1 t2
   on (subq1.y1 = t2.unique1)
 where t1.unique2 < 42 and t1.stringu1 > t2.stringu2;
+
+-- Here's a variant that we can't fold too aggressively, though,
+-- or we end up with noplace to evaluate the lateral PHV
+explain (verbose, costs off)
+select * from
+  (select 1 as x) ss1 left join (select 2 as y) ss2 on (true),
+  lateral (select ss2.y as z limit 1) ss3;
+select * from
+  (select 1 as x) ss1 left join (select 2 as y) ss2 on (true),
+  lateral (select ss2.y as z limit 1) ss3;
+
+-- Test proper handling of appendrel PHVs during useless-RTE removal
+explain (costs off)
+select * from
+  (select 0 as z) as t1
+  left join
+  (select true as a) as t2
+  on true,
+  lateral (select true as b
+           union all
+           select a as b) as t3
+where b;
+
+select * from
+  (select 0 as z) as t1
+  left join
+  (select true as a) as t2
+  on true,
+  lateral (select true as b
+           union all
+           select a as b) as t3
+where b;
 
 --
 -- test extraction of restriction OR clauses from join OR clause
@@ -1331,25 +1361,21 @@ select * from
 
 --
 -- test for appropriate join order in the presence of lateral references
+-- GPDB: add order by to ensure consistent results
 --
--- start_ignore
--- GPDB_94_STABLE_MERGE_FIXME: Currently LATERAL is not fully supported in GPDB
--- and the queries below are failing at the moment (The first one fails with
--- error and the other two fail with panic). Comment them off temporarily.
-/*
 explain (verbose, costs off)
 select * from
   text_tbl t1
   left join int8_tbl i8
   on i8.q2 = 123,
-  lateral (select i8.q1, t2.f1 from text_tbl t2 limit 1) as ss
+  lateral (select i8.q1, t2.f1 from text_tbl t2 order by f1 limit 1) as ss
 where t1.f1 = ss.f1;
 
 select * from
   text_tbl t1
   left join int8_tbl i8
   on i8.q2 = 123,
-  lateral (select i8.q1, t2.f1 from text_tbl t2 limit 1) as ss
+  lateral (select i8.q1, t2.f1 from text_tbl t2 order by f1 limit 1) as ss
 where t1.f1 = ss.f1;
 
 explain (verbose, costs off)
@@ -1357,16 +1383,16 @@ select * from
   text_tbl t1
   left join int8_tbl i8
   on i8.q2 = 123,
-  lateral (select i8.q1, t2.f1 from text_tbl t2 limit 1) as ss1,
-  lateral (select ss1.* from text_tbl t3 limit 1) as ss2
+  lateral (select i8.q1, t2.f1 from text_tbl t2 order by f1 limit 1) as ss1,
+  lateral (select ss1.* from text_tbl t3 order by f1 limit 1) as ss2
 where t1.f1 = ss2.f1;
 
 select * from
   text_tbl t1
   left join int8_tbl i8
   on i8.q2 = 123,
-  lateral (select i8.q1, t2.f1 from text_tbl t2 limit 1) as ss1,
-  lateral (select ss1.* from text_tbl t3 limit 1) as ss2
+  lateral (select i8.q1, t2.f1 from text_tbl t2 order by f1 limit 1) as ss1,
+  lateral (select ss1.* from text_tbl t3 order by f1 limit 1) as ss2
 where t1.f1 = ss2.f1;
 
 explain (verbose, costs off)
@@ -1375,7 +1401,7 @@ select 1 from
   inner join text_tbl as tt2 on (tt1.f1 = 'foo')
   left join text_tbl as tt3 on (tt3.f1 = 'foo')
   left join text_tbl as tt4 on (tt3.f1 = tt4.f1),
-  lateral (select tt4.f1 as c0 from text_tbl as tt5 limit 1) as ss1
+  lateral (select tt4.f1 as c0 from text_tbl as tt5 order by f1 limit 1) as ss1
 where tt1.f1 = ss1.c0;
 
 select 1 from
@@ -1383,19 +1409,13 @@ select 1 from
   inner join text_tbl as tt2 on (tt1.f1 = 'foo')
   left join text_tbl as tt3 on (tt3.f1 = 'foo')
   left join text_tbl as tt4 on (tt3.f1 = tt4.f1),
-  lateral (select tt4.f1 as c0 from text_tbl as tt5 limit 1) as ss1
+  lateral (select tt4.f1 as c0 from text_tbl as tt5 order by f1 limit 1) as ss1
 where tt1.f1 = ss1.c0;
-*/
---end_ignore
+
 
 --
 -- check a case in which a PlaceHolderVar forces join order
 --
-
---start_ignore
---GPDB_94_STABLE_MERGE_FIXME: This query is lateral related and its plan is
---different from PostgreSQL's.  Do not know why yet. Ignore its plan
---temporarily.
 explain (verbose, costs off)
 select ss2.* from
   int4_tbl i41
@@ -1404,9 +1424,8 @@ select ss2.* from
           from int4_tbl i42, int4_tbl i43) ss1
     on i8.q1 = ss1.c2
   on i41.f1 = ss1.c1,
-  lateral (select i41.*, i8.*, ss1.* from text_tbl limit 1) ss2
+  lateral (select i41.*, i8.*, ss1.* from text_tbl order by f1 limit 1) ss2
 where ss1.c2 = 0;
---end_ignore
 
 select ss2.* from
   int4_tbl i41
@@ -1415,7 +1434,7 @@ select ss2.* from
           from int4_tbl i42, int4_tbl i43) ss1
     on i8.q1 = ss1.c2
   on i41.f1 = ss1.c1,
-  lateral (select i41.*, i8.*, ss1.* from text_tbl limit 1) ss2
+  lateral (select i41.*, i8.*, ss1.* from text_tbl order by f1 limit 1) ss2
 where ss1.c2 = 0;
 
 --
@@ -1645,6 +1664,41 @@ where ss.stringu2 !~* ss.case1;
 
 rollback;
 
+-- test case to expose miscomputation of required relid set for a PHV
+explain (verbose, costs off)
+select i8.*, ss.v, t.unique2
+  from int8_tbl i8
+    left join int4_tbl i4 on i4.f1 = 1
+    left join lateral (select i4.f1 + 1 as v) as ss on true
+    left join tenk1 t on t.unique2 = ss.v
+where q2 = 456;
+
+select i8.*, ss.v, t.unique2
+  from int8_tbl i8
+    left join int4_tbl i4 on i4.f1 = 1
+    left join lateral (select i4.f1 + 1 as v) as ss on true
+    left join tenk1 t on t.unique2 = ss.v
+where q2 = 456;
+
+
+-- and check a related issue where we miscompute required relids for
+-- a PHV that's been translated to a child rel
+create temp table parttbl (a integer primary key) partition by range (a);
+create temp table parttbl1 partition of parttbl for values from (1) to (100);
+insert into parttbl values (11), (12);
+set optimizer_enable_dynamicindexonlyscan=off;
+explain (costs off)
+select * from
+  (select *, 12 as phv from parttbl) as ss
+  right join int4_tbl on true
+where ss.a = ss.phv and f1 = 0;
+reset optimizer_enable_dynamicindexonlyscan;
+
+select * from
+  (select *, 12 as phv from parttbl) as ss
+  right join int4_tbl on true
+where ss.a = ss.phv and f1 = 0;
+
 -- bug #8444: we've historically allowed duplicate aliases within aliased JOINs
 
 select * from
@@ -1737,13 +1791,12 @@ select count(*) from tenk1 a,
   tenk1 b join lateral (values(a.unique1),(-1)) ss(x) on b.unique2 = ss.x;
 
 -- lateral injecting a strange outer join condition
--- start_ignore
--- GPDB_93_MERGE_FIXME: These queries are failing at the moment. Need to investigate.
--- There were a lot of LATERAL fixes in upstream minor versions, so I'm hoping that
--- these will get fixed once we catch up to those. Or if not, at least it will be
--- nicer to work on the code, knowing that there aren't going to be a dozen commits
--- coming up, touching the same area.
--- FAIL with ERROR:  could not devise a query plan for the given query (pathnode.c:416)
+-- TODO_LATERAL: failed to generate plan
+-- If the right path needs params of outer path.
+-- We can not add any motion above right path.
+-- however, in left join, we can not add broadcast motion above left path.
+-- So We can not add proper motion to generate path for left join,
+-- And hit the error: could not devise a query plan for the given query.
 explain (costs off)
   select * from int8_tbl a,
     int8_tbl x left join lateral (select a.q1 from int4_tbl y) ss(z)
@@ -1753,7 +1806,6 @@ select * from int8_tbl a,
   int8_tbl x left join lateral (select a.q1 from int4_tbl y) ss(z)
     on x.q2 = ss.z
   order by a.q1, a.q2, x.q1, x.q2, ss.z;
---end_ignore
 
 -- lateral reference to a join alias variable
 select * from (select f1/2 as x from int4_tbl) ss1 join int4_tbl i4 on x = f1,
@@ -1832,9 +1884,12 @@ select * from int4_tbl a,
   ) ss;
 
 -- lateral reference in a PlaceHolderVar evaluated at join level
--- GPDB_94_STABLE_MERGE_FIXME: The query fails. The change is related to
--- upstream commit acfcd4. Need to come back to fix it when understanding more
--- about that commit.
+-- TODO_LATERAL: failed to generate plan
+-- If the right path needs params of outer path.
+-- We can not add any motion above right path.
+-- however, in left join, we can not add broadcast motion above left path.
+-- So We can not add proper motion to generate path for left join,
+-- And hit the error: could not devise a query plan for the given query.
 explain (verbose, costs off)
 select * from
   int8_tbl a left join lateral
@@ -1896,6 +1951,9 @@ select * from
    union all
    (select q1.v)
   ) as q2;
+
+-- check the number of columns specified
+SELECT * FROM (int8_tbl i cross join int4_tbl j) ss(a,b,c,d);
 
 -- check we don't try to do a unique-ified semijoin with LATERAL
 explain (verbose, costs off)
@@ -1973,12 +2031,12 @@ create table join_pt1p1p1 partition of join_pt1p1 for values from (0) to (100);
 insert into join_pt1 values (1, 1, 'x'), (101, 101, 'y');
 create table join_ut1 (a int, b int, c varchar);
 insert into join_ut1 values (101, 101, 'y'), (2, 2, 'z');
--- GPDB_12_MERGE_FIXME: The query fails. This test query is new with v12,
--- but a corresponding query fails on GPDB master, too. I think this is
--- similar to the case marked with GPDB_94_STABLE_MERGE_FIXME above.
--- upstream commit acfcd4. Need to come back to fix it when understanding more
--- about that commit.
--- start_ignore
+-- TODO_LATERAL: failed to generate plan
+-- If the right path needs params of outer path.
+-- We can not add any motion above right path.
+-- however, in left join, we can not add broadcast motion above left path.
+-- So We can not add proper motion to generate path for left join,
+-- And hit the error: could not devise a query plan for the given query.
 explain (verbose, costs off)
 select t1.b, ss.phv from join_ut1 t1 left join lateral
               (select t2.a as t2a, t3.a t3a, least(t1.a, t2.a, t3.a) phv
@@ -1988,7 +2046,7 @@ select t1.b, ss.phv from join_ut1 t1 left join lateral
               (select t2.a as t2a, t3.a t3a, least(t1.a, t2.a, t3.a) phv
 					  from join_pt1 t2 join join_ut1 t3 on t2.a = t3.b) ss
               on t1.a = ss.t2a order by t1.a;
--- end_ignore
+
 
 drop table join_pt1;
 drop table join_ut1;

@@ -516,19 +516,18 @@ CExpressionHandle::DeriveCostContextStats()
 		return;
 	}
 
-#if 0
 	CEnfdPartitionPropagation *pepp = m_pcc->Poc()->Prpp()->Pepp();
 	COperator *pop = Pop();
 	if (CUtils::FPhysicalScan(pop) &&
 		CPhysicalScan::PopConvert(pop)->FDynamicScan() &&
-		!pepp->PpfmDerived()->IsEmpty())
+		pepp->PppsRequired()->ContainsAnyConsumers())
 	{
 		// derive stats on dynamic table scan using stats of part selector
 		CPhysicalScan *popScan = CPhysicalScan::PopConvert(m_pgexpr->Pop());
 		IStatistics *pstatsDS = popScan->PstatsDerive(
 			m_mp, *this, m_pcc->Poc()->Prpp(), m_pcc->Poc()->Pdrgpstat());
 
-		if (NULL == m_pstats || m_pstats->Rows() > pstatsDS->Rows())
+		if (nullptr == m_pstats || m_pstats->Rows() > pstatsDS->Rows())
 		{
 			// Replace the group stats with our newly derived DPE stats
 			CRefCount::SafeRelease(m_pstats);
@@ -544,7 +543,6 @@ CExpressionHandle::DeriveCostContextStats()
 
 		return;
 	}
-#endif
 
 	// release current stats since we will derive new stats
 	CRefCount::SafeRelease(m_pstats);
@@ -1486,7 +1484,7 @@ CExpressionHandle::PfpChild(ULONG child_index) const
 //		CExpressionHandle::FChildrenHaveVolatileFuncScan
 //
 //	@doc:
-//		Check whether an expression's children have a volatile function
+//		Check whether an expression's children have a volatile function scan
 //
 //---------------------------------------------------------------------------
 BOOL
@@ -1496,6 +1494,29 @@ CExpressionHandle::FChildrenHaveVolatileFuncScan() const
 	for (ULONG ul = 0; ul < arity; ul++)
 	{
 		if (PfpChild(ul)->FHasVolatileFunctionScan())
+		{
+			return true;
+		}
+	}
+
+	return false;
+}
+
+//---------------------------------------------------------------------------
+//	@function:
+//		CExpressionHandle::FChildrenHaveVolatileFunc
+//
+//	@doc:
+//		Check whether an expression's children have a volatile function
+//
+//---------------------------------------------------------------------------
+BOOL
+CExpressionHandle::FChildrenHaveVolatileFunc() const
+{
+	const ULONG arity = Arity();
+	for (ULONG ul = 0; ul < arity; ul++)
+	{
+		if (PfpChild(ul)->Efs() == IMDFunction::EfsVolatile)
 		{
 			return true;
 		}
@@ -1962,7 +1983,7 @@ CExpressionHandle::DerivePartitionInfo() const
 	return GetRelationalProperties()->GetPartitionInfo();
 }
 
-CTableDescriptor *
+CTableDescriptorHashSet *
 CExpressionHandle::DeriveTableDescriptor() const
 {
 	if (nullptr != Pexpr())
@@ -1973,7 +1994,7 @@ CExpressionHandle::DeriveTableDescriptor() const
 	return GetRelationalProperties()->GetTableDescriptor();
 }
 
-CTableDescriptor *
+CTableDescriptorHashSet *
 CExpressionHandle::DeriveTableDescriptor(ULONG child_index) const
 {
 	if (nullptr != Pexpr())
@@ -2093,5 +2114,30 @@ CExpressionHandle::DeriveHasScalarArrayCmp(ULONG child_index) const
 	}
 
 	return GetDrvdScalarProps(child_index)->HasScalarArrayCmp();
+}
+
+BOOL
+CExpressionHandle::DeriveHasScalarFuncProject(ULONG child_index) const
+{
+	if (nullptr != Pexpr())
+	{
+		return (*Pexpr())[child_index]->DeriveHasScalarFuncProject();
+	}
+
+	return GetDrvdScalarProps(child_index)->HasScalarFuncProject();
+}
+
+BOOL
+CExpressionHandle::DeriveContainsOnlyReplicationSafeAggFuncs(
+	ULONG child_index) const
+{
+	if (nullptr != Pexpr())
+	{
+		return (*Pexpr())[child_index]
+			->DeriveContainsOnlyReplicationSafeAggFuncs();
+	}
+
+	return GetDrvdScalarProps(child_index)
+		->ContainsOnlyReplicationSafeAggFuncs();
 }
 // EOF

@@ -71,8 +71,34 @@ ifneq ($(PORTNAME), cygwin)
 ifneq ($(PORTNAME), win32)
 ifneq ($(PORTNAME), aix)
 
-postgres: $(OBJS)
-	$(CXX) $(CXXFLAGS) $(call expand_subsys,$^) $(LDFLAGS) $(LDFLAGS_EX) $(export_dynamic) $(LIBS) -o $@
+# Due to Greenplum's MPP architecture, the postgres process needs to connect to
+# databases, some symbols from frontend are compiled to the postgres binary.
+# Some extensions requires frontend symbols and are dynamically linked to libpq.so.
+# However, some symbols are not safe to be exported both in the postgres binary
+# and libpq.so. E.g., some of the functions are using palloc()/pfree() to allocate
+# and free memory in backend codes while using malloc()/free() to allocate and free
+# memory in frontend codes. We use linker version script to make these symbols exported
+# in libpq.so and private in the postgres binary.
+# FIXME: Can we teach the postgres binary to dynamically link against libpq.so? So that
+# we don't need this hack.
+SAFELY_EXPORTED_SYMBOLS_PATTERN = "(pqsignal|pg_*)"
+SYMBOL_MAPPING_FLAGS =
+ifeq ($(PORTNAME), darwin)
+SYMBOL_MAP_FILE = hide_symbols.list
+$(SYMBOL_MAP_FILE): $(top_builddir)/src/interfaces/libpq/exports.txt
+	$(AWK) '/^[^#]/ {printf "_%s\n",$$1}' $< | grep -v -E $(SAFELY_EXPORTED_SYMBOLS_PATTERN) >$@
+SYMBOL_MAPPING_FLAGS = -unexported_symbols_list $(SYMBOL_MAP_FILE)
+endif
+
+ifeq ($(PORTNAME), linux)
+SYMBOL_MAP_FILE = postgres_symbols.map
+$(SYMBOL_MAP_FILE): $(top_builddir)/src/interfaces/libpq/exports.txt
+	( echo '{ global: *; '; echo ' local:'; $(AWK) '/^[^#]/ {printf "%s;\n",$$1}' $< | grep -v -E $(SAFELY_EXPORTED_SYMBOLS_PATTERN); echo '};' ) >$@
+SYMBOL_MAPPING_FLAGS = -Wl,--version-script=$(SYMBOL_MAP_FILE)
+endif
+
+postgres: $(OBJS) $(SYMBOL_MAP_FILE)
+	$(CXX) $(CXXFLAGS) $(call expand_subsys,$(OBJS)) $(LDFLAGS) $(LDFLAGS_EX) $(export_dynamic) $(LIBS) $(SYMBOL_MAPPING_FLAGS) -o $@
 
 endif
 endif
@@ -195,6 +221,7 @@ distprep:
 	$(MAKE) -C bootstrap	bootparse.c bootscanner.c
 	$(MAKE) -C catalog	distprep
 	$(MAKE) -C replication	repl_gram.c repl_scanner.c syncrep_gram.c syncrep_scanner.c
+	$(MAKE) -C statistics statistics_gram.c statistics_scanner.c
 	$(MAKE) -C storage/lmgr	lwlocknames.h lwlocknames.c
 	$(MAKE) -C utils	distprep
 	$(MAKE) -C utils/adt	jsonpath_gram.c jsonpath_scan.c
@@ -229,8 +256,14 @@ endif
 ifeq ($(with_llvm), yes)
 install-bin: install-postgres-bitcode
 
+# GPDB: Bitcode generation in certain subdir can be avoid when `with_llvm = no`
+# set there. But the install step is not aware of the setting and would fail if
+# we don't tell it the absence of *.bc files under those directory manually.
+# As we set ORCA to generate no bitcodes, ORCA directories is excluded here.
+bitcode_ignored_subdirs = $(top_builddir)/src/timezone gporca gpopt
+
 install-postgres-bitcode: $(OBJS) all
-	$(call install_llvm_module,postgres,$(call expand_subsys, $(filter-out $(top_builddir)/src/timezone/objfiles.txt, $(SUBDIROBJS))))
+	$(call install_llvm_module,postgres,$(call expand_subsys, $(filter-out $(bitcode_ignored_subdirs:%=%/objfiles.txt), $(SUBDIROBJS))))
 endif
 
 install-bin: postgres $(POSTGRES_IMP) installdirs
@@ -305,6 +338,10 @@ endif
 ifeq ($(PORTNAME), win32)
 	rm -f postgres.dll libpostgres.a $(WIN32RES)
 endif
+ifeq (,$(filter cygwin win32 aix,$(PORTNAME)))
+	rm -f postgres_symbols.map
+	rm -f hide_symbols.list
+endif
 
 distclean: clean
 	rm -f port/tas.s port/pg_sema.c port/pg_shmem.c
@@ -317,6 +354,9 @@ maintainer-clean: distclean
 	      parser/gram.c \
 	      parser/gram.h \
 	      parser/scan.c \
+	      statistics/statistics_gram.c \
+	      statistics/statistics_scanner.c \
+	      statistics/statistics_gram.h \
 	      replication/repl_gram.c \
 	      replication/repl_scanner.c \
 	      replication/syncrep_gram.c \

@@ -22,6 +22,8 @@
 
 #include "access/bitmap.h"
 #include "access/reloptions.h"
+#include "catalog/pg_attribute_encoding.h"
+#include "catalog/pg_type.h"
 #include "cdb/cdbappendonlyam.h"
 #include "cdb/cdbvars.h"
 #include "commands/defrem.h"
@@ -32,7 +34,7 @@
 #include "utils/memutils.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
-#include "parser/analyze.h"
+#include "storage/gp_compress.h"
 
 /*
  * Helper macro used for validation
@@ -53,6 +55,15 @@ static relopt_bool boolRelOpts_gp[] =
 			AccessExclusiveLock
 		},
 		AO_DEFAULT_CHECKSUM
+	},
+	{
+		{
+			SOPT_ANALYZEHLL,
+			"Enable HLL stats collection during analyze",
+			RELOPT_KIND_HEAP | RELOPT_KIND_TOAST | RELOPT_KIND_APPENDOPTIMIZED,
+			ShareUpdateExclusiveLock
+		},
+		ANALYZE_DEFAULT_HLL
 	},
 	/* list terminator */
 	{{NULL}}
@@ -114,8 +125,8 @@ static relopt_string stringRelOpts_gp[] =
 	{{NULL}}
 };
 
-static void free_options_deep(relopt_value *options, int num_options);
 static relopt_value *get_option_set(relopt_value *options, int num_options, const char *opt_name);
+static bool reloption_is_default(const char *optstr, int optlen);
 
 /*
  * initialize_reloptions_gp
@@ -140,8 +151,8 @@ initialize_reloptions_gp(void)
 		add_bool_reloption(boolRelOpts_gp[i].gen.kinds,
 						   (char *) boolRelOpts_gp[i].gen.name,
 						   (char *) boolRelOpts_gp[i].gen.desc,
-						   boolRelOpts_gp[i].default_val);
-		set_reloption_lockmode(boolRelOpts_gp[i].gen.name, boolRelOpts_gp[i].gen.lockmode);
+						   boolRelOpts_gp[i].default_val,
+						   boolRelOpts_gp[i].gen.lockmode);
 	}
 
 	for (i = 0; intRelOpts_gp[i].gen.name; i++)
@@ -151,8 +162,8 @@ initialize_reloptions_gp(void)
 						  (char *) intRelOpts_gp[i].gen.desc,
 						  intRelOpts_gp[i].default_val,
 						  intRelOpts_gp[i].min,
-						  intRelOpts_gp[i].max);
-		set_reloption_lockmode(intRelOpts_gp[i].gen.name, intRelOpts_gp[i].gen.lockmode);
+						  intRelOpts_gp[i].max,
+						  intRelOpts_gp[i].gen.lockmode);
 	}
 
 	for (i = 0; realRelOpts_gp[i].gen.name; i++)
@@ -161,8 +172,8 @@ initialize_reloptions_gp(void)
 						   (char *) realRelOpts_gp[i].gen.name,
 						   (char *) realRelOpts_gp[i].gen.desc,
 						   realRelOpts_gp[i].default_val,
-						   realRelOpts_gp[i].min, realRelOpts_gp[i].max);
-		set_reloption_lockmode(realRelOpts_gp[i].gen.name, realRelOpts_gp[i].gen.lockmode);
+						   realRelOpts_gp[i].min, realRelOpts_gp[i].max,
+						   realRelOpts_gp[i].gen.lockmode);
 	}
 
 	for (i = 0; stringRelOpts_gp[i].gen.name; i++)
@@ -171,16 +182,15 @@ initialize_reloptions_gp(void)
 							 (char *) stringRelOpts_gp[i].gen.name,
 							 (char *) stringRelOpts_gp[i].gen.desc,
 							 NULL,
-							 stringRelOpts_gp[i].validate_cb);
-		set_reloption_lockmode(stringRelOpts_gp[i].gen.name, stringRelOpts_gp[i].gen.lockmode);
+							 stringRelOpts_gp[i].validate_cb,
+							 stringRelOpts_gp[i].gen.lockmode);
 	}
 }
 
 /*
  * This is set whenever the GUC gp_default_storage_options is set.
  */
-static StdRdOptions ao_storage_opts;
-static bool ao_storage_opts_changed = false;
+static StdRdOptions *ao_storage_opts = NULL;
 
 /*
  * Accumulate a new datum for one AO storage option.
@@ -280,14 +290,14 @@ resetAOStorageOpts(StdRdOptions *ao_opts)
 void
 resetDefaultAOStorageOpts(void)
 {
-	resetAOStorageOpts(&ao_storage_opts);
-	ao_storage_opts_changed = false;
+	if (ao_storage_opts)
+		resetAOStorageOpts(ao_storage_opts);
 }
 
 const StdRdOptions *
 currentAOStorageOptions(void)
 {
-	return (const StdRdOptions *) &ao_storage_opts;
+	return (const StdRdOptions *) ao_storage_opts;
 }
 
 /*
@@ -298,14 +308,21 @@ setDefaultAOStorageOpts(StdRdOptions *copy)
 {
 	Assert(copy);
 
-	memcpy(&ao_storage_opts, copy, sizeof(ao_storage_opts));
+	/* If not allocated yet, do it now */
+	if (!ao_storage_opts)
+		ao_storage_opts = calloc(sizeof(*ao_storage_opts), 1);
+	if (!ao_storage_opts)
+		ereport(ERROR,
+			(errcode(ERRCODE_OUT_OF_MEMORY),
+				 errmsg("out of memory")));
+
+	memcpy(ao_storage_opts, copy, sizeof(*ao_storage_opts));
+
 	if (pg_strcasecmp(copy->compresstype, "none") == 0)
 	{
 		/* Represent compresstype=none as an empty string (MPP-25073). */
-		ao_storage_opts.compresstype[0] = '\0';
+		ao_storage_opts->compresstype[0] = '\0';
 	}
-
-	ao_storage_opts_changed = true;
 }
 
 static int	setDefaultCompressionLevel(char *compresstype);
@@ -313,7 +330,7 @@ static int	setDefaultCompressionLevel(char *compresstype);
 /*
  * Accept a string of the form "name=value,name=value,...".  Space
  * around ',' and '=' is allowed.  Parsed values are stored in
- * corresponding fields of StdRdOptions object.  The parser is a
+ * a text array and returned to caller.  The parser is a
  * finite state machine that changes states for each input character
  * scanned.
  */
@@ -513,12 +530,14 @@ parseAOStorageOpts(const char *opts_str)
  * appendonly storage option in opts.  This datum is used to populate
  * pg_class.reloptions during relation creation.
  *
- * To avoid catalog bloat, we only create "name=value" item for those
- * values in opts that are not specified in WITH clause and are
- * different from their initial defaults.
+ * If hasStorage is true, record all attributes to pg_class.reloptions
+ * even if not specified in withOpts since they are necessary to perform
+ * table scans. In cases where hasStorage is false and the reloption has
+ * been modified from server defaults, the parameter is recorded in
+ * pg_class.reloptions and used for inheritence purposes only.
  */
 Datum
-transformAOStdRdOptions(StdRdOptions *opts, Datum withOpts)
+transformAOStdRdOptions(StdRdOptions *opts, Datum withOpts, bool hasStorage)
 {
 	char	   *strval;
 	Datum	   *withDatums = NULL;
@@ -533,7 +552,8 @@ transformAOStdRdOptions(StdRdOptions *opts, Datum withOpts)
 	bool		foundBlksz = false,
 				foundComptype = false,
 				foundComplevel = false,
-				foundChecksum = false;
+				foundChecksum = false,
+				foundAnalyzeHLL = false;
 
 	/*
 	 * withOpts must be parsed to see if an option was spcified in WITH()
@@ -583,14 +603,35 @@ transformAOStdRdOptions(StdRdOptions *opts, Datum withOpts)
 				pg_strncasecmp(strval, SOPT_COMPTYPE, soptLen) == 0)
 			{
 				foundComptype = true;
-
 				/*
 				 * Record "none" as compresstype in reloptions if it was
 				 * explicitly specified in WITH clause.
+				 *
+				 * If "quicklz" was explicitly specified in WITH clause and
+				 * gp_quicklz_fallback=true, record "zstd" as compresstype
+				 * if available, else record AO_DEFAULT_USABLE_COMPRESSTYPE
 				 */
+				char* compresstype;
+
+				if (opts->compresstype[0])
+				{
+					if (gp_quicklz_fallback && pg_strcasecmp(opts->compresstype, "quicklz") == 0)
+					{						
+#ifdef USE_ZSTD
+						compresstype = "zstd";
+#else
+						compresstype = AO_DEFAULT_USABLE_COMPRESSTYPE;
+#endif
+					}
+					else
+						compresstype = opts->compresstype;
+				}
+				else
+					compresstype = "none";
+
 				d = CStringGetTextDatum(psprintf("%s=%s",
 												 SOPT_COMPTYPE,
-												 (opts->compresstype[0] ? opts->compresstype : "none")));
+												 compresstype));
 				astate = accumArrayResult(astate, d, false, TEXTOID,
 										  CurrentMemoryContext);
 			}
@@ -616,70 +657,63 @@ transformAOStdRdOptions(StdRdOptions *opts, Datum withOpts)
 				astate = accumArrayResult(astate, d, false, TEXTOID,
 										  CurrentMemoryContext);
 			}
-
-			/*
-			 * Record fillfactor only if it's specified in WITH clause.
-			 * Default fillfactor is assumed otherwise.
-			 */
-			soptLen = strlen(SOPT_FILLFACTOR);
+			soptLen = strlen(SOPT_ANALYZEHLL);
 			if (withLen > soptLen &&
-				pg_strncasecmp(strval, SOPT_FILLFACTOR, soptLen) == 0)
+				pg_strncasecmp(strval, SOPT_ANALYZEHLL, soptLen) == 0)
 			{
-				d = CStringGetTextDatum(psprintf("%s=%d",
-												 SOPT_FILLFACTOR,
-												 opts->fillfactor));
+				foundAnalyzeHLL = true;
+				d = CStringGetTextDatum(psprintf("%s=%s",
+												 SOPT_ANALYZEHLL,
+												 (opts->analyze_hll_non_part_table ? "true" : "false")));
 				astate = accumArrayResult(astate, d, false, TEXTOID,
 										  CurrentMemoryContext);
 			}
 		}
 	}
 
-	if ((opts->blocksize != AO_DEFAULT_BLOCKSIZE) && !foundBlksz)
+
+	/* Record AO storage parameters {blocksize,checksum,compresslevel,compresstype}
+	 * in pg_class.reloptions even if not provided in WITH clause IFF hasStorage=true
+	 * OR the paremeter has been modified from the server default value.
+	 */
+
+	if (!foundBlksz && (opts->blocksize != AO_DEFAULT_BLOCKSIZE || hasStorage))
 	{
 		d = CStringGetTextDatum(psprintf("%s=%d",
-										 SOPT_BLOCKSIZE,
-										 opts->blocksize));
+										SOPT_BLOCKSIZE,
+										opts->blocksize));
 		astate = accumArrayResult(astate, d, false, TEXTOID,
-								  CurrentMemoryContext);
+									CurrentMemoryContext);
 	}
-
-	/*
-	 * Record compression options only if compression is enabled.  No need to
-	 * check compresstype here as by the time we get here, "opts" should have
-	 * been set by default_reloptions() correctly.
-	 */
-	if (opts->compresslevel > AO_DEFAULT_COMPRESSLEVEL &&
-		opts->compresstype[0])
+	if (!foundComplevel && (opts->compresslevel != AO_DEFAULT_COMPRESSLEVEL || hasStorage))
 	{
-		if (!foundComptype && (
-							   (pg_strcasecmp(opts->compresstype, AO_DEFAULT_COMPRESSTYPE) == 0
-								&& opts->compresslevel == 1 && !foundComplevel) ||
-							   pg_strcasecmp(opts->compresstype,
-											 AO_DEFAULT_COMPRESSTYPE) != 0))
-		{
-			d = CStringGetTextDatum(psprintf("%s=%s",
-											 SOPT_COMPTYPE,
-											 opts->compresstype));
-			astate = accumArrayResult(astate, d, false, TEXTOID,
-									  CurrentMemoryContext);
-		}
-		/* When compression is enabled, default compresslevel is 1. */
-		if ((opts->compresslevel != 1) &&
-			!foundComplevel)
-		{
 			d = CStringGetTextDatum(psprintf("%s=%d",
-											 SOPT_COMPLEVEL,
-											 opts->compresslevel));
+												SOPT_COMPLEVEL,
+												(opts->compresslevel ? opts->compresslevel : AO_DEFAULT_COMPRESSLEVEL)));
 			astate = accumArrayResult(astate, d, false, TEXTOID,
-									  CurrentMemoryContext);
-		}
+										CurrentMemoryContext);
 	}
-
-	if ((opts->checksum != AO_DEFAULT_CHECKSUM) && !foundChecksum)
+	if (!foundComptype && ((opts->compresstype[0] && pg_strcasecmp(opts->compresstype, "none") != 0) || hasStorage))
 	{
 		d = CStringGetTextDatum(psprintf("%s=%s",
-										 SOPT_CHECKSUM,
-										 (opts->checksum ? "true" : "false")));
+							SOPT_COMPTYPE,
+							(opts->compresstype[0] ? opts->compresstype : "none")));
+		astate = accumArrayResult(astate, d, false, TEXTOID,
+									CurrentMemoryContext);
+	}
+	if (!foundChecksum && (!opts->checksum || hasStorage))
+	{
+	d = CStringGetTextDatum(psprintf("%s=%s",
+									SOPT_CHECKSUM,
+									(opts->checksum ? "true" : "false")));
+	astate = accumArrayResult(astate, d, false, TEXTOID,
+								CurrentMemoryContext);
+	}
+	if ((opts->analyze_hll_non_part_table != ANALYZE_DEFAULT_HLL) && !foundAnalyzeHLL)
+	{
+		d = CStringGetTextDatum(psprintf("%s=%s",
+										 SOPT_ANALYZEHLL,
+										 (opts->analyze_hll_non_part_table ? "true" : "false")));
 		astate = accumArrayResult(astate, d, false, TEXTOID,
 								  CurrentMemoryContext);
 	}
@@ -688,23 +722,161 @@ transformAOStdRdOptions(StdRdOptions *opts, Datum withOpts)
 		PointerGetDatum(NULL);
 }
 
+/* 
+ * Check if the given reloption string has default value.
+ */
+static bool
+reloption_is_default(const char *optstr, int optlen)
+{
+	char 		*defaultopt = NULL;
+	bool 		res;
+
+	if (optlen > strlen(SOPT_BLOCKSIZE) &&
+		pg_strncasecmp(optstr, SOPT_BLOCKSIZE, strlen(SOPT_BLOCKSIZE)) == 0)
+	{
+		defaultopt = psprintf("%s=%d",
+										 SOPT_BLOCKSIZE,
+										 AO_DEFAULT_BLOCKSIZE);
+	}
+	else if (optlen > strlen(SOPT_COMPTYPE) &&
+		pg_strncasecmp(optstr, SOPT_COMPTYPE, strlen(SOPT_COMPTYPE)) == 0)
+	{
+		defaultopt = psprintf("%s=%s",
+										 SOPT_COMPTYPE,
+										 AO_DEFAULT_COMPRESSTYPE);
+	}
+	else if (optlen > strlen(SOPT_COMPLEVEL) &&
+		pg_strncasecmp(optstr, SOPT_COMPLEVEL, strlen(SOPT_COMPLEVEL)) == 0)
+	{
+		defaultopt = psprintf("%s=%d",
+										 SOPT_COMPLEVEL,
+										 AO_DEFAULT_COMPRESSLEVEL);
+	}
+	else if (optlen > strlen(SOPT_CHECKSUM) &&
+		pg_strncasecmp(optstr, SOPT_CHECKSUM, strlen(SOPT_CHECKSUM)) == 0)
+	{
+		defaultopt = psprintf("%s=%s",
+										 SOPT_CHECKSUM,
+										 AO_DEFAULT_CHECKSUM ? "true" : "false");
+	}
+	else if (optlen > strlen(SOPT_ANALYZEHLL) &&
+		pg_strncasecmp(optstr, SOPT_ANALYZEHLL, strlen("analyze_hll_non_part_table")) == 0)
+	{
+		defaultopt = psprintf("%s=%s",
+							  SOPT_ANALYZEHLL,
+										 ANALYZE_DEFAULT_HLL ? "true" : "false");
+	}
+	if (defaultopt != NULL)
+		res = strlen(defaultopt) == optlen && 
+				pg_strncasecmp(optstr, defaultopt, optlen) == 0;
+	else
+		res = false;
+
+	pfree(defaultopt);
+	return res;
+}
+
+/* 
+ * Check if two string arrays of reloptions are the same.
+ *
+ * Note that this will not handle the case where the option doesn't contain 
+ * the '=' sign in it, e.g. "checksum" vs. "checksum=true". But it seems 
+ * that at this point we should always have both options as "x=y" anyways.
+ */
+bool
+relOptionsEquals(Datum oldOptions, Datum newOptions)
+{
+	ArrayType 	*oldoptarray, *newoptarray;
+	Datum 		*opts1, *opts2;
+	int		noldoptions = 0, nnewoptions = 0;
+	int		i, j;
+
+	/* Deconstruct both options. */
+	if (PointerIsValid(DatumGetPointer(oldOptions)))
+	{
+		oldoptarray = DatumGetArrayTypeP(oldOptions);
+		deconstruct_array(oldoptarray, TEXTOID, -1, false, 'i',
+						  &opts1, NULL, &noldoptions);
+	}
+	if (PointerIsValid(DatumGetPointer(newOptions)))
+	{
+		newoptarray = DatumGetArrayTypeP(newOptions);
+		deconstruct_array(newoptarray, TEXTOID, -1, false, 'i',
+						  &opts2, NULL, &nnewoptions);
+	}
+
+	for (i = 0; i < nnewoptions; i++)
+	{
+		char 	*newopt_str = VARDATA(opts2[i]);
+		int	newopt_len = VARSIZE(opts2[i]) - VARHDRSZ;
+		int 	keylen;
+
+		/* Should be "x=y" but better panic here rather than returning wrong result. */
+		Assert(strchr(newopt_str, '=') != 0);
+
+		keylen = strchr(newopt_str, '=') - newopt_str;
+
+		/* Search for a match in old options. */
+		for (j = 0; j < noldoptions; j++)
+		{
+			char 	*oldopt_str = VARDATA(opts1[j]);
+			int	oldopt_len = VARSIZE(opts1[j]) - VARHDRSZ;
+
+			/* Not the same option. */
+			if (oldopt_len <= keylen || 
+					pg_strncasecmp(oldopt_str, newopt_str, keylen) != 0)
+				continue;
+
+			/* Old option should be as "x=y" too. */
+			Assert(oldopt_str[keylen] == '=');
+
+			/* Key found, now they must match exactly otherwise it's a changed option. */
+			if (oldopt_len != newopt_len ||
+					pg_strncasecmp(oldopt_str, newopt_str, oldopt_len) != 0)
+				return false;
+			else
+				break;
+		}
+
+		/* 
+		 * If key not found, then it must've changed unless it's a default value 
+		 * that doesn't appear in the old reloptions.
+		 */
+		if (j == noldoptions && !reloption_is_default(newopt_str, newopt_len))
+			return false;
+	}
+	return true;
+}
+
 void
 validate_and_adjust_options(StdRdOptions *result,
 							relopt_value *options,
 							int num_options, relopt_kind kind, bool validate)
 {
 	int			i;
-	relopt_value *fillfactor_opt;
 	relopt_value *blocksize_opt;
 	relopt_value *comptype_opt;
 	relopt_value *complevel_opt;
 	relopt_value *checksum_opt;
 
-	/* fillfactor */
-	fillfactor_opt = get_option_set(options, num_options, SOPT_FILLFACTOR);
-	if (fillfactor_opt != NULL)
+	/* 
+	 * Firstly, for AO/CO tables, if anything is not set in the options but has 
+	 * been specified by gp_default_storage_options before, use them. 
+	 */
+	if (ao_storage_opts &&
+		KIND_IS_APPENDOPTIMIZED(kind))
 	{
-		result->fillfactor = fillfactor_opt->values.int_val;
+		if (!(get_option_set(options, num_options, SOPT_BLOCKSIZE)))
+			result->blocksize = ao_storage_opts->blocksize;
+
+		if (!(get_option_set(options, num_options, SOPT_COMPLEVEL)))
+			result->compresslevel = ao_storage_opts->compresslevel;
+
+		if (!(get_option_set(options, num_options, SOPT_COMPTYPE)))
+			strlcpy(result->compresstype, ao_storage_opts->compresstype, sizeof(result->compresstype));
+
+		if (!(get_option_set(options, num_options, SOPT_CHECKSUM)))
+			result->checksum = ao_storage_opts->checksum;
 	}
 
 	/* blocksize */
@@ -747,9 +919,25 @@ validate_and_adjust_options(StdRdOptions *result,
 					(errcode(ERRCODE_UNDEFINED_OBJECT),
 					 errmsg("unknown compresstype \"%s\"",
 							comptype_opt->values.string_val)));
-		for (i = 0; i < strlen(comptype_opt->values.string_val); i++)
-			result->compresstype[i] = pg_tolower(comptype_opt->values.string_val[i]);
-		result->compresstype[i] = '\0';
+		/*
+		 * GPDB7 has dropped support for quicklz.
+		 * If compresstype passed the above validity check, we want to fallback to using
+		 * "zstd" as compresstype if available, else the default usable compresstype.
+		 */
+		if (pg_strcasecmp(comptype_opt->values.string_val, "quicklz") == 0)
+		{
+#ifdef USE_ZSTD
+			StrNCpy(result->compresstype, "zstd", NAMEDATALEN);
+#else
+			StrNCpy(result->compresstype, AO_DEFAULT_USABLE_COMPRESSTYPE, NAMEDATALEN);
+#endif
+		}
+		else
+		{
+			for (i = 0; i < strlen(comptype_opt->values.string_val); i++)
+				result->compresstype[i] = pg_tolower(comptype_opt->values.string_val[i]);
+			result->compresstype[i] = '\0';
+		}
 	}
 
 	/* compression level */
@@ -780,14 +968,6 @@ validate_and_adjust_options(StdRdOptions *result,
 
 			result->compresslevel = setDefaultCompressionLevel(result->compresstype);
 		}
-
-		/*
-		 * use the default compressor if compresslevel was indicated but not
-		 * compresstype. must make a copy otherwise str_tolower below will
-		 * crash.
-		 */
-		if (result->compresslevel > 0 && !result->compresstype[0])
-			strlcpy(result->compresstype, AO_DEFAULT_COMPRESSTYPE, sizeof(result->compresstype));
 
 		/* Check upper bound of compresslevel for each compression type */
 
@@ -834,34 +1014,13 @@ validate_and_adjust_options(StdRdOptions *result,
 		}
 
 		if (result->compresstype[0] &&
-			(pg_strcasecmp(result->compresstype, "quicklz") == 0))
-		{
-#ifndef HAVE_LIBQUICKLZ
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("QuickLZ library is not supported by this build"),
-					 errhint("Compile with --with-quicklz to use QuickLZ compression.")));
-#endif
-			if (result->compresslevel != 1)
-			{
-				if (validate)
-					ereport(ERROR,
-							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-							 errmsg("compresslevel=%d is out of range for quicklz (should be 1)",
-									result->compresslevel)));
-
-				result->compresslevel = setDefaultCompressionLevel(result->compresstype);
-			}
-		}
-
-		if (result->compresstype[0] &&
 			(pg_strcasecmp(result->compresstype, "rle_type") == 0) &&
-			(result->compresslevel > 4))
+			(result->compresslevel > RLE_MAX_LEVEL))
 		{
 			if (validate)
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-						 errmsg("compresslevel=%d is out of range for rle_type (should be in the range 1 to 4)",
+						 errmsg("compresslevel=%d is out of range for rle_type (should be in the range 1 to 6)",
 								result->compresslevel)));
 
 			result->compresslevel = setDefaultCompressionLevel(result->compresstype);
@@ -880,160 +1039,41 @@ validate_and_adjust_options(StdRdOptions *result,
 		result->checksum = checksum_opt->values.bool_val;
 	}
 
-	if (result->compresstype[0] &&
-		result->compresslevel == AO_DEFAULT_COMPRESSLEVEL)
+	/* More adjustment for compression settings: */
+	/*
+	 * use the default compressor if compresslevel was indicated but not
+	 * compresstype. must make a copy otherwise str_tolower below will
+	 * crash.
+	 */
+	if (result->compresslevel > 0 && !result->compresstype[0])
+		strlcpy(result->compresstype, AO_DEFAULT_USABLE_COMPRESSTYPE, sizeof(result->compresstype));
+	/*
+	 * use compresslevel=1 if the compresstype is not none
+	 */
+	if (result->compresstype[0] && result->compresslevel == 0)
 	{
 		result->compresslevel = setDefaultCompressionLevel(result->compresstype);
 	}
 }
 
-void
-validate_and_refill_options(StdRdOptions *result, relopt_value *options,
-							int numrelopts, relopt_kind kind, bool validate)
-{
-	if (validate &&
-		ao_storage_opts_changed &&
-		KIND_IS_APPENDOPTIMIZED(kind))
-	{
-		if (!(get_option_set(options, numrelopts, SOPT_FILLFACTOR)))
-			result->fillfactor = ao_storage_opts.fillfactor;
-
-		if (!(get_option_set(options, numrelopts, SOPT_BLOCKSIZE)))
-			result->blocksize = ao_storage_opts.blocksize;
-
-		if (!(get_option_set(options, numrelopts, SOPT_COMPLEVEL)))
-			result->compresslevel = ao_storage_opts.compresslevel;
-
-		if (!(get_option_set(options, numrelopts, SOPT_COMPTYPE)))
-			strlcpy(result->compresstype, ao_storage_opts.compresstype, sizeof(result->compresstype));
-
-		if (!(get_option_set(options, numrelopts, SOPT_CHECKSUM)))
-			result->checksum = ao_storage_opts.checksum;
-	}
-
-	validate_and_adjust_options(result, options, numrelopts, kind, validate);
-}
-
-void
-parse_validate_reloptions(StdRdOptions *result, Datum reloptions,
-						  bool validate, relopt_kind kind)
-{
-	relopt_value *options;
-	int			num_options;
-
-	options = parseRelOptions(reloptions, validate, kind, &num_options);
-
-	validate_and_adjust_options(result, options, num_options, kind, validate);
-	free_options_deep(options, num_options);
-}
-
 /*
- * validateAppendOnlyRelOptions
+ * validateOrientationRelOptions
  *
- *		Various checks for validity of appendonly relation rules.
+ *		Checks validity of orientation-specific reloption rules, currently only one. 
+ * 		Other appendonly-specific rules should've been done in default_reloptions().
  */
 void
-validateAppendOnlyRelOptions(int blocksize,
-							 int safewrite,
-							 int complevel,
-							 char *comptype,
-							 bool checksum,
+validateOrientationRelOptions(char *comptype,
 							 bool co)
 {
-	if (comptype &&
-		(pg_strcasecmp(comptype, "quicklz") == 0 ||
-		 pg_strcasecmp(comptype, "zlib") == 0 ||
-		 pg_strcasecmp(comptype, "rle_type") == 0 ||
-		 pg_strcasecmp(comptype, "zstd") == 0))
+	if (!co &&
+		pg_strcasecmp(comptype, "rle_type") == 0)
 	{
-		if (!co &&
-			pg_strcasecmp(comptype, "rle_type") == 0)
-		{
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("%s cannot be used with Append Only relations row orientation",
-							comptype)));
-		}
-
-		if (comptype && complevel == 0)
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("compresstype cannot be used with compresslevel 0")));
-
-		if (comptype && (pg_strcasecmp(comptype, "zlib") == 0))
-		{
-#ifndef HAVE_LIBZ
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("zlib compression is not supported by this build"),
-					 errhint("Compile without --without-zlib to use zlib compression.")));
-#endif
-			if (complevel < 0 || complevel > 9)
-			{
-				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-						 errmsg("compresslevel=%d is out of range (should be between 0 and 9)",
-								complevel)));
-			}
-		}
-
-		if (comptype && (pg_strcasecmp(comptype, "zstd") == 0))
-		{
-#ifndef USE_ZSTD
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("Zstandard library is not supported by this build"),
-					 errhint("Compile without --without-zstd to use Zstandard compression.")));
-#endif
-			if (complevel < 0 || complevel > 19)
-				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-						 errmsg("compresslevel=%d is out of range for zstd (should be in the range 1 to 19)",
-								complevel)));
-		}
-
-		if (comptype && (pg_strcasecmp(comptype, "quicklz") == 0))
-		{
-#ifndef HAVE_LIBQUICKLZ
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("QuickLZ library is not supported by this build"),
-					 errhint("Compile with --with-quicklz to use QuickLZ compression.")));
-#endif
-			if (complevel != 1)
-				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-						 errmsg("compresslevel=%d is out of range for quicklz (should be 1)",
-								complevel)));
-		}
-		if (comptype && (pg_strcasecmp(comptype, "rle_type") == 0) &&
-			(complevel < 0 || complevel > 4))
-		{
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("compresslevel=%d is out of range for rle_type (should be in the range 1 to 4)",
-							complevel)));
-		}
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("%s cannot be used with Append Only relations row orientation",
+						comptype)));
 	}
-
-	if (blocksize < MIN_APPENDONLY_BLOCK_SIZE ||
-		blocksize > MAX_APPENDONLY_BLOCK_SIZE ||
-		blocksize % MIN_APPENDONLY_BLOCK_SIZE != 0)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("block size must be between 8KB and 2MB and be an 8KB multiple, got %d", blocksize)));
-
-	if (safewrite > MAX_APPENDONLY_BLOCK_SIZE || safewrite % 8 != 0)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("safefswrite size must be less than 8MB and be a multiple of 8")));
-
-	if (gp_safefswritesize > blocksize)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("block size (%d) is smaller gp_safefswritesize (%d)",
-						blocksize, gp_safefswritesize),
-				 errhint("Increase blocksize or decrease gp_safefswritesize if it is safe to do so on this file system.")));
 }
 
 /*
@@ -1044,11 +1084,14 @@ static int
 setDefaultCompressionLevel(char *compresstype)
 {
 	if (!compresstype || pg_strcasecmp(compresstype, "none") == 0)
-		return 0;
+		return AO_DEFAULT_COMPRESSLEVEL;
 	else
-		return 1;
+		return AO_DEFAULT_USABLE_COMPRESSLEVEL;
 }
 
+/*
+ * It's used to prevent persistent memory leaks when parseRelOptions() is called repeatedly.
+ */
 void
 free_options_deep(relopt_value *options, int num_options)
 {
@@ -1087,6 +1130,27 @@ get_option_set(relopt_value *options, int num_options, const char *opt_name)
  * Attribute Encoding specific functions
  * ------------------------------------------------------------------------
  */
+
+/*
+ * Check if the name is one of the ENCODING clauses.
+ */
+bool
+is_storage_encoding_directive(char *name)
+{
+	/* names we expect to see in ENCODING clauses */
+	static char *storage_directive_names[] = {"compresstype", 
+						"compresslevel",
+						"blocksize"};
+
+	int i = 0;
+
+	for (i = 0; i < lengthof(storage_directive_names); i++)
+	{
+		if (strcmp(name, storage_directive_names[i]) == 0)
+			return true;
+	}
+	return false;
+}
 
 /*
  * Add any missing encoding attributes (compresstype = none,
@@ -1164,7 +1228,7 @@ fillin_encoding(List *aocoColumnEncoding)
 			}
 			else
 			{
-				arg = AO_DEFAULT_COMPRESSTYPE;
+				arg = AO_DEFAULT_USABLE_COMPRESSTYPE;
 			}
 			el = makeDefElem("compresstype", (Node *) makeString(arg), -1);
 			retList = lappend(retList, el);
@@ -1200,6 +1264,49 @@ fillin_encoding(List *aocoColumnEncoding)
 		retList = lappend(retList, el);
 	}
 	return retList;
+}
+
+/*
+ * Make encoding (compresstype = ..., blocksize=...) based on
+ * currently configured defaults.
+ * For blocksize, it is impossible for the value to be unset
+ * if an appendonly relation, hence the default is always ignored.
+ */
+static List *
+default_column_encoding_clause(Relation rel)
+{
+	DefElem *e1, *e2, *e3;
+	const StdRdOptions *ao_opts = currentAOStorageOptions();
+	bool		appendonly;
+	int32		blocksize = -1;
+	int16		compresslevel = 0;
+	char	   *compresstype = NULL;
+	NameData	compresstype_nd;
+
+	appendonly = rel && RelationIsAppendOptimized(rel);
+	if (appendonly)
+	{
+		GetAppendOnlyEntryAttributes(RelationGetRelid(rel),
+									 &blocksize,
+									 &compresslevel,
+									 NULL,
+									 &compresstype_nd);
+		compresstype = NameStr(compresstype_nd);
+	}
+
+	compresstype = compresstype && compresstype[0] ? pstrdup(compresstype) : 
+					(ao_opts->compresstype[0] ? pstrdup(ao_opts->compresstype) : "none");
+	e1 = makeDefElem("compresstype", (Node *) makeString(pstrdup(compresstype)), -1);
+
+	blocksize = appendonly ? blocksize : 
+					(ao_opts->blocksize != 0 ? ao_opts->blocksize : AO_DEFAULT_BLOCKSIZE);
+	e2 = makeDefElem("blocksize", (Node *) makeInteger(blocksize), -1);
+
+	compresslevel = appendonly && compresslevel != 0 ? compresslevel :
+					(ao_opts->compresslevel != 0 ? ao_opts->compresslevel : AO_DEFAULT_COMPRESSLEVEL);
+	e3 = makeDefElem("compresslevel", (Node *) makeInteger(compresslevel), -1);
+
+	return list_make3(e1, e2, e3);
 }
 
 /*
@@ -1356,12 +1463,7 @@ validateColumnStorageEncodingClauses(List *aocoColumnEncoding,
 																	true,
 																	RELOPT_KIND_APPENDOPTIMIZED);
 
-		validateAppendOnlyRelOptions(stdRdOptions->blocksize,
-									 gp_safefswritesize,
-									 stdRdOptions->compresslevel,
-									 stdRdOptions->compresstype,
-									 stdRdOptions->checksum,
-									 true);
+		validateOrientationRelOptions(stdRdOptions->compresstype, true);
 	}
 }
 
@@ -1411,9 +1513,10 @@ List *
 transformStorageEncodingClause(List *aocoColumnEncoding, bool validate)
 {
 	ListCell   *lc;
-	DefElem	   *dl;
+	DefElem	   *dl = NULL;
+	int c = 0;
 
-	foreach(lc, aocoColumnEncoding)
+	foreach_with_count(lc, aocoColumnEncoding, c)
 	{
 		dl = (DefElem *) lfirst(lc);
 		if (pg_strncasecmp(dl->defname, SOPT_CHECKSUM, strlen(SOPT_CHECKSUM)) == 0)
@@ -1422,6 +1525,27 @@ transformStorageEncodingClause(List *aocoColumnEncoding, bool validate)
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 					 errmsg("\"%s\" is not a column specific option",
 							SOPT_CHECKSUM)));
+		}
+		/* 
+		 * For compresstype, the value must be modified from the value passed
+		 * into the encoding clause if gp_quicklz_fallback is enabled and "quicklz"
+		 * is specified. The value will instead fallback to "zstd" if available, else
+		 * the default usable compresstype.
+		 */
+		if (pg_strncasecmp(dl->defname, SOPT_COMPTYPE, strlen(SOPT_COMPTYPE)) == 0
+				&& gp_quicklz_fallback)
+		{
+			char *name = defGetString(dl);
+			if (pg_strcasecmp(name, "quicklz") == 0)
+			{
+#ifdef USE_ZSTD
+				char *compresstype = "zstd";
+#else
+				char *compresstype = AO_DEFAULT_USABLE_COMPRESSTYPE;
+#endif
+				dl = makeDefElem("compresstype", (Node *) makeString(compresstype), -1);
+			}
+				list_nth_replace(aocoColumnEncoding, c, dl);
 		}
 	}
 
@@ -1449,10 +1573,10 @@ transformStorageEncodingClause(List *aocoColumnEncoding, bool validate)
 /*
  * Find the column reference storage encoding clause for `column'.
  *
- * This is called by transformAttributeEncoding() in a loop but stenc should be
+ * This is called by transformColumnEncoding() in a loop but stenc should be
  * quite small in practice.
  */
-static ColumnReferenceStorageDirective *
+ColumnReferenceStorageDirective *
 find_crsd(const char *column, List *stenc)
 {
 	ListCell *lc;
@@ -1470,12 +1594,16 @@ find_crsd(const char *column, List *stenc)
 /*
  * Parse and validate COLUMN <col> ENCODING ... directives.
  *
- * The 'columns', 'stenc' and 'taboptions' arguments are parts of the
- * CREATE TABLE command:
+ * The 'colDefs', 'stenc' and 'taboptions' arguments are parts of the
+ * CREATE TABLE or ALTER TABLE command:
  *
- * 'columns' - list of ColumnDefs
+ * 'colDefs' - list of ColumnDefs
  * 'stenc' - list of ColumnReferenceStorageDirectives
  * 'withOptions' - list of WITH options
+ * 'parentenc' - list of ColumnReferenceStorageDirectives explicitly defined for
+ * parent partition
+ * 'explicitOnly' - Only return explicitly defined column encoding values
+ *  to be used for child partitions
  *
  * ENCODING options can be attached to column definitions, like
  * "mycolumn integer ENCODING ..."; these go into ColumnDefs. They
@@ -1483,14 +1611,14 @@ find_crsd(const char *column, List *stenc)
  * they go into the ColumnReferenceStorageDirectives. And table-wide
  * defaults can be given in the WITH clause.
  *
- * If any ENCODING clauses were given, *found_enc is set to true.
- * That's a separate output argument, because the returned list will
- * include defaults from the GUCs etc. even if no ENCODING clause was
- * given in this CREATE TABLE command.
+ * Normally if any ENCODING clause was given for a non-AO/CO table,
+ * we should report an error. However, exception exists in DefineRelation()
+ * where we allow that to happen, so we pass in errorOnEncodingClause to
+ * indicate whether we should report this error. 
  *
  * This function is called for RELKIND_PARTITIONED_TABLE as well even if we
  * don't store entries in pg_attribute_encoding for rootpartition. The reason
- * is to transformAttributeEncoding for parent as need to use them later while
+ * is to transformColumnEncoding for parent as need to use them later while
  * creating partitions in GPDB legacy partitioning syntax. Hence, if
  * rootpartition add to the list, only encoding elements specified in command,
  * defaults based on GUCs and such are skipped. Each child partition would
@@ -1500,33 +1628,18 @@ find_crsd(const char *column, List *stenc)
  * and then need to add defaults only for remaining columns.
  *
  * NOTE: This is *not* performed during the parse analysis phase, like
- * most transformation, but only later in DefineRelation(). This needs
- * access to possible inherited columns, so it can only be done after
+ * most transformation, but only later in DefineRelation() or ATExecAddColumn(). 
+ * This needs access to possible inherited columns, so it can only be done after
  * expanding them.
- *
- * GPDB_12_AFTER_MERGE_FIXME:
- *		Attempt to code, precedence, merging and access to possibly existing
- *		encodings in this function, in a manner similar to
- *		validateColumnStorageEncodingClauses(). Currently the whole transform,
- *		merge, validate dance is happening both inside and outside this function
- *		but not consistently in all cases. Look at CREATE and ALTER table for
- *		specifics.
  */
-List *
-transformAttributeEncoding(List *columns,
-						   List *stenc,
-						   List *withOptions,
-						   bool rootpartition,
-						   bool *found_enc)
+List* transformColumnEncoding(Relation rel, List *colDefs, List *stenc, List *withOptions, List *parentenc, bool explicitOnly, bool errorOnEncodingClause)
 {
-	ListCell   *lc;
 	ColumnReferenceStorageDirective *deflt = NULL;
-	List	   *newenc = NIL;
-	List	   *tmpenc;
+	ListCell   *lc;
+	List	   *result = NIL;
 
-	*found_enc = false;
-
-	validateColumnStorageEncodingClauses(stenc, columns);
+	if (stenc)
+		validateColumnStorageEncodingClauses(stenc, colDefs);
 
 	/* get the default clause, if there is one. */
 	foreach(lc, stenc)
@@ -1534,6 +1647,10 @@ transformAttributeEncoding(List *columns,
 		ColumnReferenceStorageDirective *c = lfirst(lc);
 		Assert(IsA(c, ColumnReferenceStorageDirective));
 
+		if (errorOnEncodingClause)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					errmsg("ENCODING clause only supported with column oriented tables")));
 		if (c->deflt)
 		{
 			/*
@@ -1556,36 +1673,31 @@ transformAttributeEncoding(List *columns,
 						 errmsg("DEFAULT COLUMN ENCODING clause cannot override values set in WITH clause")));
 		}
 
-		*found_enc = true;
 	}
 
 	/*
 	 * If no default has been specified, we might create one out of the
 	 * WITH clause.
 	 */
-	tmpenc = form_default_storage_directive(withOptions);
-	if (tmpenc)
+	if (!deflt)
 	{
-		deflt = makeNode(ColumnReferenceStorageDirective);
-		deflt->deflt = true;
-		deflt->encoding = transformStorageEncodingClause(tmpenc, false);
+		List	   *tmpenc;
+		if ((tmpenc = form_default_storage_directive(withOptions)) != NULL)
+		{
+			deflt = makeNode(ColumnReferenceStorageDirective);
+			deflt->deflt = true;
+			deflt->encoding = transformStorageEncodingClause(tmpenc, false);
+		}
 	}
 
-	/*
-	 * Loop over all columns. If a column has a column reference storage clause
-	 * -- i.e., COLUMN name ENCODING () -- apply that. Otherwise, apply the
-	 * default.
-	 */
-	foreach(lc, columns)
+	foreach(lc, colDefs)
 	{
 		Node	   *elem = (Node *) lfirst(lc);
 		ColumnDef *d;
 		ColumnReferenceStorageDirective *c;
 		List *encoding = NIL;
 
-		/* GPDB_12_AFTER_MERGE_FIXME: can we have anything else here? This used to be an Insist */
-		if (!IsA(elem, ColumnDef))
-			continue;
+		Assert(IsA(elem, ColumnDef));
 
 		d = (ColumnDef *) elem;
 
@@ -1595,12 +1707,16 @@ transformAttributeEncoding(List *columns,
 		 * 1. An explicit encoding clause in the ColumnDef
 		 * 2. A column reference storage directive for this column
 		 * 3. A default column encoding in the statement
-		 * 4. A default for the type.
+		 * 4. Parent partition's column encoding values
+		 * 5. A default for the type.
 		 */
 		if (d->encoding)
 		{
 			encoding = transformStorageEncodingClause(d->encoding, true);
-			*found_enc = true;
+			if (errorOnEncodingClause)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("ENCODING clause only supported with column oriented tables")));
 		}
 		else
 		{
@@ -1612,19 +1728,17 @@ transformAttributeEncoding(List *columns,
 			{
 				if (deflt)
 					encoding = copyObject(deflt->encoding);
-				else if (!rootpartition)
+				else if (!explicitOnly)
 				{
-					List	   *te;
-
-					if (d->typeName)
-						te = TypeNameGetStorageDirective(d->typeName);
-					else
-						te = NIL;
-
-					if (te)
-						encoding = copyObject(te);
-					else
-						encoding = default_column_encoding_clause(NULL);
+					if (parentenc)
+					{
+						ColumnReferenceStorageDirective *parent_col_encoding = find_crsd(d->colname, parentenc);
+						encoding = transformStorageEncodingClause(parent_col_encoding->encoding, true);
+					}
+					else if (d->typeName)
+						encoding = get_type_encoding(d->typeName);
+					if (!encoding)
+						encoding = default_column_encoding_clause(rel);
 				}
 			}
 		}
@@ -1635,10 +1749,150 @@ transformAttributeEncoding(List *columns,
 			c->column = pstrdup(d->colname);
 			c->encoding = encoding;
 
-			newenc = lappend(newenc, c);
+			result = lappend(result, c);
 		}
 	}
 
-	Assert(rootpartition?true:list_length(newenc) == list_length(columns));
-	return newenc;
+	return result;
+}
+
+/*
+ * Update the corresponding ColumnReferenceStorageDirective clause
+ * in a list of such clauses: current_encodings.
+ *
+ * If anything is really updated (either existing one is changed or
+ * a new crsd is added), set is_updated to true. Otherwise false.
+ *
+ * Return the updated or original current_encodings.
+ */
+List*
+updateEncodingList(List *current_encodings, ColumnReferenceStorageDirective *new_crsd, bool *is_updated)
+{
+	ListCell *lc_current;
+	ColumnReferenceStorageDirective *crsd = NULL;
+
+	Assert(is_updated);
+	foreach(lc_current, current_encodings)
+	{
+		ColumnReferenceStorageDirective *current_crsd = (ColumnReferenceStorageDirective *) lfirst(lc_current);
+
+		if (current_crsd->deflt == false &&
+			strcmp(new_crsd->column, current_crsd->column) == 0)
+		{
+			crsd = current_crsd;
+			break;
+		}
+	}
+	if (crsd)
+	{
+		ListCell *lc1;
+		List *merged_encodings = NIL;
+		*is_updated = false;
+
+		/*
+		 * Create a new list of encodings merging the existing and new values.
+		 *
+		 * Assuming crsd->encoding is complete list of all encoding attributes,
+		 * but new_crsd->encoding may or may not be complete list.
+		 */
+		foreach(lc1, crsd->encoding)
+		{
+			ListCell *lc2;
+			DefElem  *el1        = lfirst(lc1);
+			DefElem  *el2;
+			bool current_updated = false;
+			foreach (lc2, new_crsd->encoding)
+			{
+				el2 = lfirst(lc2);
+				if ((strcmp(el1->defname, el2->defname) == 0) &&
+					(strcmp(defGetString(el1), defGetString(el2)) != 0))
+				{
+					current_updated  = true;
+					*is_updated       = true;
+					merged_encodings = lappend(merged_encodings, copyObject(el2));
+				}
+			}
+			if (!current_updated)
+				merged_encodings = lappend(merged_encodings, copyObject(el1));
+		}
+		/*
+		 * Validate the merged encodings to weed out duplicate parameters and/or
+		 * invalid parameter values.
+		 * We can have duplicate parameters if user enters for eg:
+		 * ALTER COLUMN a SET ENCODING (compresslevel=3, compresslevel=4);
+		 */
+		merged_encodings =
+			transformStorageEncodingClause(merged_encodings, true);
+
+		/*
+		 * Update current_encodings in place with the merged and validated merged_encodings
+		 */
+		list_free_deep(crsd->encoding);
+		crsd->encoding = merged_encodings;
+	}
+	else
+	{
+		/*
+		 * new_crsd->column not found in current_encodings
+		 * Must be coming from a newly added column
+		 */
+
+		new_crsd->encoding = transformStorageEncodingClause(new_crsd->encoding, true);
+		current_encodings = lappend(current_encodings, new_crsd);
+		*is_updated = true;
+	}
+	return current_encodings;
+}
+
+/*
+ * GPDB: Convenience function to judge a relation option whether already in opts
+ */
+bool
+reloptions_has_opt(List *opts, const char *name)
+{
+	ListCell *lc;
+	foreach(lc, opts)
+	{
+		DefElem *de = lfirst(lc);
+		if (pg_strcasecmp(de->defname, name) == 0)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * GPDB: Convenience function to build storage reloptions for a given relation, just for AO table.
+ */
+List *
+build_ao_rel_storage_opts(List *opts, Relation rel)
+{
+	bool		checksum = true;
+	int32		blocksize = -1;
+	int16		compresslevel = 0;
+	char	   *compresstype = NULL;
+	NameData	compresstype_nd;
+
+	GetAppendOnlyEntryAttributes(RelationGetRelid(rel),
+								 &blocksize,
+								 &compresslevel,
+								 &checksum,
+								 &compresstype_nd);
+	compresstype = NameStr(compresstype_nd);
+
+	if (!reloptions_has_opt(opts, "blocksize"))
+		opts = lappend(opts, makeDefElem("blocksize", (Node *) makeInteger(blocksize), -1));
+
+	if (!reloptions_has_opt(opts, "compresslevel"))
+		opts = lappend(opts, makeDefElem("compresslevel", (Node *) makeInteger(compresslevel), -1));
+
+	if (!reloptions_has_opt(opts, "checksum"))
+		opts = lappend(opts, makeDefElem("checksum", (Node *) makeInteger(checksum), -1));
+
+	if (!reloptions_has_opt(opts, "compresstype"))
+	{
+		compresstype = (compresstype && compresstype[0]) ? pstrdup(compresstype) : "none";
+		opts = lappend(opts, makeDefElem("compresstype", (Node *) makeString(compresstype), -1));
+	}
+
+	return opts;
 }

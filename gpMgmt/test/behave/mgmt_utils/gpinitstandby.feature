@@ -42,6 +42,7 @@ Feature: Tests for gpinitstandby feature
         And the file "log/testfile" does not exist under standby coordinator data directory
         And the file "db_dumps/testfile" does not exist under standby coordinator data directory
         And the file "promote/testfile" does not exist under standby coordinator data directory
+        And the file "pg_hba.conf.bak" does not exist under standby coordinator data directory
         ## maybe clean up the directories created in the coordinator data directory
 
     Scenario: gpstate -f shows standby coordinator information after running gpinitstandby
@@ -71,7 +72,6 @@ Feature: Tests for gpinitstandby feature
 
          Then gpinitstandby should return a return code of 0
           And gpinitstandby should print "If you continue with initialization, pg_hba.conf files on these hosts will not be updated." to stdout
-          And gpinitstandby should print "Manual update of the pg_hba_conf files for all segments on unreachable host invalid_host will be required." to stdout
           And the cluster is returned to a good state
 
     Scenario: gpinitstandby exits if confirmation is not given when a segment host is unreachable
@@ -132,3 +132,22 @@ Feature: Tests for gpinitstandby feature
         And the user runs gpinitstandby with options " "
         Then gpinitstandby should return a return code of 0
         And verify that the file "pg_hba.conf" in the coordinator data directory has "no" line starting with "host.*replication.*(127.0.0.1|::1).*trust"
+
+    @backup_restore_bashrc
+    Scenario: gpinitstandby should not throw error when banner exists on the host
+        Given the database is running
+        And the standby is not initialized
+        When the user sets banner on host
+        And the user runs gpinitstandby with options " "
+        Then gpinitstandby should return a return code of 0
+
+    @concourse_cluster
+    Scenario: gpinitstandby should create pg_hba entry to segment primary
+        Given the database is not running
+        And a working directory of the test as '/tmp/gpinitstandby'
+        And a cluster is created with mirrors on "cdw" and "sdw1"
+        And the standby is not initialized
+        When running gpinitstandby on host "cdw" to create a standby on host "sdw1"
+        Then gpinitstandby should return a return code of 0
+        And verify the standby coordinator entries in catalog
+        And verify that pg_hba.conf file has "standby" entries in each segment data directories

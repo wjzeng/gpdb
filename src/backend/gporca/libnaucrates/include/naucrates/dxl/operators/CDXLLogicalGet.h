@@ -35,11 +35,15 @@ private:
 	// table descriptor for the scanned table
 	CDXLTableDescr *m_dxl_table_descr;
 
+	// the table has row level security enabled and contains security quals
+	BOOL m_has_security_quals{false};
+
 public:
 	CDXLLogicalGet(CDXLLogicalGet &) = delete;
 
 	// ctor
-	CDXLLogicalGet(CMemoryPool *mp, CDXLTableDescr *table_descr);
+	CDXLLogicalGet(CMemoryPool *mp, CDXLTableDescr *table_descr,
+				   BOOL hasSecurityQuals = false);
 
 	// dtor
 	~CDXLLogicalGet() override;
@@ -62,10 +66,12 @@ public:
 	{
 		GPOS_ASSERT(nullptr != dxl_op);
 		GPOS_ASSERT(EdxlopLogicalGet == dxl_op->GetDXLOperator() ||
-					EdxlopLogicalExternalGet == dxl_op->GetDXLOperator());
+					EdxlopLogicalForeignGet == dxl_op->GetDXLOperator());
 
 		return dynamic_cast<CDXLLogicalGet *>(dxl_op);
 	}
+
+	BOOL HasSecurityQuals() const;
 
 #ifdef GPOS_DEBUG
 	// checks whether the operator has valid structure, i.e. number and

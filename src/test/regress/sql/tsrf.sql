@@ -94,11 +94,11 @@ SELECT few.dataa, count(*), min(id), max(id), generate_series(1,3) FROM few GROU
 -- grouping sets are a bit special, they produce NULLs in columns not actually NULL
 set enable_hashagg = false;
 SELECT dataa, datab b, generate_series(1,2) g, count(*) FROM few GROUP BY CUBE(dataa, datab);
-SELECT dataa, datab b, generate_series(1,2) g, count(*) FROM few GROUP BY CUBE(dataa, datab) ORDER BY dataa;
-SELECT dataa, datab b, generate_series(1,2) g, count(*) FROM few GROUP BY CUBE(dataa, datab) ORDER BY g;
+SELECT dataa, datab b, generate_series(1,2) g, count(*) FROM few GROUP BY CUBE(dataa, datab) ORDER BY dataa, b, g;
+SELECT dataa, datab b, generate_series(1,2) g, count(*) FROM few GROUP BY CUBE(dataa, datab) ORDER BY g, dataa, b;
 SELECT dataa, datab b, generate_series(1,2) g, count(*) FROM few GROUP BY CUBE(dataa, datab, g);
-SELECT dataa, datab b, generate_series(1,2) g, count(*) FROM few GROUP BY CUBE(dataa, datab, g) ORDER BY dataa;
-SELECT dataa, datab b, generate_series(1,2) g, count(*) FROM few GROUP BY CUBE(dataa, datab, g) ORDER BY g;
+SELECT dataa, datab b, generate_series(1,2) g, count(*) FROM few GROUP BY CUBE(dataa, datab, g) ORDER BY dataa, b, g;
+SELECT dataa, datab b, generate_series(1,2) g, count(*) FROM few GROUP BY CUBE(dataa, datab, g) ORDER BY g, dataa, b;
 reset enable_hashagg;
 
 -- case with degenerate ORDER BY
@@ -151,10 +151,6 @@ FROM (VALUES (3, 2), (3,1), (1,1), (1,4), (5,3), (5,1)) AS t(a, b)
 ORDER BY a, b DESC, g DESC;
 
 -- only SRF mentioned in DISTINCT ON
--- GPDB: the result is not well-defined, because for rows with same 'g',
--- any row can legally be returned. GPDB chooses a different plan than
--- upstream, one that redistributes the data. (That's probably not a
--- good plan in this simple case, but it's not incorrect.)
 SELECT DISTINCT ON (g) a, b, generate_series(1,3) g
 FROM (VALUES (3, 2), (3,1), (1,1), (1,4), (5,3), (5,1)) AS t(a, b);
 

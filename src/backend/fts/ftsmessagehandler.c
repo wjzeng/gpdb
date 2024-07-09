@@ -26,6 +26,7 @@
 #include "utils/faultinjector.h"
 #include "utils/guc.h"
 #include "replication/gp_replication.h"
+#include "replication/walsender.h"
 #include "storage/fd.h"
 
 #define FTS_PROBE_FILE_NAME "fts_probe_file.bak"
@@ -152,7 +153,7 @@ checkIODataDirectory(void)
 		 * We are more concerned with IOs hanging than failures.
 		 * Cleanup the file as detected the problem and reporting the same.
 		 * This is done to cover for cases like:
-		 * 1] FTS detects corruption/read failure on the file, reports to Master
+		 * 1] FTS detects corruption/read failure on the file, reports to Coordinator
 		 * 2] Triggers failover to mirror
 		 * 3] But if the file stays around, when it transitions back to Primary
 		 *    would again detect this corrupted file and again trigger failover.
@@ -268,13 +269,15 @@ HandleFtsWalRepProbe(void)
 	}
 	else
 	{
-		GetMirrorStatus(&response);
+		bool ready_for_syncrep;
+
+		GetMirrorStatus(&response, &ready_for_syncrep);
 
 		/*
 		 * We check response.IsSyncRepEnabled even though syncrep is again checked
 		 * later in the set function to avoid acquiring the SyncRepLock again.
 		 */
-		if (response.IsMirrorUp && !response.IsSyncRepEnabled)
+		if (!response.IsSyncRepEnabled && ready_for_syncrep)
 		{
 			SetSyncStandbysDefined();
 			/* Syncrep is enabled now, so respond accordingly. */
@@ -307,7 +310,7 @@ HandleFtsWalRepSyncRepOff(void)
 	ereport(LOG,
 			(errmsg("turning off synchronous wal replication due to FTS request")));
 	UnsetSyncStandbysDefined();
-	GetMirrorStatus(&response);
+	GetMirrorStatus(&response, NULL);
 
 	SendFtsResponse(&response, FTS_MSG_SYNCREP_OFF);
 }
@@ -382,7 +385,8 @@ HandleFtsWalRepPromote(void)
 	 * idempotent way.
 	 */
 	DBState state = GetCurrentDBState();
-	if (state == DB_IN_ARCHIVE_RECOVERY)
+	XLogRecPtr redo = GetRedoRecPtr();
+	if (state == DB_IN_ARCHIVE_RECOVERY && redo != InvalidXLogRecPtr)
 	{
 		/*
 		 * Reset sync_standby_names on promotion. This is to avoid commits
@@ -400,8 +404,12 @@ HandleFtsWalRepPromote(void)
 	}
 	else
 	{
-		elog(LOG, "ignoring promote request, walreceiver not running,"
-			 " DBState = %d", state);
+		/*
+		 * FTS will retry promotion request based on am_mirror reporting
+		 * status.
+		 */
+		elog(LOG, "ignoring promote request, not in archive recovery state,"
+			 " DBState = %d, RedoPtr = %X/%X", state, (uint32) (redo >> 32), (uint32) redo);
 	}
 
 	SendFtsResponse(&response, FTS_MSG_PROMOTE);

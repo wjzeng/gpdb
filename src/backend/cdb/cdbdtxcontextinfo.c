@@ -34,7 +34,7 @@
 static uint32 syncCount = 1;
 
 void
-DtxContextInfo_CreateOnMaster(DtxContextInfo *dtxContextInfo, bool inCursor,
+DtxContextInfo_CreateOnCoordinator(DtxContextInfo *dtxContextInfo, bool inCursor,
 							  int txnOptions, Snapshot snapshot)
 {
 	int			i;
@@ -60,7 +60,7 @@ DtxContextInfo_CreateOnMaster(DtxContextInfo *dtxContextInfo, bool inCursor,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("cannot have more than 2^32-2 commands in a session")));
 
-	AssertImply(inCursor,
+	AssertImply(inCursor && !IS_HOT_STANDBY_QD(),
 				dtxContextInfo->distributedXid != InvalidDistributedTransactionId &&
 				gp_command_count == MySessionState->latestCursorCommandId);
 
@@ -68,7 +68,7 @@ DtxContextInfo_CreateOnMaster(DtxContextInfo *dtxContextInfo, bool inCursor,
 	dtxContextInfo->nestingLevel = GetCurrentTransactionNestLevel();
 
 	elog((Debug_print_full_dtm ? LOG : DEBUG5),
-		 "DtxContextInfo_CreateOnMaster: created dtxcontext with dxid "UINT64_FORMAT" nestingLevel %d segmateSync %u/%u (current/cached)",
+		 "DtxContextInfo_CreateOnCoordinator: created dtxcontext with dxid "UINT64_FORMAT" nestingLevel %d segmateSync %u/%u (current/cached)",
 		 dtxContextInfo->distributedXid, dtxContextInfo->nestingLevel,
 		 dtxContextInfo->segmateSync, syncCount);
 
@@ -91,9 +91,9 @@ DtxContextInfo_CreateOnMaster(DtxContextInfo *dtxContextInfo, bool inCursor,
 			memcpy(gid, "<empty>", 8);
 
 		elog((Debug_print_full_dtm ? LOG : DEBUG5),
-			 "DtxContextInfo_CreateOnMaster Gp_role is DISPATCH and have gid = %s --> have distributed snapshot", gid);
+			 "DtxContextInfo_CreateOnCoordinator Gp_role is DISPATCH and have gid = %s --> have distributed snapshot", gid);
 		elog((Debug_print_full_dtm ? LOG : DEBUG5),
-			 "DtxContextInfo_CreateOnMaster distributedXid = "UINT64_FORMAT", "
+			 "DtxContextInfo_CreateOnCoordinator distributedXid = "UINT64_FORMAT", "
 			 "distributedSnapshotHeader (xminAllDistributedSnapshots "UINT64_FORMAT", xmin = "UINT64_FORMAT", xmax = "UINT64_FORMAT", count = %d)",
 			 dtxContextInfo->distributedXid,
 			 ds->xminAllDistributedSnapshots,
@@ -108,11 +108,11 @@ DtxContextInfo_CreateOnMaster(DtxContextInfo *dtxContextInfo, bool inCursor,
 				 i, ds->inProgressXidArray[i]);
 		}
 		elog((Debug_print_full_dtm ? LOG : DEBUG5),
-			 "DtxContextInfo_CreateOnMaster curcid = %u",
+			 "DtxContextInfo_CreateOnCoordinator curcid = %u",
 			 dtxContextInfo->curcid);
 
 		elog((Debug_print_full_dtm ? LOG : DEBUG5),
-			 "DtxContextInfo_CreateOnMaster txnOptions = 0x%x, needDtx = %s, explicitBegin = %s, isoLevel = %s, readOnly = %s.",
+			 "DtxContextInfo_CreateOnCoordinator txnOptions = 0x%x, needDtx = %s, explicitBegin = %s, isoLevel = %s, readOnly = %s.",
 			 txnOptions,
 			 (isMppTxOptions_NeedDtx(txnOptions) ? "true" : "false"),
 			 (isMppTxOptions_ExplicitBegin(txnOptions) ? "true" : "false"),

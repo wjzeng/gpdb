@@ -37,8 +37,8 @@ extern ObjectAddress DefineIndex(Oid relationId,
 								 bool skip_build,
 								 bool quiet,
 								 bool is_new_table);
-extern void ReindexIndex(ReindexStmt *stmt);
-extern Oid	ReindexTable(ReindexStmt *stmt);
+extern void ReindexIndex(ReindexStmt *stmt, bool isTopLevel);
+extern Oid	ReindexTable(ReindexStmt *stmt, bool isTopLevel);
 extern void ReindexMultipleTables(const char *objectName, ReindexObjectType objectKind,
 								  int options, bool concurrent);
 extern char *makeObjectName(const char *name1, const char *name2,
@@ -47,12 +47,9 @@ extern char *ChooseRelationName(const char *name1, const char *name2,
 								const char *label, Oid namespaceid,
 								bool isconstraint);
 extern char *ChooseRelationNameWithCache(const char *name1, const char *name2,
-										 const char *label, Oid namespaceid, 
+										 const char *label, Oid namespaceid,
 										 bool isconstraint,
 										 struct HTAB *cache);
-extern char *ChooseIndexName(const char *tabname, Oid namespaceId,
-				List *colnames, List *exclusionOpNames,
-				bool primary, bool isconstraint);
 extern List *ChooseIndexColumnNames(List *indexElems);
 extern bool CheckIndexCompatible(Oid oldId,
 								 const char *accessMethodName,
@@ -170,9 +167,6 @@ extern Oid	get_index_am_oid(const char *amname, bool missing_ok);
 extern Oid	get_table_am_oid(const char *amname, bool missing_ok);
 extern Oid	get_am_oid(const char *amname, bool missing_ok);
 extern char *get_am_name(Oid amOid);
-
-/* Greenplum specific */
-extern Oid  get_table_am_handler_oid(const char *amname, bool missing_ok);
 
 /* support routines in commands/define.c */
 

@@ -23,16 +23,22 @@
 
 #include "libpq-fe.h"
 #include "libpq-int.h"
+#include "access/table.h"
 #include "access/xact.h"
+#include "catalog/gp_configuration_history.h"
+#include "catalog/indexing.h"
 #include "cdb/cdbfts.h"
 #include "cdb/cdbvars.h"
 #include "postmaster/fts.h"
 #include "postmaster/ftsprobe.h"
 #include "postmaster/postmaster.h"
+#include "utils/builtins.h"
+#include "utils/rel.h"
 #include "utils/snapmgr.h"
 
 
 static struct pollfd *PollFds;
+static Bitmapset *failedContentIds;
 
 static CdbComponentDatabaseInfo *
 FtsGetPeerSegment(CdbComponentDatabases *cdbs,
@@ -199,8 +205,15 @@ ftsConnectStart(fts_segment_info *ftsInfo)
 	return true;
 }
 
+/*
+ * Check if the primary segment is restarting normally by examing the PQ error message.
+ * It could be that they are in RESET (waiting for the children to exit) or making 
+ * progress in RECOVERY. Note there is no good source of RESET progress indications 
+ * that we could check, so we simply always allow it. Normally RESET should be fast 
+ * and there's a timeout in postmaster to guard against long wait.
+ */
 static void
-checkIfFailedDueToRecoveryInProgress(fts_segment_info *ftsInfo)
+checkIfFailedDueToNormalRestart(fts_segment_info *ftsInfo)
 {
 	if (strstr(PQerrorMessage(ftsInfo->conn), _(POSTMASTER_IN_RECOVERY_MSG)) ||
 		strstr(PQerrorMessage(ftsInfo->conn), _(POSTMASTER_IN_STARTUP_MSG)))
@@ -241,6 +254,7 @@ checkIfFailedDueToRecoveryInProgress(fts_segment_info *ftsInfo)
 		 */
 		if (tmpptr <= ftsInfo->xlogrecptr)
 		{
+			ftsInfo->restart_state = PM_IN_RECOVERY_NOT_MAKING_PROGRESS;
 			elog(LOG, "FTS: detected segment is in recovery mode and not making progress (content=%d) "
 				 "primary dbid=%d, mirror dbid=%d",
 				 ftsInfo->primary_cdbinfo->config->segindex,
@@ -249,7 +263,7 @@ checkIfFailedDueToRecoveryInProgress(fts_segment_info *ftsInfo)
 		}
 		else
 		{
-			ftsInfo->recovery_making_progress = true;
+			ftsInfo->restart_state = PM_IN_RECOVERY_MAKING_PROGRESS;
 			ftsInfo->xlogrecptr = tmpptr;
 			elogif(gp_log_fts >= GPVARS_VERBOSITY_VERBOSE, LOG,
 				   "FTS: detected segment is in recovery mode replayed (%X/%X) (content=%d) "
@@ -260,6 +274,15 @@ checkIfFailedDueToRecoveryInProgress(fts_segment_info *ftsInfo)
 				   ftsInfo->primary_cdbinfo->config->dbid,
 				   ftsInfo->mirror_cdbinfo->config->dbid);
 		}
+	}
+	else if (strstr(PQerrorMessage(ftsInfo->conn), _(POSTMASTER_IN_RESET_MSG)))
+	{
+		ftsInfo->restart_state = PM_IN_RESETTING;
+		elog(LOG, "FTS: detected segment is in RESET state (content=%d) "
+				   "primary dbid=%d, mirror dbid=%d",
+				   ftsInfo->primary_cdbinfo->config->segindex,
+				   ftsInfo->primary_cdbinfo->config->dbid,
+				   ftsInfo->mirror_cdbinfo->config->dbid);
 	}
 }
 
@@ -296,10 +319,11 @@ ftsConnect(fts_context *context)
 			case FTS_SYNCREP_OFF_SEGMENT:
 			case FTS_PROMOTE_SEGMENT:
 				/*
-				 * We always default to false.  If connect fails due to recovery in progress
-				 * this variable will be set based on LSN value in error message.
+				 * We always default to PM_NOT_IN_RESTART.  If connect fails, we then check
+				 * the primary's restarting state, so we can skip promoting mirror if it's in
+				 * PM_IN_RESETTING or PM_IN_RECOVERY_MAKING_PROGRESS.
 				 */
-				ftsInfo->recovery_making_progress = false;
+				ftsInfo->restart_state = PM_NOT_IN_RESTART;
 				if (ftsInfo->conn == NULL)
 				{
 					AssertImply(ftsInfo->retry_count > 0,
@@ -348,7 +372,7 @@ ftsConnect(fts_context *context)
 
 						case PGRES_POLLING_FAILED:
 							ftsInfo->state = nextFailedState(ftsInfo->state);
-							checkIfFailedDueToRecoveryInProgress(ftsInfo);
+							checkIfFailedDueToNormalRestart(ftsInfo);
 							elog(LOG, "FTS: cannot establish libpq connection "
 								 "(content=%d, dbid=%d): %s, retry_count=%d",
 								 ftsInfo->primary_cdbinfo->config->segindex,
@@ -404,10 +428,13 @@ ftsCheckTimeout(fts_segment_info *ftsInfo, pg_time_t now)
 	{
 		elog(LOG,
 			 "FTS timeout detected for (content=%d, dbid=%d) "
-			 "state=%d, retry_count=%d,",
+			 "state=%d, retry_count=%d, timeout_count=%d ",
 			 ftsInfo->primary_cdbinfo->config->segindex,
 			 ftsInfo->primary_cdbinfo->config->dbid, ftsInfo->state,
-			 ftsInfo->retry_count);
+			 ftsInfo->retry_count, ftsInfo->timeout_count);
+
+		/* Reset timeout_count before moving to next failed state */
+		ftsInfo->timeout_count = 0;
 		ftsInfo->state = nextFailedState(ftsInfo->state);
 	}
 }
@@ -504,6 +531,17 @@ ftsPoll(fts_context *context)
 					 ftsInfo->primary_cdbinfo->config->dbid, ftsInfo->state,
 					 ftsInfo->retry_count, ftsInfo->conn->status,
 					 ftsInfo->conn->asyncStatus);
+			}
+			/*
+			 * Count time out errors reported by poll(), so we can refer it
+			 * when gp_fts_probe_timeout is exceeded in ftsCheckTimeout().
+			 * Segments for which a response is received already are not to be
+			 * counted.
+			 */
+			if (!IsFtsMessageStateSuccess(ftsInfo->state) &&
+				nready == 0)
+			{
+				ftsInfo->timeout_count++;
 			}
 			/* If poll timed-out above, check timeout */
 			ftsCheckTimeout(ftsInfo, now);
@@ -818,7 +856,7 @@ processRetry(fts_context *context)
 				 * mirror as down prematurely.  If mirror is already marked
 				 * down in configuration, there is no need to retry.
 				 */
-				if (!(ftsInfo->result.retryRequested &&
+				if (!(ftsInfo->result.retryRequested && context->has_mirrors &&
 					  SEGMENT_IS_ALIVE(ftsInfo->mirror_cdbinfo)))
 					break;
 				/* else, fallthrough */
@@ -940,10 +978,47 @@ updateConfiguration(CdbComponentDatabaseInfo *primary,
 }
 
 /*
+ * This function is used to update gp_configuration_history whenever a
+ * segment pair goes into double fault or comes out of double fault.
+ * Or when a segment goes down/up in a mirrorless cluster.
+ * Since FTS probe doesn't have its own transaction, we need to create one
+ * to update the catalog and commit it once it is done.
+ * We cannot update gp_segment_configuration in these cases since the status of
+ * last standing primary has to be 'u' to enable gpstop/gpstart to start/restart
+ * the last standing primary segment. We only log a special message of this state
+ * (mirrored double fault/ mirrorless single fault) into gp_configuration_history
+ * for utils to detect this state.
+ */
+static void
+updateSegmentDownStatus(CdbComponentDatabaseInfo *primary,
+						bool isSegmentAlive,
+						bool hasMirrors)
+{
+	/* Nothing to update if segment is alive, but content isn't down */
+	if (isSegmentAlive && !bms_is_member(primary->config->segindex, failedContentIds))
+		return;
+	/* Nothing to update if segment is dead, and we have already reported */
+	if (!isSegmentAlive && bms_is_member(primary->config->segindex, failedContentIds))
+		return;
+	/*
+	 * Insert new tuple into gp_configuration_history catalog.
+	 */
+	StartTransactionCommand();
+	GetTransactionSnapshot();
+	probeUpdateConfHistory(primary, isSegmentAlive, hasMirrors);
+
+	CommitTransactionCommand();
+	if (isSegmentAlive)
+		failedContentIds = bms_del_member(failedContentIds, primary->config->segindex);
+	else
+		failedContentIds = bms_add_member(failedContentIds, primary->config->segindex);
+}
+
+/*
  * Process responses from primary segments:
  * (a) Transition internal state so that segments can be messaged subsequently
  * (e.g. promotion and turning off syncrep).
- * (b) Update gp_segment_configuration catalog table, if needed.
+ * (b) Update gp_segment_configuration, gp_configuration_history catalog table, if needed.
  */
 static bool
 processResponse(fts_context *context)
@@ -974,21 +1049,28 @@ processResponse(fts_context *context)
 		bool IsPrimaryAlive = ftsInfo->result.isPrimaryAlive;
 		/* Trust a response from primary only if it's alive. */
 		bool IsMirrorAlive =  IsPrimaryAlive ?
-			ftsInfo->result.isMirrorAlive : SEGMENT_IS_ALIVE(mirror);
+			ftsInfo->result.isMirrorAlive : (context->has_mirrors && SEGMENT_IS_ALIVE(mirror));
 		bool IsInSync = IsPrimaryAlive ?
 			ftsInfo->result.isInSync : false;
 
 		/* If primary and mirror are in sync, then both have to be ALIVE. */
 		AssertImply(IsInSync, IsPrimaryAlive && IsMirrorAlive);
-		/* Primary must enable syncrep as long as it thinks mirror is alive. */
-		AssertImply(IsMirrorAlive && IsPrimaryAlive,
-					ftsInfo->result.isSyncRepEnabled);
 
 		switch(ftsInfo->state)
 		{
 			case FTS_PROBE_SUCCESS:
 				Assert(IsPrimaryAlive);
-				if (ftsInfo->result.isSyncRepEnabled && !IsMirrorAlive)
+
+				updateSegmentDownStatus(primary,true, context->has_mirrors);
+
+				if (!context->has_mirrors)
+				{
+					elogif(gp_log_fts >= GPVARS_VERBOSITY_VERBOSE, LOG,
+						   "FTS skipping mirror down update for (content=%d) as mirrorless",
+						   primary->config->segindex);
+					ftsInfo->state = FTS_RESPONSE_PROCESSED;
+				}
+				else if (ftsInfo->result.isSyncRepEnabled && !IsMirrorAlive)
 				{
 					if (!ftsInfo->result.retryRequested)
 					{
@@ -1060,8 +1142,19 @@ processResponse(fts_context *context)
 			case FTS_PROBE_FAILED:
 				/* Primary is down */
 
-				/* If primary is in recovery, do not mark it down and promote mirror */
-				if (ftsInfo->recovery_making_progress)
+				/* If primary is in resetting or making progress in recovery, do not mark it down and promote mirror */
+				if (ftsInfo->restart_state == PM_IN_RESETTING)
+				{
+					Assert(strstr(PQerrorMessage(ftsInfo->conn), _(POSTMASTER_IN_RESET_MSG)));
+					elogif(gp_log_fts >= GPVARS_VERBOSITY_VERBOSE, LOG,
+						 "FTS: detected segment is in resetting mode "
+						 "(content=%d) primary dbid=%d, mirror dbid=%d",
+						 primary->config->segindex, primary->config->dbid, mirror->config->dbid);
+
+					ftsInfo->state = FTS_RESPONSE_PROCESSED;
+					break;
+				}
+				else if (ftsInfo->restart_state == PM_IN_RECOVERY_MAKING_PROGRESS)
 				{
 					Assert(strstr(PQerrorMessage(ftsInfo->conn), _(POSTMASTER_IN_RECOVERY_MSG)) ||
 						   strstr(PQerrorMessage(ftsInfo->conn), _(POSTMASTER_IN_STARTUP_MSG)));
@@ -1076,7 +1169,7 @@ processResponse(fts_context *context)
 
 				Assert(!IsPrimaryAlive);
 				/* See if mirror can be promoted. */
-				if (SEGMENT_IS_IN_SYNC(mirror))
+				if (context->has_mirrors && SEGMENT_IS_IN_SYNC(mirror))
 				{
 					/*
 					 * Primary and mirror must have been recorded as in-sync
@@ -1113,9 +1206,23 @@ processResponse(fts_context *context)
 				}
 				else
 				{
-					elog(WARNING, "FTS double fault detected (content=%d) "
-						 "primary dbid=%d, mirror dbid=%d",
-						 primary->config->segindex, primary->config->dbid, mirror->config->dbid);
+					/*
+					 * Only log here, will handle it later, having an "ERROR"
+					 * keyword here for customer convenience
+					 */
+					if (context->has_mirrors)
+					{
+						elog(WARNING, "ERROR: FTS double fault detected (content=%d) "
+								  "primary dbid=%d, mirror dbid=%d",
+								  primary->config->segindex, primary->config->dbid, mirror->config->dbid);
+					 }
+					else
+					{
+						elog(WARNING, "ERROR: FTS detected segment down (content=%d) "
+									  "primary dbid=%d",
+							 primary->config->segindex, primary->config->dbid);
+					}
+					updateSegmentDownStatus(primary,false, context->has_mirrors);
 					ftsInfo->state = FTS_RESPONSE_PROCESSED;
 				}
 				break;
@@ -1130,9 +1237,14 @@ processResponse(fts_context *context)
 				ftsInfo->state = FTS_RESPONSE_PROCESSED;
 				break;
 			case FTS_PROMOTE_FAILED:
-				elog(WARNING, "FTS double fault detected (content=%d) "
+				/*
+				 * Only log here, will handle it later, having an "ERROR"
+				 * keyword here for customer convenience
+				 */
+				elog(WARNING, "ERROR: FTS double fault detected (content=%d) "
 					 "primary dbid=%d, mirror dbid=%d",
 					 primary->config->segindex, primary->config->dbid, mirror->config->dbid);
+				updateSegmentDownStatus(primary,false, context->has_mirrors);
 				ftsInfo->state = FTS_RESPONSE_PROCESSED;
 				break;
 			case FTS_PROMOTE_SUCCESS:
@@ -1140,6 +1252,7 @@ processResponse(fts_context *context)
 					   "FTS mirror (content=%d, dbid=%d) promotion "
 					   "triggered successfully",
 					   primary->config->segindex, primary->config->dbid);
+				updateSegmentDownStatus(primary,true, context->has_mirrors);
 				ftsInfo->state = FTS_RESPONSE_PROCESSED;
 				break;
 			case FTS_SYNCREP_OFF_SUCCESS:
@@ -1149,9 +1262,10 @@ processResponse(fts_context *context)
 				ftsInfo->state = FTS_RESPONSE_PROCESSED;
 				break;
 			default:
-				elog(ERROR, "FTS invalid internal state %d for (content=%d)"
-					 "primary dbid=%d, mirror dbid=%d", ftsInfo->state,
-					 primary->config->segindex, primary->config->dbid, mirror->config->dbid);
+				elog(ERROR, "FTS invalid internal state %d for (content=%d) "
+							"primary dbid=%d, mirror dbid=%d", ftsInfo->state,
+					 primary->config->segindex, primary->config->dbid,
+					 context->has_mirrors  ? mirror->config->dbid : -1);
 				break;
 		}
 		/* Close connection and reset result for next message, if any. */
@@ -1160,6 +1274,7 @@ processResponse(fts_context *context)
 		ftsInfo->conn = NULL;
 		ftsInfo->poll_events = ftsInfo->poll_revents = 0;
 		ftsInfo->retry_count = 0;
+		ftsInfo->timeout_count = 0;
 	}
 
 	return is_updated;
@@ -1189,22 +1304,25 @@ FtsWalRepInitProbeContext(CdbComponentDatabases *cdbs, fts_context *context)
 	context->num_pairs = cdbs->total_segments;
 	context->perSegInfos = (fts_segment_info *) palloc0(
 		context->num_pairs * sizeof(fts_segment_info));
+	context->has_mirrors = !(cdbs->total_segment_dbs == cdbs->total_segments);
 
 	int fts_index = 0;
 	int cdb_index = 0;
+	CdbComponentDatabaseInfo *mirror = NULL;
+
 	for(; cdb_index < cdbs->total_segment_dbs; cdb_index++)
 	{
 		CdbComponentDatabaseInfo *primary = &(cdbs->segment_db_info[cdb_index]);
 		if (!SEGMENT_IS_ACTIVE_PRIMARY(primary))
 			continue;
-		CdbComponentDatabaseInfo *mirror = FtsGetPeerSegment(cdbs,
-															 primary->config->segindex,
-															 primary->config->dbid);
-		/*
-		 * If there is no mirror under this primary, no need to probe.
-		 */
-		if (!mirror)
+		mirror = FtsGetPeerSegment(cdbs,
+								   primary->config->segindex,
+								   primary->config->dbid);
+		if (context->has_mirrors && !mirror)
 		{
+			/*
+			* If there is no mirror under this primary, no need to probe.
+			*/
 			context->num_pairs--;
 			continue;
 		}
@@ -1227,7 +1345,7 @@ FtsWalRepInitProbeContext(CdbComponentDatabases *cdbs, fts_context *context)
 		ftsInfo->result.isRoleMirror = false;
 		ftsInfo->result.dbid = primary->config->dbid;
 		ftsInfo->state = FTS_PROBE_SEGMENT;
-		ftsInfo->recovery_making_progress = false;
+		ftsInfo->restart_state = PM_NOT_IN_RESTART;
 		ftsInfo->xlogrecptr = InvalidXLogRecPtr;
 
 		ftsInfo->primary_cdbinfo = primary;

@@ -9,6 +9,7 @@
 #
 # psql -f src/test/regress/sql/hs_primary_setup.sql regression
 #
+
 test: hs_standby_check
 #
 # These tests will pass on both primary and standby servers

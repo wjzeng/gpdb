@@ -1,106 +1,112 @@
-#!/usr/bin/env python3
+from mock import Mock, patch, call
 
-from gparray import Segment, GpArray
-from gppylib import gparray
-from gppylib.commands.base import CommandResult, WorkerPool, Command
+from gppylib.test.unit.gp_unittest import GpTestCase, run_tests
+from gppylib.commands.base import CommandResult, ExecutionError
 from gppylib.programs.clsRecoverSegment import GpRecoverSegmentProgram
-from mock import Mock, patch, MagicMock
+from gppylib.test.unit.test_unit_gprecoverseg import Options
 
-from system.configurationInterface import GpConfigurationProvider
-from test.unit.gp_unittest import GpTestCase
-
-
-class GpRecoverSegmentProgramTestCase(GpTestCase):
+class RecoverSegmentsTestCase(GpTestCase):
     def setUp(self):
-        raw_options = GpRecoverSegmentProgram.createParser()
-        (options, _) = raw_options.parse_args(args=[])
-        options.spareDataDirectoryFile = None
-        options.newRecoverHosts = None
-        self.subject = GpRecoverSegmentProgram(options)
-
-        self.execSqlResult = Mock(spec=['fetchall'])
-
-        self.gp_env = Mock()
-        GpCoordinatorEnvironmentMock = Mock(return_value=self.gp_env)
-
-        self.gparray = Mock(spec=GpArray)
-        self.gparray.getDbList.return_value = self._segments_mock()
-
-        configProviderMock = Mock(spec=GpConfigurationProvider)
-        configProviderMock.initializeProvider.return_value = configProviderMock
-        configProviderMock.loadSystemConfig.return_value = self.gparray
-
-        self.getConfigProviderFunctionMock = Mock(GpConfigurationProvider)
-        self.getConfigProviderFunctionMock.return_value = configProviderMock
-
-        self.subject.logger = Mock()
-
-        self.worker_pool = Mock(spec=WorkerPool, return_value=None)
-        self.worker_pool.getCompletedItems.return_value = []
-        self.worker_pool.logger = self.subject.logger
-        self.worker_pool.addCommand.return_value = None
-        self.pool_completed = []
-
+        mock_logger = Mock(spec=['log', 'warn', 'info', 'debug', 'error', 'warning', 'fatal'])
 
         self.apply_patches([
-            patch("gppylib.db.dbconn.connect"),
-            patch("gppylib.db.dbconn.DbURL"),
-            patch("gppylib.db.dbconn.execSQL", return_value=self.execSqlResult),
-            patch('time.sleep'),
-
-            patch('gppylib.programs.clsRecoverSegment.GpCoordinatorEnvironment', GpCoordinatorEnvironmentMock),
-            # patch('gppylib.system.environment.GpCoordinatorEnvironment.__init__', self.gp_env),
-            # patch('gppylib.system.environment.GpCoordinatorEnvironment.getCoordinatorPort'),
-            patch('gppylib.system.faultProberInterface.getFaultProber'),
-            patch('gppylib.system.configurationInterface.getConfigurationProvider', self.getConfigProviderFunctionMock),
-
-            patch('gppylib.commands.base.WorkerPool.__init__', self.worker_pool),
-            patch('gppylib.commands.base.WorkerPool.getCompletedItems', return_value=self.pool_completed),
-            patch('gppylib.commands.base.WorkerPool.addCommand'),
-            patch('gppylib.commands.base.WorkerPool.join'),
+            patch('gppylib.programs.clsRecoverSegment.logger', return_value=mock_logger),
         ])
 
-        # tests make use of a workaround to access a python attribute that is normally
-        # name mangled when specified with a "__" prefix. That workaround is to use _<class>__<attribute>
-        # such as  self.subject._GpRecoverSegmentProgram__pool = mock_pool
-        self.subject._GpRecoverSegmentProgram__pool = self.worker_pool
+        self.mock_logger = self.get_mock_from_apply_patch('logger')
 
-    def test_output_segments_with_persistent_mirroring_disabled_should_print_failed_segments(self):
-        segs_with_persistent_mirroring_disabled = [0, 1]
-        self.subject._output_segments_with_persistent_mirroring_disabled(segs_with_persistent_mirroring_disabled)
-        self.subject.logger.warn.assert_called_once_with(
-            'Segments with dbid 0, 1 not recovered; persistent mirroring state is disabled.')
+        # Mock WorkerPool
+        self.mock_pool = Mock()
+        self.mock_pool.isDone.side_effect = [False, True]
+        self.obj = GpRecoverSegmentProgram(Mock())
+        self.obj._GpRecoverSegmentProgram__pool = self.mock_pool
+    
+    def tearDown(self):
+        super(RecoverSegmentsTestCase, self).tearDown()
 
-    def test_output_segments_with_persistent_mirroring_disabled_should_not_print_if_no_segments(self):
-        segs_with_persistent_mirroring_disabled = []
-        self.subject._output_segments_with_persistent_mirroring_disabled(segs_with_persistent_mirroring_disabled)
-        assert not self.subject.logger.warn.called
+    @patch('gppylib.programs.clsRecoverSegment.Command.run') 
+    def test_shutdown_runs_successfully_single_host(self, mock1):
+        self.obj.shutdown(['sdw1'])
 
-    ############################################################
-    # Private
-    def _get_mock_segment(self, name, port, address, datadir):
-        segment = Mock(spec=Segment)
-        segment.getSegmentHostName.return_value = name
-        segment.getSegmentAddress.return_value = address
-        segment.getSegmentPort.return_value = port
-        segment.getSegmentDataDirectory.return_value = datadir
-        return segment
+        self.mock_logger.debug.assert_called_once_with("Terminating recovery process on host sdw1")
+        self.assertEqual(mock1.call_count, 1)
+    
+    @patch('gppylib.programs.clsRecoverSegment.Command.run')
+    def test_shutdown_runs_successfully_multiple_hosts(self, mock1):
+        self.obj.shutdown(['sdw1', 'sdw2', 'sdw3'])
 
-    def _get_mock_conf_provider(self, gparray_result=None):
-        conf_provider = Mock(spec=GpConfigurationProvider)
-        conf_provider.loadSystemConfig.return_value = gparray_result
-        return conf_provider
+        self.mock_logger.debug.assert_any_call("Terminating recovery process on host sdw1")
+        self.mock_logger.debug.assert_any_call("Terminating recovery process on host sdw2")
+        self.mock_logger.debug.assert_any_call("Terminating recovery process on host sdw3")
 
-    def _segments_mock(self):
-        segment1 = Mock(spec=Segment)
-        segment1.getSegmentHostName.return_value = 'foo1'
-        segment1.isSegmentUp.return_value = True
-        segment1.isSegmentCoordinator.return_value = False
-        segment1.isSegmentStandby.return_value = False
-        segment2 = Mock(spec=Segment)
-        segment2.getSegmentHostName.return_value = 'foo2'
-        segment2.isSegmentUp.return_value = True
-        segment2.isSegmentCoordinator.return_value = False
-        segment2.isSegmentStandby.return_value = False
-        return [segment1, segment2]
+        self.assertEqual(mock1.call_count, 3)
 
+    @patch('gppylib.programs.clsRecoverSegment.ExecutionError.__str__', return_value="Error getting recovery PID")
+    def test_shutdown_logs_exception_on_single_host(self, mock1):
+
+        def mock_func(*args, **kwargs):
+            cmd = args[0]
+            if cmd.remoteHost == "sdw2":
+                raise ExecutionError("Error getting recovery PID", cmd)
+
+        with patch('gppylib.programs.clsRecoverSegment.Command.run', mock_func):
+            self.obj.shutdown(['sdw1', 'sdw2', 'sdw3'])
+
+        self.mock_logger.debug.assert_has_calls([call("Terminating recovery process on host sdw1"),
+                                                 call("Terminating recovery process on host sdw2"),
+                                                 call("Terminating recovery process on host sdw3")])
+        self.mock_logger.error.assert_called_once_with("Not able to terminate recovery process on host sdw2: Error getting recovery PID")
+
+    @patch('gppylib.programs.clsRecoverSegment.ExecutionError.__str__', return_value="Error getting recovery PID")
+    def test_shutdown_logs_exception_on_multiple_host(self, mock1):
+
+        def mock_func(*args, **kwargs):
+            cmd = args[0]
+            if cmd.remoteHost in ["sdw1", "sdw3"]:
+                raise ExecutionError("Error getting recovery PID", cmd)
+
+        with patch('gppylib.programs.clsRecoverSegment.Command.run', mock_func):
+            self.obj.shutdown(['sdw1', 'sdw2', 'sdw3'])
+
+        self.mock_logger.debug.assert_has_calls([call("Terminating recovery process on host sdw1"),
+                                                 call("Terminating recovery process on host sdw2"),
+                                                 call("Terminating recovery process on host sdw3")])
+        self.mock_logger.error.assert_has_calls([call("Not able to terminate recovery process on host sdw1: Error getting recovery PID"),
+                                                 call("Not able to terminate recovery process on host sdw3: Error getting recovery PID")])
+
+    def test_is_max_rate_valid_exception(self):
+        options = Options()
+        options.showProgressInplace = True
+
+        options.maxRate = 'k32'
+        object = GpRecoverSegmentProgram(options)
+        with self.assertRaises(Exception) as ex:
+            object.validateMaxRate()
+        self.assertEqual("transfer rate k32 is not a valid value", str(ex.exception))
+
+        options.maxRate = '0'
+        object = GpRecoverSegmentProgram(options)
+        with self.assertRaises(Exception) as ex:
+            object.validateMaxRate()
+        self.assertEqual("Transfer rate must be greater than zero", str(ex.exception))
+
+        options.maxRate = '1046M'
+        object = GpRecoverSegmentProgram(options)
+        with self.assertRaises(Exception) as ex:
+            object.validateMaxRate()
+        self.assertEqual("transfer rate 1046M is out of range", str(ex.exception))
+
+        options.maxRate = '1024G'
+        object = GpRecoverSegmentProgram(options)
+        with self.assertRaises(Exception) as ex:
+            object.validateMaxRate()
+        self.assertEqual("Invalid --max-rate unit: G", str(ex.exception))
+
+        options.maxRate = '3k2k'
+        object = GpRecoverSegmentProgram(options)
+        with self.assertRaises(Exception) as ex:
+            object.validateMaxRate()
+        self.assertEqual("transfer rate 3k2k is not a valid value", str(ex.exception))
+
+if __name__ == '__main__':
+    run_tests()

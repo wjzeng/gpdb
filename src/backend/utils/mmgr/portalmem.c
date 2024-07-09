@@ -30,6 +30,7 @@
 #include "utils/snapmgr.h"
 #include "utils/timestamp.h"
 
+#include "cdb/cdbendpoint.h"
 #include "cdb/ml_ipc.h"
 #include "utils/resource_manager.h"
 #include "utils/resscheduler.h"
@@ -216,6 +217,7 @@ CreatePortal(const char *name, bool allowDup, bool dupSilent)
 	portal->cleanup = PortalCleanup;
 	portal->createSubid = GetCurrentSubTransactionId();
 	portal->activeSubid = portal->createSubid;
+	portal->createLevel = GetCurrentTransactionNestLevel();
 	portal->strategy = PORTAL_MULTI_QUERY;
 	portal->cursorOptions = CURSOR_OPT_NO_SCROLL;
 	portal->atStart = true;
@@ -223,11 +225,16 @@ CreatePortal(const char *name, bool allowDup, bool dupSilent)
 	portal->visible = true;
 	portal->creation_time = GetCurrentStatementStartTimestamp();
 
-	/* set portal id and queue id if have enabled resource scheduling */
-	if (Gp_role == GP_ROLE_DISPATCH && IsResQueueEnabled())
+	if (IsResQueueEnabled())
 	{
-		portal->portalId = ResCreatePortalId(name);
-		portal->queueId = GetResQueueId();
+		/* Only QD needs to set portal id if have enabled resource scheduling */
+		if (Gp_role == GP_ROLE_DISPATCH)
+		{
+			portal->portalId = ResCreatePortalId(name);
+			portal->queueId = GetResQueueId();
+		}
+		else if (Gp_role == GP_ROLE_EXECUTE)
+			portal->queueId = GetResQueueId();
 	}
 	portal->is_extended_query = false; /* default value */
 
@@ -516,6 +523,9 @@ PortalDrop(Portal portal, bool isTopCommit)
 		portal->cleanup = NULL;
 	}
 
+	/* There shouldn't be an active snapshot anymore, except after error */
+	Assert(portal->portalSnapshot == NULL || !isTopCommit);
+
 	/*
 	 * Remove portal from hash table.  Because we do this here, we will not
 	 * come back to try to remove the portal again if there's any error in the
@@ -524,7 +534,10 @@ PortalDrop(Portal portal, bool isTopCommit)
 	 */
 	PortalHashTableDelete(portal);
 
-	if (IsResQueueLockedForPortal(portal))
+	/*
+	 * GPDB: Cleanup for resource queue associated with the portal (if any).
+	 */
+	if (IsResQueueLockedForPortal(portal) || ResPortalHasDanglingIncrement(portal))
 	{
 		ResUnLockPortal(portal);
 	}
@@ -673,6 +686,7 @@ HoldPortal(Portal portal)
 	 */
 	portal->createSubid = InvalidSubTransactionId;
 	portal->activeSubid = InvalidSubTransactionId;
+	portal->createLevel = 0;
 }
 
 /*
@@ -728,6 +742,8 @@ PreCommit_Portals(bool isPrepare)
 				portal->holdSnapshot = NULL;
 			}
 			portal->resowner = NULL;
+			/* Clear portalSnapshot too, for cleanliness */
+			portal->portalSnapshot = NULL;
 			continue;
 		}
 
@@ -971,6 +987,7 @@ PortalErrorCleanup(void)
 void
 AtSubCommit_Portals(SubTransactionId mySubid,
 					SubTransactionId parentSubid,
+					int parentLevel,
 					ResourceOwner parentXactOwner)
 {
 	HASH_SEQ_STATUS status;
@@ -985,6 +1002,7 @@ AtSubCommit_Portals(SubTransactionId mySubid,
 		if (portal->createSubid == mySubid)
 		{
 			portal->createSubid = parentSubid;
+			portal->createLevel = parentLevel;
 			if (portal->resowner)
 				ResourceOwnerNewParent(portal->resowner, parentXactOwner);
 		}
@@ -1027,13 +1045,6 @@ AtSubAbort_Portals(SubTransactionId mySubid,
 				portal->activeSubid = parentSubid;
 
 				/*
-				 * GPDB_96_MERGE_FIXME: We had this different comment here in GPDB.
-				 * Does this scenario happen in GPDB for some reason?
-				 *
-				 * Upper-level portals that failed while running in this
-				 * subtransaction must be forced into FAILED state, for the
-				 * same reasons discussed below.
-				 *
 				 * A MarkPortalActive() caller ran an upper-level portal in
 				 * this subtransaction and left the portal ACTIVE.  This can't
 				 * happen, but force the portal into FAILED state for the same
@@ -1179,7 +1190,14 @@ AtExitCleanup_ResPortals(void)
 	{
 		Portal		portal = hentry->portal;
 
-		if (IsResQueueLockedForPortal(portal))
+		/*
+		 * Note: There is no real need to call ResPortalHasDanglingIncrement()
+		 * here. Only persisted holdable portals are cleaned up here and they
+		 * should already have hasResQueueLock=true.
+		 *
+		 * But we still do so out of paranoia/future-proofing.
+		 */
+		if (IsResQueueLockedForPortal(portal) || ResPortalHasDanglingIncrement(portal))
 			ResUnLockPortal(portal);
 
 	}
@@ -1271,7 +1289,7 @@ pg_cursor(PG_FUNCTION_ARGS)
 	 * build tupdesc for result tuples. This must match the definition of the
 	 * pg_cursors view in system_views.sql
 	 */
-	tupdesc = CreateTemplateTupleDesc(6);
+	tupdesc = CreateTemplateTupleDesc(7);
 	TupleDescInitEntry(tupdesc, (AttrNumber) 1, "name",
 					   TEXTOID, -1, 0);
 	TupleDescInitEntry(tupdesc, (AttrNumber) 2, "statement",
@@ -1284,6 +1302,8 @@ pg_cursor(PG_FUNCTION_ARGS)
 					   BOOLOID, -1, 0);
 	TupleDescInitEntry(tupdesc, (AttrNumber) 6, "creation_time",
 					   TIMESTAMPTZOID, -1, 0);
+	TupleDescInitEntry(tupdesc, (AttrNumber) 7, "is_parallel",
+					   BOOLOID, -1, 0);
 
 	/*
 	 * We put all the tuples into a tuplestore in one scan of the hashtable.
@@ -1300,8 +1320,8 @@ pg_cursor(PG_FUNCTION_ARGS)
 	while ((hentry = hash_seq_search(&hash_seq)) != NULL)
 	{
 		Portal		portal = hentry->portal;
-		Datum		values[6];
-		bool		nulls[6];
+		Datum		values[7];
+		bool		nulls[7];
 
 		/* report only "visible" entries */
 		if (!portal->visible)
@@ -1315,6 +1335,7 @@ pg_cursor(PG_FUNCTION_ARGS)
 		values[3] = BoolGetDatum(portal->cursorOptions & CURSOR_OPT_BINARY);
 		values[4] = BoolGetDatum(portal->cursorOptions & CURSOR_OPT_SCROLL);
 		values[5] = TimestampTzGetDatum(portal->creation_time);
+		values[6] = BoolGetDatum(PortalIsParallelRetrieveCursor(portal));
 
 		tuplestore_putvalues(tupstore, tupdesc, values, nulls);
 	}
@@ -1390,7 +1411,7 @@ HoldPinnedPortals(void)
 			 */
 			if (portal->strategy != PORTAL_ONE_SELECT)
 				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_TRANSACTION_TERMINATION),
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 						 errmsg("cannot perform transaction commands inside a cursor loop that is not read-only")));
 
 			/* Verify it's in a suitable state to be held */
@@ -1401,4 +1422,93 @@ HoldPinnedPortals(void)
 			portal->autoHeld = true;
 		}
 	}
+}
+
+/*
+ * Drop the outer active snapshots for all portals, so that no snapshots
+ * remain active.
+ *
+ * Like HoldPinnedPortals, this must be called when initiating a COMMIT or
+ * ROLLBACK inside a procedure.  This has to be separate from that since it
+ * should not be run until we're done with steps that are likely to fail.
+ *
+ * It's tempting to fold this into PreCommit_Portals, but to do so, we'd
+ * need to clean up snapshot management in VACUUM and perhaps other places.
+ */
+void
+ForgetPortalSnapshots(void)
+{
+	HASH_SEQ_STATUS status;
+	PortalHashEnt *hentry;
+	int			numPortalSnaps = 0;
+	int			numActiveSnaps = 0;
+
+	/* First, scan PortalHashTable and clear portalSnapshot fields */
+	hash_seq_init(&status, PortalHashTable);
+
+	while ((hentry = (PortalHashEnt *) hash_seq_search(&status)) != NULL)
+	{
+		Portal		portal = hentry->portal;
+
+		if (portal->portalSnapshot != NULL)
+		{
+			portal->portalSnapshot = NULL;
+			numPortalSnaps++;
+		}
+		/* portal->holdSnapshot will be cleaned up in PreCommit_Portals */
+	}
+
+	/*
+	 * Now, pop all the active snapshots, which should be just those that were
+	 * portal snapshots.  Ideally we'd drive this directly off the portal
+	 * scan, but there's no good way to visit the portals in the correct
+	 * order.  So just cross-check after the fact.
+	 */
+	while (ActiveSnapshotSet())
+	{
+		PopActiveSnapshot();
+		numActiveSnaps++;
+	}
+
+	if (numPortalSnaps != numActiveSnaps)
+		elog(ERROR, "portal snapshots (%d) did not account for all active snapshots (%d)",
+			 numPortalSnaps, numActiveSnaps);
+}
+
+/* Find all parallel retrieve cursors and return a list of their portals */
+List *
+GetAllParallelRetrieveCursorPortals(void)
+{
+	List			*portals;
+	PortalHashEnt	*hentry;
+	HASH_SEQ_STATUS	status;
+
+	if (PortalHashTable == NULL)
+		return NULL;
+
+	portals = NULL;
+	hash_seq_init(&status, PortalHashTable);
+	while ((hentry = hash_seq_search(&status)) != NULL)
+	{
+		if (PortalIsParallelRetrieveCursor(hentry->portal) &&
+			hentry->portal->queryDesc != NULL)
+			portals = lappend(portals, hentry->portal);
+	}
+
+	return portals;
+}
+
+/* Return the number of active parallel retrieve cursors */
+int
+GetNumOfParallelRetrieveCursors(void)
+{
+	List   *portals;
+	int		sum;
+
+	portals = GetAllParallelRetrieveCursorPortals();
+	sum = list_length(portals);
+
+	list_free(portals);
+
+	return sum;
 }

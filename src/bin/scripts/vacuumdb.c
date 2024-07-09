@@ -10,6 +10,10 @@
  *-------------------------------------------------------------------------
  */
 
+#ifdef WIN32
+#define FD_SETSIZE 1024			/* must set before winsock2.h is included */
+#endif
+
 #include "postgres_fe.h"
 
 #ifdef HAVE_SYS_SELECT_H
@@ -45,22 +49,20 @@ typedef struct vacuumingOptions
 	bool		skip_locked;
 	int			min_xid_age;
 	int			min_mxid_age;
+	bool		skip_database_stats;
 } vacuumingOptions;
 
 
-static void vacuum_one_database(const char *dbname, vacuumingOptions *vacopts,
+static void vacuum_one_database(const ConnParams *cparams,
+								vacuumingOptions *vacopts,
 								int stage,
 								SimpleStringList *tables,
-								const char *host, const char *port,
-								const char *username, enum trivalue prompt_password,
 								int concurrentCons,
 								const char *progname, bool echo, bool quiet);
 
-static void vacuum_all_databases(vacuumingOptions *vacopts,
+static void vacuum_all_databases(ConnParams *cparams,
+								 vacuumingOptions *vacopts,
 								 bool analyze_in_stages,
-								 const char *maintenance_db,
-								 const char *host, const char *port,
-								 const char *username, enum trivalue prompt_password,
 								 int concurrentCons,
 								 const char *progname, bool echo, bool quiet);
 
@@ -69,6 +71,11 @@ static void prepare_vacuum_command(PQExpBuffer sql, int serverVersion,
 
 static void run_vacuum_command(PGconn *conn, const char *sql, bool echo,
 							   const char *table, const char *progname, bool async);
+
+static void append_to_vacuum_command(PQExpBuffer sql, const char *table);
+
+static void finalize_vacuum_command(PQExpBuffer sql);
+
 
 static ParallelSlot *GetIdleSlot(ParallelSlot slots[], int numslots,
 								 const char *progname);
@@ -129,6 +136,7 @@ main(int argc, char *argv[])
 	char	   *port = NULL;
 	char	   *username = NULL;
 	enum trivalue prompt_password = TRI_DEFAULT;
+	ConnParams	cparams;
 	bool		echo = false;
 	bool		quiet = false;
 	vacuumingOptions vacopts;
@@ -204,12 +212,6 @@ main(int argc, char *argv[])
 				if (concurrentCons <= 0)
 				{
 					pg_log_error("number of parallel jobs must be at least 1");
-					exit(1);
-				}
-				if (concurrentCons > FD_SETSIZE - 1)
-				{
-					pg_log_error("too many parallel jobs requested (maximum: %d)",
-								 FD_SETSIZE - 1);
 					exit(1);
 				}
 				break;
@@ -288,6 +290,13 @@ main(int argc, char *argv[])
 		/* allow 'and_analyze' with 'analyze_only' */
 	}
 
+	/* fill cparams except for dbname, which is set below */
+	cparams.pghost = host;
+	cparams.pgport = port;
+	cparams.pguser = username;
+	cparams.prompt_password = prompt_password;
+	cparams.override_dbname = NULL;
+
 	setup_cancel_handler();
 
 	/* Avoid opening extra connections. */
@@ -307,10 +316,10 @@ main(int argc, char *argv[])
 			exit(1);
 		}
 
-		vacuum_all_databases(&vacopts,
+		cparams.dbname = maintenance_db;
+
+		vacuum_all_databases(&cparams, &vacopts,
 							 analyze_in_stages,
-							 maintenance_db,
-							 host, port, username, prompt_password,
 							 concurrentCons,
 							 progname, echo, quiet);
 	}
@@ -326,25 +335,25 @@ main(int argc, char *argv[])
 				dbname = get_user_name_or_exit(progname);
 		}
 
+		cparams.dbname = dbname;
+
 		if (analyze_in_stages)
 		{
 			int			stage;
 
 			for (stage = 0; stage < ANALYZE_NUM_STAGES; stage++)
 			{
-				vacuum_one_database(dbname, &vacopts,
+				vacuum_one_database(&cparams, &vacopts,
 									stage,
 									&tables,
-									host, port, username, prompt_password,
 									concurrentCons,
 									progname, echo, quiet);
 			}
 		}
 		else
-			vacuum_one_database(dbname, &vacopts,
+			vacuum_one_database(&cparams, &vacopts,
 								ANALYZE_NO_STAGE,
 								&tables,
-								host, port, username, prompt_password,
 								concurrentCons,
 								progname, echo, quiet);
 	}
@@ -366,11 +375,10 @@ main(int argc, char *argv[])
  * a list of tables from the database.
  */
 static void
-vacuum_one_database(const char *dbname, vacuumingOptions *vacopts,
+vacuum_one_database(const ConnParams *cparams,
+					vacuumingOptions *vacopts,
 					int stage,
 					SimpleStringList *tables,
-					const char *host, const char *port,
-					const char *username, enum trivalue prompt_password,
 					int concurrentCons,
 					const char *progname, bool echo, bool quiet)
 {
@@ -384,6 +392,8 @@ vacuum_one_database(const char *dbname, vacuumingOptions *vacopts,
 	SimpleStringList dbtables = {NULL, NULL};
 	int			i;
 	int			ntups;
+	int			processedTables;
+	int			tablesPerConn;
 	bool		failed = false;
 	bool		parallel = concurrentCons > 1;
 	bool		tables_listed = false;
@@ -402,8 +412,7 @@ vacuum_one_database(const char *dbname, vacuumingOptions *vacopts,
 	Assert(stage == ANALYZE_NO_STAGE ||
 		   (stage >= 0 && stage < ANALYZE_NUM_STAGES));
 
-	conn = connectDatabase(dbname, host, port, username, prompt_password,
-						   progname, echo, false, true);
+	conn = connectDatabase(cparams, progname, echo, false, true);
 
 	if (vacopts->disable_page_skipping && PQserverVersion(conn) < 90600)
 	{
@@ -434,6 +443,12 @@ vacuum_one_database(const char *dbname, vacuumingOptions *vacopts,
 					 "--min-mxid-age", "9.6");
 		exit(1);
 	}
+
+	/*
+	 * skip_database_stats is used automatically if server supports it.
+	 * GPDB: This option was backported from PG16 to GPDB7 (PG12)
+	 */
+	vacopts->skip_database_stats = (PQserverVersion(conn) >= 120000);
 
 	if (!quiet)
 	{
@@ -630,8 +645,19 @@ vacuum_one_database(const char *dbname, vacuumingOptions *vacopts,
 	{
 		for (i = 1; i < concurrentCons; i++)
 		{
-			conn = connectDatabase(dbname, host, port, username, prompt_password,
-								   progname, echo, false, true);
+			conn = connectDatabase(cparams, progname, echo, false, true);
+
+			/*
+			 * Fail and exit immediately if trying to use a socket in an
+			 * unsupported range.  POSIX requires open(2) to use the lowest
+			 * unused file descriptor and the hint given relies on that.
+			 */
+			if (PQsocket(conn) >= FD_SETSIZE)
+			{
+				pg_log_fatal("too many jobs for this platform -- try %d", i);
+				exit(1);
+			}
+
 			init_slot(slots + i, conn);
 		}
 
@@ -654,11 +680,34 @@ vacuum_one_database(const char *dbname, vacuumingOptions *vacopts,
 
 	initPQExpBuffer(&sql);
 
+	/*
+	 * GPDB: Prepare and execute a database wide VACUUM to save on dispatch
+	 * overhead. We use the only connection slot we have, which we know to be free.
+	 * In this mode, the program terminates in case of an error.
+	 */
+	if (!(parallel || tables_listed))
+	{
+
+		prepare_vacuum_command(&sql, PQserverVersion(slots->connection),
+								vacopts, NULL);
+		finalize_vacuum_command(&sql);
+		run_vacuum_command(slots->connection, sql.data,
+								echo, NULL, progname, parallel);
+		return;
+	}
+
+	/*
+	 * GPDB: Prepare and execute a VACUUM command with a table list.
+	 * The table list is divided evenly across concurrentCons.
+	 */
+	processedTables = 0;
+	tablesPerConn = ntups / concurrentCons;
 	cell = dbtables.head;
 	do
 	{
 		const char *tabname = cell->val;
 		ParallelSlot *free_slot;
+		bool cmdBegin = (processedTables == 0);
 
 		if (CancelRequested)
 		{
@@ -667,39 +716,55 @@ vacuum_one_database(const char *dbname, vacuumingOptions *vacopts,
 		}
 
 		/*
+		 * GPDB: Prepare the VACUUM command. If it's not a new command, append
+		 * the table to the query string.
+		 *
 		 * Get the connection slot to use.  If in parallel mode, here we wait
 		 * for one connection to become available if none already is.  In
 		 * non-parallel mode we simply use the only slot we have, which we
 		 * know to be free.
 		 */
-		if (parallel)
+		if (cmdBegin)
 		{
-			/*
-			 * Get a free slot, waiting until one becomes free if none
-			 * currently is.
-			 */
-			free_slot = GetIdleSlot(slots, concurrentCons, progname);
-			if (!free_slot)
+			if (parallel)
 			{
-				failed = true;
-				goto finish;
+				/*
+				* Get a free slot, waiting until one becomes free if none
+				* currently is.
+				*/
+				free_slot = GetIdleSlot(slots, concurrentCons, progname);
+				if (!free_slot)
+				{
+					failed = true;
+					goto finish;
+				}
+				free_slot->isFree = false;
 			}
+			else
+				free_slot = slots;
 
-			free_slot->isFree = false;
+			prepare_vacuum_command(&sql, PQserverVersion(free_slot->connection),
+									vacopts, tabname);
 		}
 		else
-			free_slot = slots;
+			append_to_vacuum_command(&sql, tabname);
 
-		prepare_vacuum_command(&sql, PQserverVersion(free_slot->connection),
-							   vacopts, tabname);
 
 		/*
-		 * Execute the vacuum.  If not in parallel mode, this terminates the
+		 * GPDB: When tablesPerConn tables have been processed or we are
+		 * at the end of the table list, execute the VACUUM.
+		 *
+		 * If not in parallel mode, this terminates the
 		 * program in case of an error.  (The parallel case handles query
 		 * errors in ProcessQueryResult through GetIdleSlot.)
 		 */
-		run_vacuum_command(free_slot->connection, sql.data,
-						   echo, tabname, progname, parallel);
+		if ((++processedTables == tablesPerConn) || (cell->next == NULL))
+		{
+			finalize_vacuum_command(&sql);
+			run_vacuum_command(free_slot->connection, sql.data,
+									echo, tabname, progname, parallel);
+			processedTables = 0;
+		}
 
 		cell = cell->next;
 	} while (cell != NULL);
@@ -717,6 +782,15 @@ vacuum_one_database(const char *dbname, vacuumingOptions *vacopts,
 				goto finish;
 			}
 		}
+	}
+
+	/* If we used SKIP_DATABASE_STATS, mop up with ONLY_DATABASE_STATS */
+	if (vacopts->skip_database_stats && stage == ANALYZE_NO_STAGE)
+	{
+		resetPQExpBuffer(&sql);
+		appendPQExpBufferStr(&sql, "VACUUM (ONLY_DATABASE_STATS)");
+		finalize_vacuum_command(&sql);
+		run_vacuum_command(slots->connection, sql.data, echo, NULL, progname, false);
 	}
 
 finish:
@@ -738,28 +812,23 @@ finish:
  * quickly everywhere before generating more detailed ones.
  */
 static void
-vacuum_all_databases(vacuumingOptions *vacopts,
+vacuum_all_databases(ConnParams *cparams,
+					 vacuumingOptions *vacopts,
 					 bool analyze_in_stages,
-					 const char *maintenance_db, const char *host,
-					 const char *port, const char *username,
-					 enum trivalue prompt_password,
 					 int concurrentCons,
 					 const char *progname, bool echo, bool quiet)
 {
 	PGconn	   *conn;
 	PGresult   *result;
-	PQExpBufferData connstr;
 	int			stage;
 	int			i;
 
-	conn = connectMaintenanceDatabase(maintenance_db, host, port, username,
-									  prompt_password, progname, echo);
+	conn = connectMaintenanceDatabase(cparams, progname, echo);
 	result = executeQuery(conn,
 						  "SELECT datname FROM pg_database WHERE datallowconn ORDER BY 1;",
 						  progname, echo);
 	PQfinish(conn);
 
-	initPQExpBuffer(&connstr);
 	if (analyze_in_stages)
 	{
 		/*
@@ -774,14 +843,11 @@ vacuum_all_databases(vacuumingOptions *vacopts,
 		{
 			for (i = 0; i < PQntuples(result); i++)
 			{
-				resetPQExpBuffer(&connstr);
-				appendPQExpBuffer(&connstr, "dbname=");
-				appendConnStrVal(&connstr, PQgetvalue(result, i, 0));
+				cparams->override_dbname = PQgetvalue(result, i, 0);
 
-				vacuum_one_database(connstr.data, vacopts,
+				vacuum_one_database(cparams, vacopts,
 									stage,
 									NULL,
-									host, port, username, prompt_password,
 									concurrentCons,
 									progname, echo, quiet);
 			}
@@ -791,19 +857,15 @@ vacuum_all_databases(vacuumingOptions *vacopts,
 	{
 		for (i = 0; i < PQntuples(result); i++)
 		{
-			resetPQExpBuffer(&connstr);
-			appendPQExpBuffer(&connstr, "dbname=");
-			appendConnStrVal(&connstr, PQgetvalue(result, i, 0));
+			cparams->override_dbname = PQgetvalue(result, i, 0);
 
-			vacuum_one_database(connstr.data, vacopts,
+			vacuum_one_database(cparams, vacopts,
 								ANALYZE_NO_STAGE,
 								NULL,
-								host, port, username, prompt_password,
 								concurrentCons,
 								progname, echo, quiet);
 		}
 	}
-	termPQExpBuffer(&connstr);
 
 	PQclear(result);
 }
@@ -812,8 +874,8 @@ vacuum_all_databases(vacuumingOptions *vacopts,
  * Construct a vacuum/analyze command to run based on the given options, in the
  * given string buffer, which may contain previous garbage.
  *
- * The table name used must be already properly quoted.  The command generated
- * depends on the server version involved and it is semicolon-terminated.
+ * The table name used must be already properly quoted. The command generated
+ * depends on the server version involved.
  */
 static void
 prepare_vacuum_command(PQExpBuffer sql, int serverVersion,
@@ -867,6 +929,13 @@ prepare_vacuum_command(PQExpBuffer sql, int serverVersion,
 				appendPQExpBuffer(sql, "%sDISABLE_PAGE_SKIPPING", sep);
 				sep = comma;
 			}
+			if (vacopts->skip_database_stats)
+			{
+				/* GPDB: SKIP_DATABASE_STATS is supported since GP7 (PG12) */
+				Assert(serverVersion >= 120000);
+				appendPQExpBuffer(sql, "%sSKIP_DATABASE_STATS", sep);
+				sep = comma;
+			}
 			if (vacopts->skip_locked)
 			{
 				/* SKIP_LOCKED is supported since v12 */
@@ -910,7 +979,27 @@ prepare_vacuum_command(PQExpBuffer sql, int serverVersion,
 		}
 	}
 
-	appendPQExpBuffer(sql, " %s;", table);
+	if (table)
+		appendPQExpBuffer(sql, " %s", table);
+}
+
+/*
+ * GPDB: append table to the vacuum command
+ */
+static void
+append_to_vacuum_command(PQExpBuffer sql, const char *table)
+{
+	if (table)
+		appendPQExpBuffer(sql, ", %s", table);
+}
+
+/*
+ * GPDB: semicolon-terminate the vacuum command
+ */
+static void
+finalize_vacuum_command(PQExpBuffer sql)
+{
+	appendPQExpBufferChar(sql, ';');
 }
 
 /*

@@ -19,8 +19,6 @@
 
 using namespace gpopt;
 
-FORCE_GENERATE_DBGSTR(CColRefSet);
-
 //---------------------------------------------------------------------------
 //	@function:
 //		CColRefSet::CColRefSet
@@ -87,7 +85,6 @@ CColRefSet::FMember(const CColRef *colref) const
 {
 	return CBitSet::Get(colref->Id());
 }
-
 
 //---------------------------------------------------------------------------
 //	@function:
@@ -291,6 +288,29 @@ CColRefSet::Pdrgpcr(CMemoryPool *mp) const
 	}
 
 	return colref_array;
+}
+
+
+//---------------------------------------------------------------------------
+//	@function:
+//		CColRefSet::Phmicr
+//
+//	@doc:
+//		Convert set into map
+//
+//---------------------------------------------------------------------------
+IntToColRefMap *
+CColRefSet::Phmicr(CMemoryPool *mp) const
+{
+	IntToColRefMap *phmicr = GPOS_NEW(mp) IntToColRefMap(mp);
+
+	CColRefSetIter crsi(*this);
+	while (crsi.Advance())
+	{
+		phmicr->Insert(GPOS_NEW(mp) INT(crsi.Pcr()->Id()), crsi.Pcr());
+	}
+
+	return phmicr;
 }
 
 

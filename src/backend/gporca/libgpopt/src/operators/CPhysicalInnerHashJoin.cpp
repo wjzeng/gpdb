@@ -16,6 +16,8 @@
 #include "gpopt/base/CDistributionSpecHashed.h"
 #include "gpopt/base/CUtils.h"
 #include "gpopt/operators/CExpressionHandle.h"
+#include "gpopt/operators/CPredicateUtils.h"
+#include "gpopt/operators/CScalarCmp.h"
 
 using namespace gpopt;
 
@@ -30,9 +32,10 @@ using namespace gpopt;
 //---------------------------------------------------------------------------
 CPhysicalInnerHashJoin::CPhysicalInnerHashJoin(
 	CMemoryPool *mp, CExpressionArray *pdrgpexprOuterKeys,
-	CExpressionArray *pdrgpexprInnerKeys, IMdIdArray *hash_opfamilies)
+	CExpressionArray *pdrgpexprInnerKeys, IMdIdArray *hash_opfamilies,
+	BOOL is_null_aware, CXform::EXformId origin_xform)
 	: CPhysicalHashJoin(mp, pdrgpexprOuterKeys, pdrgpexprInnerKeys,
-						hash_opfamilies)
+						hash_opfamilies, is_null_aware, origin_xform)
 {
 }
 
@@ -94,7 +97,7 @@ CPhysicalInnerHashJoin::PdshashedCreateMatching(
 //
 //	@doc:
 //		Derive hash join distribution from hashed children;
-//		return NULL if derivation failed
+//		return nullptr if derivation failed
 //
 //---------------------------------------------------------------------------
 CDistributionSpec *
@@ -173,7 +176,7 @@ CPhysicalInnerHashJoin::PdsDeriveFromReplicatedOuter(
 //
 //	@doc:
 //		Derive hash join distribution from a hashed outer child;
-//		return NULL if derivation failed
+//		return nullptr if derivation failed
 //
 //---------------------------------------------------------------------------
 CDistributionSpec *
@@ -256,5 +259,23 @@ CPhysicalInnerHashJoin::PdsDerive(CMemoryPool *mp,
 	return pdsOuter;
 }
 
+CPartitionPropagationSpec *
+CPhysicalInnerHashJoin::PppsRequired(CMemoryPool *mp,
+									 CExpressionHandle &exprhdl,
+									 CPartitionPropagationSpec *pppsRequired,
+									 ULONG child_index,
+									 CDrvdPropArray *pdrgpdpCtxt,
+									 ULONG ulOptReq) const
+{
+	return PppsRequiredForJoins(mp, exprhdl, pppsRequired, child_index,
+								pdrgpdpCtxt, ulOptReq);
+}
+
+CPartitionPropagationSpec *
+CPhysicalInnerHashJoin::PppsDerive(CMemoryPool *mp,
+								   CExpressionHandle &exprhdl) const
+{
+	return PppsDeriveForJoins(mp, exprhdl);
+}
 
 // EOF

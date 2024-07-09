@@ -40,6 +40,7 @@
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "port/atomics.h"
+#include "port/pg_bitutils.h"
 #include "utils/dynahash.h"
 #include "utils/memutils.h"
 #include "utils/lsyscache.h"
@@ -95,6 +96,7 @@ static bool ExecParallelHashTuplePrealloc(HashJoinTable hashtable,
 static void ExecParallelHashMergeCounters(HashJoinTable hashtable);
 static void ExecParallelHashCloseBatchAccessors(HashJoinTable hashtable);
 
+static inline void ResetWorkFileSetStatsInfo(HashJoinTable hashtable);
 
 /* ----------------------------------------------------------------
  *		ExecHash
@@ -174,18 +176,19 @@ MultiExecPrivateHash(HashState *node)
 	SIMPLE_FAULT_INJECTOR("multi_exec_hash_large_vmem");
 
 	/*
-	 * get all inner tuples and insert into the hash table (or temp files)
+	 * Get all tuples from the node below the Hash node and insert into the
+	 * hash table (or temp files).
 	 */
 	for (;;)
 	{
+		bool hashkeys_null = false;
+
 		slot = ExecProcNode(outerNode);
 		if (TupIsNull(slot))
 			break;
 
 		/* We have to compute the hash value */
-		econtext->ecxt_innertuple = slot;
-		bool hashkeys_null = false;
-
+		econtext->ecxt_outertuple = slot;
 		if (ExecHashGetHashValue(node, hashtable, econtext, hashkeys,
 								 false, hashtable->keepNulls,
 								 &hashvalue, &hashkeys_null))
@@ -316,7 +319,7 @@ MultiExecParallelHash(HashState *node)
 				slot = ExecProcNode(outerNode);
 				if (TupIsNull(slot))
 					break;
-				econtext->ecxt_innertuple = slot;
+				econtext->ecxt_outertuple = slot;
 				if (ExecHashGetHashValue(node, hashtable, econtext, hashkeys,
 										 false, hashtable->keepNulls,
 										 &hashvalue, &hashkeys_null))
@@ -423,8 +426,9 @@ ExecInitHash(Hash *node, EState *estate, int eflags)
 	/*
 	 * initialize child expressions
 	 */
-	hashstate->ps.qual =
-		ExecInitQual(node->plan.qual, (PlanState *) hashstate);
+	Assert(node->plan.qual == NIL);
+	hashstate->hashkeys =
+		ExecInitExprList(node->hashkeys, (PlanState *) hashstate);
 
 	return hashstate;
 }
@@ -554,6 +558,8 @@ ExecHashTableCreate(HashState *state, HashJoinState *hjstate,
 	hashtable->parallel_state = state->parallel_state;
 	hashtable->area = state->ps.state->es_query_dsa;
 	hashtable->batches = NULL;
+
+	ResetWorkFileSetStatsInfo(hashtable);
 
 #ifdef HJDEBUG
 	printf("Hashjoin %p: initial nbatch = %d, nbuckets = %d\n",
@@ -982,11 +988,8 @@ ExecHashTableDestroy(HashState *hashState, HashJoinTable hashtable)
 	Assert(!hashtable->eagerlyReleased);
 
 	/*
-	 * Make sure all the temp files are closed.  We skip batch 0, since it
-	 * can't have any temp files (and the arrays might not even exist if
-	 * nbatch is only 1).  Parallel hash joins don't use these files.
-	 *
-	 * GPDB_12_MERGE_FIXME: In GPDB, we don't skip batch 0. Why?
+	 * Make sure all the temp files are closed.
+	 * GPDB supports rescan of hashjoin, the batch0 can still have temp files.
 	 */
 	if (hashtable->innerBatchFile != NULL)
 	{
@@ -1954,9 +1957,13 @@ ExecParallelHashTableInsertCurrentBatch(HashJoinTable hashtable,
  * ExecHashGetHashValue
  *		Compute the hash value for a tuple
  *
- * The tuple to be tested must be in either econtext->ecxt_outertuple or
- * econtext->ecxt_innertuple.  Vars in the hashkeys expressions should have
- * varno either OUTER_VAR or INNER_VAR.
+ * The tuple to be tested must be in econtext->ecxt_outertuple (thus Vars in
+ * the hashkeys expressions need to have OUTER_VAR as varno). If outer_tuple
+ * is false (meaning it's the HashJoin's inner node, Hash), econtext,
+ * hashkeys, and slot need to be from Hash, with hashkeys/slot referencing and
+ * being suitable for tuples from the node below the Hash. Conversely, if
+ * outer_tuple is true, econtext is from HashJoin, and hashkeys/slot need to
+ * be appropriate for tuples from HashJoin's outer node.
  *
  * A true result means the tuple's hash value has been successfully computed
  * and stored at *hashvalue.  A false result means the tuple cannot match
@@ -2064,7 +2071,7 @@ ExecHashGetHashValue(HashState *hashState, HashJoinTable hashtable,
  * chains), and must only cause the batch number to remain the same or
  * increase.  Our algorithm is
  *		bucketno = hashvalue MOD nbuckets
- *		batchno = (hashvalue DIV nbuckets) MOD nbatch
+ *		batchno = ROR(hashvalue, log2_nbuckets) MOD nbatch
  * where nbuckets and nbatch are both expected to be powers of 2, so we can
  * do the computations by shifting and masking.  (This assumes that all hash
  * functions are good about randomizing all their output bits, else we are
@@ -2076,7 +2083,11 @@ ExecHashGetHashValue(HashState *hashState, HashJoinTable hashtable,
  * number the way we do here).
  *
  * nbatch is always a power of 2; we increase it only by doubling it.  This
- * effectively adds one more bit to the top of the batchno.
+ * effectively adds one more bit to the top of the batchno.  In very large
+ * joins, we might run out of bits to add, so we do this by rotating the hash
+ * value.  This causes batchno to steal bits from bucketno when the number of
+ * virtual buckets exceeds 2^32.  It's better to have longer bucket chains
+ * than to lose the ability to divide batches.
  */
 void
 ExecHashGetBucketAndBatch(HashJoinTable hashtable,
@@ -2089,9 +2100,9 @@ ExecHashGetBucketAndBatch(HashJoinTable hashtable,
 
 	if (nbatch > 1)
 	{
-		/* we can do MOD by masking, DIV by shifting */
 		*bucketno = hashvalue & (nbuckets - 1);
-		*batchno = (hashvalue >> hashtable->log2_nbuckets) & (nbatch - 1);
+		*batchno = pg_rotate_right32(hashvalue,
+									 hashtable->log2_nbuckets) & (nbatch - 1);
 	}
 	else
 	{
@@ -2114,7 +2125,12 @@ bool
 ExecScanHashBucket(HashState *hashState, HashJoinState *hjstate,
 				   ExprContext *econtext)
 {
-	ExprState  *hjclauses = hjstate->hashclauses;
+	/*
+	 * Greenplum specific behavior.
+	 * Using hashqualclauses to support hash join on 'IS NOT DISTINCT FROM'
+	 * as well as '='.
+	 */
+	ExprState  *hjclauses = hjstate->hashqualclauses;
 	HashJoinTable hashtable = hjstate->hj_HashTable;
 	HashJoinTuple hashTuple = hjstate->hj_CurTuple;
 	uint32		hashvalue = hjstate->hj_CurHashValue;
@@ -2175,7 +2191,12 @@ bool
 ExecParallelScanHashBucket(HashState *hashState, HashJoinState *hjstate,
 						   ExprContext *econtext)
 {
-	ExprState  *hjclauses = hjstate->hashclauses;
+	/*
+	 * Greenplum specific behavior.
+	 * Using hashqualclauses to support hash join on 'IS NOT DISTINCT FROM'
+	 * as well as '='.
+	 */
+	ExprState  *hjclauses = hjstate->hashqualclauses;
 	HashJoinTable hashtable = hjstate->hj_HashTable;
 	HashJoinTuple hashTuple = hjstate->hj_CurTuple;
 	uint32		hashvalue = hjstate->hj_CurHashValue;
@@ -2504,6 +2525,16 @@ ExecHashTableExplainEnd(PlanState *planstate, struct StringInfoData *buf)
 				hashtable->nbatch_outstart,
 				hashtable->nbatch,
 				"Secondary Overflow");
+
+		appendStringInfo(buf,
+						 "Work file set: %u files (%u compressed), "
+						 "avg file size %lu, "
+						 "compression buffer size %lu bytes \n",
+						 hashtable->workset_num_files,
+						 hashtable->workset_num_files_compressed,
+						 hashtable->workset_avg_file_size,
+						 hashtable->workset_compression_buf_total);
+		ResetWorkFileSetStatsInfo(hashtable);
     }
 
     /* Report hash chain statistics. */
@@ -2674,76 +2705,88 @@ ExecHashTableExplainBatchEnd(HashState *hashState, HashJoinTable hashtable)
     /* Final size of hash table for this batch */
     batchstats->hashspace_final = hashtable->spaceUsed;
 
-    /* Collect workfile I/O statistics. */
-	/* GPDB_12_MERGE_FIXME: broken */
-#if 0
-    if (hashtable->nbatch > 1)
+    /* Collect buffile I/O statistics. */
+    /* Parallel hash join uses shared tuplestores, don't consider it now. */
+    if (hashtable->parallel_state == NULL)
     {
-        uint64      owrbytes = 0;
-        uint64      iwrbytes = 0;
-
-        Assert(stats->batchstats &&
-               hashtable->nbatch <= stats->nbatchstats);
-
-        /* How much was read from inner workfile for current batch? */
-        batchstats->irdbytes = batchstats->innerfilesize;
-
-        /* How much was read from outer workfiles for current batch? */
-		if (hashtable->outerBatchFile &&
-			hashtable->outerBatchFile[curbatch] != NULL)
+		if (hashtable->nbatch > 1)
 		{
-			batchstats->ordbytes = BufFileSize(hashtable->outerBatchFile[curbatch]);
-		}
+			uint64      owrbytes = 0;
+			uint64      iwrbytes = 0;
 
-		/*
-		 * How much was written to workfiles for the remaining batches?
-		 */
-		for (i = curbatch + 1; i < hashtable->nbatch; i++)
-		{
-			HashJoinBatchStats *bs = &stats->batchstats[i];
-			uint64              filebytes = 0;
+			Assert(stats->batchstats &&
+					hashtable->nbatch <= stats->nbatchstats);
 
+			/* for curbatch=0, the inner tuple is in the in-memory hash table, the outer tuple is
+			 * read from outer relation, nothing need to read from batch file, but the innerfilesize
+			 * is initialized to 0 and the outerBatchFile[0] is initialized to NULL.
+			 * for curbatch>0, the inner tuple and outer tuple are read from batch file.
+			 */
+
+			/* How much was read from inner buffile for current batch? */
+			batchstats->irdbytes = batchstats->innerfilesize;
+
+			/* How much was read from outer buffiles for current batch? */
 			if (hashtable->outerBatchFile &&
-				hashtable->outerBatchFile[i] != NULL)
+					hashtable->outerBatchFile[curbatch] != NULL)
 			{
-				filebytes = BufFileGetSize(hashtable->outerBatchFile[i]);
+				batchstats->ordbytes = BufFileGetSize(hashtable->outerBatchFile[curbatch]);
 			}
 
-			Assert(filebytes >= bs->outerfilesize);
-			owrbytes += filebytes - bs->outerfilesize;
-			bs->outerfilesize = filebytes;
+			/* for curbatch=0, the tuple which is not belong to the batch 0 is put into the temp
+			 * file for later batches.
+			 * for curbatch>0, It's possible that we increase the number, so that by the time we
+			 * reload curbatch file, some of the tuples we wrote here will logically belong to a later
+			 * file, they may be sent to future batches, so we count the increasing size here.
+			 */
 
-			filebytes = 0;
-
-			if (hashtable->innerBatchFile &&
-				hashtable->innerBatchFile[i])
+			/* How much was written to buffiles for the remaining batches? */
+			for (int i = curbatch + 1; i < hashtable->nbatch; i++)
 			{
-				filebytes = BufFileGetSize(hashtable->innerBatchFile[i]);
+				HashJoinBatchStats *bs = &stats->batchstats[i];
+				uint64              filebytes = 0;
+
+				if (hashtable->outerBatchFile &&
+						hashtable->outerBatchFile[i] != NULL)
+				{
+					filebytes = BufFileGetSize(hashtable->outerBatchFile[i]);
+				}
+
+				Assert(filebytes >= bs->outerfilesize);
+				owrbytes += filebytes - bs->outerfilesize;
+				bs->outerfilesize = filebytes;
+
+				filebytes = 0;
+
+				if (hashtable->innerBatchFile &&
+						hashtable->innerBatchFile[i])
+				{
+					filebytes = BufFileGetSize(hashtable->innerBatchFile[i]);
+				}
+
+				Assert(filebytes >= bs->innerfilesize);
+				iwrbytes += filebytes - bs->innerfilesize;
+				bs->innerfilesize = filebytes;
 			}
+			batchstats->owrbytes = owrbytes;
+			batchstats->iwrbytes = iwrbytes;
+		}                           /* give buffile I/O statistics */
 
-			Assert(filebytes >= bs->innerfilesize);
-			iwrbytes += filebytes - bs->innerfilesize;
-			bs->innerfilesize = filebytes;
-		}
-		batchstats->owrbytes = owrbytes;
-		batchstats->iwrbytes = iwrbytes;
-    }                           /* give workfile I/O statistics */
-
-	/* Collect hash chain statistics. */
-	stats->nonemptybatches++;
-	for (i = 0; i < hashtable->nbuckets; i++)
-	{
-		HashJoinTuple   hashtuple = hashtable->buckets[i];
-		int             chainlength;
-
-		if (hashtuple)
+		/* Collect hash chain statistics. */
+		stats->nonemptybatches++;
+		for (int i = 0; i < hashtable->nbuckets; i++)
 		{
-			for (chainlength = 0; hashtuple; hashtuple = hashtuple->next)
-				chainlength++;
-			cdbexplain_agg_upd(&stats->chainlength, chainlength, i);
+			HashJoinTuple   hashtuple = hashtable->buckets.unshared[i];
+			int             chainlength;
+
+			if (hashtuple)
+			{
+				for (chainlength = 0; hashtuple; hashtuple = hashtuple->next.unshared)
+					chainlength++;
+				cdbexplain_agg_upd(&stats->chainlength, chainlength, i);
+			}
 		}
-	}
-#endif
+    }
 }                               /* ExecHashTableExplainBatchEnd */
 
 
@@ -3888,4 +3931,12 @@ ExecParallelHashTuplePrealloc(HashJoinTable hashtable, int batchno, size_t size)
 	LWLockRelease(&pstate->lock);
 
 	return true;
+}
+
+static inline void ResetWorkFileSetStatsInfo(HashJoinTable hashtable)
+{
+	hashtable->workset_num_files = 0;
+	hashtable->workset_num_files_compressed = 0;
+	hashtable->workset_avg_file_size = 0;
+	hashtable->workset_compression_buf_total = 0;
 }

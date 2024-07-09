@@ -21,6 +21,7 @@
 #include "gpopt/mdcache/CMDAccessor.h"
 #include "gpopt/metadata/CTableDescriptor.h"
 #include "gpopt/operators/CLogicalDML.h"
+#include "gpopt/operators/CPhysicalHashJoin.h"
 #include "gpopt/operators/CPhysicalScan.h"
 #include "gpopt/operators/CScalarArrayRefIndexList.h"
 #include "gpopt/operators/CScalarBoolOp.h"
@@ -56,9 +57,9 @@ using namespace gpdxl;
 using namespace gpnaucrates;
 
 // hash map mapping CColRef -> CDXLNode
-typedef CHashMap<CColRef, CDXLNode, CColRef::HashValue, CColRef::Equals,
-				 CleanupNULL<CColRef>, CleanupRelease<CDXLNode> >
-	ColRefToDXLNodeMap;
+using ColRefToDXLNodeMap =
+	CHashMap<CColRef, CDXLNode, CColRef::HashValue, CColRef::Equals,
+			 CleanupNULL<CColRef>, CleanupRelease<CDXLNode>>;
 
 //---------------------------------------------------------------------------
 //	@class:
@@ -97,8 +98,8 @@ private:
 	// segment ids on target system
 	IntPtrArray *m_pdrgpiSegments;
 
-	// id of master node
-	INT m_iMasterId;
+	// id of coordinator node
+	INT m_iCoordinatorId;
 
 	// private copy ctor
 	CTranslatorExprToDXL(const CTranslatorExprToDXL &);
@@ -168,12 +169,6 @@ private:
 								   CDistributionSpecArray *pdrgpdsBaseTables,
 								   CExpression *pexprScalar,
 								   CDXLPhysicalProperties *dxl_properties);
-
-	// translate a partition selector into DXL while inlining the given condition in the child
-	CDXLNode *PdxlnPartitionSelectorWithInlinedCondition(
-		CExpression *pexprFilter, CColRefArray *colref_array,
-		CDistributionSpecArray *pdrgpdsBaseTables, ULONG *pulNonGatherMotions,
-		BOOL *pfDML);
 
 	// create a DXL result node from an optimizer filter node
 	CDXLNode *PdxlnResultFromFilter(CExpression *pexprFilter,
@@ -337,6 +332,19 @@ private:
 		CDistributionSpecArray *pdrgpdsBaseTables, ULONG *pulNonGatherMotions,
 		BOOL *pfDML);
 
+	// translate a dynamic foreign scan
+	CDXLNode *PdxlnDynamicForeignScan(CExpression *pexprDFS,
+									  CColRefArray *colref_array,
+									  CDistributionSpecArray *pdrgpdsBaseTables,
+									  ULONG *pulNonGatherMotions, BOOL *pfDML);
+
+	// translate a dynamic foreign scan with a scalar condition
+	CDXLNode *PdxlnDynamicForeignScan(CExpression *pexprDFS,
+									  CColRefArray *colref_array,
+									  CDistributionSpecArray *pdrgpdsBaseTables,
+									  CExpression *pexprScalarCond,
+									  CDXLPhysicalProperties *dxl_properties);
+
 	// Construct a table descr for a child partition
 	CTableDescriptor *MakeTableDescForPart(const IMDRelation *part,
 										   CTableDescriptor *root_table_desc);
@@ -352,17 +360,29 @@ private:
 		CDistributionSpecArray *pdrgpdsBaseTables, CExpression *pexprScalar,
 		CDXLPhysicalProperties *dxl_properties);
 
-	// translate a dynamic index scan based on passed properties
+	// translate a dynamic [only] index scan based on passed properties
 	CDXLNode *PdxlnDynamicIndexScan(CExpression *pexprDIS,
 									CColRefArray *colref_array,
 									CDXLPhysicalProperties *dxl_properties,
-									CReqdPropPlan *prpp);
+									CReqdPropPlan *prpp, BOOL indexOnly);
 
 	// translate a dynamic index scan
 	CDXLNode *PdxlnDynamicIndexScan(CExpression *pexprDIS,
 									CColRefArray *colref_array,
 									CDistributionSpecArray *pdrgpdsBaseTables,
 									ULONG *pulNonGatherMotions, BOOL *pfDML);
+
+	// translate a dynamic index scan based on passed properties
+	CDXLNode *PdxlnDynamicIndexOnlyScan(CExpression *pexprDIS,
+										CColRefArray *colref_array,
+										CDXLPhysicalProperties *dxl_properties,
+										CReqdPropPlan *prpp);
+
+	// translate a dynamic index scan
+	CDXLNode *PdxlnDynamicIndexOnlyScan(
+		CExpression *pexprDIS, CColRefArray *colref_array,
+		CDistributionSpecArray *pdrgpdsBaseTables, ULONG *pulNonGatherMotions,
+		BOOL *pfDML);
 
 	// translate a const table get into a result node
 	CDXLNode *PdxlnResultFromConstTableGet(
@@ -392,91 +412,6 @@ private:
 									 CDistributionSpecArray *pdrgpdsBaseTables,
 									 ULONG *pulNonGatherMotions, BOOL *pfDML);
 
-	// translate a partition selector
-	CDXLNode *PdxlnPartitionSelector(CExpression *pexpr,
-									 CColRefArray *colref_array,
-									 CDistributionSpecArray *pdrgpdsBaseTables,
-									 ULONG *pulNonGatherMotions, BOOL *pfDML,
-									 CExpression *pexprScalarCond,
-									 CDXLPhysicalProperties *dxl_properties);
-
-	// translate a DML partition selector
-	CDXLNode *PdxlnPartitionSelectorDML(
-		CExpression *pexpr, CColRefArray *pdrgpc,
-		CDistributionSpecArray *pdrgpdsBaseTables, ULONG *pulNonGatherMotions,
-		BOOL *pfDMLr);
-
-	// translate an expansion-based partition selector with a scalar condition to inline
-	CDXLNode *PdxlnPartitionSelectorExpand(
-		CExpression *pexpr, CColRefArray *colref_array,
-		CDistributionSpecArray *pdrgpdsBaseTables, ULONG *pulNonGatherMotions,
-		BOOL *pfDML, CExpression *pexprScalarCond,
-		CDXLPhysicalProperties *dxl_properties);
-
-	// translate partition filter list
-	CDXLNode *PdxlnPartFilterList(CExpression *pexpr, BOOL fEqFilters);
-
-	// check whether the given partition selector only has equality filters
-	// or no filters on all partitioning levels. return false if it has
-	// non-equality filters.
-	BOOL FEqPartFiltersAllLevels(CExpression *pexpr, BOOL fCheckGeneralFilters);
-
-	// translate partition selector filters
-	void TranslatePartitionFilters(CExpression *pexprPartSelector,
-								   BOOL fPassThrough,
-								   CDXLNode **ppdxlnEqFilters,
-								   CDXLNode **ppdxlnFilters,
-								   CDXLNode **ppdxlnResidual);
-
-	// construct the level filter lists for partition selector
-	void ConstructLevelFilters4PartitionSelector(CExpression *pexprPartSelector,
-												 CDXLNode **ppdxlnEqFilters,
-												 CDXLNode **ppdxlnFilters);
-
-	// translate a general predicate on a part key and update the various
-	// comparison type flags accordingly
-	CDXLNode *PdxlnPredOnPartKey(CExpression *pexprPred, CColRef *pcrPartKey,
-								 IMDId *pmdidTypePartKey, ULONG ulPartLevel,
-								 BOOL fRangePart, BOOL *pfLTComparison,
-								 BOOL *pfGTComparison, BOOL *pfEQComparison);
-
-	// translate a conjunctive or disjunctive predicate on a part key and update the various
-	// comparison type flags accordingly
-	CDXLNode *PdxlnConjDisjOnPartKey(CExpression *pexprPred,
-									 CColRef *pcrPartKey,
-									 IMDId *pmdidTypePartKey, ULONG ulPartLevel,
-									 BOOL fRangePart, BOOL *pfLTComparison,
-									 BOOL *pfGTComparison,
-									 BOOL *pfEQComparison);
-
-	// translate a scalar comparison on a part key and update the various
-	// comparison type flags accordingly
-	CDXLNode *PdxlnScCmpPartKey(CExpression *pexprScCmp, CColRef *pcrPartKey,
-								IMDId *pmdidTypePartKey, ULONG ulPartLevel,
-								BOOL fRangePart, BOOL *pfLTComparison,
-								BOOL *pfGTComparison, BOOL *pfEQComparison);
-
-	// translate a scalar null test on a part key
-	CDXLNode *PdxlnScNullTestPartKey(IMDId *pmdidTypePartKey, ULONG ulPartLevel,
-									 BOOL fRangePart, BOOL is_null);
-
-	// translate the child of a partition selector expression, pushing the given
-	// scalar predicate if available
-	CDXLNode *PdxlnPartitionSelectorChild(
-		CExpression *pexprChild, CExpression *pexprScalarCond,
-		CDXLPhysicalProperties *dxl_properties, CColRefArray *colref_array,
-		CDistributionSpecArray *pdrgpdsBaseTables, ULONG *pulNonGatherMotions,
-		BOOL *pfDML);
-
-	CDXLNode *PdxlArrayExprOnPartKey(CExpression *pexprPred,
-									 CColRef *pcrPartKey,
-									 IMDId *pmdidTypePartKey, ULONG ulPartLevel,
-									 BOOL fRangePart,
-									 BOOL *pfLTComparison,	// input/output
-									 BOOL *pfGTComparison,	// input/output
-									 BOOL *pfEQComparison	// input/output
-	);
-
 	// translate a DML operator
 	CDXLNode *PdxlnDML(CExpression *pexpr, CColRefArray *colref_array,
 					   CDistributionSpecArray *pdrgpdsBaseTables,
@@ -496,11 +431,6 @@ private:
 	CDXLNode *PdxlnAssert(CExpression *pexprAssert, CColRefArray *colref_array,
 						  CDistributionSpecArray *pdrgpdsBaseTables,
 						  ULONG *pulNonGatherMotions, BOOL *pfDML);
-
-	// translate a row trigger operator
-	CDXLNode *PdxlnRowTrigger(CExpression *pexpr, CColRefArray *colref_array,
-							  CDistributionSpecArray *pdrgpdsBaseTables,
-							  ULONG *pulNonGatherMotions, BOOL *pfDML);
 
 	// translate a scalar If statement
 	CDXLNode *PdxlnScIfStmt(CExpression *pexprScIf);
@@ -525,6 +455,8 @@ private:
 
 	// translate a scalar constant
 	CDXLNode *PdxlnScConst(CExpression *pexprScConst);
+
+	CDXLNode *PdxlnScSortGroupClause(CExpression *pexprScSortGroupClause);
 
 	// translate a scalar coalesce
 	CDXLNode *PdxlnScCoalesce(CExpression *pexprScCoalesce);
@@ -571,11 +503,19 @@ private:
 	// translate a scalar array coerce expr with element coerce function
 	CDXLNode *PdxlnScArrayCoerceExpr(CExpression *pexprScArrayCoerceExpr);
 
+	// translate a scalar param
+	CDXLNode *PdxlnScParam(CExpression *pexprScParam);
+
+	CDXLNode *PdxlnValuesList(CExpression *pexpr);
+
 	// translate an array
 	CDXLNode *PdxlnArray(CExpression *pexpr);
 
 	// translate an arrayref
 	CDXLNode *PdxlnArrayRef(CExpression *pexpr);
+
+	// translate a FieldSelect expr
+	CDXLNode *PdxlnFieldSelect(CExpression *pexpr);
 
 	// translate an arrayref index list
 	CDXLNode *PdxlnArrayRefIndexList(CExpression *pexpr);
@@ -621,16 +561,6 @@ private:
 									const CColRefArray *part_colrefs,
 									const CColRefArray *root_colrefs,
 									CExpression *pred);
-
-	CDXLNode *PdxlnBitmapIndexProbeForChildPart(
-		const ColRefToUlongMap *root_col_mapping,
-		const CColRefArray *part_colrefs, const CColRefArray *root_colrefs,
-		const IMDRelation *part, CExpression *pexprBitmapIndexProbe);
-
-	CDXLNode *PdxlnBitmapIndexPathForChildPart(
-		const ColRefToUlongMap *root_col_mapping,
-		const CColRefArray *part_colrefs, const CColRefArray *root_colrefs,
-		const IMDRelation *part, CExpression *pexprBitmapIndexPath);
 
 	// translate a project list expression into a DXL proj list node
 	// according to the order specified in the dynamic array
@@ -711,7 +641,10 @@ private:
 	CDXLNode *PdxlnProjectBoolConst(CDXLNode *dxlnode, BOOL value);
 
 	// helper to build a Result expression with project list restricted to required column
-	CDXLNode *PdxlnRestrictResult(CDXLNode *dxlnode, CColRef *colref);
+	CDXLNode *PdxlnRestrictResult(CDXLNode *dxlnode, const CColRef *colref);
+
+	// helper to build a Result expression with project list restricted to required columns
+	CDXLNode *PdxlnRestrictResult(CDXLNode *dxlnode, const CColRefSet *colrefs);
 
 	//	helper to build subplans from correlated LOJ
 	void BuildSubplansForCorrelatedLOJ(
@@ -757,6 +690,8 @@ private:
 	// check if result node imposes a motion hazard
 	BOOL FNeedsMaterializeUnderResult(CDXLNode *proj_list_dxlnode,
 									  CDXLNode *child_dxlnode);
+
+	void AddPartForScanId(ULONG scanid, ULONG index);
 
 	// helper to find subplan type from a correlated left outer join expression
 	static EdxlSubPlanType EdxlsubplantypeCorrelatedLOJ(

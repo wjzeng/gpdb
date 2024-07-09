@@ -56,8 +56,14 @@ private:
 	// order spec
 	COrderSpec *m_pos;
 
-	// distribution columns (empty for master only tables)
+	// distribution columns (empty for coordinator only tables)
 	CColRefSet *m_pcrsDist;
+
+	// Number of predicate not applicable on the index
+	ULONG m_ulUnindexedPredColCount;
+
+	// index scan direction
+	EIndexScanDirection m_scan_direction;
 
 public:
 	CLogicalIndexGet(const CLogicalIndexGet &) = delete;
@@ -67,7 +73,9 @@ public:
 
 	CLogicalIndexGet(CMemoryPool *mp, const IMDIndex *pmdindex,
 					 CTableDescriptor *ptabdesc, ULONG ulOriginOpId,
-					 const CName *pnameAlias, CColRefArray *pdrgpcrOutput);
+					 const CName *pnameAlias, CColRefArray *pdrgpcrOutput,
+					 ULONG ulUnindexedPredColCount,
+					 EIndexScanDirection scan_direction);
 
 	// dtor
 	~CLogicalIndexGet() override;
@@ -140,6 +148,20 @@ public:
 	Pos() const
 	{
 		return m_pos;
+	}
+
+	// number of predicate not applicable on the index
+	ULONG
+	ResidualPredicateSize() const
+	{
+		return m_ulUnindexedPredColCount;
+	}
+
+	// index scan direction is only used for B-tree indices.
+	EIndexScanDirection
+	ScanDirection() const
+	{
+		return m_scan_direction;
 	}
 
 	// operator specific hash function
@@ -218,6 +240,19 @@ public:
 	// derive statistics
 	IStatistics *PstatsDerive(CMemoryPool *mp, CExpressionHandle &exprhdl,
 							  IStatisticsArray *stats_ctxt) const override;
+
+	CTableDescriptorHashSet *
+	DeriveTableDescriptor(CMemoryPool *mp,
+						  CExpressionHandle &exprhdl GPOS_UNUSED) const override
+	{
+		CTableDescriptorHashSet *result =
+			GPOS_NEW(mp) CTableDescriptorHashSet(mp);
+		if (result->Insert(m_ptabdesc))
+		{
+			m_ptabdesc->AddRef();
+		}
+		return result;
+	}
 
 	//-------------------------------------------------------------------------------------
 	// Transformations

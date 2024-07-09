@@ -33,13 +33,6 @@ partition by list (f2)
 );
 
 
--- start_ignore
--- GPDB_12_MERGE_FIXME
--- Disable ORCA temporarily for this test as it produces wrong results. It uses
--- an incorrect comparison function for date and timestamp, causing the
--- partition to be incorrectly pruned.
--- end_ignore
-set optimizer=off;
 -- TEST
 -- Middle of a middle range
 INSERT INTO TIMESTAMP_MONTH_rangep_STARTINCL values (1, '2000-07-16');
@@ -105,8 +98,6 @@ SELECT * FROM TIMESTAMP_MONTH_listp WHERE f2 = '2000-01-03';
 SELECT * FROM TIMESTAMP_MONTH_listp WHERE f2 = TO_TIMESTAMP('2000-01-03', 'YYYY-MM-DD');
 SELECT * FROM TIMESTAMP_MONTH_listp WHERE f2 = TO_DATE('2000-01-03', 'YYYY-MM-DD');
 
-
-reset optimizer;
 --
 -- Data Engineer can see partition key in psql
 --
@@ -1215,13 +1206,13 @@ ALTER TABLE qa147.sales SET SUBPARTITION TEMPLATE (|);
 ALTER TABLE qa147.sales SET SUBPARTITION TEMPLATE (~);
 ALTER TABLE qa147.sales SET SUBPARTITION TEMPLATE (`);
 
-select relid::regclass, level, template from gp_partition_template where relid = 'qa147.sales'::regclass;
+select relid::regclass, level, pg_get_expr(template, relid) from gp_partition_template where relid = 'qa147.sales'::regclass;
 
 set client_min_messages='warning';
 drop schema qa147 cascade;
 reset client_min_messages;
 
-select relid, level, template from gp_partition_template where not exists (select oid from pg_class where oid = relid);
+select relid, level, pg_get_expr(template, relid) from gp_partition_template where not exists (select oid from pg_class where oid = relid);
 
 -- Mix-Match for Alter subpartition template
 CREATE TABLE qa147sales (trans_id int, date date, amount 
@@ -1239,29 +1230,29 @@ SUBPARTITION TEMPLATE
 
 -- Clear TEMPLATE
 ALTER TABLE qa147sales SET SUBPARTITION TEMPLATE ();
-select relid::regclass, level, template from gp_partition_template where relid = 'qa147sales'::regclass;
+select relid::regclass, level, pg_get_expr(template, relid) from gp_partition_template where relid = 'qa147sales'::regclass;
 -- This will overwrite previous subpartition template
 ALTER TABLE qa147sales SET SUBPARTITION TEMPLATE
 ( SUBPARTITION usa VALUES ('usa'), SUBPARTITION asia VALUES ('asia') );
-select relid::regclass, level, template from gp_partition_template where relid = 'qa147sales'::regclass;
+select relid::regclass, level, pg_get_expr(template, relid) from gp_partition_template where relid = 'qa147sales'::regclass;
 -- Invalid subpartition
 ALTER TABLE qa147sales SET SUBPARTITION TEMPLATE
 ( SUBPARTITION usam1 start (date '2008-01-01') INCLUSIVE END (date '2008-02-01') EXCLUSIVE );
 ALTER TABLE qa147sales SET SUBPARTITION TEMPLATE
 ( SUBPARTITION usam1 start (date '2008-01-01') INCLUSIVE END (date '2009-01-01') EXCLUSIVE EVERY (INTERVAL '1 month') );
-select relid::regclass, level, template from gp_partition_template where relid = 'qa147sales'::regclass;
+select relid::regclass, level, pg_get_expr(template, relid) from gp_partition_template where relid = 'qa147sales'::regclass;
 -- Mix and Match RANGE/LIST . Expect to Error
 ALTER TABLE qa147sales SET SUBPARTITION TEMPLATE
 ( 
 SUBPARTITION usa1 VALUES('usa'),
 SUBPARTITION usadate start (date '2008-01-01') INCLUSIVE END(date '2009-01-01') EXCLUSIVE);
-select relid::regclass, level, template from gp_partition_template where relid = 'qa147sales'::regclass;
+select relid::regclass, level, pg_get_expr(template, relid) from gp_partition_template where relid = 'qa147sales'::regclass;
 -- Mix and Match RANGE/LIST . Expect to Error
 ALTER TABLE qa147sales SET SUBPARTITION TEMPLATE
 ( 
 SUBPARTITION usadate start (date '2008-01-01') INCLUSIVE END(date '2009-01-01') EXCLUSIVE,
 SUBPARTITION usa1 VALUES('usa'));
-select relid::regclass, level, template from gp_partition_template where relid = 'qa147sales'::regclass;
+select relid::regclass, level, pg_get_expr(template, relid) from gp_partition_template where relid = 'qa147sales'::regclass;
 
 drop table qa147sales;
 
@@ -1281,33 +1272,33 @@ SUBPARTITION TEMPLATE
 
 -- Clear TEMPLATE
 ALTER TABLE qa147sales SET SUBPARTITION TEMPLATE ();
-select relid::regclass, level, template from gp_partition_template where relid = 'qa147sales'::regclass;
+select relid::regclass, level, pg_get_expr(template, relid) from gp_partition_template where relid = 'qa147sales'::regclass;
 -- This will overwrite previous subpartition template
 ALTER TABLE qa147sales SET SUBPARTITION TEMPLATE
 ( SUBPARTITION usam1 start (date '2008-01-01') INCLUSIVE END (date '2008-02-01') EXCLUSIVE );
-select relid::regclass, level, template from gp_partition_template where relid = 'qa147sales'::regclass;
+select relid::regclass, level, pg_get_expr(template, relid) from gp_partition_template where relid = 'qa147sales'::regclass;
 ALTER TABLE qa147sales SET SUBPARTITION TEMPLATE
 ( SUBPARTITION usam1 start (date '2008-01-01') INCLUSIVE END (date '2009-01-01') EXCLUSIVE EVERY (INTERVAL '1 month') );
-select relid::regclass, level, template from gp_partition_template where relid = 'qa147sales'::regclass;
+select relid::regclass, level, pg_get_expr(template, relid) from gp_partition_template where relid = 'qa147sales'::regclass;
 -- Invalid subpartition template
 ALTER TABLE qa147sales SET SUBPARTITION TEMPLATE
 ( SUBPARTITION usa VALUES ('usa'), SUBPARTITION asia VALUES ('asia') );
-select relid::regclass, level, template from gp_partition_template where relid = 'qa147sales'::regclass;
+select relid::regclass, level, pg_get_expr(template, relid) from gp_partition_template where relid = 'qa147sales'::regclass;
 -- Mix and Match RANGE/LIST . Expect to Error
 ALTER TABLE qa147sales SET SUBPARTITION TEMPLATE
 (
 SUBPARTITION usa1 VALUES('usa'),
 SUBPARTITION usadate start (date '2008-01-01') INCLUSIVE END(date '2009-01-01') EXCLUSIVE);
-select relid::regclass, level, template from gp_partition_template where relid = 'qa147sales'::regclass;
+select relid::regclass, level, pg_get_expr(template, relid) from gp_partition_template where relid = 'qa147sales'::regclass;
 -- Mix and Match RANGE/LIST . Expect to Error
 ALTER TABLE qa147sales SET SUBPARTITION TEMPLATE
 ( 
 SUBPARTITION usadate start (date '2008-01-01') INCLUSIVE END(date '2009-01-01') EXCLUSIVE,
 SUBPARTITION usa1 VALUES('usa'));
-select relid::regclass, level, template from gp_partition_template where relid = 'qa147sales'::regclass;
+select relid::regclass, level, pg_get_expr(template, relid) from gp_partition_template where relid = 'qa147sales'::regclass;
 
 drop table qa147sales;
-select relid, level, template from gp_partition_template where not exists (select oid from pg_class where oid = relid);
+select relid, level, pg_get_expr(template, relid) from gp_partition_template where not exists (select oid from pg_class where oid = relid);
 
 -- Now with Schema
 -- Mix-Match for Alter subpartition template in a schema
@@ -1327,32 +1318,32 @@ SUBPARTITION TEMPLATE
 
 -- Clear TEMPLATE
 ALTER TABLE qa147.sales SET SUBPARTITION TEMPLATE ();
-select relid::regclass, level, template from gp_partition_template where relid = 'qa147.sales'::regclass;
+select relid::regclass, level, pg_get_expr(template, relid) from gp_partition_template where relid = 'qa147.sales'::regclass;
 -- This will overwrite previous subpartition template
 ALTER TABLE qa147.sales SET SUBPARTITION TEMPLATE
 ( SUBPARTITION usa VALUES ('usa'), SUBPARTITION asia VALUES ('asia') );
-select relid::regclass, level, template from gp_partition_template where relid = 'qa147.sales'::regclass;
+select relid::regclass, level, pg_get_expr(template, relid) from gp_partition_template where relid = 'qa147.sales'::regclass;
 -- Invalid subpartition
 ALTER TABLE qa147.sales SET SUBPARTITION TEMPLATE
 ( SUBPARTITION usam1 start (date '2008-01-01') INCLUSIVE END (date '2008-02-01') EXCLUSIVE );
 ALTER TABLE qa147.sales SET SUBPARTITION TEMPLATE
 ( SUBPARTITION usam1 start (date '2008-01-01') INCLUSIVE END (date '2009-01-01') EXCLUSIVE EVERY (INTERVAL '1 month') );
-select relid::regclass, level, template from gp_partition_template where relid = 'qa147.sales'::regclass;
+select relid::regclass, level, pg_get_expr(template, relid) from gp_partition_template where relid = 'qa147.sales'::regclass;
 -- Mix and Match RANGE/LIST . Expect to Error
 ALTER TABLE qa147.sales SET SUBPARTITION TEMPLATE
 (
 SUBPARTITION usa1 VALUES('usa'),
 SUBPARTITION usadate start (date '2008-01-01') INCLUSIVE END(date '2009-01-01') EXCLUSIVE);
-select relid::regclass, level, template from gp_partition_template where relid = 'qa147.sales'::regclass;
+select relid::regclass, level, pg_get_expr(template, relid) from gp_partition_template where relid = 'qa147.sales'::regclass;
 -- Mix and Match RANGE/LIST . Expect to Error
 ALTER TABLE qa147.sales SET SUBPARTITION TEMPLATE
 (
 SUBPARTITION usadate start (date '2008-01-01') INCLUSIVE END(date '2009-01-01') EXCLUSIVE,
 SUBPARTITION usa1 VALUES('usa'));
-select relid::regclass, level, template from gp_partition_template where relid = 'qa147.sales'::regclass;
+select relid::regclass, level, pg_get_expr(template, relid) from gp_partition_template where relid = 'qa147.sales'::regclass;
 
 DROP SCHEMA qa147 cascade;
-select relid, level, template from gp_partition_template where not exists (select oid from pg_class where oid = relid);
+select relid, level, pg_get_expr(template, relid) from gp_partition_template where not exists (select oid from pg_class where oid = relid);
 
 CREATE SCHEMA qa147;
 CREATE TABLE qa147.sales (trans_id int, date date, amount
@@ -1371,33 +1362,33 @@ SUBPARTITION TEMPLATE
 
 -- Clear TEMPLATE
 ALTER TABLE qa147.sales SET SUBPARTITION TEMPLATE ();
-select relid::regclass, level, template from gp_partition_template where relid = 'qa147.sales'::regclass;
+select relid::regclass, level, pg_get_expr(template, relid) from gp_partition_template where relid = 'qa147.sales'::regclass;
 -- This will overwrite previous subpartition template
 ALTER TABLE qa147.sales SET SUBPARTITION TEMPLATE
 ( SUBPARTITION usam1 start (date '2008-01-01') INCLUSIVE END (date '2008-02-01') EXCLUSIVE );
-select relid::regclass, level, template from gp_partition_template where relid = 'qa147.sales'::regclass;
+select relid::regclass, level, pg_get_expr(template, relid) from gp_partition_template where relid = 'qa147.sales'::regclass;
 ALTER TABLE qa147.sales SET SUBPARTITION TEMPLATE
 ( SUBPARTITION usam1 start (date '2008-01-01') INCLUSIVE END (date '2009-01-01') EXCLUSIVE EVERY (INTERVAL '1 month') );
-select relid::regclass, level, template from gp_partition_template where relid = 'qa147.sales'::regclass;
+select relid::regclass, level, pg_get_expr(template, relid) from gp_partition_template where relid = 'qa147.sales'::regclass;
 -- Invalid subpartition template
 ALTER TABLE qa147.sales SET SUBPARTITION TEMPLATE
 ( SUBPARTITION usa VALUES ('usa'), SUBPARTITION asia VALUES ('asia') );
-select relid::regclass, level, template from gp_partition_template where relid = 'qa147.sales'::regclass;
+select relid::regclass, level, pg_get_expr(template, relid) from gp_partition_template where relid = 'qa147.sales'::regclass;
 -- Mix and Match RANGE/LIST . Expect to Error
 ALTER TABLE qa147.sales SET SUBPARTITION TEMPLATE
 (
 SUBPARTITION usa1 VALUES('usa'),
 SUBPARTITION usadate start (date '2008-01-01') INCLUSIVE END(date '2009-01-01') EXCLUSIVE);
-select relid::regclass, level, template from gp_partition_template where relid = 'qa147.sales'::regclass;
+select relid::regclass, level, pg_get_expr(template, relid) from gp_partition_template where relid = 'qa147.sales'::regclass;
 -- Mix and Match RANGE/LIST . Expect to Error
 ALTER TABLE qa147.sales SET SUBPARTITION TEMPLATE
 (
 SUBPARTITION usadate start (date '2008-01-01') INCLUSIVE END(date '2009-01-01') EXCLUSIVE,
 SUBPARTITION usa1 VALUES('usa'));
-select relid::regclass, level, template from gp_partition_template where relid = 'qa147.sales'::regclass;
+select relid::regclass, level, pg_get_expr(template, relid) from gp_partition_template where relid = 'qa147.sales'::regclass;
 
 drop schema qa147 cascade;
-select relid, level, template from gp_partition_template where not exists (select oid from pg_class where oid = relid);
+select relid, level, pg_get_expr(template, relid) from gp_partition_template where not exists (select oid from pg_class where oid = relid);
 set gp_autostats_mode=on_change;
 set gp_autostats_on_change_threshold=100;
 
@@ -1482,7 +1473,7 @@ alter table partsupp_def set subpartition template( subpartition aaa start(400) 
 -- Note 2: We do not support this function yet, but if we are able to split default partition with default subpartition, would we
 -- be using the subpartition template to definte the "new" partition or the existing one.
 
-select relid::regclass, level, template from gp_partition_template where relid = 'partsupp_def'::regclass;
+select relid::regclass, level, pg_get_expr(template, relid) from gp_partition_template where relid = 'partsupp_def'::regclass;
 
 alter table partsup_def add partition f1 start(0) end (300) every(100);
 
@@ -1502,7 +1493,7 @@ subpartition template
 alter table partsupp_def2 set subpartition template();
 alter table partsupp_def2 set subpartition template( subpartition aaa start(400) end (600) every(100) );
 
-select relid::regclass, level, template from gp_partition_template where relid = 'partsupp_def2'::regclass;
+select relid::regclass, level, pg_get_expr(template, relid) from gp_partition_template where relid = 'partsupp_def2'::regclass;
 
 drop table partsupp_def;
 drop table partsupp_def2;
@@ -1626,7 +1617,7 @@ drop table partition_cleanup1;
 drop schema partition_999 cascade;
 
 -- These should be empty
-select relid, level, template from gp_partition_template where not exists (select oid from pg_class where oid = relid);
+select relid, level, pg_get_expr(template, relid) from gp_partition_template where not exists (select oid from pg_class where oid = relid);
 
 
 --
@@ -1675,6 +1666,22 @@ SELECT grant_table_in_function();
 -- calling it second time in same session should use cached plan for
 -- GrantStmt
 SELECT grant_table_in_function();
+
+-- Validate that ISSUE #14395 which manifested as a crash while deriving stats
+-- on partitioned tables over CTEs is resolved.
+CREATE TABLE a_partition_table_used_in_cte_test(c1 int)
+PARTITION BY LIST(c1)
+(
+	PARTITION a_part values(2,3),
+	DEFAULT partition other
+);
+
+INSERT INTO a_partition_table_used_in_cte_test SELECT 2;
+ANALYZE a_partition_table_used_in_cte_test;
+WITH cte AS (
+  SELECT * FROM a_partition_table_used_in_cte_test WHERE c1 < 2
+) SELECT * FROM cte WHERE c1 = 1;
+DROP TABLE a_partition_table_used_in_cte_test;
 
 -- CLEANUP
 -- start_ignore

@@ -29,6 +29,7 @@
 #include "commands/defrem.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
+#include "nodes/makefuncs.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/pg_locale.h"
@@ -211,7 +212,26 @@ DefineCollation(ParseState *pstate, List *names, List *parameters, bool if_not_e
 	if (!fromEl)
 	{
 		if (collprovider == COLLPROVIDER_ICU)
+		{
+#ifdef USE_ICU
+			/*
+			 * We could create ICU collations with collencoding == database
+			 * encoding, but it seems better to use -1 so that it matches the
+			 * way initdb would create ICU collations.  However, only allow
+			 * one to be created when the current database's encoding is
+			 * supported.  Otherwise the collation is useless, plus we get
+			 * surprising behaviors like not being able to drop the collation.
+			 *
+			 * Skip this test when !USE_ICU, because the error we want to
+			 * throw for that isn't thrown till later.
+			 */
+			if (!is_encoding_supported_by_icu(GetDatabaseEncoding()))
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("current database's encoding is not supported with this provider")));
+#endif
 			collencoding = -1;
+		}
 		else
 		{
 			collencoding = GetDatabaseEncoding();
@@ -472,8 +492,16 @@ cmpaliases(const void *a, const void *b)
 }
 #endif							/* READ_LOCALE_A_OUTPUT */
 
+/*
+ * Dispatch collation create command to segments.
+ *
+ * @param alias:	collation name in collname field
+ * @param locale:	locale name, usually include lang and region
+ * @param nspid:	namespace pid
+ * @param provider:	"icu" or "libc", NULL means decided by callee (DefineCollation in QE, default "libc")
+ */
 static void
-DispatchCollationCreate(char *alias, char *locale, Oid nspid, int encoding)
+DispatchCollationCreate(char *alias, char *locale, Oid nspid, char* provider)
 {
 	Assert(Gp_role == GP_ROLE_DISPATCH);
 
@@ -484,14 +512,11 @@ DispatchCollationCreate(char *alias, char *locale, Oid nspid, int encoding)
 	names = lappend(names, schemaname);
 	names = lappend(names, relname);
 
-	List *parameters = NIL;
-	DefElem *defstring = makeNode(DefElem);
-
-	defstring->defname = "locale";
-	defstring->defaction = DEFELEM_UNSPEC;
-	defstring->arg = (Node*) makeString(locale);
-
-	parameters = lappend(parameters, defstring);
+	List *parameters = lappend(NIL, makeDefElem("locale", (Node*) makeString(locale), -1));
+	if (provider)
+	{
+		parameters = lappend(parameters, makeDefElem("provider", (Node*) makeString(provider), -1));
+	}
 
 	DefineStmt * stmt = makeNode(DefineStmt);
 	stmt->kind = OBJECT_COLLATION;
@@ -508,7 +533,6 @@ DispatchCollationCreate(char *alias, char *locale, Oid nspid, int encoding)
 	                            NULL);
 }
 
-
 #ifdef USE_ICU
 /*
  * Get the ICU language tag for a locale name.
@@ -521,7 +545,7 @@ get_icu_language_tag(const char *localename)
 	UErrorCode	status;
 
 	status = U_ZERO_ERROR;
-	uloc_toLanguageTag(localename, buf, sizeof(buf), TRUE, &status);
+	uloc_toLanguageTag(localename, buf, sizeof(buf), true, &status);
 	if (U_FAILURE(status))
 		ereport(ERROR,
 				(errmsg("could not convert locale name \"%s\" to language tag: %s",
@@ -579,9 +603,6 @@ pg_import_system_collations(PG_FUNCTION_ARGS)
 	Oid			nspid = PG_GETARG_OID(0);
 	int			ncreated = 0;
 
-	/* silence compiler warning if we have no locale implementation at all */
-	(void) nspid;
-
 	if (!superuser())
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
@@ -590,6 +611,11 @@ pg_import_system_collations(PG_FUNCTION_ARGS)
 	if (Gp_role != GP_ROLE_DISPATCH)
 		ereport(ERROR,
 					(errmsg("must be dispatcher to import system collations")));
+
+	if (!SearchSysCacheExists1(NAMESPACEOID, ObjectIdGetDatum(nspid)))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_SCHEMA),
+				 errmsg("schema with OID %u does not exist", nspid)));
 
 	/* Load collations known to libc, using "locale -a" to enumerate them */
 #ifdef READ_LOCALE_A_OUTPUT
@@ -653,10 +679,14 @@ pg_import_system_collations(PG_FUNCTION_ARGS)
 				continue;		/* ignore locales for client-only encodings */
 			if (enc == PG_SQL_ASCII)
 				continue;		/* C/POSIX are already in the catalog */
-
-			/* GPDB_12_MERGE_FIXME: Why do we have this extra condition in GPDB? */
+			/*
+			 * Greenplum specific behavior: this function in Greenplum can only be called after a full cluster is
+			 * built, this is different from Postgres which might call this function during initdb. When reaching
+			 * here, it must be in a database session, we can just ignore the collations not match current database's
+			 * encoding because they cannot be used in this database.
+			 */
 			if (enc != GetDatabaseEncoding())
-				continue;
+				continue;       /* Ignore collations incompatible with database encoding */ 
 
 			/* count valid locales found in operating system */
 			nvalid++;
@@ -677,7 +707,7 @@ pg_import_system_collations(PG_FUNCTION_ARGS)
 									 true, true);
 			if (OidIsValid(collid))
 			{
-				DispatchCollationCreate(localebuf, localebuf, nspid, enc);
+				DispatchCollationCreate(localebuf, localebuf, nspid, "libc");
 				ncreated++;
 
 				/* Must do CCI between inserts to handle duplicates correctly */
@@ -739,7 +769,7 @@ pg_import_system_collations(PG_FUNCTION_ARGS)
 									 true, true);
 			if (OidIsValid(collid))
 			{
-				DispatchCollationCreate(alias, locale, nspid, enc);
+				DispatchCollationCreate(alias, locale, nspid, "libc");
 				ncreated++;
 
 				CommandCounterIncrement();
@@ -777,6 +807,7 @@ pg_import_system_collations(PG_FUNCTION_ARGS)
 			char	   *langtag;
 			char	   *icucomment;
 			const char *collcollate;
+			char	   *collname;
 			Oid			collid;
 
 			if (i == -1)
@@ -794,7 +825,8 @@ pg_import_system_collations(PG_FUNCTION_ARGS)
 			if (!is_all_ascii(langtag) || !is_all_ascii(collcollate))
 				continue;
 
-			collid = CollationCreate(psprintf("%s-x-icu", langtag),
+			collname = psprintf("%s-x-icu", langtag);
+			collid = CollationCreate(collname,
 									 nspid, GetUserId(),
 									 COLLPROVIDER_ICU, true, -1,
 									 collcollate, collcollate,
@@ -802,6 +834,7 @@ pg_import_system_collations(PG_FUNCTION_ARGS)
 									 true, true);
 			if (OidIsValid(collid))
 			{
+				DispatchCollationCreate(collname, unconstify(char*, collcollate), nspid, "icu");
 				ncreated++;
 
 				CommandCounterIncrement();

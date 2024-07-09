@@ -22,10 +22,12 @@
 #include "catalog/gp_partition_template.h"
 #include "catalog/partition.h"
 #include "catalog/pg_attribute.h"
+#include "catalog/pg_attribute_encoding.h"
 #include "catalog/pg_collation.h"
 #include "catalog/pg_inherits.h"
 #include "catalog/pg_partitioned_table.h"
 #include "catalog/pg_opclass.h"
+#include "catalog/heap.h"
 #include "cdb/cdbvars.h"
 #include "cdb/memquota.h"
 #include "commands/extension.h"
@@ -66,7 +68,7 @@ FormPartitionKeyDatumFromExpr(Relation rel, Node *expr, Datum *values, bool *isn
 	int			i;
 
 	Assert(rel);
-	partkey = RelationGetPartitionKey(rel);
+	partkey = RelationRetrievePartitionKey(rel);
 	Assert(partkey != NULL);
 
 	Assert(IsA(expr, List));
@@ -134,7 +136,7 @@ GpFindTargetPartition(Relation parent, GpAlterPartitionId *partid,
 		case AT_AP_IDDefault:
 			/* Find default partition */
 			target_relid =
-				get_default_oid_from_partdesc(RelationGetPartitionDesc(parent));
+				get_default_oid_from_partdesc(RelationRetrievePartitionDesc(parent));
 			if (!OidIsValid(target_relid) && !missing_ok)
 				ereport(ERROR,
 						(errcode(ERRCODE_UNDEFINED_OBJECT),
@@ -181,7 +183,7 @@ GpFindTargetPartition(Relation parent, GpAlterPartitionId *partid,
 				if (partRel->rd_rel->relispartition)
 				{
 					bool		    found = false;
-					PartitionDesc   partdesc = RelationGetPartitionDesc(parent);
+					PartitionDesc   partdesc = RelationRetrievePartitionDesc(parent);
 					target_relid = RelationGetRelid(partRel);
 					table_close(partRel, AccessShareLock);
 					/*
@@ -219,11 +221,11 @@ GpFindTargetPartition(Relation parent, GpAlterPartitionId *partid,
 			{
 				Datum		values[PARTITION_MAX_KEYS];
 				bool		isnull[PARTITION_MAX_KEYS];
-				PartitionDesc partdesc = RelationGetPartitionDesc(parent);
+				PartitionDesc partdesc = RelationRetrievePartitionDesc(parent);
 				int partidx;
 
 				FormPartitionKeyDatumFromExpr(parent, partid->partiddef, values, isnull);
-				partidx = get_partition_for_tuple(RelationGetPartitionKey(parent),
+				partidx = get_partition_for_tuple(RelationRetrievePartitionKey(parent),
 												  partdesc, values, isnull);
 
 				if (partidx < 0)
@@ -237,7 +239,7 @@ GpFindTargetPartition(Relation parent, GpAlterPartitionId *partid,
 				}
 
 				if (partdesc->oids[partidx] ==
-					get_default_oid_from_partdesc(RelationGetPartitionDesc(parent)))
+					get_default_oid_from_partdesc(RelationRetrievePartitionDesc(parent)))
 				{
 					ereport(ERROR,
 							(errcode(ERRCODE_WRONG_OBJECT_TYPE),
@@ -614,7 +616,7 @@ AtExecGPSplitPartition(Relation rel, AlterTableCmd *cmd)
 		Assert(OidIsValid(partrelid));
 		partrel = table_open(partrelid, AccessShareLock);
 
-		if (partrelid == get_default_oid_from_partdesc(RelationGetPartitionDesc(rel)))
+		if (partrelid == get_default_oid_from_partdesc(RelationRetrievePartitionDesc(rel)))
 			defaultpartname = pstrdup(RelationGetRelationName(partrel));
 		else
 			defaultpartname = NULL;
@@ -700,7 +702,7 @@ AtExecGPSplitPartition(Relation rel, AlterTableCmd *cmd)
 		GpPartDefElem       *elem;
 		PartitionBoundSpec  *boundspec1;
 		PartitionBoundSpec  *boundspec2 = boundspec;
-		PartitionKey        partkey     = RelationGetPartitionKey(rel);
+		PartitionKey        partkey     = RelationRetrievePartitionKey(rel);
 		ParseState          *pstate     = make_parsestate(NULL);
 		char                *part_col_name;
 		Oid                 part_col_typid;
@@ -990,7 +992,7 @@ AtExecGPSplitPartition(Relation rel, AlterTableCmd *cmd)
 		elem->options = p_reloptions;
 
 		/* create first partition stmt */
-		stmts = lappend(stmts, makePartitionCreateStmt(rel, partname1, boundspec1, NULL, elem, &partcomp));
+		stmts = lappend(stmts, makePartitionCreateStmt(rel, partname1, boundspec1, NULL, elem, &partcomp, ORIGIN_GP_CLASSIC_ALTER_GEN));
 
 		/* create second partition stmt */
 		if (defaultpartname)
@@ -998,7 +1000,7 @@ AtExecGPSplitPartition(Relation rel, AlterTableCmd *cmd)
 			partcomp.tablename = defaultpartname;
 			partname2 = NULL;
 		}
-		stmts = lappend(stmts, makePartitionCreateStmt(rel, partname2, boundspec2, NULL, elem, &partcomp));
+		stmts = lappend(stmts, makePartitionCreateStmt(rel, partname2, boundspec2, NULL, elem, &partcomp, ORIGIN_GP_CLASSIC_ALTER_GEN));
 	}
 
 	foreach (l, stmts)
@@ -1047,6 +1049,58 @@ AtExecGPSplitPartition(Relation rel, AlterTableCmd *cmd)
 	}
 
 	return stmts;
+}
+
+void GpAlterPartMetaTrackUpdObject(Oid relid, AlterTableType subcmdtype)
+{
+	char	   *subtype;
+	switch (subcmdtype)
+	{
+		case AT_PartTruncate:
+			subtype = "TRUNCATE";
+			break;
+
+		case AT_PartAdd:
+			subtype = "ADD";
+			break;
+
+		case AT_PartDrop:
+			subtype = "DROP";
+			break;
+
+		case AT_PartExchange:
+			subtype = "EXCHANGE";
+			break;
+
+		case AT_PartSplit:
+			subtype = "SPLIT";
+			break;
+
+		case AT_SetDistributedBy:
+			subtype = "SET DISTRIBUTED BY";
+			break;
+
+		case AT_SetTableSpace:
+			subtype = "SET TABLESPACE";
+			break;
+
+		case AT_PartSetTemplate:
+			subtype = "SET TEMPLATE";
+			break;
+
+		case AT_PartRename:
+			subtype = "RENAME";
+			break;
+
+		default:
+			subtype = "UNKNOWN ALTER PARTITION COMMAND";
+			break;
+	}
+	MetaTrackUpdObject(RelationRelationId,
+					   relid,
+					   GetUserId(),
+					   "PARTITION",
+					   subtype);
 }
 
 void
@@ -1152,10 +1206,12 @@ ATExecGPPartCmds(Relation origrel, AlterTableCmd *cmd)
 				Oid firstchildoid;
 
 				Assert(temprel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE);
-				partdesc = RelationGetPartitionDesc(temprel);
+				partdesc = RelationRetrievePartitionDesc(temprel);
 
 				if (partdesc->nparts == 0)
-					elog(ERROR, "GPDB add partition syntax needs at least one sibling to exist");
+					ereport(ERROR,
+							(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+								errmsg("GPDB add partition syntax needs at least one sibling to exist")));
 
 				if (partdesc->is_leaf[0])
 				{
@@ -1185,9 +1241,14 @@ ATExecGPPartCmds(Relation origrel, AlterTableCmd *cmd)
 				}
 			} while (1);
 
+			Assert(!gpPartDef->fromCatalog);
+			gpPartDef = transformGpPartitionDefinition(RelationGetRelid(rel), cmd->queryString, gpPartDef);
+			if (gpPartDef->isTemplate)
+				StoreGpPartitionTemplate(ancestors ? llast_oid(ancestors) : RelationGetRelid(rel),
+										 list_length(ancestors), gpPartDef);
 			List *cstmts = generatePartitions(RelationGetRelid(rel),
 											  gpPartDef, subpart, cmd->queryString,
-											  NIL, NULL, NULL, false);
+											  NIL, NULL, NULL, ORIGIN_GP_CLASSIC_ALTER_GEN);
 			foreach(l, cstmts)
 			{
 				Node *stmt = (Node *) lfirst(l);
@@ -1210,7 +1271,7 @@ ATExecGPPartCmds(Relation origrel, AlterTableCmd *cmd)
 				break;
 
 			partrel = table_open(partrelid, AccessShareLock);
-			partdesc = RelationGetPartitionDesc(rel);
+			partdesc = RelationRetrievePartitionDesc(rel);
 
 			/*
 			 * If two drop partition cmds are specified in same alter table stmt,
@@ -1285,19 +1346,27 @@ ATExecGPPartCmds(Relation origrel, AlterTableCmd *cmd)
 			{
 				Relation firstrel;
 				Oid firstchildoid;
-				PartitionDesc partdesc = RelationGetPartitionDesc(rel);
+				PartitionDesc partdesc = RelationRetrievePartitionDesc(rel);
 
 				if (partdesc->nparts == 0)
-					elog(ERROR, "GPDB SET SUBPARTITION TEMPLATE syntax needs at least one sibling to exist");
+					ereport(ERROR,
+							(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+								errmsg("GPDB SET SUBPARTITION TEMPLATE syntax needs at least one sibling to exist")));
 
 				firstchildoid = partdesc->oids[0];
 				firstrel = table_open(firstchildoid, AccessShareLock);
 				if (firstrel->rd_rel->relkind != RELKIND_PARTITIONED_TABLE)
-					elog(ERROR, "level %d is not partitioned and hence can't set subpartition template for the same",
-						 level);
+					ereport(ERROR,
+							(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+								errmsg("level %d is not partitioned and hence can't set subpartition template for the same",
+									   level)));
+				if (RelationRetrievePartitionDesc(firstrel)->nparts == 0)
+					ereport(ERROR,
+							(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+								errmsg("GPDB SET SUBPARTITION TEMPLATE syntax needs at least one sibling to exist")));
 
 				/* if this is not leaf level partition then sub-partition must exist for next level */
-				if (!RelationGetPartitionDesc(firstrel)->is_leaf[0])
+				if (!RelationRetrievePartitionDesc(firstrel)->is_leaf[0])
 				{
 					if (GetGpPartitionTemplate(topParentrelid, level + 1) == NULL)
 					{
@@ -1310,12 +1379,13 @@ ATExecGPPartCmds(Relation origrel, AlterTableCmd *cmd)
 				}
 
 				/*
-				 * call generatePartitions() using first child as partition to
+				 * call generatePartitions() using first child's PartitionKey to
 				 * add partitions, just to validate the subpartition template,
 				 * if anything wrong it will error out.
 				 */
+				templateDef = transformGpPartitionDefinition(firstchildoid, cmd->queryString, templateDef);
 				generatePartitions(firstchildoid, templateDef, NULL, cmd->queryString,
-								   NIL, NULL, NULL, true);
+								   NIL, NULL, NULL, false);
 				table_close(firstrel, AccessShareLock);
 
 				StoreGpPartitionTemplate(topParentrelid, level, templateDef);
@@ -1410,6 +1480,19 @@ ATExecGPPartCmds(Relation origrel, AlterTableCmd *cmd)
 					   None_Receiver,
 					   NULL);
 	}
+
+	/* 
+	 * The pg_stat_last_operation table contains metadata tracking 
+	 * information about operations on database objects. Greenplum 
+	 * Database updates this table when a database object is 
+	 * created, altered, truncated, vacuumed, analyzed, or 
+	 * partitioned, and when privileges are granted to an object.
+	 * GpAlterPartMetaTrackUpdObject() will update 
+	 * pg_stat_last_operation for GPDB specific alter partition 
+	 * commands. 
+	 */
+	if (Gp_role == GP_ROLE_DISPATCH)
+		GpAlterPartMetaTrackUpdObject(RelationGetRelid(rel), cmd->subtype);
 }
 
 /*

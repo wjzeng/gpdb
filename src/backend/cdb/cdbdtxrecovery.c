@@ -19,6 +19,7 @@
 #include "utils/ps_status.h"
 #include "postmaster/bgworker.h"
 #include "pgstat.h"
+#include "commands/progress.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
 #include "storage/lwlock.h"
@@ -53,6 +54,10 @@ volatile int *shmNumCommittedGxacts;
 
 static volatile sig_atomic_t got_SIGHUP = false;
 
+static int64 in_doubt_tx_in_progress = 0;
+static int64 in_doubt_tx_aborted = 0;
+static int64 in_doubt_tx_total = 0;
+
 typedef struct InDoubtDtx
 {
 	char		gid[TMGIDSIZE];
@@ -66,6 +71,11 @@ static void abortRMInDoubtTransactions(HTAB *htab);
 static void doAbortInDoubt(char *gid);
 static bool doNotifyCommittedInDoubt(char *gid);
 static void AbortOrphanedPreparedTransactions(void);
+
+bool IsDtxRecoveryProcess()
+{
+	return getpid() == DtxRecoveryPID();
+}
 
 static bool
 doNotifyCommittedInDoubt(char *gid)
@@ -136,7 +146,7 @@ recoverTM(void)
 	 * still possible there are residual QE processes but it's better than doing
 	 * nothing.
 	 *
-	 * We just do this when there was abnormal shutdown on master or standby
+	 * We just do this when there was abnormal shutdown on primary or standby
 	 * promote, else mostly there should not have residual QE processes.
 	 */
 	if (*shmCleanupBackends)
@@ -185,8 +195,18 @@ recoverInDoubtTransactions(void)
 		 "Going to retry commit notification for distributed transactions (count = %d)",
 		 *shmNumCommittedGxacts);
 
+	pgstat_progress_update_param(PROGRESS_DTX_RECOVERY_PHASE,
+								 PROGRESS_DTX_RECOVERY_PHASE_STARTUP_RECOVER_COMMITTED_DTX);
+	pgstat_progress_update_param(PROGRESS_DTX_RECOVERY_COMITTED_DTX_TOTAL,
+								 *shmNumCommittedGxacts);
+
 	for (i = 0; i < *shmNumCommittedGxacts; i++)
 	{
+		/*
+		 * No need to acquire CommittedGxidArrayLock since dtx recovery
+		 * only happens on primary, but not hot standby where concurrent 
+		 * access to this array is possible from CreateDistributedSnapshot.
+		 */
 		DistributedTransactionId gxid = shmCommittedGxidArray[i];
 		char gid[TMGIDSIZE];
 
@@ -199,9 +219,18 @@ recoverInDoubtTransactions(void)
 		doNotifyCommittedInDoubt(gid);
 
 		RecordDistributedForgetCommitted(gxid);
+
+		pgstat_progress_update_param(PROGRESS_DTX_RECOVERY_COMITTED_DTX_COMPLETED,
+									 i+1);
 	}
 
+	SIMPLE_FAULT_INJECTOR("post_progress_recovery_comitted");
+
 	*shmNumCommittedGxacts = 0;
+
+
+	pgstat_progress_update_param(PROGRESS_DTX_RECOVERY_PHASE,
+								 PROGRESS_DTX_RECOVERY_PHASE_STARTUP_GATHER_IN_DOUBT_TX);
 
 	/*
 	 * Any in-doubt transctions found will be for aborted
@@ -209,6 +238,8 @@ recoverInDoubtTransactions(void)
 	 */
 	htab = gatherRMInDoubtTransactions(0, true);
 
+	pgstat_progress_update_param(PROGRESS_DTX_RECOVERY_PHASE,
+								 PROGRESS_DTX_RECOVERY_PHASE_STARTUP_ABORT_IN_DOUBT_TX);
 	/*
 	 * go through and resolve any remaining in-doubt transactions that the
 	 * RM's have AFTER recoverDTMInDoubtTransactions.  ALL of these in doubt
@@ -346,9 +377,14 @@ gatherRMInDoubtTransactions(int prepared_seconds, bool raiseError)
 				elog(DEBUG3, "Found in-doubt transaction with GID: %s on remote RM", gid);
 
 				strncpy(lastDtx->gid, gid, TMGIDSIZE);
+
+				pgstat_progress_update_param(PROGRESS_DTX_RECOVERY_IN_DOUBT_TX_TOTAL,
+											 ++in_doubt_tx_total);
 			}
 		}
 	}
+
+	cdbdisp_clearCdbPgResults(&cdb_pgresults);
 
 	return htab;
 }
@@ -383,6 +419,9 @@ abortRMInDoubtTransactions(HTAB *htab)
 		elog(DTM_DEBUG3, "Aborting in-doubt transaction with gid = %s", entry->gid);
 
 		doAbortInDoubt(entry->gid);
+
+		pgstat_progress_update_param(PROGRESS_DTX_RECOVERY_IN_DOUBT_TX_ABORTED,
+									 ++in_doubt_tx_aborted);
 	}
 }
 
@@ -409,10 +448,19 @@ abortOrphanedTransactions(HTAB *htab)
 
 		dtxDeformGid(entry->gid, &gxid);
 
-		if (!IsDtxInProgress(gxid))
+		if (IsDtxInProgress(gxid))
+		{
+			pgstat_progress_update_param(PROGRESS_DTX_RECOVERY_IN_DOUBT_TX_IN_PROGRESS,
+										 ++in_doubt_tx_in_progress);
+			SIMPLE_FAULT_INJECTOR("post_in_doubt_tx_in_progress");
+		}
+		else
 		{
 			elog(LOG, "Aborting orphaned transactions with gid = %s", entry->gid);
 			doAbortInDoubt(entry->gid);
+
+			pgstat_progress_update_param(PROGRESS_DTX_RECOVERY_IN_DOUBT_TX_ABORTED,
+										 ++in_doubt_tx_aborted);
 		}
 	}
 }
@@ -445,7 +493,12 @@ void
 redoDistributedCommitRecord(DistributedTransactionId gxid)
 {
 	int			i;
+	bool 			is_hot_standby_qd = IS_HOT_STANDBY_QD();
 
+	/* 
+	 * Only the startup process can be modifying shmNumCommittedGxacts
+	 * and shmCommittedGxidArray. So should be OK reading the value w/o lock.
+	 */
 	for (i = 0; i < *shmNumCommittedGxacts; i++)
 	{
 		if (gxid == shmCommittedGxidArray[i])
@@ -481,11 +534,22 @@ redoDistributedCommitRecord(DistributedTransactionId gxid)
 							max_tm_gxacts, gxid, *shmNumCommittedGxacts, gxact_array.data),
 					 errdetail("It should not happen. Temporarily increase "
 							   "max_connections (need postmaster reboot) on "
-							   "the postgres (master or standby) to work "
+							   "the postgres (primary or standby) to work "
 							   "around this issue and then report a bug")));
 		}
 
+		/*
+		 * only on hot standby there might be backends that call CreateDistributedSnapshot()
+		 * to access the committed gxid array concurrently.
+		 */
+		if (is_hot_standby_qd)
+			LWLockAcquire(CommittedGxidArrayLock, LW_EXCLUSIVE);
+
 		shmCommittedGxidArray[(*shmNumCommittedGxacts)++] = gxid;
+
+		if (is_hot_standby_qd)
+			LWLockRelease(CommittedGxidArrayLock);
+
 		elog((Debug_print_full_dtm ? LOG : DEBUG5),
 			 "Crash recovery redo added committed distributed transaction gid = "UINT64_FORMAT, gxid);
 	}
@@ -498,7 +562,13 @@ void
 redoDistributedForgetCommitRecord(DistributedTransactionId gxid)
 {
 	int			i;
-
+	bool 			is_hot_standby_qd = IS_HOT_STANDBY_QD();
+	
+	SIMPLE_FAULT_INJECTOR("redoDistributedForgetCommitRecord");
+	/* 
+	 * Only the startup process can be modifying shmNumCommittedGxacts
+	 * and shmCommittedGxidArray. So should be OK reading the value w/o lock.
+	 */
 	for (i = 0; i < *shmNumCommittedGxacts; i++)
 	{
 		if (gxid == shmCommittedGxidArray[i])
@@ -509,13 +579,27 @@ redoDistributedForgetCommitRecord(DistributedTransactionId gxid)
 				 gxid);
 
 			/*
-			 * there's no concurrent access to shmCommittedGxidArray during
-			 * recovery
+			 * only on hot standby there might be backends that call CreateDistributedSnapshot()
+			 * to access the committed gxid array concurrently.
 			 */
+			if (is_hot_standby_qd)
+				LWLockAcquire(CommittedGxidArrayLock, LW_EXCLUSIVE);
+
 			(*shmNumCommittedGxacts)--;
 			if (i != *shmNumCommittedGxacts)
 				shmCommittedGxidArray[i] = shmCommittedGxidArray[*shmNumCommittedGxacts];
 
+			if (is_hot_standby_qd)
+				LWLockRelease(CommittedGxidArrayLock);
+
+			/* on the hot standby, we rely on the forget record to advance latestCompletedGxid */
+			if (is_hot_standby_qd)
+			{
+				LWLockAcquire(ProcArrayLock, LW_EXCLUSIVE);
+				if (gxid > ShmemVariableCache->latestCompletedGxid)
+					ShmemVariableCache->latestCompletedGxid = gxid;
+				LWLockRelease(ProcArrayLock);
+			}
 			return;
 		}
 	}
@@ -532,6 +616,14 @@ DtxRecoveryStartRule(Datum main_arg)
 }
 
 static void
+ResetInDoubtStatProgress()
+{
+	in_doubt_tx_total = 0;
+	in_doubt_tx_aborted = 0;
+	in_doubt_tx_in_progress = 0;
+}
+
+static void
 AbortOrphanedPreparedTransactions()
 {
 	HTAB	   *htab;
@@ -541,8 +633,14 @@ AbortOrphanedPreparedTransactions()
 		return;
 #endif
 
+	pgstat_progress_update_param(PROGRESS_DTX_RECOVERY_PHASE,
+								 PROGRESS_DTX_RECOVERY_PHASE_GATHER_IN_DOUBT_TX);
+
 	StartTransactionCommand();
 	htab = gatherRMInDoubtTransactions(gp_dtx_recovery_prepared_period, false);
+
+	pgstat_progress_update_param(PROGRESS_DTX_RECOVERY_PHASE,
+								 PROGRESS_DTX_RECOVERY_PHASE_ABORT_IN_DOUBT_TX);
 
 	/* in case an error happens somehow. */
 	if (htab != NULL)
@@ -624,6 +722,9 @@ DtxRecoveryMain(Datum main_arg)
 	/* Connect to postgres */
 	BackgroundWorkerInitializeConnection(DB_FOR_COMMON_ACCESS, NULL, 0);
 
+	/* initialize progress */
+	pgstat_progress_start_command(PROGRESS_COMMAND_DTX_RECOVERY, InvalidOid);
+
 	/*
 	 * Do dtx recovery process.  It is possible that *shmDtmStarted is true
 	 * here if we terminate after this code block, e.g. due to error and then
@@ -641,12 +742,14 @@ DtxRecoveryMain(Datum main_arg)
 		set_ps_display("", false);
 	}
 
+	pgstat_progress_end_command();
+
 	/* Fetch the gxid batch in advance. */
 	bumpGxid();
 
 	/*
 	 * Normally we check with interval gp_dtx_recovery_interval, but sometimes
-	 * we want to be more frequent in a period, e.g. just after master panic.
+	 * we want to be more frequent in a period, e.g. just after primary panic.
 	 * We do not use a guc to control the period, instead hardcode 12 times
 	 * with inteval 5 seconds simply.
 	 */
@@ -685,7 +788,18 @@ DtxRecoveryMain(Datum main_arg)
 			 * cases so that it could respond promptly for gxid bumping given
 			 * the abort operation might be time-consuming.
 			 */
+
+			/*
+			 * The total amount of in doubt transactions are calculated per iteration
+			 * and are destroyed after use. Keeping the old statistics may be confusing,
+			 * so clear it up.
+			 */
+			ResetInDoubtStatProgress();
+			pgstat_progress_start_command(PROGRESS_COMMAND_DTX_RECOVERY, InvalidOid);
+
 			AbortOrphanedPreparedTransactions();
+
+			pgstat_progress_end_command();
 		}
 
 		rc = WaitLatch(&MyProc->procLatch,

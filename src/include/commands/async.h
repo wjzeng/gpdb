@@ -20,7 +20,7 @@
 /*
  * The number of SLRU page buffers we use for the notification queue.
  */
-#define NUM_ASYNC_BUFFERS	8
+#define NUM_NOTIFY_BUFFERS	8
 
 extern bool Trace_notify;
 extern volatile sig_atomic_t notifyInterruptPending;
@@ -53,5 +53,6 @@ extern void HandleNotifyInterrupt(void);
 
 /* process interrupts */
 extern void ProcessNotifyInterrupt(void);
+extern void NotifyMyFrontEnd(const char *channel, const char *payload, int32 srcPid);
 
 #endif							/* ASYNC_H */

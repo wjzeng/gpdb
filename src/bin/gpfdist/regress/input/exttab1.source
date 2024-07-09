@@ -3,6 +3,7 @@
 -- exists in cdbunit.
 --
 set optimizer_print_missing_stats = off;
+show writable_external_table_bufsize;
 CREATE TABLE REG_REGION (R_REGIONKEY INT, R_NAME CHAR(25), R_COMMENT VARCHAR(152)) DISTRIBUTED BY (R_REGIONKEY);
 
 -- start_ignore
@@ -37,7 +38,7 @@ on SEGMENT 0
 FORMAT 'text' (delimiter '|');
 
 CREATE EXTERNAL WEB TABLE exttab1_gpfdist_start (x text)
-execute E'((@bindir@/gpfdist -p 7070 -d @abs_srcdir@/data  </dev/null >/dev/null 2>&1 &); for i in `seq 1 30`; do curl 127.0.0.1:7070 >/dev/null 2>&1 && break; sleep 1; done; echo "starting...") '
+execute E'((@bindir@/gpfdist -p 7070 -k 360 -d @abs_srcdir@/data  </dev/null >/dev/null 2>&1 &); for i in `seq 1 30`; do curl 127.0.0.1:7070 >/dev/null 2>&1 && break; sleep 1; done; echo "starting...") '
 on SEGMENT 0
 FORMAT 'text' (delimiter '|');
 
@@ -464,6 +465,7 @@ drop external table bad_location2;
 -- CREATE (including LIKE, DISTRIBUTED BY)
 --
 -- positive
+set writable_external_table_bufsize = 131072;
 create writable external table wet_pos1(a text, b text) location('gpfdist://@hostname@:7070/wet.out') format 'text';
 \d wet_pos1
 create writable external table wet_pos2(a text, b text) location('gpfdist://@hostname@:7070/wet.out') format 'text' distributed by(b);
@@ -487,7 +489,10 @@ COPY wet_region FROM STDIN DELIMITER '|';
 3|EUROPE|ly final courts cajole furiously final excuse
 \.
 INSERT INTO wet_region VALUES(4,'MIDDLE EAST','uickly special');
-
+-- Check error correctness, if trying to insert too long row
+-- Since the resumable download feature has been added to gpfdist, a too long row will not trigger error.
+INSERT INTO wet_pos1(a)
+SELECT string_agg(md5(random()::text), '') from generate_series(1,1100);
 --
 -- Now use RET to see if data was exported correctly.
 -- NOTE: since we don't bother cleaning up the exported file, it may grow bigger
@@ -566,6 +571,33 @@ DROP EXTERNAL TABLE ext_transform;
 -- get an error for missing gpfdist
 --
 select count(*) from ext_whois;
+
+
+-- Test external table sreh output in gp_read_error_log() print rawbytes with \0 in it.
+-- start_ignore
+select * from exttab1_gpfdist_stop;
+select * from exttab1_gpfdist_start;
+-- end_ignore
+-- sreh 1 text format with bad data.
+
+drop external table if exists external_sreh_bad_data_text;
+create external table external_sreh_bad_data_text(name text) location('gpfdist://@hostname@:7070/exttab1/bad_data.tbl') format 'text' log errors segment reject limit 3;
+select * from external_sreh_bad_data_text;
+select rawbytes from gp_read_error_log('external_sreh_bad_data_text');
+drop external table external_sreh_bad_data_text;
+
+-- sreh 2 custom format with bad data.
+drop external table if exists external_sreh_bad_data;
+create external table external_sreh_bad_data(name text) location('gpfdist://@hostname@:7070/exttab1/bad_data.tbl') format 'custom' (formatter='fixedwidth_in', name='5') log errors segment reject limit 3;
+select * from external_sreh_bad_data;
+select rawbytes from gp_read_error_log('external_sreh_bad_data');
+drop external table external_sreh_bad_data;
+
+
+-- start_ignore
+select * from exttab1_gpfdist_stop;
+-- end_ignore
+-- End Test external table sreh output in gp_read_error_log() print rawbytes with \0 in it.
 
 drop external table ext_whois;
 drop external table exttab1_gpfdist_start;

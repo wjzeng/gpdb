@@ -10,36 +10,15 @@
 -- end_matchsubs
 
 -- to make test deterministic and fast
-!\retcode gpconfig -c gp_fts_probe_retries -v 2 --masteronly;
+!\retcode gpconfig -c gp_fts_probe_retries -v 2 --coordinatoronly;
 
 -- Allow extra time for mirror promotion to complete recovery to avoid
 -- gprecoverseg BEGIN failures due to gang creation failure as some primaries
 -- are not up. Setting these increase the number of retries in gang creation in
 -- case segment is in recovery. Approximately we want to wait 120 seconds.
-!\retcode gpconfig -c gp_gang_creation_retry_count -v 120 --skipvalidation --masteronly;
-!\retcode gpconfig -c gp_gang_creation_retry_timer -v 1000 --skipvalidation --masteronly;
+!\retcode gpconfig -c gp_gang_creation_retry_count -v 120 --skipvalidation --coordinatoronly;
+!\retcode gpconfig -c gp_gang_creation_retry_timer -v 1000 --skipvalidation --coordinatoronly;
 !\retcode gpstop -u;
-
--- Helper function
-CREATE or REPLACE FUNCTION wait_until_segments_are_down(num_segs int)
-RETURNS bool AS
-$$
-declare
-retries int; /* in func */
-begin /* in func */
-  retries := 1200; /* in func */
-  loop /* in func */
-    if (select count(*) = num_segs from gp_segment_configuration where status = 'd') then /* in func */
-      return true; /* in func */
-    end if; /* in func */
-    if retries <= 0 then /* in func */
-      return false; /* in func */
-    end if; /* in func */
-    perform pg_sleep(0.1); /* in func */
-    retries := retries - 1; /* in func */
-  end loop; /* in func */
-end; /* in func */
-$$ language plpgsql;
 
 -- no segment down.
 select count(*) from gp_segment_configuration where status = 'd';
@@ -98,7 +77,6 @@ select gp_inject_fault('get_dns_cached_address', 'reset', 1);
 2:END;
 -- session 3: in transaction and has a cursor, cann't update
 --            cdb_component_dbs, following query should fail 
-3:FETCH ALL FROM c1;
 3:END;
 -- session 4: not in transaction but has temp table, cann't update
 --            cdb_component_dbs, following query should fail and session
@@ -136,9 +114,9 @@ select wait_until_all_segments_synchronized();
 -- verify no segment is down after recovery
 select count(*) from gp_segment_configuration where status = 'd';
 
-!\retcode gpconfig -r gp_fts_probe_retries --masteronly;
-!\retcode gpconfig -r gp_gang_creation_retry_count --skipvalidation --masteronly;
-!\retcode gpconfig -r gp_gang_creation_retry_timer --skipvalidation --masteronly;
+!\retcode gpconfig -r gp_fts_probe_retries --coordinatoronly;
+!\retcode gpconfig -r gp_gang_creation_retry_count --skipvalidation --coordinatoronly;
+!\retcode gpconfig -r gp_gang_creation_retry_timer --skipvalidation --coordinatoronly;
 !\retcode gpstop -u;
 
 

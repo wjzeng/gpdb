@@ -138,18 +138,16 @@ CCostContext::FNeedsNewStats() const
 		return false;
 	}
 
-#if 0
-	if (!m_pdpplan->Ppim()->FContainsUnresolved())
+	if (!m_poc->Prpp()->Pepp()->PppsRequired()->ContainsAnyConsumers())
 	{
 		// All partition selectors have been resolved at this level.
 		// No need to use DPE stats for the common ancestor join and
 		// nodes above it, that aren't affected by the partition selector.
 		return false;
 	}
-#endif
-	// GPDB_12_MERGE_FIXME: Re-enable this when DPE is re-implemented
+
 	if (GPOS_FTRACE(EopttraceDeriveStatsForDPE) && CUtils::FPhysicalScan(pop) &&
-		CPhysicalScan::PopConvert(pop)->FDynamicScan() && false)
+		CPhysicalScan::PopConvert(pop)->FDynamicScan())
 	{
 		// context is attached to a dynamic scan that went through
 		// partition elimination in another part of the plan
@@ -203,10 +201,8 @@ CCostContext::DeriveStats()
 	exprhdl.DeriveCostContextStats();
 	if (nullptr == exprhdl.Pstats())
 	{
-		GPOS_RAISE(
-			gpopt::ExmaGPOPT, gpopt::ExmiNoPlanFound,
-			GPOS_WSZ_LIT(
-				"Could not compute cost since statistics for the group no derived"));
+		GPOS_RAISE(gpopt::ExmaGPOPT, gpopt::ExmiNoStats,
+				   GPOS_WSZ_LIT("CCostContext"));
 	}
 
 	exprhdl.Pstats()->AddRef();
@@ -441,6 +437,46 @@ CCostContext::FBetterThan(const CCostContext *pcc) const
 		}
 	}
 
+	// if multistageAgg flag is true and the distribution type is not
+	// replicated/universal mark multistage agg plan is better and should
+	// override cost based check between multistage agg and singlestage
+	// agg.  When data distribution is universal or replicated, it means
+	// that the same data is available across all the nodes, there is no
+	// need for motions between nodes during aggregation. What if we force
+	// a multi-stage plan where no motion exists, we would get 2
+	// consecutive aggs that are redundant. So multi-stage aggregation may
+	// not be necessary in this scenario, instead single-stage aggregation
+	// approach can be used, where each node independently aggregates its
+	// local data and the final result is obtained by combining the local
+	// aggregates.
+	if (GPOS_FTRACE(EopttraceForceMultiStageAgg))
+	{
+		if ((IsMultiStageAggCostCtxt(pcc) && IsSingleStageAggCostCtxt(this)))
+		{
+			switch (Pdpplan()->Pds()->Edt())
+			{
+				case CDistributionSpec::EdtStrictReplicated:
+				case CDistributionSpec::EdtTaintedReplicated:
+				case CDistributionSpec::EdtUniversal:
+					return true;
+				default:
+					return false;
+			}
+		}
+		else if (IsSingleStageAggCostCtxt(pcc) && IsMultiStageAggCostCtxt(this))
+		{
+			switch (pcc->Pdpplan()->Pds()->Edt())
+			{
+				case CDistributionSpec::EdtStrictReplicated:
+				case CDistributionSpec::EdtTaintedReplicated:
+				case CDistributionSpec::EdtUniversal:
+					return false;
+				default:
+					return true;
+			}
+		}
+	}
+
 	DOUBLE dCostDiff = (Cost().Get() - pcc->Cost().Get());
 	if (dCostDiff < 0.0)
 	{
@@ -534,6 +570,30 @@ CCostContext::IsThreeStageScalarDQACostCtxt(const CCostContext *pcc)
 		GPOS_ASSERT_IMP(popAgg->IsThreeStageScalarDQA(),
 						popAgg->IsAggFromSplitDQA());
 		return (popAgg->IsAggFromSplitDQA() && popAgg->IsThreeStageScalarDQA());
+	}
+
+	return false;
+}
+
+BOOL
+CCostContext::IsMultiStageAggCostCtxt(const CCostContext *pcc)
+{
+	if (CUtils::FPhysicalAgg(pcc->Pgexpr()->Pop()))
+	{
+		CPhysicalAgg *popAgg = CPhysicalAgg::PopConvert(pcc->Pgexpr()->Pop());
+		return popAgg->FMultiStage();
+	}
+
+	return false;
+}
+
+BOOL
+CCostContext::IsSingleStageAggCostCtxt(const CCostContext *pcc)
+{
+	if (CUtils::FPhysicalAgg(pcc->Pgexpr()->Pop()))
+	{
+		CPhysicalAgg *popAgg = CPhysicalAgg::PopConvert(pcc->Pgexpr()->Pop());
+		return !popAgg->FMultiStage();
 	}
 
 	return false;

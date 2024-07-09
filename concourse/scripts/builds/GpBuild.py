@@ -13,7 +13,6 @@ class GpBuild:
         self.mode = 'on' if mode == 'orca' else 'off'
         self.configure_options =  [
                                     "--enable-gpcloud",
-                                    "--enable-mapreduce",
                                     "--enable-orafce",
                                     "--enable-tap-tests",
                                     "--with-gssapi",
@@ -21,6 +20,7 @@ class GpBuild:
                                     "--with-openssl",
                                     "--with-perl",
                                     "--with-python",
+                                    "--with-uuid=e2fs",
                                     # TODO: Remove this line as soon as zstd is built into Ubuntu docker image
                                     "--without-zstd",
                                     "--prefix={0}".format(INSTALL_DIR)
@@ -51,10 +51,10 @@ class GpBuild:
             cmd = source_env_cmd
         runcmd = "runuser gpadmin -c \"{0} && {1} \"".format(cmd, command)
         if print_command:
-            print "Executing {}".format(runcmd)
+            print("Executing {}".format(runcmd))
         return subprocess.call([runcmd], shell=True, stdout=stdout, stderr=stderr)
 
-    def run_explain_test_suite(self, dbexists):
+    def run_explain_test_suite(self, dbexists, num_segments):
         cmd = 'echo \\\\timing on>> /home/gpadmin/.psqlrc'
         self._run_cmd(cmd, "gpdb_src")
 
@@ -73,16 +73,19 @@ class GpBuild:
                 status = self._run_gpdb_command("psql -q -f stats.sql", stdout=f)
             if status:
                 with open("load_stats.txt", "r") as f:
-                    print f.read()
+                    print(f.read())
                 fail_on_error(status)
 
         # set gucs if any were specified
-        self._run_cmd("source gpdb_src/gpAux/gpdemo/gpdemo-env.sh && cat gporca-commits-to-test/optional_gucs.txt >> $COORDINATOR_DATA_DIRECTORY/postgresql.conf", None)
+        status = self._run_cmd("source gpdb_src/gpAux/gpdemo/gpdemo-env.sh && cat gporca-commits-to-test/optional_gucs.txt >> $COORDINATOR_DATA_DIRECTORY/postgresql.conf", None)
         fail_on_error(status)
-        # use 32 segments for explain tests (this number is fairly arbitrary, it might be better to make this dependent on the workload?)
-        self._run_cmd("source gpdb_src/gpAux/gpdemo/gpdemo-env.sh && echo 'optimizer_segments=32\ngp_segments_for_planner=32' >> $COORDINATOR_DATA_DIRECTORY/postgresql.conf", None)
+
+        command = "source gpdb_src/gpAux/gpdemo/gpdemo-env.sh && echo 'optimizer_segments={0}\ngp_segments_for_planner={0}' >> $COORDINATOR_DATA_DIRECTORY/postgresql.conf".format(num_segments)
+        print("Running command: " + command)
+        status = self._run_cmd(command, None)
+
         fail_on_error(status)
-        self._run_gpdb_command("gpstop -ar")
+        status = self._run_gpdb_command("gpstop -ar")
         fail_on_error(status)
 
         # Now run the queries !!
@@ -94,10 +97,10 @@ class GpBuild:
             if fsql.endswith('.sql') and fsql not in ['stats.sql', 'schema.sql']:
                 output_fname = 'out/{}'.format(fsql.replace('.sql', '.out'))
                 with open(output_fname, 'w') as fout:
-                    print "Running query: " + fsql
+                    print("Running query: " + fsql)
                     current_status = self._run_gpdb_command("psql -a -f sql/{}".format(fsql), stdout=fout, stderr=fout, source_env_cmd=source_env_cmd, print_command=False)
                     if current_status != 0:
-                        print "ERROR: {0}".format(current_status)
+                        print("ERROR: {0}".format(current_status))
                     status = status if status != 0 else current_status
 
         return status

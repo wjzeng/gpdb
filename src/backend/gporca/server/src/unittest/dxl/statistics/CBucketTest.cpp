@@ -101,12 +101,14 @@ CBucketTest::EresUnittest_CBucketInt4()
 		mp, 1, 1, CDouble(1.0), CDouble(1.0));
 	CCardinalityTestUtils::PrintBucket(mp, "b1", bucket1);
 
-	GPOS_RTL_ASSERT_MSG(bucket1->Contains(point1), "[1,1] must contain 1");
-	GPOS_RTL_ASSERT_MSG(CDouble(1.0) == bucket1->GetOverlapPercentage(
-											point1, true /*include_point*/),
-						"overlap of 1 in [1,1] must 1.0");
+	GPOS_UNITTEST_ASSERT_MSG(bucket1->Contains(point1), "[1,1] must contain 1");
+	GPOS_UNITTEST_ASSERT_MSG(
+		CDouble(1.0) ==
+			bucket1->GetOverlapPercentage(point1, true /*include_point*/),
+		"overlap of 1 in [1,1] must 1.0");
 
-	GPOS_RTL_ASSERT_MSG(!bucket1->Contains(point2), "[1,1] must not contain 2");
+	GPOS_UNITTEST_ASSERT_MSG(!bucket1->Contains(point2),
+							 "[1,1] must not contain 2");
 
 	// bucket [1,3)
 	CBucket *bucket2 = CCardinalityTestUtils::PbucketIntegerClosedLowerBound(
@@ -116,7 +118,7 @@ CBucketTest::EresUnittest_CBucketInt4()
 	// overlap of [1,2) w.r.t [1,3) should be about 50%
 	CDouble overlap =
 		bucket2->GetOverlapPercentage(point2, false /*include_point*/);
-	GPOS_RTL_ASSERT(0.49 <= overlap && overlap <= 0.51);
+	GPOS_UNITTEST_ASSERT(0.49 <= overlap && overlap <= 0.51);
 
 	// bucket [1,10)
 	CBucket *bucket3 = GPOS_NEW(mp)
@@ -140,31 +142,31 @@ CBucketTest::EresUnittest_CBucketInt4()
 	// overlap of [1,4) w.r.t [1,10] should be about 30%
 	CDouble overlap_open =
 		bucket3->GetOverlapPercentage(point4, false /*include_point*/);
-	GPOS_RTL_ASSERT(0.29 <= overlap_open && overlap_open <= 0.31);
+	GPOS_UNITTEST_ASSERT(0.29 <= overlap_open && overlap_open <= 0.31);
 	// overlap of [1,4] w.r.t [1,10] should be about 40%
 	CDouble overlap_closed =
 		bucket3->GetOverlapPercentage(point4, true /*include_point*/);
-	GPOS_RTL_ASSERT(0.39 <= overlap_closed && overlap_closed <= 0.41);
+	GPOS_UNITTEST_ASSERT(0.39 <= overlap_closed && overlap_closed <= 0.41);
 	// overlap of [1,10) w.r.t [1,10] should be about 90%
 	CDouble overlap_bound =
 		bucket3->GetOverlapPercentage(point10, false /*include_point*/);
-	GPOS_RTL_ASSERT(0.89 <= overlap_bound && overlap_bound <= 0.91);
+	GPOS_UNITTEST_ASSERT(0.89 <= overlap_bound && overlap_bound <= 0.91);
 	// overlap of (1,3) w.r.t (1,5) should be about 33%
 	CDouble overlap_open2 =
 		bucket4->GetOverlapPercentage(point3, false /*include_point*/);
-	GPOS_RTL_ASSERT(0.32 <= overlap_open2 && overlap_open2 <= 0.34);
+	GPOS_UNITTEST_ASSERT(0.32 <= overlap_open2 && overlap_open2 <= 0.34);
 	// overlap of [1,3) w.r.t [1,5) should be about 50%
 	CDouble overlap_closed2 =
 		bucket5->GetOverlapPercentage(point3, false /*include_point*/);
-	GPOS_RTL_ASSERT(0.49 <= overlap_closed2 && overlap_closed2 <= 0.51);
+	GPOS_UNITTEST_ASSERT(0.49 <= overlap_closed2 && overlap_closed2 <= 0.51);
 
 	// subsumption
-	GPOS_RTL_ASSERT(bucket1->Subsumes(bucket1));
-	GPOS_RTL_ASSERT(bucket2->Subsumes(bucket1));
+	GPOS_UNITTEST_ASSERT(bucket1->Subsumes(bucket1));
+	GPOS_UNITTEST_ASSERT(bucket2->Subsumes(bucket1));
 
 	// width
 	CDouble width = bucket1->Width();
-	GPOS_RTL_ASSERT(0.99 <= width && width <= 1.01);
+	GPOS_UNITTEST_ASSERT(0.99 <= width && width <= 1.01);
 
 	// bucket [1,2] and (2,4)
 	CBucket *pbucket3 = CCardinalityTestUtils::PbucketInteger(
@@ -173,11 +175,12 @@ CBucketTest::EresUnittest_CBucketInt4()
 		mp, 2, 4, false, false, CDouble(1.0), CDouble(1.0));
 
 	// point IsBefore
-	GPOS_RTL_ASSERT_MSG(pbucket4->IsBefore(point2), "2 must be before (2,4)");
+	GPOS_UNITTEST_ASSERT_MSG(pbucket4->IsBefore(point2),
+							 "2 must be before (2,4)");
 
 	// bucket IsBefore
-	GPOS_RTL_ASSERT_MSG(pbucket3->IsBefore(pbucket4),
-						"[1,2] must be before (2,4)");
+	GPOS_UNITTEST_ASSERT_MSG(pbucket3->IsBefore(pbucket4),
+							 "[1,2] must be before (2,4)");
 
 	point1->Release();
 	point2->Release();
@@ -211,14 +214,15 @@ CBucketTest::EresUnittest_CBucketBool()
 	CBucket *bucket =
 		CCardinalityTestUtils::PbucketSingletonBoolVal(mp, true, CDouble(1.0));
 
-	GPOS_RTL_ASSERT_MSG(bucket->Contains(p1), "true bucket must contain true");
-	GPOS_RTL_ASSERT_MSG(CDouble(1.0) == bucket->GetOverlapPercentage(p1),
-						"overlap must 1.0");
+	GPOS_UNITTEST_ASSERT_MSG(bucket->Contains(p1),
+							 "true bucket must contain true");
+	GPOS_UNITTEST_ASSERT_MSG(CDouble(1.0) == bucket->GetOverlapPercentage(p1),
+							 "overlap must 1.0");
 
-	GPOS_RTL_ASSERT_MSG(!bucket->Contains(p2),
-						"true bucket must not contain false");
-	GPOS_RTL_ASSERT_MSG(CDouble(0.0) == bucket->GetOverlapPercentage(p2),
-						"overlap must 0.0");
+	GPOS_UNITTEST_ASSERT_MSG(!bucket->Contains(p2),
+							 "true bucket must not contain false");
+	GPOS_UNITTEST_ASSERT_MSG(CDouble(0.0) == bucket->GetOverlapPercentage(p2),
+							 "overlap must 0.0");
 
 	p1->Release();
 	p2->Release();
@@ -247,25 +251,25 @@ CBucketTest::EresUnittest_CBucketScale()
 		bucket1->MakeBucketScaleUpper(mp, point1, false /* include_upper */);
 
 	// new bucket [1, 10) must not contain 10
-	GPOS_RTL_ASSERT(!bucket2->Contains(point1));
+	GPOS_UNITTEST_ASSERT(!bucket2->Contains(point1));
 
 	// new bucket [1, 10) must contain 9
 	CPoint *point2 = CTestUtils::PpointInt4(mp, 9);
-	GPOS_RTL_ASSERT(bucket2->Contains(point2));
+	GPOS_UNITTEST_ASSERT(bucket2->Contains(point2));
 	point2->Release();
 
 	// new bucket's frequency and distinct values must be lesser than original
-	GPOS_RTL_ASSERT(bucket2->GetFrequency() < bucket1->GetFrequency());
-	GPOS_RTL_ASSERT(bucket2->GetNumDistinct() < bucket1->GetNumDistinct());
+	GPOS_UNITTEST_ASSERT(bucket2->GetFrequency() < bucket1->GetFrequency());
+	GPOS_UNITTEST_ASSERT(bucket2->GetNumDistinct() < bucket1->GetNumDistinct());
 
 	// scale lower
 	CBucket *pbucket3 =
 		bucket1->MakeBucketScaleLower(mp, point1, true /* include_lower */);
-	GPOS_RTL_ASSERT(pbucket3->Contains(point1));
+	GPOS_UNITTEST_ASSERT(pbucket3->Contains(point1));
 
 	// scale to a singleton
 	CBucket *pbucket4 = bucket1->MakeBucketSingleton(mp, point1);
-	GPOS_RTL_ASSERT(pbucket4->GetNumDistinct() < 2.0);
+	GPOS_UNITTEST_ASSERT(pbucket4->GetNumDistinct() < 2.0);
 
 	// clean up
 	point1->Release();
@@ -300,16 +304,16 @@ CBucketTest::EresUnittest_CBucketDifference()
 	CBucket *pbucket4 = nullptr;
 	CBucket *pbucket5 = nullptr;
 	bucket1->Difference(mp, bucket2, &pbucket4, &pbucket5);
-	GPOS_RTL_ASSERT(nullptr != pbucket4);
-	GPOS_RTL_ASSERT(nullptr != pbucket5);
+	GPOS_UNITTEST_ASSERT(nullptr != pbucket4);
+	GPOS_UNITTEST_ASSERT(nullptr != pbucket5);
 	CCardinalityTestUtils::PrintBucket(mp, "pbucket4", pbucket4);
 	CCardinalityTestUtils::PrintBucket(mp, "pbucket5", pbucket4);
 
 	CBucket *pbucket6 = nullptr;
 	CBucket *pbucket7 = nullptr;
 	bucket1->Difference(mp, pbucket3, &pbucket6, &pbucket7);
-	GPOS_RTL_ASSERT(nullptr != pbucket6);
-	GPOS_RTL_ASSERT(nullptr == pbucket7);
+	GPOS_UNITTEST_ASSERT(nullptr != pbucket6);
+	GPOS_UNITTEST_ASSERT(nullptr == pbucket7);
 	CCardinalityTestUtils::PrintBucket(mp, "pbucket6", pbucket6);
 
 	GPOS_DELETE(bucket1);
@@ -331,50 +335,86 @@ CBucketTest::EresUnittest_CBucketIntersect()
 	CMemoryPool *mp = amp.Pmp();
 
 	SBucketsIntersectTestElem rgBucketsIntersectTestElem[] = {
-		{7, 203, true, true, 3, 213, true, true, true, 7, 203, true,
-		 true},	 // overlaps
-		{3, 213, true, true, 7, 203, true, true, true, 7, 203, true,
-		 true},	 // same as above but reversed
+		{7, 203, true, true, CDouble(0.1), CDouble(100), 3, 213, true, true,
+		 CDouble(0.1), CDouble(100), true, 7, 203, true, true,
+		 CDouble(9.33e-05), CDouble(93.33)},  // overlaps
+		{3, 213, true, true, CDouble(0.1), CDouble(100), 7, 203, true, true,
+		 CDouble(0.1), CDouble(100), true, 7, 203, true, true,
+		 CDouble(9.33e-05), CDouble(93.33)},  // same as above but reversed
+		{13, 103, true, true, CDouble(0.1), CDouble(100), 2, 98, true, true,
+		 CDouble(0.1), CDouble(100), true, 13, 98, true, true,
+		 CDouble(8.85e-05), CDouble(88.54)},  // subsumes
+		{2, 99, true, true, CDouble(0.1), CDouble(100.0), 13, 103, true, true,
+		 CDouble(0.1), CDouble(100), true, 13, 99, true, true,
+		 CDouble(8.87e-05), CDouble(88.66)},  // same as above but reversed
+		{0, 5, true, true, CDouble(0.1), CDouble(100), 10, 15, false, true,
+		 CDouble(0.1), CDouble(100), false, -1, -1, false, false, CDouble(0.1),
+		 CDouble(100)},	 // negative
+		{10, 15, true, true, CDouble(0.1), CDouble(100), 0, 5, false, true,
+		 CDouble(0.1), CDouble(100), false, -1, -1, false, false, CDouble(0.1),
+		 CDouble(100)},	 // same as above but reversed
+		{0, 5, true, true, CDouble(0.1), CDouble(100), 5, 10, true, true,
+		 CDouble(0.1), CDouble(100), true, 5, 5, true, true, CDouble(2.00e-05),
+		 CDouble(
+			 20)},	// ub of one bucket is the same as lb of the other and both bounds are closed
+		{5, 10, true, true, CDouble(0.1), CDouble(100), 0, 5, true, true,
+		 CDouble(0.1), CDouble(100), true, 5, 5, true, true, CDouble(2.00e-05),
+		 CDouble(20)},	// same as above but reversed
+		{0, 5, true, true, CDouble(0.1), CDouble(100), 5, 10, false, true,
+		 CDouble(0.1), CDouble(100), false, -1, -1, false, false, CDouble(0.1),
+		 CDouble(
+			 100)},	 // ub of one bucket is the same as lb of the other but closing criteria are different
+		{5, 10, false, true, CDouble(0.1), CDouble(100), 0, 5, true, true,
+		 CDouble(0.1), CDouble(100), false, -1, -1, false, false, CDouble(0.1),
+		 CDouble(100)},	 // same as above but reversed
+		{0, 5, true, true, CDouble(0.1), CDouble(100), 0, 5, false, true,
+		 CDouble(0.1), CDouble(100), true, 0, 5, false, true,
+		 CDouble(0.00010000000000000002),
+		 CDouble(100)},	 // exact match but only differ in closure of lb
+		{0, 5, true, true, CDouble(0.1), CDouble(100), 0, 5, true, true,
+		 CDouble(0.1), CDouble(100), true, 0, 5, true, true,
+		 CDouble(0.00010000000000000002),
+		 CDouble(100)},	 // exact match with all bounds closed
+		{0, 5, true, false, CDouble(0.1), CDouble(100), 0, 5, true, false,
+		 CDouble(0.1), CDouble(100), true, 0, 5, true, false,
+		 CDouble(0.00010000000000000002),
+		 CDouble(100)},	 // exact match with ubs open
+		{0, 5, false, false, CDouble(0.1), CDouble(100), 0, 5, true, false,
+		 CDouble(0.1), CDouble(100), true, 0, 5, false, false,
+		 CDouble(0.00010000000000000002),
+		 CDouble(100)},	 // exact match with lbs differ in closure
 		{
-			13,
-			103,
+			0,
+			5,
 			true,
 			true,
-			2,
-			98,
+			CDouble(0.1),
+			CDouble(100),
+			0,
+			5,
 			true,
+			false,
+			CDouble(0.1),
+			CDouble(100),
 			true,
+			0,
+			5,
 			true,
-			13,
-			98,
-			true,
-			true,
-		},	// subsumes
-		{2, 99, true, true, 13, 103, true, true, true, 13, 99, true,
-		 true},	 // same as above but reversed
-		{0, 5, true, true, 10, 15, false, true, false, -1, -1, false,
-		 false},  // negative
-		{10, 15, true, true, 0, 5, false, true, false, -1, -1, false,
-		 false},  // same as above but reversed
-		{0, 5, true, true, 5, 10, true, true, true, 5, 5, true,
-		 true},	 // ub of one bucket is the same as lb of the other and both bounds are closed
-		{5, 10, true, true, 0, 5, true, true, true, 5, 5, true,
-		 true},	 // same as above but reversed
-		{0, 5, true, true, 5, 10, false, true, false, -1, -1, false,
-		 false},  // ub of one bucket is the same as lb of the other but closing criteria are different
-		{5, 10, false, true, 0, 5, true, true, false, -1, -1, false,
-		 false},  // same as above but reversed
-		{0, 5, true, true, 0, 5, false, true, true, 0, 5, false,
-		 true},	 // exact match but only differ in closure of lb
-		{0, 5, true, true, 0, 5, true, true, true, 0, 5, true,
-		 true},	 // exact match with all bounds closed
-		{0, 5, true, false, 0, 5, true, false, true, 0, 5, true,
-		 false},  // exact match with ubs open
-		{0, 5, false, false, 0, 5, true, false, true, 0, 5, false,
-		 false},  // exact match with lbs differ in closure
-		{0, 5, true, true, 0, 5, true, false, true, 0, 5, true,
-		 false},  // exact match with ubs differ in closure
-	};
+			false,
+			CDouble(0.00010000000000000002),
+			CDouble(100),
+		},	// exact match with ubs differ in closure
+		{
+			0, 5,	 true,	true,		CDouble(0), CDouble(0), 0,
+			5, true, false, CDouble(0), CDouble(0), true,		0,
+			5, true, false, CDouble(0), CDouble(0),
+		},	// overlaps but both buckets are empty
+		{
+			0, 5,	 true,	true,		CDouble(0.1), CDouble(100), 0,
+			5, true, false, CDouble(0), CDouble(0),	  true,			0,
+			5, true, false, CDouble(0), CDouble(0),
+		},
+	};	// overlaps but one bucket is empty
 
 	const ULONG length = GPOS_ARRAY_SIZE(rgBucketsIntersectTestElem);
 	for (ULONG ul = 0; ul < length; ul++)
@@ -383,15 +423,17 @@ CBucketTest::EresUnittest_CBucketIntersect()
 			mp, rgBucketsIntersectTestElem[ul].m_iLb1,
 			rgBucketsIntersectTestElem[ul].m_iUb1,
 			rgBucketsIntersectTestElem[ul].m_fLb1Closed,
-			rgBucketsIntersectTestElem[ul].m_fUb1Closed, CDouble(0.1),
-			CDouble(100.0));
+			rgBucketsIntersectTestElem[ul].m_fUb1Closed,
+			rgBucketsIntersectTestElem[ul].m_frequency1,
+			rgBucketsIntersectTestElem[ul].m_distinct1);
 
 		CBucket *bucket2 = CCardinalityTestUtils::PbucketInteger(
 			mp, rgBucketsIntersectTestElem[ul].m_iLb2,
 			rgBucketsIntersectTestElem[ul].m_iUb2,
 			rgBucketsIntersectTestElem[ul].m_fLb2Closed,
-			rgBucketsIntersectTestElem[ul].m_fUb2Closed, CDouble(0.1),
-			CDouble(100.0));
+			rgBucketsIntersectTestElem[ul].m_fUb2Closed,
+			rgBucketsIntersectTestElem[ul].m_frequency2,
+			rgBucketsIntersectTestElem[ul].m_distinct2);
 
 		BOOL result = bucket1->Intersects(bucket2);
 
@@ -411,10 +453,11 @@ CBucketTest::EresUnittest_CBucketIntersect()
 				mp, rgBucketsIntersectTestElem[ul].m_iLbOutput,
 				rgBucketsIntersectTestElem[ul].m_iUbOutput,
 				rgBucketsIntersectTestElem[ul].m_fLbOutputClosed,
-				rgBucketsIntersectTestElem[ul].m_fUbOutputClosed, CDouble(0.1),
-				CDouble(100.0));
+				rgBucketsIntersectTestElem[ul].m_fUbOutputClosed,
+				rgBucketsIntersectTestElem[ul].m_frequencyOutput,
+				rgBucketsIntersectTestElem[ul].m_distinctOutput);
 
-			BOOL fMatch = FMatchBucketBoundary(pbucketOuput, pbucketExpected);
+			BOOL fMatch = FMatchBucket(pbucketOuput, pbucketExpected);
 
 			if (!fMatch)
 			{
@@ -447,12 +490,12 @@ CBucketTest::EresUnittest_CBucketIntersect()
 }
 
 
-// do the bucket boundaries match
+// do the bucket boundaries, frequencies and NDVs match
 BOOL
-CBucketTest::FMatchBucketBoundary(CBucket *bucket1, CBucket *bucket2)
+CBucketTest::FMatchBucket(CBucket *bucket1, CBucket *bucket2)
 {
-	GPOS_ASSERT(nullptr != bucket1);
-	GPOS_ASSERT(nullptr != bucket2);
+	GPOS_UNITTEST_ASSERT(nullptr != bucket1);
+	GPOS_UNITTEST_ASSERT(nullptr != bucket2);
 
 	if (bucket1->IsLowerClosed() != bucket2->IsLowerClosed())
 	{
@@ -460,6 +503,17 @@ CBucketTest::FMatchBucketBoundary(CBucket *bucket1, CBucket *bucket2)
 	}
 
 	if (bucket1->IsUpperClosed() != bucket2->IsUpperClosed())
+	{
+		return false;
+	}
+
+	if (fabs((bucket1->GetFrequency() - bucket2->GetFrequency()).Get()) >
+		CStatistics::Epsilon)
+	{
+		return false;
+	}
+
+	if (fabs((bucket1->GetNumDistinct() - bucket2->GetNumDistinct()).Get()) > 1)
 	{
 		return false;
 	}
@@ -505,15 +559,15 @@ CBucketTest::EresUnittest_CBucketMergeCommutativityUnion()
 		mp, bucket1, 600, 1000, &bucket1_new2, &bucket2_new2, &result_rows2,
 		false /*is_union_all*/);
 
-	GPOS_ASSERT(result1->Equals(result2));
+	GPOS_UNITTEST_ASSERT(result1->Equals(result2));
 
 	if (nullptr != bucket1_new1)
 	{
-		GPOS_ASSERT(bucket1_new1->Equals(bucket2_new2));
+		GPOS_UNITTEST_ASSERT(bucket1_new1->Equals(bucket2_new2));
 	}
 	else if (nullptr != bucket2_new1)
 	{
-		GPOS_ASSERT(bucket2_new1->Equals(bucket1_new2));
+		GPOS_UNITTEST_ASSERT(bucket2_new1->Equals(bucket1_new2));
 	}
 
 	GPOS_DELETE(bucket1);
@@ -561,7 +615,7 @@ CBucketTest::EresUnittest_CBucketMergeCommutativitySameLowerBounds()
 		mp, bucket2, 1000, 600, &bucket1_new1, &bucket2_new1, &result_rows1,
 		false /*is_union_all*/);
 
-	GPOS_ASSERT(bucket2->Equals(bucket2_new1));
+	GPOS_UNITTEST_ASSERT(bucket2->Equals(bucket2_new1));
 
 	CBucket *bucket1_new2 = nullptr;
 	CBucket *bucket2_new2 = nullptr;
@@ -570,17 +624,17 @@ CBucketTest::EresUnittest_CBucketMergeCommutativitySameLowerBounds()
 		mp, bucket1, 600, 1000, &bucket1_new2, &bucket2_new2, &result_rows2,
 		false /*is_union_all*/);
 
-	GPOS_ASSERT(result1->Equals(result2));
-	GPOS_ASSERT(result1->IsSingleton());
-	GPOS_ASSERT(result2->IsSingleton());
+	GPOS_UNITTEST_ASSERT(result1->Equals(result2));
+	GPOS_UNITTEST_ASSERT(result1->IsSingleton());
+	GPOS_UNITTEST_ASSERT(result2->IsSingleton());
 
 	if (nullptr != bucket1_new1)
 	{
-		GPOS_ASSERT(bucket1_new1->Equals(bucket2_new2));
+		GPOS_UNITTEST_ASSERT(bucket1_new1->Equals(bucket2_new2));
 	}
 	else if (nullptr != bucket2_new1)
 	{
-		GPOS_ASSERT(bucket2_new1->Equals(bucket1_new2));
+		GPOS_UNITTEST_ASSERT(bucket2_new1->Equals(bucket1_new2));
 	}
 
 	GPOS_DELETE(bucket1);
@@ -628,7 +682,7 @@ CBucketTest::EresUnittest_CBucketMergeCommutativitySameUpperBounds()
 		mp, bucket2, 1000, 600, &bucket1_new1, &bucket2_new1, &result_rows1,
 		false /*is_union_all*/);
 
-	GPOS_ASSERT(bucket2_new1->IsSingleton());
+	GPOS_UNITTEST_ASSERT(bucket2_new1->IsSingleton());
 
 	CBucket *bucket1_new2 = nullptr;
 	CBucket *bucket2_new2 = nullptr;
@@ -637,17 +691,17 @@ CBucketTest::EresUnittest_CBucketMergeCommutativitySameUpperBounds()
 		mp, bucket1, 600, 1000, &bucket1_new2, &bucket2_new2, &result_rows2,
 		false /*is_union_all*/);
 
-	GPOS_ASSERT(bucket1_new2->IsSingleton());
+	GPOS_UNITTEST_ASSERT(bucket1_new2->IsSingleton());
 
-	GPOS_ASSERT(result1->Equals(result2));
+	GPOS_UNITTEST_ASSERT(result1->Equals(result2));
 
 	if (nullptr != bucket1_new1)
 	{
-		GPOS_ASSERT(bucket1_new1->Equals(bucket2_new2));
+		GPOS_UNITTEST_ASSERT(bucket1_new1->Equals(bucket2_new2));
 	}
 	else if (nullptr != bucket2_new1)
 	{
-		GPOS_ASSERT(bucket2_new1->Equals(bucket1_new2));
+		GPOS_UNITTEST_ASSERT(bucket2_new1->Equals(bucket1_new2));
 	}
 
 	GPOS_DELETE(bucket1);
@@ -694,15 +748,15 @@ CBucketTest::EresUnittest_CBucketMergeCommutativityUnionAll()
 		mp, bucket1, 600, 1000, &bucket1_new2, &bucket2_new2, &result_rows2,
 		true /*is_union_all*/);
 
-	GPOS_ASSERT(result1->Equals(result2));
+	GPOS_UNITTEST_ASSERT(result1->Equals(result2));
 
 	if (nullptr != bucket1_new1)
 	{
-		GPOS_ASSERT(bucket1_new1->Equals(bucket2_new2));
+		GPOS_UNITTEST_ASSERT(bucket1_new1->Equals(bucket2_new2));
 	}
 	else if (nullptr != bucket2_new1)
 	{
-		GPOS_ASSERT(bucket2_new1->Equals(bucket1_new2));
+		GPOS_UNITTEST_ASSERT(bucket2_new1->Equals(bucket1_new2));
 	}
 
 	GPOS_DELETE(bucket1);
@@ -760,15 +814,15 @@ CBucketTest::EresUnittest_CBucketMergeCommutativityDoubleDatum()
 		mp, bucket1, 600, 1000, &bucket1_new2, &bucket2_new2, &result_rows2,
 		false /*is_union_all*/);
 
-	GPOS_ASSERT(result1->Equals(result2));
+	GPOS_UNITTEST_ASSERT(result1->Equals(result2));
 
 	if (nullptr != bucket1_new1)
 	{
-		GPOS_ASSERT(bucket1_new1->Equals(bucket2_new2));
+		GPOS_UNITTEST_ASSERT(bucket1_new1->Equals(bucket2_new2));
 	}
 	else if (nullptr != bucket2_new1)
 	{
-		GPOS_ASSERT(bucket2_new1->Equals(bucket1_new2));
+		GPOS_UNITTEST_ASSERT(bucket2_new1->Equals(bucket1_new2));
 	}
 
 	GPOS_DELETE(bucket1);
@@ -827,15 +881,15 @@ CBucketTest::EresUnittest_CBucketMergeCommutativityDoubleDatumSameLowerBounds()
 		mp, bucket1, 600, 1000, &bucket1_new2, &bucket2_new2, &result_rows2,
 		false /*is_union_all*/);
 
-	GPOS_ASSERT(result1->Equals(result2));
+	GPOS_UNITTEST_ASSERT(result1->Equals(result2));
 
 	if (nullptr != bucket1_new1)
 	{
-		GPOS_ASSERT(bucket1_new1->Equals(bucket2_new2));
+		GPOS_UNITTEST_ASSERT(bucket1_new1->Equals(bucket2_new2));
 	}
 	else if (nullptr != bucket2_new1)
 	{
-		GPOS_ASSERT(bucket2_new1->Equals(bucket1_new2));
+		GPOS_UNITTEST_ASSERT(bucket2_new1->Equals(bucket1_new2));
 	}
 
 	GPOS_DELETE(bucket1);
@@ -894,15 +948,15 @@ CBucketTest::EresUnittest_CBucketMergeCommutativityDoubleDatumSameUpperBounds()
 		mp, bucket1, 600, 1000, &bucket1_new2, &bucket2_new2, &result_rows2,
 		false /*is_union_all*/);
 
-	GPOS_ASSERT(result1->Equals(result2));
+	GPOS_UNITTEST_ASSERT(result1->Equals(result2));
 
 	if (nullptr != bucket1_new1)
 	{
-		GPOS_ASSERT(bucket1_new1->Equals(bucket2_new2));
+		GPOS_UNITTEST_ASSERT(bucket1_new1->Equals(bucket2_new2));
 	}
 	else if (nullptr != bucket2_new1)
 	{
-		GPOS_ASSERT(bucket2_new1->Equals(bucket1_new2));
+		GPOS_UNITTEST_ASSERT(bucket2_new1->Equals(bucket1_new2));
 	}
 
 	GPOS_DELETE(bucket1);

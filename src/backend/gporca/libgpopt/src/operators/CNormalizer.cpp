@@ -17,7 +17,9 @@
 #include "gpopt/base/COptCtxt.h"
 #include "gpopt/base/CUtils.h"
 #include "gpopt/operators/CLogical.h"
+#include "gpopt/operators/CLogicalConstTableGet.h"
 #include "gpopt/operators/CLogicalInnerJoin.h"
+#include "gpopt/operators/CLogicalLeftOuterCorrelatedApply.h"
 #include "gpopt/operators/CLogicalLeftOuterJoin.h"
 #include "gpopt/operators/CLogicalNAryJoin.h"
 #include "gpopt/operators/CLogicalProject.h"
@@ -863,6 +865,21 @@ CNormalizer::PushThruJoin(CMemoryPool *mp, CExpression *pexprJoin,
 		return;
 	}
 
+	// if we have an nary join with only inner joins and a false scalar condition,
+	// simplify the expression to a constant false. Trying to normalize this would
+	// improperly cause the scalar condition to be pulled into one of the predicates,
+	// and leave the condition as a const false
+	if (popNAryJoin && !fMixedInnerOuterJoin &&
+		CUtils::FScalarConstFalse(pexprConj))
+	{
+		COperator *popCTG = GPOS_NEW(mp) CLogicalConstTableGet(
+			mp, pexprJoin->DeriveOutputColumns()->Pdrgpcr(mp),
+			GPOS_NEW(mp) IDatum2dArray(mp));
+		*ppexprResult = GPOS_NEW(mp) CExpression(mp, popCTG);
+
+		return;
+	}
+
 	// combine conjunct with join predicate
 	CExpression *pexprScalar = (*pexprJoin)[arity - 1];
 	if (fMixedInnerOuterJoin)
@@ -1078,7 +1095,6 @@ CNormalizer::PushThru(CMemoryPool *mp, CExpression *pexprLogical,
 		case COperator::EopLogicalInnerCorrelatedApply:
 		case COperator::EopLogicalLeftOuterJoin:
 		case COperator::EopLogicalLeftOuterApply:
-		case COperator::EopLogicalLeftOuterCorrelatedApply:
 		case COperator::EopLogicalLeftSemiApply:
 		case COperator::EopLogicalLeftSemiApplyIn:
 		case COperator::EopLogicalLeftSemiCorrelatedApplyIn:
@@ -1088,9 +1104,19 @@ CNormalizer::PushThru(CMemoryPool *mp, CExpression *pexprLogical,
 		case COperator::EopLogicalLeftSemiJoin:
 			PushThruJoin(mp, pexprLogical, pexprConj, ppexprResult);
 			break;
-
+		case COperator::EopLogicalLeftOuterCorrelatedApply:
 		default:
 		{
+			if (COperator::EopLogicalLeftOuterCorrelatedApply ==
+					pexprLogical->Pop()->Eopid() &&
+				CLogicalLeftOuterCorrelatedApply::PopConvert(
+					pexprLogical->Pop())
+					->IsPredicatePushDownAllowed())
+			{
+				PushThruJoin(mp, pexprLogical, pexprConj, ppexprResult);
+				break;
+			}
+
 			// can't push predicates through, start a new normalization path
 			CExpression *pexprNormalized =
 				PexprRecursiveNormalize(mp, pexprLogical);

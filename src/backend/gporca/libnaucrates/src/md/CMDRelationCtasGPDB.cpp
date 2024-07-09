@@ -28,7 +28,7 @@ using namespace gpmd;
 //---------------------------------------------------------------------------
 CMDRelationCtasGPDB::CMDRelationCtasGPDB(
 	CMemoryPool *mp, IMDId *mdid, CMDName *mdname_schema, CMDName *mdname,
-	BOOL fTemporary, BOOL fHasOids, Erelstoragetype rel_storage_type,
+	BOOL fTemporary, Erelstoragetype rel_storage_type,
 	Ereldistrpolicy rel_distr_policy, CMDColumnArray *mdcol_array,
 	ULongPtrArray *distr_col_array, IMdIdArray *distr_opfamiles,
 	IMdIdArray *distr_opclasses, ULongPtr2dArray *keyset_array,
@@ -39,7 +39,6 @@ CMDRelationCtasGPDB::CMDRelationCtasGPDB(
 	  m_mdname_schema(mdname_schema),
 	  m_mdname(mdname),
 	  m_is_temp_table(fTemporary),
-	  m_has_oids(fHasOids),
 	  m_rel_storage_type(rel_storage_type),
 	  m_rel_distr_policy(rel_distr_policy),
 	  m_md_col_array(mdcol_array),
@@ -85,8 +84,6 @@ CMDRelationCtasGPDB::CMDRelationCtasGPDB(
 
 		m_col_width_array->Append(GPOS_NEW(mp) CDouble(mdcol->Length()));
 	}
-	m_dxl_str = CDXLUtils::SerializeMDObj(
-		m_mp, this, false /*fSerializeHeader*/, false /*indentation*/);
 }
 
 //---------------------------------------------------------------------------
@@ -101,7 +98,10 @@ CMDRelationCtasGPDB::~CMDRelationCtasGPDB()
 {
 	GPOS_DELETE(m_mdname_schema);
 	GPOS_DELETE(m_mdname);
-	GPOS_DELETE(m_dxl_str);
+	if (nullptr != m_dxl_str)
+	{
+		GPOS_DELETE(m_dxl_str);
+	}
 	m_mdid->Release();
 	m_md_col_array->Release();
 	m_keyset_array->Release();
@@ -113,6 +113,17 @@ CMDRelationCtasGPDB::~CMDRelationCtasGPDB()
 	m_vartypemod_array->Release();
 	m_distr_opfamilies->Release();
 	m_distr_opclasses->Release();
+}
+
+const CWStringDynamic *
+CMDRelationCtasGPDB::GetStrRepr()
+{
+	if (nullptr == m_dxl_str)
+	{
+		m_dxl_str = CDXLUtils::SerializeMDObj(
+			m_mp, this, false /*fSerializeHeader*/, false /*indentation*/);
+	}
+	return m_dxl_str;
 }
 
 //---------------------------------------------------------------------------
@@ -312,8 +323,6 @@ CMDRelationCtasGPDB::Serialize(CXMLSerializer *xml_serializer) const
 								 m_mdname->GetMDName());
 	xml_serializer->AddAttribute(
 		CDXLTokens::GetDXLTokenStr(EdxltokenRelTemporary), m_is_temp_table);
-	xml_serializer->AddAttribute(
-		CDXLTokens::GetDXLTokenStr(EdxltokenRelHasOids), m_has_oids);
 	xml_serializer->AddAttribute(
 		CDXLTokens::GetDXLTokenStr(EdxltokenRelStorageType),
 		IMDRelation::GetStorageTypeStr(m_rel_storage_type));

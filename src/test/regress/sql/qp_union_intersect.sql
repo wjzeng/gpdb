@@ -10,6 +10,8 @@
 -- start_matchsubs
 -- m/DETAIL:  Failing row contains \(.*\)/
 -- s/DETAIL:  Failing row contains \(.*\)/DETAIL:  Failing row contains (#####)/
+-- m/\(cost=.*\)/
+-- s/\(cost=.*\)//
 -- end_matchsubs
 begin;
 CREATE TABLE dml_union_r (
@@ -267,12 +269,9 @@ SELECT COUNT(*) FROM dml_union_r;
 -- @description union_test29: INSERT NON ATOMICS with union/intersect/except
 begin;
 SELECT COUNT(*) FROM dml_union_r;
--- GPDB_12_MERGE_FIXME: ORCA doesn't produce the right intersect plan
-set optimizer=off;
 SELECT COUNT(*) FROM (SELECT dml_union_r.* FROM dml_union_r INTERSECT (SELECT dml_union_r.* FROM dml_union_r UNION ALL SELECT dml_union_s.* FROM dml_union_s) EXCEPT SELECT dml_union_s.* FROM dml_union_s)foo;
 INSERT INTO dml_union_r SELECT dml_union_r.* FROM dml_union_r INTERSECT (SELECT dml_union_r.* FROM dml_union_r UNION ALL SELECT dml_union_s.* FROM dml_union_s) EXCEPT SELECT dml_union_s.* FROM dml_union_s;
 SELECT COUNT(*) FROM dml_union_r;
-reset optimizer;
 rollback;
 
 -- @description union_test30: INSERT NON ATOMICS with union/intersect/except
@@ -645,6 +644,7 @@ UPDATE dml_union_s SET b = (SELECT NULL UNION SELECT NULL)::numeric;
 --
 -- To make the output stable, arbitrarily fix optimizer_segments to 2, to get the latter.
 set optimizer_segments=2;
+ANALYZE dml_union_r, dml_union_s;
 SELECT COUNT(DISTINCT(a)) FROM dml_union_r;
 UPDATE dml_union_r SET a = ( SELECT a FROM dml_union_r UNION ALL SELECT a FROM dml_union_s);
 reset optimizer_segments;
@@ -736,6 +736,23 @@ select 1
 union all
 select * from t_github_issue_9874 where a = 1;
 
+--
+-- Test mixing a SegmentGeneral with distributed table
+-- when gp_enable_direct_dispatch is off.
+--
+begin;
+create table rt1(a int, b int) distributed replicated;
+create table t1(a int, b int);
+insert into t1 select i, i+1 from generate_series(6, 9) i;
+insert into rt1 select i, i+1 from generate_series(1, 5) i;
+set local gp_enable_direct_dispatch = on;
+explain(costs off) select * from rt1 union all select * from t1;
+select * from rt1 union all select * from t1;
+set local gp_enable_direct_dispatch = off;
+select * from rt1 union all select * from t1;
+reset gp_enable_direct_dispatch;
+abort;
+
 -- Test mixing a SegmentGeneral with General locus scan.
 explain (costs off)
 select a from t_test_append_rep
@@ -745,6 +762,16 @@ select * from generate_series(100, 105);
 select a from t_test_append_rep
 union all
 select * from generate_series(100, 105);
+
+-- test INTERSECT/EXCEPT with General and partitioned locus, but none of the columns are hashable
+CREATE TABLE p1(a int) distributed by (a);
+INSERT INTO p1 select generate_series(1,10);
+explain (costs off)
+select from generate_series(1,5) intersect select from p1;
+select from generate_series(1,5) intersect select from p1;
+explain (costs off)
+select from generate_series(1,5) except select from p1;
+select from generate_series(1,5) except select from p1;
 
 --
 -- Test for creation of MergeAppend paths.
@@ -783,6 +810,17 @@ explain analyze select a, b, array_dims(array_agg(x)) from mergeappend_test r gr
 union all
 select null, null, array_dims(array_agg(x)) FROM mergeappend_test r
 order by 1,2;
+
+select * from
+  test_util.extract_plan_stats($$
+select a, b, array_dims(array_agg(x)) from mergeappend_test r group by a, b
+union all
+select null, null, array_dims(array_agg(x)) FROM mergeappend_test r
+order by 1,2;
+  $$, false)
+where stats_name = 'executor_mem_lines'
+or stats_name = 'workmem_wanted_lines'
+order by stats_name;
 
 CREATE TABLE t1(c1 int, c2 int, c3 int);
 CREATE TABLE t2(c1 int, c2 int, c3 int);

@@ -18,11 +18,17 @@
 #include "gpopt/base/CCTEInfo.h"
 #include "gpopt/base/CColumnFactory.h"
 #include "gpopt/base/IComparator.h"
+#include "gpopt/base/SPartSelectorInfo.h"
 #include "gpopt/mdcache/CMDAccessor.h"
 
 namespace gpopt
 {
 using namespace gpos;
+
+// hash maps ULONG -> array of ULONGs
+using UlongToBitSetMap =
+	CHashMap<ULONG, CBitSet, gpos::HashValue<ULONG>, gpos::Equals<ULONG>,
+			 CleanupDelete<ULONG>, CleanupRelease<CBitSet>>;
 
 // forward declarations
 class CColRefSet;
@@ -85,18 +91,37 @@ private:
 	// value for the first valid part id
 	static ULONG m_ulFirstValidPartId;
 
-	// if there are master only tables in the query
-	BOOL m_has_master_only_tables;
+	// if there are coordinator only tables in the query
+	BOOL m_has_coordinator_only_tables;
 
 	// does the query contain any volatile functions or
 	// functions that read/modify SQL data
-	BOOL m_has_volatile_or_SQL_func;
+	BOOL m_has_volatile_func{false};
 
 	// does the query have replicated tables
 	BOOL m_has_replicated_tables;
 
 	// does this plan have a direct dispatchable filter
 	CExpressionArray *m_direct_dispatchable_filters;
+
+	// mappings of dynamic scan -> partition indexes (after static elimination)
+	// this is mainetained here to avoid dependencies on optimization order
+	// between dynamic scans/partition selectors and remove the assumption
+	// of one being optimized before the other. Instead, we populate the
+	// partitions during optimization of the dynamic scans, and populate
+	// the partitions for the corresponding partition selector in
+	// ExprToDXL. We could possibly do this in DXLToPlstmt, but we would be
+	// making an assumption about the order the scan vs partition selector
+	// is translated, and would also need information from the append's
+	// child dxl nodes.
+	UlongToBitSetMap *m_scanid_to_part_map;
+
+	// unique id per partition selector in the memo
+	ULONG m_selector_id_counter;
+
+	// detailed info (filter expr, stats etc) per partition selector
+	// (required by CDynamicPhysicalScan for recomputing statistics for DPE)
+	SPartSelectorInfo *m_part_selector_info;
 
 public:
 	COptCtxt(COptCtxt &) = delete;
@@ -138,15 +163,15 @@ public:
 	}
 
 	void
-	SetHasMasterOnlyTables()
+	SetHasCoordinatorOnlyTables()
 	{
-		m_has_master_only_tables = true;
+		m_has_coordinator_only_tables = true;
 	}
 
 	void
-	SetHasVolatileOrSQLFunc()
+	SetHasVolatileFunc()
 	{
-		m_has_volatile_or_SQL_func = true;
+		m_has_volatile_func = true;
 	}
 
 	void
@@ -163,15 +188,15 @@ public:
 	}
 
 	BOOL
-	HasMasterOnlyTables() const
+	HasCoordinatorOnlyTables() const
 	{
-		return m_has_master_only_tables;
+		return m_has_coordinator_only_tables;
 	}
 
 	BOOL
-	HasVolatileOrSQLFunc() const
+	HasVolatileFunc() const
 	{
-		return m_has_volatile_or_SQL_func;
+		return m_has_volatile_func;
 	}
 
 	BOOL
@@ -189,16 +214,13 @@ public:
 	BOOL
 	OptimizeDMLQueryWithSingletonSegment() const
 	{
-		// A DML statement can be optimized by enforcing a gather motion on segment instead of master,
+		// A DML statement can be optimized by enforcing a gather motion on segment instead of coordinator,
 		// whenever a singleton execution is needed.
 		// This optmization can not be applied if the query contains any of the following:
-		// (1). master-only tables
+		// (1). coordinator-only tables
 		// (2). a volatile function
-		// (3). a function SQL dataaccess: EfdaContainsSQL or EfdaReadsSQLData or EfdaModifiesSQLData
-		//      In such cases, it is safe to *always* enforce gather motion on master as there is no way to determine
-		//      if the SQL contains any master-only tables.
-		return !GPOS_FTRACE(EopttraceDisableNonMasterGatherForDML) &&
-			   FDMLQuery() && !HasMasterOnlyTables() && !HasVolatileOrSQLFunc();
+		return !GPOS_FTRACE(EopttraceDisableNonCoordinatorGatherForDML) &&
+			   FDMLQuery() && !HasCoordinatorOnlyTables() && !HasVolatileFunc();
 	}
 
 	// column factory accessor
@@ -250,12 +272,30 @@ public:
 		return m_auPartId++;
 	}
 
+	ULONG
+	NextPartSelectorId()
+	{
+		return m_selector_id_counter++;
+	}
+
 	// required system columns
 	CColRefArray *
 	PdrgpcrSystemCols() const
 	{
 		return m_pdrgpcrSystemCols;
 	}
+
+	void AddPartForScanId(ULONG scanid, ULONG index);
+
+	CBitSet *
+	GetPartitionsForScanId(ULONG scanid)
+	{
+		return m_scanid_to_part_map->Find(&scanid);
+	}
+
+	BOOL AddPartSelectorInfo(ULONG selector_id, SPartSelectorInfoEntry *entry);
+
+	const SPartSelectorInfoEntry *GetPartSelectorInfo(ULONG selector_id) const;
 
 	// set required system columns
 	void

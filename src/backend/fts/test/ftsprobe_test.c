@@ -52,7 +52,7 @@ static void poll_will_return(int expected_return_value, int revents)
  *    has_mirrors - controls if mirrors corresponding to primary are created
  * --------------------------------
  *
- * Function always adds master to the configuration. Also, all the segments
+ * Function always adds coordinator to the configuration. Also, all the segments
  * are by default marked up. Tests leverage to create initial configuration
  * using this and then modify the same as per needs to mock different
  * scenarios like mirror down, primary down, etc...
@@ -78,7 +78,7 @@ InitTestCdb(int segCnt, bool has_mirrors, char default_mode)
 		sizeof(CdbComponentDatabaseInfo) * cdb->total_segment_dbs);
 
 
-	/* create the master entry_db_info */
+	/* create the coordinator entry_db_info */
 	CdbComponentDatabaseInfo *cdbinfo = &cdb->entry_db_info[0];
 
 	cdbinfo->config = (GpSegConfigEntry*)palloc(sizeof(GpSegConfigEntry));
@@ -447,7 +447,7 @@ test_ftsReceive_success(void **state)
 
 
 /*
- * Scenario: if primary responds FATAL to FTS probe, ftsReceive on master
+ * Scenario: if primary responds FATAL to FTS probe, ftsReceive on coordinator
  * should fail due to PQconsumeInput() failed
  */
 static void
@@ -480,7 +480,7 @@ test_ftsReceive_when_fts_handler_FATAL(void **state)
 }
 
 /*
- * Scenario: if primary response ERROR to FTS probe, ftsReceive on master
+ * Scenario: if primary response ERROR to FTS probe, ftsReceive on coordinator
  * should fail due to PQresultStatus(lastResult) returned PGRES_FATAL_ERROR
  */
 static void
@@ -707,6 +707,14 @@ test_PrimayUpMirrorUpNotInSync_to_PrimaryDown(void **state)
 	will_be_called(PQfinish);
 	expect_value(PQfinish, conn, context.perSegInfos[1].conn);
 	will_be_called(PQfinish);
+
+	will_be_called(StartTransactionCommand);
+	will_be_called(GetTransactionSnapshot);
+	expect_value(probeUpdateConfHistory, primary, context.perSegInfos[0].primary_cdbinfo);
+	expect_value(probeUpdateConfHistory, isSegmentAlive, false);
+	expect_value(probeUpdateConfHistory, hasMirrors, true);
+	will_be_called(probeUpdateConfHistory);
+	will_be_called(CommitTransactionCommand);
 
 	/* No update must happen */
 	bool is_updated = processResponse(&context);
@@ -1218,6 +1226,14 @@ test_PrimaryUpMirrorDownNotInSync_to_PrimayUpMirrorUpSync(void **state)
 	expect_value(PQfinish, conn, context.perSegInfos[0].conn);
 	will_be_called(PQfinish);
 
+	will_be_called(StartTransactionCommand);
+	will_be_called(GetTransactionSnapshot);
+	expect_value(probeUpdateConfHistory, primary, context.perSegInfos[0].primary_cdbinfo);
+	expect_value(probeUpdateConfHistory, isSegmentAlive, true);
+	expect_value(probeUpdateConfHistory, hasMirrors, true);
+	will_be_called(probeUpdateConfHistory);
+	will_be_called(CommitTransactionCommand);
+
 	bool is_updated = processResponse(&context);
 
 	assert_true(is_updated);
@@ -1297,6 +1313,14 @@ test_PrimaryUpMirrorDownNotInSync_to_PrimaryDown(void **state)
 	will_be_called(PQfinish);
 	expect_value(PQfinish, conn, context.perSegInfos[1].conn);
 	will_be_called(PQfinish);
+
+	will_be_called(StartTransactionCommand);
+	will_be_called(GetTransactionSnapshot);
+	expect_value(probeUpdateConfHistory, primary, context.perSegInfos[0].primary_cdbinfo);
+	expect_value(probeUpdateConfHistory, isSegmentAlive, false);
+	expect_value(probeUpdateConfHistory, hasMirrors, true);
+	will_be_called(probeUpdateConfHistory);
+	will_be_called(CommitTransactionCommand);
 
 	bool is_updated = processResponse(&context);
 

@@ -27,6 +27,7 @@
 #include "naucrates/dxl/operators/CDXLNode.h"
 #include "naucrates/dxl/operators/CDXLScalarArrayRefIndexList.h"
 #include "naucrates/dxl/operators/CDXLScalarCast.h"
+#include "naucrates/dxl/operators/CDXLScalarCoerceViaIO.h"
 
 // fwd declarations
 namespace gpopt
@@ -88,6 +89,9 @@ private:
 	Expr *TranslateDXLScalarArrayCompToScalar(
 		const CDXLNode *scalar_array_cmp_node, CMappingColIdVar *colid_var);
 
+	Expr *TranslateDXLScalarParamToScalar(const CDXLNode *scalar_param_node,
+										  CMappingColIdVar *colid_var);
+
 	Expr *TranslateDXLScalarOpExprToScalar(const CDXLNode *scalar_op_expr_node,
 										   CMappingColIdVar *colid_var);
 
@@ -111,6 +115,9 @@ private:
 
 	Expr *TranslateDXLScalarArrayCoerceExprToScalar(
 		const CDXLNode *coerce_node, CMappingColIdVar *colid_var);
+
+	Expr *TranslateDXLFieldSelectToScalar(const CDXLNode *field_select_node,
+										  CMappingColIdVar *colid_var);
 
 	Expr *TranslateDXLScalarNullTestToScalar(
 		const CDXLNode *scalar_null_test_node, CMappingColIdVar *colid_var);
@@ -149,6 +156,7 @@ private:
 	Expr *TranslateDXLSubplanTestExprToScalar(CDXLNode *test_expr_node,
 											  SubLinkType slink,
 											  CMappingColIdVar *colid_var,
+											  BOOL has_outer_refs,
 											  List **param_ids_list);
 
 	// translate subplan parameters
@@ -156,6 +164,12 @@ private:
 								CDXLTranslateContext *dxl_translator_ctxt,
 								const CDXLColRefArray *outer_refs,
 								CMappingColIdVar *colid_var);
+
+	// translate subplan test expression parameters
+	void TranslateDXLTestExprScalarIdentToExpr(CDXLNode *child_node,
+											   Param *param,
+											   CDXLScalarIdent **ident,
+											   Expr **expr);
 
 	CHAR *GetSubplanAlias(ULONG plan_id);
 
@@ -192,6 +206,11 @@ private:
 	static Expr *TranslateDXLScalarDMLActionToScalar(
 		const CDXLNode *dml_action_node, CMappingColIdVar *colid_var);
 
+	List *TranslateScalarListChildren(const CDXLNode *dxlnode,
+									  CMappingColIdVar *colid_var);
+
+	static Expr *TranslateDXLScalarSortGroupClauseToScalar(
+		const CDXLNode *dml_action_node, CMappingColIdVar *colid_var);
 
 	// translate children of DXL node, and add them to list
 	List *TranslateScalarChildren(List *list, const CDXLNode *dxlnode,
@@ -207,8 +226,10 @@ private:
 	static Const *ConvertDXLDatumToConstInt8(CDXLDatum *datum_dxl);
 	static Const *ConvertDXLDatumToConstBool(CDXLDatum *datum_dxl);
 	Const *TranslateDXLDatumGenericToScalar(CDXLDatum *datum_dxl);
-	Expr *TranslateRelabelTypeOrFuncExprFromDXL(
-		const CDXLScalarCast *scalar_cast, Expr *pexprChild);
+	Expr *TranslateDXLScalarCastWithChildExpr(const CDXLScalarCast *scalar_cast,
+											  Expr *child_expr);
+	Expr *TranslateDXLScalarCoerceViaIOWithChildExpr(
+		const CDXLScalarCoerceViaIO *dxl_coerce_via_io, Expr *child_expr);
 
 public:
 	CTranslatorDXLToScalar(const CTranslatorDXLToScalar &) = delete;
@@ -227,6 +248,9 @@ public:
 	// This function is called during the translation of DXL->Query or DXL->Query
 	Expr *TranslateDXLToScalar(const CDXLNode *scalar_op_node,
 							   CMappingColIdVar *colid_var);
+
+	Expr *TranslateDXLScalarValuesListToScalar(
+		const CDXLNode *scalar_values_list_node, CMappingColIdVar *colid_var);
 
 	// translate a scalar ident into an Expr
 	static Expr *TranslateDXLScalarIdentToScalar(const CDXLNode *scalar_id_node,

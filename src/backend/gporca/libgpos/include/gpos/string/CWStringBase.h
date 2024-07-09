@@ -16,6 +16,7 @@
 
 #define GPOS_WSZ_LENGTH(x) gpos::clib::Wcslen(x)
 #define GPOS_WSZ_STR_LENGTH(x) GPOS_WSZ_LIT(x), GPOS_WSZ_LENGTH(GPOS_WSZ_LIT(x))
+#define GPOS_SZ_LENGTH(x) gpos::clib::Strlen(x)
 
 #define WCHAR_EOS GPOS_WSZ_LIT('\0')
 
@@ -53,9 +54,6 @@ protected:
 	// whether string owns its memory and should take care of deallocating it at destruction time
 	BOOL m_owns_memory;
 
-	// checks whether the string is byte-wise equal to a given string literal
-	virtual BOOL Equals(const WCHAR *w_str_buffer) const;
-
 public:
 	CWStringBase(const CWStringBase &) = delete;
 
@@ -77,6 +75,9 @@ public:
 	// checks whether the string is byte-wise equal to another string
 	virtual BOOL Equals(const CWStringBase *str) const;
 
+	// checks whether the string is equal to a string literal
+	virtual BOOL Equals(const WCHAR *str) const;
+
 	// checks whether the string contains any characters
 	virtual BOOL IsEmpty() const;
 
@@ -97,6 +98,14 @@ public:
 
 	// count how many times the character appears in string
 	ULONG CountOccurrencesOf(const WCHAR wc) const;
+
+	static INT
+	Compare(const void *left, const void *right)
+	{
+		CWStringBase *leftstr = *(CWStringBase **) left;
+		CWStringBase *rightstr = *(CWStringBase **) right;
+		return wcscmp(leftstr->GetBuffer(), rightstr->GetBuffer());
+	}
 };
 
 }  // namespace gpos

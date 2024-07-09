@@ -71,7 +71,9 @@ CStatistics::CStatistics(CMemoryPool *mp,
 	  m_num_rebinds(
 		  1.0),	 // by default, a stats object is rebound to parameters only once
 	  m_num_predicates(num_predicates),
-	  m_src_upper_bound_NDVs(nullptr)
+	  m_src_upper_bound_NDVs(nullptr),
+	  m_ext_stats(nullptr),
+	  m_colid_to_attno_mapping(GPOS_NEW(mp) UlongToIntMap(mp))
 {
 	GPOS_ASSERT(nullptr != m_colid_histogram_mapping);
 	GPOS_ASSERT(nullptr != m_colid_width_mapping);
@@ -87,7 +89,10 @@ CStatistics::CStatistics(CMemoryPool *mp,
 CStatistics::CStatistics(CMemoryPool *mp,
 						 UlongToHistogramMap *col_histogram_mapping,
 						 UlongToDoubleMap *colid_width_mapping, CDouble rows,
-						 BOOL is_empty, ULONG relpages, ULONG relallvisible)
+						 BOOL is_empty, ULONG relpages, ULONG relallvisible,
+						 CDouble rebinds, ULONG num_predicates,
+						 const IMDExtStatsInfo *extstats,
+						 UlongToIntMap *colid_to_attno_mapping)
 	: m_colid_histogram_mapping(col_histogram_mapping),
 	  m_colid_width_mapping(colid_width_mapping),
 	  m_rows(rows),
@@ -95,10 +100,11 @@ CStatistics::CStatistics(CMemoryPool *mp,
 	  m_empty(is_empty),
 	  m_relpages(relpages),
 	  m_relallvisible(relallvisible),
-	  m_num_rebinds(
-		  1.0),	 // by default, a stats object is rebound to parameters only once
-	  m_num_predicates(0),
-	  m_src_upper_bound_NDVs(nullptr)
+	  m_num_rebinds(rebinds),
+	  m_num_predicates(num_predicates),
+	  m_src_upper_bound_NDVs(nullptr),
+	  m_ext_stats(extstats),
+	  m_colid_to_attno_mapping(colid_to_attno_mapping)
 {
 	GPOS_ASSERT(nullptr != m_colid_histogram_mapping);
 	GPOS_ASSERT(nullptr != m_colid_width_mapping);
@@ -117,6 +123,7 @@ CStatistics::~CStatistics()
 	m_colid_histogram_mapping->Release();
 	m_colid_width_mapping->Release();
 	m_src_upper_bound_NDVs->Release();
+	m_colid_to_attno_mapping->Release();
 }
 
 // look up the width of a particular column
@@ -569,10 +576,13 @@ CStatistics::ScaleStats(CMemoryPool *mp, CDouble factor) const
 
 	CDouble scaled_num_rows = m_rows * factor;
 
+	m_colid_to_attno_mapping->AddRef();
+
 	// create a scaled stats object
-	CStatistics *scaled_stats =
-		GPOS_NEW(mp) CStatistics(mp, histograms_new, widths_new,
-								 scaled_num_rows, IsEmpty(), m_num_predicates);
+	CStatistics *scaled_stats = GPOS_NEW(mp)
+		CStatistics(mp, histograms_new, widths_new, scaled_num_rows, IsEmpty(),
+					RelPages(), RelAllVisible(), NumRebinds(), m_num_predicates,
+					m_ext_stats, m_colid_to_attno_mapping);
 
 	// In the output statistics object, the upper bound source cardinality of the scaled column
 	// cannot be greater than the the upper bound source cardinality information maintained in the input
@@ -597,15 +607,20 @@ CStatistics::CopyStatsWithRemap(CMemoryPool *mp,
 	GPOS_ASSERT(nullptr != colref_mapping);
 	UlongToHistogramMap *histograms_new = GPOS_NEW(mp) UlongToHistogramMap(mp);
 	UlongToDoubleMap *widths_new = GPOS_NEW(mp) UlongToDoubleMap(mp);
+	UlongToIntMap *attnos_new = GPOS_NEW(mp) UlongToIntMap(mp);
 
 	AddHistogramsWithRemap(mp, m_colid_histogram_mapping, histograms_new,
 						   colref_mapping, must_exist);
 	AddWidthInfoWithRemap(mp, m_colid_width_mapping, widths_new, colref_mapping,
 						  must_exist);
+	AddAttnoInfoWithRemap(mp, m_colid_to_attno_mapping, attnos_new,
+						  colref_mapping, must_exist);
 
 	// create a copy of the stats object
-	CStatistics *stats_copy = GPOS_NEW(mp) CStatistics(
-		mp, histograms_new, widths_new, m_rows, IsEmpty(), m_num_predicates);
+	CStatistics *stats_copy = GPOS_NEW(mp)
+		CStatistics(mp, histograms_new, widths_new, m_rows, IsEmpty(),
+					RelPages(), RelAllVisible(), NumRebinds(), m_num_predicates,
+					m_ext_stats, attnos_new);
 
 	// In the output statistics object, the upper bound source cardinality of the join column
 	// cannot be greater than the the upper bound source cardinality information maintained in the input
@@ -728,6 +743,39 @@ CStatistics::AddWidthInfoWithRemap(CMemoryPool *mp, UlongToDoubleMap *src_width,
 	}
 }
 
+// add attno information where the column ids have been re-mapped
+void
+CStatistics::AddAttnoInfoWithRemap(CMemoryPool *mp, UlongToIntMap *src_attno,
+								   UlongToIntMap *dest_attno,
+								   UlongToColRefMap *colref_mapping,
+								   BOOL must_exist)
+{
+	UlongToIntMapIter col_attno_map_iterator(src_attno);
+	while (col_attno_map_iterator.Advance())
+	{
+		ULONG colid = *(col_attno_map_iterator.Key());
+		CColRef *new_colref = colref_mapping->Find(&colid);
+		if (must_exist && nullptr == new_colref)
+		{
+			continue;
+		}
+
+		if (nullptr != new_colref)
+		{
+			colid = new_colref->Id();
+		}
+
+		if (nullptr == dest_attno->Find(&colid))
+		{
+			const INT *attno = col_attno_map_iterator.Value();
+			INT *attno_copy = GPOS_NEW(mp) INT(*attno);
+			BOOL result GPOS_ASSERTS_ONLY =
+				dest_attno->Insert(GPOS_NEW(mp) ULONG(colid), attno_copy);
+			GPOS_ASSERT(result);
+		}
+	}
+}
+
 // return the index of the array of upper bound ndvs to which column reference belongs
 ULONG
 CStatistics::GetIndexUpperBoundNDVs(const CColRef *colref)
@@ -834,5 +882,41 @@ CStatistics::GetNDVs(const CColRef *colref)
 	return std::min(m_rows, GetColUpperBoundNDVs(colref));
 }
 
+// Compute stats of a given column
+IStatistics *
+CStatistics::ComputeColStats(CMemoryPool *mp, CColRef *colref, IMDId *rel_mdid)
+{
+	GPOS_ASSERT(nullptr != mp);
+	GPOS_ASSERT(nullptr != colref);
+	GPOS_ASSERT(nullptr != rel_mdid);
+
+	CColRefSet *pcrsHist = GPOS_NEW(mp) CColRefSet(mp);
+	pcrsHist->Include(colref);
+
+	CColRefSet *pcrsWidth = GPOS_NEW(mp) CColRefSet(mp);
+	pcrsWidth->Include(colref);
+
+	CMDAccessor *md_accessor = COptCtxt::PoctxtFromTLS()->Pmda();
+	IStatistics *stats = md_accessor->Pstats(mp, rel_mdid, pcrsHist, pcrsWidth);
+
+	pcrsHist->Release();
+	pcrsWidth->Release();
+	return stats;
+}
+
+// look up the fraction of null values of a particular column
+CDouble
+CStatistics::GetNullFreq(const CColRef *colref)
+{
+	ULONG colid = colref->Id();
+	CHistogram *col_histogram = m_colid_histogram_mapping->Find(&colid);
+	if (nullptr != col_histogram)
+	{
+		return col_histogram->GetNullFreq();
+	}
+
+	// if no histogram is available for required column, we assume no nulls
+	return 0;
+}
 
 // EOF

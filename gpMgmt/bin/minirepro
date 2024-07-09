@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 '''
+Copyright (c) 2007 - 2016 Pivotal
+Copyright (c) 2023 VMware, Inc. or its affiliates. All Rights Reserved.
+
 minirepro utility
 
 USAGE
@@ -61,10 +64,10 @@ minirepro gptest -h locahost -U gpadmin -p 4444 -q ~/in.sql -f ~/out.sql
 
 import pwd
 import os, sys, re, json, platform, subprocess
-import pgdb
+import psycopg2
 from optparse import OptionParser
 from datetime import datetime
-from gppylib.utils import formatInsertValuesList, Escape
+from gppylib.utils import formatInsertValuesList, escape_string
 
 version = '1.13'
 PATH_PREFIX = '/tmp/'
@@ -97,11 +100,21 @@ def get_server_version(cursor):
     query = "select version()"
     try:
         cursor.execute(query)
-        vals = cursor.fetchone()
-        return vals[0]
-    except pgdb.DatabaseError as e:
-        sys.stderr.write('\nError while trying to find HAWQ/GPDB version.\n\n' + str(e) + '\n\n')
+    except psycopg2.DatabaseError as e:
+        sys.stderr.write('\nError while trying to find GPDB version.\n\n' + str(e) + '\n\n')
         sys.exit(1)
+    vals = cursor.fetchone()
+    return vals[0]
+
+def get_num_segments(cursor):
+    query = "select count(*) from gp_segment_configuration where role='p' and content >=0;"
+    try:
+        cursor.execute(query)
+    except psycopg2.DatabaseError as e:
+        sys.stderr.write('\nError while trying to retrieve number of segments.\n\n' + str(e) + '\n\n')
+        sys.exit(1)
+    vals = cursor.fetchone()
+    return vals[0]
 
 def parse_cmd_line():
     p = OptionParser(usage='Usage: %prog <database> [options]', version='%prog '+version, conflict_handler="resolve", epilog="WARNING: This tool collects statistics about your data, including most common values, which requires some data elements to be included in the output file. Please review output file to ensure it is within corporate policy to transport the output file.")
@@ -126,7 +139,7 @@ def dump_query(connectionInfo, query_file):
 
     with open(query_file, 'r') as query_f:
         sql_text = query_f.read()
-    query = "select pg_catalog.gp_dump_query_oids('%s')" % Escape(sql_text)
+    query = "select pg_catalog.gp_dump_query_oids('%s')" % escape_string(sql_text)
 
     toolkit_sql = PATH_PREFIX + 'toolkit.sql'
     with open(toolkit_sql, 'w') as toolkit_f:
@@ -177,7 +190,7 @@ def pg_dump_object(mr_query, connectionInfo, envOpts):
     out_file = PATH_PREFIX + PGDUMP_FILE
     dmp_cmd = 'pg_dump -h %s -p %s -U %s -sxO %s' % connectionInfo
     dmp_cmd = "%s --relation-oids %s --function-oids %s -f %s" % \
-        (dmp_cmd, mr_query.relids, mr_query.funcids, Escape(out_file))
+        (dmp_cmd, mr_query.relids, mr_query.funcids, escape_string(out_file))
     print(dmp_cmd)
     p = subprocess.Popen(dmp_cmd, shell=True, stderr=subprocess.PIPE, env=envOpts)
     _, errormsg = p.communicate()
@@ -203,11 +216,17 @@ def dump_tuple_count(cur, oid_str, f_out):
         for col, val, typ in zip(columns[2:], vals[2:], types):
             # i.e. relpages = 1::int, reltuples = 1.0::real
             lines.append('\t%s = %s::%s' % (col, val, typ))
-        updateStmt = templateStmt.format(Escape(',\n'.join(lines)), Escape(vals[0]), Escape(vals[1]))
+        updateStmt = templateStmt.format(escape_string(',\n'.join(lines)), escape_string(vals[0]), escape_string(vals[1]))
         f_out.writelines(updateStmt)
 
 def dump_stats(cur, oid_str, f_out, inclHLL):
-    query = 'SELECT pgc.relname, pgn.nspname, pga.attname, pgtn.nspname, pgt.typname, pgs.* ' \
+    query = 'SELECT pgc.relname, pgn.nspname, pga.attname, pgtn.nspname, pgt.typname, ' \
+        'pgs.starelid, pgs.staattnum, pgs.stainherit, pgs.stanullfrac, pgs.stawidth, pgs.stadistinct, ' \
+        'pgs.stakind1, pgs.stakind2, pgs.stakind3, pgs.stakind4, pgs.stakind5, ' \
+        'pgs.staop1, pgs.staop2, pgs.staop3, pgs.staop4, pgs.staop5, ' \
+        'pgs.stacoll1, pgs.stacoll2, pgs.stacoll3, pgs.stacoll4, pgs.stacoll5, ' \
+        'pgs.stanumbers1, pgs.stanumbers2, pgs.stanumbers3, pgs.stanumbers4, pgs.stanumbers5, ' \
+        'pgs.stavalues1::text::text[], pgs.stavalues2::text::text[], pgs.stavalues3::text::text[], pgs.stavalues4::text::text[], pgs.stavalues5::text::text[] ' \
         'FROM pg_class pgc, pg_statistic pgs, pg_namespace pgn, pg_attribute pga, pg_type pgt, pg_namespace pgtn ' \
         'WHERE pgc.relnamespace = pgn.oid and pgc.oid in (%s) ' \
         'and pgn.nspname NOT LIKE \'pg_temp_%%\' ' \
@@ -229,7 +248,7 @@ def dump_stats(cur, oid_str, f_out, inclHLL):
 
     for vals in result_iter(cur):
         schemaname = vals[1]
-        starelid = "'%s.%s'::regclass" % (Escape(vals[1]), Escape(vals[0]))
+        starelid = "'%s.%s'::regclass" % (escape_string(vals[1]), escape_string(vals[0]))
         rowVals = formatInsertValuesList(vals, starelid, inclHLL)
 
         # For non-catalog tables we don't need to delete stats first
@@ -238,7 +257,54 @@ def dump_stats(cur, oid_str, f_out, inclHLL):
         if schemaname != 'pg_catalog':
             linecomment = '-- ' # This will comment out the DELETE query
 
-        f_out.writelines(pstring.format(Escape(vals[0]), Escape(vals[2]), linecomment, starelid, vals[6], ',\n'.join(rowVals)))
+        f_out.writelines(pstring.format(escape_string(vals[0]), escape_string(vals[2]), linecomment, starelid, vals[6], ',\n'.join(rowVals)))
+
+def dump_extstats(cur, oid_str, f_out):
+    # dunp pg_statistics_ext data on a per table basis
+    query = 'SELECT pg_get_statisticsobjdef(oid) FROM pg_statistic_ext where stxrelid in (%s)' %(oid_str)
+
+    pstring = '--\n' \
+              '-- Name: {0}, Type: {1}\n' \
+              '--\n' \
+              '{2};\n\n'
+    cur.execute(query)
+
+    for vals in result_iter(cur):
+        val = vals[0].split()
+        f_out.writelines(pstring.format(val[2], val[1], vals[0]))
+
+    query = 'select pge.stxname, pgc.relname, nsp.nspname, pgd.stxdndistinct, pgd.stxddependencies, pgd.stxdmcv' \
+            ' from pg_class pgc, pg_statistic_ext pge, pg_statistic_ext_data pgd, pg_namespace nsp ' \
+            'where pgd.stxoid = pge.oid and pge.stxrelid=pgc.oid and pgc.relnamespace=nsp.oid '
+
+    # pg_statistic_ext_data has stxoid which gets populated when creating the statistics object,
+    # So we can not use stxoid of pg_statistic_ext_data while dumping the statistics. Hence we are populating
+    # the content of pg_statistic_ext_data based on stxname in pg_statistic_ext.
+
+    setStmt = '-- Table: pg_statistic_ext_data, stxname: {0}, schema: {1}\n' \
+              'UPDATE pg_statistic_ext_data\nSET\n' \
+              '{2}\n' \
+              'WHERE stxoid = (select pge.oid from pg_statistic_ext pge, pg_namespace pgn, pg_class pgc ' \
+              'WHERE pge.stxrelid=pgc.oid and pgc.relnamespace=pgn.oid and pge.stxname =\'{3}\' and pgn.nspname=\'{1}\') ;\n\n'
+
+    cur.execute(query)
+    columns = [x[0] for x in    cur.description]
+    types = ['pg_ndistinct', 'pg_dependencies', 'pg_mcv_list']
+
+    for vals in result_iter(cur):
+        f_out.writelines(setStmt.format(vals[0], vals[2], ',\n'.join(['\t%s = %s::%s' %
+                                                                      t for t in zip(columns[3:], ['NULL' if x is None else "'" + x + "'" for x in vals[3:]], types)]),  vals[0]))
+
+def get_non_default_optimization_gucs(cursor):
+    # Ignore 'optimizer' guc as it is turned off by minirepro while creating connection object
+    query = "select name, setting from pg_settings where category like 'Query Tuning%' and setting!=boot_val and name!='optimizer';"
+    try:
+        cursor.execute(query)
+    except psycopg2.DatabaseError as e:
+        sys.stderr.write('\nError while trying to retrieve non default optimization gucs.\n\n' + str(e) + '\n\n')
+        sys.exit(1)
+    vals = cursor.fetchall()
+    return vals
 
 def main():
     parser = parse_cmd_line()
@@ -289,11 +355,16 @@ def main():
             }
 
     print("Connecting to database: host=%s, port=%s, user=%s, db=%s ..." % connectionInfo)
-    conn = pgdb.connect(**connectionDict)
+    conn = psycopg2.connect(**connectionDict)
     cursor = conn.cursor()
 
     # get server version, which is dumped to minirepro output file
     server_ver = get_server_version(cursor)
+
+    num_segments = get_num_segments(cursor)
+
+    # fetch non-default optimization gucs
+    non_default_optimization_gucs = get_non_default_optimization_gucs(cursor)
 
     """
     invoke gp_toolkit UDF, dump object oids as json text
@@ -320,7 +391,6 @@ def main():
     f_out = open(output_file, 'w')
     ts = datetime.today()
     f_out.writelines(['-- MiniRepro ' + version,
-                           '\n-- Copyright (C) 2007 - 2016 Pivotal'
                            '\n-- Database: ' + db,
                            '\n-- Date:     ' + ts.date().isoformat(),
                            '\n-- Time:     ' + ts.time().isoformat(),
@@ -329,10 +399,12 @@ def main():
 
     # make sure we connect with the right database
     f_out.writelines('\\connect ' + db + '\n\n')
+    # turn off optimizer when loading stats. Orca adds a bit of overhead, but it's significant when small insrt queries take 1 vs .1ms
+    f_out.writelines('set optimizer to off;\n\n')
 
     # first create schema DDLs
     print("Writing schema DDLs ...")
-    table_schemas = ["CREATE SCHEMA %s;\n" % Escape(schema) for schema in mr_query.schemas if schema != 'public']
+    table_schemas = ["CREATE SCHEMA %s;\n" % escape_string(schema) for schema in mr_query.schemas if schema != 'public']
     f_out.writelines(table_schemas)
 
     # write relation and function DDLs
@@ -354,6 +426,10 @@ def main():
     print("Writing column statistics ...")
     dump_stats(cursor, mr_query.relids, f_out, inclHLL)
 
+    # dump correlated stats
+    print("Writing correlated statistics ...")
+    dump_extstats(cursor, mr_query.relids, f_out)
+
     cursor.close()
     conn.close()
 
@@ -362,7 +438,20 @@ def main():
     f_out.writelines(['\n-- ',
                        '\n-- Query text',
                        '\n-- \n\n'])
+    line = 'set optimizer_segments = ' + str(num_segments) + ';'
+    f_out.writelines('\n-- ' + line + '\n')
 
+    # write non-default optimization gucs
+    print("Writing non-default optimization guc settings ...")
+    f_out.writelines(['-- ',
+                      '\n-- Non-default optimization guc settings',
+                      '\n--'])
+    if len(non_default_optimization_gucs) == 0:
+        f_out.writelines('\n-- Using all default guc settings')
+    else:
+        for setting in non_default_optimization_gucs:
+            f_out.writelines('\n-- set {0} = {1};'.format(setting[0], setting[1]))
+    f_out.writelines('\n-- \n\n')
     with open(query_file, 'r') as query_f:
         for line in query_f:
             f_out.writelines('-- ' + line)
@@ -377,4 +466,4 @@ def main():
     print('Please review output file to ensure it is within corporate policy to transport the output file.')
 
 if __name__ == "__main__":
-        main()
+    main()

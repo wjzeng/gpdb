@@ -225,8 +225,6 @@ static void send_message_to_frontend(ErrorData *edata);
 static const char *error_severity(int elevel);
 static void append_with_tabs(StringInfo buf, const char *str);
 static bool is_log_level_output(int elevel, int log_min_level);
-static void write_pipe_chunks(char *data, int len, int dest);
-static void write_csvlog(ErrorData *edata);
 static void elog_debug_linger(ErrorData *edata);
 
 /* GPDB: wrapper function to silence unused result warning */
@@ -234,18 +232,6 @@ static inline void
 ignore_returned_result(long long int result)
 {
 	(void) result;
-}
-
-/* verify string is correctly encoded, and escape it if invalid  */
-static void verify_and_replace_mbstr(char **str, int len)
-{
-	Assert(pg_verifymbstr(*str, len, true));
-
-	if (!pg_verifymbstr(*str, len, true))
-	{
-		pfree(*str);
-		*str = pstrdup("Message skipped due to incorrect encoding.");
-	}
 }
 
 static void setup_formatted_log_time(void);
@@ -336,11 +322,11 @@ errstart(int elevel, const char *domain)
 		}
 
 		/*
-		 * If master process hits FATAL, post PREPARE but before COMMIT / ABORT on segment,
-		 * just master process dies silently, leaves dangling prepared xact on segment.
-		 * This also introduces inconsistency in the cluster, as xact is commited on master
+		 * If coordinator process hits FATAL, post PREPARE but before COMMIT / ABORT on segment,
+		 * just coordinator process dies silently, leaves dangling prepared xact on segment.
+		 * This also introduces inconsistency in the cluster, as xact is commited on coordinator
 		 * and some segments and still in-progress on few others.
-		 * Hence converting FATAL to PANIC, here to reset master and perform full recovery
+		 * Hence converting FATAL to PANIC, here to reset coordinator and perform full recovery
 		 * instead, which would clean the dangling transaction update to COMMIT / ABORT.
 		 */
 		if ((elevel == FATAL) && (Gp_role == GP_ROLE_DISPATCH))
@@ -722,8 +708,6 @@ errfinish_and_return(const char *filename, int lineno, const char *funcname)
 {
 	ErrorData  *edata = &errordata[errordata_stack_depth];
 	ErrorData  *edata_copy;
-	ErrorContextCallback *econtext;
-	MemoryContext oldcontext;
 	int			saved_errno;            /*CDB*/
 
 	recursion_depth++;
@@ -744,24 +728,6 @@ errfinish_and_return(const char *filename, int lineno, const char *funcname)
 	edata->filename = filename;
 	edata->lineno = lineno;
 	edata->funcname = funcname;
-
-	/*
-	 * Do processing in ErrorContext, which we hope has enough reserved space
-	 * to report an error.
-	 */
-	oldcontext = MemoryContextSwitchTo(ErrorContext);
-
-	/*
-	 * Call any context callback functions.  Errors occurring in callback
-	 * functions will be treated as recursive errors --- this ensures we will
-	 * avoid infinite recursion (see errstart).
-	 */
-	for (econtext = error_context_stack;
-		 econtext != NULL;
-		 econtext = econtext->previous)
-		(*econtext->callback) (econtext->arg);
-
-	MemoryContextSwitchTo(oldcontext);
 
 	edata_copy = CopyErrorData();
 
@@ -1060,9 +1026,6 @@ errmsg(const char *fmt,...)
 	edata->message_id = fmt;
 	EVALUATE_MESSAGE(edata->domain, message, false, true);
 
-	/* enforce correct encoding */
-	verify_and_replace_mbstr(&(edata->message), strlen(edata->message));
-
 	MemoryContextSwitchTo(oldcontext);
 	recursion_depth--;
 	errno = edata->saved_errno; /*CDB*/
@@ -1092,9 +1055,6 @@ errmsg_internal(const char *fmt,...)
 	edata->message_id = fmt;
 	EVALUATE_MESSAGE(edata->domain, message, false, false);
 
-	/* enforce correct encoding */
-	verify_and_replace_mbstr(&(edata->message), strlen(edata->message));
-
 	MemoryContextSwitchTo(oldcontext);
 	recursion_depth--;
 	errno = edata->saved_errno; /*CDB*/
@@ -1119,9 +1079,6 @@ errmsg_plural(const char *fmt_singular, const char *fmt_plural,
 	edata->message_id = fmt_singular;
 	EVALUATE_MESSAGE_PLURAL(edata->domain, message, false);
 
-	/* enforce correct encoding */
-	verify_and_replace_mbstr(&(edata->message), strlen(edata->message));
-
 	MemoryContextSwitchTo(oldcontext);
 	recursion_depth--;
 	errno = edata->saved_errno; /*CDB*/
@@ -1143,8 +1100,6 @@ errdetail(const char *fmt,...)
 
 	EVALUATE_MESSAGE(edata->domain, detail, false, true);
 
-	/* enforce correct encoding */
-	verify_and_replace_mbstr(&(edata->detail), strlen(edata->detail));
 	MemoryContextSwitchTo(oldcontext);
 	recursion_depth--;
 	errno = edata->saved_errno; /*CDB*/
@@ -1236,9 +1191,6 @@ errdetail_plural(const char *fmt_singular, const char *fmt_plural,
 
 	EVALUATE_MESSAGE_PLURAL(edata->domain, detail, false);
 
-	/* enforce correct encoding */
-	verify_and_replace_mbstr(&(edata->detail), strlen(edata->detail));
-
 	MemoryContextSwitchTo(oldcontext);
 	recursion_depth--;
 	errno = edata->saved_errno; /*CDB*/
@@ -1259,9 +1211,6 @@ errhint(const char *fmt,...)
 	oldcontext = MemoryContextSwitchTo(edata->assoc_context);
 
 	EVALUATE_MESSAGE(edata->domain, hint, false, true);
-
-	/* enforce correct encoding */
-	verify_and_replace_mbstr(&(edata->hint), strlen(edata->hint));
 
 	MemoryContextSwitchTo(oldcontext);
 	recursion_depth--;
@@ -1287,9 +1236,6 @@ errcontext_msg(const char *fmt,...)
 	oldcontext = MemoryContextSwitchTo(edata->assoc_context);
 
 	EVALUATE_MESSAGE(edata->context_domain, context, true, true);
-
-	/* enforce correct encoding */
-	verify_and_replace_mbstr(&(edata->context), strlen(edata->context));
 
 	MemoryContextSwitchTo(oldcontext);
 	recursion_depth--;
@@ -1966,6 +1912,30 @@ pg_re_throw(void)
 						 __FILE__, __LINE__);
 }
 
+/*
+ * GPDB: elog_exception_statement
+ * Write statement in log file if an exception was encountered during
+ * its execution.
+ */
+void
+elog_exception_statement(const char* statement)
+{
+	ErrorData  *edata = NULL;
+
+	if (errordata_stack_depth < 0 || statement == NULL)
+		return;
+
+	edata = &errordata[errordata_stack_depth];
+	/*
+	 * We should also honour whether hide the statement and GUC
+	 * log_min_error_statement to prevent print the statement
+	 * when error happens.
+	 */
+	if (!edata->hide_stmt &&
+		is_log_level_output(edata->elevel, log_min_error_statement))
+		elog(LOG, "An exception was encountered during the execution of statement: %s",
+			 statement);
+}
 
 /*
  * CDB: elog_demote
@@ -3492,7 +3462,7 @@ append_string_to_pipe_chunk(PipeProtoChunk *buffer, const char* input)
 	 */
 	if (len >= PIPE_MAX_PAYLOAD * 20)
 	{
-		len = PIPE_MAX_PAYLOAD * 20 - 1;
+		len = pg_mbcliplen(input, len, PIPE_MAX_PAYLOAD * 20 - 1);
 	}
 
 	char *data = buffer->data + buffer->hdr.len;
@@ -3607,9 +3577,9 @@ append_stacktrace(PipeProtoChunk *buffer, StringInfo append, void *const *stacka
 			}
 		}
 
-		if (fd_ok && strlen(cmdresult[0]) > 1)
+		if (!fd_ok || strlen(cmdresult[0]) <= 1)
 		{
-			addr2line_ok = true;
+			addr2line_ok = false;
 		}
 
 		if (fd != NULL)
@@ -3678,7 +3648,9 @@ append_stacktrace(PipeProtoChunk *buffer, StringInfo append, void *const *stacka
 				{
 					lineInfo = parenth + 1;
 					parenth = strrchr(lineInfo, ')');
-					*parenth = '\0';
+					if (parenth != NULL) {
+						*parenth = '\0';
+					}
 				}
 
 				/* line info added, print file and line info */
@@ -3860,7 +3832,11 @@ write_syslogger_in_csv(ErrorData *edata, bool amsyslogger)
 	write_syslogger_file_string(edata->context, amsyslogger, true);
 
 	/* user query */
-	write_syslogger_file_string(debug_query_string, amsyslogger, true);
+	if (!edata->hide_stmt &&
+		is_log_level_output(edata->elevel, log_min_error_statement))
+		write_syslogger_file_string(debug_query_string, amsyslogger, true);
+	else
+		write_syslogger_file_string("", amsyslogger, true);
 
 	/* cursor pos */
 	syslogger_write_int32(true, "", edata->cursorpos, amsyslogger, true);
@@ -4015,7 +3991,10 @@ write_message_to_server_log(int elevel,
 	append_string_to_pipe_chunk(&buffer, context);
 
 	/* debug_query_string */
-	append_string_to_pipe_chunk(&buffer, query_text);
+	if (is_log_level_output(elevel, log_min_error_statement))
+		append_string_to_pipe_chunk(&buffer, query_text);
+	else
+		append_string_to_pipe_chunk(&buffer, NULL);
 
 	/* error_func_name */
 	if (show_funcname)

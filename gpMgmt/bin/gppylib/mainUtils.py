@@ -83,6 +83,12 @@ class PIDLockFile:
             if self.PID == self.read_pid():
                 # remove the dir and PID file inside of it
                 shutil.rmtree(self.path)
+
+                # Eventhough we remove the directory, it is not guaranteed that the directory is removed
+                # at the disk level. So it is necessary to make this call to sync the changes at the disk level.
+                # Refer https://stackoverflow.com/questions/7127075/what-exactly-is-file-flush-doing for more context.
+                os.sync()
+
         except EnvironmentError as e:
             if e.errno == errno.ENOENT:
                 pass
@@ -162,13 +168,22 @@ class SimpleMainLock:
             return None
 
         # look for a lock file
-        self.pidfilepid = self.pidlockfile.read_pid()
+        try:
+            self.pidfilepid = self.pidlockfile.read_pid()
+        except ValueError:
+            shutil.rmtree(self.ppath)
+
         if self.pidfilepid is not None:
 
             # we found a lock file
             # allow the process to proceed if the locker was our parent
             if self.pidfilepid == self.parentpid:
                 return None
+
+            # Check if the process that holds the lock exists.
+            # If the process is already killed, remove the lock directory.
+            if not unix.check_pid(self.pidfilepid):
+                shutil.rmtree(self.ppath)
 
         # try and acquire the lock
         try:
@@ -232,7 +247,7 @@ class ExceptionNoStackTraceNeeded(Exception):
 
 class UserAbortedException(Exception):
     """
-    UserAbortedException should be thrown when a user decides to stop the 
+    UserAbortedException should be thrown when a user decides to stop the
     program (at a y/n prompt, for example).
     """
     pass
@@ -259,6 +274,18 @@ def simple_main(createOptionParserFn, createCommandFn, mainOptions=None):
 
 
 def simple_main_internal(createOptionParserFn, createCommandFn, mainOptions):
+
+    """
+    if -d <coordinator_data_dir> option is provided in that case doing parsing after creating
+    lock file would not be a good idea therefore handling -d option before lock.
+    """
+    parser = createOptionParserFn()
+    (parserOptions, parserArgs) = parser.parse_args()
+
+    if parserOptions.ensure_value("coordinatorDataDirectory", None) is not None:
+        parserOptions.coordinator_data_directory = os.path.abspath(parserOptions.coordinatorDataDirectory)
+        gp.set_coordinatordatadir(parserOptions.coordinator_data_directory)
+
     """
     If caller specifies 'pidlockpath' in mainOptions then we manage the
     specified pid file within the COORDINATOR_DATA_DIRECTORY before proceeding
@@ -277,13 +304,13 @@ def simple_main_internal(createOptionParserFn, createCommandFn, mainOptions):
 
     # at this point we have whatever lock we require
     try:
-        simple_main_locked(createOptionParserFn, createCommandFn, mainOptions)
+        simple_main_locked(parser, parserOptions, parserArgs, createCommandFn, mainOptions)
     finally:
         if sml is not None:
             sml.release()
 
 
-def simple_main_locked(createOptionParserFn, createCommandFn, mainOptions):
+def simple_main_locked(parser, parserOptions, parserArgs, createCommandFn, mainOptions):
     """
     Not to be called externally -- use simple_main instead
     """
@@ -296,10 +323,8 @@ def simple_main_locked(createOptionParserFn, createCommandFn, mainOptions):
     faultProberInterface.registerFaultProber(faultProberImplGpdb.GpFaultProberImplGpdb())
 
     commandObject = None
-    parser = None
 
     forceQuiet = mainOptions is not None and mainOptions.get("forceQuietOutput")
-    options = None
 
     if mainOptions is not None and mainOptions.get("programNameOverride"):
         global gProgramName
@@ -315,30 +340,24 @@ def simple_main_locked(createOptionParserFn, createCommandFn, mainOptions):
         hostname = unix.getLocalHostname()
         username = unix.getUserName()
 
-        parser = createOptionParserFn()
-        (options, args) = parser.parse_args()
-
         if useHelperToolLogging:
             gplog.setup_helper_tool_logging(execname, hostname, username)
         else:
             gplog.setup_tool_logging(execname, hostname, username,
-                                     logdir=options.ensure_value("logfileDirectory", None), nonuser=nonuser)
+                                     logdir=parserOptions.ensure_value("logfileDirectory", None), nonuser=nonuser)
 
         if forceQuiet:
             gplog.quiet_stdout_logging()
         else:
-            if options.ensure_value("verbose", False):
+            if parserOptions.ensure_value("verbose", False):
                 gplog.enable_verbose_logging()
-            if options.ensure_value("quiet", False):
+            if parserOptions.ensure_value("quiet", False):
                 gplog.quiet_stdout_logging()
-
-        if options.ensure_value("coordinatorDataDirectory", None) is not None:
-            options.coordinator_data_directory = os.path.abspath(options.coordinatorDataDirectory)
 
         if not suppressStartupLogMessage:
             logger.info("Starting %s with args: %s" % (gProgramName, ' '.join(sys.argv[1:])))
 
-        commandObject = createCommandFn(options, args)
+        commandObject = createCommandFn(parserOptions, parserArgs)
         exitCode = commandObject.run()
         exit_status = exitCode
 
@@ -360,10 +379,10 @@ def simple_main_locked(createOptionParserFn, createCommandFn, mainOptions):
                       e.cmd.results.stderr))
         exit_status = 2
     except Exception as e:
-        if options is None:
+        if parserOptions is None:
             logger.exception("%s failed.  exiting...", gProgramName)
         else:
-            if options.ensure_value("verbose", False):
+            if parserOptions.ensure_value("verbose", False):
                 logger.exception("%s failed.  exiting...", gProgramName)
             else:
                 logger.fatal("%s failed. (Reason='%s') exiting..." % (gProgramName, e))
@@ -414,9 +433,51 @@ def addCoordinatorDirectoryOptionForSingleClusterProgram(addTo):
     For programs that operate on multiple clusters at once, this function/option
     is not appropriate.
     """
-    addTo.add_option('-d', '--master_data_directory', type='string',
+    addTo.add_option('-d', '--master_data_directory', '--coordinator_data_directory', type='string',
                      dest="coordinatorDataDirectory",
                      metavar="<coordinator data directory>",
                      help="Optional. The coordinator host data directory. If not specified, the value set" \
                           "for $COORDINATOR_DATA_DIRECTORY will be used.")
 
+def parseStatusLine(line, isStart = False, isStop = False):
+    """
+    Function to parse status line of the result out, for gpstart and gpstop.
+    Currently the parsing for both the utilities is implemented at two different places
+    __processStartOrConvertCommands() and  _process_segment_stop()
+    This is an attempt to consolidate
+    """
+
+    if isStart:
+        tag = "STARTED:"
+    elif isStop:
+        tag = "STOPPED:"
+    else:
+        raise Exception("parseStatusLine: Invalid input")
+
+    fields = line.split('--')
+    index = 1
+    started_tag_index = index + 1
+    while not fields[started_tag_index].startswith(tag):
+        started_tag_index += 1
+
+    dir = "--".join(fields[index:started_tag_index])
+    dir = dir.split(':')[1]
+
+    index = started_tag_index
+    started = fields[index].split(':')[1]
+    index += 1
+
+    if isStart:
+        reasonCode = gp.SEGSTART_ERROR_UNKNOWN_ERROR
+        if fields[index].startswith("REASONCODE:"):
+            reasonCode = int(fields[index].split(":")[1])
+            index += 1
+    else:
+        reasonCode = gp.SEGSTART_SUCCESS
+
+    # The funny join and splits are because Reason could have colons or -- in the text itself
+    reasonStr = "--".join(fields[index:])
+    reasonArr = reasonStr.split(':')
+    reasonArr = reasonArr[1:]
+    reasonStr = ":".join(reasonArr)
+    return reasonCode, reasonStr, started, dir

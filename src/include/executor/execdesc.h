@@ -221,6 +221,11 @@ typedef struct QueryDispatchDesc
 	List	   *cursorPositions;
 
 	/*
+	 * For parallel retrieve cursor. Pass cursor name to QEs.
+	 */
+	char	   *parallelCursorName;
+
+	/*
 	 * Set to true for CTAS and SELECT INTO. Set to false for ALTER TABLE
 	 * REORGANIZE. This is mainly used to track if the dispatched query is
 	 * meant for internal rewrite on QE segments or just for holding data from
@@ -229,6 +234,11 @@ typedef struct QueryDispatchDesc
 	 * set, use default reloptions + gp_default_storage_options.
 	 */
 	bool useChangedAOOpts;
+
+	/*
+	 * Security context flags.
+	 */
+	int		secContext;
 } QueryDispatchDesc;
 
 /*

@@ -11,6 +11,8 @@
 
 #include "gpopt/operators/CPhysical.h"
 
+#include <cwchar>
+
 #include "gpos/base.h"
 
 #include "gpopt/base/CCTEMap.h"
@@ -20,6 +22,7 @@
 #include "gpopt/base/CDistributionSpecRandom.h"
 #include "gpopt/base/CDistributionSpecReplicated.h"
 #include "gpopt/base/CDistributionSpecSingleton.h"
+#include "gpopt/base/CDistributionSpecUniversal.h"
 #include "gpopt/base/CDrvdPropPlan.h"
 #include "gpopt/base/CReqdPropPlan.h"
 #include "gpopt/operators/CExpression.h"
@@ -249,20 +252,40 @@ CPhysical::CReqdColsRequest::Equals(const CReqdColsRequest *prcrFst,
 //---------------------------------------------------------------------------
 CDistributionSpec *
 CPhysical::PdsCompute(CMemoryPool *mp, const CTableDescriptor *ptabdesc,
-					  CColRefArray *pdrgpcrOutput)
+					  CColRefArray *pdrgpcrOutput, CColRef *pcr_segment_id)
 {
 	CDistributionSpec *pds = nullptr;
 
 	switch (ptabdesc->GetRelDistribution())
 	{
-		case IMDRelation::EreldistrMasterOnly:
+		case IMDRelation::EreldistrCoordinatorOnly:
 			pds = GPOS_NEW(mp) CDistributionSpecSingleton(
-				CDistributionSpecSingleton::EstMaster);
+				CDistributionSpecSingleton::EstCoordinator);
+			break;
+
+		case IMDRelation::EreldistrUniversal:
+			pds = GPOS_NEW(mp) CDistributionSpecUniversal();
 			break;
 
 		case IMDRelation::EreldistrRandom:
-			pds = GPOS_NEW(mp) CDistributionSpecRandom();
+		{
+			// We calculate gp_segment_id directly through ptabdesc by
+			// finding the column Attno that matches the string in question
+			if (pcr_segment_id == nullptr)
+			{
+				for (ULONG i = 0; i < pdrgpcrOutput->Size(); i++)
+				{
+					if (wcscmp((*pdrgpcrOutput)[i]->Name().Pstr()->GetBuffer(),
+							   L"gp_segment_id") == 0)
+					{
+						pcr_segment_id = (*pdrgpcrOutput)[i];
+					}
+				}
+			}
+
+			pds = GPOS_NEW(mp) CDistributionSpecRandom(pcr_segment_id);
 			break;
+		}
 
 		case IMDRelation::EreldistrHash:
 		{
@@ -378,7 +401,7 @@ CPhysical::PdsRequireSingletonOrReplicated(CMemoryPool *mp,
 										   CDistributionSpec *pdsRequired,
 										   ULONG child_index, ULONG ulOptReq)
 {
-	GPOS_ASSERT(2 > ulOptReq);
+	GPOS_ASSERT(3 > ulOptReq);
 
 	// if expression has to execute on a single host then we need a gather motion
 	if (exprhdl.NeedsSingletonExecution())
@@ -602,9 +625,9 @@ CPhysical::PdssMatching(CMemoryPool *mp, CDistributionSpecSingleton *pdss)
 {
 	CDistributionSpecSingleton::ESegmentType est =
 		CDistributionSpecSingleton::EstSegment;
-	if (pdss->FOnMaster())
+	if (pdss->FOnCoordinator())
 	{
-		est = CDistributionSpecSingleton::EstMaster;
+		est = CDistributionSpecSingleton::EstCoordinator;
 	}
 
 	return GPOS_NEW(mp) CDistributionSpecSingleton(est);
@@ -955,6 +978,66 @@ CPhysical::Ped(CMemoryPool *mp, CExpressionHandle &exprhdl,
 					pdrgpdpCtxt, ulDistrReq),
 		Edm(prppInput, child_index, pdrgpdpCtxt, ulDistrReq));
 	;
+}
+
+CPartitionPropagationSpec *
+CPhysical::PppsRequired(CMemoryPool *mp, CExpressionHandle &exprhdl,
+						CPartitionPropagationSpec *pppsRequired,
+						ULONG child_index, CDrvdPropArray *, ULONG) const
+{
+	// pass through consumer<x> requests to the appropriate child.
+	// do not pass through any propagator<x> requests
+	CPartitionPropagationSpec *pps_result =
+		GPOS_NEW(mp) CPartitionPropagationSpec(mp);
+
+	CBitSet *allowed_scan_ids = GPOS_NEW(mp) CBitSet(mp);
+	CPartInfo *part_info = exprhdl.DerivePartitionInfo(child_index);
+	for (ULONG ul = 0; ul < part_info->UlConsumers(); ++ul)
+	{
+		ULONG scan_id = part_info->ScanId(ul);
+		allowed_scan_ids->ExchangeSet(scan_id);
+	}
+
+	pps_result->InsertAllowedConsumers(pppsRequired, allowed_scan_ids);
+	allowed_scan_ids->Release();
+
+	return pps_result;
+}
+
+CEnfdProp::EPropEnforcingType
+CPhysical::EpetPartitionPropagation(
+	CExpressionHandle &exprhdl, const CEnfdPartitionPropagation *pps_reqd) const
+{
+	GPOS_ASSERT(nullptr != pps_reqd);
+
+	CPartitionPropagationSpec *pps_drvd =
+		CDrvdPropPlan::Pdpplan(exprhdl.Pdp())->Ppps();
+	if (pps_reqd->FCompatible(pps_drvd))
+	{
+		// all requests are resolved
+		return CEnfdProp::EpetUnnecessary;
+	}
+
+	return CEnfdProp::EpetRequired;
+}
+
+CPartitionPropagationSpec *
+CPhysical::PppsDerive(CMemoryPool *mp, CExpressionHandle &exprhdl) const
+{
+	CPartitionPropagationSpec *pps_result =
+		GPOS_NEW(mp) CPartitionPropagationSpec(mp);
+
+	for (ULONG ul = 0; ul < exprhdl.Arity(); ++ul)
+	{
+		if (exprhdl.FScalarChild(ul))
+		{
+			continue;
+		}
+		CPartitionPropagationSpec *pps = exprhdl.Pdpplan(ul)->Ppps();
+		pps_result->InsertAll(pps);
+	}
+
+	return pps_result;
 }
 
 // EOF

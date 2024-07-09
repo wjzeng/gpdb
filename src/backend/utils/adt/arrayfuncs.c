@@ -373,6 +373,8 @@ array_in(PG_FUNCTION_ARGS)
 
 	/* This checks for overflow of the array dimensions */
 	nitems = ArrayGetNItems(ndim, dim);
+	ArrayCheckBounds(ndim, dim, lBound);
+
 	/* Empty array? */
 	if (nitems == 0)
 		PG_RETURN_ARRAYTYPE_P(construct_empty_array(element_type));
@@ -1322,24 +1324,11 @@ array_recv(PG_FUNCTION_ARGS)
 	{
 		dim[i] = pq_getmsgint(buf, 4);
 		lBound[i] = pq_getmsgint(buf, 4);
-
-		/*
-		 * Check overflow of upper bound. (ArrayGetNItems() below checks that
-		 * dim[i] >= 0)
-		 */
-		if (dim[i] != 0)
-		{
-			int			ub = lBound[i] + dim[i] - 1;
-
-			if (lBound[i] > ub)
-				ereport(ERROR,
-						(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
-						 errmsg("integer out of range")));
-		}
 	}
 
 	/* This checks for overflow of array dimensions */
 	nitems = ArrayGetNItems(ndim, dim);
+	ArrayCheckBounds(ndim, dim, lBound);
 
 	/*
 	 * We arrange to look up info about element type, including its receive
@@ -2244,7 +2233,7 @@ array_set_element(Datum arraydatum,
 					(errcode(ERRCODE_ARRAY_SUBSCRIPT_ERROR),
 					 errmsg("wrong number of array subscripts")));
 
-		if (indx[0] < 0 || indx[0] * elmlen >= arraytyplen)
+		if (indx[0] < 0 || indx[0] >= arraytyplen / elmlen)
 			ereport(ERROR,
 					(errcode(ERRCODE_ARRAY_SUBSCRIPT_ERROR),
 					 errmsg("array subscript out of range")));
@@ -2359,10 +2348,13 @@ array_set_element(Datum arraydatum,
 		}
 	}
 
+	/* This checks for overflow of the array dimensions */
+	newnitems = ArrayGetNItems(ndim, dim);
+	ArrayCheckBounds(ndim, dim, lb);
+
 	/*
 	 * Compute sizes of items and areas to copy
 	 */
-	newnitems = ArrayGetNItems(ndim, dim);
 	if (newhasnulls)
 		overheadlen = ARR_OVERHEAD_WITHNULLS(ndim, newnitems);
 	else
@@ -2615,6 +2607,13 @@ array_set_element_expanded(Datum arraydatum,
 						(errcode(ERRCODE_ARRAY_SUBSCRIPT_ERROR),
 						 errmsg("array subscript out of range")));
 		}
+	}
+
+	/* Check for overflow of the array dimensions */
+	if (dimschanged)
+	{
+		(void) ArrayGetNItems(ndim, dim);
+		ArrayCheckBounds(ndim, dim, lb);
 	}
 
 	/* Now we can calculate linear offset of target item in array */
@@ -2935,6 +2934,7 @@ array_set_slice(Datum arraydatum,
 
 	/* Do this mainly to check for overflow */
 	nitems = ArrayGetNItems(ndim, dim);
+	ArrayCheckBounds(ndim, dim, lb);
 
 	/*
 	 * Make sure source array has enough entries.  Note we ignore the shape of
@@ -3355,7 +3355,9 @@ construct_md_array(Datum *elems,
 				 errmsg("number of array dimensions (%d) exceeds the maximum allowed (%d)",
 						ndims, MAXDIM)));
 
+	/* This checks for overflow of the array dimensions */
 	nelems = ArrayGetNItems(ndims, dims);
+	ArrayCheckBounds(ndims, dims, lbs);
 
 	/* if ndims <= 0 or any dims[i] == 0, return empty array */
 	if (nelems <= 0)
@@ -4097,7 +4099,7 @@ hash_array_extended(PG_FUNCTION_ARGS)
 	typalign = typentry->typalign;
 
 	InitFunctionCallInfoData(*locfcinfo, &typentry->hash_extended_proc_finfo, 2,
-							 InvalidOid, NULL, NULL);
+							 PG_GET_COLLATION(), NULL, NULL);
 
 	/* Loop over source data */
 	nitems = ArrayGetNItems(ndims, dims);
@@ -5043,7 +5045,7 @@ array_insert_slice(ArrayType *destArray,
  * In the older scheme, you start with a NULL ArrayBuildState pointer, and
  * call accumArrayResult once per element.  In this scheme you end up with
  * a NULL pointer if there were no elements, which you need to special-case.
- * In the newer scheme, call initArrayResult and then call accumArrayResult
+ * In the newer scheme, call initArrayResultWithSize and then call accumArrayResult
  * once per element.  In this scheme you always end with a non-NULL pointer
  * that you can pass to makeArrayResult; you get an empty array if there
  * were no elements.  This is preferred if an empty array is what you want.
@@ -5061,8 +5063,26 @@ array_insert_slice(ArrayType *destArray,
  * single memory context is impractical. Instead, pass subcontext=true so that
  * the array build states can be freed individually.
  */
+
 ArrayBuildState *
 initArrayResult(Oid element_type, MemoryContext rcontext, bool subcontext)
+{
+	/*
+	 * When using a subcontext, we can afford to start with a somewhat larger
+	 * initial array size.  Without subcontexts, we'd better hope that most of
+	 * the states stay small ...
+	 */
+	return initArrayResultWithSize(element_type, rcontext, subcontext,
+								   subcontext ? 64 : 8);
+}
+
+/*
+ * initArrayResultWithSize
+ *		As initArrayResult, but allow the initial size of the allocated arrays
+ *		to be specified.
+ */
+ArrayBuildState *
+initArrayResultWithSize(Oid element_type, MemoryContext rcontext, bool subcontext, int initsize)
 {
 	ArrayBuildState *astate;
 	MemoryContext arr_context = rcontext;
@@ -5077,7 +5097,7 @@ initArrayResult(Oid element_type, MemoryContext rcontext, bool subcontext)
 		MemoryContextAlloc(arr_context, sizeof(ArrayBuildState));
 	astate->mcontext = arr_context;
 	astate->private_cxt = subcontext;
-	astate->alen = (subcontext ? 64 : 8);	/* arbitrary starting array size */
+	astate->alen = initsize;
 	astate->dvalues = (Datum *)
 		MemoryContextAlloc(arr_context, astate->alen * sizeof(Datum));
 	astate->dnulls = (bool *)
@@ -5159,7 +5179,7 @@ accumArrayResult(ArrayBuildState *astate,
  * makeArrayResult - produce 1-D final result of accumArrayResult
  *
  * Note: only releases astate if it was initialized within a separate memory
- * context (i.e. using subcontext=true when calling initArrayResult).
+ * context (i.e. using subcontext=true when calling initArrayResultWithSize).
  *
  *	astate is working state (must not be NULL)
  *	rcontext is where to construct result
@@ -5188,7 +5208,7 @@ makeArrayResult(ArrayBuildState *astate,
  * accumulated.
  *
  * Note: if the astate was not initialized within a separate memory context
- * (that is, initArrayResult was called with subcontext=false), then using
+ * (that is, initArrayResultWithSize was called with subcontext=false), then using
  * release=true is illegal. Instead, release astate along with the rest of its
  * context when appropriate.
  *
@@ -5234,7 +5254,7 @@ makeMdArrayResult(ArrayBuildState *astate,
 
 /*
  * The following three functions provide essentially the same API as
- * initArrayResult/accumArrayResult/makeArrayResult, but instead of accepting
+ * initArrayResultWithSize/accumArrayResult/makeArrayResult, but instead of accepting
  * inputs that are array elements, they accept inputs that are arrays and
  * produce an output array having N+1 dimensions.  The inputs must all have
  * identical dimensionality as well as element type.
@@ -5472,6 +5492,10 @@ makeArrayResultArr(ArrayBuildStateArr *astate,
 		int			dataoffset,
 					nbytes;
 
+		/* Check for overflow of the array dimensions */
+		(void) ArrayGetNItems(astate->ndims, astate->dims);
+		ArrayCheckBounds(astate->ndims, astate->dims, astate->lbs);
+
 		/* Compute required space */
 		nbytes = astate->nbytes;
 		if (astate->nullbitmap != NULL)
@@ -5515,7 +5539,7 @@ makeArrayResultArr(ArrayBuildStateArr *astate,
 
 /*
  * The following three functions provide essentially the same API as
- * initArrayResult/accumArrayResult/makeArrayResult, but can accept either
+ * initArrayResultWithSize/accumArrayResult/makeArrayResult, but can accept either
  * scalar or array inputs, invoking the appropriate set of functions above.
  */
 
@@ -5901,7 +5925,9 @@ array_fill_internal(ArrayType *dims, ArrayType *lbs,
 		lbsv = deflbs;
 	}
 
+	/* This checks for overflow of the array dimensions */
 	nitems = ArrayGetNItems(ndims, dimv);
+	ArrayCheckBounds(ndims, dimv, lbsv);
 
 	/* fast track for empty array */
 	if (nitems <= 0)

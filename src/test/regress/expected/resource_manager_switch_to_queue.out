@@ -1,0 +1,11 @@
+-- start_ignore
+\! gpconfig -c gp_resource_manager -v queue
+20230109:22:58:10:221578 gpconfig:ubuntu:gpadmin-[INFO]:-completed successfully with parameters '-c gp_resource_manager -v queue'
+-- end_ignore
+\! echo $?
+0
+-- start_ignore
+\! gpstop -raf
+-- end_ignore
+\! echo $?
+0

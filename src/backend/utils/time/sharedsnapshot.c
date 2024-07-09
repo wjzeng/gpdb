@@ -41,8 +41,8 @@
  * So, the theme is to share private, not-yet-committed session transaction
  * information with the QE Readers so the SegMate process group can all work
  * on the transaction correctly. [We mostly think of QE Writers/Readers being
- * on the segments. However, masters have special purpose QE Reader called the
- * Entry DB Singleton. So, the SegMate module also works on the master.]
+ * on the segments. However, coordinators have special purpose QE Reader called the
+ * Entry DB Singleton. So, the SegMate module also works on the coordinator.]
  *
  * Each shared snapshot is local only to the segment database. High level
  * Writer gang member establishes a local transaction, acquires the slot in
@@ -159,6 +159,7 @@
 #include "storage/proc.h"
 #include "storage/procarray.h"
 #include "utils/builtins.h"
+#include "utils/faultinjector.h"
 #include "utils/guc.h"
 #include "utils/memutils.h"
 #include "utils/resowner.h"
@@ -379,7 +380,11 @@ retry:
 		SharedSnapshotSlot *testSlot = &arrayP->slots[i];
 
 		if (testSlot->slotindex > arrayP->maxSlots)
-			elog(ERROR, "Shared Local Snapshots Array appears corrupted: %s", SharedSnapshotDump());
+		{
+			char *slot_dump = SharedSnapshotDump();
+			LWLockRelease(SharedSnapshotLock);
+			elog(ERROR, "Shared Local Snapshots Array appears corrupted: %s", slot_dump);
+		}
 
 		if (testSlot->slotid == slotId)
 		{
@@ -403,8 +408,10 @@ retry:
 		}
 		else
 		{
+			char *slot_dump = SharedSnapshotDump();
+			LWLockRelease(SharedSnapshotLock);
 			elog(ERROR, "writer segworker group shared snapshot collision on id %d. Slot array dump: %s",
-				 slotId, SharedSnapshotDump());
+				 slotId, slot_dump);
 		}
 	}
 
@@ -667,6 +674,7 @@ readSharedLocalSnapshot_forCursor(Snapshot snapshot, DtxContext distributedTrans
 	Assert(SharedLocalSnapshotSlot != NULL);
 	Assert(snapshot->xip != NULL);
 
+	SIMPLE_FAULT_INJECTOR("before_read_shared_snapshot_for_cursor");
 
 	if (dumpHtab == NULL)
 	{

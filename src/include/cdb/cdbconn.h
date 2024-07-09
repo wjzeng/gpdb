@@ -53,6 +53,8 @@ typedef struct SegmentDatabaseDescriptor
     char                   *whoami;         /* QE identifier for msgs */
 	bool					isWriter;
 	int						identifier;		/* unique identifier in the cdbcomponent segment pool */
+	double					establishConnTime; /* the time of establish connection to the segment,
+												* -1 means this connection is cached */
 } SegmentDatabaseDescriptor;
 
 SegmentDatabaseDescriptor *
@@ -68,7 +70,8 @@ cdbconn_termSegmentDescriptor(SegmentDatabaseDescriptor *segdbDesc);
 void
 cdbconn_doConnectStart(SegmentDatabaseDescriptor *segdbDesc,
 					   const char *gpqeid,
-					   const char *options);
+					   const char *options,
+					   const char *diff_options);
 void
 cdbconn_doConnectComplete(SegmentDatabaseDescriptor *segdbDesc);
 

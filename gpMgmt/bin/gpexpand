@@ -10,6 +10,7 @@ import copy
 import datetime
 import os
 import random
+import re
 import sys
 import json
 import shutil
@@ -17,10 +18,10 @@ import signal
 import traceback
 from collections import defaultdict
 from time import strftime, sleep
-
+import psycopg2
+from psycopg2 import DatabaseError, OperationalError
+from psycopg2 import extras
 try:
-    import pg, pgdb
-
     from gppylib.commands.unix import *
     from gppylib.commands.gp import *
     from gppylib.gparray import GpArray, MODE_NOT_SYNC, STATUS_DOWN
@@ -32,14 +33,16 @@ try:
     from gppylib.operations.startSegments import MIRROR_MODE_MIRRORLESS
     from gppylib.system import configurationInterface, configurationImplGpdb
     from gppylib.system.environment import GpCoordinatorEnvironment
-    from pgdb import DatabaseError
-    from gppylib.gpcatalog import COORDINATOR_ONLY_TABLES
+    from gppylib.gpcatalog import COORDINATOR_ONLY_TABLES_MAPPED
+    from gppylib.gpcatalog import COORDINATOR_ONLY_TABLES_NON_MAPPED
     from gppylib.operations.package import SyncPackages
+    from gppylib.programs.clsRecoverSegment_triples import get_segments_with_running_basebackup
     from gppylib.operations.utils import ParallelOperation
     from gppylib.parseutils import line_reader, check_values, canonicalize_address
     from gppylib.heapchecksum import HeapChecksum
     from gppylib.commands.pg import PgBaseBackup
     from gppylib.mainUtils import ExceptionNoStackTraceNeeded
+    from gppylib.operations.update_pg_hba_on_segments import update_pg_hba_on_segments
 
 except ImportError as e:
     sys.exit('ERROR: Cannot import modules.  Please check that you have sourced greenplum_path.sh.  Detail: ' + str(e))
@@ -47,6 +50,9 @@ except ImportError as e:
 # constants
 MAX_PARALLEL_EXPANDS = 96
 MAX_BATCH_SIZE = 128
+
+FIRST_NORMAL_OID = 16384
+RELKIND_FOREIGN_TABLE = 'f'
 
 SEGMENT_CONFIGURATION_BACKUP_FILE = "gpexpand.gp_segment_configuration"
 
@@ -147,6 +153,8 @@ def parseargs():
                       help='Do not prompt for confirmation to proceed on warnings')
     parser.add_option('', '--hba-hostnames', action='store_true', default=False,
                       help='use hostnames instead of CIDR in pg_hba.conf')
+    parser.add_option('', '--without-icproxy-check', action='store_true', default=False,
+                      help='no check the icproxy address')
     parser.add_option('--usage', action="briefhelp")
 
     parser.set_defaults(verbose=False, filters=[], slice=(None, None))
@@ -258,6 +266,17 @@ def gpexpand_status_file_exists(coordinator_data_directory):
     return os.path.exists(coordinator_data_directory + '/gpexpand.status')
 
 
+def is_cluster_up_and_balanced(dburl):
+    count = -1
+    sql = "select count(*) from gp_segment_configuration where status <> 'u' or preferred_role <> role;"
+    try:
+        with closing(dbconn.connect(dburl, encoding='UTF8')) as conn:
+            count = dbconn.querySingleton(conn, sql)
+    except Exception as e:
+        raise Exception("failed to query cluster role check: %s" % str(e))
+
+    return count == 0
+
 # -------------------------------------------------------------------------
 # expansion schema
 
@@ -274,16 +293,16 @@ status_table_sql = """CREATE TABLE gpexpand.status
                           updated timestamp ) """
 
 status_detail_table_sql = """CREATE TABLE gpexpand.status_detail
-                        ( dbname text,
+                        ( table_oid oid,
+                          dbname text,
                           fq_name text,
-                          table_oid oid,
-                          root_partition_name text,
+                          root_partition_oid oid,
                           rank int,
                           external_writable bool,
                           status text,
                           expansion_started timestamp,
                           expansion_finished timestamp,
-                          source_bytes numeric ) """
+                          source_bytes numeric ) distributed by (table_oid)"""
 # gpexpand views
 progress_view_simple_sql = """CREATE VIEW gpexpand.expansion_progress AS
 SELECT
@@ -441,10 +460,12 @@ class GpExpandStatus():
 
     def _sync_status_file(self):
         """Syncs the gpexpand status file with the coordinator mirror"""
-        cpCmd = Scp('gpexpand copying status file to coordinator mirror',
+        cpCmd = Rsync('gpexpand copying status file to coordinator mirror',
                     srcFile=self._status_filename,
                     dstFile=self._status_standby_filename,
-                    dstHost=self._coordinator_mirror.getSegmentHostName())
+                    dstHost=self._coordinator_mirror.getSegmentHostName(),
+                    ignore_times=True,
+                    whole_file=True)
         cpCmd.run(validateAfter=True)
 
     def set_status(self, status, status_info=None, force=False):
@@ -511,10 +532,12 @@ class GpExpandStatus():
         """ Sync the segment configuration backup file to standby """
         if self._coordinator_mirror:
             self.logger.debug("Sync segment configuration backup file")
-            cpCmd = Scp('gpexpand copying segment configuration backup file to coordinator mirror',
+            cpCmd = Rsync('gpexpand copying segment configuration backup file to coordinator mirror',
                         srcFile=self._gp_segment_configuration_backup,
                         dstFile=self._segment_configuration_standby_filename,
-                        dstHost=self._coordinator_mirror.getSegmentHostName())
+                        dstHost=self._coordinator_mirror.getSegmentHostName(),
+                        ignore_times=True,
+                        whole_file=True)
             cpCmd.run(validateAfter=True)
 
     def get_temp_dir(self):
@@ -659,9 +682,9 @@ class SegmentTemplate:
 
         try:
             coordinatorSeg = self.gparray.coordinator
-            cmd = PgBaseBackup(pgdata=self.tempDir,
-                               host=coordinatorSeg.getSegmentHostName(),
-                               port=str(coordinatorSeg.getSegmentPort()),
+            cmd = PgBaseBackup(target_datadir=self.tempDir,
+                               source_host=coordinatorSeg.getSegmentAddress(),
+                               source_port=str(coordinatorSeg.getSegmentPort()),
                                recovery_mode=False,
                                target_gp_dbid=dummyDBID)
             cmd.run(validateAfter=True)
@@ -756,10 +779,12 @@ class SegmentTemplate:
         """Distributes template tar file to hosts"""
         for host in self.hosts:
             logger.debug('Copying tar file to %s' % host)
-            cpCmd = Scp(name='gpexpand distribute tar file to new hosts',
+            cpCmd = Rsync(name='gpexpand distribute tar file to new hosts',
                         srcFile=self.schema_tar_file,
                         dstFile=self.segTarDir,
-                        dstHost=host)
+                        dstHost=host,
+                        ignore_times=True,
+                        whole_file=True)
             self.pool.addCommand(cpCmd)
 
         self.pool.join()
@@ -825,24 +850,13 @@ class SegmentTemplate:
         self.pool.check_results()
 
         # Map primary and mirror hostnames to expanded segment's contentid
-        m = defaultdict(lambda: [])
+        expanded_host_content = defaultdict(lambda: [])
         for seg in self.gparray.getExpansionSegDbList():
-            m[seg.getSegmentContentId()].append(seg.getSegmentHostName())
+            expanded_host_content[seg.getSegmentContentId()].append(seg.getSegmentHostName())
 
         # Now update the primary's hba config with the corresponding primary
         # and mirror information
-        for seg in self.gparray.getExpansionSegDbList():
-            if seg.isSegmentPrimary():
-                modifyConfCmd = ModifyPgHbaConfSetting(
-                        'Updating %s/pg_hba.conf' % seg.getSegmentHostName(),
-                        os.path.join(seg.getSegmentDataDirectory(), 'pg_hba.conf'),
-                        ctxt=REMOTE, remoteHost=seg.getSegmentHostName(),
-                        addresses=m[seg.getSegmentContentId()],
-                        is_hba_hostnames=self.isHbaHostnames)
-                self.pool.addCommand(modifyConfCmd)
-
-        self.pool.join()
-        self.pool.check_results()
+        update_pg_hba_on_segments(self.gparray, self.isHbaHostnames, self.batch_size, expanded_host_content)
 
         self._start_new_primary_segments()
         self._stop_new_primary_segments()
@@ -856,17 +870,17 @@ class SegmentTemplate:
         localHostname = self.gparray.coordinator.getSegmentHostName()
         cmdName = 'gpexpand copying postgresql.conf to %s:%s/postgresql.conf' \
                   % (self.srcSegHostname, self.srcSegDataDir)
-        cpCmd = Scp(name=cmdName, srcFile=self.srcSegDataDir + '/postgresql.conf',
+        cpCmd = Rsync(name=cmdName, srcFile=self.srcSegDataDir + '/postgresql.conf',
             dstFile=self.tempDir, dstHost=localHostname, ctxt=REMOTE,
-            remoteHost=self.srcSegHostname)
+            remoteHost=self.srcSegHostname, ignore_times=True, whole_file=True)
         cpCmd.run(validateAfter=True)
 
         self.logger.info('Copying pg_hba.conf from existing segment into template')
         cmdName = 'gpexpand copy pg_hba.conf to %s:%s/pg_hba.conf' \
                   % (self.srcSegHostname, self.srcSegDataDir)
-        cpCmd = Scp(name=cmdName, srcFile=self.srcSegDataDir + '/pg_hba.conf',
+        cpCmd = Rsync(name=cmdName, srcFile=self.srcSegDataDir + '/pg_hba.conf',
                     dstFile=self.tempDir, dstHost=localHostname,ctxt=REMOTE,
-                    remoteHost=self.srcSegHostname)
+                    remoteHost=self.srcSegHostname, ignore_times=True, whole_file=True)
         cpCmd.run(validateAfter=True)
 
     def _tar_template(self):
@@ -1151,6 +1165,13 @@ class gpexpand:
         return dict(cursor.fetchall())
 
     def addNewSegments(self, inputFileEntryList):
+        segments_with_running_basebackup = get_segments_with_running_basebackup()
+        contentIds_with_running_basebackup = [seg.contentId for seg in inputFileEntryList if seg.contentId in segments_with_running_basebackup]
+
+        if len(contentIds_with_running_basebackup)>0:
+            raise Exception(
+            "Found pg_basebackup running for segments with contentIds %s" %contentIds_with_running_basebackup)
+
         for seg in inputFileEntryList:
             self.gparray.addExpansionSeg(content=int(seg.contentId)
                                          , preferred_role=seg.role
@@ -1237,6 +1258,20 @@ class gpexpand:
             raise ExpansionError('Missing tablespace input file')
 
         tablespace_inputfile = self.options.filename + ".ts"
+
+        """
+        Check if the tablespace input file exists or not
+        In cases where the user manually creates an input file, the file
+        will not be present. In such cases create the file and exit giving the
+        user a chance to review it and re-run gpexpand.
+        """
+        if not os.path.exists(tablespace_inputfile):
+            self.generate_tablespace_inputfile(tablespace_inputfile)
+            self.logger.warning("Could not locate tablespace input configuration file '{0}'. A new tablespace input configuration file is written " \
+                                "to '{0}'. Please review the file and re-run with: gpexpand -i {1}".format(tablespace_inputfile, self.options.filename))
+
+            logger.info("Exiting...")
+            sys.exit(1)
 
         new_tblspc_info = {}
 
@@ -1350,7 +1385,7 @@ class gpexpand:
         dbconn.execSQL(self.conn, "CHECKPOINT")
         self.conn.close()
 
-        # increase expand version 
+        # increase expand version
         self.conn = dbconn.connect(self.dburl, utility=True, encoding='UTF8')
         dbconn.execSQL(self.conn, "select gp_expand_bump_version()")
         self.conn.close()
@@ -1396,11 +1431,13 @@ class gpexpand:
         self.pool.check_results()
 
         """
-        Build the list of delete statements based on the COORDINATOR_ONLY_TABLES
-        defined in gpcatalog.py
+        Build the list of DELETE and TRUNCATE statements based on the subset of
+        COORDINATOR_ONLY_TABLES defined in gpcatalog.py. Mapped tables cannot
+        be TRUNCATEd, and we will have DELETE from them.
         """
-        statements = ["delete from pg_catalog.%s" % tab for tab in COORDINATOR_ONLY_TABLES]
-
+        delete_statements = ["delete from pg_catalog.%s" % tab for tab in COORDINATOR_ONLY_TABLES_MAPPED]
+        truncate_statements = ["truncate pg_catalog.%s" % tab for tab in COORDINATOR_ONLY_TABLES_NON_MAPPED]
+        statements = delete_statements + truncate_statements
         """
           Connect to each database in the new segments, and clean up the catalog tables.
         """
@@ -1576,32 +1613,82 @@ class gpexpand:
         # including new segments has been started once before so finalize
         self.finalize_prepare()
 
+    def generate_sql_to_populate_table_size(self, sql):
+        # This function generate a SQL that can compute table size
+        # taking the advantage of MPP. Previous code put pg_relation_size
+        # in target list of a query involving only catalog, thus each
+        # tuple will lead to a dispatch to compute pg_relation_size
+        # thus bad performance. Now we let pg_relation_size compute
+        # at each segment and then group by the table oid and sum
+        # together to get each table's size. pg_relation_size is
+        # volatile function, so the following CTE sql's subquery
+        # x will never be pulled up which means the pg_relation_size
+        # will always be evaluated before later motion to gurantee
+        # correctness no matter single stage or multi stage agg.
+        #
+        # Also note, we filter out those relations with relkind is
+        # RELKIND_FOREIGN_TABLE, because we only expand those
+        # are external writable, and even for external writable ones
+        # we simple modify the numsegments and do not move data.
+        # Refer to C code: ATExecExpandTable and ATExecExpandPartitionTablePrepare.
+        cte_sql = """with table_size_cte(table_oid, size) as
+        (
+           select table_oid, sum(size)
+           from (
+             select oid as table_oid,
+                    pg_relation_size(oid) as size
+             from gp_dist_random('pg_class')
+             where oid >= %d and relkind <> '%s'
+           ) x(table_oid, size)
+           group by table_oid
+        )
+        """ % (FIRST_NORMAL_OID, RELKIND_FOREIGN_TABLE)
+
+        final_sql = """{cte_sql}
+        select
+          s1.table_oid,
+          s1.dbname,
+          s1.fq_name,
+          s1.root_partition_oid,
+          s1.rank,
+          s1.external_writable,
+          s1.undone_status,
+          s1.expansion_started,
+          s1.expansion_finished,
+          coalesce(table_size_cte.size, 0) as source_bytes
+        from ({orig_sql})s1 left join table_size_cte
+        on s1.table_oid = table_size_cte.table_oid
+        """
+        return final_sql.format(cte_sql=cte_sql,
+                                orig_sql=sql)
+
     def _populate_regular_tables(self, dbname):
-        src_bytes_str = "0" if self.options.simple_progress else "pg_relation_size(quote_ident(n.nspname) || '.' || quote_ident(c.relname))"
         sql = """SELECT
-    current_database(),
-    quote_ident(n.nspname) || '.' || quote_ident(c.relname) as fq_name,
-    c.oid as tableoid,
-    NULL as root_partition_name,
-    2 as rank,
-    pe.writable is not null as external_writable,
-    '%s' as undone_status,
-    NULL as expansion_started,
-    NULL as expansion_finished,
-    %s as source_bytes
-FROM
-    pg_class c
-    JOIN pg_namespace n ON (c.relnamespace=n.oid)
-    JOIN pg_catalog.gp_distribution_policy p on (c.oid = p.localoid)
-    LEFT JOIN pg_partitioned_table pp on (c.oid=pp.partrelid)
-    LEFT JOIN pg_exttable pe on (c.oid=pe.reloid and pe.writable)
-WHERE
-    pp.partrelid is NULL
-    AND NOT c.relispartition
-    AND n.nspname != 'gpexpand'
-    AND n.nspname != 'pg_bitmapindex'
-    AND c.relpersistence != 't'
-                  """ % (undone_status, src_bytes_str)
+                   c.oid as table_oid,
+                   current_database() as dbname,
+                   quote_ident(n.nspname) || '.' || quote_ident(c.relname) as fq_name,
+                   NULL as root_partition_oid,
+                   2 as rank,
+                   pe.writable is not null as external_writable,
+                   '%s' as undone_status,
+                   NULL as expansion_started,
+                   NULL as expansion_finished,
+                   0 as source_bytes
+                FROM
+                       pg_class c
+                  JOIN pg_namespace n ON (c.relnamespace=n.oid)
+                  JOIN  pg_catalog.gp_distribution_policy p on (c.oid = p.localoid)
+              LEFT JOIN pg_partitioned_table pp on (c.oid=pp.partrelid)
+              LEFT JOIN pg_exttable pe on (c.oid=pe.reloid and pe.writable)
+                WHERE
+                      pp.partrelid is NULL
+                  AND NOT c.relispartition
+                  AND n.nspname != 'gpexpand'
+                  AND n.nspname != 'pg_bitmapindex'
+                  AND c.relpersistence != 't' """ % undone_status
+
+        if not self.options.simple_progress:
+            sql = self.generate_sql_to_populate_table_size(sql)
         self.logger.debug(sql)
         table_conn = self.connect_database(dbname)
 
@@ -1628,14 +1715,17 @@ WHERE
 
     def _populate_partitioned_tables(self, dbname):
         """
-        population of status_detail for partitioned tables, leaf partition cannot
-        has different numsegments with root partition, we need to expand root
-        partition in one shot, so just populate root partition for now.
+        The policy of leaves can be different of the policy of root, But it must
+        follow below rules:
+        If a partitioned table is Hash distributed, then all its leaf partitions
+        must also be Hash partitioned on the same distribution key, with the
+        same 'numsegments', or randomly distributed with the same 'numsegments'.
+        If a partitioned table is Randomly distributed, then all the leaves must
+        be randomly distributed as well.
 
-        TODO:
-        We used to use a tricky but effective way to expand leaf partition in
-        in parallel, that way is still under discussion. Keep the old method
-        here in case we need bring it back someday.
+        population of status_detail for partitioned tables, leaf partition can
+        has different policy with root partition, we need to expand leaf
+        partitions separately in parallel.
 
         Step1:
            BEGIN;
@@ -1644,44 +1734,62 @@ WHERE
            Change all leaf partition to random distributed;
            COMMIT;
         Step2:
-           Change all leaf partition's policy back to old policy with a mandatory
-           data movement.
+           Change all leaf partition's policy back to parent's policy with set distributed
+           with(REORGANIZE=true)
         """
-        src_bytes_str = "0" if self.options.simple_progress else "pg_relation_size(quote_ident(n.nspname) || '.' || quote_ident(c.relname))"
-        sql = """
-SELECT
-    current_database(),
-    quote_ident(n.nspname) || '.' || quote_ident(c.relname) as fq_name,
-    c.oid as tableoid,
-    quote_ident(n.nspname) || '.' || quote_ident(c.relname) as root_partition_name,
-    2 as rank,
-    false as external_writable,
-    '%s' as undone_status,
-    NULL as expansion_started,
-    NULL as expansion_finished,
-    %s as source_bytes
-FROM
-    pg_class c,
-    pg_namespace n,
-    pg_partitioned_table p,
-    gp_distribution_policy d
-WHERE
-    c.relnamespace = n.oid
-    AND p.partrelid = c.oid
-    AND NOT c.relispartition
-    AND d.localoid = c.oid
-ORDER BY fq_name, tableoid desc
-                  """ % (undone_status, src_bytes_str)
-        self.logger.debug(sql)
         table_conn = self.connect_database(dbname)
+
+        cursor = dbconn.query(table_conn, """
+            SELECT partrelid::regclass AS relname
+            FROM pg_partitioned_table, pg_class
+            WHERE partrelid = pg_class.oid AND relispartition = FALSE;
+        """)
+        for row in cursor:
+            prepare_cmd = """
+                ALTER TABLE %s EXPAND PARTITION PREPARE;
+            """ % (row.relname)
+            self.logger.debug(prepare_cmd)
+            dbconn.execSQL(table_conn, prepare_cmd, autocommit=True)
+
+        get_status_detail_cmd = """
+             SELECT
+                c.oid as table_oid,
+                current_database() as dbname,
+                quote_ident(n.nspname) || '.' || quote_ident(c.relname) as fq_name,
+                d.oid as root_partition_oid,
+                2 as rank,
+                false as external_writable,
+                '%s' as undone_status,
+                NULL as expansion_started,
+                NULL as expansion_finished,
+                0 as source_bytes
+            FROM
+                pg_inherits a,
+                pg_partitioned_table b,
+                pg_class c,
+                pg_class d,
+                pg_namespace n
+            WHERE
+                a.inhparent=b.partrelid and
+                a.inhrelid = c.oid and
+                a.inhparent = d.oid and
+                c.relnamespace = n.oid and
+                c.relkind != 'p' and
+                c.relkind != 'f'
+        """ % undone_status
+
+        if not self.options.simple_progress:
+            get_status_detail_cmd = self.generate_sql_to_populate_table_size(get_status_detail_cmd)
+        self.logger.debug(get_status_detail_cmd)
 
         try:
             data_file = os.path.abspath('./status_detail.dat')
             self.logger.debug('status_detail data file: %s' % data_file)
-            copySQL = """COPY (%s) TO '%s'""" % (sql, data_file)
+            copySQL = """COPY (%s) TO '%s'""" % (get_status_detail_cmd, data_file)
 
             self.logger.debug(copySQL)
             dbconn.execSQL(table_conn, copySQL)
+            table_conn.commit()
             table_conn.close()
         except Exception as e:
             raise ExpansionError(e)
@@ -1797,7 +1905,7 @@ ORDER BY fq_name, tableoid desc
                 expansionStopped)
             dbconn.execSQL(self.conn, sql)
             self.conn.close()
-        except pgdb.OperationalError:
+        except OperationalError:
             pass
         except Exception:
             # schema doesn't exist.  Cancel or error during setup
@@ -1849,7 +1957,7 @@ ORDER BY fq_name, tableoid desc
     def connect_database(self, dbname):
         test_url = copy.deepcopy(self.dburl)
         test_url.pgdb = dbname
-        c = dbconn.connect(test_url, encoding='UTF8', allowSystemTableMods=True)
+        c = dbconn.connect(test_url, encoding='UTF8', allowSystemTableMods=True, cursorFactory=psycopg2.extras.NamedTupleCursor)
         return c
 
     def sync_packages(self):
@@ -1859,16 +1967,10 @@ ORDER BY fq_name, tableoid desc
         """
         try:
             logger.info('Syncing Greenplum Database extensions')
-            new_segment_list = self.gparray.getExpansionSegDbList()
-            new_host_set = set([h.getSegmentHostName() for h in new_segment_list])
-            operations = [SyncPackages(host) for host in new_host_set]
-            ParallelOperation(operations, self.numworkers).run()
-            # introspect outcomes
-            for operation in operations:
-                operation.get_ret()
+            SyncPackages().run()
         except Exception:
             logger.exception('Syncing of Greenplum Database extensions has failed.')
-            logger.warning('Please run gppkg --clean after successful expansion.')
+            logger.warning('Please run `gppkg sync` after successful expansion.')
 
     def validate_heap_checksums(self):
         num_workers = min(len(self.gparray.get_hostlist()), MAX_PARALLEL_EXPANDS)
@@ -1902,27 +2004,81 @@ ORDER BY fq_name, tableoid desc
         else:
             self.logger.info("Heap checksum setting consistent across cluster")
 
+    def validate_icproxy_addr(self, inputFileEntryList):
+        """
+        If we are in icproxy mode: the proxy addresses of newly added segments are still empty after
+        expansion. It will cause queries to hang forever.
+        So, we have to check if the user have already set gp_interconnect_proxy_addresses before.
+        And prompt user to set a proper value via gpconfig before expansion.
+        """
+
+        # get GUC value
+        conn = dbconn.connect(_gp_expand.dburl, encoding='UTF8')
+        try:
+            sql = "show gp_interconnect_proxy_addresses;"
+            icproxy_addresses_string = dbconn.queryRow(conn, sql)[0].strip()
+            sql = "show gp_interconnect_type;"
+            ic_type = dbconn.queryRow(conn, sql)[0].strip()
+        except DatabaseError as e:
+            if re.search('unrecognized configuration parameter', str(e)):
+                # no gp_interconnect_proxy_addresses in a distribution without `ENABLE_IC_PROXY`
+                # it means no need to check the proxy addresses, let's return directly
+                return
+            raise Exception("failed to query in validate_icproxy_addr, database error: %s" % str(e))
+        except Exception as e:
+            raise Exception("failed to query in validate_icproxy_addr, exception: %s" % str(e))
+        finally:
+            conn.close()
+
+        # check if newly added dbid exists in gp_interconnect_proxy_addresses
+        need_prompt = False
+        new_addresses_string = icproxy_addresses_string
+        if icproxy_addresses_string:
+            self.logger.info("ICProxy addresses has been set to: %s, start to checking if it contains newly added segs", icproxy_addresses_string)
+
+            dbid_set = set()
+            # icproxy_addresses_string example: 1:-1:gpdb:1432,2:0:gpdb:2000,3:1:gpdb:2001
+            for addr in icproxy_addresses_string.split(','):
+                db_id, content_id, host, port = addr.split(':')
+                dbid_set.add(db_id)
+
+            for seg in inputFileEntryList:
+                if seg.dbid not in dbid_set:
+                    need_prompt = True
+                    new_addresses_string += ",%s:%s:%s:{port}" % (seg.dbid, seg.contentId, seg.hostname.strip())
+                    self.logger.warning(" Missing the address of dbid %s in gp_interconnect_proxy_addresses" % (seg.dbid))
+
+            # prompt user to use gpconfig to set the proper value of gp_interconnect_proxy_addresses
+            if need_prompt:
+                if ic_type == "proxy":
+                    self.logger.error("Please run gpconfig to set gp_interconnect_proxy_addresses (replace the {port} with a proper value):")
+                    self.logger.error(" gpconfig -c gp_interconnect_proxy_addresses -v \"'%s'\" --skipvalidation" % (new_addresses_string))
+                    self.logger.error('then rerun gpexpand -i {input_file}')
+                    raise Exception("Checking ICProxy addresses failed")
+                else:
+                    self.logger.warning("Recommended that run gpconfig to set gp_interconnect_proxy_addresses (replace the {port} with a proper value):")
+                    self.logger.warning(" gpconfig -c gp_interconnect_proxy_addresses -v \"'%s'\" --skipvalidation" % (new_addresses_string))
+            else:
+                self.logger.info("Checking ICProxy addresses passed")
+        return
 
 # -----------------------------------------------
 class ExpandTable():
     def __init__(self, options, row=None):
         self.options = options
-        self.is_root_partition = False
         if row is not None:
-            (self.dbname, self.fq_name, self.table_oid,
-             self.root_partition_name,
+            (self.table_oid, self.dbname, self.fq_name,
+             self.root_partition_oid,
              self.rank, self.external_writable, self.status,
              self.expansion_started, self.expansion_finished,
              self.source_bytes) = row
-        if self.fq_name == self.root_partition_name:
-            self.is_root_partition = True
 
     def add_table(self, conn):
         insertSQL = """INSERT INTO gpexpand.status_detail
                             VALUES ('%s','%s',%s,
-                                    '%s',%d,'%s','%s','%s','%s',%d)
+                                    '%d',%d,'%s','%s','%s','%s',%d)
                     """ % (self.dbname.replace("'", "''"), self.fq_name.replace("'", "''"), self.table_oid,
-                           self.root_partition_name.replace("'", "''"),
+                           self.root_partition_oid,
                            self.rank, self.external_writable, self.status,
                            self.expansion_started, self.expansion_finished,
                            self.source_bytes)
@@ -1960,19 +2116,36 @@ class ExpandTable():
         dbconn.execSQL(status_conn, sql)
 
     def expand(self, table_conn, cancel_flag):
-        # for root partition, we want to expand whose partition in one shot
-        # TODO: expand leaf partitions separately in parallel
-        only_str = "" if self.is_root_partition else "ONLY"
-        external_str = "EXTERNAL" if self.external_writable else ""
-        sql = 'ALTER %s TABLE %s %s EXPAND TABLE' % (external_str, only_str, self.fq_name)
+        # expand leaf partitions separately in parallel
+        # FIXME: alter table on external table does not throw
+        #        a warning, but it will throw error in 6X
+        #        do we still need using alter external table?
+        if self.root_partition_oid is not None:
+            get_dist_cmd = """
+                select pg_get_table_distributedby(%d) as distribution_policy;
+            """ % (self.root_partition_oid)
+            res = dbconn.queryRow(table_conn, get_dist_cmd)
+            sql = "ALTER TABLE %s SET WITH (REORGANIZE=true) %s" % (self.fq_name, res.distribution_policy)
+        else:
+            # FIXME: Can "ONLY" be allowed in "EXPAND TABLE"?
+            sql = 'ALTER TABLE %s EXPAND TABLE' % self.fq_name
 
         logger.info('Expanding %s.%s' % (self.dbname, self.fq_name))
         logger.debug("Expand SQL: %s" % sql)
 
         # check is atomic in python
         if not cancel_flag:
-            dbconn.execSQL(table_conn, sql)
-            # the ALTER TABLE command requires a commit to execute
+            try:
+                dbconn.execSQL(table_conn, sql)
+            except DatabaseError as e:
+                if re.search('DETAIL:\s*table has already been expanded', str(e)):
+                    logger.info('Table %s.%s seems to be already expanded, marking as done' % (self.dbname, self.fq_name))
+                elif re.search('\s*could not open relation with (OID \d+ )?', str(e)):
+                    logger.warning('Encountered unexpected issue when expanding table %s.%s, skipping' % (self.dbname, self.fq_name))
+                    table_conn.rollback()
+                    return False
+                else:
+                    raise
             table_conn.commit()
             if self.options.analyze:
                 sql = 'ANALYZE %s' % (self.fq_name)
@@ -2085,7 +2258,7 @@ class ExpandCommand(SQLCommand):
 
         try:
             status_conn = dbconn.connect(self.status_url, encoding='UTF8')
-            table_conn = dbconn.connect(self.table_url, encoding='UTF8')
+            table_conn = dbconn.connect(self.table_url, encoding='UTF8', cursorFactory=psycopg2.extras.NamedTupleCursor)
         except DatabaseError as ex:
             if self.options.verbose:
                 logger.exception(ex)
@@ -2329,7 +2502,7 @@ with: gpexpand -i %s
                 """ % (outfile))
 
 
-def sig_handler(sig):
+def sig_handler(sig, arg):
     if _gp_expand is not None:
         _gp_expand.shutdown()
 
@@ -2385,7 +2558,7 @@ def main(options, args, parser):
             logger.error('Failed to connect to database.  Make sure the')
             logger.error('Greenplum instance you wish to expand is running')
             logger.error('and that your environment is correct, then rerun')
-            logger.error('gexpand ' + ' '.join(sys.argv[1:]))
+            logger.error('gpexpand ' + ' '.join(sys.argv[1:]))
             sys.exit(1)
 
         _gp_expand = gpexpand(logger, gparray, dburl, options, parallel=options.parallel)
@@ -2416,6 +2589,10 @@ def main(options, args, parser):
                 logger.error(e)
                 sys.exit(1)
 
+        # check if the cluster is in good health
+        if gpexpand_file_status is None and gpexpand_db_status is None and not is_cluster_up_and_balanced(dburl):
+            logger.warning('One or more segments are either down or not in preferred role.')
+
         if gpexpand_db_status == 'SETUP DONE' or gpexpand_db_status == 'EXPANSION STOPPED':
             if not _gp_expand.validate_max_connections():
                 raise ValidationError()
@@ -2434,10 +2611,12 @@ def main(options, args, parser):
             _gp_expand.validate_heap_checksums()
             newSegList = _gp_expand.read_input_files()
             _gp_expand.addNewSegments(newSegList)
+            if not options.without_icproxy_check:
+                _gp_expand.validate_icproxy_addr(newSegList)
+            newTableSpaceInfo = _gp_expand.read_tablespace_file()
             _gp_expand.sync_packages()
             _gp_expand.start_prepare()
             _gp_expand.lock_catalog()
-            newTableSpaceInfo = _gp_expand.read_tablespace_file()
             _gp_expand.add_segments(newTableSpaceInfo)
             _gp_expand.update_original_segments()
             _gp_expand.cleanup_new_segments()

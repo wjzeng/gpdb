@@ -179,7 +179,8 @@ CSubqueryHandler::PexprReplace(CMemoryPool *mp, CExpression *pexprInput,
 CExpression *
 CSubqueryHandler::PexprSubqueryPred(CExpression *pexprOuter,
 									CExpression *pexprSubquery,
-									CExpression **ppexprResult)
+									CExpression **ppexprResult,
+									CSubqueryHandler::ESubqueryCtxt esqctxt)
 {
 	GPOS_ASSERT(CUtils::FQuantifiedSubquery(pexprSubquery->Pop()));
 
@@ -187,7 +188,6 @@ CSubqueryHandler::PexprSubqueryPred(CExpression *pexprOuter,
 	CExpression *pexprNewLogical = nullptr;
 
 	CExpression *pexprScalarChild = (*pexprSubquery)[1];
-	CSubqueryHandler::ESubqueryCtxt esqctxt = CSubqueryHandler::EsqctxtFilter;
 
 	// If pexprScalarChild is a non-scalar subquery such as follows,
 	// EXPLAIN SELECT * FROM t3 WHERE (c = ANY(SELECT c FROM t2)) IN (SELECT b from t1);
@@ -1223,11 +1223,35 @@ CSubqueryHandler::FCreateCorrelatedApplyForQuantifiedSubquery(
 		CScalarSubqueryQuantified::PopConvert(pexprSubquery->Pop());
 	CColRef *colref = const_cast<CColRef *>(popSubquery->Pcr());
 
+	// If subq is SubqueryAll and scalar child is a subquery then it must be
+	// treated in "Value" context. For example:
+	//
+	//   SELECT * FROM foo WHERE (SELECT a FROM foo limit 1) = ALL(SELECT b FROM bar);
+	//
+	//   +--CScalarSubqueryAll(=)["b" (8)]
+	//      |--CLogicalGet "bar" ("bar"),
+	//      +--CScalarSubquery["a" (16)]
+	//         +--CLogicalLimit <empty> global
+	//            |--CLogicalGet "foo" ("foo"),
+	//            |--CScalarConst (0)
+	//            +--CScalarCast
+	//               +--CScalarConst (1)
+	//
+	// "Value" context signals FGenerateCorrelatedApplyForScalarSubquery() to
+	// generate a left outer apply as opposed to an inner apply. This is
+	// necessary in order to avoid incorrectly filtering out non-matching rows
+	// which are required to correctly determine the ALL_SUBLINK result.
+	if ((*pexprSubquery)[1]->Pop()->Eopid() == COperator::EopScalarSubquery &&
+		eopidSubq == COperator::EopScalarSubqueryAll)
+	{
+		esqctxt = EsqctxtValue;
+	}
+
 	// build subquery quantified comparison
 	CExpression *pexprResult = nullptr;
 	CSubqueryHandler sh(mp, true /* fEnforceCorrelatedApply */);
 	CExpression *pexprPredicate =
-		sh.PexprSubqueryPred(pexprInner, pexprSubquery, &pexprResult);
+		sh.PexprSubqueryPred(pexprInner, pexprSubquery, &pexprResult, esqctxt);
 
 	pexprInner->AddRef();
 	if (EsqctxtFilter == esqctxt)
@@ -1430,13 +1454,6 @@ CSubqueryHandler::FRemoveAnySubquery(CExpression *pexprOuter,
 #ifdef GPOS_DEBUG
 	AssertValidArguments(mp, pexprOuter, pexprSubquery, ppexprNewOuter,
 						 ppexprResidualScalar);
-	COperator *popSubqChild = (*pexprSubquery)[0]->Pop();
-	GPOS_ASSERT_IMP(
-		COperator::EopLogicalConstTableGet == popSubqChild->Eopid(),
-		0 == CLogicalConstTableGet::PopConvert(popSubqChild)
-					->Pdrgpdrgpdatum()
-					->Size() &&
-			"Constant subqueries must be unnested during preprocessing");
 #endif	// GPOS_DEBUG
 
 	CScalarSubqueryAny *pScalarSubqAny =
@@ -1459,7 +1476,7 @@ CSubqueryHandler::FRemoveAnySubquery(CExpression *pexprOuter,
 	// build subquery quantified comparison
 	CExpression *pexprResult = nullptr;
 	CExpression *pexprPredicate =
-		PexprSubqueryPred(pexprInner, pexprSubquery, &pexprResult);
+		PexprSubqueryPred(pexprInner, pexprSubquery, &pexprResult, esqctxt);
 
 	// generate a select for the quantified predicate
 	pexprInner->AddRef();
@@ -1601,13 +1618,6 @@ CSubqueryHandler::FRemoveAllSubquery(CExpression *pexprOuter,
 #ifdef GPOS_DEBUG
 	AssertValidArguments(mp, pexprOuter, pexprSubquery, ppexprNewOuter,
 						 ppexprResidualScalar);
-	COperator *popSubqChild = (*pexprSubquery)[0]->Pop();
-	GPOS_ASSERT_IMP(
-		COperator::EopLogicalConstTableGet == popSubqChild->Eopid(),
-		0 == CLogicalConstTableGet::PopConvert(popSubqChild)
-					->Pdrgpdrgpdatum()
-					->Size() &&
-			"Constant subqueries must be unnested during preprocessing");
 #endif	// GPOS_DEBUG
 
 	if (m_fEnforceCorrelatedApply)
@@ -1619,7 +1629,6 @@ CSubqueryHandler::FRemoveAllSubquery(CExpression *pexprOuter,
 
 	BOOL fSuccess = true;
 	BOOL fUseCorrelated = false;
-	CExpression *pexprInnerSelect = nullptr;
 	CExpression *pexprPredicate = nullptr;
 	CExpression *pexprInner = (*pexprSubquery)[0];
 	COperator::EOperatorId eopidSubq = pexprSubquery->Pop()->Eopid();
@@ -1638,8 +1647,8 @@ CSubqueryHandler::FRemoveAllSubquery(CExpression *pexprOuter,
 		{
 			// build subquery quantified comparison
 			CExpression *pexprResult = nullptr;
-			CExpression *pexprPredicate =
-				PexprSubqueryPred(pexprInner, pexprSubquery, &pexprResult);
+			CExpression *pexprPredicate = PexprSubqueryPred(
+				pexprInner, pexprSubquery, &pexprResult, esqctxt);
 
 			*ppexprResidualScalar =
 				CUtils::PexprScalarConstBool(mp, true /*value*/);
@@ -1655,10 +1664,10 @@ CSubqueryHandler::FRemoveAllSubquery(CExpression *pexprOuter,
 		}
 	}
 
-	CExpression *pexprInversePred =
-		CXformUtils::PexprInversePred(mp, pexprSubquery);
 	// generate a select with the inverse predicate as the selection predicate
 	// TODO: Handle the case where pexprInversePred == NULL
+	CExpression *pexprInversePred =
+		CXformUtils::PexprInversePred(mp, pexprSubquery);
 	pexprPredicate = pexprInversePred;
 
 	if (EsqctxtValue == esqctxt)
@@ -1673,12 +1682,14 @@ CSubqueryHandler::FRemoveAllSubquery(CExpression *pexprOuter,
 			const IMDFunction *pmdFunc =
 				md_accessor->RetrieveFunc(pmdOp->FuncMdId());
 			if (IMDFunction::EfsVolatile == pmdFunc->GetFuncStability())
+			{
 				// the non-correlated plan would evaluate the comparison operation twice
 				// per outer row, that is not a good idea when the operation is volatile
 				fUseCorrelated = true;
+			}
 		}
 
-		pexprInnerSelect = PexprInnerSelect(
+		CExpression *pexprInnerSelect = PexprInnerSelect(
 			mp, colref, pexprInner, pexprPredicate, &fUseNotNullOptimization);
 
 		if (!fUseCorrelated)
@@ -1695,6 +1706,8 @@ CSubqueryHandler::FRemoveAllSubquery(CExpression *pexprOuter,
 				mp, pexprOuter, pexprSubquery, esqctxt, ppexprNewOuter,
 				ppexprResidualScalar);
 		}
+
+		// cleanup
 		pexprInner->Release();
 		pexprPredicate->Release();
 	}
@@ -1702,33 +1715,10 @@ CSubqueryHandler::FRemoveAllSubquery(CExpression *pexprOuter,
 	{
 		GPOS_ASSERT(EsqctxtFilter == esqctxt);
 
-		// check that inner row in filter is nullable
-		CColRefSet *pcrsNotNullInner = GPOS_NEW(mp) CColRefSet(mp);
-		pcrsNotNullInner->Include(pexprInner->DeriveNotNullColumns());
-		CColRefSet *pcrsUsedInner = GPOS_NEW(mp) CColRefSet(mp);
-		pcrsUsedInner->Include(colref);
-		pcrsUsedInner->Intersection(pexprPredicate->DeriveUsedColumns());
-		pcrsNotNullInner->Intersection(pcrsUsedInner);
-		BOOL fInnerUsesNullableCol =
-			pcrsNotNullInner->Size() != pcrsUsedInner->Size();
-		pcrsNotNullInner->Release();
-		pcrsUsedInner->Release();
-
-		if (fInnerUsesNullableCol)
-		{
-			pexprInnerSelect = CUtils::PexprLogicalSelect(
-				mp, pexprInner, CUtils::PexprIsNotFalse(mp, pexprPredicate));
-		}
-		else
-		{
-			pexprInnerSelect =
-				CUtils::PexprLogicalSelect(mp, pexprInner, pexprPredicate);
-		}
-
 		*ppexprResidualScalar = CUtils::PexprScalarConstBool(mp, true);
 		*ppexprNewOuter =
 			CUtils::PexprLogicalApply<CLogicalLeftAntiSemiApplyNotIn>(
-				mp, pexprOuter, pexprInnerSelect, colref, eopidSubq);
+				mp, pexprOuter, pexprInner, colref, eopidSubq, pexprPredicate);
 	}
 
 	return fSuccess;
@@ -2207,12 +2197,16 @@ CSubqueryHandler::FProcessScalarOperator(CExpression *pexprOuter,
 		case COperator::EopScalarAggFunc:
 		case COperator::EopScalarWindowFunc:
 		case COperator::EopScalarArray:
+		case COperator::EopScalarArrayRef:
+		case COperator::EopScalarArrayRefIndexList:
 		case COperator::EopScalarArrayCmp:
 		case COperator::EopScalarCoalesce:
 		case COperator::EopScalarCaseTest:
 		case COperator::EopScalarNullIf:
 		case COperator::EopScalarSwitch:
 		case COperator::EopScalarSwitchCase:
+		case COperator::EopScalarValuesList:
+		case COperator::EopScalarMinMax:
 			fSuccess = FRecursiveHandler(pexprOuter, pexprScalar, esqctxt,
 										 ppexprNewOuter, ppexprResidualScalar);
 			break;

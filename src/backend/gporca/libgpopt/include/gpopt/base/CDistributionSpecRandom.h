@@ -44,9 +44,13 @@ protected:
 	// private copy ctor
 	CDistributionSpecRandom(const CDistributionSpecRandom &);
 
+	CColRef *m_gp_segment_id = {nullptr};
+
 public:
 	//ctor
 	CDistributionSpecRandom();
+
+	CDistributionSpecRandom(CColRef *gp_segment_id_);
 
 	// accessor
 	EDistributionType
@@ -61,6 +65,11 @@ public:
 		return "RANDOM";
 	}
 
+	CColRef *
+	GetGpSegmentId()
+	{
+		return m_gp_segment_id;
+	}
 	// is distribution duplicate sensitive
 	BOOL
 	IsDuplicateSensitive() const
@@ -72,8 +81,6 @@ public:
 	void
 	MarkDuplicateSensitive()
 	{
-		GPOS_ASSERT(!m_is_duplicate_sensitive);
-
 		m_is_duplicate_sensitive = true;
 	}
 

@@ -51,17 +51,17 @@ CContextDXLToPlStmt::CContextDXLToPlStmt(
 	  m_param_types_list(NIL),
 	  m_distribution_hashops(distribution_hashops),
 	  m_rtable_entries_list(nullptr),
-	  m_partitioned_tables_list(nullptr),
-	  m_num_partition_selectors_array(nullptr),
 	  m_subplan_entries_list(nullptr),
 	  m_subplan_sliceids_list(nullptr),
 	  m_slices_list(nullptr),
 	  m_result_relation_index(0),
 	  m_into_clause(nullptr),
-	  m_distribution_policy(nullptr)
+	  m_distribution_policy(nullptr),
+	  m_part_selector_to_param_map(nullptr)
 {
 	m_cte_consumer_info = GPOS_NEW(m_mp) HMUlCTEConsumerInfo(m_mp);
-	m_num_partition_selectors_array = GPOS_NEW(m_mp) ULongPtrArray(m_mp);
+	m_part_selector_to_param_map = GPOS_NEW(m_mp) UlongToUlongMap(m_mp);
+	m_used_rte_indexes = GPOS_NEW(m_mp) HMUlIndex(m_mp);
 }
 
 //---------------------------------------------------------------------------
@@ -75,7 +75,8 @@ CContextDXLToPlStmt::CContextDXLToPlStmt(
 CContextDXLToPlStmt::~CContextDXLToPlStmt()
 {
 	m_cte_consumer_info->Release();
-	m_num_partition_selectors_array->Release();
+	m_part_selector_to_param_map->Release();
+	m_used_rte_indexes->Release();
 }
 
 //---------------------------------------------------------------------------
@@ -211,6 +212,7 @@ CContextDXLToPlStmt::GetCTEConsumerList(ULONG cte_id) const
 void
 CContextDXLToPlStmt::AddRTE(RangeTblEntry *rte, BOOL is_result_relation)
 {
+	// add rte to rtable entries list
 	m_rtable_entries_list = gpdb::LAppend(m_rtable_entries_list, rte);
 
 	rte->inFromCl = true;
@@ -226,66 +228,21 @@ CContextDXLToPlStmt::AddRTE(RangeTblEntry *rte, BOOL is_result_relation)
 
 //---------------------------------------------------------------------------
 //	@function:
-//		CContextDXLToPlStmt::AddPartitionedTable
+//		CContextDXLToPlStmt::InsertUsedRTEIndexes
 //
 //	@doc:
-//		Add a partitioned table oid
+//		Add assigned query id --> rte index key-value pair
+//		to used rte indexes map
 //
 //---------------------------------------------------------------------------
 void
-CContextDXLToPlStmt::AddPartitionedTable(OID oid)
+CContextDXLToPlStmt::InsertUsedRTEIndexes(
+	ULONG assigned_query_id_for_target_rel, Index index)
 {
-	if (!gpdb::ListMemberOid(m_partitioned_tables_list, oid))
-	{
-		m_partitioned_tables_list =
-			gpdb::LAppendOid(m_partitioned_tables_list, oid);
-	}
-}
-
-//---------------------------------------------------------------------------
-//	@function:
-//		CContextDXLToPlStmt::IncrementPartitionSelectors
-//
-//	@doc:
-//		Increment the number of partition selectors for the given scan id
-//
-//---------------------------------------------------------------------------
-void
-CContextDXLToPlStmt::IncrementPartitionSelectors(ULONG scan_id)
-{
-	// add extra elements to the array if necessary
-	const ULONG len = m_num_partition_selectors_array->Size();
-	for (ULONG ul = len; ul <= scan_id; ul++)
-	{
-		ULONG *pul = GPOS_NEW(m_mp) ULONG(0);
-		m_num_partition_selectors_array->Append(pul);
-	}
-
-	ULONG *ul = (*m_num_partition_selectors_array)[scan_id];
-	(*ul)++;
-}
-
-//---------------------------------------------------------------------------
-//	@function:
-//		CContextDXLToPlStmt::GetNumPartitionSelectorsList
-//
-//	@doc:
-//		Return list containing number of partition selectors for every scan id
-//
-//---------------------------------------------------------------------------
-List *
-CContextDXLToPlStmt::GetNumPartitionSelectorsList() const
-{
-	List *partition_selectors_list = NIL;
-	const ULONG len = m_num_partition_selectors_array->Size();
-	for (ULONG ul = 0; ul < len; ul++)
-	{
-		ULONG *num_partition_selectors = (*m_num_partition_selectors_array)[ul];
-		partition_selectors_list = gpdb::LAppendInt(partition_selectors_list,
-													*num_partition_selectors);
-	}
-
-	return partition_selectors_list;
+	// update used rte indexes map
+	m_used_rte_indexes->Insert(GPOS_NEW(m_mp)
+								   ULONG(assigned_query_id_for_target_rel),
+							   GPOS_NEW(m_mp) Index(index));
 }
 
 //---------------------------------------------------------------------------
@@ -515,22 +472,128 @@ CContextDXLToPlStmt::GetDistributionHashFuncForType(Oid typid)
 	return hashproc;
 }
 
-List *
-CContextDXLToPlStmt::GetStaticPruneResult(ULONG scanId)
+ULONG
+CContextDXLToPlStmt::GetParamIdForSelector(OID oid_type, ULONG selectorId)
 {
-	// GPDB_12_MERGE_FIXME: we haven't seen the scan id yet, this scan id is likely for dynamic pruning.
-	// When we can, remove this check
-	if ((scanId - 1) >= m_static_prune_results.size())
-		GPOS_RAISE(gpdxl::ExmaDXL, gpdxl::ExmiDXL2PlStmtConversion,
-				   GPOS_WSZ_LIT("dynamic pruning"));
-	return m_static_prune_results[scanId - 1];
+	ULONG *param_id = m_part_selector_to_param_map->Find(&selectorId);
+	if (nullptr == param_id)
+	{
+		param_id = GPOS_NEW(m_mp) ULONG(GetNextParamId(oid_type));
+		ULONG *selector_id = GPOS_NEW(m_mp) ULONG(selectorId);
+		m_part_selector_to_param_map->Insert(selector_id, param_id);
+	}
+	return *param_id;
 }
-void
-CContextDXLToPlStmt::SetStaticPruneResult(ULONG scanId,
-										  List *static_prune_result)
+
+Index
+CContextDXLToPlStmt::FindRTE(Oid reloid)
 {
-	m_static_prune_results.resize(scanId);
-	m_static_prune_results[scanId - 1] = static_prune_result;
+	ListCell *lc;
+	int idx = 0;
+
+	ForEachWithCount(lc, m_rtable_entries_list, idx)
+	{
+		RangeTblEntry *rte = (RangeTblEntry *) lfirst(lc);
+		if (rte->relid == reloid)
+		{
+			return idx + 1;
+		}
+	}
+	return -1;
+}
+
+RangeTblEntry *
+CContextDXLToPlStmt::GetRTEByIndex(Index index)
+{
+	return (RangeTblEntry *) gpdb::ListNth(m_rtable_entries_list,
+										   int(index - 1));
+}
+
+//---------------------------------------------------------------------------
+//	@function: of associated
+//		CContextDXLToPlStmt::GetRTEIndexByAssignedQueryId
+//
+//	@doc:
+//
+//		For given assigned query id, this function returns the index of rte in
+//		m_rtable_entries_list for further processing and sets is_rte_exists
+//		flag that rte was processed.
+//
+//		assigned query id is a "tag" of a table descriptor. It marks the query
+//		structure that contains the result relation. If two table descriptors
+//		have the same assigned query id, these two table descriptors point to
+//		the same result relation in `ModifyTable` operation. If the assigned
+//		query id is positive, it indicates the query is an INSERT/UPDATE/DELETE
+//		operation (`ModifyTable` operation). If the assigned query id zero
+// 		(UNASSIGNED_QUERYID), usually it indicates the operation is not
+// 		INSERT/UPDATE/DELETE, and doesn't have a result relation. Or sometimes,
+// 		the operation is INSERT/UPDATE/DELETE, but the table descriptor tagged
+//		with the assigned query id doesn't point to a result relation.
+//
+//		m_used_rte_indexes is a hash map. It maps the assigned query id (key)
+//		to the rte index (value) as in m_rtable_entries_list. The hash map only
+//		stores positive id's, because id 0 is reserved for operations that
+//		don't have a result relation.
+//
+//		To look up the rte index, we may encounter three scenarios:
+//
+//		1. If assigned query id == 0, since the hash map only stores positive
+//		id's, the rte index isn't stored in the hash map. In this case, we
+//		return rtable entries list length+1. This means we will add a new rte
+//		to the rte list.
+//
+//		2. If assigned query id > 0, it indicates the operation is
+//		INSERT/UPDATE/DELETE. We look for its index in the hash map. If the
+//		index is found, we return the index. This means we can reuse the rte
+//		that's already in the list.
+//
+// 		3. If assigned query id > 0, but the index isn't found in the hash map,
+// 		it means the id hasn't been processed. We return rtable entries list
+// 		length+1. This means we will add a new rte to the rte list. At the same
+// 		time, we will add the assigned query id --> list_length+1 key-value pair
+// 		to the hash map for future look ups.
+//
+//		Here's an example
+//		```sql
+//		create table b (i int, j int);
+//		create table c (i int);
+//		insert into b(i,j) values (1,2), (2,3), (3,4);
+//		insert into c(i) values (1), (2);
+//		delete from b where i in (select i from c);
+//		```
+//
+//		`b` is a result relation. Table descriptors for `b` will have the same
+//		positive assigned query id. `c` is not a result relation. Table
+//		descriptors for `c` will have zero assigned query id.
+//---------------------------------------------------------------------------
+
+Index
+CContextDXLToPlStmt::GetRTEIndexByAssignedQueryId(
+	ULONG assigned_query_id_for_target_rel, BOOL *is_rte_exists)
+{
+	*is_rte_exists = false;
+
+	if (assigned_query_id_for_target_rel == UNASSIGNED_QUERYID)
+	{
+		return gpdb::ListLength(m_rtable_entries_list) + 1;
+	}
+
+	Index *usedIndex =
+		m_used_rte_indexes->Find(&assigned_query_id_for_target_rel);
+
+	//	`usedIndex` is a non NULL value in next case: table descriptor with
+	//	the same `assigned_query_id_for_target_rel` was processed previously
+	//	(so no need to create a new index for result relation like the relation
+	//	itself)
+	if (usedIndex)
+	{
+		*is_rte_exists = true;
+		return *usedIndex;
+	}
+
+	//	`assigned_query_id_for_target_rel` of table descriptor which points to
+	//	result relation wasn't previously processed - create a new index.
+	return gpdb::ListLength(m_rtable_entries_list) + 1;
 }
 
 // EOF

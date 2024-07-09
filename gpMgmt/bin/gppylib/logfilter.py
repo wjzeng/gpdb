@@ -42,10 +42,14 @@ Module contents:
     spiffInterval() - get begin/end datetime given any subset of begin/end/duration
 """
 
+import io
+import csv
 from datetime import date, datetime
 import re
 import sys
 import time
+
+csvDelimeter = '|'
 
 timestampPattern = re.compile(r'\d\d\d\d-\d\d-\d\d \d\d:\d\d:\d\d(\.\d*)?')
 # This pattern matches the date and time stamp at the beginning of a line
@@ -253,7 +257,7 @@ def FilterLogEntries(iterable,
             msg += '; timestamps from %s to %s' % srange
         print(msg, file=msgfile)
 
-    
+
 
 #------------------------------- Spying --------------------------------
 class CsvFlatten(object):
@@ -261,20 +265,25 @@ class CsvFlatten(object):
     Used to flatten a CSV parsed log line into something that looks like the 
     old format.
     """
-    
+
     def __init__(self,iterable):
         self.source = iter(iterable)
-    
+        self.buffer = io.StringIO()
+        self.writer = csv.writer(self.buffer, delimiter=csvDelimeter, quotechar='"', quoting=csv.QUOTE_MINIMAL)
+
     def __iter__(self):
         return self
-    
+
     def __next__(self):
         item = next(self.source)
         #we need to make a minor format change to the log level field so that
         # our single regex will match both.
         item[16] = item[16] + ": "
-        return '|'.join(item) + "\n"
 
+        self.buffer.truncate(0)
+        self.writer.writerow(item)
+
+        return self.buffer.getvalue()
 
 #------------------------------- Spying --------------------------------
 
@@ -541,7 +550,7 @@ def TimestampInBounds(iterable, begin, end):
     # any following lines which do not have timestamps.
     if isinstance(item, str):
         withinbounds = False
-        while True:
+        for item in source:
             if begin <= item < end:
                 withinbounds = True
                 yield item
@@ -549,17 +558,14 @@ def TimestampInBounds(iterable, begin, end):
                 withinbounds = False
             elif withinbounds:
                 yield item
-            item = next(source)
 
     # Else assume input consists of groups (i.e. sequences) of lines.
     # Yield groups in which the first line starts with a timestamp within
     # the given bounds.  Skip groups which are empty or have no timestamp.
-    while True:
+    for item in source:
         if (len(item) > 0 and
             begin <= item[0] < end):
             yield item
-        item = next(source)
-
 
 #--------------------------- Pattern Matching ----------------------------
     
@@ -699,14 +705,14 @@ def MatchColumns(iterable, cols):
             for s in item:
                 n = 1
                 out = []
-                
-                for c in s.split('|'):
+
+                for c in csv.reader(s, delimiter=csvDelimeter, quotechar='"'):
                     if n in cols:
                         out.append(c)
                     n += 1
                 if len(out):
                     #print out
-                    ret.append('|'.join(out) + "\n")
+                    ret.append(csvDelimeter.join(out) + "\n")
             yield ret
 
 #-------------------------------- Slicing --------------------------------

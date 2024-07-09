@@ -67,13 +67,13 @@ Feature: gpconfig integration tests
     Examples:
         | test_case                                   | guc                          | type       | seed_value | value     | file_value | live_value | value_coordinator_only | file_value_coordinator_only | value_coordinator | file_value_coordinator | live_value_coordinator |
         | bool                                        | log_connections              | bool       | off        | on        | on         | on         | off                    | off                         | off               | off                    | off                    |
-        | enum                                        | gp_resgroup_memory_policy    | enum       | eager_free | auto      | auto       | auto       | eager_free             | eager_free                  | eager_free        | eager_free             | eager_free             |
         | integer                                     | vacuum_cost_limit            | integer    | 300        | 400       | 400        | 400        | 555                    | 555                         | 500               | 500                    | 500                    |
         | integer with memory unit                    | statement_mem                | int w/unit | 123MB      | 500MB     | 500MB      | 500MB      | 500MB                  | 500MB                       | 500MB             | 500MB                  | 500MB                  |
         | integer with time unit                      | statement_timeout            | int w/unit | 1min       | 5min      | 5min       | 5min       | 5min                   | 5min                        | 5min              | 5min                   | 5min                   |
         | float                                       | checkpoint_completion_target | float      | 0.4        | 0.5       | 0.5        | 0.5        | 0.33                   | 0.33                        | 0.7               | 0.7                    | 0.7                    |
         | basic string                                | application_name             | string     | xxxxxx     | bodhi     | 'bodhi'    | bodhi      | lucy                   | 'lucy'                      | bengie            | 'bengie'               | bengie                 |
         | string with spaces                          | application_name             | string     | yyyyyy     | 'bod hi'  | 'bod hi'   | bod hi     | 'bod hi'               | 'bod hi'                    | 'bod hi'          | 'bod hi'               | bod hi                 |
+        | string with special characters              | application_name             | string     | yyyyyy     | '$li@d#r' | '$li@d#r'   | $li@d#r   | '$li@d#r'              | '$li@d#r'                   | '$li@d#r'         | '$li@d#r'              | $li@d#r                |
         | different value on coordinator and segments | application_name             | string     | yyyyyy     | 'bod hi'  | 'bod hi'   | bod hi     | 'lu cy'                | 'lu cy'                     | 'ben gie'         | 'ben gie'              | ben gie                |
         | empty string                                | application_name             | string     | zzzzzz     | ''        | ''         |            | ''                     | ''                          | ''                | ''                     |                        |
         | quoted double quotes                        | application_name             | string     | zzzzzz     | '"hi"'    | '"hi"'     | "hi"       | '"hi"'                 | '"hi"'                      | '"hi"'            | '"hi"'                 | "hi"                   |
@@ -116,7 +116,6 @@ Feature: gpconfig integration tests
     Examples:
         | guc                          | type     | seed_value | value    | file_value | live_value |
         | log_connections              |  bool    | off        | on       | on         | on         |
-        | gp_resgroup_memory_policy    |  enum    | eager_free | auto     | auto       | auto       |
         | vacuum_cost_limit            |  integer | 300        | 400      | 400        | 400        |
         | checkpoint_completion_target |  real    | 0.4        | 0.5      | 0.5        | 0.5        |
         | application_name             |  string  | xxxxxx     | bodhi    | bodhi      | bodhi      |
@@ -173,7 +172,6 @@ Feature: gpconfig integration tests
     Examples:
         | guc                          | type     | value      |
         | log_connections              |  bool    | off        |
-        | gp_resgroup_memory_policy    |  enum    | eager_free |
         | vacuum_cost_limit            |  integer | 300        |
         | checkpoint_completion_target |  real    | 0.4        |
         | application_name             |  string  | bengie     |
@@ -215,3 +213,34 @@ Feature: gpconfig integration tests
         | asks for confirmation and completes when user selects yes | 0           | should         | completed successfully | should                    | should                | gpconfig -c application_name -v "easy" < test/behave/mgmt_utils/steps/data/yes.txt|
         | asks for confirmation and aborts when user selects no     | 1           | should         | User Aborted. Exiting. | should not                | should not            | gpconfig -c application_name -v "easy" < test/behave/mgmt_utils/steps/data/no.txt |
         | does not ask for confirmation for coordinator only change | 0           | should not     | completed successfully | should                    | should not            | gpconfig -c application_name -v "easy" --coordinatoronly                          |
+
+    @concourse_cluster
+    @demo_cluster
+    Scenario: gpconfig check for GUC's with same prefix
+      Given the user runs "gpstop -u"
+        And gpstop should return a return code of 0
+        And the gpconfig context is setup
+
+        When the user runs "gpconfig -c gp_resqueue_priority -v 'off'"
+        Then gpconfig should return a return code of 0
+        And verify that the file "postgresql.conf" in the coordinator data directory has "some" line starting with "gp_resqueue_priority"
+        And verify that the file "postgresql.conf" in each segment data directory has "some" line starting with "gp_resqueue_priority"
+
+        When the user runs "gpconfig -c gp_resqueue_priority_cpucores_per_segment -v '4'"
+        Then gpconfig should return a return code of 0
+        And verify that the file "postgresql.conf" in the coordinator data directory has "some" line starting with "gp_resqueue_priority_cpucores_per_segment"
+        And verify that the file "postgresql.conf" in each segment data directory has "some" line starting with "gp_resqueue_priority_cpucores_per_segment"
+
+        When the user runs "gpconfig -c gp_resqueue_priority -v 'on'"
+        Then gpconfig should return a return code of 0
+        And verify that the file "postgresql.conf" in the coordinator data directory has "some" line starting with "gp_resqueue_priority"
+        And verify that the file "postgresql.conf" in each segment data directory has "some" line starting with "gp_resqueue_priority"
+        And verify that the file "postgresql.conf" in the coordinator data directory has "some" line starting with "gp_resqueue_priority_cpucores_per_segment"
+        And verify that the file "postgresql.conf" in each segment data directory has "some" line starting with "gp_resqueue_priority_cpucores_per_segment"
+
+    @demo_cluster
+    Scenario: gpconfig checks liveness of correct number of hosts
+      Given the database is running
+       When the user runs "gpconfig --debug -c optimizer -v on"
+       Then gpconfig should return a return code of 0
+        And gpconfig should print "WorkerPool() initialized with 1 workers" escaped to stdout

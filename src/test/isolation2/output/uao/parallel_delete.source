@@ -2,11 +2,11 @@
 -- until the transaction is committed.
 --
 DROP TABLE IF EXISTS ao;
-DROP
+DROP TABLE
 CREATE TABLE ao (a INT) USING @amname@ DISTRIBUTED BY (a);
-CREATE
+CREATE TABLE
 insert into ao select generate_series(1,100);
-INSERT 100
+INSERT 0 100
 
 -- The actual test begins
 1: BEGIN;
@@ -21,9 +21,9 @@ DELETE 1
  ao       | ExclusiveLock | relation | master 
 (1 row)
 2: SELECT * FROM locktest_segments WHERE coalesce = 'ao';
- coalesce | mode             | locktype | node      
-----------+------------------+----------+-----------
- ao       | RowExclusiveLock | relation | 1 segment 
+ coalesce | mode          | locktype | node      
+----------+---------------+----------+-----------
+ ao       | ExclusiveLock | relation | 1 segment 
 (1 row)
 -- The case here should delete a tuple at the same seg with(2).
 -- Under jump hash, (2) and (3) are on the same seg(seg0).

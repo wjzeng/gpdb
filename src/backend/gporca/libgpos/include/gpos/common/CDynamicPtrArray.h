@@ -22,7 +22,7 @@ template <class T, void (*CleanupFn)(T *)>
 class CDynamicPtrArray;
 
 // comparison function signature
-typedef INT (*CompareFn)(const void *, const void *);
+using CompareFn = INT (*)(const void *, const void *);
 
 // frequently used destroy functions
 
@@ -57,21 +57,32 @@ CleanupRelease(T *elem)
 	(dynamic_cast<CRefCount *>(elem))->Release();
 }
 
+// Compare function used by CDynamicPtrArray::Sort
+inline INT
+CompareUlongPtr(const void *right, const void *left)
+{
+	return *((ULONG *) right) - *((ULONG *) left);
+}
+
+
 // commonly used array types
 
 // arrays of unsigned integers
-typedef CDynamicPtrArray<ULONG, CleanupDelete> ULongPtrArray;
+using ULongPtrArray = CDynamicPtrArray<ULONG, CleanupDelete>;
 // array of unsigned integer arrays
-typedef CDynamicPtrArray<ULongPtrArray, CleanupRelease> ULongPtr2dArray;
+using ULongPtr2dArray = CDynamicPtrArray<ULongPtrArray, CleanupRelease>;
 
 // arrays of integers
-typedef CDynamicPtrArray<INT, CleanupDelete> IntPtrArray;
+using IntPtrArray = CDynamicPtrArray<INT, CleanupDelete>;
 
 // array of strings
-typedef CDynamicPtrArray<CWStringBase, CleanupDelete> StringPtrArray;
+using StringPtrArray = CDynamicPtrArray<CWStringBase, CleanupDelete>;
+
+// array of string arrays
+using StringPtr2dArray = CDynamicPtrArray<StringPtrArray, CleanupRelease>;
 
 // arrays of chars
-typedef CDynamicPtrArray<CHAR, CleanupDelete> CharPtrArray;
+using CharPtrArray = CDynamicPtrArray<CHAR, CleanupDelete>;
 
 //---------------------------------------------------------------------------
 //	@class:
@@ -102,26 +113,6 @@ private:
 
 	// actual array
 	T **m_elems;
-
-	// comparison function for pointers
-	static INT
-	PtrCmp(const void *p1, const void *p2)
-	{
-		ULONG_PTR ulp1 = *(ULONG_PTR *) p1;
-		ULONG_PTR ulp2 = *(ULONG_PTR *) p2;
-
-		if (ulp1 < ulp2)
-		{
-			return -1;
-		}
-
-		if (ulp1 > ulp2)
-		{
-			return 1;
-		}
-
-		return 0;
-	}
 
 	// resize function
 	void
@@ -158,10 +149,9 @@ public:
 		  m_expansion_factor(std::max((ULONG) 2, expansion_factor)),
 		  m_elems(nullptr)
 	{
-		GPOS_ASSERT(nullptr != CleanupFn &&
-					"No valid destroy function specified");
-
 		// do not allocate in constructor; defer allocation to first insertion
+		GPOS_CPL_ASSERT(nullptr != CleanupFn,
+						"No valid destroy function specified");
 	}
 
 	// dtor
@@ -242,8 +232,13 @@ public:
 
 	// sort array
 	void
-	Sort(CompareFn compare_func = PtrCmp)
+	Sort(CompareFn compare_func)
 	{
+		if (m_size == 0)
+		{
+			return;
+		}
+
 		clib::Qsort(m_elems, m_size, sizeof(T *), compare_func);
 	}
 
@@ -255,10 +250,22 @@ public:
 
 		for (ULONG i = 0; i < m_size && is_equal; i++)
 		{
-			is_equal = (m_elems[i] == arr->m_elems[i]);
+			is_equal = (*m_elems[i] == *arr->m_elems[i]);
 		}
 
 		return is_equal;
+	}
+
+	BOOL
+	operator==(const CDynamicPtrArray<T, CleanupFn> &other)
+	{
+		if (this == &other)
+		{
+			// same object reference
+			return true;
+		}
+
+		return Equals(&other);
 	}
 
 	// lookup object
@@ -295,14 +302,13 @@ public:
 		return gpos::ulong_max;
 	}
 
-#ifdef GPOS_DEBUG
 	// check if array is sorted
 	BOOL
-	IsSorted() const
+	IsSorted(CompareFn compare_func) const
 	{
 		for (ULONG i = 1; i < m_size; i++)
 		{
-			if ((ULONG_PTR)(m_elems[i - 1]) > (ULONG_PTR)(m_elems[i]))
+			if (compare_func(&m_elems[i - 1], &m_elems[i]) > 0)
 			{
 				return false;
 			}
@@ -310,7 +316,6 @@ public:
 
 		return true;
 	}
-#endif	// GPOS_DEBUG
 
 	// accessor for n-th element
 	T *

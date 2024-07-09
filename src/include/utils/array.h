@@ -398,8 +398,10 @@ extern void deconstruct_array(ArrayType *array,
 							  Datum **elemsp, bool **nullsp, int *nelemsp);
 extern bool array_contains_nulls(ArrayType *array);
 
-extern ArrayBuildState *initArrayResult(Oid element_type,
-										MemoryContext rcontext, bool subcontext);
+extern ArrayBuildState *
+initArrayResult(Oid element_type, MemoryContext rcontext, bool subcontext);
+extern ArrayBuildState *
+initArrayResultWithSize(Oid element_type, MemoryContext rcontext, bool subcontext, int initsize);
 extern ArrayBuildState *accumArrayResult(ArrayBuildState *astate,
 										 Datum dvalue, bool disnull,
 										 Oid element_type,
@@ -438,6 +440,7 @@ extern void array_free_iterator(ArrayIterator iterator);
 extern int	ArrayGetOffset(int n, const int *dim, const int *lb, const int *indx);
 extern int	ArrayGetOffset0(int n, const int *tup, const int *scale);
 extern int	ArrayGetNItems(int ndim, const int *dims);
+extern void ArrayCheckBounds(int ndim, const int *dims, const int *lb);
 extern void mda_get_range(int n, int *span, const int *st, const int *endp);
 extern void mda_get_prod(int n, const int *range, int *prod);
 extern void mda_get_offset_values(int n, int *dist, const int *prod, const int *span);

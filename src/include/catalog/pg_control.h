@@ -87,6 +87,8 @@ typedef struct CheckPoint
 #define XLOG_FPI						0xB0
 #define XLOG_NEXTRELFILENODE			0xC0
 #define XLOG_NEXTGXID					0xD0
+#define XLOG_OVERWRITE_CONTRECORD		0xE0
+#define XLOG_LATESTCOMPLETED_GXID 		0xF0
 
 
 /*
@@ -151,7 +153,7 @@ typedef struct ControlFileData
 	 * to simply to store the location of end of backup in standby mode
 	 * That guards against starting standby, aborting it, and restarting with
 	 * an earlier stop location. We can't get promoted unless we've at-least
-	 * replayed upto minRecoveryPoint
+	 * replayed up to minRecoveryPoint
 	 *
 	 * backupStartPoint is the redo pointer of the backup start checkpoint, if
 	 * we are recovering from an online backup and haven't reached the end of

@@ -15,7 +15,8 @@
 import os
 import sys
 import re
-
+import psutil
+from psycopg2 import DatabaseError
 try:
     from gppylib.gpparseopts import OptParser, OptChecker
     from gppylib.gparray import GpArray
@@ -25,7 +26,6 @@ try:
     from gppylib.commands.gp import *
     from gppylib.db import dbconn
     from gppylib.userinput import *
-    from pg import DatabaseError
     from gpconfig_modules.segment_guc import SegmentGuc
     from gpconfig_modules.database_segment_guc import DatabaseSegmentGuc
     from gpconfig_modules.file_segment_guc import FileSegmentGuc
@@ -164,8 +164,27 @@ class Guc:
                 msg = GpResGroup().validate()
                 if msg is not None:
                     return msg
-            elif newval != "'queue'":
-                return "the value of gp_resource_manager must be 'group' or 'queue'"
+            elif newval == "'group-v2'":
+                msg = GpResGroup().validate_v2()
+                if msg is not None:
+                    return msg
+            elif newval != "'queue'" and newval != "'none'":
+                return "the value of gp_resource_manager must be 'none', 'queue', 'group', or 'group-v2'"
+        elif self.name == "gp_resource_group_cgroup_parent":
+            base = newval.strip("'")
+            if not re.match("^[0-9a-zA-Z][-._0-9a-zA-Z]*$", base):
+                return "resource group cgroup parent can only contains alphabet, number, and non-leading . _ -"
+
+            path = None
+            for partition in psutil.disk_partitions(all=True):
+                if partition.fstype == "cgroup2":
+                    path = partition.mountpoint + "/" + base
+                    break
+            if path is None:
+                return "cannot find cgroup v2 mountpoint"
+            if not os.path.isdir(path):
+                return "'%s' doesn't exists or is not a directory" % path
+
 
         elif self.name == 'unix_socket_permissions':
             if newval[0] != '0':
@@ -317,7 +336,7 @@ def do_change(options):
     if not options.coordinatoronly:
         hosts.extend(gp_array.get_hostlist(includeCoordinator=False))
 
-    unreachable_hosts = get_unreachable_segment_hosts(hosts, len(hosts))
+    unreachable_hosts = get_unreachable_segment_hosts(hosts, len(set(hosts)))
     if len(unreachable_hosts) > 0:
         confirm_user_wants_to_continue()
 

@@ -77,6 +77,9 @@ enum EOptTraceFlag
 	// print equivalent distribution specs
 	EopttracePrintEquivDistrSpecs = 101017,
 
+	// log results of hint parsing
+	EopttracePrintPgHintPlanLog = 101018,
+
 	///////////////////////////////////////////////////////
 	////////////////// transformations flags //////////////
 	///////////////////////////////////////////////////////
@@ -146,9 +149,6 @@ enum EOptTraceFlag
 	EopttraceApplyLeftOuter2InnerUnionAllLeftAntiSemiJoinDisregardingStats =
 		103017,
 
-	// Disable sort below Insert for Parquet tables
-	EopttraceDisableSortForDMLOnParquet = 103018,
-
 	// Do not keep an order-by, even if it is right under a DML operator
 	EopttraceRemoveOrderBelowDML = 103019,
 
@@ -176,18 +176,14 @@ enum EOptTraceFlag
 	// enable motion hazard handling during NLJ optimization
 	EopttraceMotionHazardHandling = 103027,
 
-	// non-master gather enforcement for DML queries
-	EopttraceDisableNonMasterGatherForDML = 103028,
+	// non-coordinator gather enforcement for DML queries
+	EopttraceDisableNonCoordinatorGatherForDML = 103028,
 
 	// Force the optimizer to pick a plan that minimizes skew but adds an extra motion node when aggs are used
 	EopttraceForceAggSkewAvoidance = 103029,
 
 	// Eager Agg
 	EopttraceEnableEagerAgg = 103030,
-
-	// Translate unused colrefs. specifically translate all colrefs, including ones
-	// that are not referenced in the query.
-	EopttraceTranslateUnusedColrefs = 103031,
 
 	// ExpandFullJoin
 	EopttraceExpandFullJoin = 103032,
@@ -212,6 +208,23 @@ enum EOptTraceFlag
 
 	// Use legacy (cdbhash) opfamilies for compatibility
 	EopttraceUseLegacyOpfamilies = 103039,
+
+	// enable NL Left Join plan alternatives where inner child is redistributed if possible
+	EopttraceEnableRedistributeNLLOJInnerChild = 103040,
+
+	EopttraceForceComprehensiveJoinImplementation = 103041,
+
+	// Discard HashJoin with RedistributeMotion nodes
+	EopttraceDiscardRedistributeHashJoin = 103044,
+
+	// disable hash join alternatives
+	EopttraceDisableInnerHashJoin = 103045,
+
+	// enable nested loop join alternatives
+	EopttraceDisableInnerNLJ = 103046,
+
+	// Ordered Agg
+	EopttraceDisableOrderedAgg = 103047,
 
 	///////////////////////////////////////////////////////
 	///////////////////// statistics flags ////////////////

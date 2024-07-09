@@ -937,7 +937,7 @@ ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
 
 	/*
 	 * If this function has restrictions on where it can be executed
-	 * (EXECUTE ON MASTER or EXECUTE ON ALL SEGMENTS), make note of that,
+	 * (EXECUTE ON COORDINATOR or EXECUTE ON ALL SEGMENTS), make note of that,
 	 * so that the planner knows to be prepared for it.
 	 */
 	if (func_exec_location(funcid) != PROEXECLOCATION_ANY)
@@ -1941,7 +1941,12 @@ FuncNameAsType(List *funcname)
 	Oid			result;
 	Type		typtup;
 
-	typtup = LookupTypeName(NULL, makeTypeNameFromNameList(funcname), NULL, false);
+	/*
+	 * temp_ok=false protects the <refsect1 id="sql-createfunction-security">
+	 * contract for writing SECURITY DEFINER functions safely.
+	 */
+	typtup = LookupTypeNameExtended(NULL, makeTypeNameFromNameList(funcname),
+									NULL, false, false);
 	if (typtup == NULL)
 		return InvalidOid;
 
@@ -2102,8 +2107,8 @@ LookupFuncNameInternal(List *funcname, int nargs, const Oid *argtypes,
 {
 	FuncCandidateList clist;
 
-	/* Passing NULL for argtypes is no longer allowed */
-	Assert(argtypes);
+	/* NULL argtypes allowed for nullary functions only */
+	Assert(argtypes != NULL || nargs == 0);
 
 	/* Always set *lookupError, to forestall uninitialized-variable warnings */
 	*lookupError = FUNCLOOKUP_NOSUCHFUNC;
@@ -2137,7 +2142,9 @@ LookupFuncNameInternal(List *funcname, int nargs, const Oid *argtypes,
 	 */
 	while (clist)
 	{
-		if (memcmp(argtypes, clist->args, nargs * sizeof(Oid)) == 0)
+		/* if nargs==0, argtypes can be null; don't pass that to memcmp */
+		if (nargs == 0 ||
+			memcmp(argtypes, clist->args, nargs * sizeof(Oid)) == 0)
 			return clist->oid;
 		clist = clist->next;
 	}

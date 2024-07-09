@@ -40,7 +40,7 @@ typedef struct ForeignDataWrapper
 	Oid			fdwhandler;		/* Oid of handler function, or 0 */
 	Oid			fdwvalidator;	/* Oid of validator function, or 0 */
 	List	   *options;		/* fdwoptions as DefElem list */
-	char		exec_location;  /* execute on MASTER, ANY or ALL SEGMENTS, Greenplum MPP specific */
+	char		exec_location;  /* execute on COORDINATOR, ANY or ALL SEGMENTS, Greenplum MPP specific */
 } ForeignDataWrapper;
 
 typedef struct ForeignServer
@@ -52,7 +52,8 @@ typedef struct ForeignServer
 	char	   *servertype;		/* server type, optional */
 	char	   *serverversion;	/* server version, optional */
 	List	   *options;		/* srvoptions as DefElem list */
-	char		exec_location;  /* execute on MASTER, ANY or ALL SEGMENTS, Greenplum MPP specific */
+	char		exec_location;  /* execute on COORDINATOR, ANY or ALL SEGMENTS, Greenplum MPP specific */
+	int32		num_segments;	/* the number of segments of the foreign cluster */
 } ForeignServer;
 
 typedef struct UserMapping
@@ -79,6 +80,7 @@ typedef struct ForeignTable
 
 
 extern char SeparateOutMppExecute(List **options);
+extern int32 SeparateOutNumSegments(List **options);
 extern ForeignServer *GetForeignServer(Oid serverid);
 extern ForeignServer *GetForeignServerExtended(Oid serverid,
 											   bits16 flags);

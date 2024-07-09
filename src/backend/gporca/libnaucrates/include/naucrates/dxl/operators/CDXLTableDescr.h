@@ -20,6 +20,10 @@
 #include "naucrates/md/CMDName.h"
 #include "naucrates/md/IMDId.h"
 
+#define GPDXL_ACL_UNDEFINED (gpos::ulong_max)
+// default value for m_assigned_query_id_for_target_rel - no assigned query for table descriptor
+#define UNASSIGNED_QUERYID 0
+
 namespace gpdxl
 {
 using namespace gpmd;
@@ -50,6 +54,15 @@ private:
 	// lock mode from the parser
 	INT m_lockmode;
 
+	// acl mode from the parser
+	ULONG m_acl_mode;
+
+	// identifier of query to which current table belongs.
+	// This field is used for assigning current table entry with
+	// target one within DML operation. If descriptor doesn't point
+	// to the target (result) relation it has value UNASSIGNED_QUERYID
+	ULONG m_assigned_query_id_for_target_rel;
+
 	void SerializeMDId(CXMLSerializer *xml_serializer) const;
 
 public:
@@ -57,7 +70,8 @@ public:
 
 	// ctor/dtor
 	CDXLTableDescr(CMemoryPool *mp, IMDId *mdid, CMDName *mdname,
-				   ULONG ulExecuteAsUser, int lockmode);
+				   ULONG ulExecuteAsUser, int lockmode, ULONG acl_mode,
+				   ULONG assigned_query_id_for_target_rel = UNASSIGNED_QUERYID);
 
 	~CDXLTableDescr() override;
 
@@ -81,11 +95,17 @@ public:
 	// lock mode
 	INT LockMode() const;
 
+	// acl mode
+	ULONG GetAclMode() const;
+
 	// get the column descriptor at the given position
 	const CDXLColDescr *GetColumnDescrAt(ULONG idx) const;
 
 	// serialize to dxl format
 	void SerializeToDXL(CXMLSerializer *xml_serializer) const;
+
+	// get assigned query id for target relation
+	ULONG GetAssignedQueryIdForTargetRel() const;
 };
 }  // namespace gpdxl
 

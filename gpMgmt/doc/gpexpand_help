@@ -14,6 +14,7 @@ gpexpand
       | --hba-hostnames
       | --rollback
       | --clean
+      | --without-icproxy-check
 [--verbose] [--silent]
 
 gpexpand -? | -h | --help 
@@ -139,7 +140,7 @@ OPTIONS
 
 -n <parallel_processes>
  The number of tables to redistribute simultaneously. Valid values 
- are 1 - 16. Each table redistribution process requires two database 
+ are 1 - 96. Each table redistribution process requires two database
  connections: one to alter the table, and another to update the table's 
  status in the expansion schema. Before increasing -n, check the current 
  value of the server configuration parameter max_connections and make 
@@ -175,6 +176,9 @@ OPTIONS
 -V | --novacuum
  Do not vacuum catalog tables before creating schema copy.
 
+
+--without-icproxy-check
+ Skip the step of checking the icproxy address.
 
 -? | -h | --help
  Displays the online help.

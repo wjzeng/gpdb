@@ -1642,7 +1642,8 @@ DatumStreamBlockWrite_PutOrig(
 			p = DatumGetPointer(d);
 			wsz = sz;
 		}
-		else if (value_type_could_short(DatumGetPointer(d), dsw->typeInfo->typid))
+		else if (dsw->typeInfo->typstorage != 'p' &&
+			 VARATT_CAN_MAKE_SHORT(DatumGetPointer(d)))
 		{
 			sz = VARATT_CONVERTED_SHORT_SIZE(DatumGetPointer(d));
 			c1 = VARSIZE_TO_SHORT_D(d);
@@ -3271,7 +3272,8 @@ DatumStreamBlockWrite_PutDense(
 			p = DatumGetPointer(d);
 			wsz = sz;
 		}
-		else if (value_type_could_short(DatumGetPointer(d), dsw->typeInfo->typid))
+		else if (dsw->typeInfo->typstorage != 'p' &&
+			 VARATT_CAN_MAKE_SHORT(DatumGetPointer(d)))
 		{
 			sz = VARATT_CONVERTED_SHORT_SIZE(DatumGetPointer(d));
 			c1 = VARSIZE_TO_SHORT_D(d);
@@ -4440,25 +4442,46 @@ DatumStreamBlockWrite_Finish(
 
 	oldCtxt = MemoryContextSwitchTo(dsw->memctxt);
 	if (dsw->null_bitmap_buffer != NULL)
+	{
 		pfree(dsw->null_bitmap_buffer);
+		dsw->null_bitmap_buffer = NULL;
+	}
 
 	if (dsw->datum_buffer != NULL)
+	{
 		pfree(dsw->datum_buffer);
+		dsw->datum_buffer = NULL;
+	}
 
 	if (dsw->rle_compress_bitmap_buffer != NULL)
+	{
 		pfree(dsw->rle_compress_bitmap_buffer);
+		dsw->rle_compress_bitmap_buffer = NULL;
+	}
 
 	if (dsw->rle_repeatcounts != NULL)
+	{
 		pfree(dsw->rle_repeatcounts);
+		dsw->rle_repeatcounts = NULL;
+	}
 
 	if (dsw->delta_bitmap_buffer != NULL)
+	{
 		pfree(dsw->delta_bitmap_buffer);
+		dsw->delta_bitmap_buffer = NULL;
+	}
 
 	if (dsw->deltas != NULL)
+	{
 		pfree(dsw->deltas);
+		dsw->deltas = NULL;
+	}
 
 	if (dsw->delta_sign != NULL)
+	{
 		pfree(dsw->delta_sign);
+		dsw->delta_sign = NULL;
+	}
 
 	MemoryContextSwitchTo(oldCtxt);
 }

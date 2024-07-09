@@ -185,6 +185,14 @@ get_opts(int argc, char **argv, struct options *my_opts)
 				exit(1);
 		}
 	}
+
+	if (optind < argc)
+	{
+		fprintf(stderr, _("%s: too many command-line arguments (first is \"%s\")\n"),
+				progname, argv[optind]);
+		fprintf(stderr, _("Try \"%s --help\" for more information.\n"), progname);
+		exit(1);
+	}
 }
 
 static void
@@ -340,7 +348,7 @@ sql_conn(struct options *my_opts)
 	if (PQstatus(conn) == CONNECTION_BAD)
 	{
 		fprintf(stderr, "%s: could not connect to database %s: %s",
-				"oid2name", my_opts->dbname, PQerrorMessage(conn));
+				"oid2name", PQdb(conn) ? PQdb(conn) : "", PQerrorMessage(conn));
 		PQfinish(conn);
 		exit(1);
 	}

@@ -876,6 +876,17 @@ _equalOnConflictExpr(const OnConflictExpr *a, const OnConflictExpr *b)
 	return true;
 }
 
+static bool
+_equalDQAExpr(const DQAExpr *a, const DQAExpr *b)
+{
+	COMPARE_SCALAR_FIELD(agg_expr_id);
+	COMPARE_BITMAPSET_FIELD(agg_args_id_bms);
+	COMPARE_NODE_FIELD(agg_filter);
+	COMPARE_BITMAPSET_FIELD(agg_vars_ref);
+
+	return true;
+}
+
 /*
  * Stuff from pathnodes.h
  */
@@ -1175,6 +1186,7 @@ _equalAlterTableCmd(const AlterTableCmd *a, const AlterTableCmd *b)
 	COMPARE_NODE_FIELD(def);
 	COMPARE_SCALAR_FIELD(behavior);
 	COMPARE_SCALAR_FIELD(missing_ok);
+	COMPARE_SCALAR_FIELD(recurse);
 
 	return true;
 }
@@ -1334,6 +1346,7 @@ _equalCreateStmt(const CreateStmt *a, const CreateStmt *b)
 	COMPARE_STRING_FIELD(tablespacename);
 	COMPARE_STRING_FIELD(accessMethod);
 	COMPARE_SCALAR_FIELD(if_not_exists);
+	COMPARE_SCALAR_FIELD(origin);
 
 	COMPARE_NODE_FIELD(distributedBy);
 	COMPARE_SCALAR_FIELD(relKind);
@@ -1400,6 +1413,7 @@ _equalTableLikeClause(const TableLikeClause *a, const TableLikeClause *b)
 {
 	COMPARE_NODE_FIELD(relation);
 	COMPARE_SCALAR_FIELD(options);
+	COMPARE_SCALAR_FIELD(relationOid);
 
 	return true;
 }
@@ -1469,6 +1483,16 @@ _equalFetchStmt(const FetchStmt *a, const FetchStmt *b)
 	COMPARE_SCALAR_FIELD(howMany);
 	COMPARE_STRING_FIELD(portalname);
 	COMPARE_SCALAR_FIELD(ismove);
+
+	return true;
+}
+
+static bool
+_equalRetrieveStmt(const RetrieveStmt *a, const RetrieveStmt *b)
+{
+	COMPARE_STRING_FIELD(endpoint_name);
+	COMPARE_SCALAR_FIELD(count);
+	COMPARE_SCALAR_FIELD(is_all);
 
 	return true;
 }
@@ -2255,6 +2279,7 @@ _equalLockStmt(const LockStmt *a, const LockStmt *b)
 	COMPARE_NODE_FIELD(relations);
 	COMPARE_SCALAR_FIELD(mode);
 	COMPARE_SCALAR_FIELD(nowait);
+	COMPARE_SCALAR_FIELD(coordinatoronly);
 
 	return true;
 }
@@ -3447,6 +3472,9 @@ equal(const void *a, const void *b)
 		case T_JoinExpr:
 			retval = _equalJoinExpr(a, b);
 			break;
+		case T_DQAExpr:
+			retval = _equalDQAExpr(a, b);
+			break;
 
 			/*
 			 * RELATION NODES
@@ -3586,6 +3614,9 @@ equal(const void *a, const void *b)
 			break;
 		case T_FetchStmt:
 			retval = _equalFetchStmt(a, b);
+			break;
+		case T_RetrieveStmt:
+			retval = _equalRetrieveStmt(a, b);
 			break;
 		case T_IndexStmt:
 			retval = _equalIndexStmt(a, b);

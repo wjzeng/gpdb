@@ -64,19 +64,22 @@ private:
 	static UlongToHistogramMap *MakeHistHashMapConjOrDisjFilter(
 		CMemoryPool *mp, const CStatisticsConfig *stats_config,
 		UlongToHistogramMap *input_histograms, CDouble input_rows,
-		CStatsPred *pred_stats, CDouble *scale_factor);
+		CStatsPred *pred_stats, CDouble *scale_factor,
+		const CStatistics *input_stats);
 
 	// create new hash map of histograms after applying the conjunction predicate
 	static UlongToHistogramMap *MakeHistHashMapConjFilter(
 		CMemoryPool *mp, const CStatisticsConfig *stats_config,
 		UlongToHistogramMap *intermediate_histograms, CDouble input_rows,
-		CStatsPredConj *conjunctive_pred_stats, CDouble *scale_factor);
+		CStatsPredConj *conjunctive_pred_stats, CDouble *scale_factor,
+		const CStatistics *input_stats);
 
 	// create new hash map of histograms after applying the disjunctive predicate
 	static UlongToHistogramMap *MakeHistHashMapDisjFilter(
 		CMemoryPool *mp, const CStatisticsConfig *stats_config,
 		UlongToHistogramMap *input_histograms, CDouble input_rows,
-		CStatsPredDisj *pred_stats, CDouble *scale_factor);
+		CStatsPredDisj *pred_stats, CDouble *scale_factor,
+		const CStatistics *input_stats);
 
 	// check if the column is a new column for statistic calculation
 	static BOOL IsNewStatsColumn(ULONG colid, ULONG last_colid);
@@ -86,7 +89,8 @@ public:
 	static CStatistics *MakeStatsFilter(CMemoryPool *mp,
 										const CStatistics *input_stats,
 										CStatsPred *base_pred_stats,
-										BOOL do_cap_NDVs);
+										BOOL do_cap_NDVs,
+										CDouble rows_filter = 0);
 
 	// derive statistics for filter operation based on given scalar expression
 	static IStatistics *MakeStatsFilterForScalarExpr(

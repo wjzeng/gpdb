@@ -35,6 +35,18 @@ static void filemap_list_to_array(filemap_t *map);
 static bool check_file_excluded(const char *path, bool is_source);
 
 /*
+ * Definition of one element part of an exclusion list, used to exclude
+ * contents when rewinding.  "name" is the name of the file or path to
+ * check for exclusion.  If "match_prefix" is true, any items matching
+ * the name as prefix are excluded.
+ */
+struct exclude_list_item
+{
+	const char *name;
+	bool		match_prefix;
+};
+
+/*
  * The contents of these directories are removed or recreated during server
  * start so they are not included in data processed by pg_rewind.
  *
@@ -54,7 +66,7 @@ static const char *excludeDirContents[] =
 
 	/*
 	 * It is generally not useful to backup the contents of this directory
-	 * even if the intention is to restore to another master. See backup.sgml
+	 * even if the intention is to restore to another primary. See backup.sgml
 	 * for a more detailed description.
 	 */
 	"pg_replslot",
@@ -67,7 +79,7 @@ static const char *excludeDirContents[] =
 
 	/*
 	 * Old contents are loaded for possible debugging but are not required for
-	 * normal operation, see OldSerXidInit().
+	 * normal operation, see SerialInit().
 	 */
 	"pg_serial",
 
@@ -80,39 +92,47 @@ static const char *excludeDirContents[] =
 	/* GPDB: Contents unique to each segment instance. */
 	"log",
 
+	/* GPDB: Default gpbackup directory (backup contents) */
+	"backups",
+
 	/* end of list */
 	NULL
 };
 
 /*
- * List of files excluded from filemap processing.
+ * List of files excluded from filemap processing.   Files are excluded
+ * if their prefix match.
  */
-static const char *excludeFiles[] =
+static const struct exclude_list_item excludeFiles[] =
 {
 	/* Skip auto conf temporary file. */
-	"postgresql.auto.conf.tmp", /* defined as PG_AUTOCONF_FILENAME */
+	{"postgresql.auto.conf.tmp", false},	/* defined as PG_AUTOCONF_FILENAME */
 
 	/* Skip current log file temporary file */
-	"current_logfiles.tmp",		/* defined as LOG_METAINFO_DATAFILE_TMP */
+	{"current_logfiles.tmp", false},	/* defined as
+										 * LOG_METAINFO_DATAFILE_TMP */
 
 	/* Skip relation cache because it is rebuilt on startup */
-	"pg_internal.init",			/* defined as RELCACHE_INIT_FILENAME */
+	{"pg_internal.init", true}, /* defined as RELCACHE_INIT_FILENAME */
 
 	/*
 	 * If there's a backup_label or tablespace_map file, it belongs to a
 	 * backup started by the user with pg_start_backup().  It is *not* correct
 	 * for this backup.  Our backup_label is written later on separately.
 	 */
-	"backup_label",				/* defined as BACKUP_LABEL_FILE */
-	"tablespace_map",			/* defined as TABLESPACE_MAP */
+	{"backup_label", false},	/* defined as BACKUP_LABEL_FILE */
+	{"tablespace_map", false},	/* defined as TABLESPACE_MAP */
 
-	"postmaster.pid",
-	"postmaster.opts",
+	{"postmaster.pid", false},
+	{"postmaster.opts", false},
 
-	GP_INTERNAL_AUTO_CONF_FILE_NAME,
+	{GP_INTERNAL_AUTO_CONF_FILE_NAME, false},
+
+	/* GPDB: Default gpbackup directory (top-level directory) */
+	{"backups", false},
 
 	/* end of list */
-	NULL
+	{NULL, false}
 };
 
 /*
@@ -210,11 +230,11 @@ process_source_file(const char *path, file_type_t type, size_t size,
 	Assert(filemap->array == NULL);
 
 	/*
-	 * Pretend that pg_wal is a directory, even if it's really a symlink. We
+	 * Pretend that pg_wal/log is a directory, even if it's really a symlink. We
 	 * don't want to mess with the symlink itself, nor complain if it's a
 	 * symlink in source but not in target or vice versa.
 	 */
-	if (strcmp(path, "pg_wal") == 0 && type == FILE_TYPE_SYMLINK)
+	if (((strcmp(path, "pg_wal") == 0 || strcmp(path, "log") == 0)) && type == FILE_TYPE_SYMLINK)
 		type = FILE_TYPE_DIRECTORY;
 
 	/*
@@ -251,22 +271,34 @@ process_target_file(const char *path, file_type_t type, size_t size,
 	 * from the target data folder all paths which have been filtered out from
 	 * the source data folder when processing the source files.
 	 *
-	 * GPDB: GP_INTERNAL_AUTO_CONF_FILE_NAME and "log" are in the excluded
-	 * file list.  These should not be copied but also should not be
-	 * removed. In the future, if there are more files or directories that
+	 * GPDB: GP_INTERNAL_AUTO_CONF_FILE_NAME, "log", and "backups" are in the
+	 * excluded dir/file list.  These should not be copied but also should not
+	 * be removed. In the future, if there are more files or directories that
 	 * should not be copied but also should not be removed, then a separate
 	 * function for those would be better.
 	 */
 	{
+		char		localpath[MAXPGPATH];
 		const char *filename = last_dir_separator(path);
 		if (filename == NULL)
 			filename = path;
 		else
 			filename++;
+
 		if (strcmp(filename, GP_INTERNAL_AUTO_CONF_FILE_NAME) == 0)
 			return;
 		if (strstr(path, "log/") == path)
 			return;
+		if (strstr(path, "backups/") == path ||
+			strcmp(path, "backups") == 0)
+			return;
+
+		if (log_directory != NULL)
+		{
+			snprintf(localpath, sizeof(localpath), "%s/", log_directory);
+			if (strstr(path, localpath) == path)
+				return;
+		}
 	}
 
 	if (map->array == NULL)
@@ -286,9 +318,9 @@ process_target_file(const char *path, file_type_t type, size_t size,
 	}
 
 	/*
-	 * Like in process_source_file, pretend that pg_wal is always a directory.
+	 * Like in process_source_file, pretend that pg_wal/log is always a directory.
 	 */
-	if (strcmp(path, "pg_wal") == 0 && type == FILE_TYPE_SYMLINK)
+	if (((strcmp(path, "pg_wal") == 0 || strcmp(path, "log") == 0)) && type == FILE_TYPE_SYMLINK)
 		type = FILE_TYPE_DIRECTORY;
 
 	/* Remember this target file */
@@ -411,13 +443,34 @@ process_target_wal_aofile_change(RelFileNode rnode, int segno, int64 offset)
 	}
 }
 
+static bool
+is_excluded_path_found(const char *path, const char *excluded_dir, bool is_source)
+{
+	char		localpath[MAXPGPATH];
+	if (excluded_dir == NULL)
+		return false;
+
+	snprintf(localpath, sizeof(localpath), "%s/", excluded_dir);
+	if (strstr(path, localpath) == path)
+	{
+		if (is_source)
+			pg_log_debug("entry \"%s\" excluded from source file list",
+						path);
+		else
+			pg_log_debug("entry \"%s\" excluded from target file list",
+						path);
+		return true;
+	}
+
+	return false;
+}
+
 /*
  * Is this the path of file that pg_rewind can skip copying?
  */
 static bool
 check_file_excluded(const char *path, bool is_source)
 {
-	char		localpath[MAXPGPATH];
 	int			excludeIdx;
 	const char *filename;
 
@@ -431,14 +484,19 @@ check_file_excluded(const char *path, bool is_source)
 	}
 
 	/* check individual files... */
-	for (excludeIdx = 0; excludeFiles[excludeIdx] != NULL; excludeIdx++)
+	for (excludeIdx = 0; excludeFiles[excludeIdx].name != NULL; excludeIdx++)
 	{
+		int			cmplen = strlen(excludeFiles[excludeIdx].name);
+
 		filename = last_dir_separator(path);
 		if (filename == NULL)
 			filename = path;
 		else
 			filename++;
-		if (strcmp(filename, excludeFiles[excludeIdx]) == 0)
+
+		if (!excludeFiles[excludeIdx].match_prefix)
+			cmplen++;
+		if (strncmp(filename, excludeFiles[excludeIdx].name, cmplen) == 0)
 		{
 			if (is_source)
 				pg_log_debug("entry \"%s\" excluded from source file list",
@@ -456,19 +514,12 @@ check_file_excluded(const char *path, bool is_source)
 	 */
 	for (excludeIdx = 0; excludeDirContents[excludeIdx] != NULL; excludeIdx++)
 	{
-		snprintf(localpath, sizeof(localpath), "%s/",
-				 excludeDirContents[excludeIdx]);
-		if (strstr(path, localpath) == path)
-		{
-			if (is_source)
-				pg_log_debug("entry \"%s\" excluded from source file list",
-							 path);
-			else
-				pg_log_debug("entry \"%s\" excluded from target file list",
-							 path);
+		if (is_excluded_path_found(path, excludeDirContents[excludeIdx], is_source))
 			return true;
-		}
 	}
+
+	if (is_excluded_path_found(path, log_directory, is_source))
+		return true;
 
 	return false;
 }

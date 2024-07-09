@@ -35,6 +35,9 @@
 #include "utils/rel.h"
 
 
+/* source-code-compatibility hacks for pull_varnos() API change */
+#define make_restrictinfo(a,b,c,d,e,f,g,h,i) make_restrictinfo_new(a,b,c,d,e,f,g,h,i)
+
 static void expand_partitioned_rtentry(PlannerInfo *root, RelOptInfo *relinfo,
 									   RangeTblEntry *parentrte,
 									   Index parentRTindex, Relation parentrel,
@@ -113,28 +116,6 @@ expand_inherited_rtentry(PlannerInfo *root, RelOptInfo *rel,
 	 */
 	oldrelation = table_open(parentOID, NoLock);
 	lockmode = rte->rellockmode;
-
-#if 0
-	// GPDB_12_MERGE_FIXME: We used to have this code in GPDB. Where does it belong now?
-       else if (oldrc)
-       {
-               /*
-                * Greenplum specific behavior:
-                * The implementation of select statement with locking clause
-                * (for update | no key update | share | key share) in postgres
-                * is to hold RowShareLock on tables during parsing stage, and
-                * generate a LockRows plan node for executor to lock the tuples.
-                * It is not easy to lock tuples in Greenplum database, since
-                * tuples may be fetched through motion nodes.
-                *
-                * But when Global Deadlock Detector is enabled, and the select
-                * statement with locking clause contains only one table, we are
-                * sure that there are no motions. For such simple cases, we could
-                * make the behavior just the same as Postgres.
-                */
-               lockmode = oldrc->canOptSelectLockingClause ? RowShareLock : ExclusiveLock;
-       }
-#endif
 
 	/*
 	 * If parent relation is selected FOR UPDATE/SHARE, we need to mark its
@@ -250,8 +231,25 @@ expand_inherited_rtentry(PlannerInfo *root, RelOptInfo *rel,
 		char		resname[32];
 		List	   *newvars = NIL;
 
-		/* The old PlanRowMark should already have necessitated adding TID */
-		Assert(old_allMarkTypes & ~(1 << ROW_MARK_COPY));
+		/* Add TID junk Var if needed, unless we had it already */
+		if (new_allMarkTypes & ~(1 << ROW_MARK_COPY) &&
+			!(old_allMarkTypes & ~(1 << ROW_MARK_COPY)))
+		{
+			/* Need to fetch TID */
+			var = makeVar(oldrc->rti,
+						  SelfItemPointerAttributeNumber,
+						  TIDOID,
+						  -1,
+						  InvalidOid,
+						  0);
+			snprintf(resname, sizeof(resname), "ctid%u", oldrc->rowmarkId);
+			tle = makeTargetEntry((Expr *) var,
+								  list_length(root->processed_tlist) + 1,
+								  pstrdup(resname),
+								  true);
+			root->processed_tlist = lappend(root->processed_tlist, tle);
+			newvars = lappend(newvars, var);
+		}
 
 		/* Add whole-row junk Var if needed, unless we had it already */
 		if ((new_allMarkTypes & (1 << ROW_MARK_COPY)) &&
@@ -726,7 +724,8 @@ apply_child_basequals(PlannerInfo *root, RelOptInfo *parentrel,
 			}
 			/* reconstitute RestrictInfo with appropriate properties */
 			childquals = lappend(childquals,
-								 make_restrictinfo((Expr *) onecq,
+								 make_restrictinfo(root,
+												   (Expr *) onecq,
 												   rinfo->is_pushed_down,
 												   rinfo->outerjoin_delayed,
 												   pseudoconstant,
@@ -763,7 +762,7 @@ apply_child_basequals(PlannerInfo *root, RelOptInfo *parentrel,
 
 				/* not likely that we'd see constants here, so no check */
 				childquals = lappend(childquals,
-									 make_restrictinfo(qual,
+									 make_restrictinfo(root, qual,
 													   true, false, false,
 													   security_level,
 													   NULL, NULL, NULL));

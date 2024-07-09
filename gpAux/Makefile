@@ -90,7 +90,7 @@ ISCONFIG=$(GPPGDIR)/GNUmakefile
 ## On these platforms, we do the full build including the server. On other
 ## platforms, we do a client-only build.
 ##
-SERVER_PLATFORMS=rhel7_x86_64 rhel6_x86_64 linux_x86_64
+SERVER_PLATFORMS=rhel7_x86_64 rhel6_x86_64 rhel8_x86_64 rocky8_x86_64 ol8_x86_64 linux_x86_64
 
 #---------------------------------------------------------------------
 # Compiler options
@@ -112,7 +112,6 @@ DEBUG_CFLAGS_OPT=-g3
 endif
 
 DEBUGFLAGS="$(strip $(BLD_CFLAGS) $(CFLAGS_OPT) $(DEBUG_CFLAGS_OPT))"
-
 #---------------------------------------------------------------------
 # configure
 #---------------------------------------------------------------------
@@ -121,16 +120,15 @@ DEFPORT=5432
 
 ORCA_CONFIG=--enable-orca
 
-ifneq "$(findstring $(BLD_ARCH),aix7_ppc_64)" ""
-APR_CONFIG=--with-apr-config=$(BLD_THIRDPARTY_BIN_DIR)/apr-1-config
-endif
-
-aix7_ppc_64_CONFIGFLAGS=--disable-gpcloud --without-readline --without-libcurl --disable-orca --disable-pxf --without-zstd $(APR_CONFIG)
-rhel6_x86_64_CONFIGFLAGS=--with-quicklz --with-gssapi --enable-mapreduce --enable-orafce --enable-ic-proxy ${ORCA_CONFIG} --enable-gpcloud --with-libxml
-rhel7_x86_64_CONFIGFLAGS=--with-quicklz --with-gssapi --enable-mapreduce --enable-orafce --enable-ic-proxy ${ORCA_CONFIG} --enable-gpcloud --with-libxml
-linux_x86_64_CONFIGFLAGS=${ORCA_CONFIG} --enable-gpcloud --with-libxml $(APR_CONFIG)
-ubuntu18.04_x86_64_CONFIGFLAGS=--with-quicklz --with-gssapi --enable-mapreduce --enable-orafce --enable-ic-proxy ${ORCA_CONFIG} --enable-gpcloud --with-libxml
-sles12_x86_64_CONFIGFLAGS=--with-quicklz --with-gssapi --enable-mapreduce --enable-orafce --enable-ic-proxy ${ORCA_CONFIG} --enable-gpcloud --with-libxml
+rhel6_x86_64_CONFIGFLAGS=--with-gssapi --enable-orafce --enable-ic-proxy ${ORCA_CONFIG} --enable-gpcloud --with-libxml --with-openssl --with-pam --with-ldap --with-uuid=e2fs --with-llvm
+rhel7_x86_64_CONFIGFLAGS=--with-gssapi --enable-orafce --enable-ic-proxy ${ORCA_CONFIG} --enable-gpcloud --with-libxml --with-openssl --with-pam --with-ldap --with-uuid=e2fs --with-llvm
+rhel8_x86_64_CONFIGFLAGS=--with-gssapi --enable-orafce --enable-ic-proxy ${ORCA_CONFIG} --enable-gpcloud --with-libxml --with-openssl --with-pam --with-ldap --with-uuid=e2fs --with-llvm
+rocky8_x86_64_CONFIGFLAGS=--with-gssapi --enable-orafce --enable-ic-proxy ${ORCA_CONFIG} --enable-gpcloud --with-libxml --with-openssl --with-pam --with-ldap --with-uuid=e2fs --with-llvm
+rocky9_x86_64_CONFIGFLAGS=--with-gssapi --enable-orafce --enable-ic-proxy ${ORCA_CONFIG} --enable-gpcloud --with-libxml --with-openssl --with-pam --with-ldap --with-uuid=e2fs --with-llvm
+rhel9_x86_64_CONFIGFLAGS=--with-gssapi --enable-orafce --enable-ic-proxy ${ORCA_CONFIG} --enable-gpcloud --with-libxml --with-openssl --with-pam --with-ldap --with-uuid=e2fs --with-llvm
+ol8_x86_64_CONFIGFLAGS=--with-gssapi --enable-orafce --enable-ic-proxy ${ORCA_CONFIG} --enable-gpcloud --with-libxml --with-openssl --with-pam --with-ldap --with-uuid=e2fs --with-llvm
+ubuntu18.04_x86_64_CONFIGFLAGS=--with-gssapi --enable-orafce --enable-ic-proxy ${ORCA_CONFIG} --enable-gpcloud --with-libxml --with-openssl --with-pam --with-ldap --with-uuid=e2fs --with-llvm
+sles12_x86_64_CONFIGFLAGS=--with-gssapi --enable-orafce --enable-ic-proxy ${ORCA_CONFIG} --enable-gpcloud --with-libxml --with-openssl --with-pam --with-ldap --with-uuid=e2fs --with-llvm
 BLD_CONFIGFLAGS=$($(BLD_ARCH)_CONFIGFLAGS)
 
 CONFIGFLAGS=$(strip $(BLD_CONFIGFLAGS) --with-pgport=$(DEFPORT) $(BLD_DEPLOYMENT_SETTING))
@@ -139,48 +137,20 @@ ifdef CONFIGURE_FLAGS
 CONFIGFLAGS+= $(CONFIGURE_FLAGS)
 endif
 
-# PL/Python does not compile on Tiger, skipping it on AIX
-ifneq "$(findstring $(BLD_ARCH),aix7_ppc_64)" ""
-PG_LANG=false
-endif
 
 ifneq (false, ${PG_LANG})
-CONFIGFLAGS+= --with-perl --with-python PYTHON=python3
+CONFIGFLAGS+= --with-perl --with-python PYTHON=python3.11
 ifdef TCL_CFG
 CONFIGFLAGS+= --with-tcl-config=${TCL_CFG}
 endif
 endif
-
-# Configure in the extra path AIX requires for pthread support
-aix7_ppc_64_PTHREADS_LIB_DIR=/usr/lib/threads
-BLD_PTHREADS_LIB_DIR=$($(BLD_ARCH)_PTHREADS_LIB_DIR)
 
 # Configure in thirdparty libraries from the ext/ directory
 CONFIG_INCLUDES=$(BLD_THIRDPARTY_INCLUDE_DIR) $(BLD_THIRDPARTY_INCLUDE_DIR)/libxml2
 CONFIG_LIBRARIES=$(strip $(BLD_THIRDPARTY_LIB_DIR) $(BLD_CXX_LIB_DIR) $(BLD_PTHREADS_LIB_DIR))
 CONFIGFLAGS+= --with-includes="$(CONFIG_INCLUDES)" --with-libraries="$(CONFIG_LIBRARIES)"
 
-# Configure in "authlibs"...
-# ...without an ext/ dir copy of curl-config on Tiger or AIX
-ifeq "$(findstring $(BLD_ARCH),aix7_ppc_64 rhel6_x86_64 rhel7_x86_64 ubuntu18.04_x86_64 sles12_x86_64)" ""
-BLD_CURL_CONFIG=CURL_CONFIG=$(BLD_THIRDPARTY_BIN_DIR)/curl-config
-endif
-# ...and do not include the authlibs on Windows or AIX
-ifeq "$(findstring $(BLD_ARCH),aix7_ppc_64)" ""
-CONFIGFLAGS+= --with-openssl --with-pam --with-ldap $(BLD_CURL_CONFIG) $(APR_CONFIG)
-endif
 
-# ...but do include some of the authlibs on AIX
-ifneq "$(findstring $(BLD_ARCH),aix7_ppc_64)" ""
-CONFIGFLAGS+= --with-openssl --with-pam --without-krb5 --with-ldap $(BLD_CURL_CONFIG)
-endif
-
-# Platform-specific config flags
-aix7_ppc_64_CONFIG_ADDITIONS=LDFLAGS="-Wl,-bbigtoc -L/usr/lib/threads"
-
-CONFIG_ADDITIONS=$($(BLD_ARCH)_CONFIG_ADDITIONS)
-
-CONFIGFLAGS+= $(CONFIG_ADDITIONS)
 CONFIGFLAGS+= --disable-rpath
 CONFIGFLAGS+= LDFLAGS='-Wl,--enable-new-dtags -Wl,-rpath,\$$$$ORIGIN/../lib'
 
@@ -189,15 +159,12 @@ RECONFIG :
 	rm -f Release/GNUmakefile
 	rm -f $(GPPGDIR)/GNUmakefile
 
-# avoid AIX's restricted shell
-aix7_ppc_64_CONFIG_SHELL=/usr/bin/bash
-BLD_CONFIG_SHELL=$($(BLD_ARCH)_CONFIG_SHELL)
 $(GPPGDIR)/GNUmakefile : $(GPPGDIR)/configure  env.sh
 	rm -rf $(INSTLOC)
 	mkdir -p $(GPPGDIR)
 	echo "Running ./configure with CONFIGFLAGS=$(CONFIGFLAGS)\n"
 	cd $(GPPGDIR) && \
-                     CFLAGS=$(INSTCFLAGS) $(BLD_CONFIG_SHELL) \
+                     CFLAGS=$(INSTCFLAGS) 					  \
                      ./configure $(CONFIGFLAGS)               \
                          --prefix=$(INSTLOC)                  \
                          --mandir=$(INSTLOC)/man
@@ -207,7 +174,7 @@ Debug/GNUmakefile : $(GPPGDIR)/configure  env.sh
 	mkdir -p Debug
 	echo "Running ./configure with CONFIGFLAGS=$(CONFIGFLAGS)\n"
 	cd Debug && \
-                CFLAGS=$(INSTCFLAGS) $(BLD_CONFIG_SHELL)     \
+                CFLAGS=$(INSTCFLAGS) 						 \
                 ./configure $(CONFIGFLAGS)                   \
                     --prefix=$(INSTLOC)                      \
                     --mandir=$(INSTLOC)/man
@@ -217,7 +184,7 @@ Release/GNUmakefile : $(GPPGDIR)/configure  env.sh
 	mkdir -p Release
 	echo "Running ./configure with CONFIGFLAGS=$(CONFIGFLAGS)\n"
 	cd Release && \
-                  CFLAGS=$(INSTCFLAGS) $(BLD_CONFIG_SHELL)  \
+                  CFLAGS=$(INSTCFLAGS) 					    \
                   ./configure $(CONFIGFLAGS)                \
                       --prefix=$(INSTLOC)                   \
                       --mandir=$(INSTLOC)/man
@@ -243,15 +210,12 @@ autoconf : RECONFIG
 BLD_LD_LIBRARY_PATH:=$($(BLD_ARCH)_LD_LIBRARY_PATH):$($(BLD_WHERE_THE_LIBRARY_THINGS_ARE))
 export $(BLD_WHERE_THE_LIBRARY_THINGS_ARE)=$(BLD_LD_LIBRARY_PATH)
 
-# how much of GPDB to build by platform (default is "full")
-aix7_ppc_64_GPDB_BUILDSET=aix_subset
-BLD_GPDB_BUILDSET=$($(BLD_ARCH)_GPDB_BUILDSET)
 perl_archlibexp:=$(shell perl -MConfig -e 'print $$Config{archlibexp}')
 
 # set default build steps
 define BUILD_STEPS
 	@$(MAKE) -C $(BUILDDIR)/src/backend generated-headers
-	cd $(BUILDDIR) && PYGRESQL_LDFLAGS='-Wl,-rpath,\$$$$ORIGIN/../../../lib -Wl,--enable-new-dtags' QUICKLZ_LDFLAGS='-Wl,-rpath,\$$$$ORIGIN/../../lib -Wl,--enable-new-dtags' $(MAKE) $(PARALLEL_MAKE_OPTS) install
+	cd $(BUILDDIR) && $(MAKE) $(PARALLEL_MAKE_OPTS) install
 	cd $(BUILDDIR)/src/pl/plpython && $(MAKE) clean && echo 'LDFLAGS += -Wl,-rpath,\$$$$ORIGIN/../../ext/python/lib/ -Wl,--enable-new-dtags' >> Makefile && $(MAKE) $(PARALLEL_MAKE_OPTS) install && cd $(BUILDDIR)
 	cd $(BUILDDIR)/src/pl/plperl && $(MAKE) clean && echo "LDFLAGS += -Wl,-rpath,$(perl_archlibexp)/CORE -Wl,--enable-new-dtags" >> GNUmakefile && echo "LDFLAGS_SL += -Wl,-rpath,$(perl_archlibexp)/CORE -Wl,--enable-new-dtags" >> GNUmakefile && $(MAKE) $(PARALLEL_MAKE_OPTS) install && cd $(BUILDDIR)
 	#@$(MAKE) greenplum_path INSTLOC=$(INSTLOC)
@@ -263,26 +227,6 @@ define BUILD_STEPS
                          CLIENTSINSTLOC=$(CLIENTSINSTLOC)
 endef
 
-ifeq "$(BLD_GPDB_BUILDSET)" "aix_subset"
-define BUILD_STEPS
-	rm -rf $(INSTLOC)
-	cd $(BUILDDIR)/gpMgmt/ && $(MAKE) generate_greenplum_path_file
-	cd $(BUILDDIR)/src/backend/ && $(MAKE) ../../src/include/parser/gram.h
-	cd $(BUILDDIR)/src/backend/ && $(MAKE) ../../src/include/utils/errcodes.h
-	cd $(BUILDDIR)/src/backend/ && $(MAKE) ../../src/include/utils/fmgroids.h
-	cd $(BUILDDIR)/src/include/ && $(MAKE) install
-	cd $(BUILDDIR)/src/interfaces/libpq/ && $(MAKE) install
-	cd $(BUILDDIR)/src/bin/pg_config/ && $(MAKE) install
-	cd $(BUILDDIR)/src/bin/psql/ && $(MAKE) install
-	cd $(BUILDDIR)/src/bin/pg_dump/ && $(MAKE) install
-	cd $(BUILDDIR)/src/bin/gpfdist && $(MAKE) install
-	@$(MAKE) mgmtcopy INSTLOC=$(INSTLOC)
-	@$(MAKE) copylibs INSTLOC=$(INSTLOC)
-	cd $(GPMGMT)/bin && $(MAKE) pygresql INSTLOC=$(INSTLOC)
-	@$(MAKE) clients INSTLOC=$(INSTLOC) CLIENTSINSTLOC=$(CLIENTSINSTLOC)
-	@$(MAKE) set_scripts_version INSTLOC=$(CLIENTSINSTLOC)
-endef
-endif
 ifeq "$(BLD_GPDB_BUILDSET)" "partial"
 define BUILD_STEPS
 	rm -rf $(INSTLOC)
@@ -307,7 +251,6 @@ define BUILD_STEPS
 	cp -p $(GPMGMT)/bin/gpload $(INSTLOC)/bin/gpload
 	cp -p $(GPMGMT)/bin/gpload.py $(INSTLOC)/bin/gpload.py
 	$(MAKE) copylibs INSTLOC=$(INSTLOC)
-	cd $(GPMGMT)/bin && $(MAKE) pygresql INSTLOC=$(INSTLOC)
 	$(MAKE) clients INSTLOC=$(INSTLOC) CLIENTSINSTLOC=$(CLIENTSINSTLOC)
 endef
 endif
@@ -401,7 +344,6 @@ CLIENTS_HOME_DIR=$(BLD_HOME)
 endif
 CLIENTSINSTLOC=$(CLIENTS_HOME_DIR)/greenplum-clients
 CLIENTSINSTLOC_BIN=$(CLIENTSINSTLOC)/bin
-CLIENTSINSTLOC_BINEXT=$(CLIENTSINSTLOC)/bin/ext/
 CLIENTSINSTLOC_EXT=$(CLIENTSINSTLOC)/ext
 CLIENTSINSTLOC_LIB=$(CLIENTSINSTLOC)/lib
 CLIENTSINSTLOC_LIB_PWARE=$(CLIENTSINSTLOC)/lib/pware
@@ -425,24 +367,9 @@ define tmpCLIENTS_FILESET_BIN
 endef
 CLIENTS_FILESET_BIN = $(strip $(tmpCLIENTS_FILESET_BIN))
 
-# pg.py, pgdb.py, _pg.so are from pygresql which does not install into a single module
-define tmpCLIENTS_FILESET_BINEXT
-	pg.py
-	pgdb.py
-	_pg*.so
-	yaml
-endef
-CLIENTS_FILESET_BINEXT = $(strip $(tmpCLIENTS_FILESET_BINEXT))
-
-# define python file subset to ship by platform, as desired
 BLD_PYTHON_FILESET=.
-aix7_ppc_64_PYTHON_FILESET=bin/python* lib/*python* lib64/*python* include/python*
-ifneq "$($(BLD_ARCH)_PYTHON_FILESET)" ""
-BLD_PYTHON_FILESET=$($(BLD_ARCH)_PYTHON_FILESET)
-endif
 
 BLD_OS:=$(shell uname -s)
-AIX_CLIENTS_LIBS=libbz2.a libz.a libpq.a liblber*.a libldap*.a libyaml*.a libcrypto.so* libevent*.a
 Darwin_CLIENTS_LIBS=libcrypto.*.dylib libssl.*.dylib libpq.*.dylib* libkrb5.*.dylib libcom_err.*.dylib libldap_r-*.dylib libk5crypto.*.dylib libkrb5support.*.dylib liblber-*.dylib libyaml*.dylib
 Linux_CLIENTS_LIBS=libpq.so*
 define tmpCLIENTS_FILESET_LIB
@@ -450,25 +377,12 @@ define tmpCLIENTS_FILESET_LIB
 endef
 CLIENTS_FILESET_LIB = $(strip $(tmpCLIENTS_FILESET_LIB))
 
-aix7_ppc_64_CLIENTS_LIBS_GCC=libgcc_s.a
-aix7_ppc_64_CLIENTS_LIBS_GCC_LOC=/opt/freeware/lib/gcc/powerpc-ibm-aix7.1.0.0/4.8.5/ppc64/
-
-FILESET_LIB_GCC=$($(BLD_ARCH)_CLIENTS_LIBS_GCC)
-FILESET_LIB_GCC_LOC=$($(BLD_ARCH)_CLIENTS_LIBS_GCC_LOC)
-
-aix7_ppc_64_CLIENTS_LIBS_PERZL=libcrypto.a libssl.a
-
-aix7_ppc_64_CLIENTS_LIBS_PERZL_LOC=$(BLD_TOP)/ext/aix7_ppc_64/lib
-
-CLIENTS_FILESET_LIB_PERZL=$($(BLD_ARCH)_CLIENTS_LIBS_PERZL)
-CLIENTS_FILESET_LIB_PERZL_LOC=$($(BLD_ARCH)_CLIENTS_LIBS_PERZL_LOC)
-
-AIX_CLIENTS_LIBS_PWARE=libbz2.a libiconv.a libintl.a libncurses.a libpanel.a libsqlite3.a
-CLIENTS_FILESET_LIB_PWARE=$($(BLD_OS)_CLIENTS_LIBS_PWARE)
-
 ifeq "$(MPP_ARCH)" ""
 rhel6_x86_64_MPP_ARCH=RHEL6-x86_64
 rhel7_x86_64_MPP_ARCH=RHEL7-x86_64
+rhel8_x86_64_MPP_ARCH=RHEL8-x86_64
+rocky8_x86_64_MPP_ARCH=ROCKY8-x86_64
+ol8_x86_64_MPP_ARCH=OL8-x86_64
 ifneq "$($(BLD_ARCH)_MPP_ARCH)" ""
 export MPP_ARCH=$($(BLD_ARCH)_MPP_ARCH)
 else
@@ -492,8 +406,6 @@ else
 	# ---- copy GPDB fileset ----
 	mkdir -p $(CLIENTSINSTLOC_BIN)
 	(cd $(INSTLOC)/bin/ && $(TAR) cf - $(CLIENTS_FILESET_BIN)) | (cd $(CLIENTSINSTLOC_BIN)/ && $(TAR) xpf -)$(check_pipe_for_errors)
-	mkdir -p $(CLIENTSINSTLOC_BINEXT)
-	(cd $(GPMGMT)/bin/ext/ && $(TAR) cf - $(CLIENTS_FILESET_BINEXT)) | (cd $(CLIENTSINSTLOC_BINEXT)/ && $(TAR) xpf -)$(check_pipe_for_errors)
 ifneq "$(PYTHONHOME)" ""
 	mkdir -p $(CLIENTSINSTLOC_EXT)/python
 	(cd $(PYTHONHOME) && $(TAR) cf - $(BLD_PYTHON_FILESET)) | (cd $(CLIENTSINSTLOC_EXT)/python/ && $(TAR) xpf -)$(check_pipe_for_errors)
@@ -502,19 +414,6 @@ endif
  ifneq "$(CLIENTS_FILESET_LIB)" ""
 	 (cd $(INSTLOC)/lib/ && $(TAR) cf - $(CLIENTS_FILESET_LIB)) | (cd $(CLIENTSINSTLOC_LIB)/ && $(TAR) xpf -)$(check_pipe_for_errors)
  endif
-ifneq "$(FILESET_LIB_GCC)" ""
-	(cd $(CLIENTSINSTLOC_LIB)/ && $(TAR) cf - -C $(FILESET_LIB_GCC_LOC) $(FILESET_LIB_GCC) | $(TAR) xpf -)$(check_pipe_for_errors)
-endif
-ifneq "$(CLIENTS_FILESET_LIB_PERZL)" ""
-	# include libraries from www.perzl.org needed by the pware Python-2.6.1 build
-	mkdir -p $(CLIENTSINSTLOC_LIB_PWARE)
-	($(TAR) cf - -C $(CLIENTS_FILESET_LIB_PERZL_LOC) $(CLIENTS_FILESET_LIB_PERZL)) | ($(TAR) xpf - -C $(CLIENTSINSTLOC_LIB_PWARE))$(check_pipe_for_errors)
-endif
-ifneq "$(CLIENTS_FILESET_LIB_PWARE)" ""
-	# include libraries from pware needed by the pware Python-2.6.1 build
-	mkdir -p $(CLIENTSINSTLOC_LIB_PWARE)
-	($(TAR) cf - -C $(PYTHONHOME)/lib $(CLIENTS_FILESET_LIB_PWARE)) | ($(TAR) xpf - -C $(CLIENTSINSTLOC_LIB_PWARE))$(check_pipe_for_errors)
-endif
 	# ---- copy scripts fileset ----
 	mkdir -p $(CLIENTSINSTLOC)
 	cp -f client/scripts/greenplum_$@_path$(SCRIPT) $(CLIENTSINSTLOC)/
@@ -592,7 +491,6 @@ SET_VERSION_SCRIPTS = \
 	lib/python/gppylib/programs/clsHostCacheLookup.py \
 	lib/python/gppylib/programs/clsRecoverSegment.py \
 	lib/python/gppylib/programs/clsSystemState.py \
-	lib/python/gppylib/programs/gppkg.py \
 	lib/python/gppylib/programs/kill.py \
 	lib/python/gppylib/mainUtils.py \
 	$(NULL)

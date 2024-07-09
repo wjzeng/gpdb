@@ -3,16 +3,6 @@
 -- exist at the time of running upgrades. If objects are to be manipulated
 -- in other databases, make sure to change to the correct database first.
 
--- GPDB_12_MERGE_FIXME: We don't need to drop partitioned table with indexes
--- anymore, do we?
---partition tables with indexes requires dropping for now
---NOTE: 'isolation2test' and 'regression' database must already exist
---\c isolation2test;
---\i test_gpdb_pre_drop_partition_indices.sql;
-
---\c regression;
---\i test_gpdb_pre_drop_partition_indices.sql;
-
 -- The isolation tests are run in utility mode, and the objects left behind
 -- are not consistent between the QD and QEs.
 DROP DATABASE IF EXISTS isolation_regression;
@@ -26,7 +16,7 @@ DROP DATABASE IF EXISTS isolation_regression;
 -- Note: Table newpart is 'not' a partition table, and the index's referenced above are created by a check constraint.
 DROP TABLE IF EXISTS public.newpart CASCADE;
 
--- GPDB_94_STABLE_MERGE_FIXME: The patent table has NO INHERIT
+-- GPDB_UPGRADE_FIXME: The patent table has NO INHERIT
 -- constraint for this table. This is not handled for pg_upgrade and
 -- check if needs to be fixed or not. This table was newly added to
 -- alter_table.sql as part of 9.4 STABLE merge.

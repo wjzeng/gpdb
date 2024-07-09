@@ -28,7 +28,9 @@ interval '1 day 1 hour 12 secs' * i as days1,interval '42 minutes 10 seconds' * 
 random() * 9 + i  as b, 
 i as c from generate_series(1, 100)i;
 
+-- reduce noise, specifying a precision and format
 SET datestyle = "ISO, DMY";
+SET extra_float_digits to 0;
 -- end_ignore
 
 --TIMESTAMPTZ
@@ -118,6 +120,8 @@ select b, percentile_cont(0.9876) within group( order by c::numeric - 2.8765::nu
 select median( c::numeric + (0.2*0.99):: numeric) from perctnum;
 
 select percentile_cont(1.00) within group( order by b::float8 + (110 / 13)::float8) from perctnum; 
+
+select percentile_cont(0.95) within group( order by c) from perctnum;
 
 --SQL with <> operator with IDF in HAVING clause
 

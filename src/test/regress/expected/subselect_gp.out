@@ -1,4 +1,11 @@
-set optimizer_enable_master_only_queries = on;
+-- start_matchsubs
+-- m/\(cost=.*\)/
+-- s/\(cost=.*\)//
+--
+-- m/\(slice.*\)/
+-- s/\(slice.*\)//
+-- end_matchsubs
+set optimizer_enable_coordinator_only_queries = on;
 set optimizer_segments = 3;
 set optimizer_nestloop_factor = 1.0;
 --
@@ -310,7 +317,7 @@ select array(select x from csq_d1); -- {1}
 (1 row)
 
 --
--- CSQs involving master-only and distributed tables
+-- CSQs involving coordinator-only and distributed tables
 --
 drop table if exists t3cozlib;
 NOTICE:  table "t3cozlib" does not exist, skipping
@@ -345,7 +352,7 @@ ORDER BY a.attnum
 (2 rows)
 
 --
--- More CSQs involving master-only and distributed relations
+-- More CSQs involving coordinator-only and distributed relations
 --
 drop table if exists csq_m1;
 create table csq_m1();
@@ -378,7 +385,7 @@ select * from csq_d1;
 (3 rows)
 
 --
--- outer plan node is master-only and CSQ has distributed relation
+-- outer plan node is coordinator-only and CSQ has distributed relation
 --
 explain select * from csq_m1 where x not in (select x from csq_d1) or x < -100; -- gather motion
                                      QUERY PLAN                                     
@@ -398,7 +405,7 @@ select * from csq_m1 where x not in (select x from csq_d1) or x < -100; -- (3)
 (1 row)
 
 --
--- outer plan node is master-only and CSQ has distributed relation
+-- outer plan node is coordinator-only and CSQ has distributed relation
 --
 explain select * from csq_d1 where x not in (select x from csq_m1) or x < -100; -- broadcast motion
                                    QUERY PLAN                                   
@@ -1395,9 +1402,6 @@ SELECT bar_s.c FROM bar_s, foo_s WHERE foo_s.b = (SELECT max(i) FROM baz_s WHERE
 
 -- Same as above, but with another subquery, so it must use a SubPlan. There
 -- are two references to the same SubPlan in the plan, on different slices.
--- GPDB_96_MERGE_FIXME: this EXPLAIN output should become nicer-looking once we
--- merge upstream commit 4d042999f9, to suppress the SubPlans from being
--- printed twice.
 explain SELECT bar_s.c FROM bar_s, foo_s WHERE foo_s.b = (SELECT max(i) FROM baz_s WHERE bar_s.c = 9) AND foo_s.b = (select bar_s.d::int4);
                                                            QUERY PLAN                                                            
 ---------------------------------------------------------------------------------------------------------------------------------
@@ -1584,22 +1588,26 @@ EXPLAIN SELECT '' AS six, f1 AS "Correlated Field", f3 AS "Second Field"
   FROM SUBSELECT_TBL upper
   WHERE f3 IN (SELECT upper.f1 + f2 FROM SUBSELECT_TBL
                WHERE f2 = CAST(f3 AS integer)) ORDER BY 2,3;
-                                               QUERY PLAN                                               
---------------------------------------------------------------------------------------------------------
- Gather Motion 3:1  (slice2; segments: 3)  (cost=2.18..2.19 rows=4 width=12)
+                                                          QUERY PLAN                                                           
+-------------------------------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)  (cost=10000000002.39..10000000002.44 rows=3 width=44)
    Merge Key: upper.f1, upper.f3
-   ->  Sort  (cost=2.18..2.19 rows=2 width=12)
+   ->  Sort  (cost=10000000002.39..10000000002.40 rows=1 width=44)
          Sort Key: upper.f1, upper.f3
-         ->  Nested Loop Semi Join  (cost=3.16..6.90 rows=2 width=12)
-               Join Filter: (upper.f1 + subselect_tbl.f2)::double precision = upper.f3
-               ->  Seq Scan on subselect_tbl upper  (cost=0.00..1.01 rows=1 width=12)
-               ->  Materialize  (cost=1.06..1.09 rows=1 width=12)
-                     ->  Broadcast Motion 3:3  (slice1; segments: 3)  (cost=0.00..1.05 rows=1 width=12)
-                           ->  Seq Scan on subselect_tbl  (cost=0.00..1.01 rows=1 width=12)
-                                 Filter: f2 = f3::integer
- Settings:  optimizer=off
- Optimizer status: Postgres query optimizer
-(13 rows)
+         ->  Result  (cost=10000000002.36..10000000002.38 rows=1 width=44)
+               ->  HashAggregate  (cost=10000000002.36..10000000002.37 rows=1 width=12)
+                     Group Key: (RowIdExpr)
+                     ->  Redistribute Motion 3:3  (slice2; segments: 3)  (cost=10000000000.00..10000000002.36 rows=1 width=12)
+                           Hash Key: (RowIdExpr)
+                           ->  Nested Loop  (cost=10000000000.00..10000000002.34 rows=1 width=12)
+                                 Join Filter: (((upper.f1 + subselect_tbl.f2))::double precision = upper.f3)
+                                 ->  Broadcast Motion 3:3  (slice3; segments: 3)  (cost=0.00..1.13 rows=8 width=12)
+                                       ->  Seq Scan on subselect_tbl upper  (cost=0.00..1.03 rows=3 width=12)
+                                 ->  Materialize  (cost=0.00..1.04 rows=1 width=4)
+                                       ->  Seq Scan on subselect_tbl  (cost=0.00..1.04 rows=1 width=4)
+                                             Filter: (f2 = (f3)::integer)
+ Optimizer: Postgres query optimizer
+(17 rows)
 
 EXPLAIN SELECT '' AS five, f1 AS "Correlated Field"
   FROM SUBSELECT_TBL
@@ -1619,6 +1627,77 @@ EXPLAIN SELECT '' AS five, f1 AS "Correlated Field"
                            Hash Key: subselect_tbl_1.f2
                            ->  Seq Scan on subselect_tbl subselect_tbl_1  (cost=0.00..3.08 rows=3 width=12)
                                  Filter: f3 IS NOT NULL
+ Optimizer: Postgres query optimizer
+(13 rows)
+
+-- Test simplify group-by/order-by inside subquery if sublink pull-up is possible
+EXPLAIN SELECT '' AS six, f1 AS "Correlated Field", f2 AS "Second Field"
+  FROM SUBSELECT_TBL upper
+  WHERE f1 IN (SELECT f2 FROM SUBSELECT_TBL WHERE f1 = upper.f1 GROUP BY f2);
+                                  QUERY PLAN                                   
+-------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)  (cost=1.05..2.13 rows=3 width=40)
+   ->  Hash Semi Join  (cost=1.05..2.09 rows=1 width=40)
+         Hash Cond: (upper.f1 = subselect_tbl.f1)
+         ->  Seq Scan on subselect_tbl upper  (cost=0.00..1.03 rows=3 width=8)
+         ->  Hash  (cost=1.03..1.03 rows=1 width=8)
+               ->  Seq Scan on subselect_tbl  (cost=0.00..1.03 rows=1 width=8)
+                     Filter: (f1 = f2)
+ Optimizer: Postgres query optimizer
+(8 rows)
+
+EXPLAIN SELECT '' AS six, f1 AS "Correlated Field", f2 AS "Second Field"
+  FROM SUBSELECT_TBL upper
+  WHERE f1 IN (SELECT f2 FROM SUBSELECT_TBL WHERE f1 = upper.f1  GROUP BY f2 LIMIT 3);
+                                                     QUERY PLAN                                                      
+---------------------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)  (cost=0.00..1.08 rows=4 width=40)
+   ->  Seq Scan on subselect_tbl upper  (cost=0.00..1.03 rows=1 width=40)
+         Filter: (SubPlan 1)
+         SubPlan 1
+           ->  Limit  (cost=1.27..1.30 rows=3 width=4)
+                 ->  HashAggregate  (cost=1.27..1.33 rows=6 width=4)
+                       Group Key: subselect_tbl.f2
+                       ->  Result  (cost=0.00..1.25 rows=8 width=4)
+                             Filter: (subselect_tbl.f1 = upper.f1)
+                             ->  Materialize  (cost=0.00..1.17 rows=8 width=8)
+                                   ->  Broadcast Motion 3:3  (slice2; segments: 3)  (cost=0.00..1.13 rows=8 width=8)
+                                         ->  Seq Scan on subselect_tbl  (cost=0.00..1.03 rows=3 width=8)
+ Optimizer: Postgres query optimizer
+(13 rows)
+
+EXPLAIN SELECT '' AS six, f1 AS "Correlated Field", f2 AS "Second Field"
+  FROM SUBSELECT_TBL upper
+  WHERE f1 IN (SELECT f2 FROM SUBSELECT_TBL WHERE f1 = upper.f1 ORDER BY f2);
+                                  QUERY PLAN                                   
+-------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)  (cost=1.05..2.13 rows=3 width=40)
+   ->  Hash Semi Join  (cost=1.05..2.09 rows=1 width=40)
+         Hash Cond: (upper.f1 = subselect_tbl.f1)
+         ->  Seq Scan on subselect_tbl upper  (cost=0.00..1.03 rows=3 width=8)
+         ->  Hash  (cost=1.03..1.03 rows=1 width=8)
+               ->  Seq Scan on subselect_tbl  (cost=0.00..1.03 rows=1 width=8)
+                     Filter: (f1 = f2)
+ Optimizer: Postgres query optimizer
+(8 rows)
+
+EXPLAIN SELECT '' AS six, f1 AS "Correlated Field", f2 AS "Second Field"
+  FROM SUBSELECT_TBL upper
+  WHERE f1 IN (SELECT f2 FROM SUBSELECT_TBL WHERE f1 = upper.f1  ORDER BY f2 LIMIT 3);
+                                                     QUERY PLAN                                                      
+---------------------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)  (cost=0.00..1.08 rows=4 width=40)
+   ->  Seq Scan on subselect_tbl upper  (cost=0.00..1.03 rows=1 width=40)
+         Filter: (SubPlan 1)
+         SubPlan 1
+           ->  Limit  (cost=1.36..1.36 rows=3 width=4)
+                 ->  Sort  (cost=1.36..1.38 rows=8 width=4)
+                       Sort Key: subselect_tbl.f2
+                       ->  Result  (cost=0.00..1.25 rows=8 width=4)
+                             Filter: (subselect_tbl.f1 = upper.f1)
+                             ->  Materialize  (cost=0.00..1.17 rows=8 width=8)
+                                   ->  Broadcast Motion 3:3  (slice2; segments: 3)  (cost=0.00..1.13 rows=8 width=8)
+                                         ->  Seq Scan on subselect_tbl  (cost=0.00..1.03 rows=3 width=8)
  Optimizer: Postgres query optimizer
 (13 rows)
 
@@ -1688,7 +1767,7 @@ EXPLAIN select count(*) from
                                  Group Key: b.hundred
                                  ->  Redistribute Motion 3:3  (slice1; segments: 3)  (cost=0.00..389.00 rows=3334 width=4)
                                        Hash Key: b.hundred
-                                       ->  Seq Scan on tenk1 b  (cost=0.00..189.00 rows=3334 width=4)
+                                             ->  Seq Scan on tenk1 b  (cost=0.00..62.33 rows=3333 width=4)
  Optimizer: Postgres query optimizer
 (13 rows)
 
@@ -1714,34 +1793,26 @@ EXPLAIN select count(distinct ss.ten) from
                                                    Group Key: b.hundred
                                                    ->  Redistribute Motion 3:3  (slice1; segments: 3)  (cost=0.00..389.00 rows=3334 width=4)
                                                          Hash Key: b.hundred
-                                                         ->  Seq Scan on tenk1 b  (cost=0.00..189.00 rows=3334 width=4)
+                                                         ->  Seq Scan on tenk1 b  (cost=0.00..62.33 rows=3333 width=4)
  Optimizer: Postgres query optimizer
 (19 rows)
 
 --
--- In case of simple exists query, planner can generate alternative
--- subplans and choose one of them during execution based on the cost.
--- The below test check that we are generating alternative subplans,
--- we should see 2 subplans in the explain
+-- Commit 41efb83 remove unused subplans in planner stage, it
+-- will shows only the subplan actually be used.
 --
 EXPLAIN SELECT EXISTS(SELECT * FROM tenk1 WHERE tenk1.unique1 = tenk2.unique1) FROM tenk2 LIMIT 1;
-                                                        QUERY PLAN                                                        
---------------------------------------------------------------------------------------------------------------------------
- Limit  (cost=0.00..0.08 rows=1 width=4)
-   ->  Gather Motion 3:1  (slice3; segments: 3)  (cost=0.00..0.08 rows=1 width=4)
-         ->  Limit  (cost=0.00..0.06 rows=1 width=4)
-               ->  Seq Scan on tenk2  (cost=0.00..625.00 rows=3334 width=4)
-                     SubPlan 1
-                       ->  Result  (cost=0.00..439.00 rows=10000 width=4)
-                             Filter: (tenk1.unique1 = tenk2.unique1)
-                             ->  Materialize  (cost=0.00..439.00 rows=10000 width=4)
-                                   ->  Broadcast Motion 3:3  (slice1; segments: 3)  (cost=0.00..389.00 rows=3334 width=4)
-                                         ->  Seq Scan on tenk1  (cost=0.00..189.00 rows=3334 width=4)
+                                                 QUERY PLAN                                                  
+-------------------------------------------------------------------------------------------------------------
+ Limit  (cost=21.08..21.11 rows=1 width=1)
+   ->  Gather Motion 3:1  (slice1; segments: 3)  (cost=21.08..21.17 rows=3 width=1)
+         ->  Limit  (cost=21.08..21.13 rows=1 width=1)
+               ->  Seq Scan on tenk2  (cost=0.00..210.78 rows=3967 width=1)
                      SubPlan 2
-                       ->  Broadcast Motion 3:3  (slice2; segments: 3)  (cost=0.00..189.00 rows=3334 width=4)
-                             ->  Seq Scan on tenk1 tenk1_1  (cost=0.00..189.00 rows=3334 width=4)
+                       ->  Broadcast Motion 3:3  (slice2; segments: 3)  (cost=0.00..62.33 rows=3333 width=4)
+                             ->  Seq Scan on tenk1  (cost=0.00..62.33 rows=3333 width=4)
  Optimizer: Postgres query optimizer
-(14 rows)
+(8 rows)
 
 SELECT EXISTS(SELECT * FROM tenk1 WHERE tenk1.unique1 = tenk2.unique1) FROM tenk2 LIMIT 1;
  exists 
@@ -1847,7 +1918,7 @@ select * from dedup_reptab r where r.a in (select t.a/10 from dedup_tab t);
          ->  Unique
                Group Key: (RowIdExpr)
                ->  Sort
-                     Sort Key (Distinct): (RowIdExpr)
+                     Sort Key: (RowIdExpr)
                      ->  Redistribute Motion 3:3  (slice2; segments: 3)
                            Hash Key: (RowIdExpr)
                            ->  Hash Join
@@ -1899,7 +1970,7 @@ select * from dedup_srf() r(a) where r.a in (select t.a/10 from dedup_tab t);
          ->  Unique
                Group Key: (RowIdExpr)
                ->  Sort
-                     Sort Key (Distinct): (RowIdExpr)
+                     Sort Key: (RowIdExpr)
                      ->  Redistribute Motion 3:3  (slice2; segments: 3)
                            Hash Key: (RowIdExpr)
                            ->  Hash Join
@@ -1928,7 +1999,7 @@ select * from dedup_srf_stable() r(a) where r.a in (select t.a/10 from dedup_tab
          ->  Unique
                Group Key: (RowIdExpr)
                ->  Sort
-                     Sort Key (Distinct): (RowIdExpr)
+                     Sort Key: (RowIdExpr)
                      ->  Redistribute Motion 3:3  (slice2; segments: 3)
                            Hash Key: (RowIdExpr)
                            ->  Hash Join
@@ -1957,7 +2028,7 @@ select * from dedup_srf_volatile() r(a) where r.a in (select t.a/10 from dedup_t
          ->  Unique
                Group Key: (RowIdExpr)
                ->  Sort
-                     Sort Key (Distinct): (RowIdExpr)
+                     Sort Key: (RowIdExpr)
                      ->  Redistribute Motion 3:3  (slice2; segments: 3)
                            Hash Key: (RowIdExpr)
                            ->  Hash Join
@@ -1999,7 +2070,7 @@ select * from dedup_func() r(a) where r.a in (select t.a/10 from dedup_tab t);
          ->  Unique
                Group Key: (RowIdExpr)
                ->  Sort
-                     Sort Key (Distinct): (RowIdExpr)
+                     Sort Key: (RowIdExpr)
                      ->  Redistribute Motion 3:3  (slice2; segments: 3)
                            Hash Key: (RowIdExpr)
                            ->  Hash Join
@@ -2026,7 +2097,7 @@ select * from dedup_func_stable() r(a) where r.a in (select t.a/10 from dedup_ta
          ->  Unique
                Group Key: (RowIdExpr)
                ->  Sort
-                     Sort Key (Distinct): (RowIdExpr)
+                     Sort Key: (RowIdExpr)
                      ->  Redistribute Motion 3:3  (slice2; segments: 3)
                            Hash Key: (RowIdExpr)
                            ->  Hash Join
@@ -2053,7 +2124,7 @@ select * from dedup_func_volatile() r(a) where r.a in (select t.a/10 from dedup_
          ->  Unique
                Group Key: (RowIdExpr)
                ->  Sort
-                     Sort Key (Distinct): (RowIdExpr)
+                     Sort Key: (RowIdExpr)
                      ->  Redistribute Motion 3:3  (slice2; segments: 3)
                            Hash Key: (RowIdExpr)
                            ->  Hash Join
@@ -2542,3 +2613,1386 @@ select * from foo where
   9 |  9
 (6 rows)
 
+-- When creating plan with subquery and CTE, it sets the useless flow for the plan.
+-- But we only need flow for the topmost plan and child of the motion. See commit
+-- https://github.com/greenplum-db/gpdb/commit/93abe741cd67f04958e2951edff02b45ab6e280f for detail
+-- The extra flow will cause subplan set wrong motionType and cause an ERROR
+-- unexpected gang size: XX
+-- This related to issue: https://github.com/greenplum-db/gpdb/issues/12371
+create table extra_flow_dist(a int, b int, c date);
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column named 'a' as the Greenplum Database data distribution key for this table.
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
+create table extra_flow_dist1(a int, b int);
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column named 'a' as the Greenplum Database data distribution key for this table.
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
+insert into extra_flow_dist select i, i, '1949-10-01'::date from generate_series(1, 10)i;
+insert into extra_flow_dist1 select i, i from generate_series(20, 22)i;
+-- case 1 subplan with outer general locus (CTE and subquery)
+explain (verbose, costs off) with run_dt as (
+	select
+	(
+	  select c from extra_flow_dist where b = x  -- subplan's outer is the below general locus path
+	) dt
+	from (select ( max(1) ) x) a  -- general locus
+)
+select * from run_dt, extra_flow_dist1
+where dt < '2010-01-01'::date;
+                                               QUERY PLAN                                                
+---------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Output: ((SubPlan 1)), extra_flow_dist1.a, extra_flow_dist1.b
+   ->  Nested Loop
+         Output: ((SubPlan 1)), extra_flow_dist1.a, extra_flow_dist1.b
+         ->  Subquery Scan on a
+               Output: (SubPlan 1)
+               Filter: ((SubPlan 2) < '01-01-2010'::date)
+               ->  Aggregate
+                     Output: max(1)
+                     ->  Result
+               SubPlan 1
+                 ->  Result
+                       Output: extra_flow_dist.c
+                       Filter: (extra_flow_dist.b = a.x)
+                       ->  Materialize
+                             Output: extra_flow_dist.c, extra_flow_dist.b
+                             ->  Broadcast Motion 3:3  (slice2; segments: 3)
+                                   Output: extra_flow_dist.c, extra_flow_dist.b
+                                   ->  Seq Scan on subselect_gp.extra_flow_dist
+                                         Output: extra_flow_dist.c, extra_flow_dist.b
+               SubPlan 2
+                 ->  Result
+                       Output: extra_flow_dist_1.c
+                       Filter: (extra_flow_dist_1.b = a.x)
+                       ->  Materialize
+                             Output: extra_flow_dist_1.c, extra_flow_dist_1.b
+                             ->  Broadcast Motion 3:3  (slice3; segments: 3)
+                                   Output: extra_flow_dist_1.c, extra_flow_dist_1.b
+                                   ->  Seq Scan on subselect_gp.extra_flow_dist extra_flow_dist_1
+                                         Output: extra_flow_dist_1.c, extra_flow_dist_1.b
+         ->  Seq Scan on subselect_gp.extra_flow_dist1
+               Output: extra_flow_dist1.a, extra_flow_dist1.b
+ Optimizer: Postgres query optimizer
+(25 rows)
+
+with run_dt as (
+	select
+	(
+	  select c from extra_flow_dist where b = x
+	) dt
+	from (select ( max(1) ) x) a
+)
+select * from run_dt, extra_flow_dist1
+where dt < '2010-01-01'::date;
+     dt     | a  | b  
+------------+----+----
+ 10-01-1949 | 20 | 20
+ 10-01-1949 | 22 | 22
+ 10-01-1949 | 21 | 21
+(3 rows)
+
+create table extra_flow_rand(a int) distributed replicated;
+insert into extra_flow_rand values (1);
+-- case 2 for subplan with outer segment general locus (CTE and subquery)
+explain (verbose, costs off) with run_dt as (
+	select
+	(
+		select c from extra_flow_dist where b = x  -- subplan's outer is the below segment general locus path
+	) dt
+	from (select a x from extra_flow_rand) a  -- segment general locus
+)
+select * from run_dt, extra_flow_dist1
+where dt < '2010-01-01'::date;
+                                               QUERY PLAN                                                
+---------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Output: ((SubPlan 1)), extra_flow_dist1.a, extra_flow_dist1.b
+   ->  Nested Loop
+         Output: ((SubPlan 1)), extra_flow_dist1.a, extra_flow_dist1.b
+         ->  Seq Scan on subselect_gp.extra_flow_rand
+               Output: (SubPlan 1)
+               Filter: ((SubPlan 2) < '01-01-2010'::date)
+               SubPlan 1
+                 ->  Result
+                       Output: extra_flow_dist.c
+                       Filter: (extra_flow_dist.b = extra_flow_rand.a)
+                       ->  Materialize
+                             Output: extra_flow_dist.c, extra_flow_dist.b
+                             ->  Broadcast Motion 3:3  (slice2; segments: 3)
+                                   Output: extra_flow_dist.c, extra_flow_dist.b
+                                   ->  Seq Scan on subselect_gp.extra_flow_dist
+                                         Output: extra_flow_dist.c, extra_flow_dist.b
+               SubPlan 2
+                 ->  Result
+                       Output: extra_flow_dist_1.c
+                       Filter: (extra_flow_dist_1.b = extra_flow_rand.a)
+                       ->  Materialize
+                             Output: extra_flow_dist_1.c, extra_flow_dist_1.b
+                             ->  Broadcast Motion 3:3  (slice3; segments: 3)
+                                   Output: extra_flow_dist_1.c, extra_flow_dist_1.b
+                                   ->  Seq Scan on subselect_gp.extra_flow_dist extra_flow_dist_1
+                                         Output: extra_flow_dist_1.c, extra_flow_dist_1.b
+         ->  Materialize
+               Output: extra_flow_dist1.a, extra_flow_dist1.b
+               ->  Seq Scan on subselect_gp.extra_flow_dist1
+                     Output: extra_flow_dist1.a, extra_flow_dist1.b
+ Optimizer: Postgres query optimizer
+(24 rows)
+
+with run_dt as (
+	select
+	(
+		select c from extra_flow_dist where b = x
+	) dt
+	from (select a x from extra_flow_rand) a
+)
+select * from run_dt, extra_flow_dist1
+where dt < '2010-01-01'::date;
+     dt     | a  | b  
+------------+----+----
+ 10-01-1949 | 22 | 22
+ 10-01-1949 | 20 | 20
+ 10-01-1949 | 21 | 21
+(3 rows)
+
+-- case 3 for subplan with outer entry locus (CTE and subquery)
+explain (verbose, costs off) with run_dt as (
+	select
+	(
+		select c from extra_flow_dist where b = x  -- subplan's outer is the below entry locus path
+	) dt
+	from (select 1 x from pg_class limit 1) a  -- entry locus
+)
+select * from run_dt, extra_flow_dist1
+where dt < '2010-01-01'::date;
+                                               QUERY PLAN                                                
+---------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Output: ((SubPlan 1)), extra_flow_dist1.a, extra_flow_dist1.b
+   ->  Nested Loop
+         Output: ((SubPlan 1)), extra_flow_dist1.a, extra_flow_dist1.b
+         ->  Broadcast Motion 1:3  (slice2)
+               Output: ((SubPlan 1))
+               ->  Subquery Scan on a
+                     Output: (SubPlan 1)
+                     Filter: ((SubPlan 2) < '01-01-2010'::date)
+                     ->  Limit
+                           Output: 1
+                           ->  Seq Scan on pg_catalog.pg_class
+                                 Output: 1
+                     SubPlan 1
+                       ->  Result
+                             Output: extra_flow_dist.c
+                             Filter: (extra_flow_dist.b = a.x)
+                             ->  Materialize
+                                   Output: extra_flow_dist.c, extra_flow_dist.b
+                                   ->  Gather Motion 3:1  (slice3; segments: 3)
+                                         Output: extra_flow_dist.c, extra_flow_dist.b
+                                         ->  Seq Scan on subselect_gp.extra_flow_dist
+                                               Output: extra_flow_dist.c, extra_flow_dist.b
+                     SubPlan 2
+                       ->  Result
+                             Output: extra_flow_dist_1.c
+                             Filter: (extra_flow_dist_1.b = a.x)
+                             ->  Materialize
+                                   Output: extra_flow_dist_1.c, extra_flow_dist_1.b
+                                   ->  Gather Motion 3:1  (slice4; segments: 3)
+                                         Output: extra_flow_dist_1.c, extra_flow_dist_1.b
+                                         ->  Seq Scan on subselect_gp.extra_flow_dist extra_flow_dist_1
+                                               Output: extra_flow_dist_1.c, extra_flow_dist_1.b
+         ->  Seq Scan on subselect_gp.extra_flow_dist1
+               Output: extra_flow_dist1.a, extra_flow_dist1.b
+ Optimizer: Postgres query optimizer
+(28 rows)
+
+with run_dt as (
+	select
+	(
+		select c from extra_flow_dist where b = x  -- subplan's outer is the below entry locus path
+	) dt
+	from (select 1 x from pg_class limit 1) a  -- entry locus
+)
+select * from run_dt, extra_flow_dist1
+where dt < '2010-01-01'::date;
+     dt     | a  | b  
+------------+----+----
+ 10-01-1949 | 20 | 20
+ 10-01-1949 | 21 | 21
+ 10-01-1949 | 22 | 22
+(3 rows)
+
+-- case 4 subplan with outer segment general locus without param in subplan (CTE and subquery)
+explain (verbose, costs off) with run_dt as (
+	select x, y dt
+	from (select a x from extra_flow_rand ) a  -- segment general locus
+	left join (select max(1) y) aaa
+	on a.x > any (select random() from extra_flow_dist)  -- subplan's outer is the above segment general locus path
+)
+select * from run_dt, extra_flow_dist1
+where dt < extra_flow_dist1.a;
+                                     QUERY PLAN                                      
+-------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Output: extra_flow_rand.a, (max(1)), extra_flow_dist1.a, extra_flow_dist1.b
+   ->  Nested Loop
+         Output: extra_flow_rand.a, (max(1)), extra_flow_dist1.a, extra_flow_dist1.b
+         Join Filter: ((max(1)) < extra_flow_dist1.a)
+         ->  Nested Loop Left Join
+               Output: extra_flow_rand.a, (max(1))
+               Inner Unique: true
+               Join Filter: ((SubPlan 1))
+               ->  Seq Scan on subselect_gp.extra_flow_rand
+                     Output: extra_flow_rand.a, (SubPlan 1)
+                     SubPlan 1
+                       ->  Materialize
+                             Output: (random())
+                             ->  Broadcast Motion 3:3  (slice2; segments: 3)
+                                   Output: (random())
+                                   ->  Seq Scan on subselect_gp.extra_flow_dist
+                                         Output: random()
+               ->  Materialize
+                     Output: (max(1))
+                     ->  Aggregate
+                           Output: max(1)
+                           ->  Result
+         ->  Materialize
+               Output: extra_flow_dist1.a, extra_flow_dist1.b
+               ->  Seq Scan on subselect_gp.extra_flow_dist1
+                     Output: extra_flow_dist1.a, extra_flow_dist1.b
+ Optimizer: Postgres query optimizer
+(28 rows)
+
+-- case 5 for subplan with outer entry locus without param in subplan (CTE and subquery)
+explain (verbose, costs off) with run_dt as (
+	select x, y dt
+	from (select relnatts x from pg_class ) a  -- entry locus
+	left join (select max(1) y) aaa
+	on a.x > any (select random() from extra_flow_dist)  -- subplan's outer is the above entry loucs
+)
+select * from run_dt, extra_flow_dist1
+where dt < extra_flow_dist1.a;
+                                      QUERY PLAN                                      
+--------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Output: pg_class.relnatts, (max(1)), extra_flow_dist1.a, extra_flow_dist1.b
+   ->  Nested Loop
+         Output: pg_class.relnatts, (max(1)), extra_flow_dist1.a, extra_flow_dist1.b
+         Join Filter: ((max(1)) < extra_flow_dist1.a)
+         ->  Broadcast Motion 1:3  (slice2)
+               Output: pg_class.relnatts, (max(1))
+               ->  Nested Loop Left Join
+                     Output: pg_class.relnatts, (max(1))
+                     Inner Unique: true
+                     Join Filter: ((SubPlan 1))
+                     ->  Seq Scan on pg_catalog.pg_class
+                           Output: pg_class.relnatts, (SubPlan 1)
+                           SubPlan 1
+                             ->  Materialize
+                                   Output: (random())
+                                   ->  Gather Motion 3:1  (slice3; segments: 3)
+                                         Output: (random())
+                                         ->  Seq Scan on subselect_gp.extra_flow_dist
+                                               Output: random()
+                     ->  Materialize
+                           Output: (max(1))
+                           ->  Aggregate
+                                 Output: max(1)
+                                 ->  Result
+         ->  Materialize
+               Output: extra_flow_dist1.a, extra_flow_dist1.b
+               ->  Seq Scan on subselect_gp.extra_flow_dist1
+                     Output: extra_flow_dist1.a, extra_flow_dist1.b
+ Optimizer: Postgres query optimizer
+(30 rows)
+
+-- case 6 without CTE, nested subquery should not add extral flow
+explain (verbose, costs off) select * from (
+	select dt from (
+		select
+		(
+			select c from extra_flow_dist where b = x  -- subplan's outer is the below general locus path
+		) dt
+		from (select ( max(1) ) x) a  -- general locus
+		union
+		select
+		(
+			select c from extra_flow_dist where b = x  -- subplan's outer is the below general locus path
+		) dt
+		from (select ( max(1) ) x) aa  -- general locus
+	) tbl
+) run_dt,
+extra_flow_dist1
+where dt < '2010-01-01'::date;
+                                                     QUERY PLAN                                                     
+--------------------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Output: ((SubPlan 1)), extra_flow_dist1.a, extra_flow_dist1.b
+   ->  Nested Loop
+         Output: ((SubPlan 1)), extra_flow_dist1.a, extra_flow_dist1.b
+         ->  Seq Scan on subselect_gp.extra_flow_dist1
+               Output: extra_flow_dist1.a, extra_flow_dist1.b
+         ->  Materialize
+               Output: ((SubPlan 1))
+               ->  HashAggregate
+                     Output: ((SubPlan 1))
+                     Group Key: ((SubPlan 1))
+                     ->  Append
+                           ->  Subquery Scan on a
+                                 Output: (SubPlan 1)
+                                 Filter: ((SubPlan 2) < '01-01-2010'::date)
+                                 ->  Aggregate
+                                       Output: max(1)
+                                       ->  Result
+                                 SubPlan 1
+                                   ->  Result
+                                         Output: extra_flow_dist.c
+                                         Filter: (extra_flow_dist.b = a.x)
+                                         ->  Materialize
+                                               Output: extra_flow_dist.c, extra_flow_dist.b
+                                               ->  Broadcast Motion 3:3  (slice2; segments: 3)
+                                                     Output: extra_flow_dist.c, extra_flow_dist.b
+                                                     ->  Seq Scan on subselect_gp.extra_flow_dist
+                                                           Output: extra_flow_dist.c, extra_flow_dist.b
+                                 SubPlan 2
+                                   ->  Result
+                                         Output: extra_flow_dist_1.c
+                                         Filter: (extra_flow_dist_1.b = a.x)
+                                         ->  Materialize
+                                               Output: extra_flow_dist_1.c, extra_flow_dist_1.b
+                                               ->  Broadcast Motion 3:3  (slice3; segments: 3)
+                                                     Output: extra_flow_dist_1.c, extra_flow_dist_1.b
+                                                     ->  Seq Scan on subselect_gp.extra_flow_dist extra_flow_dist_1
+                                                           Output: extra_flow_dist_1.c, extra_flow_dist_1.b
+                           ->  Subquery Scan on aa
+                                 Output: (SubPlan 3)
+                                 Filter: ((SubPlan 4) < '01-01-2010'::date)
+                                 ->  Aggregate
+                                       Output: max(1)
+                                       ->  Result
+                                 SubPlan 3
+                                   ->  Result
+                                         Output: extra_flow_dist_2.c
+                                         Filter: (extra_flow_dist_2.b = aa.x)
+                                         ->  Materialize
+                                               Output: extra_flow_dist_2.c, extra_flow_dist_2.b
+                                               ->  Broadcast Motion 3:3  (slice4; segments: 3)
+                                                     Output: extra_flow_dist_2.c, extra_flow_dist_2.b
+                                                     ->  Seq Scan on subselect_gp.extra_flow_dist extra_flow_dist_2
+                                                           Output: extra_flow_dist_2.c, extra_flow_dist_2.b
+                                 SubPlan 4
+                                   ->  Result
+                                         Output: extra_flow_dist_3.c
+                                         Filter: (extra_flow_dist_3.b = aa.x)
+                                         ->  Materialize
+                                               Output: extra_flow_dist_3.c, extra_flow_dist_3.b
+                                               ->  Broadcast Motion 3:3  (slice5; segments: 3)
+                                                     Output: extra_flow_dist_3.c, extra_flow_dist_3.b
+                                                     ->  Seq Scan on subselect_gp.extra_flow_dist extra_flow_dist_3
+                                                           Output: extra_flow_dist_3.c, extra_flow_dist_3.b
+ Optimizer: Postgres-based planner
+ Settings: optimizer_enable_coordinator_only_queries = 'on', optimizer_enable_master_only_queries = 'on'
+(66 rows)
+
+-- Check DISTINCT ON clause and ORDER BY clause in SubLink, See https://github.com/greenplum-db/gpdb/issues/12656.
+-- For EXISTS SubLink, we don’t need to care about the data deduplication problem, we can delete DISTINCT ON clause and
+-- ORDER BY clause with confidence, because we only care about whether the data exists.
+-- But for ANY SubLink, wo can't do this, because we not only care about the existence of data, but also the content of
+-- the data.
+create table issue_12656 (
+    i int,
+    j int
+) distributed by (i);
+insert into issue_12656 values (1, 10001), (1, 10002);
+-- case 1, check basic DISTINCT ON
+explain (costs off, verbose)
+select * from issue_12656 where (i, j) in (select distinct on (i) i, j from issue_12656);
+                                          QUERY PLAN                                          
+----------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Output: issue_12656.i, issue_12656.j
+   ->  Hash Join
+         Output: issue_12656.i, issue_12656.j
+         Inner Unique: true
+         Hash Cond: ((issue_12656.i = issue_12656_1.i) AND (issue_12656.j = issue_12656_1.j))
+         ->  Seq Scan on subselect_gp.issue_12656
+               Output: issue_12656.i, issue_12656.j
+         ->  Hash
+               Output: issue_12656_1.i, issue_12656_1.j
+               ->  Unique
+                     Output: issue_12656_1.i, issue_12656_1.j
+                     Group Key: issue_12656_1.i
+                     ->  Sort
+                           Output: issue_12656_1.i, issue_12656_1.j
+                           Sort Key: issue_12656_1.i
+                           ->  Seq Scan on subselect_gp.issue_12656 issue_12656_1
+                                 Output: issue_12656_1.i, issue_12656_1.j
+ Optimizer: Postgres query optimizer
+ Settings: optimizer=off
+(20 rows)
+
+select * from issue_12656 where (i, j) in (select distinct on (i) i, j from issue_12656);
+ i |   j   
+---+-------
+ 1 | 10001
+(1 row)
+
+-- case 2, check DISTINCT ON and ORDER BY
+explain (costs off, verbose)
+select * from issue_12656 where (i, j) in (select distinct on (i) i, j from issue_12656 order by i, j asc);
+                                          QUERY PLAN                                          
+----------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Output: issue_12656.i, issue_12656.j
+   ->  Hash Join
+         Output: issue_12656.i, issue_12656.j
+         Inner Unique: true
+         Hash Cond: ((issue_12656.i = issue_12656_1.i) AND (issue_12656.j = issue_12656_1.j))
+         ->  Seq Scan on subselect_gp.issue_12656
+               Output: issue_12656.i, issue_12656.j
+         ->  Hash
+               Output: issue_12656_1.i, issue_12656_1.j
+               ->  Unique
+                     Output: issue_12656_1.i, issue_12656_1.j
+                     Group Key: issue_12656_1.i
+                     ->  Sort
+                           Output: issue_12656_1.i, issue_12656_1.j
+                           Sort Key: issue_12656_1.i, issue_12656_1.j
+                           ->  Seq Scan on subselect_gp.issue_12656 issue_12656_1
+                                 Output: issue_12656_1.i, issue_12656_1.j
+ Optimizer: Postgres query optimizer
+ Settings: optimizer=off
+(20 rows)
+
+select * from issue_12656 where (i, j) in (select distinct on (i) i, j from issue_12656 order by i, j asc);
+ i |   j   
+---+-------
+ 1 | 10001
+(1 row)
+
+explain (costs off, verbose)
+select * from issue_12656 where (i, j) in (select distinct on (i) i, j from issue_12656 order by i, j desc);
+                                          QUERY PLAN                                          
+----------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Output: issue_12656.i, issue_12656.j
+   ->  Hash Join
+         Output: issue_12656.i, issue_12656.j
+         Inner Unique: true
+         Hash Cond: ((issue_12656.i = issue_12656_1.i) AND (issue_12656.j = issue_12656_1.j))
+         ->  Seq Scan on subselect_gp.issue_12656
+               Output: issue_12656.i, issue_12656.j
+         ->  Hash
+               Output: issue_12656_1.i, issue_12656_1.j
+               ->  Unique
+                     Output: issue_12656_1.i, issue_12656_1.j
+                     Group Key: issue_12656_1.i
+                     ->  Sort
+                           Output: issue_12656_1.i, issue_12656_1.j
+                           Sort Key: issue_12656_1.i, issue_12656_1.j DESC
+                           ->  Seq Scan on subselect_gp.issue_12656 issue_12656_1
+                                 Output: issue_12656_1.i, issue_12656_1.j
+ Optimizer: Postgres query optimizer
+ Settings: optimizer=off
+(20 rows)
+
+select * from issue_12656 where (i, j) in (select distinct on (i) i, j from issue_12656 order by i, j desc);
+ i |   j   
+---+-------
+ 1 | 10002
+(1 row)
+
+-- case 3, check correlated DISTINCT ON
+explain select * from issue_12656 a where (i, j) in
+(select distinct on (i) i, j from issue_12656 b where a.i=b.i order by i, j asc);
+                                                         QUERY PLAN                                                         
+----------------------------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)  (cost=0.00..895.00 rows=43050 width=8)
+   ->  Seq Scan on issue_12656 a  (cost=0.00..321.00 rows=14350 width=8)
+         Filter: (SubPlan 1)
+         SubPlan 1
+           ->  Unique  (cost=9818.00..10033.25 rows=1000 width=8)
+                 ->  Sort  (cost=9818.00..10033.25 rows=86100 width=8)
+                       Sort Key: b.j
+                       ->  Result  (cost=0.00..2760.50 rows=86100 width=8)
+                             Filter: (a.i = b.i)
+                             ->  Materialize  (cost=0.00..1899.50 rows=86100 width=8)
+                                   ->  Broadcast Motion 3:3  (slice2; segments: 3)  (cost=0.00..1469.00 rows=86100 width=8)
+                                         ->  Seq Scan on issue_12656 b  (cost=0.00..321.00 rows=28700 width=8)
+ Optimizer: Postgres query optimizer
+(13 rows)
+
+select * from issue_12656 a where (i, j) in
+(select distinct on (i) i, j from issue_12656 b where a.i=b.i order by i, j asc);
+ i |   j   
+---+-------
+ 1 | 10001
+(1 row)
+
+---
+--- Test param info is preserved when bringing a path to OuterQuery locus
+---
+drop table if exists param_t;
+NOTICE:  table "param_t" does not exist, skipping
+create table param_t (i int, j int);
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column named 'i' as the Greenplum Database data distribution key for this table.
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
+insert into param_t select i, i from generate_series(1,10)i;
+analyze param_t;
+explain (costs off)
+select * from param_t a where a.i in
+	(select count(b.j) from param_t b, param_t c,
+		lateral (select * from param_t d where d.j = c.j limit 10) s
+	where s.i = a.i
+	);
+                                                QUERY PLAN                                                 
+-----------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Seq Scan on param_t a
+         Filter: (SubPlan 1)
+         SubPlan 1
+           ->  Aggregate
+                 ->  Nested Loop
+                       ->  Nested Loop
+                             ->  Materialize
+                                   ->  Broadcast Motion 3:3  (slice2; segments: 3)
+                                         ->  Seq Scan on param_t c
+                             ->  Materialize
+                                   ->  Result
+                                         Filter: (d.i = a.i)
+                                         ->  Limit
+                                               ->  Result
+                                                     Filter: (d.j = c.j)
+                                                     ->  Materialize
+                                                           ->  Broadcast Motion 3:3  (slice3; segments: 3)
+                                                                 ->  Seq Scan on param_t d
+                       ->  Materialize
+                             ->  Broadcast Motion 3:3  (slice4; segments: 3)
+                                   ->  Seq Scan on param_t b
+ Optimizer: Postgres query optimizer
+(23 rows)
+
+select * from param_t a where a.i in
+	(select count(b.j) from param_t b, param_t c,
+		lateral (select * from param_t d where d.j = c.j limit 10) s
+	where s.i = a.i
+	);
+ i  | j  
+----+----
+ 10 | 10
+(1 row)
+
+drop table if exists param_t;
+-- A guard test case for gpexpand's populate SQL
+-- Some simple notes and background is: we want to compute
+-- table size efficiently, it is better to avoid invoke
+-- pg_relation_size() in serial on QD, since this function
+-- will dispatch for each tuple. The bad pattern SQL is like
+--   select pg_relation_size(oid) from pg_class where xxx
+-- The idea is force pg_relations_size is evaluated on each
+-- segment and the sum the result together to get the final
+-- result. To make sure correctness, we have to evaluate
+-- pg_relation_size before any motion. The skill here is
+-- to wrap this in a subquery, due to volatile of pg_relation_size,
+-- this subquery won't be pulled up. Plus the skill of
+-- gp_dist_random('pg_class') we can achieve this goal.
+-- the below test is to verify the plan, we should see pg_relation_size
+-- is evaludated on each segment and then motion then sum together. The
+-- SQL pattern is a catalog join a table size "dict".
+set gp_enable_multiphase_agg = on;
+-- force nestloop join to make test stable since we
+-- are testing plan and do not care about where we
+-- put hash table.
+set enable_hashjoin = off;
+set enable_nestloop = on;
+set enable_indexscan = off;
+set enable_bitmapscan = off;
+explain (verbose on, costs off)
+with cte(table_oid, size) as
+(
+   select
+     table_oid,
+     sum(size) size
+   from (
+     select oid,
+          pg_relation_size(oid)
+     from gp_dist_random('pg_class')
+   ) x(table_oid, size)
+  group by table_oid
+)
+select pc.relname, ts.size
+from pg_class pc, cte ts
+where pc.oid = ts.table_oid;
+                                                   QUERY PLAN                                                   
+----------------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Output: pc.relname, (sum((pg_relation_size((pg_class.oid)::regclass, 'main'::text))))
+   ->  Nested Loop
+         Output: pc.relname, (sum((pg_relation_size((pg_class.oid)::regclass, 'main'::text))))
+         Join Filter: (pc.oid = pg_class.oid)
+         ->  Redistribute Motion 1:3  (slice2)
+               Output: pc.relname, pc.oid
+               Hash Key: pc.oid
+               ->  Seq Scan on pg_catalog.pg_class pc
+                     Output: pc.relname, pc.oid
+         ->  Materialize
+               Output: pg_class.oid, (sum((pg_relation_size((pg_class.oid)::regclass, 'main'::text))))
+               ->  HashAggregate
+                     Output: pg_class.oid, sum((pg_relation_size((pg_class.oid)::regclass, 'main'::text)))
+                     Group Key: pg_class.oid
+                     ->  Redistribute Motion 3:3  (slice3; segments: 3)
+                           Output: pg_class.oid, (pg_relation_size((pg_class.oid)::regclass, 'main'::text))
+                           Hash Key: pg_class.oid
+                           ->  Seq Scan on pg_catalog.pg_class
+                                 Output: pg_class.oid, pg_relation_size((pg_class.oid)::regclass, 'main'::text)
+ Optimizer: Postgres query optimizer
+(21 rows)
+
+set gp_enable_multiphase_agg = off;
+explain (verbose on, costs off)
+with cte(table_oid, size) as
+(
+   select
+     table_oid,
+     sum(size) size
+   from (
+     select oid,
+          pg_relation_size(oid)
+     from gp_dist_random('pg_class')
+   ) x(table_oid, size)
+  group by table_oid
+)
+select pc.relname, ts.size
+from pg_class pc, cte ts
+where pc.oid = ts.table_oid;
+                                                   QUERY PLAN                                                   
+----------------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Output: pc.relname, (sum((pg_relation_size((pg_class.oid)::regclass, 'main'::text))))
+   ->  Nested Loop
+         Output: pc.relname, (sum((pg_relation_size((pg_class.oid)::regclass, 'main'::text))))
+         Join Filter: (pc.oid = pg_class.oid)
+         ->  Redistribute Motion 1:3  (slice2)
+               Output: pc.relname, pc.oid
+               Hash Key: pc.oid
+               ->  Seq Scan on pg_catalog.pg_class pc
+                     Output: pc.relname, pc.oid
+         ->  Materialize
+               Output: pg_class.oid, (sum((pg_relation_size((pg_class.oid)::regclass, 'main'::text))))
+               ->  HashAggregate
+                     Output: pg_class.oid, sum((pg_relation_size((pg_class.oid)::regclass, 'main'::text)))
+                     Group Key: pg_class.oid
+                     ->  Redistribute Motion 3:3  (slice3; segments: 3)
+                           Output: pg_class.oid, (pg_relation_size((pg_class.oid)::regclass, 'main'::text))
+                           Hash Key: pg_class.oid
+                           ->  Seq Scan on pg_catalog.pg_class
+                                 Output: pg_class.oid, pg_relation_size((pg_class.oid)::regclass, 'main'::text)
+ Optimizer: Postgres query optimizer
+(21 rows)
+
+reset gp_enable_multiphase_agg;
+reset enable_hashjoin;
+reset enable_nestloop;
+reset enable_indexscan;
+reset enable_bitmapscan;
+create table sublink_outer_table(a int, b int) distributed by(b);
+create table sublink_inner_table(x int, y bigint) distributed by(y);
+set optimizer to off;
+explain select t.* from sublink_outer_table t join (select y ,10*avg(x) s from sublink_inner_table group by y) RR on RR.y = t.b and t.a > rr.s;
+                                            QUERY PLAN                                            
+--------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)  (cost=436.00..1310.77 rows=28700 width=8)
+   ->  Hash Join  (cost=436.00..928.11 rows=9567 width=8)
+         Hash Cond: (t.b = sublink_inner_table.y)
+         Join Filter: ((t.a)::numeric > (('10'::numeric * avg(sublink_inner_table.x))))
+         ->  Seq Scan on sublink_outer_table t  (cost=0.00..321.00 rows=28700 width=8)
+         ->  Hash  (cost=431.83..431.83 rows=333 width=40)
+               ->  HashAggregate  (cost=423.50..428.50 rows=333 width=40)
+                     Group Key: sublink_inner_table.y
+                     ->  Seq Scan on sublink_inner_table  (cost=0.00..293.67 rows=25967 width=12)
+ Optimizer: Postgres query optimizer
+(10 rows)
+
+explain select * from sublink_outer_table T where a > (select 10*avg(x) from sublink_inner_table R where T.b=R.y);
+                                                QUERY PLAN                                                
+----------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)  (cost=436.00..1310.77 rows=28700 width=8)
+   ->  Hash Join  (cost=436.00..928.11 rows=9567 width=8)
+         Hash Cond: (t.b = "Expr_SUBQUERY".csq_c0)
+         Join Filter: ((t.a)::numeric > "Expr_SUBQUERY".csq_c1)
+         ->  Seq Scan on sublink_outer_table t  (cost=0.00..321.00 rows=28700 width=8)
+         ->  Hash  (cost=431.83..431.83 rows=333 width=40)
+               ->  Subquery Scan on "Expr_SUBQUERY"  (cost=423.50..431.83 rows=333 width=40)
+                     ->  HashAggregate  (cost=423.50..428.50 rows=333 width=40)
+                           Group Key: r.y
+                           ->  Seq Scan on sublink_inner_table r  (cost=0.00..293.67 rows=25967 width=12)
+ Optimizer: Postgres query optimizer
+(11 rows)
+
+set enable_hashagg to off;
+explain select t.* from sublink_outer_table t join (select y ,10*avg(x) s from sublink_inner_table group by y) RR on RR.y = t.b and t.a > rr.s;
+                                               QUERY PLAN                                               
+--------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)  (cost=2404.84..3279.62 rows=28700 width=8)
+   ->  Hash Join  (cost=2404.84..2896.95 rows=9567 width=8)
+         Hash Cond: (t.b = sublink_inner_table.y)
+         Join Filter: ((t.a)::numeric > (('10'::numeric * avg(sublink_inner_table.x))))
+         ->  Seq Scan on sublink_outer_table t  (cost=0.00..321.00 rows=28700 width=8)
+         ->  Hash  (cost=2400.67..2400.67 rows=333 width=40)
+               ->  GroupAggregate  (cost=2197.59..2397.34 rows=333 width=40)
+                     Group Key: sublink_inner_table.y
+                     ->  Sort  (cost=2197.59..2262.51 rows=25967 width=12)
+                           Sort Key: sublink_inner_table.y
+                           ->  Seq Scan on sublink_inner_table  (cost=0.00..293.67 rows=25967 width=12)
+ Optimizer: Postgres query optimizer
+(12 rows)
+
+explain select * from sublink_outer_table T where a > (select 10*avg(x) from sublink_inner_table R where T.b=R.y);
+                                                   QUERY PLAN                                                   
+----------------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)  (cost=2404.84..3279.62 rows=28700 width=8)
+   ->  Hash Join  (cost=2404.84..2896.95 rows=9567 width=8)
+         Hash Cond: (t.b = "Expr_SUBQUERY".csq_c0)
+         Join Filter: ((t.a)::numeric > "Expr_SUBQUERY".csq_c1)
+         ->  Seq Scan on sublink_outer_table t  (cost=0.00..321.00 rows=28700 width=8)
+         ->  Hash  (cost=2400.67..2400.67 rows=333 width=40)
+               ->  Subquery Scan on "Expr_SUBQUERY"  (cost=2197.59..2400.67 rows=333 width=40)
+                     ->  GroupAggregate  (cost=2197.59..2397.34 rows=333 width=40)
+                           Group Key: r.y
+                           ->  Sort  (cost=2197.59..2262.51 rows=25967 width=12)
+                                 Sort Key: r.y
+                                 ->  Seq Scan on sublink_inner_table r  (cost=0.00..293.67 rows=25967 width=12)
+ Optimizer: Postgres query optimizer
+(13 rows)
+
+drop table sublink_outer_table;
+drop table sublink_inner_table;
+reset optimizer;
+reset enable_hashagg;
+-- Ensure sub-queries with order by outer reference can be decorrelated and executed correctly.
+create table r(a int, b int, c int) distributed by (a);
+create table s(a int, b int, c int) distributed by (a);
+insert into r values (1,2,3);
+insert into s values (1,2,10);
+explain (costs off) select * from r where b in (select b from s where c=10 order by r.c);
+                          QUERY PLAN                           
+---------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Hash Semi Join
+         Hash Cond: (r.b = s.b)
+         ->  Seq Scan on r
+         ->  Hash
+               ->  Broadcast Motion 3:3  (slice2; segments: 3)
+                     ->  Seq Scan on s
+                           Filter: (c = 10)
+ Optimizer: Postgres query optimizer
+(9 rows)
+
+select * from r where b in (select b from s where c=10 order by r.c);
+ a | b | c 
+---+---+---
+ 1 | 2 | 3
+(1 row)
+
+explain (costs off) select * from r where b in (select b from s where c=10 order by r.c limit 2);
+                                 QUERY PLAN                                  
+-----------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Seq Scan on r
+         Filter: (SubPlan 1)
+         SubPlan 1
+           ->  Limit
+                 ->  Result
+                       ->  Materialize
+                             ->  Broadcast Motion 3:3  (slice2; segments: 3)
+                                   ->  Seq Scan on s
+                                         Filter: (c = 10)
+ Optimizer: Postgres query optimizer
+(11 rows)
+
+select * from r where b in (select b from s where c=10 order by r.c limit 2);
+ a | b | c 
+---+---+---
+ 1 | 2 | 3
+(1 row)
+
+explain (costs off) select * from r where b in (select b from s where c=10 order by r.c, b);
+                          QUERY PLAN                           
+---------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Hash Semi Join
+         Hash Cond: (r.b = s.b)
+         ->  Seq Scan on r
+         ->  Hash
+               ->  Broadcast Motion 3:3  (slice2; segments: 3)
+                     ->  Seq Scan on s
+                           Filter: (c = 10)
+ Optimizer: Postgres query optimizer
+(9 rows)
+
+select * from r where b in (select b from s where c=10 order by r.c, b);
+ a | b | c 
+---+---+---
+ 1 | 2 | 3
+(1 row)
+
+explain (costs off) select * from r where b in (select b from s where c=10 order by r.c, b limit 2);
+                                    QUERY PLAN                                     
+-----------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Seq Scan on r
+         Filter: (SubPlan 1)
+         SubPlan 1
+           ->  Limit
+                 ->  Sort
+                       Sort Key: s.b
+                       ->  Result
+                             ->  Materialize
+                                   ->  Broadcast Motion 3:3  (slice2; segments: 3)
+                                         ->  Seq Scan on s
+                                               Filter: (c = 10)
+ Optimizer: Postgres query optimizer
+(13 rows)
+
+select * from r where b in (select b from s where c=10 order by r.c, b limit 2);
+ a | b | c 
+---+---+---
+ 1 | 2 | 3
+(1 row)
+
+explain (costs off) select * from r where b in (select b from s where c=10 order by c);
+                          QUERY PLAN                           
+---------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Hash Semi Join
+         Hash Cond: (r.b = s.b)
+         ->  Seq Scan on r
+         ->  Hash
+               ->  Broadcast Motion 3:3  (slice2; segments: 3)
+                     ->  Seq Scan on s
+                           Filter: (c = 10)
+ Optimizer: Postgres query optimizer
+(9 rows)
+
+select * from r where b in (select b from s where c=10 order by c);
+ a | b | c 
+---+---+---
+ 1 | 2 | 3
+(1 row)
+
+explain (costs off) select * from r where b in (select b from s where c=10 order by c limit 2);
+                                  QUERY PLAN                                  
+------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Hash Semi Join
+         Hash Cond: (r.b = "ANY_subquery".b)
+         ->  Seq Scan on r
+         ->  Hash
+               ->  Broadcast Motion 1:3  (slice2; segments: 1)
+                     ->  Subquery Scan on "ANY_subquery"
+                           ->  Limit
+                                 ->  Gather Motion 3:1  (slice3; segments: 3)
+                                       ->  Limit
+                                             ->  Seq Scan on s
+                                                   Filter: (c = 10)
+ Optimizer: Postgres query optimizer
+(13 rows)
+
+select * from r where b in (select b from s where c=10 order by c limit 2);
+ a | b | c 
+---+---+---
+ 1 | 2 | 3
+(1 row)
+
+-- Test nested query with aggregate inside a sublink,
+-- ORCA should correctly normalize the aggregate expression inside the
+-- sublink's nested query and the column variable accessed in aggregate should
+-- be accessible to the aggregate after the normalization of query.
+-- If the query is not supported, ORCA should gracefully fallback to postgres
+explain (COSTS OFF) with t0 AS (
+    SELECT
+       ROW_TO_JSON((SELECT x FROM (SELECT max(t.b)) x))
+       AS c
+    FROM r
+        JOIN s ON true
+        JOIN s as t ON  true
+   )
+SELECT c FROM t0;
+                                      QUERY PLAN                                       
+---------------------------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Nested Loop
+                     ->  Broadcast Motion 3:3  (slice2; segments: 3)
+                           ->  Nested Loop
+                                 ->  Seq Scan on r
+                                 ->  Materialize
+                                       ->  Broadcast Motion 3:3  (slice3; segments: 3)
+                                             ->  Seq Scan on s
+                     ->  Materialize
+                           ->  Seq Scan on s t
+   SubPlan 1
+     ->  Result
+ Optimizer: Postgres-based planner
+(15 rows)
+
+-- Test push predicate into subquery
+-- more details could be found at https://github.com/greenplum-db/gpdb/issues/8429
+CREATE TABLE foo_predicate_pushdown (a int, b  int);
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column named 'a' as the Greenplum Database data distribution key for this table.
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
+CREATE TABLE bar_predicate_pushdown (c int, d int);
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column named 'c' as the Greenplum Database data distribution key for this table.
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
+explain (costs off) select * from (   
+ select distinct (select bar.c from bar_predicate_pushdown bar where c = foo.b) as ss from foo_predicate_pushdown foo
+) ABC where ABC.ss = 5;
+                                         QUERY PLAN                                         
+--------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Merge Key: ((SubPlan 1))
+   ->  Unique
+         Group Key: ((SubPlan 1))
+         ->  Sort
+               Sort Key: ((SubPlan 1))
+               ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                     Hash Key: ((SubPlan 1))
+                     ->  Seq Scan on foo_predicate_pushdown foo
+                           Filter: ((SubPlan 2) = 5)
+                           SubPlan 1
+                             ->  Result
+                                   Filter: (bar.c = foo.b)
+                                   ->  Materialize
+                                         ->  Broadcast Motion 3:3  (slice3; segments: 3)
+                                               ->  Seq Scan on bar_predicate_pushdown bar
+                           SubPlan 2
+                             ->  Result
+                                   Filter: (bar_1.c = foo.b)
+                                   ->  Materialize
+                                         ->  Broadcast Motion 3:3  (slice4; segments: 3)
+                                               ->  Seq Scan on bar_predicate_pushdown bar_1
+ Optimizer: Postgres-based planner
+(23 rows)
+
+DROP TABLE foo_predicate_pushdown;
+DROP TABLE bar_predicate_pushdown;
+--
+-- Test case for ORCA semi join with random table
+-- See https://github.com/greenplum-db/gpdb/issues/16611
+--
+--- case for random distribute 
+create table table_left (l1 int, l2 int) distributed by (l1);
+create table table_right (r1 int, r2 int) distributed randomly;
+create index table_right_idx on table_right(r1);
+insert into table_left values (1,1);
+insert into table_right select i, i from generate_series(1, 300) i;
+insert into table_right select 1, 1 from generate_series(1, 100) i;
+--- make sure the same value (1,1) rows are inserted into different segments
+select count(distinct gp_segment_id) > 1 from table_right where r1 = 1;
+ ?column? 
+----------
+ t
+(1 row)
+
+analyze table_left;
+analyze table_right;
+-- two types of semi join tests
+explain (costs off) select * from table_left where exists (select 1 from table_right where l1 = r1);
+                                QUERY PLAN                                 
+---------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  HashAggregate
+         Group Key: (RowIdExpr)
+         ->  Redistribute Motion 3:3  (slice2; segments: 3)
+               Hash Key: (RowIdExpr)
+               ->  Hash Join
+                     Hash Cond: (table_right.r1 = table_left.l1)
+                     ->  Seq Scan on table_right
+                     ->  Hash
+                           ->  Broadcast Motion 3:3  (slice3; segments: 3)
+                                 ->  Seq Scan on table_left
+ Optimizer: Postgres-based planner
+(12 rows)
+
+select * from table_left where exists (select 1 from table_right where l1 = r1);
+ l1 | l2 
+----+----
+  1 |  1
+(1 row)
+
+explain (costs off) select * from table_left where l1 in (select r1 from table_right);
+                                QUERY PLAN                                 
+---------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  HashAggregate
+         Group Key: (RowIdExpr)
+         ->  Redistribute Motion 3:3  (slice2; segments: 3)
+               Hash Key: (RowIdExpr)
+               ->  Hash Join
+                     Hash Cond: (table_right.r1 = table_left.l1)
+                     ->  Seq Scan on table_right
+                     ->  Hash
+                           ->  Broadcast Motion 3:3  (slice3; segments: 3)
+                                 ->  Seq Scan on table_left
+ Optimizer: Postgres-based planner
+(12 rows)
+
+select * from table_left where exists (select 1 from table_right where l1 = r1);
+ l1 | l2 
+----+----
+  1 |  1
+(1 row)
+
+--- case for replicate distribute
+alter table table_right set distributed replicated;
+explain (costs off) select * from table_left where exists (select 1 from table_right where l1 = r1);
+                     QUERY PLAN                      
+-----------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Hash Join
+         Hash Cond: (table_right.r1 = table_left.l1)
+         ->  HashAggregate
+               Group Key: table_right.r1
+               ->  Seq Scan on table_right
+         ->  Hash
+               ->  Seq Scan on table_left
+ Optimizer: Postgres-based planner
+(9 rows)
+
+select * from table_left where exists (select 1 from table_right where l1 = r1);
+ l1 | l2 
+----+----
+  1 |  1
+(1 row)
+
+explain (costs off) select * from table_left where l1 in (select r1 from table_right);
+                     QUERY PLAN                      
+-----------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Hash Join
+         Hash Cond: (table_right.r1 = table_left.l1)
+         ->  HashAggregate
+               Group Key: table_right.r1
+               ->  Seq Scan on table_right
+         ->  Hash
+               ->  Seq Scan on table_left
+ Optimizer: Postgres-based planner
+(9 rows)
+
+select * from table_left where exists (select 1 from table_right where l1 = r1);
+ l1 | l2 
+----+----
+  1 |  1
+(1 row)
+
+--- case for partition table with random distribute
+drop table table_right;
+create table table_right (r1 int, r2 int) distributed randomly partition by range (r1) ( start (0) end (300) every (100));
+create index table_right_idx on table_right(r1);
+insert into table_right select i, i from generate_series(1, 299) i;
+insert into table_right select 1, 1 from generate_series(1, 100) i;
+analyze table_right;
+explain (costs off) select * from table_left where exists (select 1 from table_right where l1 = r1);
+                                   QUERY PLAN                                    
+---------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  HashAggregate
+         Group Key: (RowIdExpr)
+         ->  Redistribute Motion 3:3  (slice2; segments: 3)
+               Hash Key: (RowIdExpr)
+               ->  Hash Join
+                     Hash Cond: (table_right_1_prt_1.r1 = table_left.l1)
+                     ->  Append
+                           Partition Selectors: $0
+                           ->  Seq Scan on table_right_1_prt_1
+                           ->  Seq Scan on table_right_1_prt_2
+                           ->  Seq Scan on table_right_1_prt_3
+                     ->  Hash
+                           ->  Partition Selector (selector id: $0)
+                                 ->  Broadcast Motion 3:3  (slice3; segments: 3)
+                                       ->  Seq Scan on table_left
+ Optimizer: Postgres-based planner
+(17 rows)
+
+select * from table_left where exists (select 1 from table_right where l1 = r1);
+ l1 | l2 
+----+----
+  1 |  1
+(1 row)
+
+explain (costs off) select * from table_left where l1 in (select r1 from table_right);
+                                   QUERY PLAN                                    
+---------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  HashAggregate
+         Group Key: (RowIdExpr)
+         ->  Redistribute Motion 3:3  (slice2; segments: 3)
+               Hash Key: (RowIdExpr)
+               ->  Hash Join
+                     Hash Cond: (table_right_1_prt_1.r1 = table_left.l1)
+                     ->  Append
+                           Partition Selectors: $0
+                           ->  Seq Scan on table_right_1_prt_1
+                           ->  Seq Scan on table_right_1_prt_2
+                           ->  Seq Scan on table_right_1_prt_3
+                     ->  Hash
+                           ->  Partition Selector (selector id: $0)
+                                 ->  Broadcast Motion 3:3  (slice3; segments: 3)
+                                       ->  Seq Scan on table_left
+ Optimizer: Postgres-based planner
+(17 rows)
+
+select * from table_left where exists (select 1 from table_right where l1 = r1);
+ l1 | l2 
+----+----
+  1 |  1
+(1 row)
+
+-- clean up
+drop table table_left;
+drop table table_right;
+-- test cross params of initplan
+-- https://github.com/greenplum-db/gpdb/issues/16268
+create table tmp (a varchar, b varchar, c varchar);
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column named 'a' as the Greenplum Database data distribution key for this table.
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
+select (SELECT EXISTS
+                 (SELECT
+                  FROM pg_views
+                  WHERE schemaname = a)) from tmp;
+ exists 
+--------
+(0 rows)
+
+drop table tmp;
+-- Test LEAST() and GREATEST() with an embedded subquery
+drop table if exists foo;
+create table foo (a int, b int) distributed by(a);
+insert into foo values (1, 2), (2, 3), (3, 4);
+analyze foo;
+explain (costs off) select foo.a from foo where foo.a <= LEAST(foo.b, (SELECT 1), NULL);
+                     QUERY PLAN                     
+----------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   InitPlan 1 (returns $0)  (slice2)
+     ->  Result
+   ->  Seq Scan on foo
+         Filter: (a <= LEAST(b, $0, NULL::integer))
+ Optimizer: Postgres-based planner
+(6 rows)
+
+select foo.a from foo where foo.a <= LEAST(foo.b, (SELECT 1), NULL);
+ a 
+---
+ 1
+(1 row)
+
+explain (costs off) select foo.a from foo where foo.a <= GREATEST(foo.b, (SELECT 1), NULL);
+                      QUERY PLAN                       
+-------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   InitPlan 1 (returns $0)  (slice2)
+     ->  Result
+   ->  Seq Scan on foo
+         Filter: (a <= GREATEST(b, $0, NULL::integer))
+ Optimizer: Postgres-based planner
+(6 rows)
+
+select foo.a from foo where foo.a <= GREATEST(foo.b, (SELECT 1), NULL);
+ a 
+---
+ 2
+ 3
+ 1
+(3 rows)
+
+explain (costs off) select least((select 5), greatest(b, NULL, (select 1)), a) from foo;
+                QUERY PLAN                
+------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   InitPlan 1 (returns $0)  (slice2)
+     ->  Result
+   InitPlan 2 (returns $1)  (slice3)
+     ->  Result
+   ->  Seq Scan on foo
+ Optimizer: Postgres-based planner
+(7 rows)
+
+select least((select 5), greatest(b, NULL, (select 1)), a) from foo;
+ least 
+-------
+     1
+     2
+     3
+(3 rows)
+
+drop table foo;
+-- Test subquery within ScalarArrayRef or ScalarArrayRefIndexList
+drop table if exists bar;
+create table bar (a int[], b int[][]) distributed by(a);
+insert into bar values (ARRAY[1, 2, 3], ARRAY[[1, 2, 3], [4, 5, 6]]);
+analyze bar;
+explain (costs off) select (select a from bar)[1] from bar;
+                    QUERY PLAN                    
+--------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   InitPlan 1 (returns $0)  (slice2)
+     ->  Gather Motion 3:1  (slice3; segments: 3)
+           ->  Seq Scan on bar bar_1
+   ->  Seq Scan on bar
+ Optimizer: Postgres-based planner
+(6 rows)
+
+select (select a from bar)[1] from bar;
+ a 
+---
+ 1
+(1 row)
+
+explain (costs off) select (select a from bar)[(select 1)] from bar;
+                    QUERY PLAN                    
+--------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   InitPlan 1 (returns $0)  (slice2)
+     ->  Result
+   InitPlan 2 (returns $1)  (slice3)
+     ->  Gather Motion 3:1  (slice4; segments: 3)
+           ->  Seq Scan on bar bar_1
+   ->  Seq Scan on bar
+ Optimizer: Postgres-based planner
+(8 rows)
+
+select (select a from bar)[(select 1)] from bar;
+ a 
+---
+ 1
+(1 row)
+
+explain (costs off) select (select b from bar)[1][1:3] from bar;
+                    QUERY PLAN                    
+--------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   InitPlan 1 (returns $0)  (slice2)
+     ->  Gather Motion 3:1  (slice3; segments: 3)
+           ->  Seq Scan on bar bar_1
+   ->  Seq Scan on bar
+ Optimizer: Postgres-based planner
+(6 rows)
+
+select (select b from bar)[1][1:3] from bar;
+     b     
+-----------
+ {{1,2,3}}
+(1 row)
+
+explain (costs off) select (select b from bar)[(select 1)][1:3] from bar;
+                    QUERY PLAN                    
+--------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   InitPlan 1 (returns $0)  (slice2)
+     ->  Result
+   InitPlan 2 (returns $1)  (slice3)
+     ->  Gather Motion 3:1  (slice4; segments: 3)
+           ->  Seq Scan on bar bar_1
+   ->  Seq Scan on bar
+ Optimizer: Postgres-based planner
+(8 rows)
+
+select (select b from bar)[(select 1)][1:3] from bar;
+     b     
+-----------
+ {{1,2,3}}
+(1 row)
+
+drop table bar;
+create table outer_foo(a int primary key, b int);
+create table inner_bar(a int, b int) distributed randomly;
+insert into outer_foo values (generate_series(1,20), generate_series(11,30));
+insert into inner_bar values (generate_series(1,20), generate_series(25,44));
+set optimizer to off;
+explain (costs off) select t1.a from outer_foo t1,  LATERAL(SELECT  distinct t2.a from inner_bar t2 where t1.b=t2.b) q order by 1;
+                               QUERY PLAN                               
+------------------------------------------------------------------------
+ Nested Loop
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         Merge Key: t1.a
+         ->  Index Scan using outer_foo_pkey on outer_foo t1
+   ->  Materialize
+         ->  HashAggregate
+               Group Key: t2.a
+               ->  Result
+                     Filter: (t1.b = t2.b)
+                     ->  Materialize
+                           ->  Gather Motion 3:1  (slice2; segments: 3)
+                                 ->  Seq Scan on inner_bar t2
+ Optimizer: Postgres-based planner
+(13 rows)
+
+explain (costs off) select t1.a from outer_foo t1,  LATERAL(SELECT  distinct t2.a from inner_bar t2 where t1.b=t2.b) q;
+                               QUERY PLAN                               
+------------------------------------------------------------------------
+ Nested Loop
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Seq Scan on outer_foo t1
+   ->  Materialize
+         ->  HashAggregate
+               Group Key: t2.a
+               ->  Result
+                     Filter: (t1.b = t2.b)
+                     ->  Materialize
+                           ->  Gather Motion 3:1  (slice2; segments: 3)
+                                 ->  Seq Scan on inner_bar t2
+ Optimizer: Postgres-based planner
+(12 rows)
+
+select t1.a from outer_foo t1,  LATERAL(SELECT  distinct t2.a from inner_bar t2 where t1.b=t2.b) q order by 1;
+ a  
+----
+ 15
+ 16
+ 17
+ 18
+ 19
+ 20
+(6 rows)
+
+create table t(a int, b int);
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column named 'a' as the Greenplum Database data distribution key for this table.
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
+explain (costs off) with cte(x) as (select t1.a from outer_foo t1, LATERAL(SELECT distinct t2.a from inner_bar t2 where t1.b=t2.b) q order by 1)
+select * from t where a > (select count(1) from cte where x > t.a + random());
+                                             QUERY PLAN                                              
+-----------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Seq Scan on t
+         Filter: (a > (SubPlan 1))
+         SubPlan 1
+           ->  Aggregate
+                 ->  Result
+                       Filter: ((t1.a)::double precision > ((t.a)::double precision + random()))
+                       ->  Nested Loop
+                             ->  Materialize
+                                   ->  Sort
+                                         Sort Key: t1.a
+                                         ->  Broadcast Motion 3:3  (slice2; segments: 3)
+                                               ->  Index Scan using outer_foo_pkey on outer_foo t1
+                             ->  Materialize
+                                   ->  HashAggregate
+                                         Group Key: t2.a
+                                         ->  Result
+                                               Filter: (t1.b = t2.b)
+                                               ->  Materialize
+                                                     ->  Broadcast Motion 3:3  (slice3; segments: 3)
+                                                           ->  Seq Scan on inner_bar t2
+ Optimizer: Postgres-based planner
+(22 rows)
+
+with cte(x) as (select t1.a from outer_foo t1, LATERAL(SELECT distinct t2.a from inner_bar t2 where t1.b=t2.b) q order by 1)
+select * from t where a > (select count(1) from cte where x > t.a + random());
+ a | b 
+---+---
+(0 rows)
+
+reset optimizer;
+drop table outer_foo;
+drop table inner_bar;
+drop table t;

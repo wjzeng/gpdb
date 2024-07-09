@@ -92,8 +92,6 @@ static void checkWellFormedRecursion(CteState *cstate);
 static bool checkWellFormedRecursionWalker(Node *node, CteState *cstate);
 static void checkWellFormedSelectStmt(SelectStmt *stmt, CteState *cstate);
 
-static void checkSelfRefInRangeSubSelect(SelectStmt *stmt, CteState *cstate);
-static void checkWindowFuncInRecursiveTerm(SelectStmt *stmt, CteState *cstate);
 
 /*
  * transformWithClause -
@@ -857,26 +855,6 @@ checkWellFormedRecursionWalker(Node *node, CteState *cstate)
 		else
 			checkWellFormedSelectStmt(stmt, cstate);
 
-		if (cstate->context == RECURSION_OK)
-		{
-			if (stmt->distinctClause)
-				ereport(ERROR,
-						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						 errmsg("DISTINCT in a recursive query is not implemented"),
-						 parser_errposition(cstate->pstate,
-											exprLocation((Node *) stmt->distinctClause))));
-			if (stmt->groupClause)
-				ereport(ERROR,
-						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						 errmsg("GROUP BY in a recursive query is not implemented"),
-						 parser_errposition(cstate->pstate,
-											exprLocation((Node *) stmt->groupClause))));
-
-			checkWindowFuncInRecursiveTerm(stmt, cstate);
-		}
-
-		checkSelfRefInRangeSubSelect(stmt, cstate);
-
 		/* We're done examining the SelectStmt */
 		return false;
 	}
@@ -944,19 +922,7 @@ checkWellFormedRecursionWalker(Node *node, CteState *cstate)
 		checkWellFormedRecursionWalker(sl->testexpr, cstate);
 		return false;
 	}
-	if (IsA(node, RangeSubselect))
-	{
-		RangeSubselect *rs = (RangeSubselect *) node;
 
-		/*
-		 * we intentionally override outer context, since subquery is
-		 * independent
-		 */
-		cstate->context = RECURSION_SUBLINK;
-		checkWellFormedRecursionWalker(rs->subquery, cstate);
-		cstate->context = save_context;
-		return false;
-	}
 	return raw_expression_tree_walker(node,
 									  checkWellFormedRecursionWalker,
 									  (void *) cstate);
@@ -1028,58 +994,6 @@ checkWellFormedSelectStmt(SelectStmt *stmt, CteState *cstate)
 			default:
 				elog(ERROR, "unrecognized set op: %d",
 					 (int) stmt->op);
-		}
-	}
-}
-
-/*
- * Check if a recursive cte is referred to in a RangeSubSelect's SelectStmt.
- * This is currently not supported and is checked for in the parsing stage
- */
-static void
-checkSelfRefInRangeSubSelect(SelectStmt *stmt, CteState *cstate)
-{
-	ListCell *lc;
-	RecursionContext cxt = cstate->context;
-
-	foreach(lc, stmt->fromClause)
-	{
-		if (IsA((Node *) lfirst(lc), RangeSubselect))
-		{
-			cstate->context = RECURSION_SUBLINK;
-			RangeSubselect *rs = (RangeSubselect *) lfirst(lc);
-			SelectStmt *subquery = (SelectStmt *) rs->subquery;
-			checkWellFormedSelectStmt(subquery, cstate);
-		}
-	}
-	cstate->context = cxt;
-}
-
-/*
- * Check if the recursive term of a recursive cte contains a window function.
- * This is currently not supported and is checked for in the parsing stage
- */
-static void
-checkWindowFuncInRecursiveTerm(SelectStmt *stmt, CteState *cstate)
-{
-	ListCell *lc;
-	foreach(lc, stmt->targetList)
-	{
-		if (IsA((Node *) lfirst(lc), ResTarget))
-		{
-			ResTarget *rt = (ResTarget *) lfirst(lc);
-			if (IsA(rt->val, FuncCall))
-			{
-				FuncCall *fc = (FuncCall *) rt->val;
-				if (fc->over != NULL)
-				{
-					ereport(ERROR,
-							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-							 errmsg("window functions in a recursive query is not implemented"),
-							 parser_errposition(cstate->pstate,
-												exprLocation((Node *) fc))));
-				}
-			}
 		}
 	}
 }

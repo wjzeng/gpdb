@@ -18,6 +18,7 @@
 #include "executor/execdesc.h"
 #include "utils/faultinjector.h"
 #include "utils/portal.h"
+#include "storage/latch.h"
 
 struct Port;
 struct QueryDesc;
@@ -46,11 +47,13 @@ typedef struct Gang
 
 extern int qe_identifier;
 
-extern int host_segments;
+extern int host_primary_segment_count;
 extern int ic_htab_size;
 
 extern MemoryContext GangContext;
 extern Gang *CurrentGangCreating;
+
+extern WaitEventSet *DispWaitSet;
 
 /*
  * cdbgang_createGang:
@@ -74,7 +77,7 @@ extern void RecycleGang(Gang *gp, bool forceDestroy);
 extern void DisconnectAndDestroyAllGangs(bool resetSession);
 extern void DisconnectAndDestroyUnusedQEs(void);
 
-extern void CheckForResetSession(void);
+extern void GpDropTempTables(void);
 extern void ResetAllGangs(void);
 
 extern struct SegmentDatabaseDescriptor *getSegmentDescriptorFromGang(const Gang *gp, int seg);
@@ -82,9 +85,12 @@ extern struct SegmentDatabaseDescriptor *getSegmentDescriptorFromGang(const Gang
 Gang *buildGangDefinition(List *segments, SegmentType segmentType);
 bool build_gpqeid_param(char *buf, int bufsz, bool is_writer, int identifier, int hostSegs, int icHtabSize);
 
-char *makeOptions(void);
+extern void makeOptions(char **options, char **diff_options);
 extern bool segment_failure_due_to_recovery(const char *error_message);
 extern bool segment_failure_due_to_missing_writer(const char *error_message);
+#ifdef FAULT_INJECTOR
+extern bool segment_failure_due_to_fault_injector(const char *error_message);
+#endif
 
 /*
  * cdbgang_parse_gpqeid_params
@@ -97,6 +103,8 @@ extern bool segment_failure_due_to_missing_writer(const char *error_message);
  * inherited from the postmaster; etc; so don't try to do too much in here.
  */
 extern void cdbgang_parse_gpqeid_params(struct Port *port, const char *gpqeid_value);
+
+extern void resetSessionForPrimaryGangLoss(void);
 
 /*
  * MPP Worker Process information
@@ -126,5 +134,8 @@ typedef struct CdbProcess
 } CdbProcess;
 
 typedef Gang *(*CreateGangFunc)(List *segments, SegmentType segmentType);
+
+extern Datum gp_backend_info(PG_FUNCTION_ARGS);
+extern void printCreateGangTime(int sliceId, Gang *gang);
 
 #endif   /* _CDBGANG_H_ */

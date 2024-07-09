@@ -161,7 +161,7 @@ retry:
 	else
 #endif
 #ifdef ENABLE_GSS
-	if (port->gss->enc)
+	if (port->gss && port->gss->enc)
 	{
 		n = be_gssapi_read(port, ptr, len);
 		waitfor = WL_SOCKET_READABLE;
@@ -236,8 +236,6 @@ secure_raw_read(Port *port, void *ptr, size_t len)
 {
 	ssize_t		n;
 
-	enable_client_wait_timeout_interrupt();
-
 	/*
 	 * Try to read from the socket without blocking. If it succeeds we're
 	 * done, otherwise we'll wait for the socket using the latch mechanism.
@@ -249,8 +247,6 @@ secure_raw_read(Port *port, void *ptr, size_t len)
 #ifdef WIN32
 	pgwin32_noblock = false;
 #endif
-
-	disable_client_wait_timeout_interrupt();
 
 	return n;
 }
@@ -278,7 +274,7 @@ retry:
 	else
 #endif
 #ifdef ENABLE_GSS
-	if (port->gss->enc)
+	if (port->gss && port->gss->enc)
 	{
 		n = be_gssapi_write(port, ptr, len);
 		waitfor = WL_SOCKET_WRITEABLE;

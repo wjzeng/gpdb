@@ -1,4 +1,10 @@
 -- SQL coverage of RESOURCE QUEUE
+-- start_ignore
+create extension if not exists gp_inject_fault;
+-- end_ignore
+
+-- check we have correct initial state of the default resource queue
+SELECT rqc.* FROM pg_resqueuecapability rqc JOIN pg_resqueue rq ON rqc.resqueueid = rq.oid WHERE rq.rsqname = 'pg_default';
 
 CREATE RESOURCE QUEUE regressq ACTIVE THRESHOLD 1;
 SELECT rsqname, rsqcountlimit, rsqcostlimit, rsqovercommit, rsqignorecostlimit FROM pg_resqueue WHERE rsqname='regressq';
@@ -95,6 +101,21 @@ create resource queue test_rq with (max_cost=2000000, memory_limit='0'); -- shou
 create resource queue test_rq with (active_statements=2);
 drop resource queue test_rq;
 create resource queue test_rq with (active_statements=2, memory_limit='1024MB');
+
+--
+-- CPU priority feature
+--
+create resource queue test_rq_cpu with (active_statements=2, priority='HIGH');
+create user test_rp_user with login;
+alter role test_rp_user resource queue test_rq_cpu;
+SET ROLE test_rp_user;
+-- query priority and weight on master
+select rqppriority, rqpweight from gp_toolkit.gp_resq_priority_backend where rqpsession in (select sess_id from pg_stat_activity where pid  = pg_backend_pid());
+-- query priority and weight on segments
+select rqppriority, rqpweight from gp_dist_random('gp_toolkit.gp_resq_priority_backend') where rqpsession in (select sess_id from pg_stat_activity where pid  = pg_backend_pid());
+RESET ROLE;
+drop user test_rp_user;
+drop resource queue test_rq_cpu;
 
 -- Alters
 
@@ -197,7 +218,7 @@ DROP RESOURCE QUEUE reg_activeq;
 DROP RESOURCE QUEUE reg_costq;
 
 -- catalog tests
-set optimizer_enable_master_only_queries = on;
+set optimizer_enable_coordinator_only_queries = on;
 select count(*)/1000 from
 (select
 (select ressetting from pg_resqueue_attributes b
@@ -226,7 +247,7 @@ where x.oid=y.rolresqueue and a.rsqname=x.rsqname) as "RQAssignedUsers"
 from ( select distinct rsqname from pg_resqueue_attributes ) a)
 as foo;
 
-reset optimizer_enable_master_only_queries;
+reset optimizer_enable_coordinator_only_queries;
 
 -- Followup additional tests.
 -- MPP-7474
@@ -378,3 +399,39 @@ DROP USER rq_test_u;
 DROP RESOURCE QUEUE rq_test_q;
 DROP TABLE rq_product;
 
+-- Coverage for resource queue error conditions
+CREATE ROLE rq_test_oosm_role;
+SET ROLE rq_test_oosm_role;
+CREATE TABLE rq_test_oosm_table(i int);
+INSERT INTO rq_test_oosm_table VALUES(1);
+-- Simulate an out-of-shared-memory condition during the course of grabbing a
+-- resource queue lock (in ResLockAcquire()).
+SELECT gp_inject_fault('res_increment_add_oosm', 'skip', 1);
+-- Queries should error out indicating that we have no shared memory left.
+SELECT * FROM rq_test_oosm_table;
+SELECT gp_inject_fault('res_increment_add_oosm', 'reset', 1);
+-- Queries should succeed now.
+SELECT * FROM rq_test_oosm_table;
+DROP TABLE rq_test_oosm_table;
+RESET ROLE;
+DROP ROLE rq_test_oosm_role;
+-- test for extended queries
+-- create a role that only use in this test will drop it later
+-- later we will use username to identify the backend process
+create role extend_protocol_requeue_role with login;
+
+-- start_matchsubs
+--
+-- m/NOTICE:  query requested \d+/
+-- s/NOTICE:  query requested \d+/NOTICE:  query requested XXX/g
+--
+-- m/NOTICE:  SPI memory reservation \d+/
+-- s/NOTICE:  SPI memory reservation \d+/NOTICE:  SPI memory reservation /g
+--
+-- end_matchsubs
+
+-- run query using non_superuser role so that it can be
+-- controled by resource queue
+\! ./extended_protocol_resqueue dbname=regression extend_protocol_requeue_role;
+
+drop role extend_protocol_requeue_role;

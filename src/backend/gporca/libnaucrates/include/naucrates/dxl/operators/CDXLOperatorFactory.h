@@ -20,6 +20,7 @@
 #include "gpos/base.h"
 #include "gpos/common/CDouble.h"
 
+#include "gpopt/hints/CJoinHint.h"
 #include "naucrates/base/IDatum.h"
 #include "naucrates/dxl/operators/CDXLColRef.h"
 #include "naucrates/dxl/operators/CDXLCtasStorageOptions.h"
@@ -41,7 +42,7 @@
 #include "naucrates/md/IMDIndex.h"
 
 // dynamic array of XML strings
-typedef CDynamicPtrArray<XMLCh, CleanupNULL> XMLChArray;
+using XMLChArray = CDynamicPtrArray<XMLCh, CleanupNULL>;
 
 // fwd decl
 namespace gpmd
@@ -133,10 +134,6 @@ public:
 	static CDXLPhysical *MakeDXLTblScan(CDXLMemoryManager *dxl_memory_manager,
 										const Attributes &attrs);
 
-	// create a subquery scan operator
-	static CDXLPhysical *MakeDXLSubqScan(CDXLMemoryManager *dxl_memory_manager,
-										 const Attributes &attrs);
-
 	// create a result operator
 	static CDXLPhysical *MakeDXLResult(CDXLMemoryManager *dxl_memory_manager);
 
@@ -212,6 +209,10 @@ public:
 	static CDXLScalar *MakeDXLOpExpr(CDXLMemoryManager *dxl_memory_manager,
 									 const Attributes &attrs);
 
+	// create a scalar Param
+	static CDXLScalar *MakeDXLScalarParam(CDXLMemoryManager *dxl_memory_manager,
+										  const Attributes &attrs);
+
 	// create a scalar ArrayComp
 	static CDXLScalar *MakeDXLArrayComp(CDXLMemoryManager *dxl_memory_manager,
 										const Attributes &attrs);
@@ -250,6 +251,10 @@ public:
 	// create a ArrayCoerceExpr
 	static CDXLScalar *MakeDXLArrayCoerceExpr(
 		CDXLMemoryManager *dxl_memory_manager, const Attributes &attrs);
+
+	// create a FieldSelectExpr
+	static CDXLScalar *MakeDXLFieldSelect(CDXLMemoryManager *dxl_memory_manager,
+										  const Attributes &attrs);
 
 	// create a scalar identifier operator
 	static CDXLScalar *MakeDXLScalarIdent(CDXLMemoryManager *dxl_memory_manager,
@@ -471,9 +476,10 @@ public:
 								  Edxltoken target_elem);
 
 	// parse a GPDB mdid object from an array of its components
-	static CMDIdGPDB *GetGPDBMdId(CDXLMemoryManager *dxl_memory_manager,
-								  XMLChArray *remaining_tokens,
-								  Edxltoken target_attr, Edxltoken target_elem);
+	static CMDIdGPDB *GetGPDBMdId(
+		CDXLMemoryManager *dxl_memory_manager, XMLChArray *remaining_tokens,
+		Edxltoken target_attr, Edxltoken target_elem,
+		IMDId::EMDIdType mdidType = IMDId::EmdidGeneral);
 
 	// parse a GPDB CTAS mdid object from an array of its components
 	static CMDIdGPDB *GetGPDBCTASMdId(CDXLMemoryManager *dxl_memory_manager,
@@ -522,6 +528,14 @@ public:
 		CDXLMemoryManager *dxl_memory_manager, const Attributes &attr,
 		Edxltoken target_attr, Edxltoken target_elem);
 
+	static IntPtrArray *ExtractConvertValuesToIntArray(
+		CDXLMemoryManager *dxl_memory_manager, const Attributes &attr,
+		Edxltoken target_attr, Edxltoken target_elem);
+
+	static CBitSet *ExtractConvertValuesToIntBitSet(
+		CDXLMemoryManager *dxl_memory_manager, const Attributes &attr,
+		Edxltoken target_attr, Edxltoken target_elem);
+
 	// parse a comma-separated list of integers numbers into a dynamic array
 	// will raise an exception if list is not well-formed
 	template <typename T, void (*CleanupFn)(T *),
@@ -550,6 +564,33 @@ public:
 			dxl_memory_manager, xmlszUl, target_attr, target_elem);
 	}
 
+	static CBitSet *
+	ExtractIntsToIntBitSet(CDXLMemoryManager *dxl_memory_manager,
+						   const XMLCh *mdid_list_xml, Edxltoken target_attr,
+						   Edxltoken target_elem)
+	{
+		// get the memory pool from the memory manager
+		CMemoryPool *mp = dxl_memory_manager->Pmp();
+
+		CBitSet *pbs = GPOS_NEW(mp) CBitSet(mp);
+
+		XMLStringTokenizer mdid_components(
+			mdid_list_xml, CDXLTokens::XmlstrToken(EdxltokenComma));
+		const ULONG num_tokens = mdid_components.countTokens();
+
+		for (ULONG ul = 0; ul < num_tokens; ul++)
+		{
+			XMLCh *xmlszNext = mdid_components.nextToken();
+			GPOS_ASSERT(nullptr != xmlszNext);
+
+			INT attno = ConvertAttrValueToInt(dxl_memory_manager, xmlszNext,
+											  target_attr, target_elem);
+			pbs->ExchangeSet(attno);
+		}
+
+		return pbs;
+	}
+
 	// parse a comma-separated list of CHAR partition types into a dynamic array.
 	// will raise an exception if list is not well-formed
 	static CharPtrArray *ExtractConvertPartitionTypeToArray(
@@ -573,6 +614,18 @@ public:
 	// will raise an exception if list is not well-formed
 	static StringPtrArray *ExtractConvertStrsToArray(
 		CDXLMemoryManager *dxl_memory_manager, const XMLCh *xml_val);
+
+	// parse a Leading join order hint into a JoinHint::JoinNode
+	static CJoinHint::JoinNode *ExtractConvertStrToJoinNode(
+		CDXLMemoryManager *dxl_memory_manager, const XMLCh *xml_val);
+
+	// parse a directed Leading join order hint into a JoinHint::JoinNode
+	static CJoinHint::JoinNode *ExtractConvertStrToDirectionedJoinNode(
+		CMemoryPool *mp, const XMLCh *xml_val);
+
+	// parse a non-directed Leading join order hint into a JoinHint::JoinNode
+	static CJoinHint::JoinNode *ExtractConvertStrToNonDirectionedJoinNode(
+		CMemoryPool *mp, const XMLCh *xml_val);
 
 	// parses the input and output segment ids from Xerces attributes and
 	// stores them in the provided DXL Motion operator
@@ -621,6 +674,12 @@ public:
 
 	// parse index type
 	static IMDIndex::EmdindexType ParseIndexType(const Attributes &attrs);
+
+	// parse a comma-separated boolean list into a ULong array
+	// will raise an exception if list is not well-formed
+	static ULongPtrArray *ExtractConvertBooleanListToULongArray(
+		CDXLMemoryManager *dxl_memory_manager, const XMLCh *xml_val,
+		const XMLCh *true_value, const XMLCh *false_value, ULONG num_of_keys);
 };
 
 // parse a comma-separated list of integers numbers into a dynamic array

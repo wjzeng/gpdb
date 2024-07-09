@@ -117,8 +117,8 @@ CTranslatorDXLToExprTest::Pexpr(CMemoryPool *mp, const CHAR *dxl_filename)
 	CQueryToDXLResult *ptroutput = CDXLUtils::ParseQueryToQueryDXLTree(
 		mp, szDXLExpected, nullptr /*xsd_file_path*/);
 
-	GPOS_ASSERT(nullptr != ptroutput->CreateDXLNode() &&
-				nullptr != ptroutput->GetOutputColumnsDXLArray());
+	GPOS_UNITTEST_ASSERT(nullptr != ptroutput->CreateDXLNode() &&
+						 nullptr != ptroutput->GetOutputColumnsDXLArray());
 
 	CMDAccessor *md_accessor = COptCtxt::PoctxtFromTLS()->Pmda();
 
@@ -170,7 +170,7 @@ CTranslatorDXLToExprTest::EresTranslateAndCheck(
 	// get the string representation of the Expr Tree
 	CWStringDynamic *pstrTranslated = Pstr(mp, pexprTranslated);
 
-	GPOS_ASSERT(nullptr != pstrExpected && nullptr != pstrTranslated);
+	GPOS_UNITTEST_ASSERT(nullptr != pstrExpected && nullptr != pstrTranslated);
 
 	CWStringDynamic str(mp);
 	COstreamString oss(&str);
@@ -211,7 +211,7 @@ CTranslatorDXLToExprTest::EresTranslateAndCheck(
 CWStringDynamic *
 CTranslatorDXLToExprTest::Pstr(CMemoryPool *mp, CExpression *pexpr)
 {
-	GPOS_ASSERT(nullptr != pexpr);
+	GPOS_UNITTEST_ASSERT(nullptr != pexpr);
 
 	CWStringDynamic str(mp);
 	COstreamString *poss = GPOS_NEW(mp) COstreamString(&str);
@@ -244,15 +244,19 @@ public:
 		CMDAccessor *md_accessor = COptCtxt::PoctxtFromTLS()->Pmda();
 		m_pmdtypeint4 =
 			md_accessor->PtMDType<IMDTypeInt4>(CTestUtils::m_sysidDefault);
-		CMDIdGPDB *mdid = GPOS_NEW(mp) CMDIdGPDB(oidTableOid, 1, 1);
+		CMDIdGPDB *mdid =
+			GPOS_NEW(mp) CMDIdGPDB(IMDId::EmdidRel, oidTableOid, 1, 1);
 
 		const BOOL convert_hash_to_random = false;
 		const ULONG ulExecuteAsUser = 0;
 		m_ptabdesc = GPOS_NEW(mp) CTableDescriptor(
 			mp, mdid, CName(&strTableName), convert_hash_to_random,
-			CMDRelationGPDB::EreldistrMasterOnly,
-			CMDRelationGPDB::ErelstorageHeap, ulExecuteAsUser,
-			-1 /* lockmode */);
+			CMDRelationGPDB::EreldistrCoordinatorOnly,
+			CMDRelationGPDB::ErelstorageHeap,
+			IMDRelation::GetCurrentAOVersion(), ulExecuteAsUser,
+			-1, /* lockmode */
+			2,	/* aclmode SELECT */
+			0 /* UNASSIGNED_QUERYID */);
 	}
 
 	void
@@ -404,7 +408,8 @@ CTranslatorDXLToExprTest::EresUnittest_SelectQuery()
 		// the output column references from the logical get
 		CColRefArray *colref_array = popGet->PdrgpcrOutput();
 
-		GPOS_ASSERT(nullptr != colref_array && 2 == colref_array->Size());
+		GPOS_UNITTEST_ASSERT(nullptr != colref_array &&
+							 2 == colref_array->Size());
 
 		CColRef *pcrLeft = (*colref_array)[0];
 		CColRef *pcrRight = (*colref_array)[1];
@@ -456,7 +461,8 @@ CTranslatorDXLToExprTest::EresUnittest_SelectQueryWithConst()
 
 		// the output column references from the logical get
 		CColRefArray *colref_array = popGet->PdrgpcrOutput();
-		GPOS_ASSERT(nullptr != colref_array && 2 == colref_array->Size());
+		GPOS_UNITTEST_ASSERT(nullptr != colref_array &&
+							 2 == colref_array->Size());
 
 		CColRef *pcrLeft = (*colref_array)[0];
 		ULONG ulVal = 5;
@@ -501,7 +507,8 @@ CTranslatorDXLToExprTest::EresUnittest_SelectQueryWithConstInList()
 
 		// the output column references from the logical get
 		CColRefArray *colref_array = popGet->PdrgpcrOutput();
-		GPOS_ASSERT(nullptr != colref_array && 2 == colref_array->Size());
+		GPOS_UNITTEST_ASSERT(nullptr != colref_array &&
+							 2 == colref_array->Size());
 
 		CColRef *colref = (*colref_array)[0];
 		ULONG ulVal1 = 5;
@@ -569,7 +576,8 @@ CTranslatorDXLToExprTest::EresUnittest_SelectQueryWithBoolExpr()
 		// the output column references from the logical get
 		CColRefArray *colref_array = popGet->PdrgpcrOutput();
 
-		GPOS_ASSERT(nullptr != colref_array && 2 == colref_array->Size());
+		GPOS_UNITTEST_ASSERT(nullptr != colref_array &&
+							 2 == colref_array->Size());
 
 		// create a scalar compare for a = 5
 		CColRef *pcrLeft = (*colref_array)[0];
@@ -636,7 +644,8 @@ CTranslatorDXLToExprTest::EresUnittest_SelectQueryWithScalarOp()
 		// the output column references from the logical get
 		CColRefArray *colref_array = popGet->PdrgpcrOutput();
 
-		GPOS_ASSERT(nullptr != colref_array && 2 == colref_array->Size());
+		GPOS_UNITTEST_ASSERT(nullptr != colref_array &&
+							 2 == colref_array->Size());
 
 		// create a scalar op (arithmetic) for b + 2
 		CColRef *pcrLeft = (*colref_array)[1];
@@ -645,13 +654,13 @@ CTranslatorDXLToExprTest::EresUnittest_SelectQueryWithScalarOp()
 		CExpression *pexprScConst = CUtils::PexprScalarConstInt4(mp, ulVal);
 		CExpression *pexprScOp = CUtils::PexprScalarOp(
 			mp, pcrLeft, pexprScConst, CWStringConst(GPOS_WSZ_LIT("+")),
-			GPOS_NEW(mp) CMDIdGPDB(GPDB_INT4_ADD_OP));
+			GPOS_NEW(mp) CMDIdGPDB(IMDId::EmdidGeneral, GPDB_INT4_ADD_OP));
 
 		// create a scalar compare for a > b + 2
 		CColRef *pcrRight = (*colref_array)[0];
 		CExpression *pexprScCmp = CUtils::PexprScalarCmp(
 			mp, pcrRight, pexprScOp, CWStringConst(GPOS_WSZ_LIT(">")),
-			GPOS_NEW(mp) CMDIdGPDB(GPDB_INT4_GT_OP));
+			GPOS_NEW(mp) CMDIdGPDB(IMDId::EmdidGeneral, GPDB_INT4_GT_OP));
 
 		CExpression *pexprExpected =
 			CUtils::PexprLogicalSelect(mp, pexprLgGet, pexprScCmp);
@@ -808,7 +817,7 @@ CTranslatorDXLToExprTest::EresUnittest_MetadataColumnMapping()
 		pActualGet->Ptabdesc()->Pdrgpcoldesc();
 	CColumnDescriptor *pColDesc = (*pDrgColDesc)[0];
 	bool actualNullable = pColDesc->IsNullable();
-	GPOS_RTL_ASSERT(actualNullable == false);
+	GPOS_UNITTEST_ASSERT(actualNullable == false);
 
 	return GPOS_OK;
 }

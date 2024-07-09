@@ -40,6 +40,7 @@
 #include "executor/executor.h"
 #include "executor/nodeWindowAgg.h"
 #include "miscadmin.h"
+#include "nodes/execnodes.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "parser/parse_agg.h"
@@ -48,6 +49,7 @@
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/datum.h"
+#include "utils/faultinjector.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/regproc.h"
@@ -268,7 +270,7 @@ initialize_windowaggregate(WindowAggState *winstate,
 								  peraggstate->distinctLtOper,
 								  peraggstate->distinctColl,
 								  false, /* nullsFirstFlag */
-								  work_mem,
+								  PlanStateOperatorMemKB((PlanState *) winstate),
 								  NULL, /* coordinate */
 								  false);
 	}
@@ -685,6 +687,24 @@ perform_distinct_windowaggregate(WindowAggState *winstate,
 
 	tuplesort_performsort(peraggstate->distinctSortState);
 
+#ifdef FAULT_INJECTOR
+	/*
+	 * This routine is used for tracing whether the sort operation of DISTINCT-qualified
+	 * WindowAgg spills to disk.
+	 */
+	if (SIMPLE_FAULT_INJECTOR("distinct_winagg_perform_sort") == FaultInjectorTypeSkip)
+	{
+		TuplesortInstrumentation sortstats;
+		tuplesort_get_stats(peraggstate->distinctSortState, &sortstats);
+		if (sortstats.spaceType == SORT_SPACE_TYPE_MEMORY)
+			ereport(NOTICE,
+					(errmsg("distinct winagg sortstats: sort operation fitted in memory")));
+		else
+			ereport(NOTICE,
+					(errmsg("distinct winagg sortstats: sort operation spilled to disk")));
+	}
+#endif
+
 	/* load the first tuple from spool */
 	if (tuplesort_getdatum(peraggstate->distinctSortState, true,
 						   &fcinfo->args[1].value, &fcinfo->args[1].isnull, NULL))
@@ -813,7 +833,7 @@ finalize_windowaggregate(WindowAggState *winstate,
 	 * If result is pass-by-ref, make sure it is in the right context.
 	 */
 	if (!peraggstate->resulttypeByVal && !*isnull &&
-		!MemoryContextContains(CurrentMemoryContext,
+		!MemoryContextContainsGenericAllocation(CurrentMemoryContext,
 							   DatumGetPointer(*result)))
 		*result = datumCopy(*result,
 							peraggstate->resulttypeByVal,
@@ -1296,13 +1316,8 @@ eval_windowfunction(WindowAggState *winstate, WindowStatePerFunc perfuncstate,
 	 * need this in case the function returns a pointer into some short-lived
 	 * tuple, as is entirely possible.)
 	 */
-	// GPDB_84_MERGE_FIXME: In upstream, we know that the allocation
-	// was palloc in some memory context, but in GPDB, that is not true.
-	// This is not actually 100% safe, there is a small chance
-	// MemoryContextContains() incorrectly says that the chunk is in the context,
-	// which could lead to a crash. nodeAgg.c has the same problem.
 	if (!perfuncstate->resulttypeByVal && !fcinfo->isnull &&
-		!MemoryContextContains(CurrentMemoryContext,
+		!MemoryContextContainsGenericAllocation(CurrentMemoryContext,
 							   DatumGetPointer(*result))
 		)
 		*result = datumCopy(*result,
@@ -1364,7 +1379,9 @@ begin_partition(WindowAggState *winstate)
 	}
 
 	/* Create new tuplestore for this partition */
-	winstate->buffer = tuplestore_begin_heap(false, false, work_mem);
+	winstate->buffer =
+		tuplestore_begin_heap(false, false,
+							  PlanStateOperatorMemKB((PlanState *) winstate));
 
 	/*
 	 * Set up read pointers for the tuplestore.  The current pointer doesn't
@@ -2429,6 +2446,34 @@ ExecWindowAgg(PlanState *pstate)
 	 * already
 	 */
 	spool_tuples(winstate, winstate->currentpos);
+
+#ifdef FAULT_INJECTOR
+	/*
+	 * This routine is used for testing if we have allocated enough memory
+	 * for the tuplestore (winstate->buffer) in begin_partition(). If all
+	 * tuples of the current partition can be fitted in the memory, we
+	 * emit a notice saying 'fitted in memory'. If they cannot be fitted in
+	 * the memory, we emit a notice saying 'spilled to disk'. If there're
+	 * no input rows, we emit a notice saying 'no input rows'.
+	 *
+	 * NOTE: The fault-injector only triggers once, we emit the notice when
+	 * we finishes spooling all the tuples of the first partition.
+	 */
+	if (winstate->partition_spooled &&
+		winstate->currentpos >= winstate->spooled_rows &&
+		SIMPLE_FAULT_INJECTOR("winagg_after_spool_tuples") == FaultInjectorTypeSkip)
+	{
+		if (winstate->buffer)
+		{
+			if (tuplestore_in_memory(winstate->buffer))
+				ereport(NOTICE, (errmsg("winagg: tuplestore fitted in memory")));
+			else
+				ereport(NOTICE, (errmsg("winagg: tuplestore spilled to disk")));
+		}
+		else
+			ereport(NOTICE, (errmsg("winagg: no input rows")));
+	}
+#endif
 
 	/* Move to the next partition if we reached the end of this partition */
 	if (winstate->partition_spooled &&

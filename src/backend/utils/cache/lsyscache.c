@@ -972,9 +972,36 @@ get_attnum(Oid relid, const char *attname)
 }
 
 /*
+ * get_attstattarget
+ *
+ *		Given the relation id and the attribute number,
+ *		return the "attstattarget" field from the attribute relation.
+ *
+ *		Errors if not found.
+ */
+int
+get_attstattarget(Oid relid, AttrNumber attnum)
+{
+	HeapTuple	tp;
+	Form_pg_attribute att_tup;
+	int			result;
+
+	tp = SearchSysCache2(ATTNUM,
+						 ObjectIdGetDatum(relid),
+						 Int16GetDatum(attnum));
+	if (!HeapTupleIsValid(tp))
+		elog(ERROR, "cache lookup failed for attribute %d of relation %u",
+			 attnum, relid);
+	att_tup = (Form_pg_attribute) GETSTRUCT(tp);
+	result = att_tup->attstattarget;
+	ReleaseSysCache(tp);
+	return result;
+}
+
+/*
  * get_attgenerated
  *
- *		Given the relation id and the attribute name,
+ *		Given the relation id and the attribute number,
  *		return the "attgenerated" field from the attribute relation.
  *
  *		Errors if not found.
@@ -1564,15 +1591,22 @@ get_oprjoin(Oid opno)
 /*				---------- TRIGGER CACHE ----------					 */
 
 
-/* Does table have update triggers? */
+/*
+ * Does table have update triggers?
+ *
+ * From Greenplum 7, the Postgres planner expands partitioned table's children,
+ * including directly and indirectly, and generates a plan for each child table,
+ * but ORCA doesn't do that.
+ *
+ * So having an extra parameter including_children only for ORCA.
+ */
 bool
-has_update_triggers(Oid relid)
+has_update_triggers(Oid relid, bool including_children)
 {
 	Relation	relation;
 	bool		result = false;
 
-	/* Assume the caller already holds a suitable lock. */
-	relation = table_open(relid, NoLock);
+	relation = RelationIdGetRelation(relid);
 
 	if (relation->rd_rel->relhastriggers)
 	{
@@ -1589,15 +1623,33 @@ has_update_triggers(Oid relid)
 				found = trigger_enabled(trigger.tgoid) &&
 					(get_trigger_type(trigger.tgoid) & TRIGGER_TYPE_UPDATE) == TRIGGER_TYPE_UPDATE;
 				if (found)
+				{
+					result = true;
 					break;
+				}
+			}
+		}
+	}
+
+	if (including_children && !result && relation->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
+	{
+		List	   *partitions = find_inheritance_children(relid, NoLock);
+		ListCell   *lc;
+
+		foreach(lc, partitions)
+		{
+			Oid			partrelid = lfirst_oid(lc);
+			if (has_update_triggers(partrelid, true))
+			{
+				result = true;
+				break;
 			}
 		}
 
-		/* GPDB_96_MERGE_FIXME: Why is this not allowed? */
-		if (found || child_triggers(relation->rd_id, TRIGGER_TYPE_UPDATE))
-			result = true;
+		list_free(partitions);
 	}
-	table_close(relation, NoLock);
+
+	RelationClose(relation);
 
 	return result;
 }
@@ -1827,6 +1879,31 @@ is_agg_ordered(Oid aggid)
 	ReleaseSysCache(aggTuple);
 
 	return AGGKIND_IS_ORDERED_SET(aggkind);
+}
+
+/*
+ * is_repsafe_agg
+ *		Given aggregate id, check if it is an safe replicate slice aggregate
+ */
+bool
+is_agg_repsafe(Oid aggid)
+{
+	HeapTuple	aggTuple;
+	bool		aggrepsafe;
+	bool		isnull = false;
+
+	aggTuple = SearchSysCache1(AGGFNOID,
+							   ObjectIdGetDatum(aggid));
+	if (!HeapTupleIsValid(aggTuple))
+		elog(ERROR, "cache lookup failed for aggregate %u", aggid);
+
+	aggrepsafe = DatumGetBool(SysCacheGetAttr(AGGFNOID, aggTuple,
+										   Anum_pg_aggregate_aggrepsafeexec, &isnull));
+	Assert(!isnull);
+
+	ReleaseSysCache(aggTuple);
+
+	return aggrepsafe;
 }
 
 /*
@@ -2205,29 +2282,6 @@ get_func_support(Oid funcid)
 }
 
 /*
- * func_data_access
- *		Given procedure id, return the function's data access flag.
- */
-char
-func_data_access(Oid funcid)
-{
-	HeapTuple	tp;
-	char		result;
-	bool		isnull;
-
-	tp = SearchSysCache1(PROCOID, ObjectIdGetDatum(funcid));
-	if (!HeapTupleIsValid(tp))
-		elog(ERROR, "cache lookup failed for function %u", funcid);
-
-	result = DatumGetChar(
-		SysCacheGetAttr(PROCOID, tp, Anum_pg_proc_prodataaccess, &isnull));
-	ReleaseSysCache(tp);
-
-	Assert(!isnull);
-	return result;
-}
-
-/*
  * func_exec_location
  *		Given procedure id, return the function's proexeclocation field
  */
@@ -2291,6 +2345,32 @@ get_relnatts(Oid relid)
 		return InvalidAttrNumber;
 }
 #endif
+
+/*
+ * get_rel_am
+ *		Returns the access method of a given relation.
+ *
+ * Returns InvalidOid if there is no such relation or if the relation is not an
+ * index or a table.
+ */
+Oid
+get_rel_am(Oid relid)
+{
+	HeapTuple       tp;
+
+	tp = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
+	if (HeapTupleIsValid(tp))
+	{
+		Form_pg_class reltup = (Form_pg_class) GETSTRUCT(tp);
+		Oid       result;
+
+		result = reltup->relam;
+		ReleaseSysCache(tp);
+		return result;
+	}
+
+	return InvalidOid;
+}
 
 /*
  * get_rel_name
@@ -3748,44 +3828,153 @@ get_range_subtype(Oid rangeOid)
 }
 
 /*
- * relation_exists
- *	  Is there a relation with the given oid
+ * get_range_collation
+ *		Returns the collation of a given range type
+ *
+ * Returns InvalidOid if the type is not a range type,
+ * or if its subtype is not collatable.
  */
-bool
-relation_exists(Oid oid)
+Oid
+get_range_collation(Oid rangeOid)
 {
-	return SearchSysCacheExists(RELOID, oid, 0, 0, 0);
+	HeapTuple	tp;
+
+	tp = SearchSysCache1(RANGETYPE, ObjectIdGetDatum(rangeOid));
+	if (HeapTupleIsValid(tp))
+	{
+		Form_pg_range rngtup = (Form_pg_range) GETSTRUCT(tp);
+		Oid			result;
+
+		result = rngtup->rngcollation;
+		ReleaseSysCache(tp);
+		return result;
+	}
+	else
+		return InvalidOid;
+}
+
+/*				---------- PG_INDEX CACHE ----------				 */
+
+/*
+ * get_index_column_opclass
+ *
+ *		Given the index OID and column number,
+ *		return opclass of the index column
+ *			or InvalidOid if the index was not found
+ *				or column is non-key one.
+ */
+Oid
+get_index_column_opclass(Oid index_oid, int attno)
+{
+	HeapTuple	tuple;
+	Form_pg_index rd_index PG_USED_FOR_ASSERTS_ONLY;
+	Datum		datum;
+	bool		isnull;
+	oidvector  *indclass;
+	Oid			opclass;
+
+	/* First we need to know the column's opclass. */
+
+	tuple = SearchSysCache1(INDEXRELID, ObjectIdGetDatum(index_oid));
+	if (!HeapTupleIsValid(tuple))
+		return InvalidOid;
+
+	rd_index = (Form_pg_index) GETSTRUCT(tuple);
+
+	/* caller is supposed to guarantee this */
+	Assert(attno > 0 && attno <= rd_index->indnatts);
+
+	/* Non-key attributes don't have an opclass */
+	if (attno > rd_index->indnkeyatts)
+	{
+		ReleaseSysCache(tuple);
+		return InvalidOid;
+	}
+
+	datum = SysCacheGetAttr(INDEXRELID, tuple,
+							Anum_pg_index_indclass, &isnull);
+	Assert(!isnull);
+
+	indclass = ((oidvector *) DatumGetPointer(datum));
+
+	Assert(attno <= indclass->dim1);
+	opclass = indclass->values[attno - 1];
+
+	ReleaseSysCache(tuple);
+
+	return opclass;
 }
 
 /*
- * index_exists
- *	  Is there an index with the given oid
+ * get_index_isreplident
+ *
+ *		Given the index OID, return pg_index.indisreplident.
  */
 bool
-index_exists(Oid oid)
+get_index_isreplident(Oid index_oid)
 {
-	return SearchSysCacheExists(INDEXRELID, oid, 0, 0, 0);
+	HeapTuple		tuple;
+	Form_pg_index	rd_index;
+	bool			result;
+
+	tuple = SearchSysCache1(INDEXRELID, ObjectIdGetDatum(index_oid));
+	if (!HeapTupleIsValid(tuple))
+		return false;
+
+	rd_index = (Form_pg_index) GETSTRUCT(tuple);
+	result = rd_index->indisreplident;
+	ReleaseSysCache(tuple);
+
+	return result;
 }
 
 /*
- * type_exists
- *	  Is there a type with the given oid
+ * get_index_isvalid
+ *
+ *		Given the index OID, return pg_index.indisvalid.
  */
 bool
-type_exists(Oid oid)
+get_index_isvalid(Oid index_oid)
 {
-	return SearchSysCacheExists(TYPEOID, oid, 0, 0, 0);
+	bool		isvalid;
+	HeapTuple	tuple;
+	Form_pg_index rd_index;
+
+	tuple = SearchSysCache1(INDEXRELID, ObjectIdGetDatum(index_oid));
+	if (!HeapTupleIsValid(tuple))
+		elog(ERROR, "cache lookup failed for index %u", index_oid);
+
+	rd_index = (Form_pg_index) GETSTRUCT(tuple);
+	isvalid = rd_index->indisvalid;
+	ReleaseSysCache(tuple);
+
+	return isvalid;
 }
 
 /*
- * operator_exists
- *	  Is there an operator with the given oid
+ * get_index_isclustered
+ *
+ *		Given the index OID, return pg_index.indisclustered.
  */
 bool
-operator_exists(Oid oid)
+get_index_isclustered(Oid index_oid)
 {
-	return SearchSysCacheExists(OPEROID, oid, 0, 0, 0);
+	bool		isclustered;
+	HeapTuple	tuple;
+	Form_pg_index rd_index;
+
+	tuple = SearchSysCache1(INDEXRELID, ObjectIdGetDatum(index_oid));
+	if (!HeapTupleIsValid(tuple))
+		elog(ERROR, "cache lookup failed for index %u", index_oid);
+
+	rd_index = (Form_pg_index) GETSTRUCT(tuple);
+	isclustered = rd_index->indisclustered;
+	ReleaseSysCache(tuple);
+
+	return isclustered;
 }
+
+/*				---------- Greenplum specific ----------				 */
 
 /*
  * function_exists
@@ -3845,35 +4034,6 @@ get_aggregate(const char *aggname, Oid oidType)
 }
 
 /*
- * trigger_exists
- *	  Is there a trigger with the given oid
- */
-bool
-trigger_exists(Oid oid)
-{
-	ScanKeyData	scankey;
-	Relation	rel;
-	SysScanDesc sscan;
-	bool		result;
-
-	ScanKeyInit(&scankey, Anum_pg_trigger_oid,
-				BTEqualStrategyNumber, F_OIDEQ,
-				ObjectIdGetDatum(oid));
-
-	rel = table_open(TriggerRelationId, AccessShareLock);
-	sscan = systable_beginscan(rel, TriggerOidIndexId, true,
-							   NULL, 1, &scankey);
-
-	result = (systable_getnext(sscan) != NULL);
-
-	systable_endscan(sscan);
-
-	table_close(rel, AccessShareLock);
-
-	return result;
-}
-
-/*
  * get_relation_keys
  *	  Return a list of relation keys
  */
@@ -3903,7 +4063,13 @@ get_relation_keys(Oid relid)
 		{
 			continue;
 		}
-			
+
+		// skip the constraint if deferrable
+		if (contuple->condeferrable)
+		{
+			continue;
+		}
+
 		// store key set in an array
 		List *key = NIL;
 		
@@ -4320,6 +4486,34 @@ get_index_opfamilies(Oid oidIndex)
 }
 
 /*
+ * Return the default operator opfamily to use for the partition key.
+ */
+Oid
+default_partition_opfamily_for_type(Oid typeoid)
+{
+    TypeCacheEntry *tcache;
+
+    // flags required for or applicable to btree opfamily
+    // required: TYPECACHE_CMP_PROC, TYPECACHE_CMP_PROC_FINFO, TYPECACHE_BTREE_OPFAMILY
+    // applicable: TYPECACHE_EQ_OPR, TYPECACHE_LT_OPR, TYPECACHE_GT_OPR, TYPECACHE_EQ_OPR_FINFO
+    // Note we don't need all the flags to obtain the btree opfamily
+    // But applying all the flags allows us to abstract away the lookup_type_cache call
+    tcache = lookup_type_cache(typeoid, TYPECACHE_EQ_OPR | TYPECACHE_LT_OPR | TYPECACHE_GT_OPR |
+                                        TYPECACHE_CMP_PROC |
+                                        TYPECACHE_EQ_OPR_FINFO | TYPECACHE_CMP_PROC_FINFO |
+                                        TYPECACHE_BTREE_OPFAMILY);
+
+    if (!tcache->btree_opf)
+        return InvalidOid;
+    if (!tcache->cmp_proc)
+        return InvalidOid;
+    if (!tcache->eq_opr && !tcache->lt_opr && !tcache->gt_opr)
+        return InvalidOid;
+
+    return tcache->btree_opf;
+}
+
+/*
  *  relation_policy
  *  Return the distribution policy of a table. 
  */
@@ -4338,20 +4532,18 @@ relation_policy(Relation rel)
  *  different distribution policy. The only allowed mismatch is for the parent
  *  to be hash distributed, and its child part to be randomly distributed.
  */
-/* GPDB_12_MERGE_FIXME */
-#if 0
 bool
 child_distribution_mismatch(Relation rel)
 {
 	Assert(NULL != rel);
-	if (PART_STATUS_NONE == rel_part_status(rel->rd_id))
+	if (rel->rd_rel->relkind != RELKIND_PARTITIONED_TABLE)
 	{
 		/* not a partitioned table */
 		return false;
 	}
 
 	GpPolicy *rootPolicy = rel->rd_cdbpolicy;
-	Assert(NULL != rootPolicy && "Partitioned tables cannot be master-only");
+	Assert(NULL != rootPolicy && "Partitioned tables cannot be coordinator-only");
 
 	/* replicated table can't have child */
 	Assert(!GpPolicyIsReplicated(rootPolicy));
@@ -4391,154 +4583,4 @@ child_distribution_mismatch(Relation rel)
 	/* all children match the root's distribution policy */
 	return false;
 }
-#endif
 
-/*
- *  child_triggers
- *  Return true if the table is partitioned and any of the child partitions
- *  have a trigger of the given type.
- */
-bool
-child_triggers(Oid relationId, int32 triggerType)
-{
-/* GPDB_12_MERGE_FIXME */
-	return false;
-#if 0
-	Assert(InvalidOid != relationId);
-	if (PART_STATUS_NONE == rel_part_status(relationId))
-	{
-		/* not a partitioned table */
-		return false;
-	}
-
-	List *childOids = find_all_inheritors(relationId, NoLock, NULL);
-	ListCell *lc;
-
-	bool found = false;
-	foreach (lc, childOids)
-	{
-		Oid oidChild = lfirst_oid(lc);
-		Relation relChild = RelationIdGetRelation(oidChild);
-		Assert(NULL != relChild);
-
-		if (relChild->rd_rel->relhastriggers && NULL == relChild->trigdesc)
-		{
-			RelationBuildTriggers(relChild);
-			if (NULL == relChild->trigdesc)
-			{
-				relChild->rd_rel->relhastriggers = false;
-			}
-		}
-
-		if (relChild->rd_rel->relhastriggers)
-		{
-			for (int i = 0; i < relChild->trigdesc->numtriggers && !found; i++)
-			{
-				Trigger trigger = relChild->trigdesc->triggers[i];
-				found = trigger_enabled(trigger.tgoid) &&
-						(get_trigger_type(trigger.tgoid) & triggerType) == triggerType;
-			}
-		}
-
-		RelationClose(relChild);
-		if (found)
-		{
-			break;
-		}
-	}
-
-	list_free(childOids);
-	
-	/* no child triggers matching the given type */
-	return found;
-#endif
-}
-
-/*				---------- PG_INDEX CACHE ----------				 */
-
-/*
- * get_index_column_opclass
- *
- *		Given the index OID and column number,
- *		return opclass of the index column
- *			or InvalidOid if the index was not found.
- */
-Oid
-get_index_column_opclass(Oid index_oid, int attno)
-{
-	HeapTuple	tuple;
-	Form_pg_index rd_index PG_USED_FOR_ASSERTS_ONLY;
-	Datum		datum;
-	bool		isnull;
-	oidvector  *indclass;
-	Oid			opclass;
-
-	/* First we need to know the column's opclass. */
-
-	tuple = SearchSysCache1(INDEXRELID, ObjectIdGetDatum(index_oid));
-	if (!HeapTupleIsValid(tuple))
-		return InvalidOid;
-
-	rd_index = (Form_pg_index) GETSTRUCT(tuple);
-
-	/* caller is supposed to guarantee this */
-	Assert(attno > 0 && attno <= rd_index->indnatts);
-
-	datum = SysCacheGetAttr(INDEXRELID, tuple,
-							Anum_pg_index_indclass, &isnull);
-	Assert(!isnull);
-
-	indclass = ((oidvector *) DatumGetPointer(datum));
-	opclass = indclass->values[attno - 1];
-
-	ReleaseSysCache(tuple);
-
-	return opclass;
-}
-
-/* GPDB_12_MERGE_FIXME: only used by ORCA. Fix the callers to check
- * Relation->relkind == RELKIND_PARTITIONED_TABLE instead. They should
- * have the relcache entry at hand anyway.
- */
-bool
-relation_is_partitioned(Oid relid)
-{
-	HeapTuple   tuple;
-	tuple = SearchSysCache1(PARTRELID, ObjectIdGetDatum(relid));
-
-	if (HeapTupleIsValid(tuple))
-	{
-		ReleaseSysCache(tuple);
-		return true;
-	}
-	else
-		return false;
-}
-
-bool
-index_is_partitioned(Oid relid)
-{
-	HeapTuple   tuple;
-	tuple = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
-	if (!HeapTupleIsValid(tuple))
-		elog(ERROR, "cache lookup failed for relation %u", relid);
-	Form_pg_class pg_class_tuple = (Form_pg_class) GETSTRUCT(tuple);
-	ReleaseSysCache(tuple);
-	return pg_class_tuple->relkind == RELKIND_PARTITIONED_INDEX;
-}
-
-List *
-relation_get_leaf_partitions(Oid oid)
-{
-	List *descendants = find_all_inheritors(oid, AccessShareLock, NULL);
-	List *leaves = NIL;
-	ListCell *lc;
-	foreach(lc, descendants)
-	{
-		const Oid descendant = lfirst_oid(lc);
-		if (get_rel_relkind(descendant) != RELKIND_PARTITIONED_TABLE &&
-			get_rel_relkind(descendant) != RELKIND_PARTITIONED_INDEX)
-			leaves = lappend_oid(leaves, descendant);
-	}
-	return leaves;
-}

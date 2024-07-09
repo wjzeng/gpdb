@@ -37,16 +37,16 @@ class CSyncHashtableTest
 
 private:
 	// types used by testing functions
-	typedef CSyncHashtable<SElem, ULONG> SElemHashtable;
+	using SElemHashtable = CSyncHashtable<SElem, ULONG>;
 
-	typedef CSyncHashtableAccessByKey<SElem, ULONG> SElemHashtableAccessor;
+	using SElemHashtableAccessor = CSyncHashtableAccessByKey<SElem, ULONG>;
 
-	typedef CSyncHashtableIter<SElem, ULONG> SElemHashtableIter;
+	using SElemHashtableIter = CSyncHashtableIter<SElem, ULONG>;
 
-	typedef CSyncHashtableAccessByIter<SElem, ULONG> SElemHashtableIterAccessor;
+	using SElemHashtableIterAccessor = CSyncHashtableAccessByIter<SElem, ULONG>;
 
 	// function pointer to a hash table task
-	typedef void *(*pfuncHashtableTask)(void *);
+	using pfuncHashtableTask = void *(*) (void *);
 
 	//---------------------------------------------------------------------------
 	//	@class:
@@ -123,13 +123,11 @@ private:
 
 		SElem &operator=(const SElem &) = default;
 
-#ifdef GPOS_DEBUG
 		static BOOL
 		IsValid(const ULONG &ulKey)
 		{
 			return !FEqualKeys(m_ulInvalid, ulKey);
 		}
-#endif	// GPOS_DEBUG
 
 		// dummy ctor
 		SElem() = default;

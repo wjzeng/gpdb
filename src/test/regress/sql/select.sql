@@ -89,6 +89,7 @@ SELECT onek2.unique1, onek2.stringu1 FROM onek2
 RESET enable_seqscan;
 RESET enable_bitmapscan;
 RESET enable_sort;
+RESET optimizer_enable_tablescan;
 
 
 SELECT two, stringu1, ten, string4
@@ -148,6 +149,11 @@ SELECT 2+2, 57
 UNION ALL
 TABLE int8_tbl;
 
+-- corner case: VALUES with no columns
+CREATE TEMP TABLE nocols();
+INSERT INTO nocols DEFAULT VALUES;
+SELECT * FROM nocols n, LATERAL (VALUES(n.*)) v;
+
 --
 -- Test ORDER BY options
 --
@@ -192,6 +198,7 @@ SELECT * FROM foo ORDER BY f1 DESC NULLS LAST;
 --
 -- partial index is usable
 SET enable_seqscan TO off;
+SET optimizer_enable_tablescan TO off;
 explain (costs off)
 select * from onek2 where unique2 = 11 and stringu1 = 'ATAAAA';
 select * from onek2 where unique2 = 11 and stringu1 = 'ATAAAA';
@@ -223,11 +230,19 @@ select unique2 from onek2 where unique2 = 11 and stringu1 < 'B';
 select unique2 from onek2 where unique2 = 11 and stringu1 < 'B';
 RESET enable_indexscan;
 -- check multi-index cases too
+-- GPDB: Use onek2_3x for 3x the data, in order for us to get the upstream plan
+-- utilizing both indexes.
+create table onek2_3x (like onek2 including all) distributed by (unique1);
+insert into onek2_3x select * from onek2;
+insert into onek2_3x select * from onek2;
+insert into onek2_3x select * from onek2;
+analyze onek2_3x;
 explain (costs off)
-select unique1, unique2 from onek2
+select unique1, unique2 from onek2_3x
   where (unique2 = 11 or unique1 = 0) and stringu1 < 'B';
-select unique1, unique2 from onek2
+select unique1, unique2 from onek2_3x
   where (unique2 = 11 or unique1 = 0) and stringu1 < 'B';
+
 explain (costs off)
 select unique1, unique2 from onek2
   where (unique2 = 11 and stringu1 < 'B') or unique1 = 0;

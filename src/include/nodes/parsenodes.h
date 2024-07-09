@@ -56,7 +56,7 @@ typedef enum SortByDir
 	SORTBY_DEFAULT,
 	SORTBY_ASC,
 	SORTBY_DESC,
-	SORTBY_USING				/* not allowed in CREATE INDEX ... */
+	SORTBY_USING				/* not allowed in CREATE INDEX or AT REPACK */
 } SortByDir;
 
 typedef enum SortByNulls
@@ -157,7 +157,7 @@ typedef struct Query
 	bool		hasTargetSRFs;	/* has set-returning functions in tlist */
 	bool		hasSubLinks;	/* has subquery SubLink */
 	bool        hasDynamicFunctions; /* has functions with unstable return types */
-	bool		hasFuncsWithExecRestrictions; /* has functions with EXECUTE ON MASTER or ALL SEGMENTS */
+	bool		hasFuncsWithExecRestrictions; /* has functions with EXECUTE ON COORDINATOR or ALL SEGMENTS */
 	bool		hasDistinctOn;	/* distinctClause is from DISTINCT ON */
 	bool		hasRecursive;	/* WITH RECURSIVE was specified */
 	bool		hasModifyingCTE;	/* has INSERT/UPDATE/DELETE in WITH */
@@ -226,6 +226,8 @@ typedef struct Query
 	 */
 	int			stmt_location;	/* start location, or -1 if unknown */
 	int			stmt_len;		/* length in bytes; 0 means "rest of string" */
+
+	bool		expandMatViews; /* force expansion of materialized views during rewrite to treat as views */
 } Query;
 
 /****************************************************************************
@@ -731,6 +733,7 @@ typedef struct TableLikeClause
 	NodeTag		type;
 	RangeVar   *relation;
 	bits32		options;		/* OR of TableLikeOption flags */
+	Oid			relationOid;	/* If table has been looked up, its OID */
 } TableLikeClause;
 
 typedef enum TableLikeOption
@@ -743,6 +746,9 @@ typedef enum TableLikeOption
 	CREATE_TABLE_LIKE_INDEXES = 1 << 5,
 	CREATE_TABLE_LIKE_STATISTICS = 1 << 6,
 	CREATE_TABLE_LIKE_STORAGE = 1 << 7,
+	CREATE_TABLE_LIKE_ENCODING = 1 << 8,
+	CREATE_TABLE_LIKE_RELOPT = 1 << 9,
+	CREATE_TABLE_LIKE_AM = 1 << 10,
 	CREATE_TABLE_LIKE_ALL = PG_INT32_MAX
 } TableLikeOption;
 
@@ -874,7 +880,7 @@ typedef struct PartitionSpec
 								 * 'range') */
 	List	   *partParams;		/* List of PartitionElems */
 
-	struct GpPartitionDefinition *gpPartDef;
+	struct GpPartitionDefinition *gpPartDef; /* contains legacy partition definition */
 	struct PartitionSpec         *subPartSpec;     /* subpartition specification */
 	int                          location;		/* token location, or -1 if unknown */
 } PartitionSpec;
@@ -997,10 +1003,10 @@ typedef struct PartitionCmd
  *	  inFromCl marks those range variables that are listed in the FROM clause.
  *	  It's false for RTEs that are added to a query behind the scenes, such
  *	  as the NEW and OLD variables for a rule, or the subqueries of a UNION.
- *	  This flag is not used anymore during parsing, since the parser now uses
- *	  a separate "namespace" data structure to control visibility, but it is
- *	  needed by ruleutils.c to determine whether RTEs should be shown in
- *	  decompiled queries.
+ *	  This flag is not used during parsing (except in transformLockingClause,
+ *	  q.v.); the parser now uses a separate "namespace" data structure to
+ *	  control visibility.  But it is needed by ruleutils.c to determine
+ *	  whether RTEs should be shown in decompiled queries.
  *
  *	  requiredPerms and checkAsUser specify run-time access permissions
  *	  checks to be performed at query startup.  The user must have *all*
@@ -1022,12 +1028,16 @@ typedef struct PartitionCmd
  *
  *	  updatedCols is also used in some other places, for example, to determine
  *	  which triggers to fire and in FDWs to know which changed columns they
- *	  need to ship off.  Generated columns that are caused to be updated by an
- *	  update to a base column are collected in extraUpdatedCols.  This is not
- *	  considered for permission checking, but it is useful in those places
- *	  that want to know the full set of columns being updated as opposed to
- *	  only the ones the user explicitly mentioned in the query.  (There is
- *	  currently no need for an extraInsertedCols, but it could exist.)
+ *	  need to ship off.
+ *
+ *	  Generated columns that are caused to be updated by an update to a base
+ *	  column are listed in extraUpdatedCols.  This is not considered for
+ *	  permission checking, but it is useful in those places that want to know
+ *	  the full set of columns being updated as opposed to only the ones the
+ *	  user explicitly mentioned in the query.  (There is currently no need for
+ *	  an extraInsertedCols, but it could exist.)  Note that extraUpdatedCols
+ *	  is populated during query rewrite, NOT in the parser, since generated
+ *	  columns could be added after a rule has been parsed and stored.
  *
  *	  securityQuals is a list of security barrier quals (boolean expressions),
  *	  to be tested in the listed order before returning a row from the
@@ -1959,7 +1969,9 @@ typedef enum AlterTableType
 	AT_SetLogged,				/* SET LOGGED */
 	AT_SetUnLogged,				/* SET UNLOGGED */
 	AT_DropOids,				/* SET WITHOUT OIDS */
+	AT_SetAccessMethod,			/* SET ACCESS METHOD */
 	AT_SetTableSpace,			/* SET TABLESPACE */
+	AT_SetColumnEncoding,        /* SET ENCODING (...)*/
 	AT_SetRelOptions,			/* SET (...) -- AM specific parameters */
 	AT_ResetRelOptions,			/* RESET (...) -- AM specific parameters */
 	AT_ReplaceRelOptions,		/* replace reloption list in its entirety */
@@ -1990,9 +2002,11 @@ typedef enum AlterTableType
 	AT_AddIdentity,				/* ADD IDENTITY */
 	AT_SetIdentity,				/* SET identity column options */
 	AT_DropIdentity,			/* DROP IDENTITY */
+	AT_CookedColumnDefault,		/* add a pre-cooked column default */
 
 	AT_SetDistributedBy,		/* SET DISTRIBUTED BY */
 	AT_ExpandTable,          /* EXPAND DISTRIBUTED */
+	AT_ExpandPartitionTablePrepare,	/* EXPAND PARTITION PREPARE */
 
 	/* GPDB: Legacy commands to manipulate partitions */
 	AT_PartAdd,					/* Add */
@@ -2002,7 +2016,10 @@ typedef enum AlterTableType
 	AT_PartRename,				/* Rename */
 	AT_PartSetTemplate,			/* Set Subpartition Template */
 	AT_PartSplit,				/* Split */
-	AT_PartTruncate				/* Truncate */
+	AT_PartTruncate,			/* Truncate */
+
+	/* kept at end for ABI hygiene */
+	AT_RepackTable				/* REPACK TABLE */
 } AlterTableType;
 
 typedef struct ReplicaIdentityStmt
@@ -2026,6 +2043,7 @@ typedef struct AlterTableCmd	/* one subcommand of an ALTER TABLE */
 	Node	   *transform;		/* transformation expr for ALTER TYPE */
 	DropBehavior behavior;		/* RESTRICT or CASCADE for DROP cases */
 	bool		missing_ok;		/* skip error if missing? */
+	bool		recurse;		/* exec-time recursion */
 
 	/*
 	 * Extra information dispatched from QD to QEs in AT_SetDistributedBy and
@@ -2037,7 +2055,6 @@ typedef struct AlterTableCmd	/* one subcommand of an ALTER TABLE */
 	const char *queryString;
 
 	GpPolicy   *policy;
-
 } AlterTableCmd;
 
 typedef enum GpAlterPartitionIdType
@@ -2262,7 +2279,7 @@ typedef struct CopyStmt
 	List	   *options;		/* List of DefElem nodes */
 	Node	   *whereClause;	/* WHERE condition (or NULL) */
 
-	Node	   *sreh;			/* Single row error handling info */
+	List	   *sreh;			/* Single row error handling info */
 } CopyStmt;
 
 /* ----------------------
@@ -2301,6 +2318,21 @@ typedef struct VariableShowStmt
 	char	   *name;
 } VariableShowStmt;
 
+/*
+ * GPDB: Where did the CreateStmt originate? Was it generated and if so, what
+ * type of operation generated it?
+ *
+ * Note: 'classic' syntax refers to the legacy GPDB partitioning syntax that
+ * predates the upstream partitioning syntax that was acquired during the
+ * Postgres 12 merge.
+ */
+typedef enum CreateStmtOrigin
+{
+	ORIGIN_NO_GEN,
+	ORIGIN_GP_CLASSIC_CREATE_GEN,
+	ORIGIN_GP_CLASSIC_ALTER_GEN,
+} CreateStmtOrigin;
+
 /* ----------------------
  *		Create Table Statement
  *
@@ -2329,6 +2361,7 @@ typedef struct CreateStmt
 	char	   *tablespacename; /* table space to use, or NULL */
 	char	   *accessMethod;	/* table access method */
 	bool		if_not_exists;	/* just do nothing if it already exists? */
+	bool 		gp_style_alter_part; /* unused */
 
 	DistributedBy *distributedBy;   /* what columns we distribute the data by */
 	Node       *partitionBy;     /* what columns we partition the data by */
@@ -2337,10 +2370,14 @@ typedef struct CreateStmt
 	bool		buildAoBlkdir; /* whether to build the block directory for an AO table */
 	List	   *attr_encodings; /* attribute storage directives */
 	bool		isCtas;			/* CDB: is create table as */
+	Node       *intoQuery;      /* CDB: only set for matview with no data */
+	GpPolicy   *intoPolicy;     /* CDB: only set for matview with no data */
 
 	/* names chosen for partition indexes */
 	List	   *part_idx_oids;
 	List	   *part_idx_names;
+
+	CreateStmtOrigin origin;	/* GPDB: provenance of this CreateStmt */
 } CreateStmt;
 
 /* ----------------------
@@ -3177,6 +3214,7 @@ typedef struct SecLabelStmt
  * CURRENT OF. It can be passed to SPI_prepare_cursor.
  */
 #define CURSOR_OPT_UPDATABLE	0x0200	/* updateable with CURRENT OF, if possible */
+#define CURSOR_OPT_PARALLEL_RETRIEVE 0x0400	/* Cursor for parallel retrieving */
 
 /* GPDB additions */
 #define CURSOR_OPT_SKIP_FOREIGN_PARTITIONS	0x1000	/* don't expand foreign partitions */
@@ -3785,6 +3823,7 @@ typedef struct LockStmt
 	List	   *relations;		/* relations to lock */
 	int			mode;			/* lock mode */
 	bool		nowait;			/* no wait mode */
+	bool		coordinatoronly;		/* GPDB: lock only on coordinator */
 } LockStmt;
 
 /* ----------------------
@@ -3804,7 +3843,8 @@ typedef struct ConstraintsSetStmt
  */
 
 /* Reindex options */
-#define REINDEXOPT_VERBOSE 1 << 0	/* print progress info */
+#define REINDEXOPT_VERBOSE (1 << 0)	/* print progress info */
+#define REINDEXOPT_REPORT_PROGRESS (1 << 1)	/* report pgstat progress */
 
 typedef enum ReindexObjectType
 {
@@ -3824,7 +3864,7 @@ typedef struct ReindexStmt
 	const char *name;			/* name of database to reindex */
 	int			options;		/* Reindex options flags */
 	bool		concurrent;		/* reindex concurrently? */
-	Oid			relid;			/* oid of TABLE, used by QE */
+	Oid			relid;			/* oid of table or index, used by QE */
 } ReindexStmt;
 
 /* ----------------------
@@ -3965,7 +4005,6 @@ typedef struct AlterTSConfigurationStmt
 	bool		missing_ok;		/* for DROP - skip error if missing? */
 } AlterTSConfigurationStmt;
 
-
 typedef struct CreatePublicationStmt
 {
 	NodeTag		type;
@@ -4024,5 +4063,13 @@ typedef struct DropSubscriptionStmt
 	bool		missing_ok;		/* Skip error if missing? */
 	DropBehavior behavior;		/* RESTRICT or CASCADE behavior */
 } DropSubscriptionStmt;
+
+typedef struct RetrieveStmt
+{
+	NodeTag		type;
+	char		*endpoint_name;
+	int64		count;
+	bool		is_all;
+} RetrieveStmt;
 
 #endif							/* PARSENODES_H */

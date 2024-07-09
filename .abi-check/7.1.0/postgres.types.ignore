@@ -1,0 +1,10 @@
+enum PMSignalReason
+enum ResGroupLimitType
+struct AppendOnlyBlockDirectory
+struct AOCSScanDescData
+struct AOCSFetchDescData
+struct AOCSInsertDescData
+struct AOCSWriteColumnDescData
+struct AppendOnlyFetchDescData
+struct AppendOnlyInsertDescData
+struct ResGroupCaps

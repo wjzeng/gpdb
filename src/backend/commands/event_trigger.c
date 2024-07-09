@@ -156,8 +156,7 @@ static void AlterEventTriggerOwner_internal(Relation rel,
 											HeapTuple tup,
 											Oid newOwnerId);
 static event_trigger_command_tag_check_result check_ddl_tag(const char *tag);
-static event_trigger_command_tag_check_result check_table_rewrite_ddl_tag(
-																		  const char *tag);
+static event_trigger_command_tag_check_result check_table_rewrite_ddl_tag(const char *tag);
 static void error_duplicate_filter_variable(const char *defname);
 static Datum filter_list_to_array(List *filterlist);
 static Oid	insert_event_trigger_tuple(const char *trigname, const char *eventname,
@@ -177,7 +176,6 @@ CreateEventTrigger(CreateEventTrigStmt *stmt)
 	HeapTuple	tuple;
 	Oid			funcoid;
 	Oid			funcrettype;
-	Oid			fargtypes[1];	/* dummy */
 	Oid			evtowner = GetUserId();
 	ListCell   *lc;
 	List	   *tags = NULL;
@@ -243,7 +241,7 @@ CreateEventTrigger(CreateEventTrigStmt *stmt)
 						stmt->trigname)));
 
 	/* Find and validate the trigger function. */
-	funcoid = LookupFuncName(stmt->funcname, 0, fargtypes, false);
+	funcoid = LookupFuncName(stmt->funcname, 0, NULL, false);
 	funcrettype = get_func_rettype(funcoid);
 	if (funcrettype != EVTTRIGGEROID)
 		ereport(ERROR,
@@ -1821,9 +1819,15 @@ EventTriggerAlterTableEnd(void)
 	/* If no subcommands, don't collect */
 	if (list_length(currentEventTriggerState->currentCommand->d.alterTable.subcmds) != 0)
 	{
+		MemoryContext oldcxt;
+
+		oldcxt = MemoryContextSwitchTo(currentEventTriggerState->cxt);
+
 		currentEventTriggerState->commandList =
 			lappend(currentEventTriggerState->commandList,
 					currentEventTriggerState->currentCommand);
+
+		MemoryContextSwitchTo(oldcxt);
 	}
 	else
 		pfree(currentEventTriggerState->currentCommand);

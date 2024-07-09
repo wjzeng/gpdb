@@ -14,6 +14,8 @@
 #include "gpos/base.h"
 
 #include "gpopt/base/CDistributionSpecHashed.h"
+#include "gpopt/base/CUtils.h"
+#include "gpopt/operators/CExpressionHandle.h"
 
 
 using namespace gpopt;
@@ -29,9 +31,10 @@ using namespace gpopt;
 //---------------------------------------------------------------------------
 CPhysicalLeftOuterHashJoin::CPhysicalLeftOuterHashJoin(
 	CMemoryPool *mp, CExpressionArray *pdrgpexprOuterKeys,
-	CExpressionArray *pdrgpexprInnerKeys, IMdIdArray *hash_opfamilies)
+	CExpressionArray *pdrgpexprInnerKeys, IMdIdArray *hash_opfamilies,
+	BOOL is_null_aware, CXform::EXformId origin_xform)
 	: CPhysicalHashJoin(mp, pdrgpexprOuterKeys, pdrgpexprInnerKeys,
-						hash_opfamilies)
+						hash_opfamilies, is_null_aware, origin_xform)
 {
 }
 
@@ -46,4 +49,18 @@ CPhysicalLeftOuterHashJoin::CPhysicalLeftOuterHashJoin(
 //---------------------------------------------------------------------------
 CPhysicalLeftOuterHashJoin::~CPhysicalLeftOuterHashJoin() = default;
 
+//---------------------------------------------------------------------------
+//	@function:
+//		CPhysicalJoin::PdsDerive
+//
+//	@doc:
+//		Derive distribution
+//
+//---------------------------------------------------------------------------
+CDistributionSpec *
+CPhysicalLeftOuterHashJoin::PdsDerive(CMemoryPool *mp,
+									  CExpressionHandle &exprhdl) const
+{
+	return PdsDeriveForOuterJoin(mp, exprhdl);
+}
 // EOF

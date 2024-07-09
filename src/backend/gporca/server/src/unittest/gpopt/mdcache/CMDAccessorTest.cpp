@@ -106,64 +106,47 @@ CMDAccessorTest::EresUnittest_Basic()
 					 CTestUtils::GetCostModel(mp));
 
 	// lookup different objects
-	CMDIdGPDB *pmdidObject1 =
-		GPOS_NEW(mp) CMDIdGPDB(GPOPT_MDCACHE_TEST_OID /* OID */,
-							   1 /* major version */, 1 /* minor version */);
-	CMDIdGPDB *pmdidObject2 =
-		GPOS_NEW(mp) CMDIdGPDB(GPOPT_MDCACHE_TEST_OID /* OID */,
-							   12 /* version */, 1 /* minor version */);
+	CMDIdGPDB *pmdidObject1 = GPOS_NEW(mp)
+		CMDIdGPDB(IMDId::EmdidRel, GPOPT_MDCACHE_TEST_OID /* OID */,
+				  1 /* major version */, 1 /* minor version */);
+	CMDIdGPDB *pmdidObject2 = GPOS_NEW(mp)
+		CMDIdGPDB(IMDId::EmdidRel, GPOPT_MDCACHE_TEST_OID /* OID */,
+				  12 /* version */, 1 /* minor version */);
 
-#ifdef GPOS_DEBUG
-	const IMDRelation *pimdrel1 =
-#endif
-		mda.RetrieveRel(pmdidObject1);
+	const IMDRelation *pimdrel1 = mda.RetrieveRel(pmdidObject1);
 
-#ifdef GPOS_DEBUG
-	const IMDRelation *pimdrel2 =
-#endif
-		mda.RetrieveRel(pmdidObject2);
+	const IMDRelation *pimdrel2 = mda.RetrieveRel(pmdidObject2);
 
-	GPOS_ASSERT(pimdrel1->MDId()->Equals(pmdidObject1) &&
-				pimdrel2->MDId()->Equals(pmdidObject2));
+	GPOS_UNITTEST_ASSERT(pimdrel1->MDId()->Equals(pmdidObject1) &&
+						 pimdrel2->MDId()->Equals(pmdidObject2));
 
 	// access an object again
-#ifdef GPOS_DEBUG
-	const IMDRelation *pimdrel3 =
-#endif
-		mda.RetrieveRel(pmdidObject1);
+	const IMDRelation *pimdrel3 = mda.RetrieveRel(pmdidObject1);
 
-	GPOS_ASSERT(pimdrel1 == pimdrel3);
+	GPOS_UNITTEST_ASSERT(pimdrel1 == pimdrel3);
 
 	// access GPDB types, operators and aggregates
-	CMDIdGPDB *mdid_type = GPOS_NEW(mp) CMDIdGPDB(GPDB_INT4, 1, 0);
-	CMDIdGPDB *mdid_op = GPOS_NEW(mp) CMDIdGPDB(GPDB_OP_INT4_LT, 1, 0);
-	CMDIdGPDB *agg_mdid = GPOS_NEW(mp) CMDIdGPDB(GPDB_AGG_AVG, 1, 0);
+	CMDIdGPDB *mdid_type =
+		GPOS_NEW(mp) CMDIdGPDB(IMDId::EmdidGeneral, GPDB_INT4, 1, 0);
+	CMDIdGPDB *mdid_op =
+		GPOS_NEW(mp) CMDIdGPDB(IMDId::EmdidGeneral, GPDB_OP_INT4_LT, 1, 0);
+	CMDIdGPDB *agg_mdid =
+		GPOS_NEW(mp) CMDIdGPDB(IMDId::EmdidGeneral, GPDB_AGG_AVG, 1, 0);
 
-#ifdef GPOS_DEBUG
-	const IMDType *pimdtype =
-#endif
-		mda.RetrieveType(mdid_type);
+	const IMDType *pimdtype GPOS_ASSERTS_ONLY = mda.RetrieveType(mdid_type);
 
-	const IMDScalarOp *md_scalar_op GPOS_ASSERTS_ONLY =
-		mda.RetrieveScOp(mdid_op);
+	const IMDScalarOp *md_scalar_op = mda.RetrieveScOp(mdid_op);
 
-	GPOS_ASSERT(IMDType::EcmptL == md_scalar_op->ParseCmpType());
+	GPOS_UNITTEST_ASSERT(IMDType::EcmptL == md_scalar_op->ParseCmpType());
 
-#ifdef GPOS_DEBUG
-	const IMDAggregate *pmdagg =
-#endif
-		mda.RetrieveAgg(agg_mdid);
+	const IMDAggregate *pmdagg GPOS_ASSERTS_ONLY = mda.RetrieveAgg(agg_mdid);
 
 
 	// access types by type info
-#ifdef GPOS_DEBUG
-	const IMDTypeInt4 *pmdtypeint4 =
-#endif
+	const IMDTypeInt4 *pmdtypeint4 GPOS_ASSERTS_ONLY =
 		mda.PtMDType<IMDTypeInt4>(CTestUtils::m_sysidDefault);
 
-#ifdef GPOS_DEBUG
-	const IMDTypeBool *pmdtypebool =
-#endif
+	const IMDTypeBool *pmdtypebool GPOS_ASSERTS_ONLY =
 		mda.PtMDType<IMDTypeBool>(CTestUtils::m_sysidDefault);
 
 
@@ -234,21 +217,21 @@ CMDAccessorTest::EresUnittest_Datum()
 		mda.PtMDType<IMDTypeInt4>(CTestUtils::m_sysidDefault);
 	IDatumInt4 *pdatumInt4 =
 		pmdtypeint4->CreateInt4Datum(mp, 5, false /* is_null */);
-	GPOS_ASSERT(5 == pdatumInt4->Value());
+	GPOS_UNITTEST_ASSERT(5 == pdatumInt4->Value());
 
 	// create a BOOL datum
 	const IMDTypeBool *pmdtypebool =
 		mda.PtMDType<IMDTypeBool>(CTestUtils::m_sysidDefault);
 	IDatumBool *pdatumBool =
 		pmdtypebool->CreateBoolDatum(mp, false, false /* is_null */);
-	GPOS_ASSERT(false == pdatumBool->GetValue());
+	GPOS_UNITTEST_ASSERT(false == pdatumBool->GetValue());
 
 	// create an OID datum
 	const IMDTypeOid *pmdtypeoid =
 		mda.PtMDType<IMDTypeOid>(CTestUtils::m_sysidDefault);
 	IDatumOid *pdatumOid =
 		pmdtypeoid->CreateOidDatum(mp, 20, false /* is_null */);
-	GPOS_ASSERT(20 == pdatumOid->OidValue());
+	GPOS_UNITTEST_ASSERT(20 == pdatumOid->OidValue());
 
 
 #ifdef GPOS_DEBUG
@@ -327,9 +310,9 @@ CMDAccessorTest::EresUnittest_Navigate()
 	CMDAccessor mda(mp, CMDCache::Pcache(), CTestUtils::m_sysidDefault, pmdp);
 
 	// lookup a function in the MD cache
-	CMDIdGPDB *mdid_func =
-		GPOS_NEW(mp) CMDIdGPDB(GPDB_FUNC_TIMEOFDAY /* OID */,
-							   1 /* major version */, 0 /* minor version */);
+	CMDIdGPDB *mdid_func = GPOS_NEW(mp)
+		CMDIdGPDB(IMDId::EmdidGeneral, GPDB_FUNC_TIMEOFDAY /* OID */,
+				  1 /* major version */, 0 /* minor version */);
 
 	const IMDFunction *pmdfunc = mda.RetrieveFunc(mdid_func);
 
@@ -400,12 +383,13 @@ CMDAccessorTest::EresUnittest_Indexes()
 					 CTestUtils::GetCostModel(mp));
 
 	// lookup a relation in the MD cache
-	CMDIdGPDB *rel_mdid = GPOS_NEW(mp)
-		CMDIdGPDB(GPOPT_MDCACHE_TEST_OID, 1 /* major */, 1 /* minor version */);
+	CMDIdGPDB *rel_mdid =
+		GPOS_NEW(mp) CMDIdGPDB(IMDId::EmdidRel, GPOPT_MDCACHE_TEST_OID,
+							   1 /* major */, 1 /* minor version */);
 
 	const IMDRelation *pmdrel = mda.RetrieveRel(rel_mdid);
 
-	GPOS_ASSERT(0 < pmdrel->IndexCount());
+	GPOS_UNITTEST_ASSERT(0 < pmdrel->IndexCount());
 
 	IMDId *pmdidIndex = pmdrel->IndexMDidAt(0);
 	const IMDIndex *pmdindex = mda.RetrieveIndex(pmdidIndex);
@@ -471,11 +455,12 @@ CMDAccessorTest::EresUnittest_CheckConstraint()
 	CColumnFactory *col_factory = COptCtxt::PoctxtFromTLS()->Pcf();
 
 	// lookup a relation in the MD cache
-	CMDIdGPDB *rel_mdid = GPOS_NEW(mp)
-		CMDIdGPDB(GPOPT_TEST_REL_OID21, 1 /* major */, 1 /* minor version */);
+	CMDIdGPDB *rel_mdid =
+		GPOS_NEW(mp) CMDIdGPDB(IMDId::EmdidRel, GPOPT_TEST_REL_OID21,
+							   1 /* major */, 1 /* minor version */);
 
 	const IMDRelation *pmdrel = mda.RetrieveRel(rel_mdid);
-	GPOS_ASSERT(0 < pmdrel->CheckConstraintCount());
+	GPOS_UNITTEST_ASSERT(0 < pmdrel->CheckConstraintCount());
 
 	// create the array of column reference for the table columns
 	// for the DXL to Expr translation
@@ -551,31 +536,27 @@ CMDAccessorTest::EresUnittest_Cast()
 	const IMDType *pmdtypeBigInt =
 		mda.PtMDType<IMDTypeInt8>(CTestUtils::m_sysidDefault);
 
-#ifdef GPOS_DEBUG
 	const IMDCast *pmdcastInt2BigInt =
-#endif	// GPOS_DEBUG
 		mda.Pmdcast(pmdtypeInt->MDId(), pmdtypeBigInt->MDId());
 
-	GPOS_ASSERT(!pmdcastInt2BigInt->IsBinaryCoercible());
-	GPOS_ASSERT(pmdcastInt2BigInt->GetCastFuncMdId()->IsValid());
-	GPOS_ASSERT(pmdcastInt2BigInt->MdidSrc()->Equals(pmdtypeInt->MDId()));
-	GPOS_ASSERT(pmdcastInt2BigInt->MdidDest()->Equals(pmdtypeBigInt->MDId()));
+	GPOS_UNITTEST_ASSERT(!pmdcastInt2BigInt->IsBinaryCoercible());
+	GPOS_UNITTEST_ASSERT(pmdcastInt2BigInt->GetCastFuncMdId()->IsValid());
+	GPOS_UNITTEST_ASSERT(
+		pmdcastInt2BigInt->MdidSrc()->Equals(pmdtypeInt->MDId()));
+	GPOS_UNITTEST_ASSERT(
+		pmdcastInt2BigInt->MdidDest()->Equals(pmdtypeBigInt->MDId()));
 
-#ifdef GPOS_DEBUG
 	const IMDCast *pmdcastInt2Oid =
-#endif	// GPOS_DEBUG
 		mda.Pmdcast(pmdtypeInt->MDId(), pmdtypeOid->MDId());
 
-	GPOS_ASSERT(pmdcastInt2Oid->IsBinaryCoercible());
-	GPOS_ASSERT(!pmdcastInt2Oid->GetCastFuncMdId()->IsValid());
+	GPOS_UNITTEST_ASSERT(pmdcastInt2Oid->IsBinaryCoercible());
+	GPOS_UNITTEST_ASSERT(!pmdcastInt2Oid->GetCastFuncMdId()->IsValid());
 
-#ifdef GPOS_DEBUG
 	const IMDCast *pmdcastOid2Int =
-#endif	// GPOS_DEBUG
 		mda.Pmdcast(pmdtypeOid->MDId(), pmdtypeInt->MDId());
 
-	GPOS_ASSERT(pmdcastOid2Int->IsBinaryCoercible());
-	GPOS_ASSERT(!pmdcastOid2Int->GetCastFuncMdId()->IsValid());
+	GPOS_UNITTEST_ASSERT(pmdcastOid2Int->IsBinaryCoercible());
+	GPOS_UNITTEST_ASSERT(!pmdcastOid2Int->GetCastFuncMdId()->IsValid());
 
 	return GPOS_OK;
 }
@@ -610,15 +591,13 @@ CMDAccessorTest::EresUnittest_ScCmp()
 	const IMDType *pmdtypeBigInt =
 		mda.PtMDType<IMDTypeInt8>(CTestUtils::m_sysidDefault);
 
-#ifdef GPOS_DEBUG
-	const IMDScCmp *pmdScEqIntBigInt =
-#endif	// GPOS_DEBUG
-		mda.Pmdsccmp(pmdtypeInt->MDId(), pmdtypeBigInt->MDId(),
-					 IMDType::EcmptEq);
+	const IMDScCmp *pmdScEqIntBigInt = mda.Pmdsccmp(
+		pmdtypeInt->MDId(), pmdtypeBigInt->MDId(), IMDType::EcmptEq);
 
-	GPOS_ASSERT(IMDType::EcmptEq == pmdScEqIntBigInt->ParseCmpType());
-	GPOS_ASSERT(pmdScEqIntBigInt->GetLeftMdid()->Equals(pmdtypeInt->MDId()));
-	GPOS_ASSERT(
+	GPOS_UNITTEST_ASSERT(IMDType::EcmptEq == pmdScEqIntBigInt->ParseCmpType());
+	GPOS_UNITTEST_ASSERT(
+		pmdScEqIntBigInt->GetLeftMdid()->Equals(pmdtypeInt->MDId()));
+	GPOS_UNITTEST_ASSERT(
 		pmdScEqIntBigInt->GetRightMdid()->Equals(pmdtypeBigInt->MDId()));
 
 	return GPOS_OK;
@@ -644,9 +623,9 @@ CMDAccessorTest::EresUnittest_Negative()
 	CMDAccessor mda(mp, CMDCache::Pcache(), CTestUtils::m_sysidDefault, pmdp);
 
 	// lookup a non-existing objects
-	CMDIdGPDB *pmdidNonExistingObject =
-		GPOS_NEW(mp) CMDIdGPDB(GPOPT_MDCACHE_TEST_OID /* OID */,
-							   15 /* version */, 1 /* minor version */);
+	CMDIdGPDB *pmdidNonExistingObject = GPOS_NEW(mp)
+		CMDIdGPDB(IMDId::EmdidRel, GPOPT_MDCACHE_TEST_OID /* OID */,
+				  15 /* version */, 1 /* minor version */);
 
 	// call should result in an exception
 	(void) mda.RetrieveRel(pmdidNonExistingObject);
@@ -669,7 +648,7 @@ CMDAccessorTest::PvLookupSingleObj(void *pv)
 {
 	GPOS_CHECK_ABORT;
 
-	GPOS_ASSERT(nullptr != pv);
+	GPOS_UNITTEST_ASSERT(nullptr != pv);
 
 	SMDCacheTaskParams *pmdtaskparams = (SMDCacheTaskParams *) pv;
 
@@ -677,13 +656,13 @@ CMDAccessorTest::PvLookupSingleObj(void *pv)
 
 	CMemoryPool *mp = pmdtaskparams->m_mp;
 
-	GPOS_ASSERT(nullptr != mp);
-	GPOS_ASSERT(nullptr != md_accessor);
+	GPOS_UNITTEST_ASSERT(nullptr != mp);
+	GPOS_UNITTEST_ASSERT(nullptr != md_accessor);
 
 	// lookup a cache object
-	CMDIdGPDB *mdid =
-		GPOS_NEW(mp) CMDIdGPDB(GPOPT_MDCACHE_TEST_OID /* OID */,
-							   1 /* major version */, 1 /* minor version */);
+	CMDIdGPDB *mdid = GPOS_NEW(mp)
+		CMDIdGPDB(IMDId::EmdidRel, GPOPT_MDCACHE_TEST_OID /* OID */,
+				  1 /* major version */, 1 /* minor version */);
 
 	// lookup object
 	(void) md_accessor->RetrieveRel(mdid);
@@ -705,13 +684,13 @@ CMDAccessorTest::PvLookupMultipleObj(void *pv)
 {
 	GPOS_CHECK_ABORT;
 
-	GPOS_ASSERT(nullptr != pv);
+	GPOS_UNITTEST_ASSERT(nullptr != pv);
 
 	SMDCacheTaskParams *pmdtaskparams = (SMDCacheTaskParams *) pv;
 
 	CMDAccessor *md_accessor = pmdtaskparams->m_pmda;
 
-	GPOS_ASSERT(nullptr != md_accessor);
+	GPOS_UNITTEST_ASSERT(nullptr != md_accessor);
 
 	// lookup cache objects
 	const ULONG ulNumberOfObjects = 10;
@@ -721,8 +700,9 @@ CMDAccessorTest::PvLookupMultipleObj(void *pv)
 		GPOS_CHECK_ABORT;
 
 		// lookup relation
-		CMDIdGPDB *mdid = GPOS_NEW(pmdtaskparams->m_mp) CMDIdGPDB(
-			GPOPT_MDCACHE_TEST_OID /*OID*/, 1 /*major*/, ul + 1 /*minor*/);
+		CMDIdGPDB *mdid = GPOS_NEW(pmdtaskparams->m_mp)
+			CMDIdGPDB(IMDId::EmdidRel, GPOPT_MDCACHE_TEST_OID /*OID*/,
+					  1 /*major*/, ul + 1 /*minor*/);
 		(void) md_accessor->RetrieveRel(mdid);
 		mdid->Release();
 	}
@@ -742,7 +722,7 @@ CMDAccessorTest::PvLookupMultipleObj(void *pv)
 void *
 CMDAccessorTest::PvInitMDAAndLookup(void *pv)
 {
-	GPOS_ASSERT(nullptr != pv);
+	GPOS_UNITTEST_ASSERT(nullptr != pv);
 
 	CMDAccessor::MDCache *pcache = (CMDAccessor::MDCache *) pv;
 

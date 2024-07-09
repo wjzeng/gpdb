@@ -30,6 +30,7 @@
 
 #include "storage/sharedfileset.h"
 #include "utils/workfile_mgr.h"
+#include "cdb/cdbvars.h"
 
 /* BufFile is an opaque type whose details are not known outside buffile.c. */
 
@@ -51,6 +52,7 @@ extern int	BufFileSeek(BufFile *file, int fileno, off_t offset, int whence);
 extern void BufFileTell(BufFile *file, int *fileno, off_t *offset);
 extern int	BufFileSeekBlock(BufFile *file, int64 blknum);
 extern int64 BufFileSize(BufFile *file);
+extern int64 BufFileGetSize(BufFile *file);
 extern long BufFileAppend(BufFile *target, BufFile *source);
 
 extern BufFile *BufFileCreateShared(SharedFileSet *fileset, const char *name, struct workfile_set *work_set);

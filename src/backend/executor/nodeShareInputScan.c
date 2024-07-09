@@ -62,13 +62,16 @@
 #include "executor/executor.h"
 #include "executor/nodeShareInputScan.h"
 #include "miscadmin.h"
+#include "pgstat.h"
 #include "storage/condition_variable.h"
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
 #include "utils/faultinjector.h"
+#include "utils/guc.h"
 #include "utils/memutils.h"
 #include "utils/resowner.h"
 #include "utils/tuplestore.h"
+#include "port/atomics.h"
 
 /*
  * In a cross-slice ShareinputScan, the producer and consumer processes
@@ -100,8 +103,8 @@ typedef struct shareinput_Xslice_state
 	shareinput_tag tag;			/* hash key */
 
 	int			refcount;		/* reference count of this entry */
-	bool		ready;			/* is the input fully materialized and ready to be read? */
-	int			ndone;			/* # of consumers that have finished the scan */
+	pg_atomic_uint32	ready;	/* is the input fully materialized and ready to be read? */
+	pg_atomic_uint32	ndone;	/* # of consumers that have finished the scan */
 
 	/*
 	 * ready_done_cv is used for signaling when the scan becomes "ready", and
@@ -180,7 +183,7 @@ typedef struct shareinput_local_state
 } shareinput_local_state;
 
 static shareinput_Xslice_reference *get_shareinput_reference(int share_id);
-static void release_shareinput_reference(shareinput_Xslice_reference *ref);
+static void release_shareinput_reference(shareinput_Xslice_reference *ref, bool reader_squelching);
 static void shareinput_release_callback(ResourceReleasePhase phase,
 										bool isCommit,
 										bool isTopLevel,
@@ -228,7 +231,7 @@ init_tuplestore_state(ShareInputScanState *node)
 			{
 				char		rwfile_prefix[100];
 
-				elog(DEBUG1, "SISC writer (shareid=%d, slice=%d): No tuplestore yet, creating tuplestore",
+				elog((Debug_shareinput_xslice ? LOG : DEBUG1), "SISC WRITER (shareid=%d, slice=%d): No tuplestore yet, creating tuplestore",
 					 sisc->share_id, currentSliceId);
 
 				ts = tuplestore_begin_heap(true, /* randomAccess */
@@ -239,6 +242,20 @@ init_tuplestore_state(ShareInputScanState *node)
 				tuplestore_make_shared(ts,
 									   get_shareinput_fileset(),
 									   rwfile_prefix);
+#ifdef FAULT_INJECTOR
+				if (SIMPLE_FAULT_INJECTOR("sisc_xslice_temp_files") == FaultInjectorTypeSkip)
+				{
+					const char *filename = tuplestore_get_buffilename(ts);
+					if (!filename)
+						ereport(NOTICE, (errmsg("sisc_xslice: buffilename is null")));
+					else if (strstr(filename, "base/" PG_TEMP_FILES_DIR) == filename)
+						ereport(NOTICE, (errmsg("sisc_xslice: Use default tablespace")));
+					else if (strstr(filename, "pg_tblspc/") == filename)
+						ereport(NOTICE, (errmsg("sisc_xslice: Use temp tablespace")));
+					else
+						ereport(NOTICE, (errmsg("sisc_xslice: Unexpected prefix of the tablespace path")));
+				}
+#endif
 			}
 			else
 			{
@@ -349,6 +366,15 @@ ExecShareInputScan(PlanState *pstate)
 	/* if first time call, need to initialize the tuplestore state.  */
 	if (!node->isready)
 		init_tuplestore_state(node);
+	
+	/*
+	 * Return NULL when necessary.
+	 * This could help improve performance, especially when tuplestore is huge, because ShareInputScan 
+	 * do not need to read tuple from tuplestore when discard_output is true, which means current 
+	 * ShareInputScan is one but not the last one of Sequence's subplans.
+	 */
+	if (sisc->discard_output)
+		return NULL;
 
 	slot = node->ss.ps.ps_ResultTupleSlot;
 
@@ -454,14 +480,35 @@ ExecInitShareInputScan(ShareInputScan *node, EState *estate, int eflags)
 	}
 
 	local_state = list_nth(estate->es_sharenode, node->share_id);
-	local_state->nsharers++;
+
+	/*
+	 * To accumulate the number of CTE consumers executed in this slice.
+	 * This variable will be used by the last finishing CTE consumer
+	 * in current slice, to wake the corresponding CTE producer up for
+	 * cleaning the materialized tuplestore, during squelching.
+	 */
+	if (currentSliceId == node->this_slice_id &&
+		currentSliceId != node->producer_slice_id)
+		local_state->nsharers++;
+
 	if (childState)
 		local_state->childState = childState;
 	sisstate->local_state = local_state;
 
 	/* Get a lease on the shared state */
 	if (node->cross_slice)
+	{
+#ifdef FAULT_INJECTOR
+		if (node->producer_slice_id == currentSliceId)
+		{
+			FaultInjector_InjectFaultIfSet("get_shareinput_reference_delay_writer",
+										   DDLNotSpecified,
+										   "",  // databaseName
+										   ""); // tableName
+		}
+#endif
 		sisstate->ref = get_shareinput_reference(node->share_id);
+	}
 	else
 		sisstate->ref = NULL;
 
@@ -530,7 +577,7 @@ ExecEndShareInputScan(ShareInputScanState *node)
 				}
 			}
 		}
-		release_shareinput_reference(node->ref);
+		release_shareinput_reference(node->ref, false);
 		node->ref = NULL;
 	}
 
@@ -604,7 +651,7 @@ ExecSquelchShareInputScan(ShareInputScanState *node)
 			 */
 			if (!local_state->ready)
 			{
-				elog(DEBUG1, "SISC WRITER (shareid=%d, slice=%d): initializing because squelched",
+				elog((Debug_shareinput_xslice ? LOG : DEBUG1), "SISC WRITER (shareid=%d, slice=%d): initializing because squelched",
 					 sisc->share_id, currentSliceId);
 				init_tuplestore_state(node);
 			}
@@ -621,7 +668,7 @@ ExecSquelchShareInputScan(ShareInputScanState *node)
 				shareinput_reader_notifydone(node->ref, sisc->nconsumers);
 				local_state->closed = true;
 			}
-			release_shareinput_reference(node->ref);
+			release_shareinput_reference(node->ref, true);
 			node->ref = NULL;
 		}
 	}
@@ -677,7 +724,6 @@ ShareInputShmemInit(void)
 	{
 		HASHCTL		info;
 
-		// GPDB_12_MERGE_FIXME: would be nicer to store this hash in the DSM segment
 		info.keysize = sizeof(shareinput_tag);
 		info.entrysize = sizeof(shareinput_Xslice_state);
 
@@ -785,10 +831,12 @@ get_shareinput_reference(int share_id)
 		}
 
 		xslice_state->refcount = 0;
-		xslice_state->ready = false;
-		xslice_state->ndone = 0;
+		pg_atomic_init_u32(&xslice_state->ready, 0);
+		pg_atomic_init_u32(&xslice_state->ndone, 0);
 
 		ConditionVariableInit(&xslice_state->ready_done_cv);
+		elog((Debug_shareinput_xslice ? LOG : DEBUG1), "SISC (shareid=%d, slice=%d): initialized xslice state",
+			 share_id, currentSliceId);
 	}
 
 	xslice_state->refcount++;
@@ -807,16 +855,25 @@ get_shareinput_reference(int share_id)
  * Release reference to a shared scan.
  *
  * The reference count in the shared memory slot is decreased, and if
- * it reaches zero, it is destroyed.
+ * it reaches zero, it is destroyed if not in reader squelching.
+ * The reference is also removed from the list of references tracked by
+ * the current ResourceOwner.
+ *
+ * NB: We don't want to destroy the shared state if in reader squelching,
+ * because there might be other readers or writers that are yet to reference
+ * it. So leave the work to the producer.
  */
 static void
-release_shareinput_reference(shareinput_Xslice_reference *ref)
+release_shareinput_reference(shareinput_Xslice_reference *ref, bool reader_squelching)
 {
 	shareinput_Xslice_state *state = ref->xslice_state;
 
 	LWLockAcquire(ShareInputScanLock, LW_EXCLUSIVE);
+	state->refcount--;
+	elog((Debug_shareinput_xslice ? LOG : DEBUG1), "SISC (shareid=%d, slice=%d): decreased xslice state refcount to %d",
+		 state->tag.share_id, currentSliceId, state->refcount);
 
-	if (state->refcount == 1)
+	if (!reader_squelching && state->refcount == 0)
 	{
 		bool		found;
 
@@ -825,9 +882,11 @@ release_shareinput_reference(shareinput_Xslice_reference *ref)
 						   HASH_REMOVE,
 						   &found);
 		Assert(found);
+		elog((Debug_shareinput_xslice ? LOG : DEBUG1), "SISC (shareid=%d, slice=%d): removed xslice state",
+			 state->tag.share_id, currentSliceId);
 	}
-	else
-		state->refcount--;
+	else if (state->refcount == 0)
+		SIMPLE_FAULT_INJECTOR("get_shareinput_reference_done");
 
 	dlist_delete(&ref->node);
 
@@ -861,7 +920,7 @@ shareinput_release_callback(ResourceReleasePhase phase,
 		{
 			if (isCommit)
 				elog(WARNING, "shareinput lease reference leak: lease %p still referenced", ref);
-			release_shareinput_reference(ref);
+			release_shareinput_reference(ref, false);
 		}
 	}
 }
@@ -879,35 +938,29 @@ shareinput_reader_waitready(shareinput_Xslice_reference *ref)
 {
 	shareinput_Xslice_state *state = ref->xslice_state;
 
-	elog(DEBUG1, "SISC READER (shareid=%d, slice=%d): Waiting for producer",
+	elog((Debug_shareinput_xslice ? LOG : DEBUG1), "SISC READER (shareid=%d, slice=%d): Waiting for producer",
 		 ref->share_id, currentSliceId);
 
 	/*
 	 * Wait until the the producer sets 'ready' to true. The producer will
 	 * use the condition variable to wake us up.
-	 *
-	 * No need to hold ShareInputScanLock while we examine state->ready. It's
-	 * a boolean so it's either true or false.
-	 *
-	 * XXX: The ConditionVariablePrepareToSleep() is supposedly not needed, but
-	 * I saw mysterious hangs without it. Maybe we're missing a fix from
-	 * upstream? Or perhaps the condition variable machinery loses track of
-	 * which conditin variable we're prepared on, because the slots in shared
-	 * memory containing the condition variable are recycled. Not sure what
-	 * exactly is going on, but with the PrepareToSleep() and CancelSleep()
-	 * calls this works.
-	 * GPDB_12_MERGE_FIXME: check if that still happens after the v12 merge.
 	 */
-	ConditionVariablePrepareToSleep(&state->ready_done_cv);
-	while (!state->ready)
+	for (;;)
 	{
-		/* GPDB_12_MERGE_FIXME: Create a new WaitEventIPC member for this? */
-		ConditionVariableSleep(&state->ready_done_cv, 0);
+		/*
+		 * set state->ready via pg_atomic_exchange_u32() in shareinput_writer_notifyready()
+		 * it acts as a memory barrier, so always get the latest value here
+		 */
+		int ready = pg_atomic_read_u32(&state->ready);
+		if (ready)
+			break;
+
+		ConditionVariableSleep(&state->ready_done_cv, WAIT_EVENT_SHAREINPUT_SCAN);
 	}
 	ConditionVariableCancelSleep();
 
 	/* it's ready now */
-	elog(DEBUG1, "SISC READER (shareid=%d, slice=%d): Wait ready got writer's handshake",
+	elog((Debug_shareinput_xslice ? LOG : DEBUG1), "SISC READER (shareid=%d, slice=%d): Wait ready got writer's handshake",
 		 ref->share_id, currentSliceId);
 }
 
@@ -923,13 +976,16 @@ shareinput_writer_notifyready(shareinput_Xslice_reference *ref)
 {
 	shareinput_Xslice_state *state = ref->xslice_state;
 
-	/* we're the only writer, so no need to acquire the lock. */
-	Assert(!state->ready);
-	state->ready = true;
+	uint32 old_ready PG_USED_FOR_ASSERTS_ONLY = pg_atomic_exchange_u32(&state->ready, 1);
+	Assert(old_ready == 0);
+
+#ifdef FAULT_INJECTOR
+	SIMPLE_FAULT_INJECTOR("shareinput_writer_notifyready");
+#endif
 
 	ConditionVariableBroadcast(&state->ready_done_cv);
 
-	elog(DEBUG1, "SISC WRITER (shareid=%d, slice=%d): wrote notify_ready",
+	elog((Debug_shareinput_xslice ? LOG : DEBUG1), "SISC WRITER (shareid=%d, slice=%d): wrote notify_ready",
 		 ref->share_id, currentSliceId);
 }
 
@@ -945,18 +1001,13 @@ static void
 shareinput_reader_notifydone(shareinput_Xslice_reference *ref, int nconsumers)
 {
 	shareinput_Xslice_state *state = ref->xslice_state;
-	int		ndone;
-
-	LWLockAcquire(ShareInputScanLock, LW_EXCLUSIVE);
-	state->ndone++;
-	ndone = state->ndone;
-	LWLockRelease(ShareInputScanLock);
+	int ndone = pg_atomic_add_fetch_u32(&state->ndone, 1);
 
 	/* If we were the last consumer, wake up the producer. */
 	if (ndone >= nconsumers)
 		ConditionVariableBroadcast(&state->ready_done_cv);
 
-	elog(DEBUG1, "SISC READER (shareid=%d, slice=%d): wrote notify_done",
+	elog((Debug_shareinput_xslice ? LOG : DEBUG1), "SISC READER (shareid=%d, slice=%d): wrote notify_done",
 		 ref->share_id, currentSliceId);
 }
 
@@ -973,25 +1024,24 @@ shareinput_writer_waitdone(shareinput_Xslice_reference *ref, int nconsumers)
 {
 	shareinput_Xslice_state *state = ref->xslice_state;
 
-	if (!state->ready)
+	int ready = pg_atomic_read_u32(&state->ready);
+	if (!ready)
 		elog(ERROR, "shareinput_writer_waitdone() called without creating the tuplestore");
 
 	ConditionVariablePrepareToSleep(&state->ready_done_cv);
 	for (;;)
 	{
-		int			ndone;
-
-		LWLockAcquire(ShareInputScanLock, LW_SHARED);
-		ndone = state->ndone;
-		LWLockRelease(ShareInputScanLock);
-
+		/*
+		 * set state->ndone via pg_atomic_add_fetch_u32() in shareinput_reader_notifydone()
+		 * it acts as a memory barrier, so always get the latest value here
+		 */
+		int	ndone = pg_atomic_read_u32(&state->ndone);
 		if (ndone < nconsumers)
 		{
-			elog(DEBUG1, "SISC WRITER (shareid=%d, slice=%d): waiting for DONE message from %d / %d readers",
+			elog((Debug_shareinput_xslice ? LOG : DEBUG1), "SISC WRITER (shareid=%d, slice=%d): waiting for DONE message from %d / %d readers",
 				 ref->share_id, currentSliceId, nconsumers - ndone, nconsumers);
 
-			/* GPDB_12_MERGE_FIXME: Create a new WaitEventIPC member for this? */
-			ConditionVariableSleep(&state->ready_done_cv, 0);
+			ConditionVariableSleep(&state->ready_done_cv, WAIT_EVENT_SHAREINPUT_SCAN);
 
 			continue;
 		}
@@ -1002,7 +1052,7 @@ shareinput_writer_waitdone(shareinput_Xslice_reference *ref, int nconsumers)
 		break;
 	}
 
-	elog(DEBUG1, "SISC WRITER (shareid=%d, slice=%d): got DONE message from %d readers",
+	elog((Debug_shareinput_xslice ? LOG : DEBUG1), "SISC WRITER (shareid=%d, slice=%d): got DONE message from %d readers",
 		 ref->share_id, currentSliceId, nconsumers);
 
 	/* it's all done now */

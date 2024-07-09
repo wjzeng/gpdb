@@ -27,7 +27,6 @@
 /*
  * GUC variables.
  */
-extern int						gp_resgroup_memory_policy;
 extern int						gp_resqueue_memory_policy;
 extern bool						gp_log_resqueue_memory;
 extern int						gp_resqueue_memory_policy_auto_fixed_mem;
@@ -101,6 +100,13 @@ typedef struct ResPortalIncrement
 	Cost		increments[NUM_RES_LIMIT_TYPES];
 } ResPortalIncrement;
 
+typedef enum
+{
+	RES_INCREMENT_ADD_OK,
+	RES_INCREMENT_ADD_OOSM,
+	RES_INCREMENT_ADD_DUPLICATE_PORTAL
+} ResIncrementAddStatus;
+
 typedef struct ResPortalTag
 {
 	int			pid;
@@ -140,6 +146,7 @@ extern void				ResRemoveFromWaitQueue(PGPROC *proc, uint32 hashcode);
 extern bool				ResCheckSelfDeadLock(LOCK *lock, PROCLOCK *proclock, ResPortalIncrement *incSet);
 
 extern ResPortalIncrement	*ResIncrementFind(ResPortalTag *portaltag);
+extern bool 				ResPortalHasDanglingIncrement(Portal portal);
 
 extern bool					ResPortalIncrementHashTableInit(void);
 

@@ -22,7 +22,8 @@ using namespace gpos;
 
 
 // logger buffer must be large enough to store error messages
-GPOS_CPL_ASSERT(GPOS_ERROR_MESSAGE_BUFFER_SIZE <= GPOS_LOG_ENTRY_BUFFER_SIZE);
+GPOS_CPL_ASSERT(GPOS_ERROR_MESSAGE_BUFFER_SIZE <= GPOS_LOG_ENTRY_BUFFER_SIZE,
+				"");
 
 
 //---------------------------------------------------------------------------
@@ -90,7 +91,9 @@ void
 CErrorContext::Record(CException &exc, VA_LIST vl)
 {
 	if (m_serializing)
+	{
 		return;
+	}
 
 #ifdef GPOS_DEBUG
 	if (m_pending)
@@ -187,7 +190,9 @@ void
 CErrorContext::Serialize()
 {
 	if (m_serializing)
+	{
 		return;
+	}
 
 	if (nullptr == m_mini_dumper_handle ||
 		m_serializable_objects_list.IsEmpty())

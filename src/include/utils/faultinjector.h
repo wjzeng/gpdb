@@ -61,8 +61,13 @@ typedef struct FaultInjectorEntry_s {
 	FaultInjectorType_e		faultInjectorType;
 	
 	int						extraArg;
-		/* in seconds, in use if fault injection type is sleep */
-		
+		/*
+		 * - in seconds, in use if fault injection type is sleep
+		 * - exit code, in use if fault injection type is exit
+		 */
+	int						gpSessionid;
+		/* -1 means the fault could be triggered by any process */
+
 	DDLStatement_e			ddlStatement;
 	
 	char					databaseName[NAMEDATALEN];
@@ -106,7 +111,7 @@ extern int *numActiveFaults_ptr;
 
 extern char *InjectFault(
 	char *faultName, char *type, char *ddlStatement, char *databaseName,
-	char *tableName, int startOccurrence, int endOccurrence, int extraArg);
+	char *tableName, int startOccurrence, int endOccurrence, int extraArg, int gpSessionid);
 
 extern void HandleFaultMessage(const char* msg);
 
@@ -115,11 +120,10 @@ void register_fault_injection_warning(fault_injection_warning_function warning);
 
 #ifdef FAULT_INJECTOR
 extern bool am_faulthandler;
-#define IsFaultHandler am_faulthandler
 #define SIMPLE_FAULT_INJECTOR(FaultName) \
 	FaultInjector_InjectFaultIfSet(FaultName, DDLNotSpecified, "", "")
 #else
-#define IsFaultHandler false
+#define am_faulthandler false
 #define SIMPLE_FAULT_INJECTOR(FaultName)
 #endif
 

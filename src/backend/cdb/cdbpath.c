@@ -57,6 +57,18 @@ typedef struct
 	bool		has_wts;		/* Does the rel have WorkTableScan? */
 } CdbpathMfjRel;
 
+/*
+ * We introduced execute on initplan option for function at
+ * https://github.com/greenplum-db/gpdb/pull/9542, which introduced
+ * a new location option for function: EXECUTE ON INITPLAN and run
+ * the f() on initplan.
+ *
+ * But if f() itself is in initplan, this execution method will cause
+ * problems. Therefore, the variable allow_append_initplan_for_function_scan
+ * is introduced to control this optimization
+ */
+static bool allow_append_initplan_for_function_scan = true;
+
 static bool try_redistribute(PlannerInfo *root, CdbpathMfjRel *g,
 							 CdbpathMfjRel *o, List *redistribution_clauses);
 
@@ -171,6 +183,37 @@ cdbpath_create_motion_path(PlannerInfo *root,
 	 */
 	if (cdbpathlocus_equal(subpath->locus, locus))
 		return subpath;
+
+	/*
+	 * This can be only happened for create as or dml
+	 * The target locus is CdbLocusType_Replicated or CdbLocusType_Partitioned
+	 * However, the locus of subpath is CdbLocusType_OuterQuery
+	 * Adjust the locus of subpath according to target locus.
+	 */
+	if (CdbPathLocus_IsOuterQuery(subpath->locus)
+				&& !CdbPathLocus_IsOuterQuery(locus))
+	{
+		/*
+		 * If target locus is replicated
+		 * adjust locus of subpath to CdbLocusType_Replicated
+		 * and there is no need to add a motion between them.
+		 */
+		if (CdbPathLocus_IsReplicated(locus))
+		{
+			subpath->locus.locustype = CdbLocusType_Replicated;
+			subpath->locus.numsegments = locus.numsegments;
+		}
+		/*
+		 * If target locus is partitioned
+		 * Adjust locus of subpath to CdbLocusType_SingleQE
+		 * then add a redistribution motion above it.
+		 */
+		else if (CdbPathLocus_IsPartitioned(locus))
+		{
+			subpath->locus.locustype = CdbLocusType_SingleQE;
+			subpath->locus.numsegments = 1;
+		}
+	}
 
 	/* Moving subpath output to a single executor process (qDisp or qExec)? */
 	if (CdbPathLocus_IsOuterQuery(locus))
@@ -1237,7 +1280,7 @@ add_rowid_to_path(PlannerInfo *root, Path *path, int *rowidexpr_id)
  * Decides where a join should be done.  Adds Motion operators atop
  * the subpaths if needed to deliver their results to the join locus.
  * Returns the join locus if ok, or a null locus otherwise. If
- * jointype is JOIN_SEMI_DEDUP or JOIN_SEMI_DEDUP_REVERSE, this also
+ * jointype is JOIN_DEDUP_SEMI or JOIN_DEDUP_SEMI_REVERSE, this also
  * tacks a RowIdExpr on one side of the join, and *p_rowidexpr_id is
  * set to the ID of that. The caller is expected to uniquefy
  * the result after the join, passing the rowidexpr_id to
@@ -1309,7 +1352,7 @@ cdbpath_motion_for_join(PlannerInfo *root,
 	 * And in the function cdbpathlocus_join there is a rule:
 	 * <any locus type> join <Replicated> => any locus type
 	 * Proof by contradiction, it shows that when code arrives here,
-	 * is is impossible that any of the two input paths' locus
+	 * it is impossible that any of the two input paths' locus
 	 * is Replicated. So we add two asserts here.
 	 */
 	Assert(!CdbPathLocus_IsReplicated(outer.locus));
@@ -1981,7 +2024,7 @@ cdbpath_motion_for_join(PlannerInfo *root,
 			CdbPathLocus_MakeReplicated(&small_rel->move_to,
 										CdbPathLocus_NumSegments(large_rel->locus));
 
-		/* Replicate largeer rel if cheaper than redistributing both rels. */
+		/* Replicate larger rel if cheaper than redistributing both rels. */
 		else if (!large_rel->require_existing_order &&
 				 large_rel->ok_to_replicate &&
 				 (large_rel->bytes * CdbPathLocus_NumSegments(small_rel->locus) <
@@ -2025,14 +2068,17 @@ cdbpath_motion_for_join(PlannerInfo *root,
 			CdbPathLocus_MakeReplicated(&large_rel->move_to,
 										CdbPathLocus_NumSegments(small_rel->locus));
 
-		/* Last resort: Move both rels to a single qExec. */
-		else
+		/* Last resort: Move both rels to a single qExec
+		 * only if there is no wts on either rels*/
+		else if (!outer.has_wts && !inner.has_wts)
 		{
 			int numsegments = CdbPathLocus_CommonSegments(outer.locus,
 														  inner.locus);
 			CdbPathLocus_MakeSingleQE(&outer.move_to, numsegments);
 			CdbPathLocus_MakeSingleQE(&inner.move_to, numsegments);
 		}
+		else
+			goto fail;
 	}							/* partitioned */
 
 	/*
@@ -2303,7 +2349,8 @@ create_motion_path_for_insert(PlannerInfo *root, GpPolicy *policy,
 			/*
 			 * If the target table is DISTRIBUTED RANDOMLY, we can insert the
 			 * rows anywhere. So if the input path is already partitioned, let
-			 * the insertions happen where they are.
+			 * the insertions happen where they are. Unless the GUC gp_force_random_redistribution
+			 * tells us to force the redistribution.
 			 *
 			 * If you `explain` the query insert into tab_random select * from tab_partition
 			 * there is not Motion node in plan. However, it is not means that the query only
@@ -2312,7 +2359,7 @@ create_motion_path_for_insert(PlannerInfo *root, GpPolicy *policy,
 			 * But, we need to grant a Motion node if target locus' segnumber is different with
 			 * subpath.
 			 */
-			if(targetLocus.numsegments != subpath->locus.numsegments)
+			if (gp_force_random_redistribution || targetLocus.numsegments != subpath->locus.numsegments)
 			{
 				CdbPathLocus_MakeStrewn(&targetLocus, policy->numsegments);
 				subpath = cdbpath_create_motion_path(root, subpath, NIL, false, targetLocus);
@@ -2342,7 +2389,8 @@ create_motion_path_for_insert(PlannerInfo *root, GpPolicy *policy,
 	{
 		/* try to optimize insert with no motion introduced into */
 		if (optimizer_replicated_table_insert &&
-			!contain_volatile_functions((Node *)subpath->pathtarget->exprs))
+			!contain_volatile_functions((Node *)subpath->pathtarget->exprs) &&
+			!contain_volatile_functions((Node *)root->parse->havingQual))
 		{
 			/*
 			 * CdbLocusType_SegmentGeneral is only used by replicated table
@@ -2385,6 +2433,28 @@ create_motion_path_for_insert(PlannerInfo *root, GpPolicy *policy,
 				return subpath;
 			}
 
+			/* plan's data can be available on all segment, no motion needed */
+			if(CdbPathLocus_IsOuterQuery(subpath->locus))
+			{
+				/*
+				 * A query to reach here:
+				 * create table dest (tc1 int, tc2 int) distributed replicated;
+				 * insert into dest
+				 *   select
+				 *       a.tc1,ss.tc2
+				 *   from
+				 *       ttt1 a join lateral (
+				 *              select * from ttt2 b where b.tc2 =  a.tc2 limit 1)ss
+				 *   on true ;
+				 * The locus of subpath is outerquery, if locus of target table is replicated.
+				 * wo can modify locus of subpath to CdbLocusType_SegmentGeneral.
+				 * And there is no need to add a motion.
+				 */
+				subpath->locus.numsegments = Min(subpath->locus.numsegments, policy->numsegments) ;
+				subpath->locus.locustype = CdbLocusType_SegmentGeneral;
+				return subpath;
+			}
+
 		}
 		subpath = cdbpath_create_broadcast_motion_path(root, subpath, policy->numsegments);
 	}
@@ -2411,13 +2481,12 @@ create_motion_path_for_upddel(PlannerInfo *root, Index rti, GpPolicy *policy,
 			return subpath;
 		else
 		{
-			/* GPDB_96_MERGE_FIXME: avoid creating the Explicit Motion in
-			 * simple cases, where all the input data is already on the
-			 * same segment.
-			 *
-			 * Is "strewn" correct here? Can we do better?
-			 */
 			CdbPathLocus_MakeStrewn(&targetLocus, policy->numsegments);
+			if(CdbPathLocus_IsOuterQuery(subpath->locus))
+			{
+				subpath->locus.numsegments = 1;
+				subpath->locus.locustype = CdbLocusType_SingleQE;
+			}
 			subpath = cdbpath_create_explicit_motion_path(root,
 														  subpath,
 														  targetLocus);
@@ -2425,7 +2494,7 @@ create_motion_path_for_upddel(PlannerInfo *root, Index rti, GpPolicy *policy,
 	}
 	else if (policyType == POLICYTYPE_ENTRY)
 	{
-		/* Master-only table */
+		/* Coordinator-only table */
 		CdbPathLocus_MakeEntry(&targetLocus);
 		subpath = cdbpath_create_motion_path(root, subpath, NIL, false, targetLocus);
 	}
@@ -2475,28 +2544,19 @@ create_motion_path_for_upddel(PlannerInfo *root, Index rti, GpPolicy *policy,
  * consist of a delete and insert. So, if the result relation has update
  * triggers, we should reject and error out because it's not functional.
  *
- * GPDB_96_MERGE_FIXME: the below comment is obsolete. Nowadays, SplitUpdate
- * computes the new row's hash, and the corresponding. target segment. The
- * old segment comes from the gp_segment_id junk column. But ORCA still
- * does it the old way!
- *
- * Third, to support deletion, and hash delete operation to correct segment,
- * we need to get attributes of OLD tuple. The old attributes must therefore
- * be present in the subplan's target list. That is handled earlier in the
- * planner, in expand_targetlist().
  *
  * For example, a typical plan would be as following for statement:
  * update foo set id = l.v + 1 from dep l where foo.v = l.id:
  *
- * |-- join ( targetlist: [ l.v + 1, foo.v, foo.id, foo.ctid, foo.gp_segment_id ] )
+ * |-- join ( targetlist: [ l.v + 1, foo.v, foo.ctid, foo.gp_segment_id ] )
  *       |
  *       |-- motion ( targetlist: [l.id, l.v] )
  *       |    |
  *       |    |-- seqscan on dep ....
  *       |
- *       |-- hash (targetlist [ v, foo.ctid, foo.gp_segment_id ] )
+ *       |-- hash (targetlist [ foo.v, foo.ctid, foo.gp_segment_id ] )
  *            |
- *            |-- seqscan on foo (targetlist: [ v, foo.id, foo.ctid, foo.gp_segment_id ] )
+ *            |-- seqscan on foo (targetlist: [ foo.v, foo.ctid, foo.gp_segment_id ] )
  *
  * From the plan above, the target foo.id is assigned as l.v + 1, and expand_targetlist()
  * ensured that the old value of id, is also available, even though it would not otherwise
@@ -2524,13 +2584,18 @@ create_split_update_path(PlannerInfo *root, Index rti, GpPolicy *policy, Path *s
 		targetLocus = cdbpathlocus_for_insert(root, policy, subpath->pathtarget);
 
 		subpath = (Path *) make_splitupdate_path(root, subpath, rti);
+		if(CdbPathLocus_IsOuterQuery(subpath->locus))
+		{
+			subpath->locus.numsegments = 1;
+			subpath->locus.locustype = CdbLocusType_SingleQE;
+		}
 		subpath = cdbpath_create_explicit_motion_path(root,
 													  subpath,
 													  targetLocus);
 	}
 	else if (policyType == POLICYTYPE_ENTRY)
 	{
-		/* Master-only table */
+		/* Coordinator-only table */
 		CdbPathLocus_MakeEntry(&targetLocus);
 		subpath = cdbpath_create_motion_path(root, subpath, NIL, false, targetLocus);
 	}
@@ -2586,6 +2651,12 @@ turn_volatile_seggen_to_singleqe(PlannerInfo *root, Path *path, Node *node)
 		CdbPathLocus_MakeSingleQE(&singleQE,
 								  CdbPathLocus_NumSegments(path->locus));
 		mpath = cdbpath_create_motion_path(root, path, NIL, false, singleQE);
+		/*
+		 * mpath might be NULL, like path contain outer Params
+		 * See Github Issue 13532 for details.
+		 */
+		if (mpath == NULL)
+			return path;
 		ppath =  create_projection_path_with_quals(root, mpath->parent, mpath,
 												   mpath->pathtarget, NIL, false);
 		ppath->force = true;
@@ -2606,12 +2677,25 @@ make_splitupdate_path(PlannerInfo *root, Path *subpath, Index rti)
 	/* Suppose we already hold locks before caller */
 	rte = planner_rt_fetch(rti, root);
 
-	/* GPDB_96_MERGE_FIXME: Why is this not allowed? */
-	/* GPDB_12_MERGE_FIXME: PostgreSQL fires the DELETE+INSERT trigger, if
-	 * you UPDATE a partitioning key column. We could probably do the same with
-	 * update on the distribution key column.
+	/*
+	 * Firstly, Trigger is not supported officially by Greenplum.
+	 *
+	 * Secondly, the update trigger is processed in ExecUpdate.
+	 * however, splitupdate will execute ExecSplitUpdate_Insert
+	 * or ExecDelete instead of ExecUpdate. So the update trigger
+	 * will not be triggered in a split plan.
+	 *
+	 * PostgreSQL fires the row-level DELETE, INSERT, and BEFORE
+	 * UPDATE triggers, but not row-level AFTER UPDATE triggers,
+	 * if you UPDATE a partitioning key column.
+	 * Doing a similar thing doesn't help Greenplum likely, the
+	 * behavior would be uncertain since some triggers happen on
+	 * segments and they may require cross segments data changes.
+	 *
+	 * So an update trigger is not allowed when updating the
+	 * distribution key.
 	 */
-	if (has_update_triggers(rte->relid))
+	if (has_update_triggers(rte->relid, false))
 		ereport(ERROR,
 				(errcode(ERRCODE_GP_FEATURE_NOT_YET),
 				 errmsg("UPDATE on distributed key column not allowed on relation with update triggers")));
@@ -2659,4 +2743,22 @@ can_elide_explicit_motion(PlannerInfo *root, Index rti, Path *subpath,
 	}
 
 	return false;
+}
+
+void
+unset_allow_append_initplan_for_function_scan()
+{
+	allow_append_initplan_for_function_scan = false;
+}
+
+void
+set_allow_append_initplan_for_function_scan()
+{
+	allow_append_initplan_for_function_scan = true;
+}
+
+bool
+get_allow_append_initplan_for_function_scan()
+{
+	return allow_append_initplan_for_function_scan;
 }

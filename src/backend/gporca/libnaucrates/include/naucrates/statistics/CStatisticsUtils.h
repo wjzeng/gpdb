@@ -69,7 +69,7 @@ private:
 	};
 
 	// array of SMcvVPairs
-	typedef CDynamicPtrArray<SMcvPair, CleanupDelete> SMcvPairPtrArray;
+	using SMcvPairPtrArray = CDynamicPtrArray<SMcvPair, CleanupDelete>;
 
 	// given MCVs and histogram buckets, merge them into buckets of a single histogram
 	static CBucketArray *MergeMcvHistBucket(
@@ -216,7 +216,8 @@ public:
 
 	// derive statistics of dynamic scan based on part-selector stats in the given map
 	static IStatistics *DeriveStatsForDynamicScan(
-		CMemoryPool *mp, CExpressionHandle &expr_handle, ULONG part_idx_id);
+		CMemoryPool *mp, CExpressionHandle &exprhdl, ULONG scan_id,
+		CPartitionPropagationSpec *pps_reqd);
 
 	// derive statistics of (dynamic) index-get
 	static IStatistics *DeriveStatsForIndexGet(

@@ -76,6 +76,7 @@
 #include "postgres.h"
 
 #include "cdb/cdbvars.h"
+#include "common/hashfn.h"
 #include "funcapi.h"
 #include "lib/ilist.h"
 #include "storage/buffile.h"
@@ -548,8 +549,14 @@ workfile_mgr_create_set(const char *operator_name, const char *prefix, bool hold
 
 	if (!proc_exit_hook_registered)
 	{
-		/* register proc-exit hook to ensure temp files are dropped at exit */
-		before_shmem_exit(AtProcExit_WorkFile, 0);
+		/*
+		 * register proc-exit hook to ensure temp files are dropped at exit.
+		 *
+		 * The hook must run after before_shmem_exit(), because before_shmem_exit may do
+		 * some cleanup in transaction level, but AtProcExit_WorkFile cleans up the session
+		 * level objects which may be referenced by some short-life objects, e.g. executor nodes.
+		 */
+		on_shmem_exit(AtProcExit_WorkFile, 0);
 		proc_exit_hook_registered = true;
 	}
 
@@ -630,6 +637,8 @@ workfile_mgr_create_set_internal(const char *operator_name, const char *prefix)
 	work_set->total_bytes = 0;
 	work_set->active = true;
 	work_set->pinned = false;
+	work_set->compression_buf_total = 0;
+	work_set->num_files_compressed = 0;
 
 	/* Track all workfile_sets created in current process */
 	if (!localCtl.initialized)
@@ -719,7 +728,7 @@ workfile_mgr_close_set(workfile_set *work_set)
 			WorkFileUsagePerQuery *perquery = work_set->perquery;
 
 			ereport(WARNING,
-					(errmsg("workfile_set %s still contains files for unknow reason.", work_set->prefix),
+					(errmsg("workfile_set %s still contains files for unknown reason.", work_set->prefix),
 					 errprintstack(true)));
 
 			if (!perquery->active)

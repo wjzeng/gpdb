@@ -150,6 +150,9 @@ struct BufFile
 	/* This holds compressed input, during decompression. */
 	ZSTD_inBuffer compressed_buffer;
 	bool		decompression_finished;
+
+	/* Memory usage by ZSTD compression buffer */
+	size_t		compressed_buffer_size;
 #endif
 };
 
@@ -158,7 +161,7 @@ static BufFile *makeBufFile(File firstfile, const char *operation_name);
 static void extendBufFile(BufFile *file);
 static void BufFileLoadBuffer(BufFile *file);
 static void BufFileDumpBuffer(BufFile *file);
-static int	BufFileFlush(BufFile *file);
+static void BufFileFlush(BufFile *file);
 static File MakeNewSharedSegment(BufFile *file, int segment);
 
 static void BufFileStartCompression(BufFile *file);
@@ -204,6 +207,10 @@ makeBufFile(File firstfile, const char *operation_name)
 
 	file->operation_name = pstrdup(operation_name);
 
+#ifdef USE_ZSTD
+	file->compressed_buffer_size = 0;
+#endif
+
 	return file;
 }
 
@@ -238,14 +245,16 @@ extendBufFile(BufFile *file)
 	 * Register the file as a "work file", so that the Greenplum workfile
 	 * limits apply to it.
 	 *
-	 * GPDB_12_MERGE_FIXME: In previous Greenplum versions, we had disabled
-	 * the Postgres 1 GB segmentation of BufFiles. It was resurrected with
-	 * The v12 merge. Now each 1 GB segment file counts as one work file.
-	 * That makes the limit on the number of work files work differently.
-	 * Is that OK? Documentation changes needed, at least.
+	 * Note: The GUC gp_workfile_limit_files_per_query is used to control the
+	 * maximum number of spill files for a given query, to prevent runaway
+	 * queries from destroying the entire system. Counting each segment file is
+	 * reasonable for this scenario.
 	 */
-	FileSetIsWorkfile(pfile);
-	RegisterFileWithSet(pfile, file->work_set);
+	if (file->work_set)
+	{
+		FileSetIsWorkfile(pfile);
+		RegisterFileWithSet(pfile, file->work_set);
+	}
 }
 
 /*
@@ -287,9 +296,12 @@ BufFileCreateTempInSet(char *operation_name, bool interXact, workfile_set *work_
 	 * Register the file as a "work file", so that the Greenplum workfile
 	 * limits apply to it.
 	 */
-	file->work_set = work_set;
-	FileSetIsWorkfile(pfile);
-	RegisterFileWithSet(pfile, work_set);
+	if (work_set)
+	{
+		file->work_set = work_set;
+		FileSetIsWorkfile(pfile);
+		RegisterFileWithSet(pfile, work_set);
+	}
 
 	SIMPLE_FAULT_INJECTOR("workfile_creation_failure");
 
@@ -553,7 +565,14 @@ BufFileLoadBuffer(BufFile *file)
 							file->curOffset,
 							WAIT_EVENT_BUFFILE_READ);
 	if (file->nbytes < 0)
+	{
 		file->nbytes = 0;
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not read file \"%s\": %m",
+						FilePathName(thisfile))));
+	}
+
 	/* we choose not to advance curOffset here */
 
 	if (file->nbytes > 0)
@@ -609,7 +628,10 @@ BufFileDumpBuffer(BufFile *file)
 								 file->curOffset,
 								 WAIT_EVENT_BUFFILE_WRITE);
 		if (bytestowrite <= 0)
-			return;				/* failed to write */
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not write to file \"%s\": %m",
+							FilePathName(thisfile))));
 		file->curOffset += bytestowrite;
 		wpos += bytestowrite;
 
@@ -641,7 +663,8 @@ BufFileDumpBuffer(BufFile *file)
 /*
  * BufFileRead
  *
- * Like fread() except we assume 1-byte element size.
+ * Like fread() except we assume 1-byte element size and report I/O errors via
+ * ereport().
  */
 size_t
 BufFileRead(BufFile *file, void *ptr, size_t size)
@@ -664,12 +687,7 @@ BufFileRead(BufFile *file, void *ptr, size_t size)
 			return BufFileLoadCompressedBuffer(file, ptr, size);
 	}
 
-	if (file->dirty)
-	{
-		if (BufFileFlush(file) != 0)
-			return 0;			/* could not flush... */
-		Assert(!file->dirty);
-	}
+	BufFileFlush(file);
 
 	while (size > 0)
 	{
@@ -744,7 +762,8 @@ BufFileReadFromBuffer(BufFile *file, size_t size)
 /*
  * BufFileWrite
  *
- * Like fwrite() except we assume 1-byte element size.
+ * Like fwrite() except we assume 1-byte element size and report errors via
+ * ereport().
  */
 size_t
 BufFileWrite(BufFile *file, void *ptr, size_t size)
@@ -777,11 +796,7 @@ BufFileWrite(BufFile *file, void *ptr, size_t size)
 		{
 			/* Buffer full, dump it out */
 			if (file->dirty)
-			{
 				BufFileDumpBuffer(file);
-				if (file->dirty)
-					break;		/* I/O error */
-			}
 			else
 			{
 				/* Hmm, went directly from reading to writing? */
@@ -813,9 +828,9 @@ BufFileWrite(BufFile *file, void *ptr, size_t size)
 /*
  * BufFileFlush
  *
- * Like fflush()
+ * Like fflush(), except that I/O errors are reported with ereport().
  */
-static int
+static void
 BufFileFlush(BufFile *file)
 {
 	switch (file->state)
@@ -831,17 +846,13 @@ BufFileFlush(BufFile *file)
 		case BFS_SEQUENTIAL_READING:
 		case BFS_COMPRESSED_READING:
 			/* no-op. */
-			return 0;
+			return;
 	}
 
 	if (file->dirty)
-	{
 		BufFileDumpBuffer(file);
-		if (file->dirty)
-			return EOF;
-	}
 
-	return 0;
+	Assert(!file->dirty);
 }
 
 /*
@@ -850,6 +861,7 @@ BufFileFlush(BufFile *file)
  * Like fseek(), except that target position needs two values in order to
  * work when logical filesize exceeds maximum value representable by off_t.
  * We do not support relative seeks across more than that, however.
+ * I/O errors are reported by ereport().
  *
  * Result is 0 if OK, EOF if not.  Logical position is not moved if an
  * impossible seek is attempted.
@@ -948,8 +960,7 @@ BufFileSeek(BufFile *file, int fileno, off_t offset, int whence)
 		return 0;
 	}
 	/* Otherwise, must reposition buffer, so flush any dirty data */
-	if (BufFileFlush(file) != 0)
-		return EOF;
+	BufFileFlush(file);
 
 	/*
 	 * At this point and no sooner, check for seek past last segment. The
@@ -1025,7 +1036,7 @@ BufFileTellBlock(BufFile *file)
 #endif
 
 /*
- * Return the current shared BufFile size.
+ * Return the current fileset based BufFile size.
  *
  * Counts any holes left behind by BufFileAppend as part of the size.
  * ereport()s on failure.
@@ -1050,6 +1061,45 @@ BufFileSize(BufFile *file)
 
 	return ((file->numFiles - 1) * (int64) MAX_PHYSICAL_FILESIZE) +
 		lastFileSize;
+}
+
+/*
+ * Returns the size of this file according to current accounting.
+ *
+ * Unlike BufFileSize(), which only returns the size of BufFile flushed to the
+ * disk, BufFileGetSize() returns the size of whole BufFile including buffer.
+ *
+ * For a compressed BufFile, this returns the uncompressed size!
+ */
+int64
+BufFileGetSize(BufFile *file)
+{
+	Assert(NULL != file);
+
+	switch (file->state)
+	{
+	case BFS_RANDOM_ACCESS:
+	case BFS_SEQUENTIAL_WRITING:
+	case BFS_SEQUENTIAL_READING:
+		break;
+	case BFS_COMPRESSED_WRITING:
+	case BFS_COMPRESSED_READING:
+#ifdef USE_ZSTD
+		return file->uncompressed_bytes;
+#else
+		Assert(false);
+		break;
+#endif
+	}
+
+	int64 fileSizeWithoutBuffer = BufFileSize(file);
+
+	/* Writing after seek back doesn't always change the size. */
+	if (fileSizeWithoutBuffer > (file->curOffset + file->pos))
+	{
+		return fileSizeWithoutBuffer;
+	}
+	return file->curOffset + file->pos;
 }
 
 /*
@@ -1198,11 +1248,26 @@ bool gp_workfile_compression;		/* GUC */
 void
 BufFilePledgeSequential(BufFile *buffile)
 {
+	workfile_set *work_set = buffile->work_set;
+
 	if (BufFileSize(buffile) != 0)
 		elog(ERROR, "cannot pledge sequential access to a temporary file after writing it");
 
-	if (gp_workfile_compression)
+	AssertImply(work_set->compression_buf_total > 0, gp_workfile_compression);
+
+	/*
+	 * If gp_workfile_compression_overhead_limit is 0, it means no limit for
+	 * memory used by compressed work files. Othersize, compress the work file
+	 * only when the used memory size is under the limit.
+	 */
+	if (gp_workfile_compression &&
+		(gp_workfile_compression_overhead_limit == 0 ||
+		 work_set->compression_buf_total <
+			gp_workfile_compression_overhead_limit * 1024UL))
+	{
 		BufFileStartCompression(buffile);
+		work_set->num_files_compressed++;
+	}
 }
 
 /*
@@ -1269,6 +1334,7 @@ BufFileDumpCompressedBuffer(BufFile *file, const void *buffer, Size nbytes)
 {
 	ZSTD_inBuffer input;
 	off_t pos = 0;
+	size_t	compressed_buffer_size = 0;
 
 	file->uncompressed_bytes += nbytes;
 
@@ -1301,6 +1367,25 @@ BufFileDumpCompressedBuffer(BufFile *file, const void *buffer, Size nbytes)
 			pos += wrote;
 		}
 	}
+
+	/*
+	 * Calculate the delta of buffer used by ZSTD stream and take it into
+	 * account to work_set->comp_buf_total.
+	 */
+
+	compressed_buffer_size = ZSTD_sizeof_CStream(file->zstd_context->cctx);
+
+	/*
+	 * As ZSTD comments said, the memory usage can evolve (increase or
+	 * decrease) over time. We update work_set->compressed_buffer_size only
+	 * when compressed_buffer_size increases. It means we apply the comp buff
+	 * limit to max ever memory usage and ignore the case of memory decreasing.
+	 */
+	if (compressed_buffer_size > file->compressed_buffer_size)
+		file->work_set->compression_buf_total
+			+= compressed_buffer_size - file->compressed_buffer_size;
+	file->compressed_buffer_size = compressed_buffer_size;
+
 	file->curOffset += pos;
 }
 
@@ -1421,7 +1506,7 @@ BufFileLoadCompressedBuffer(BufFile *file, void *buffer, size_t bufsize)
 
 	return output.pos;
 }
-#else		/* HAVE_ZSTD */
+#else		/* USE_ZSTD */
 
 /*
  * Dummy versions of the compression functions, when the server is built
@@ -1451,4 +1536,4 @@ BufFileLoadCompressedBuffer(BufFile *file, void *buffer, size_t bufsize)
 	elog(ERROR, "zstandard compression not supported by this build");
 }
 
-#endif		/* HAVE_ZSTD */
+#endif		/* USE_ZSTD */

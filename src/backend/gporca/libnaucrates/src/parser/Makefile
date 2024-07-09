@@ -28,12 +28,15 @@ OBJS        = CParseHandlerAgg.o \
               CParseHandlerCostParams.o \
               CParseHandlerCtasStorageOptions.o \
               CParseHandlerDXL.o \
-              CParseHandlerDefaultValueExpr.o \
               CParseHandlerDirectDispatchInfo.o \
               CParseHandlerDistinctComp.o \
               CParseHandlerDummy.o \
+              CParseHandlerDynamicForeignScan.o \
+              CParseHandlerDynamicIndexScan.o \
+              CParseHandlerDynamicIndexOnlyScan.o \
+              CParseHandlerDynamicTableScan.o \
               CParseHandlerEnumeratorConfig.o \
-              CParseHandlerExternalScan.o \
+              CParseHandlerForeignScan.o \
               CParseHandlerFactory.o \
               CParseHandlerFilter.o \
               CParseHandlerGatherMotion.o \
@@ -53,7 +56,7 @@ OBJS        = CParseHandlerAgg.o \
               CParseHandlerLogicalCTEProducer.o \
               CParseHandlerLogicalConstTable.o \
               CParseHandlerLogicalDelete.o \
-              CParseHandlerLogicalExternalGet.o \
+              CParseHandlerLogicalForeignGet.o \
               CParseHandlerLogicalGet.o \
               CParseHandlerLogicalGroupBy.o \
               CParseHandlerLogicalInsert.o \
@@ -72,12 +75,10 @@ OBJS        = CParseHandlerAgg.o \
               CParseHandlerMDGPDBCheckConstraint.o \
               CParseHandlerMDGPDBFunc.o \
               CParseHandlerMDGPDBScalarOp.o \
-              CParseHandlerMDGPDBTrigger.o \
               CParseHandlerMDIndex.o \
               CParseHandlerMDIndexInfoList.o \
               CParseHandlerMDRelation.o \
               CParseHandlerMDRelationCtas.o \
-              CParseHandlerMDRelationExternal.o \
               CParseHandlerMDRequest.o \
               CParseHandlerMDScCmp.o \
               CParseHandlerMDType.o \
@@ -101,12 +102,13 @@ OBJS        = CParseHandlerAgg.o \
               CParseHandlerPhysicalCTEConsumer.o \
               CParseHandlerPhysicalCTEProducer.o \
               CParseHandlerPhysicalDML.o \
+              CParseHandlerPhysicalDynamicBitmapTableScan.o \
               CParseHandlerPhysicalOp.o \
-              CParseHandlerPhysicalRowTrigger.o \
               CParseHandlerPhysicalSplit.o \
               CParseHandlerPhysicalTVF.o \
               CParseHandlerPhysicalWindow.o \
               CParseHandlerPlan.o \
+              CParseHandlerPlanHint.o \
               CParseHandlerProjElem.o \
               CParseHandlerProjList.o \
               CParseHandlerProperties.o \
@@ -115,6 +117,13 @@ OBJS        = CParseHandlerAgg.o \
               CParseHandlerRandomMotion.o \
               CParseHandlerRedistributeMotion.o \
               CParseHandlerRelStats.o \
+              CParseHandlerRelationExtendedStats.o \
+              CParseHandlerExtStatsInfo.o \
+              CParseHandlerExtStats.o \
+              CParseHandlerExtStatsDependency.o \
+              CParseHandlerExtStatsDependencies.o \
+              CParseHandlerExtStatsNDistinct.o \
+              CParseHandlerExtStatsNDistinctList.o \
               CParseHandlerResult.o \
               CParseHandlerRoutedMotion.o \
               CParseHandlerScalarAggref.o \
@@ -136,6 +145,7 @@ OBJS        = CParseHandlerAgg.o \
               CParseHandlerScalarConstValue.o \
               CParseHandlerScalarDMLAction.o \
               CParseHandlerScalarExpr.o \
+              CParseHandlerScalarFieldSelect.o \
               CParseHandlerScalarFuncExpr.o \
               CParseHandlerScalarIdent.o \
               CParseHandlerScalarIfStmt.o \
@@ -147,13 +157,7 @@ OBJS        = CParseHandlerAgg.o \
               CParseHandlerScalarOp.o \
               CParseHandlerScalarOpExpr.o \
               CParseHandlerScalarOpList.o \
-              CParseHandlerScalarPartBound.o \
-              CParseHandlerScalarPartBoundInclusion.o \
-              CParseHandlerScalarPartBoundOpen.o \
-              CParseHandlerScalarPartDefault.o \
-              CParseHandlerScalarPartListNullTest.o \
-              CParseHandlerScalarPartListValues.o \
-              CParseHandlerScalarPartOid.o \
+              CParseHandlerScalarParam.o \
               CParseHandlerScalarSubPlan.o \
               CParseHandlerScalarSubPlanParam.o \
               CParseHandlerScalarSubPlanParamList.o \
@@ -164,6 +168,7 @@ OBJS        = CParseHandlerAgg.o \
               CParseHandlerScalarSwitch.o \
               CParseHandlerScalarSwitchCase.o \
               CParseHandlerScalarValuesList.o \
+              CParseHandlerScalarSortGroupClause.o \
               CParseHandlerScalarWindowFrameEdge.o \
               CParseHandlerScalarWindowRef.o \
               CParseHandlerSearchStage.o \
@@ -178,7 +183,6 @@ OBJS        = CParseHandlerAgg.o \
               CParseHandlerStatsBound.o \
               CParseHandlerStatsDerivedColumn.o \
               CParseHandlerStatsDerivedRelation.o \
-              CParseHandlerSubqueryScan.o \
               CParseHandlerTableDescr.o \
               CParseHandlerTableScan.o \
               CParseHandlerTraceFlags.o \

@@ -33,6 +33,7 @@
 #include "catalog/pg_type.h"
 #include "commands/copy.h"
 #include "commands/defrem.h"
+#include "commands/progress.h"
 #include "commands/trigger.h"
 #include "executor/execPartition.h"
 #include "executor/executor.h"
@@ -49,11 +50,13 @@
 #include "parser/parse_collate.h"
 #include "parser/parse_expr.h"
 #include "parser/parse_relation.h"
+#include "pgstat.h"
 #include "port/pg_bswap.h"
 #include "rewrite/rewriteHandler.h"
 #include "storage/fd.h"
 #include "storage/execute_pipe.h"
 #include "tcop/tcopprot.h"
+#include "tcop/utility.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
@@ -82,7 +85,7 @@
 #include "utils/metrics_utils.h"
 #include "utils/resscheduler.h"
 #include "utils/string_utils.h"
-
+#include "partitioning/partdesc.h"
 
 #define ISOCTAL(c) (((c) >= '0') && ((c) <= '7'))
 #define OCTVALUE(c) ((c) - '0')
@@ -269,7 +272,7 @@ static bool NextCopyFromRawFieldsX(CopyState cstate, char ***fields, int *nfield
 								   int stop_processing_at_field);
 static bool NextCopyFromX(CopyState cstate, ExprContext *econtext,
 						  Datum *values, bool *nulls);
-static void HandleCopyError(CopyState cstate);
+void HandleCopyError(CopyState cstate);
 static void HandleQDErrorFrame(CopyState cstate, char *p, int len);
 
 static void CopyInitDataParser(CopyState cstate);
@@ -642,6 +645,10 @@ CopySendEndOfRow(CopyState cstate)
 			return; /* don't want to reset msgbuf quite yet */
 	}
 
+	/* Update the progress */
+	cstate->bytes_processed += cstate->fe_msgbuf->len;
+	pgstat_progress_update_param(PROGRESS_COPY_BYTES_PROCESSED, cstate->bytes_processed);
+
 	resetStringInfo(fe_msgbuf);
 }
 
@@ -947,6 +954,8 @@ CopyLoadRawBuf(CopyState cstate)
 	cstate->raw_buf[nbytes] = '\0';
 	cstate->raw_buf_index = 0;
 	cstate->raw_buf_len = nbytes;
+	cstate->bytes_processed += nbytes;
+	pgstat_progress_update_param(PROGRESS_COPY_BYTES_PROCESSED, cstate->bytes_processed);
 	return (inbytes > 0);
 }
 
@@ -994,16 +1003,6 @@ DoCopy(ParseState *pstate, const CopyStmt *stmt,
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("COPY single row error handling only available using COPY FROM")));
-
-/* GPDB_91_MERGE_FIXME: this should probably be done earlier, e.g. in parser */
-	/* Transfer any SREH options to the options list, so that BeginCopy can see them. */
-	if (stmt->sreh)
-	{
-		SingleRowErrorDesc *sreh = (SingleRowErrorDesc *) stmt->sreh;
-
-		options = list_copy(options);
-		options = lappend(options, makeDefElem("sreh", (Node *) sreh, -1));
-	}
 
 	/*
 	 * Disallow COPY to/from file or program except to users with the
@@ -1113,21 +1112,8 @@ DoCopy(ParseState *pstate, const CopyStmt *stmt,
 		 *
 		 * If RLS is not enabled for this, then just fall through to the
 		 * normal non-filtering relation handling.
-		 *
-		 * GPDB: Also do this for partitioned tables. In PostgreSQL, you get
-		 * an error:
-		 *
-		 * ERROR:  cannot copy from partitioned table "foo"
-		 * HINT:  Try the COPY (SELECT ...) TO variant.
-		 *
-		 * In GPDB 6 and before, support for COPYing partitioned table was
-		 * implemented deenop in the COPY processing code. In GPDB 7,
-		 * partitiong was replaced with upstream impementation, but for
-		 * backwards-compatibility, we do the translation to "COPY (SELECT
-		 * ...)" variant automatically, just like PostgreSQL does for RLS.
 		 */
-		if (check_enable_rls(rte->relid, InvalidOid, false) == RLS_ENABLED ||
-			(!is_from && rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE))
+		if (check_enable_rls(rte->relid, InvalidOid, false) == RLS_ENABLED)
 		{
 			SelectStmt *select;
 			ColumnRef  *cr;
@@ -1371,7 +1357,10 @@ DoCopy(ParseState *pstate, const CopyStmt *stmt,
 
 	/* Issue automatic ANALYZE if conditions are satisfied (MPP-4082). */
 	if (Gp_role == GP_ROLE_DISPATCH && is_from)
-		auto_stats(AUTOSTATS_CMDTYPE_COPY, relid, *processed, false /* inFunction */);
+	{
+		bool inFunction = already_under_executor_run() || utility_nested();
+		auto_stats(AUTOSTATS_CMDTYPE_COPY, relid, *processed, inFunction);
+	}
 }
 
 /*
@@ -2362,6 +2351,8 @@ EndCopy(CopyState cstate)
 	if (cstate->cdbsreh)
 		destroyCdbSreh(cstate->cdbsreh);
 
+	pgstat_progress_end_command();
+
 	MemoryContextDelete(cstate->copycontext);
 	pfree(cstate);
 }
@@ -2547,8 +2538,16 @@ BeginCopyTo(ParseState *pstate,
 {
 	CopyState	cstate;
 	MemoryContext oldcontext;
+	const int	progress_cols[] = {
+		PROGRESS_COPY_COMMAND,
+		PROGRESS_COPY_TYPE
+	};
+	int64		progress_vals[] = {
+		PROGRESS_COPY_COMMAND_TO,
+		0
+	};
 
-	if (rel != NULL && rel->rd_rel->relkind != RELKIND_RELATION)
+	if (rel != NULL && rel->rd_rel->relkind != RELKIND_RELATION && rel->rd_rel->relkind != RELKIND_PARTITIONED_TABLE)
 	{
 		if (rel->rd_rel->relkind == RELKIND_VIEW)
 			ereport(ERROR,
@@ -2573,16 +2572,6 @@ BeginCopyTo(ParseState *pstate,
 					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 					 errmsg("cannot copy from sequence \"%s\"",
 							RelationGetRelationName(rel))));
-		/*
-		 * GPDB: This is not reached in GPDB, because we transform the command
-		 * to the COPY (SELECT ...) TO variant automatically earlier already.
-		 */
-		else if (rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
-			ereport(ERROR,
-					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-					 errmsg("cannot copy from partitioned table \"%s\"",
-							RelationGetRelationName(rel)),
-					 errhint("Try the COPY (SELECT ...) TO variant.")));
 		else
 			ereport(ERROR,
 					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
@@ -2593,6 +2582,9 @@ BeginCopyTo(ParseState *pstate,
 	cstate = BeginCopy(pstate, false, rel, query, queryRelId, attnamelist,
 					   options, NULL);
 	oldcontext = MemoryContextSwitchTo(cstate->copycontext);
+
+	if (cstate->on_segment)
+		progress_vals[0] = PROGRESS_COPY_COMMAND_TO_ON_SEGMENT;
 
 	/* Determine the mode */
 	if (Gp_role == GP_ROLE_DISPATCH && !cstate->on_segment &&
@@ -2616,6 +2608,7 @@ BeginCopyTo(ParseState *pstate,
 	}
 	else if (pipe)
 	{
+		progress_vals[1] = PROGRESS_COPY_TYPE_PIPE;
 		Assert(!is_program || Gp_role == GP_ROLE_EXECUTE);	/* the grammar does not allow this */
 		if (whereToSendOutput != DestRemote)
 			cstate->copy_file = stdout;
@@ -2631,6 +2624,7 @@ BeginCopyTo(ParseState *pstate,
 
 		if (is_program)
 		{
+			progress_vals[1] = PROGRESS_COPY_TYPE_PROGRAM;
 			cstate->program_pipes = open_program_pipes(cstate->filename, true);
 			cstate->copy_file = fdopen(cstate->program_pipes->pipes[0], PG_BINARY_W);
 
@@ -2644,6 +2638,8 @@ BeginCopyTo(ParseState *pstate,
 		{
 			mode_t oumask; /* Pre-existing umask value */
 			struct stat st;
+
+			progress_vals[1] = PROGRESS_COPY_TYPE_FILE;
 
 			/*
 			 * Prevent write to relative path ... too easy to shoot oneself in
@@ -2695,6 +2691,13 @@ BeginCopyTo(ParseState *pstate,
 								errmsg("\"%s\" is a directory", filename)));
 		}
 	}
+
+	/* initialize progress */
+	pgstat_progress_start_command(PROGRESS_COMMAND_COPY,
+								  cstate->rel ? RelationGetRelid(cstate->rel) : InvalidOid);
+	pgstat_progress_update_multi_param(2, progress_cols, progress_vals);
+
+	cstate->bytes_processed = 0;
 
 	MemoryContextSwitchTo(oldcontext);
 
@@ -3018,6 +3021,7 @@ CopyTo(CopyState cstate)
 	int			num_phys_attrs;
 	ListCell   *cur;
 	uint64		processed = 0;
+	bool *proj = NULL;
 
 	if (cstate->rel)
 		tupDesc = RelationGetDescr(cstate->rel);
@@ -3031,9 +3035,12 @@ CopyTo(CopyState cstate)
 
 	/* Get info about the columns we need to process. */
 	cstate->out_functions = (FmgrInfo *) palloc(num_phys_attrs * sizeof(FmgrInfo));
+
+	proj = palloc0(sizeof(bool) * num_phys_attrs);
 	foreach(cur, cstate->attnumlist)
 	{
 		int			attnum = lfirst_int(cur);
+		proj[attnum-1] = true;
 		Oid			out_func_oid;
 		bool		isvarlena;
 		Form_pg_attribute attr = TupleDescAttr(tupDesc, attnum - 1);
@@ -3117,27 +3124,130 @@ CopyTo(CopyState cstate)
 
 	if (cstate->rel)
 	{
-		TupleTableSlot *slot;
-		TableScanDesc scandesc;
+		List				*relids;
+		ListCell			*lc;
+		TupleTableSlot		*slot;
+		TableScanDesc		 scandesc;
+		bool foreign_partition_was_skipped = false;
 
-		scandesc = table_beginscan(cstate->rel, GetActiveSnapshot(), 0, NULL);
-		slot = table_slot_create(cstate->rel, NULL);
-
-		processed = 0;
-		while (table_scan_getnextslot(scandesc, ForwardScanDirection, slot))
+		relids = lappend_oid(NIL, cstate->rel->rd_rel->oid);
+		while (relids != NIL)
 		{
-			CHECK_FOR_INTERRUPTS();
+			List *inhRelIds = NIL;
+			foreach(lc, relids)
+			{
+				Oid relid = lfirst_oid(lc);
+				Relation rel;
+				if (relid == cstate->rel->rd_rel->oid)
+					rel = cstate->rel;
+				else
+					rel = relation_open(relid, AccessShareLock);
 
-			/* Deconstruct the tuple ... */
-			slot_getallattrs(slot);
+				/*
+				 * Support `COPY partitioned_table TO file` in GPDB 7 for backwards-compatibility.
+				 * In PostgreSQL, you get an error:
+				 *
+				 * ERROR:  cannot copy from partitioned table "foo"
+				 * HINT:  Try the COPY (SELECT ...) TO variant.
+				 */
+				if (rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
+				{
+					for (int i = 0; i < RelationRetrievePartitionDesc(rel)->nparts; i++)
+						inhRelIds = lappend_oid(inhRelIds, RelationRetrievePartitionDesc(rel)->oids[i]);
+				}
+				else if (rel->rd_rel->relkind == RELKIND_FOREIGN_TABLE)
+				{
+					if (!cstate->skip_foreign_partitions)
+					{
+						ereport(ERROR,
+								(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+										errmsg("cannot copy from relation \"%s\" which has external partition(s)",
+											   RelationGetRelationName(cstate->rel)),
+										errhint("Try the COPY (SELECT ...) TO variant.")));
+					}
+					if (!foreign_partition_was_skipped)
+					{
+						ereport(NOTICE,
+								(errmsg("COPY ignores external partition(s)")));
+						foreign_partition_was_skipped = true;
+					}
+				}
+				else
+				{
+					/*
+					 * We need to update attnumlist because different partition
+					 * entries might have dropped tables.
+					 */
+					if (rel != cstate->rel)
+					{
+						tupDesc = RelationGetDescr(rel);
+						num_phys_attrs = tupDesc->natts;
 
-			/* Format and send the data */
-			CopyOneRowTo(cstate, slot);
-			processed++;
+						/* Get info about the columns we need to process. */
+						cstate->out_functions = (FmgrInfo *) palloc(num_phys_attrs * sizeof(FmgrInfo));
+						cstate->attnumlist = CopyGetAttnums(tupDesc, rel, cstate->attnamelist);
+						proj = palloc0(sizeof(bool) * num_phys_attrs);
+						foreach(cur, cstate->attnumlist)
+						{
+							int			attnum = lfirst_int(cur);
+							proj[attnum-1] = true;
+							Oid			out_func_oid;
+							bool		isvarlena;
+							Form_pg_attribute attr = TupleDescAttr(tupDesc, attnum - 1);
+
+							if (cstate->binary)
+								getTypeBinaryOutputInfo(attr->atttypid,
+														&out_func_oid,
+														&isvarlena);
+							else
+								getTypeOutputInfo(attr->atttypid,
+												  &out_func_oid,
+												  &isvarlena);
+							fmgr_info(out_func_oid, &cstate->out_functions[attnum - 1]);
+						}
+					}
+					/*
+					 * We specifically pass NULL proj if the table has no column, and leave it
+					 * to the underlying CO AM layer to handle it - the behavior should be same
+					 * as SELECT * which is to choose one column to scan.
+					 */
+					scandesc = table_beginscan_es(rel, GetActiveSnapshot(), 0, NULL, 
+													cstate->attnumlist ? proj : NULL, 
+													NULL);
+					slot = table_slot_create(rel, NULL);
+
+					while (table_scan_getnextslot(scandesc, ForwardScanDirection, slot))
+					{
+						CHECK_FOR_INTERRUPTS();
+
+						/* Deconstruct the tuple ... */
+						slot_getallattrs(slot);
+
+						/* Format and send the data */
+						CopyOneRowTo(cstate, slot);
+
+						/*
+						* Increment the number of processed tuples, and report the
+						* progress.
+						*/
+						pgstat_progress_update_param(PROGRESS_COPY_TUPLES_PROCESSED,
+													 ++processed);
+#ifdef FAULT_INJECTOR
+						if (processed == 2)
+							SIMPLE_FAULT_INJECTOR("copy_processed_two_tuples");
+#endif
+					}
+					ExecDropSingleTupleTableSlot(slot);
+					table_endscan(scandesc);
+					pfree(proj);
+					pfree(cstate->out_functions);
+				}
+				if (rel != cstate->rel)
+					relation_close(rel, AccessShareLock);
+			}
+			list_free(relids);
+			relids = inhRelIds;
 		}
-
-		ExecDropSingleTupleTableSlot(slot);
-		table_endscan(scandesc);
 	}
 	else
 	{
@@ -3536,7 +3646,7 @@ CopyMultiInsertBufferFlush(CopyMultiInsertInfo *miinfo,
 
 	/*
 	 * Print error context information correctly, if one of the operations
-	 * below fail.
+	 * below fails.
 	 */
 	cstate->line_buf_valid = false;
 	save_cur_lineno = cstate->cur_lineno;
@@ -3604,7 +3714,8 @@ CopyMultiInsertBufferFlush(CopyMultiInsertInfo *miinfo,
  * The buffer must be flushed before cleanup.
  */
 static inline void
-CopyMultiInsertBufferCleanup(CopyMultiInsertBuffer *buffer)
+CopyMultiInsertBufferCleanup(CopyMultiInsertInfo *miinfo,
+							 CopyMultiInsertBuffer *buffer)
 {
 	int			i;
 
@@ -3619,6 +3730,9 @@ CopyMultiInsertBufferCleanup(CopyMultiInsertBuffer *buffer)
 	/* Since we only create slots on demand, just drop the non-null ones. */
 	for (i = 0; i < MAX_BUFFERED_TUPLES && buffer->slots[i] != NULL; i++)
 		ExecDropSingleTupleTableSlot(buffer->slots[i]);
+
+	table_finish_bulk_insert(buffer->resultRelInfo->ri_RelationDesc,
+							 miinfo->ti_options);
 
 	pfree(buffer);
 }
@@ -3671,7 +3785,7 @@ CopyMultiInsertInfoFlush(CopyMultiInsertInfo *miinfo, ResultRelInfo *curr_rri)
 			buffer = (CopyMultiInsertBuffer *) linitial(miinfo->multiInsertBuffers);
 		}
 
-		CopyMultiInsertBufferCleanup(buffer);
+		CopyMultiInsertBufferCleanup(miinfo, buffer);
 		miinfo->multiInsertBuffers = list_delete_first(miinfo->multiInsertBuffers);
 	}
 }
@@ -3685,7 +3799,7 @@ CopyMultiInsertInfoCleanup(CopyMultiInsertInfo *miinfo)
 	ListCell   *lc;
 
 	foreach(lc, miinfo->multiInsertBuffers)
-		CopyMultiInsertBufferCleanup(lfirst(lc));
+		CopyMultiInsertBufferCleanup(miinfo, lfirst(lc));
 
 	list_free(miinfo->multiInsertBuffers);
 }
@@ -3756,7 +3870,8 @@ CopyFrom(CopyState cstate)
 	BulkInsertState bistate = NULL;
 	CopyInsertMethod insertMethod;
 	CopyMultiInsertInfo multiInsertInfo = {0};	/* pacify compiler */
-	uint64		processed = 0;
+	int64		processed = 0;
+	int64		excluded = 0;
 	bool		has_before_insert_row_trig;
 	bool		has_instead_insert_row_trig;
 	bool		leafpart_use_multi_insert = false;
@@ -3855,15 +3970,8 @@ CopyFrom(CopyState cstate)
 		 cstate->rel->rd_newRelfilenodeSubid != InvalidSubTransactionId))
 	{
 		ti_options |= TABLE_INSERT_SKIP_FSM;
-		/*
-		 * The optimization to skip WAL has been disabled in GPDB. wal_level
-		 * is hardcoded to 'archive' in GPDB, so it wouldn't have any effect
-		 * anyway.
-		 */
-#if 0
 		if (!XLogIsNeeded())
 			ti_options |= TABLE_INSERT_SKIP_WAL;
-#endif
 	}
 
 	/*
@@ -3952,6 +4060,7 @@ CopyFrom(CopyState cstate)
 	mtstate->ps.state = estate;
 	mtstate->operation = CMD_INSERT;
 	mtstate->resultRelInfo = estate->es_result_relations;
+	mtstate->rootResultRelInfo = estate->es_result_relations;
 
 	if (resultRelInfo->ri_FdwRoutine != NULL &&
 		resultRelInfo->ri_FdwRoutine->BeginForeignInsert != NULL)
@@ -4202,32 +4311,19 @@ CopyFrom(CopyState cstate)
 		cdbCopyStart(cdbCopy, glob_copystmt, cstate->file_encoding);
 
 		/*
-		 * Skip header processing if dummy file get from master for COPY FROM ON
+		 * Skip header processing if dummy file get from coordinator for COPY FROM ON
 		 * SEGMENT
 		 */
 		if (!cstate->on_segment)
 		{
-			/*
-			 * Send QD->QE header to all segments except:
-			 * dummy file on master for COPY FROM ON SEGMENT
-			 */
-			if (!cstate->on_segment)
-				SendCopyFromForwardedHeader(cstate, cdbCopy);
+			SendCopyFromForwardedHeader(cstate, cdbCopy);
 		}
 	}
 
 	CopyInitDataParser(cstate);
 
-	/*
-	 * GPDB_12_MERGE_FIXME: We still have to perform the initialization
-	 * here for AO relations. It is preferreable by all means to perform the
-	 * initialization via the table AP API, however it simply does not
-	 * provide a good enough interface for this yet.
-	 */
-	if (RelationIsAoRows(resultRelInfo->ri_RelationDesc))
-		appendonly_dml_init(resultRelInfo->ri_RelationDesc, CMD_INSERT);
-	else if (RelationIsAoCols(resultRelInfo->ri_RelationDesc))
-		aoco_dml_init(resultRelInfo->ri_RelationDesc, CMD_INSERT);
+	if (resultRelInfo->ri_RelationDesc->rd_tableam)
+		table_dml_init(resultRelInfo->ri_RelationDesc);
 
 	for (;;)
 	{
@@ -4307,7 +4403,48 @@ CopyFrom(CopyState cstate)
 			econtext->ecxt_scantuple = myslot;
 			/* Skip items that don't match COPY's WHERE clause */
 			if (!ExecQual(cstate->qualexpr, econtext))
+			{
+				/*
+				 * Report that this tuple was filtered out by the WHERE
+				 * clause.
+				 */
+				pgstat_progress_update_param(PROGRESS_COPY_TUPLES_EXCLUDED,
+											 ++excluded);
 				continue;
+			}
+		}
+
+		if (cstate->dispatch_mode != COPY_DISPATCH && is_check_distkey)
+		{
+			/*
+			 * In COPY FROM ON SEGMENT, check the distribution key in the
+			 * QE.
+			 * Note: For partitioned tables, the order of the root table's columns can be
+			 * inconsistent with the order of the partition's columns and Greenplum/PostgreSQL
+			 * allows such behavior. When they have different orders, we need to re-order the
+			 * TupleTableSlot (myslot) to make it match the partition's columns (see execute_attr_map_slot()
+			 * for details). We must perform this check before the re-ordering of TupleTableslot,
+			 * or the value of target_seg will be incorrect.
+			 */
+			if (distData->policy->nattrs != 0)
+			{
+				target_seg = GetTargetSeg(distData, myslot);
+				if (GpIdentity.segindex != target_seg)
+				{
+					PG_TRY();
+					{
+						ereport(ERROR,
+								(errcode(ERRCODE_INTEGRITY_CONSTRAINT_VIOLATION),
+								 errmsg("value of distribution key doesn't belong to segment with ID %d, it belongs to segment with ID %d",
+										GpIdentity.segindex, target_seg)));
+					}
+					PG_CATCH();
+					{
+						HandleCopyError(cstate);
+					}
+					PG_END_TRY();
+				}
+			}
 		}
 
 		/* Determine the partition to insert the tuple into */
@@ -4471,37 +4608,7 @@ CopyFrom(CopyState cstate)
 		{
 			/* In QD, compute the target segment to send this row to. */
 			target_seg = GetTargetSeg(distData, myslot);
-		}
-		else if (is_check_distkey)
-		{
-			/*
-			 * In COPY FROM ON SEGMENT, check the distribution key in the
-			 * QE.
-			 */
-			if (distData->policy->nattrs != 0)
-			{
-				target_seg = GetTargetSeg(distData, myslot);
 
-				if (GpIdentity.segindex != target_seg)
-				{
-					PG_TRY();
-					{
-						ereport(ERROR,
-								(errcode(ERRCODE_INTEGRITY_CONSTRAINT_VIOLATION),
-								 errmsg("value of distribution key doesn't belong to segment with ID %d, it belongs to segment with ID %d",
-										GpIdentity.segindex, target_seg)));
-					}
-					PG_CATCH();
-					{
-						HandleCopyError(cstate);
-					}
-					PG_END_TRY();
-				}
-			}
-		}
-
-		if (cstate->dispatch_mode == COPY_DISPATCH)
-		{
 			bool send_to_all = distData &&
 							   GpPolicyIsReplicated(distData->policy);
 
@@ -4523,7 +4630,7 @@ CopyFrom(CopyState cstate)
 		{
 			/*
 			 * If the tuple was dispatched to segments, do not execute trigger
-			 * on master.
+			 * on coordinator.
 			 */
 			if (!skip_tuple && !ExecBRInsertTriggers(estate, resultRelInfo, myslot))
 				skip_tuple = true;	/* "do nothing" */
@@ -4634,13 +4741,19 @@ CopyFrom(CopyState cstate)
 			/*
 			 * We count only tuples not suppressed by a BEFORE INSERT trigger
 			 * or FDW; this is the same definition used by nodeModifyTable.c
-			 * for counting tuples inserted by an INSERT command.
+			 * for counting tuples inserted by an INSERT command. Update
+			 * progress of the COPY command as well.
 			 *
 			 * MPP: incrementing this counter here only matters for utility
 			 * mode. in dispatch mode only the dispatcher COPY collects row
 			 * count, so this counter is meaningless.
 			 */
-			processed++;
+			pgstat_progress_update_param(PROGRESS_COPY_TUPLES_PROCESSED,
+										 ++processed);
+#ifdef FAULT_INJECTOR
+			if (processed == 2)
+				SIMPLE_FAULT_INJECTOR("copy_processed_two_tuples");
+#endif
 			if (cstate->cdbsreh)
 				cstate->cdbsreh->processed++;
 		}
@@ -4661,9 +4774,6 @@ CopyFrom(CopyState cstate)
 	{
 		if (!CopyMultiInsertInfoIsEmpty(&multiInsertInfo))
 			CopyMultiInsertInfoFlush(&multiInsertInfo, NULL);
-
-		/* Tear down the multi-insert buffer data */
-		CopyMultiInsertInfoCleanup(&multiInsertInfo);
 	}
 
 	/* Done, clean up */
@@ -4687,6 +4797,23 @@ CopyFrom(CopyState cstate)
 		cdbCopyEnd(cdbCopy,
 				   &total_completed_from_qes,
 				   &total_rejected_from_qes);
+
+		/*
+		 * Reset returned processed to total_completed_from_qes.
+		 *
+		 * processed above excludes only rejected rows on QD, it
+		 * should also exclude rejected rows on QEs.
+		 *
+		 * NOTE:
+		 *  total_completed_from_qes + total_rejected_from_qes <= # of
+		 *  input file rows
+		 *
+		 * total_rejected_from_qes includes only rows rejected by
+		 * SREH; however, total_completed_from_qes excludes both
+		 * SREH-rejected rows and TRIGGER-rejected rows.
+		 */
+		processed = total_completed_from_qes;
+
 		if (cstate->cdbsreh)
 		{
 			/* emit a NOTICE with number of rejected rows */
@@ -4697,7 +4824,7 @@ CopyFrom(CopyState cstate)
 			 * If error log has been requested, then we send the row to the segment
 			 * so that it can be written in the error log file. The segment process
 			 * counts it again as a rejected row. So we ignore the reject count
-			 * from the master and only consider the reject count from segments.
+			 * from the coordinator and only consider the reject count from segments.
 			 */
 			if (IS_LOG_TO_FILE(cstate->cdbsreh->logerrors))
 				total_rejected_from_qd = 0;
@@ -4722,16 +4849,12 @@ CopyFrom(CopyState cstate)
 	AfterTriggerEndQuery(estate);
 
 	/*
-	 * If SREH and in executor mode send the number of rejected
-	 * rows to the client (QD COPY).
-	 * If COPY ... FROM/TO ... ON SEGMENT, then we need to send the number of
-	 * completed rows as well.
+	 * In QE, send the number of rejected rows to the client (QD COPY) if
+	 * SREH is on, always send the number of completed rows.
 	 */
-	if ((cstate->errMode != ALL_OR_NOTHING && cstate->dispatch_mode == COPY_EXECUTOR)
-		|| cstate->on_segment)
+	if (Gp_role == GP_ROLE_EXECUTE)
 	{
-		SendNumRows((cstate->errMode != ALL_OR_NOTHING) ? cstate->cdbsreh->rejectcount : 0,
-				cstate->on_segment ? processed : 0);
+		SendNumRows((cstate->errMode != ALL_OR_NOTHING) ? cstate->cdbsreh->rejectcount : 0, processed);
 	}
 
 	ExecResetTupleTable(estate->es_tupleTable, false);
@@ -4741,6 +4864,13 @@ CopyFrom(CopyState cstate)
 		target_resultRelInfo->ri_FdwRoutine->EndForeignInsert != NULL)
 		target_resultRelInfo->ri_FdwRoutine->EndForeignInsert(estate,
 															  target_resultRelInfo);
+
+	/* Tear down the multi-insert buffer data */
+	if (insertMethod != CIM_SINGLE)
+		CopyMultiInsertInfoCleanup(&multiInsertInfo);
+
+	if (target_resultRelInfo->ri_RelationDesc->rd_tableam)
+		table_dml_finish(target_resultRelInfo->ri_RelationDesc);
 
 	ExecCloseIndices(target_resultRelInfo);
 
@@ -4754,8 +4884,6 @@ CopyFrom(CopyState cstate)
 	FreeDistributionData(distData);
 
 	FreeExecutorState(estate);
-
-	table_finish_bulk_insert(cstate->rel, ti_options);
 
 	return processed;
 }
@@ -4792,9 +4920,22 @@ BeginCopyFrom(ParseState *pstate,
 	ExprState **defexprs;
 	MemoryContext oldcontext;
 	bool		volatile_defexprs;
+	const int	progress_cols[] = {
+		PROGRESS_COPY_COMMAND,
+		PROGRESS_COPY_TYPE,
+		PROGRESS_COPY_BYTES_TOTAL
+	};
+	int64		progress_vals[] = {
+		PROGRESS_COPY_COMMAND_FROM,
+		0,
+		0
+	};
 
 	cstate = BeginCopy(pstate, true, rel, NULL, InvalidOid, attnamelist, options, NULL);
 	oldcontext = MemoryContextSwitchTo(cstate->copycontext);
+
+	if (cstate->on_segment)
+		progress_vals[0] = PROGRESS_COPY_COMMAND_FROM_ON_SEGMENT;
 
 	/*
 	 * Determine the mode
@@ -4805,6 +4946,14 @@ BeginCopyFrom(ParseState *pstate,
 			 cstate->rel && cstate->rel->rd_cdbpolicy &&
 			 cstate->rel->rd_cdbpolicy->ptype != POLICYTYPE_ENTRY)
 		cstate->dispatch_mode = COPY_DISPATCH;
+	/*
+	 * Handle case where fdw executes on coordinator while it's acting as a segment
+	 * This occurs when fdw is under a redistribute on the coordinator
+	 */
+	else if (Gp_role == GP_ROLE_EXECUTE &&
+			 cstate->rel && cstate->rel->rd_cdbpolicy &&
+			 cstate->rel->rd_cdbpolicy->ptype == POLICYTYPE_ENTRY)
+		cstate->dispatch_mode = COPY_DIRECT;
 	else if (Gp_role == GP_ROLE_EXECUTE)
 		cstate->dispatch_mode = COPY_EXECUTOR;
 	else
@@ -4901,6 +5050,11 @@ BeginCopyFrom(ParseState *pstate,
 		}
 	}
 
+	/* initialize progress */
+	pgstat_progress_start_command(PROGRESS_COMMAND_COPY,
+								  cstate->rel ? RelationGetRelid(cstate->rel) : InvalidOid);
+	cstate->bytes_processed = 0;
+
 	/* We keep those variables in cstate. */
 	cstate->in_functions = in_functions;
 	cstate->typioparams = typioparams;
@@ -4923,12 +5077,14 @@ BeginCopyFrom(ParseState *pstate,
 	}
 	else if (data_source_cb)
 	{
+		progress_vals[1] = PROGRESS_COPY_TYPE_CALLBACK;
 		cstate->copy_dest = COPY_CALLBACK;
 		cstate->data_source_cb = data_source_cb;
 		cstate->data_source_cb_extra = data_source_cb_extra;
 	}
 	else if (pipe)
 	{
+		progress_vals[1] = PROGRESS_COPY_TYPE_PIPE;
 		Assert(!is_program || cstate->dispatch_mode == COPY_EXECUTOR);	/* the grammar does not allow this */
 		if (whereToSendOutput == DestRemote)
 			ReceiveCopyBegin(cstate);
@@ -4944,6 +5100,7 @@ BeginCopyFrom(ParseState *pstate,
 
 		if (cstate->is_program)
 		{
+			progress_vals[1] = PROGRESS_COPY_TYPE_PROGRAM;
 			cstate->program_pipes = open_program_pipes(cstate->filename, false);
 			cstate->copy_file = fdopen(cstate->program_pipes->pipes[0], PG_BINARY_R);
 			if (cstate->copy_file == NULL)
@@ -4957,6 +5114,7 @@ BeginCopyFrom(ParseState *pstate,
 			struct stat st;
 			char	   *filename = cstate->filename;
 
+			progress_vals[1] = PROGRESS_COPY_TYPE_FILE;
 			cstate->copy_file = AllocateFile(filename, PG_BINARY_R);
 			if (cstate->copy_file == NULL)
 			{
@@ -4985,8 +5143,12 @@ BeginCopyFrom(ParseState *pstate,
 				ereport(ERROR,
 						(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 						 errmsg("\"%s\" is a directory", filename)));
+
+			progress_vals[2] = st.st_size;
 		}
 	}
+
+	pgstat_progress_update_multi_param(3, progress_cols, progress_vals);
 
 	if (cstate->on_segment && Gp_role == GP_ROLE_DISPATCH)
 	{
@@ -5173,7 +5335,7 @@ NextCopyFrom(CopyState cstate, ExprContext *econtext,
  *
  * changing me? take a look at FILEAM_HANDLE_ERROR in fileam.c as well.
  */
-static void
+void
 HandleCopyError(CopyState cstate)
 {
 	if (cstate->errMode == ALL_OR_NOTHING)
@@ -5210,8 +5372,9 @@ HandleCopyError(CopyState cstate)
 		 * ErrorIfRejectLimit() below will use this information in the error message,
 		 * if the error count is reached.
 		 */
-		cdbsreh->rawdata = cstate->line_buf.data;
-
+		cdbsreh->rawdata->cursor = 0;
+		cdbsreh->rawdata->data = cstate->line_buf.data;
+		cdbsreh->rawdata->len = cstate->line_buf.len;
 		cdbsreh->is_server_enc = cstate->line_buf_converted;
 		cdbsreh->linenumber = cstate->cur_lineno;
 		if (cstate->cur_attname)
@@ -5352,8 +5515,14 @@ NextCopyFromX(CopyState cstate, ExprContext *econtext,
 			field_strings = cstate->raw_fields;
 		}
 
-		/* check for overflowing fields */
-		if (attr_count > 0 && fldct > attr_count)
+		/* 
+		 * Check for overflowing fields.
+		 * GPDB: Change below condition compared to upstream to 
+		 * greater than or equal to 0 as in QE, 
+		 * attr_count may be equal to 0, 
+		 * when all fields are processed in the QD.
+		 */
+		if (fldct > attr_count)
 			ereport(ERROR,
 					(errcode(ERRCODE_BAD_COPY_FILE_FORMAT),
 					 errmsg("extra data after last expected column")));
@@ -5827,7 +5996,9 @@ HandleQDErrorFrame(CopyState cstate, char *p, int len)
 	line[errframe.line_len] = '\0';
 
 	cdbsreh->linenumber = errframe.lineno;
-	cdbsreh->rawdata = line;
+	cdbsreh->rawdata->cursor = 0;
+	cdbsreh->rawdata->data = line;
+	cdbsreh->rawdata->len = strlen(line);
 	cdbsreh->errmsg = errormsg;
 	cdbsreh->is_server_enc = errframe.line_buf_converted;
 
@@ -6065,6 +6236,18 @@ void
 EndCopyFrom(CopyState cstate)
 {
 	/* No COPY FROM related resources except memory. */
+
+	/*
+	 * We call pgstat_progress_end_command here even EndCopy does 
+	 * the same because we want to be consistent with upstream.
+	 * The upstream does that because it doesn't call EndCopy in 
+	 * EndCopyFrom, and that's what GPDB would do when we merge with
+	 * PG14. So calling it here in case we miss it when that happens.
+	 * The second call of it should just be a no-op.
+	 *
+	 * GPDB_14_MERGE_FIXME: remove this comment. 
+	 */
+	pgstat_progress_end_command();
 
 	EndCopy(cstate);
 }
@@ -6434,6 +6617,60 @@ CopyReadLineText(CopyState cstate)
 			 */
 			c2 = copy_raw_buf[raw_buf_ptr];
 
+			/*
+			* We need to recognize the EOL.
+			* Github issue: https://github.com/greenplum-db/gpdb/issues/12454
+			*/
+			if(c2 == '\n')
+			{
+				if(cstate->eol_type == EOL_UNKNOWN)
+				{
+				/* We still do not found the first EOL.
+				* The current '\n' will be recongnized as EOL
+				* in next loop of c1.
+				*/
+					goto not_end_of_copy;
+				}
+				else if(cstate->eol_type == EOL_NL)
+				{
+					// found a new line with '\n'
+					raw_buf_ptr++;
+					break;
+				}
+			}
+			if (c2 == '\r')
+			{
+				if(cstate->eol_type == EOL_UNKNOWN)
+				{
+					goto not_end_of_copy;
+				}
+				else if(cstate->eol_type == EOL_CR)
+				{
+					// found a new line wirh '\r'
+					raw_buf_ptr++;
+					break;
+				}
+				else if(cstate->eol_type == EOL_CRNL)
+				{
+					/*
+					* Because the eol is '\r\n', we need another character c3
+					* which comes after c2 if exists.
+					*/
+					char c3;
+					raw_buf_ptr++;
+					IF_NEED_REFILL_AND_NOT_EOF_CONTINUE(0);
+					IF_NEED_REFILL_AND_EOF_BREAK(0);
+					c3 = copy_raw_buf[raw_buf_ptr];
+					if(c3 == '\n')
+					{
+						// found a new line with '\r\n'
+						raw_buf_ptr++;
+						break;
+					} else {
+						NO_END_OF_COPY_GOTO;
+					}
+				}
+			}
 			if (c2 == '.')
 			{
 				raw_buf_ptr++;	/* consume the '.' */
@@ -6517,7 +6754,7 @@ CopyReadLineText(CopyState cstate)
 				break;
 			}
 			else if (!cstate->csv_mode)
-
+			{
 				/*
 				 * If we are here, it means we found a backslash followed by
 				 * something other than a period.  In non-CSV mode, anything
@@ -6528,10 +6765,17 @@ CopyReadLineText(CopyState cstate)
 				 * backslashes are not special, so we want to process the
 				 * character after the backslash just like a normal character,
 				 * so we don't increment in those cases.
+				 *
+				 * Set 'c' to skip whole character correctly in multi-byte
+				 * encodings.  If we don't have the whole character in the
+				 * buffer yet, we might loop back to process it, after all,
+				 * but that's OK because multi-byte characters cannot have any
+				 * special meaning.
 				 */
 				raw_buf_ptr++;
+				c = c2;
+			}
 		}
-
 		/*
 		 * This label is for CSV cases where \. appears at the start of a
 		 * line, but there is more text after it, meaning it was a data value.
@@ -7519,7 +7763,10 @@ copy_dest_receive(TupleTableSlot *slot, DestReceiver *self)
 
 	/* Send the data */
 	CopyOneRowTo(cstate, slot);
-	myState->processed++;
+
+	/* Increment the number of processed tuples, and report the progress */
+	pgstat_progress_update_param(PROGRESS_COPY_TUPLES_PROCESSED,
+								 ++myState->processed);
 
 	return true;
 }

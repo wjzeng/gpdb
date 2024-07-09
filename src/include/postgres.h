@@ -338,13 +338,17 @@ typedef struct
  *
  *  Greenplum CDB:
  *     Datum is always 8 bytes, regardless if it is 32bit or 64bit machine.
- *  so may be > sizeof(void *).
+ *  so may be > sizeof(void *). To align with postgres, which defines Datum as
+ *  uintptr_t type, it is defined as a uintptr_t to make sure the raw Datum
+ *  comparator work. GPDB's document requires a x86_64 environment where
+ *  uintptr_t is 64bits which doesn't violate the original 64bits definition.
+ *  Although it is unclear why did GPDB had that restriction at the beginning.
  *
  * The macros below and the analogous macros for other types should be used to
  * convert between a Datum and the appropriate C type.
  */
 
-typedef int64 Datum;
+typedef uintptr_t Datum;
 typedef union Datum_U
 {
 	Datum d;
@@ -357,20 +361,6 @@ typedef union Datum_U
 
 #define SIZEOF_DATUM 8
 
-typedef Datum *DatumPtr;
-
-#define GET_1_BYTE(datum)	(((Datum) (datum)) & 0x000000ff)
-#define GET_2_BYTES(datum)	(((Datum) (datum)) & 0x0000ffff)
-#define GET_4_BYTES(datum)	(((Datum) (datum)) & 0xffffffff)
-#if SIZEOF_DATUM == 8
-#define GET_8_BYTES(datum)	((Datum) (datum))
-#endif
-#define SET_1_BYTE(value)	(((Datum) (value)) & 0x000000ff)
-#define SET_2_BYTES(value)	(((Datum) (value)) & 0x0000ffff)
-#define SET_4_BYTES(value)	(((Datum) (value)) & 0xffffffff)
-#if SIZEOF_DATUM == 8
-#define SET_8_BYTES(value)	((Datum) (value))
-#endif
 /*
  * A NullableDatum is used in places where both a Datum and its nullness needs
  * to be stored. This can be more efficient than storing datums and nullness

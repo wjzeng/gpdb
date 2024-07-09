@@ -128,6 +128,31 @@ CXform::FEqualIds(const CHAR *szIdOne, const CHAR *szIdTwo)
 
 //---------------------------------------------------------------------------
 //	@function:
+//		CXform::PbsNLJoinXforms
+//
+//	@doc:
+//		Returns a set containing all xforms related to nestloop join.
+//		Caller takes ownership of the returned set
+//
+//---------------------------------------------------------------------------
+CBitSet *
+CXform::PbsNLJoinXforms(CMemoryPool *mp)
+{
+	CBitSet *pbs = GPOS_NEW(mp) CBitSet(mp, EopttraceSentinel);
+	(void) pbs->ExchangeSet(
+		GPOPT_DISABLE_XFORM_TF(CXform::ExfLeftOuterJoin2NLJoin));
+	(void) pbs->ExchangeSet(
+		GPOPT_DISABLE_XFORM_TF(CXform::ExfLeftSemiJoin2NLJoin));
+	(void) pbs->ExchangeSet(
+		GPOPT_DISABLE_XFORM_TF(CXform::ExfLeftAntiSemiJoin2NLJoin));
+	(void) pbs->ExchangeSet(
+		GPOPT_DISABLE_XFORM_TF(CXform::ExfLeftAntiSemiJoinNotIn2NLJoinNotIn));
+
+	return pbs;
+}
+
+//---------------------------------------------------------------------------
+//	@function:
 //		CXform::PbsIndexJoinXforms
 //
 //	@doc:
@@ -163,8 +188,6 @@ CXform::PbsBitmapIndexXforms(CMemoryPool *mp)
 	(void) pbs->ExchangeSet(
 		GPOPT_DISABLE_XFORM_TF(CXform::ExfSelect2BitmapBoolOp));
 	(void) pbs->ExchangeSet(
-		GPOPT_DISABLE_XFORM_TF(CXform::ExfSelect2DynamicBitmapBoolOp));
-	(void) pbs->ExchangeSet(
 		GPOPT_DISABLE_XFORM_TF(CXform::ExfJoin2BitmapIndexGetApply));
 
 	return pbs;
@@ -178,8 +201,6 @@ CXform::PbsHashJoinXforms(CMemoryPool *mp)
 	CBitSet *pbs = GPOS_NEW(mp) CBitSet(mp, EopttraceSentinel);
 
 	(void) pbs->ExchangeSet(
-		GPOPT_DISABLE_XFORM_TF(CXform::ExfInnerJoin2HashJoin));
-	(void) pbs->ExchangeSet(
 		GPOPT_DISABLE_XFORM_TF(CXform::ExfLeftOuterJoin2HashJoin));
 	(void) pbs->ExchangeSet(
 		GPOPT_DISABLE_XFORM_TF(CXform::ExfLeftSemiJoin2HashJoin));
@@ -189,6 +210,8 @@ CXform::PbsHashJoinXforms(CMemoryPool *mp)
 		GPOPT_DISABLE_XFORM_TF(CXform::ExfLeftAntiSemiJoinNotIn2HashJoinNotIn));
 	(void) pbs->ExchangeSet(
 		GPOPT_DISABLE_XFORM_TF(CXform::ExfRightOuterJoin2HashJoin));
+	(void) pbs->ExchangeSet(
+		GPOPT_DISABLE_XFORM_TF(CXform::ExfFullOuterJoin2HashJoin));
 	(void) pbs->ExchangeSet(GPOPT_DISABLE_XFORM_TF(
 		CXform::
 			ExfLeftJoin2RightJoin));  // Right joins are only used with hash joins, so disable this too
@@ -209,7 +232,7 @@ CXform::PbsJoinOrderInQueryXforms(CMemoryPool *mp)
 	(void) pbs->ExchangeSet(
 		GPOPT_DISABLE_XFORM_TF(CXform::ExfJoinAssociativity));
 	(void) pbs->ExchangeSet(
-		GPOPT_DISABLE_XFORM_TF(CXform::ExfJoinCommutativity));
+		GPOPT_DISABLE_XFORM_TF(CXform::ExfInnerJoinCommutativity));
 	(void) pbs->ExchangeSet(
 		GPOPT_DISABLE_XFORM_TF(CXform::ExfExpandNAryJoinGreedy));
 
@@ -228,7 +251,7 @@ CXform::PbsJoinOrderOnGreedyXforms(CMemoryPool *mp)
 	(void) pbs->ExchangeSet(
 		GPOPT_DISABLE_XFORM_TF(CXform::ExfJoinAssociativity));
 	(void) pbs->ExchangeSet(
-		GPOPT_DISABLE_XFORM_TF(CXform::ExfJoinCommutativity));
+		GPOPT_DISABLE_XFORM_TF(CXform::ExfInnerJoinCommutativity));
 
 	return pbs;
 }

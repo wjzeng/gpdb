@@ -32,7 +32,9 @@ using namespace gpopt;
 //			members, hence, no need for a separate pattern ctor
 //
 //---------------------------------------------------------------------------
-CLogicalInnerJoin::CLogicalInnerJoin(CMemoryPool *mp) : CLogicalJoin(mp)
+CLogicalInnerJoin::CLogicalInnerJoin(CMemoryPool *mp,
+									 CXform::EXformId origin_xform)
+	: CLogicalJoin(mp, origin_xform)
 {
 	GPOS_ASSERT(nullptr != mp);
 }
@@ -66,13 +68,14 @@ CLogicalInnerJoin::PxfsCandidates(CMemoryPool *mp) const
 {
 	CXformSet *xform_set = GPOS_NEW(mp) CXformSet(mp);
 
-	(void) xform_set->ExchangeSet(CXform::ExfInnerJoin2NLJoin);
-	(void) xform_set->ExchangeSet(CXform::ExfInnerJoin2HashJoin);
+	(void) xform_set->ExchangeSet(CXform::ExfImplementInnerJoin);
 	(void) xform_set->ExchangeSet(CXform::ExfSubqJoin2Apply);
 	(void) xform_set->ExchangeSet(CXform::ExfJoin2BitmapIndexGetApply);
 	(void) xform_set->ExchangeSet(CXform::ExfJoin2IndexGetApply);
+	(void) xform_set->ExchangeSet(CXform::ExfPushJoinBelowLeftUnionAll);
+	(void) xform_set->ExchangeSet(CXform::ExfPushJoinBelowRightUnionAll);
 
-	(void) xform_set->ExchangeSet(CXform::ExfJoinCommutativity);
+	(void) xform_set->ExchangeSet(CXform::ExfInnerJoinCommutativity);
 	(void) xform_set->ExchangeSet(CXform::ExfJoinAssociativity);
 	(void) xform_set->ExchangeSet(CXform::ExfInnerJoinSemiJoinSwap);
 	(void) xform_set->ExchangeSet(CXform::ExfInnerJoinAntiSemiJoinSwap);

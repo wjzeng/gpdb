@@ -17,7 +17,7 @@ CDebugCounter class, see file ../libgpos/include/gpos/common/CDebugCounter.h
 # "DebugCounterEvent".
 #
 # The log file is either specified by the user, or we grep the log files
-# $MASTER_DATA_DIRECTORY/log/*.csv
+# $COORDINATOR_DATA_DIRECTORY/log/*.csv
 #
 # The log may contain multiple "runs". A run is a series of log entries made by
 # the same process. Note that this tool doesn't support concurrent processes logging.
@@ -27,7 +27,7 @@ CDebugCounter class, see file ../libgpos/include/gpos/common/CDebugCounter.h
 
 try:
 	from gppylib.db import dbconn
-except ImportError, e:
+except ImportError as e:
 	sys.exit('ERROR: Cannot import modules.  Please check that you have sourced greenplum_path.sh to set PYTHONPATH. '
 			 'Detail: ' + str(e))
 
@@ -60,6 +60,10 @@ distributed by (query_number, counter_name)
 
 glob_insert = """
 insert into debug_counters values(%s, %s, '%s', '%s', '%s', %s)
+"""
+
+show_log_directory = """
+show log_directory
 """
 
 
@@ -170,13 +174,30 @@ def processLogFile(logFileLines, allruns):
 			csv = "%d, %s" % (current_run_number, csv)
 			current_output.append(csv)
 
+# Helper function
+# -----------------------------------------------------------------------------
+
+def get_log_directory(args):
+	log_directory = ""
+	log_directory_conn = connect(args.host, args.port, args.dbName)
+	exp_curs = dbconn.query(log_directory_conn, show_log_directory)
+	rows = exp_curs.fetchall()
+	log_directory_conn.close()
+	# since we only care about the coordinator directory, there should only
+	# be one
+	if len(rows) != 1:
+		print("expected log directory result to be 1; got %d" % len(rows))
+	for row in rows:
+		log_directory = row[0]
+	return log_directory
 
 def parseargs():
-	parser = argparse.ArgumentParser(description=_help, version='1.0')
+	parser = argparse.ArgumentParser(description=_help)
 
+	parser.add_argument('--version', action='version', version='1.0')
 	parser.add_argument("--logFile", default="",
 						help="GPDB log file saved from a run with debug event counters enabled (default is to search "
-							 "GPDB master log directory)")
+							 "GPDB coordinator log directory)")
 	parser.add_argument("--allRuns", action="store_true",
 						help="Record all runs, instead of just the last one, use this if you had several psql runs")
 	parser.add_argument("--sql", action="store_true",
@@ -224,12 +245,18 @@ def main():
 	gather_command = ['sh', '-c']
 
 	if logfile is None or len(logfile) == 0:
-		if 'MASTER_DATA_DIRECTORY' in os.environ:
-			master_data_dir = os.environ['MASTER_DATA_DIRECTORY']
+		if 'COORDINATOR_DATA_DIRECTORY' in os.environ:
+			coordinator_data_dir = os.environ['COORDINATOR_DATA_DIRECTORY']
 		else:
-			print("$MASTER_DATA_DIRECTORY environment variable is not defined, exiting")
+			print("$COORDINATOR_DATA_DIRECTORY environment variable is not defined, exiting")
 			exit()
-		grep_command = grep_command + master_data_dir + '/log/*.csv'
+
+		log_directory = get_log_directory(args)
+		full_log_path = os.path.join(coordinator_data_dir, log_directory, '*.csv')
+		if os.path.isabs(log_directory):
+			full_log_path = os.path.join(log_directory, '*.csv')
+
+		grep_command = grep_command + full_log_path
 	else:
 		grep_command = grep_command + logfile
 

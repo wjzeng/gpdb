@@ -1,14 +1,10 @@
 use strict;
 use warnings;
-use TestLib;
-use PostgresNode;
+use PostgreSQL::Test::Utils;
+use PostgreSQL::Test::Cluster;
 use Test::More;
 
-if ($ENV{with_ldap} eq 'yes')
-{
-	plan tests => 22;
-}
-else
+if ($ENV{with_ldap} ne 'yes')
 {
 	plan skip_all => 'LDAP not supported by this build';
 }
@@ -48,21 +44,21 @@ elsif ($^O eq 'freebsd')
 
 $ENV{PATH} = "$ldap_bin_dir:$ENV{PATH}" if $ldap_bin_dir;
 
-my $ldap_datadir  = "${TestLib::tmp_check}/openldap-data";
-my $slapd_certs   = "${TestLib::tmp_check}/slapd-certs";
-my $slapd_conf    = "${TestLib::tmp_check}/slapd.conf";
-my $slapd_pidfile = "${TestLib::tmp_check}/slapd.pid";
-my $slapd_logfile = "${TestLib::tmp_check}/slapd.log";
-my $ldap_conf     = "${TestLib::tmp_check}/ldap.conf";
+my $ldap_datadir  = "${PostgreSQL::Test::Utils::tmp_check}/openldap-data";
+my $slapd_certs   = "${PostgreSQL::Test::Utils::tmp_check}/slapd-certs";
+my $slapd_conf    = "${PostgreSQL::Test::Utils::tmp_check}/slapd.conf";
+my $slapd_pidfile = "${PostgreSQL::Test::Utils::tmp_check}/slapd.pid";
+my $slapd_logfile = "${PostgreSQL::Test::Utils::log_path}/slapd.log";
+my $ldap_conf     = "${PostgreSQL::Test::Utils::tmp_check}/ldap.conf";
 my $ldap_server   = 'localhost';
-my $ldap_port     = int(rand() * 16384) + 49152;
-my $ldaps_port    = $ldap_port + 1;
+my $ldap_port     = PostgreSQL::Test::Cluster::get_free_port();
+my $ldaps_port    = PostgreSQL::Test::Cluster::get_free_port();
 my $ldap_url      = "ldap://$ldap_server:$ldap_port";
 my $ldaps_url     = "ldaps://$ldap_server:$ldaps_port";
 my $ldap_basedn   = 'dc=example,dc=net';
 my $ldap_rootdn   = 'cn=Manager,dc=example,dc=net';
 my $ldap_rootpw   = 'secret';
-my $ldap_pwfile   = "${TestLib::tmp_check}/ldappassword";
+my $ldap_pwfile   = "${PostgreSQL::Test::Utils::tmp_check}/ldappassword";
 
 note "setting up slapd";
 
@@ -102,10 +98,10 @@ mkdir $slapd_certs  or die;
 
 system_or_bail "openssl", "req", "-new", "-nodes", "-keyout",
   "$slapd_certs/ca.key", "-x509", "-out", "$slapd_certs/ca.crt", "-subj",
-  "/cn=CA";
+  "/CN=CA";
 system_or_bail "openssl", "req", "-new", "-nodes", "-keyout",
   "$slapd_certs/server.key", "-out", "$slapd_certs/server.csr", "-subj",
-  "/cn=server";
+  "/CN=server";
 system_or_bail "openssl", "x509", "-req", "-in", "$slapd_certs/server.csr",
   "-CA", "$slapd_certs/ca.crt", "-CAkey", "$slapd_certs/ca.key",
   "-CAcreateserial", "-out", "$slapd_certs/server.crt";
@@ -119,6 +115,24 @@ END
 
 append_to_file($ldap_pwfile, $ldap_rootpw);
 chmod 0600, $ldap_pwfile or die;
+
+# wait until slapd accepts requests
+my $retries = 0;
+while (1)
+{
+	last
+	  if (
+		system_log(
+			"ldapsearch", "-sbase",
+			"-H",         $ldap_url,
+			"-b",         $ldap_basedn,
+			"-D",         $ldap_rootdn,
+			"-y",         $ldap_pwfile,
+			"-n",         "'objectclass=*'") == 0);
+	die "cannot connect to slapd" if ++$retries >= 300;
+	note "waiting for slapd to accept requests...";
+	Time::HiRes::usleep(1000000);
+}
 
 $ENV{'LDAPURI'}    = $ldap_url;
 $ENV{'LDAPBINDDN'} = $ldap_rootdn;
@@ -134,7 +148,7 @@ system_or_bail 'ldappasswd', '-x', '-y', $ldap_pwfile, '-s', 'secret2',
 
 note "setting up PostgreSQL instance";
 
-my $node = get_new_node('node');
+my $node = PostgreSQL::Test::Cluster->new('node');
 $node->init;
 $node->start;
 
@@ -147,11 +161,17 @@ note "running tests";
 sub test_access
 {
 	my ($node, $role, $expected_res, $test_name) = @_;
+	my $connstr = "user=$role";
 
-	my $res =
-	  $node->psql('postgres', 'SELECT 1', extra_params => [ '-U', $role ]);
-	is($res, $expected_res, $test_name);
-	return;
+	if ($expected_res eq 0)
+	{
+		$node->connect_ok($connstr, $test_name);
+	}
+	else
+	{
+		# No checks of the error message, only the status code.
+		$node->connect_fails($connstr, $test_name);
+	}
 }
 
 note "simple bind";
@@ -310,3 +330,5 @@ $node->restart;
 
 $ENV{"PGPASSWORD"} = 'secret1';
 test_access($node, 'test1', 2, 'bad combination of LDAPS and StartTLS');
+
+done_testing();

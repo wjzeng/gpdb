@@ -50,6 +50,7 @@
 #include "unittest/gpopt/base/CDistributionSpecTest.h"
 #include "unittest/gpopt/base/CEquivalenceClassesTest.h"
 #include "unittest/gpopt/base/CFunctionalDependencyTest.h"
+#include "unittest/gpopt/base/CGroupTest.h"
 #include "unittest/gpopt/base/CKeyCollectionTest.h"
 #include "unittest/gpopt/base/CMaxCardTest.h"
 #include "unittest/gpopt/base/COrderSpecTest.h"
@@ -67,7 +68,6 @@
 #include "unittest/gpopt/metadata/CColumnDescriptorTest.h"
 #include "unittest/gpopt/metadata/CIndexDescriptorTest.h"
 #include "unittest/gpopt/metadata/CNameTest.h"
-#include "unittest/gpopt/metadata/CPartConstraintTest.h"
 #include "unittest/gpopt/metadata/CTableDescriptorTest.h"
 #include "unittest/gpopt/minidump/CAggTest.h"
 #include "unittest/gpopt/minidump/CArrayExpansionTest.h"
@@ -96,6 +96,7 @@
 #include "unittest/gpopt/operators/CContradictionTest.h"
 #include "unittest/gpopt/operators/CExpressionPreprocessorTest.h"
 #include "unittest/gpopt/operators/CExpressionTest.h"
+#include "unittest/gpopt/operators/CLogicalGbAggTest.h"
 #include "unittest/gpopt/operators/CPredicateUtilsTest.h"
 #include "unittest/gpopt/operators/CScalarIsDistinctFromTest.h"
 #include "unittest/gpopt/search/COptimizationJobsTest.h"
@@ -107,6 +108,7 @@
 #include "unittest/gpopt/xforms/CJoinOrderTest.h"
 #include "unittest/gpopt/xforms/CSubqueryHandlerTest.h"
 #include "unittest/gpopt/xforms/CXformFactoryTest.h"
+#include "unittest/gpopt/xforms/CXformRightOuterJoin2HashJoinTest.h"
 #include "unittest/gpopt/xforms/CXformTest.h"
 
 using namespace gpos;
@@ -159,17 +161,18 @@ static gpos::CUnittest rgut[] = {
 	GPOS_UNITTEST_STD(CCorrelatedExecutionTest),
 	GPOS_UNITTEST_STD(CDecorrelatorTest),
 	GPOS_UNITTEST_STD(CDistributionSpecTest), GPOS_UNITTEST_STD(CCastTest),
-	GPOS_UNITTEST_STD(CConstTblGetTest),
+	GPOS_UNITTEST_STD(CConstTblGetTest), GPOS_UNITTEST_STD(CLogicalGbAggTest),
 
 	GPOS_UNITTEST_STD(CSubqueryHandlerTest), GPOS_UNITTEST_STD(CBindingTest),
+	GPOS_UNITTEST_STD(CXformRightOuterJoin2HashJoinTest),
 	GPOS_UNITTEST_STD(CEngineTest), GPOS_UNITTEST_STD(CEquivalenceClassesTest),
-	GPOS_UNITTEST_STD(CExpressionTest), GPOS_UNITTEST_STD(CJoinOrderTest),
-	GPOS_UNITTEST_STD(CKeyCollectionTest), GPOS_UNITTEST_STD(CMaxCardTest),
+	GPOS_UNITTEST_STD(CGroupTest), GPOS_UNITTEST_STD(CExpressionTest),
+	GPOS_UNITTEST_STD(CJoinOrderTest), GPOS_UNITTEST_STD(CKeyCollectionTest),
+	GPOS_UNITTEST_STD(CMaxCardTest),
 	GPOS_UNITTEST_STD(CFunctionalDependencyTest), GPOS_UNITTEST_STD(CNameTest),
 	GPOS_UNITTEST_STD(COrderSpecTest), GPOS_UNITTEST_STD(CRangeTest),
 	GPOS_UNITTEST_STD(CPredicateUtilsTest),
 	GPOS_UNITTEST_STD(CScalarIsDistinctFromTest),
-	GPOS_UNITTEST_STD(CPartConstraintTest),
 	GPOS_UNITTEST_STD(CSearchStrategyTest),
 	GPOS_UNITTEST_STD(COptimizationJobsTest),
 	GPOS_UNITTEST_STD(CStateMachineTest),
@@ -178,6 +181,7 @@ static gpos::CUnittest rgut[] = {
 	GPOS_UNITTEST_STD(CXformFactoryTest), GPOS_UNITTEST_STD(CXformTest),
 	GPOS_UNITTEST_STD(CConstExprEvaluatorDefaultTest),
 	GPOS_UNITTEST_STD(CConstExprEvaluatorDXLTest),
+
 	// disable CEnumeratorTest until it is fixed
 	//	GPOS_UNITTEST_STD(CEnumeratorTest),
 };
@@ -211,9 +215,7 @@ ConfigureTests()
 #ifdef GPOS_DEBUG
 	// reset xforms factory to exercise xforms ctors and dtors
 	CXformFactory::Shutdown();
-	GPOS_RESULT eres = CXformFactory::Init();
-
-	GPOS_ASSERT(GPOS_OK == eres);
+	CXformFactory::Init();
 #endif	// GPOS_DEBUG
 }
 

@@ -21,9 +21,8 @@ from gppylib import gplog
 from gppylib.commands import base
 from gppylib.commands import unix
 from gppylib.commands import gp
-from gppylib.commands.gp import SEGMENT_STOP_TIMEOUT_DEFAULT
+from gppylib.commands.gp import SEGMENT_STOP_TIMEOUT_DEFAULT, DEFAULT_SEGHOST_NUM_WORKERS
 from gppylib.commands import pg
-from gppylib.db import dbconn
 from gppylib import pgconf
 from gppylib.commands.gp import is_pid_postmaster
 
@@ -67,8 +66,14 @@ class SegStop(base.Command):
         return self.result
 
     def run(self):
+
         try:
             self.datadir, self.port = self.get_datadir_and_port()
+
+            # Get a list of postgres processes running before stopping the server
+            # Use localhost since gpsegstop is run locally on segment hosts
+            postgres_pids = gp.get_postgres_segment_processes(self.datadir, 'localhost')
+            logger.debug("Postgres processes running for segment %s: %s", self.datadir, postgres_pids)
 
             cmd = gp.SegmentStop('segment shutdown', self.datadir, mode=self.mode, timeout=self.timeout)
             cmd.run()
@@ -115,7 +120,9 @@ class SegStop(base.Command):
                                        results.rc, results.stdout, results.stderr))
 
             try:
-                unix.kill_9_segment_processes(self.datadir, self.port, mypid)
+                # Use the process list and make sure that all the processes are killed at the end
+                # Use localhost since gpsegstop is run locally on segment hosts
+                unix.kill_9_segment_processes(self.datadir, postgres_pids, 'localhost')
 
                 if unix.check_pid(mypid) and mypid != -1:
                     status = SegStopStatus(self.datadir, False,
@@ -138,7 +145,7 @@ class SegStop(base.Command):
 # -------------------------------------------------------------------------
 class GpSegStop:
     ######
-    def __init__(self, dblist, mode, gpversion, timeout=SEGMENT_STOP_TIMEOUT_DEFAULT, logfileDirectory=False):
+    def __init__(self, dblist, mode, gpversion, timeout=SEGMENT_STOP_TIMEOUT_DEFAULT, logfileDirectory=False, segment_batch_size=DEFAULT_SEGHOST_NUM_WORKERS):
         self.dblist = dblist
         self.mode = mode
         self.expected_gpversion = gpversion
@@ -153,6 +160,7 @@ class GpSegStop:
         self.logger = logger
         self.pool = None
         self.logfileDirectory = logfileDirectory
+        self.segment_batch_size = segment_batch_size
 
     ######
     def run(self):
@@ -160,7 +168,7 @@ class GpSegStop:
         failures = []
 
         self.logger.info("Issuing shutdown commands to local segments...")
-        self.pool = base.WorkerPool()
+        self.pool = base.WorkerPool(min(len(self.dblist), self.segment_batch_size))
         for db in self.dblist:
             cmd = SegStop('segment shutdown', db=db, mode=self.mode, timeout=self.timeout)
             self.pool.addCommand(cmd)
@@ -202,13 +210,15 @@ class GpSegStop:
                           help="how to shutdown. modes are smart,fast, or immediate")
         parser.add_option("-t", "--timeout", dest="timeout", type="int", default=SEGMENT_STOP_TIMEOUT_DEFAULT,
                           help="seconds to wait")
+        parser.add_option("-b", "--segment-batch-size", dest="segment_batch_size", type="int", default=DEFAULT_SEGHOST_NUM_WORKERS,
+                          help="Max number of segments per host to operate on in parallel.")
         return parser
 
     @staticmethod
     def createProgram(options, args):
         logfileDirectory = options.ensure_value("logfileDirectory", False)
         return GpSegStop(options.dblist, options.mode, options.gpversion, options.timeout,
-                         logfileDirectory=logfileDirectory)
+                         logfileDirectory=logfileDirectory, segment_batch_size=options.segment_batch_size)
 
 
 # -------------------------------------------------------------------------

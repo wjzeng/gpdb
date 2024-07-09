@@ -15,6 +15,7 @@
 #include "gpos/common/CBitSet.h"
 #include "gpos/string/CWStringDynamic.h"
 
+#include "naucrates/md/IMDExtStatsInfo.h"
 #include "naucrates/statistics/CHistogram.h"
 #include "naucrates/statistics/CStatsPredArrayCmp.h"
 #include "naucrates/statistics/CStatsPredConj.h"
@@ -37,17 +38,24 @@ using namespace gpdxl;
 using namespace gpmd;
 using namespace gpopt;
 
-// hash maps ULONG -> array of ULONGs
-typedef CHashMap<ULONG, ULongPtrArray, gpos::HashValue<ULONG>,
-				 gpos::Equals<ULONG>, CleanupDelete<ULONG>,
-				 CleanupRelease<ULongPtrArray> >
-	UlongToUlongPtrArrayMap;
+using UlongToIntMap =
+	CHashMap<ULONG, INT, gpos::HashValue<ULONG>, gpos::Equals<ULONG>,
+			 CleanupDelete<ULONG>, CleanupDelete<INT>>;
 
 // iterator
-typedef CHashMapIter<ULONG, ULongPtrArray, gpos::HashValue<ULONG>,
-					 gpos::Equals<ULONG>, CleanupDelete<ULONG>,
-					 CleanupRelease<ULongPtrArray> >
-	UlongToUlongPtrArrayMapIter;
+using UlongToIntMapIter =
+	CHashMapIter<ULONG, INT, gpos::HashValue<ULONG>, gpos::Equals<ULONG>,
+				 CleanupDelete<ULONG>, CleanupDelete<INT>>;
+// hash maps ULONG -> array of ULONGs
+using UlongToUlongPtrArrayMap =
+	CHashMap<ULONG, ULongPtrArray, gpos::HashValue<ULONG>, gpos::Equals<ULONG>,
+			 CleanupDelete<ULONG>, CleanupRelease<ULongPtrArray>>;
+
+// iterator
+using UlongToUlongPtrArrayMapIter =
+	CHashMapIter<ULONG, ULongPtrArray, gpos::HashValue<ULONG>,
+				 gpos::Equals<ULONG>, CleanupDelete<ULONG>,
+				 CleanupRelease<ULongPtrArray>>;
 
 //---------------------------------------------------------------------------
 //	@class:
@@ -114,6 +122,12 @@ private:
 	// source can be one of the following operators: like Get, Group By, and Project
 	CUpperBoundNDVPtrArray *m_src_upper_bound_NDVs;
 
+	// extended statistics metadata
+	const IMDExtStatsInfo *m_ext_stats;
+
+	// map colid to attno (required because extended stats are stored as attno)
+	UlongToIntMap *m_colid_to_attno_mapping;
+
 	// the default value for operators that have no cardinality estimation risk
 	static const ULONG no_card_est_risk_default_val;
 
@@ -132,6 +146,13 @@ private:
 									  UlongToColRefMap *colref_mapping,
 									  BOOL must_exist);
 
+	// helper method to add attno information where the column ids have been
+	// remapped
+	static void AddAttnoInfoWithRemap(CMemoryPool *mp, UlongToIntMap *src_attno,
+									  UlongToIntMap *dest_attno,
+									  UlongToColRefMap *colref_mapping,
+									  BOOL must_exist);
+
 public:
 	CStatistics &operator=(CStatistics &) = delete;
 
@@ -144,7 +165,10 @@ public:
 
 	CStatistics(CMemoryPool *mp, UlongToHistogramMap *col_histogram_mapping,
 				UlongToDoubleMap *colid_width_mapping, CDouble rows,
-				BOOL is_empty, ULONG relpages, ULONG relallvisible);
+				BOOL is_empty, ULONG relpages, ULONG relallvisible,
+				CDouble rebinds, ULONG num_predicates,
+				const IMDExtStatsInfo *extstats,
+				UlongToIntMap *colid_to_attno_mapping);
 
 
 	// dtor
@@ -159,6 +183,12 @@ public:
 
 	// actual number of rows
 	CDouble Rows() const override;
+
+	void
+	SetRows(CDouble rows) override
+	{
+		m_rows = rows;
+	}
 
 	ULONG
 	RelPages() const override
@@ -208,8 +238,15 @@ public:
 	// look up the number of distinct values of a particular column
 	CDouble GetNDVs(const CColRef *colref) override;
 
+	// look up the fraction of nulls for a particular column
+	CDouble GetNullFreq(const CColRef *colref) override;
+
 	// look up the width of a particular column
 	virtual const CDouble *GetWidth(ULONG colid) const;
+
+	// Compute stats of a given column
+	IStatistics *ComputeColStats(CMemoryPool *mp, CColRef *colref,
+								 IMDId *rel_mdid) override;
 
 	// the risk of errors in cardinality estimation
 	ULONG
@@ -314,6 +351,19 @@ public:
 	{
 		return m_src_upper_bound_NDVs;
 	}
+
+	const IMDExtStatsInfo *
+	GetExtStatsInfo() const
+	{
+		return m_ext_stats;
+	}
+
+	UlongToIntMap *
+	GetColidToAttnoMapping() const
+	{
+		return m_colid_to_attno_mapping;
+	}
+
 	// create an empty statistics object
 	static CStatistics *
 	MakeEmptyStats(CMemoryPool *mp)

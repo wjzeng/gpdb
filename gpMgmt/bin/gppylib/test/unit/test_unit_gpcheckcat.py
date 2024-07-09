@@ -18,11 +18,11 @@ class GpCheckCatTestCase(GpTestCase):
         self.subject = imp.load_source('gpcheckcat', gpcheckcat_file)
         self.subject.check_gpexpand = lambda : (True, "")
 
-        self.db_connection = Mock(spec=['close', 'query'])
+        self.db_connection = Mock(spec=['close', 'cursor', 'set_session'])
         self.unique_index_violation_check = Mock(spec=['runCheck'])
         self.foreign_key_check = Mock(spec=['runCheck', 'checkTableForeignKey'])
         self.apply_patches([
-            patch("gpcheckcat.pg.connect", return_value=self.db_connection),
+            patch("gpcheckcat.connect", return_value=self.db_connection),
             patch("gpcheckcat.UniqueIndexViolationCheck", return_value=self.unique_index_violation_check),
             patch("gpcheckcat.ForeignKeyCheck", return_value=self.foreign_key_check),
             patch('os.environ', new={}),
@@ -129,23 +129,26 @@ class GpCheckCatTestCase(GpTestCase):
         self.assertIn(expected_message, log_messages)
 
     def test_automatic_thread_count(self):
-        self.db_connection.query.return_value.getresult.return_value = [[0]]
+        self.db_connection.cursor.return_value.fetchall.return_value = [[0]]
 
         self._run_batch_size_experiment(100)
         self._run_batch_size_experiment(101)
 
+    @patch('gpcheckcat.getversion', return_value='4.3')
     @patch('gpcheckcat.GPCatalog', return_value=Mock())
     @patch('sys.exit')
     @patch('gppylib.gplog.log_literal')
-    def test_truncate_batch_size(self, mock_log, mock_gpcheckcat, mock_sys_exit):
+    def test_truncate_batch_size(self, mock_log, mock_sys_exit, mock_gpcatalog, mock_version):
         self.subject.GV.opt['-B'] = 300  # override the setting from available memory
         # setup conditions for 50 primaries and plenty of RAM such that max threads > 50
         primaries = [dict(hostname='host0', port=123, id=1, address='123', datadir='dir', content=-1, dbid=0, isprimary='t')]
 
         for i in range(1, 50):
             primaries.append(dict(hostname='host0', port=123, id=1, address='123', datadir='dir', content=1, dbid=i, isprimary='t'))
-        self.db_connection.query.return_value.getresult.return_value = [['4.3']]
-        self.db_connection.query.return_value.dictresult.return_value = primaries
+        self.db_connection.cursor.return_value = Mock()
+        self.db_connection.cursor.return_value.__enter__ = Mock(return_value=Mock(spec=['fetchall', 'execute']))
+        self.db_connection.cursor.return_value.__exit__ = Mock(return_value=False)
+        self.db_connection.cursor.return_value.__enter__.return_value.fetchall.return_value = primaries
 
         testargs = ['some_string','-port 1', '-R foo']
 
@@ -221,10 +224,11 @@ class GpCheckCatTestCase(GpTestCase):
         self.foreign_key_check.runCheck.assert_called_once_with(cat_tables)
 
     # Test gpcheckat -C option with checkForeignKey
+    @patch('gpcheckcat.getversion', return_value='4.3')
     @patch('gpcheckcat.GPCatalog', return_value=Mock())
     @patch('sys.exit')
     @patch('gpcheckcat.checkTableMissingEntry')
-    def test_runCheckCatname__for_checkForeignKey(self, mock1, mock2, mock3):
+    def test_runCheckCatname__for_checkForeignKey(self, mock1, mock2, mock3, mock4):
         self.subject.checkForeignKey = Mock()
         gpcat_class_mock = Mock(spec=['getCatalogTable'])
         cat_obj_mock = Mock()
@@ -234,8 +238,12 @@ class GpCheckCatTestCase(GpTestCase):
 
         for i in range(1, 50):
             primaries.append(dict(hostname='host0', port=123, id=1, address='123', datadir='dir', content=1, dbid=i, isprimary='t'))
-        self.db_connection.query.return_value.getresult.return_value = [['4.3']]
-        self.db_connection.query.return_value.dictresult.return_value = primaries
+
+        # context manager helper functions.
+        self.db_connection.cursor.return_value = Mock()
+        self.db_connection.cursor.return_value.__enter__ = Mock(return_value=Mock(spec=['fetchall', 'execute']))
+        self.db_connection.cursor.return_value.__exit__ = Mock(return_value=False)
+        self.db_connection.cursor.return_value.__enter__.return_value.fetchall.return_value = primaries
 
         self.subject.GV.opt['-C'] = 'pg_class'
 
@@ -306,6 +314,109 @@ class GpCheckCatTestCase(GpTestCase):
         self.assertIn('Relation schema: N/A', log_messages)
         self.assertIn('Relation name: N/A', log_messages)
 
+    @patch('gpcheckcat.GPCatalog', return_value=Mock())
+    @patch('sys.exit')
+    @patch('gpcheckcat.runAllChecks', return_value=Mock())
+    @patch('gpcheckcat.getversion', return_value="5.0")
+    def test_skip_one_test(self, mock_ver, mock_run, mock1, mock2):
+        primaries = [dict(hostname='host0', port=123, id=1, address='123', datadir='dir', content=-1, dbid=0, isprimary='t')]
+        for i in range(1, 50):
+            primaries.append(dict(hostname='host0', port=123, id=1, address='123', datadir='dir', content=1, dbid=i, isprimary='t'))
+
+        # context manager helper functions.
+        self.db_connection.cursor.return_value = Mock()
+        self.db_connection.cursor.return_value.__enter__ = Mock(return_value=Mock(spec=['fetchall', 'execute']))
+        self.db_connection.cursor.return_value.__exit__ = Mock(return_value=False)
+        self.db_connection.cursor.return_value.__enter__.return_value.fetchall.return_value = primaries
+
+        self.subject.all_checks = {'test1': 'a', 'test2': 'b', 'test3': 'c'}
+
+        testargs = ['gpcheckcat', '-port 1', '-s test2']
+        with patch.object(sys, 'argv', testargs):
+            self.subject.main()
+        mock_run.assert_has_calls([call(['test1', 'test3'])])
+
+    @patch('gpcheckcat.GPCatalog', return_value=Mock())
+    @patch('sys.exit')
+    @patch('gpcheckcat.runAllChecks', return_value=Mock())
+    @patch('gpcheckcat.getversion', return_value="5.0")
+    def test_skip_multiple_test(self, mock_ver, mock_run, mock1, mock2):
+        primaries = [dict(hostname='host0', port=123, id=1, address='123', datadir='dir', content=-1, dbid=0, isprimary='t')]
+        for i in range(1, 50):
+            primaries.append(dict(hostname='host0', port=123, id=1, address='123', datadir='dir', content=1, dbid=i, isprimary='t'))
+
+        # context manager helper functions.
+        self.db_connection.cursor.return_value = Mock()
+        self.db_connection.cursor.return_value.__enter__ = Mock(return_value=Mock(spec=['fetchall', 'execute']))
+        self.db_connection.cursor.return_value.__exit__ = Mock(return_value=False)
+        self.db_connection.cursor.return_value.__enter__.return_value.fetchall.return_value = primaries
+
+        self.subject.all_checks = {'test1': 'a', 'test2': 'b', 'test3': 'c'}
+
+        testargs = ['gpcheckcat', '-port 1', '-s', "test1, test2"]
+        with patch.object(sys, 'argv', testargs):
+            self.subject.main()
+        mock_run.assert_has_calls([call(['test3'])])
+
+    @patch('gpcheckcat.GPCatalog', return_value=Mock())
+    @patch('sys.exit')
+    @patch('gpcheckcat.runAllChecks', return_value=Mock())
+    @patch('gpcheckcat.getversion', return_value="5.0")
+    def test_skip_test_warning(self, mock_ver, mock_run, mock1, mock2):
+        primaries = [dict(hostname='host0', port=123, id=1, address='123', datadir='dir', content=-1, dbid=0, isprimary='t')]
+        for i in range(1, 50):
+            primaries.append(dict(hostname='host0', port=123, id=1, address='123', datadir='dir', content=1, dbid=i, isprimary='t'))
+        # context manager helper functions.
+        self.db_connection.cursor.return_value = Mock()
+        self.db_connection.cursor.return_value.__enter__ = Mock(return_value=Mock(spec=['fetchall', 'execute']))
+        self.db_connection.cursor.return_value.__exit__ = Mock(return_value=False)
+        self.db_connection.cursor.return_value.__enter__.return_value.fetchall.return_value = primaries
+        self.subject.all_checks = {'test1': 'a', 'test2': 'b', 'test3': 'c'}
+
+        testargs = ['gpcheckcat', '-port 1', '-s', "test_invalid, test2"]
+        with patch.object(sys, 'argv', testargs):
+            self.subject.main()
+        mock_run.assert_has_calls([call(['test1', 'test3'])])
+        expected_message = "'test_invalid' is not a valid test"
+        log_messages = [args[0][1] for args in self.subject.logger.log.call_args_list]
+        self.assertIn(expected_message, log_messages)
+
+    @patch('gpcheckcat.GPCatalog', return_value=Mock())
+    @patch('sys.exit')
+    @patch('gpcheckcat.runAllChecks', return_value=Mock())
+    @patch('gpcheckcat.getversion', return_value="5.0")
+    def test_run_multiple_test(self, mock_ver, mock_run, mock1, mock2):
+        primaries = [dict(hostname='host0', port=123, id=1, address='123', datadir='dir', content=-1, dbid=0, isprimary='t')]
+        for i in range(1, 50):
+            primaries.append(dict(hostname='host0', port=123, id=1, address='123', datadir='dir', content=1, dbid=i, isprimary='t'))
+
+        # context manager helper functions.
+        self.db_connection.cursor.return_value = Mock()
+        self.db_connection.cursor.return_value.__enter__ = Mock(return_value=Mock(spec=['fetchall', 'execute']))
+        self.db_connection.cursor.return_value.__exit__ = Mock(return_value=False)
+        self.db_connection.cursor.return_value.__enter__.return_value.fetchall.return_value = primaries
+
+        self.subject.all_checks = {'test1': 'a', 'test2': 'b', 'test3': 'c'}
+
+        testargs = ['gpcheckcat', '-port 1', '-R', "test1, test2"]
+        with patch.object(sys, 'argv', testargs):
+            self.subject.main()
+        calls_to_check = [call(['test1', 'test2'])]
+        mock_run.assert_has_calls(calls_to_check)
+
+    @patch('sys.exit')
+    @patch('gpcheckcat.getversion', return_value="5.0")
+    def test_check_test_subset_parameter_count_fail(self, mock_ver, mock_exit):
+        GV = Global()
+        GV.opt['-R'] = 'test1'
+        GV.opt['-s'] = 'test2'
+        GV.opt['-C'] = None
+        GV.retcode = None
+        self.subject.GV = GV
+
+        self.subject.check_test_subset_parameter_count()
+        self.subject.setError.assert_any_call(self.subject.ERROR_NOREPAIR)
+
     ####################### PRIVATE METHODS #######################
 
     def _run_batch_size_experiment(self, num_primaries):
@@ -330,6 +441,179 @@ class GpCheckCatTestCase(GpTestCase):
                 self.num_batches += 1
                 self.num_joins = 0
                 self.num_starts = 0
+
+    @patch('gpcheckcat.connect2')
+    def test_checkMixDistPolicy_with_error_on_execution(self,mock_connect2):
+        # Mocking the database connection to raise an exception during execution
+
+        mock_cursor = Mock()
+        mock_connect2.return_value.cursor.return_value.__enter__.return_value = mock_cursor
+        mock_cursor.execute.side_effect = Exception("Simulated error during execution")
+
+        # Call the function to test
+        self.subject.checkMixDistPolicy()
+
+        # Assertions
+        self.assertEqual(mock_cursor.execute.call_count, 1)
+        self.assertFalse(self.subject.GV.checkStatus)
+
+    @patch('gpcheckcat.connect2')
+    def test_checkMixDistPolicy_exception_on_connect(self, mock_connect2):
+        # Mocking the database connection to raise an exception during connection
+        mock_connect2.side_effect = Exception("Simulated error during connection")
+
+        # Call the function to test
+        self.subject.checkMixDistPolicy()
+
+        # Assertions
+        self.assertEqual(mock_connect2.call_count, 1)
+        self.assertFalse(self.subject.GV.checkStatus)
+
+    @patch('gpcheckcat.connect2')
+    def test_checkMixDistPolicy_exception_on_cursor_enter(self, mock_connect2):
+        # Mocking the database connection to raise an exception when entering the cursor context
+        mock_connect2.return_value.cursor.return_value.__enter__.side_effect = Exception("Simulated error entering cursor context")
+
+        # Call the function to test
+        self.subject.checkMixDistPolicy()
+
+        # Assertions
+        self.assertEqual(mock_connect2.call_count, 1)
+        self.assertFalse(self.subject.GV.checkStatus)
+
+    @patch('gpcheckcat.connect2')
+    def test_fetch_guc_value_with_error_on_execution(self,mock_connect2):
+        # Mocking the database connection to raise an exception during execution
+
+        mock_cursor = Mock()
+        mock_connect2.return_value.cursor.return_value.__enter__.return_value = mock_cursor
+        mock_cursor.execute.side_effect = Exception("Simulated error during execution")
+
+        # Call the function to test
+        self.subject.fetch_guc_value("gp_use_legacy_hashops")
+
+        # Assertions
+        self.assertEqual(mock_cursor.execute.call_count, 1)
+        self.assertEqual(mock_cursor.fetchone.call_count, 0)
+        self.subject.setError.assert_any_call(self.subject.ERROR_NOREPAIR)
+        self.assertFalse(self.subject.GV.checkStatus)
+
+    @patch('gpcheckcat.connect2')
+    def test_fetch_guc_value_exception_on_connect(self, mock_connect2):
+        # Mocking the database connection to raise an exception during connection
+        mock_cursor = Mock()
+        mock_connect2.return_value.cursor.return_value.__enter__.return_value = mock_cursor
+        mock_connect2.side_effect = Exception("Simulated error during execution")
+
+        # Call the function to test
+        self.subject.fetch_guc_value("gp_use_legacy_hashops")
+
+        # Assertions
+        self.assertEqual(mock_cursor.execute.call_count, 0)
+        self.assertEqual(mock_connect2.call_count, 1)
+        self.assertEqual(mock_cursor.fetchone.call_count, 0)
+        self.subject.setError.assert_any_call(self.subject.ERROR_NOREPAIR)
+        self.assertFalse(self.subject.GV.checkStatus)
+
+    @patch('gpcheckcat.connect2')
+    def test_fetch_guc_value_exception_on_cursor_enter(self, mock_connect2):
+        # Mocking the database connection to raise an exception on cursor context
+        mock_cursor = Mock()
+        #mock_connect2.return_value.cursor.return_value.__enter__.return_value = mock_cursor
+        mock_connect2.return_value.cursor.return_value = mock_cursor
+        mock_cursor.side_effect = Exception("Simulated error during execution")
+
+        # Call the function to test
+        self.subject.fetch_guc_value("gp_use_legacy_hashops")
+
+        # Assertions
+        self.assertEqual(mock_connect2.call_count, 1)
+        self.assertEqual(mock_cursor.execute.call_count, 0)
+        self.assertFalse(self.subject.GV.checkStatus)
+        self.assertEqual(mock_cursor.fetchone.call_count, 0)
+        self.subject.setError.assert_any_call(self.subject.ERROR_NOREPAIR)
+
+    def test_generateDistPolicyQueryFile(self):
+        # Call the function
+        self.subject.generateDistPolicyQueryFile()
+
+        # Check if the file is created
+        self.assertTrue(os.path.exists('gpcheckcat.distpolicy.sql'))
+
+        # Read the file and check if it contains the expected query
+        with open('gpcheckcat.distpolicy.sql', 'r') as fp:
+            generated_query = fp.read()
+
+        expected_query = '''
+     -- all tables that use legacy policy:
+     with legacy_opclass_oids(oid_array) as (
+       select
+         array_agg(oid)
+       from
+         pg_opclass
+       where
+         opcfamily in (
+           select
+             amprocfamily
+           from
+             pg_amproc
+           where
+             amproc :: oid in (
+               6140, 6141, 6142, 6143, 6144, 6145, 6146,
+               6147, 6148, 6149, 6150, 6151, 6152,
+               6153, 6154, 6155, 6156, 6157, 6158,
+               6159, 6160, 6161, 6162, 6163, 6164,
+               6165, 6166, 6167, 6168, 6170, 6169,
+               6171
+             )
+         )
+     )
+    select
+         localoid :: regclass :: text as "Legacy Policy"
+    from
+         gp_distribution_policy,
+         legacy_opclass_oids
+     where
+         policytype = 'p'
+         and distclass :: oid[] && oid_array;
+  
+ -- all tables that don't use any legacy policy:
+ with legacy_opclass_oids(oid_array) as (
+   select
+     array_agg(oid)
+   from
+     pg_opclass
+   where
+     opcfamily in (
+       select
+         amprocfamily
+       from
+         pg_amproc
+       where
+         amproc :: oid in (
+           6140, 6141, 6142, 6143, 6144, 6145, 6146,
+           6147, 6148, 6149, 6150, 6151, 6152,
+           6153, 6154, 6155, 6156, 6157, 6158,
+           6159, 6160, 6161, 6162, 6163, 6164,
+           6165, 6166, 6167, 6168, 6170, 6169,
+           6171
+         )
+     )
+ )
+select
+   localoid :: regclass :: text as "Non Legacy Policy"
+from
+   gp_distribution_policy,
+   legacy_opclass_oids
+where
+   policytype = 'p'
+   and not (distclass :: oid[] && oid_array);
+           '''
+        self.assertEqual.__self__.maxDiff = None
+        self.assertTrue(generated_query.strip() == expected_query.strip())
+class Global():
+    def __init__(self):
+        self.opt = {}
 
 if __name__ == '__main__':
     run_tests()

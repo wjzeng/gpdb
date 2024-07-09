@@ -97,7 +97,7 @@ sigIntHandler(SIGNAL_ARGS)
 pid_t
 FtsProbePID(void)
 {
-	return *shmFtsProbePID;
+	return shmFtsProbePID ? *shmFtsProbePID : 0;
 }
 
 bool
@@ -156,7 +156,7 @@ CdbComponentDatabases *readCdbComponentInfoAndUpdateStatus(void)
 	}
 
 	/*
-	 * Initialize fts_stausVersion after populating the config details in
+	 * Initialize fts_statusVersion after populating the config details in
 	 * shared memory for the first time after FTS startup.
 	 */
 	if (ftsProbeInfo->status_version == 0)
@@ -199,7 +199,7 @@ probeWalRepUpdateConfig(int16 dbid, int16 segindex, char role,
 				 IsInSync ? GP_SEGMENT_CONFIGURATION_MODE_INSYNC :
 				 GP_SEGMENT_CONFIGURATION_MODE_NOTINSYNC
 			);
-		histvals[Anum_gp_configuration_history_desc-1] =
+		histvals[Anum_gp_configuration_history_description-1] =
 				CStringGetTextDatum(desc);
 		histtuple = heap_form_tuple(RelationGetDescr(histrel), histvals, histnulls);
 		CatalogTupleInsert(histrel, histtuple);
@@ -267,6 +267,57 @@ probeWalRepUpdateConfig(int16 dbid, int16 segindex, char role,
 	}
 }
 
+void
+probeUpdateConfHistory(const CdbComponentDatabaseInfo *primary,
+					bool isSegmentAlive,
+					bool hasMirrors)
+{
+	Relation  histrel;
+	HeapTuple histtuple;
+	Datum     histvals[Natts_gp_configuration_history];
+	bool      histnulls[Natts_gp_configuration_history] = {false };
+	char      desc[64];
+
+	histrel   = table_open(GpConfigHistoryRelationId,
+						   RowExclusiveLock);
+
+	histvals[Anum_gp_configuration_history_time-1] =
+		TimestampTzGetDatum(GetCurrentTimestamp());
+	histvals[Anum_gp_configuration_history_dbid-1] =
+		Int16GetDatum(primary->config->dbid);
+	if (hasMirrors)
+	{
+		if (isSegmentAlive)
+			snprintf(desc, sizeof(desc),
+					 "FTS: content id %d is out of double fault, dbid %d is up",
+					 primary->config->segindex, primary->config->dbid);
+		else
+			snprintf(desc, sizeof(desc),
+					 "FTS: double fault detected for content id %d",
+					 primary->config->segindex);
+	}
+	else
+	{
+		if (isSegmentAlive)
+			snprintf(desc, sizeof(desc),
+					 "FTS: content id %d dbid %d is now up",
+					 primary->config->segindex, primary->config->dbid);
+		else
+			snprintf(desc, sizeof(desc),
+					 "FTS: content id %d dbid %d is down",
+					 primary->config->segindex, primary->config->dbid);
+	}
+	histvals[Anum_gp_configuration_history_description-1] =
+		CStringGetTextDatum(desc);
+	histtuple = heap_form_tuple(RelationGetDescr(histrel), histvals, histnulls);
+	CatalogTupleInsert(histrel, histtuple);
+	heap_freetuple(histtuple);
+
+	SIMPLE_FAULT_INJECTOR("fts_update_config_hist");
+
+	table_close(histrel, RowExclusiveLock);
+}
+
 static
 void FtsLoop()
 {
@@ -283,7 +334,6 @@ void FtsLoop()
 
 	while (true)
 	{
-		bool		has_mirrors;
 		int			rc;
 
 		if (got_SIGHUP)
@@ -308,7 +358,6 @@ void FtsLoop()
 		cdbs = readCdbComponentInfoAndUpdateStatus();
 
 		/* Check here gp_segment_configuration if has mirror's */
-		has_mirrors = gp_segment_config_has_mirrors();
 
 		/* close the transaction we started above */
 		CommitTransactionCommand();
@@ -322,18 +371,15 @@ void FtsLoop()
 			skip_fts_probe = true;
 #endif
 
-		if (skip_fts_probe || !has_mirrors)
+		if (skip_fts_probe)
 		{
 			elogif(gp_log_fts >= GPVARS_VERBOSITY_VERBOSE, LOG,
-				   "skipping FTS probes due to %s",
-				   !has_mirrors ? "no mirrors" : "fts_probe fault");
-
+				   "skipping FTS probes due to fts_probe fault");
 		}
 		else
 		{
 			elogif(gp_log_fts == GPVARS_VERBOSITY_DEBUG, LOG,
-				   "FTS: starting %s scan with %d segments and %d contents",
-				   (probe_requested ? "full " : ""),
+				   "FTS: starting scan with %d segments and %d contents",
 				   cdbs->total_segment_dbs,
 				   cdbs->total_segments);
 			/*
@@ -392,7 +438,13 @@ void FtsLoop()
 		 * timeout, so we recheck probe_requested here before waitLatch().
 		 */
 		if (probe_requested)
+		{
+			elogif(gp_log_fts >= GPVARS_VERBOSITY_VERBOSE, LOG,
+				   "FTS: run the probe due to external request, even if the remaining time for the next probe is %ds",
+				   (int) timeout);
+
 			timeout = 0;
+		}
 
 		rc = WaitLatch(&MyProc->procLatch,
 					   WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,

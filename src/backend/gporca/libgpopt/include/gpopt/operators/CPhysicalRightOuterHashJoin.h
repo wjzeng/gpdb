@@ -28,6 +28,11 @@ namespace gpopt
 class CPhysicalRightOuterHashJoin : public CPhysicalHashJoin
 {
 private:
+	// helper for deriving hash join distribution from hashed children
+	CDistributionSpec *PdsDeriveFromHashedChildren(
+		CMemoryPool *mp, CDistributionSpec *pdsOuter,
+		CDistributionSpec *pdsInner) const;
+
 protected:
 	// create optimization requests
 	void CreateOptRequests(CMemoryPool *mp) override;
@@ -36,13 +41,17 @@ public:
 	CPhysicalRightOuterHashJoin(const CPhysicalRightOuterHashJoin &) = delete;
 
 	// ctor
-	CPhysicalRightOuterHashJoin(CMemoryPool *mp,
-								CExpressionArray *pdrgpexprOuterKeys,
-								CExpressionArray *pdrgpexprInnerKeys,
-								IMdIdArray *hash_opfamilies = nullptr);
+	CPhysicalRightOuterHashJoin(
+		CMemoryPool *mp, CExpressionArray *pdrgpexprOuterKeys,
+		CExpressionArray *pdrgpexprInnerKeys, IMdIdArray *hash_opfamilies,
+		BOOL is_null_aware = true,
+		CXform::EXformId origin_xform = CXform::ExfSentinel);
 
 	// dtor
 	~CPhysicalRightOuterHashJoin() override;
+
+	CDistributionSpec *PdsDerive(CMemoryPool *mp,
+								 CExpressionHandle &exprhdl) const override;
 
 	// ident accessors
 	EOperatorId
@@ -76,6 +85,14 @@ public:
 						   CReqdPropPlan *prppInput, ULONG child_index,
 						   CDrvdPropArray *pdrgpdpCtxt,
 						   ULONG ulOptReq) override;
+
+	CPartitionPropagationSpec *PppsRequired(
+		CMemoryPool *mp, CExpressionHandle &exprhdl,
+		CPartitionPropagationSpec *pppsRequired, ULONG child_index,
+		CDrvdPropArray *pdrgpdpCtxt, ULONG ulOptReq) const override;
+
+	CPartitionPropagationSpec *PppsDerive(
+		CMemoryPool *mp, CExpressionHandle &exprhdl) const override;
 
 };	// class CPhysicalRightOuterHashJoin
 

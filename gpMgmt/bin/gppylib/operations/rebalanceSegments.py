@@ -1,5 +1,6 @@
 import sys
 import signal
+from contextlib import closing
 from gppylib.gparray import GpArray
 from gppylib.db import dbconn
 from gppylib.commands.gp import GpSegStopCmd
@@ -8,7 +9,32 @@ from gppylib import gplog
 
 from gppylib.operations.segment_reconfigurer import SegmentReconfigurer
 
-MIRROR_PROMOTION_TIMEOUT=30
+MIRROR_PROMOTION_TIMEOUT = 600
+
+logger = gplog.get_default_logger()
+
+
+def replay_lag(primary_db):
+    """
+    This function returns replay lag (diff of flush_lsn and replay_lsn) on mirror segment. Goal being if there is a
+    lot to catchup on mirror the user should be warned about that and rebalance opertion should be aborted.
+    params: primary segment info
+    return value: replay lag in bytes
+    replay lag in bytes: diff of flush_lsn and replay_lsn on mirror
+    """
+    port = primary_db.getSegmentPort()
+    host = primary_db.getSegmentHostName()
+    logger.debug('Get replay lag on mirror of primary segment with host:{}, port:{}'.format(host, port))
+    sql = "select pg_wal_lsn_diff(flush_lsn, replay_lsn) from pg_stat_replication;"
+
+    try:
+        dburl = dbconn.DbURL(hostname=host, port=port)
+        with closing(dbconn.connect(dburl, utility=True, encoding='UTF8')) as conn:
+            replay_lag = dbconn.querySingleton(conn, sql)
+    except Exception as ex:
+        raise Exception("Failed to query pg_stat_replication for host:{}, port:{}, error: {}".
+                        format(host, port, str(ex)))
+    return replay_lag
 
 
 class ReconfigDetectionSQLQueryCommand(base.SQLCommand):
@@ -26,9 +52,13 @@ class ReconfigDetectionSQLQueryCommand(base.SQLCommand):
 
 
 class GpSegmentRebalanceOperation:
-    def __init__(self, gpEnv, gpArray):
+    def __init__(self, gpEnv, gpArray, batch_size, segment_batch_size, disable_replay_lag, replay_lag):
         self.gpEnv = gpEnv
         self.gpArray = gpArray
+        self.batch_size = batch_size
+        self.segment_batch_size = segment_batch_size
+        self.disable_replay_lag = disable_replay_lag
+        self.replay_lag = replay_lag
         self.logger = gplog.get_default_logger()
 
     def rebalance(self):
@@ -43,10 +73,22 @@ class GpSegmentRebalanceOperation:
                 continue
 
             if segmentPair.up() and segmentPair.reachable() and segmentPair.synchronized():
+
+                if not self.disable_replay_lag:
+                    self.logger.info("Allowed replay lag during rebalance is {} GB".format(self.replay_lag))
+                    replay_lag_in_bytes = replay_lag(segmentPair.primaryDB)
+                    if float(replay_lag_in_bytes) >= (self.replay_lag * 1024 * 1024 * 1024):
+                        raise Exception("{} bytes of wal is still to be replayed on mirror with dbid {}, let "
+                                        "mirror catchup on replay then trigger rebalance. Use --replay-lag to "
+                                        "configure the allowed replay lag limit or --disable-replay-lag to disable"
+                                        " the check completely if you wish to continue with rebalance anyway"
+                                        .format(replay_lag_in_bytes, segmentPair.primaryDB.getSegmentDbId()))
+
                 unbalanced_primary_segs.append(segmentPair.primaryDB)
             else:
                 self.logger.warning(
-                    "Not rebalancing primary segment dbid %d with its mirror dbid %d because one is either down, unreachable, or not synchronized" \
+                    "Not rebalancing primary segment dbid %d with its mirror dbid %d because one is either down, "
+                    "unreachable, or not synchronized" \
                     % (segmentPair.primaryDB.dbid, segmentPair.mirrorDB.dbid))
 
         if not len(unbalanced_primary_segs):
@@ -55,7 +97,7 @@ class GpSegmentRebalanceOperation:
 
         unbalanced_primary_segs = GpArray.getSegmentsByHostName(unbalanced_primary_segs)
 
-        pool = base.WorkerPool()
+        pool = base.WorkerPool(min(len(unbalanced_primary_segs), self.batch_size))
         try:
             # Disable ctrl-c
             signal.signal(signal.SIGINT, signal.SIG_IGN)
@@ -69,7 +111,8 @@ class GpSegmentRebalanceOperation:
                                    unbalanced_primary_segs[hostname],
                                    ctxt=base.REMOTE,
                                    remoteHost=hostname,
-                                   timeout=600)
+                                   timeout=600,
+                                   segment_batch_size=self.segment_batch_size)
                 pool.addCommand(cmd)
 
             base.join_and_indicate_progress(pool)
@@ -83,7 +126,7 @@ class GpSegmentRebalanceOperation:
             allSegmentsStopped = (failed_count == 0)
 
             if not allSegmentsStopped:
-                self.logger.warn("%d segments failed to stop.  A full rebalance of the")
+                self.logger.warn("%d segments failed to stop.  A full rebalance of the" % failed_count)
                 self.logger.warn("system is not possible at this time.  Please check the")
                 self.logger.warn("log files, correct the problem, and run gprecoverseg -r")
                 self.logger.warn("again.")
@@ -97,25 +140,25 @@ class GpSegmentRebalanceOperation:
             # Final step is to issue a recoverseg operation to resync segments
             self.logger.info("Starting segment synchronization")
             original_sys_args = sys.argv[:]
+            self.logger.info("=============================START ANOTHER RECOVER=========================================")
+            # import here because GpRecoverSegmentProgram and GpSegmentRebalanceOperation have a circular dependency
+            from gppylib.programs.clsRecoverSegment import GpRecoverSegmentProgram
+            cmd_args = ['gprecoverseg', '-a', '-B', str(self.batch_size), '-b', str(self.segment_batch_size)]
+            sys.argv = cmd_args[:]
+            local_parser = GpRecoverSegmentProgram.createParser()
+            local_options, args = local_parser.parse_args()
+            recover_cmd = GpRecoverSegmentProgram.createProgram(local_options, args)
             try:
-                self.logger.info("=============================START ANOTHER RECOVER=========================================")
-                # import here because GpRecoverSegmentProgram and GpSegmentRebalanceOperation have a circular dependency
-                from gppylib.programs.clsRecoverSegment import GpRecoverSegmentProgram
-                sys.argv = ['gprecoverseg', '-a']
-                local_parser = GpRecoverSegmentProgram.createParser()
-                local_options, args = local_parser.parse_args()
-                cmd = GpRecoverSegmentProgram.createProgram(local_options, args)
-                cmd.run()
-
+                recover_cmd.run()
             except SystemExit as e:
                 if e.code != 0:
                     self.logger.error("Failed to start the synchronization step of the segment rebalance.")
                     self.logger.error("Check the gprecoverseg log file, correct any problems, and re-run")
-                    self.logger.error("'gprecoverseg -a'.")
+                    self.logger.error(' '.join(cmd_args))
                     raise Exception("Error synchronizing.\nError: %s" % str(e))
             finally:
-                if cmd:
-                    cmd.cleanup()
+                if recover_cmd:
+                    recover_cmd.cleanup()
                 sys.argv = original_sys_args
                 self.logger.info("==============================END ANOTHER RECOVER==========================================")
 

@@ -39,7 +39,8 @@ protected:
 	// derive statistics for projection operators
 	IStatistics *PstatsDeriveProject(
 		CMemoryPool *mp, CExpressionHandle &exprhdl,
-		UlongToIDatumMap *phmuldatum = nullptr) const;
+		UlongToIDatumMap *phmuldatum = nullptr,
+		UlongToConstColRefMap *colidToColrefMapForNDVExpr = nullptr) const;
 
 public:
 	CLogicalUnary(const CLogicalUnary &) = delete;
@@ -98,7 +99,7 @@ public:
 	DeriveFunctionProperties(CMemoryPool *mp,
 							 CExpressionHandle &exprhdl) const override
 	{
-		return PfpDeriveFromScalar(mp, exprhdl, 1 /*ulScalarIndex*/);
+		return PfpDeriveFromScalar(mp, exprhdl);
 	}
 
 	//-------------------------------------------------------------------------------------

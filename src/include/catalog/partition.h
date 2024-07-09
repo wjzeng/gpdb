@@ -21,6 +21,7 @@
 
 extern Oid	get_partition_parent(Oid relid);
 extern List *get_partition_ancestors(Oid relid);
+extern Oid	get_top_level_partition_root(Oid relid);
 extern Oid	index_get_partition(Relation partition, Oid indexId);
 extern List *map_partition_varattnos(List *expr, int fromrel_varno,
 									 Relation to_rel, Relation from_rel,
@@ -31,5 +32,6 @@ extern bool has_partition_attrs(Relation rel, Bitmapset *attnums,
 extern Oid	get_default_partition_oid(Oid parentId);
 extern void update_default_partition_oid(Oid parentId, Oid defaultPartId);
 extern List *get_proposed_default_constraint(List *new_part_constraints);
+extern bool rel_is_range_part_nondefault(Oid relid);
 
 #endif							/* PARTITION_H */

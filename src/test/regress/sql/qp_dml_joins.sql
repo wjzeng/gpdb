@@ -1679,6 +1679,7 @@ rollback;
 
 --Negative test - Update with sub-query returning more than one row
 SELECT SUM(a) FROM dml_heap_r;
+ANALYZE dml_heap_s, dml_heap_r;
 UPDATE dml_heap_r SET a = ( SELECT DISTINCT(b) FROM dml_heap_s ) FROM dml_heap_s WHERE dml_heap_r.b = dml_heap_s.a;
 SELECT SUM(a) FROM dml_heap_r;
 
@@ -1693,8 +1694,8 @@ UPDATE dml_heap_r SET b = MAX(dml_heap_s.b) FROM dml_heap_s WHERE dml_heap_r.b =
 SELECT SUM(b) FROM dml_heap_r;
 
 --Negative test - Update WHERE join returns more than one tuple with different values.
-CREATE TABLE dml_heap_u as SELECT i as a, 1 as b  FROM generate_series(1,10)i;
-CREATE TABLE dml_heap_v as SELECT i as a ,i as b FROM generate_series(1,10)i;
+CREATE TABLE dml_heap_u as SELECT i as a, 1 as b  FROM generate_series(1,10)i distributed by (a);
+CREATE TABLE dml_heap_v as SELECT i as a ,i as b FROM generate_series(1,10)i distributed by (a);
 SELECT SUM(a) FROM dml_heap_v;
 UPDATE dml_heap_v SET a = dml_heap_u.a FROM dml_heap_u WHERE dml_heap_u.b = dml_heap_v.b;
 SELECT SUM(a) FROM dml_heap_v;
@@ -1707,3 +1708,19 @@ UPDATE dml_heap_p SET a = dml_heap_p.b % 2 FROM dml_heap_r WHERE dml_heap_p.b::i
 
 --Update on table with composite distribution key
 UPDATE dml_heap_p SET b = (dml_heap_p.b * 1.1)::int FROM dml_heap_r WHERE dml_heap_p.b = dml_heap_r.a and dml_heap_p.b = dml_heap_r.b;
+
+-- Insert with join and except
+SET optimizer_trace_fallback=on;
+CREATE TABLE dml_heap_int (a int) DISTRIBUTED BY (a);
+INSERT INTO dml_heap_int SELECT generate_series(1, 3);
+INSERT INTO dml_heap_int
+SELECT t1.a
+FROM dml_heap_int t1
+	INNER JOIN (
+		SELECT _t1.a
+		FROM dml_heap_int _t1, dml_heap_int _t2
+		WHERE (_t1.a = _t2.a)
+	EXCEPT (
+		SELECT a+1
+		FROM dml_heap_int)) t2 ON (t1.a = t2.a);
+SELECT * FROM dml_heap_int;

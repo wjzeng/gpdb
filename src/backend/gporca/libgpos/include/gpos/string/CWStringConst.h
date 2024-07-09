@@ -37,6 +37,7 @@ public:
 	// ctors
 	CWStringConst(const WCHAR *w_str_buffer);
 	CWStringConst(CMemoryPool *mp, const WCHAR *w_str_buffer);
+	CWStringConst(CMemoryPool *mp, const CHAR *str_buffer);
 
 	// shallow copy ctor
 	CWStringConst(const CWStringConst &);
@@ -46,6 +47,16 @@ public:
 
 	// returns the wide character buffer storing the string
 	const WCHAR *GetBuffer() const override;
+
+	// equality
+	static BOOL Equals(const CWStringConst *string1,
+					   const CWStringConst *string2);
+
+	// hash function
+	static ULONG HashValue(const CWStringConst *string);
+
+	// checks whether the string is byte-wise equal to another string
+	BOOL Equals(const CWStringBase *str) const override;
 };
 }  // namespace gpos
 

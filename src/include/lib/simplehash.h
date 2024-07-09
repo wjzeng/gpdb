@@ -23,6 +23,8 @@
  *	  - SH_DEFINE - if defined function definitions are generated
  *	  - SH_SCOPE - in which scope (e.g. extern, static inline) do function
  *		declarations reside
+ *	  - SH_RAW_ALLOCATOR - if defined, memory contexts are not used; instead,
+ *	    use this to allocate bytes
  *	  - SH_USE_NONDEFAULT_ALLOCATOR - if defined no element allocator functions
  *		are defined, so you can supply your own
  *	  The following parameters are only relevant when SH_DEFINE is defined:
@@ -85,6 +87,7 @@
 #define SH_ALLOCATE SH_MAKE_NAME(allocate)
 #define SH_FREE SH_MAKE_NAME(free)
 #define SH_STAT SH_MAKE_NAME(stat)
+#define SH_COLL_STAT SH_MAKE_NAME(coll_stat)
 
 /* internal helper functions (no externally visible prototypes) */
 #define SH_COMPUTE_PARAMETERS SH_MAKE_NAME(compute_parameters)
@@ -121,11 +124,21 @@ typedef struct SH_TYPE
 	/* hash buckets */
 	SH_ELEMENT_TYPE *data;
 
+#ifndef SH_RAW_ALLOCATOR
 	/* memory context to use for allocations */
 	MemoryContext ctx;
+#endif
 
 	/* user defined data, useful for callbacks */
 	void	   *private_data;
+
+	/*
+	 * number of times hash table is expanded
+	 *
+	 * Since the max size of hash table is UINT32_MAX, uint32 is good
+	 * enough for the number of expanded times.
+	 */
+	uint32 num_expansions;
 }			SH_TYPE;
 
 typedef enum SH_STATUS
@@ -142,11 +155,15 @@ typedef struct SH_ITERATOR
 }			SH_ITERATOR;
 
 /* externally visible function prototypes */
+#ifdef SH_RAW_ALLOCATOR
+SH_SCOPE	SH_TYPE *SH_CREATE(uint32 nelements, void *private_data);
+#else
 SH_SCOPE	SH_TYPE *SH_CREATE(MemoryContext ctx, uint32 nelements,
 							   void *private_data);
+#endif
 SH_SCOPE void SH_DESTROY(SH_TYPE * tb);
 SH_SCOPE void SH_RESET(SH_TYPE * tb);
-SH_SCOPE void SH_GROW(SH_TYPE * tb, uint32 newsize);
+SH_SCOPE void SH_GROW(SH_TYPE * tb, uint64 newsize);
 SH_SCOPE	SH_ELEMENT_TYPE *SH_INSERT(SH_TYPE * tb, SH_KEY_TYPE key, bool *found);
 SH_SCOPE	SH_ELEMENT_TYPE *SH_INSERT_HASH(SH_TYPE * tb, SH_KEY_TYPE key,
 											uint32 hash, bool *found);
@@ -159,13 +176,21 @@ SH_SCOPE void SH_START_ITERATE_AT(SH_TYPE * tb, SH_ITERATOR * iter, uint32 at);
 SH_SCOPE	SH_ELEMENT_TYPE *SH_ITERATE(SH_TYPE * tb, SH_ITERATOR * iter);
 SH_SCOPE void SH_STAT(SH_TYPE * tb);
 
+SH_SCOPE void
+SH_COLL_STAT(SH_TYPE * tb,
+			 uint32 * max_chain_length,
+			 uint32 * total_chain_length,
+			 uint32 * chain_count);
+
 #endif							/* SH_DECLARE */
 
 
 /* generate implementation of the hash table */
 #ifdef SH_DEFINE
 
+#ifndef SH_RAW_ALLOCATOR
 #include "utils/memutils.h"
+#endif
 
 /* max data array size,we allow up to PG_UINT32_MAX buckets, including 0 */
 #define SH_MAX_SIZE (((uint64) PG_UINT32_MAX) + 1)
@@ -226,6 +251,14 @@ sh_pow2(uint64 num)
 	return ((uint64) 1) << sh_log2(num);
 }
 
+#ifdef FRONTEND
+#define sh_error(...) pg_log_error(__VA_ARGS__)
+#define sh_log(...) pg_log_info(__VA_ARGS__)
+#else
+#define sh_error(...) elog(ERROR, __VA_ARGS__)
+#define sh_log(...) elog(LOG, __VA_ARGS__)
+#endif
+
 #endif
 
 /*
@@ -233,7 +266,7 @@ sh_pow2(uint64 num)
  * the hashtable.
  */
 static inline void
-SH_COMPUTE_PARAMETERS(SH_TYPE * tb, uint32 newsize)
+SH_COMPUTE_PARAMETERS(SH_TYPE * tb, uint64 newsize)
 {
 	uint64		size;
 
@@ -248,16 +281,12 @@ SH_COMPUTE_PARAMETERS(SH_TYPE * tb, uint32 newsize)
 	 * Verify that allocation of ->data is possible on this platform, without
 	 * overflowing Size.
 	 */
-	if ((((uint64) sizeof(SH_ELEMENT_TYPE)) * size) >= MaxAllocHugeSize)
-		elog(ERROR, "hash table too large");
+	if ((((uint64) sizeof(SH_ELEMENT_TYPE)) * size) >= SIZE_MAX / 2)
+		sh_error("hash table too large");
 
 	/* now set size */
 	tb->size = size;
-
-	if (tb->size == SH_MAX_SIZE)
-		tb->sizemask = 0;
-	else
-		tb->sizemask = tb->size - 1;
+	tb->sizemask = (uint32) (size - 1);
 
 	/*
 	 * Compute the next threshold at which we need to grow the hash table
@@ -328,8 +357,12 @@ static inline void SH_FREE(SH_TYPE * type, void *pointer);
 static inline void *
 SH_ALLOCATE(SH_TYPE * type, Size size)
 {
+#ifdef SH_RAW_ALLOCATOR
+	return SH_RAW_ALLOCATOR(size);
+#else
 	return MemoryContextAllocExtended(type->ctx, size,
 									  MCXT_ALLOC_HUGE | MCXT_ALLOC_ZERO);
+#endif
 }
 
 /* default memory free function */
@@ -350,14 +383,23 @@ SH_FREE(SH_TYPE * type, void *pointer)
  * Memory other than for the array of elements will still be allocated from
  * the passed-in context.
  */
+#ifdef SH_RAW_ALLOCATOR
+SH_SCOPE	SH_TYPE *
+SH_CREATE(uint32 nelements, void *private_data)
+#else
 SH_SCOPE	SH_TYPE *
 SH_CREATE(MemoryContext ctx, uint32 nelements, void *private_data)
+#endif
 {
 	SH_TYPE    *tb;
 	uint64		size;
 
+#ifdef SH_RAW_ALLOCATOR
+	tb = SH_RAW_ALLOCATOR(sizeof(SH_TYPE));
+#else
 	tb = MemoryContextAllocZero(ctx, sizeof(SH_TYPE));
 	tb->ctx = ctx;
+#endif
 	tb->private_data = private_data;
 
 	/* increase nelements by fillfactor, want to store nelements elements */
@@ -366,6 +408,7 @@ SH_CREATE(MemoryContext ctx, uint32 nelements, void *private_data)
 	SH_COMPUTE_PARAMETERS(tb, size);
 
 	tb->data = SH_ALLOCATE(tb, sizeof(SH_ELEMENT_TYPE) * tb->size);
+	tb->num_expansions = 0;
 
 	return tb;
 }
@@ -384,6 +427,7 @@ SH_RESET(SH_TYPE * tb)
 {
 	memset(tb->data, 0, sizeof(SH_ELEMENT_TYPE) * tb->size);
 	tb->members = 0;
+	tb->num_expansions = 0;
 }
 
 /*
@@ -394,7 +438,7 @@ SH_RESET(SH_TYPE * tb)
  * performance-wise, when known at some point.
  */
 SH_SCOPE void
-SH_GROW(SH_TYPE * tb, uint32 newsize)
+SH_GROW(SH_TYPE * tb, uint64 newsize)
 {
 	uint64		oldsize = tb->size;
 	SH_ELEMENT_TYPE *olddata = tb->data;
@@ -496,6 +540,7 @@ SH_GROW(SH_TYPE * tb, uint32 newsize)
 		}
 	}
 
+	(tb->num_expansions)++;
 	SH_FREE(tb, olddata);
 }
 
@@ -526,7 +571,7 @@ restart:
 	{
 		if (tb->size == SH_MAX_SIZE)
 		{
-			elog(ERROR, "hash table size exceeded");
+			sh_error("hash table size exceeded");
 		}
 
 		/*
@@ -978,9 +1023,72 @@ SH_STAT(SH_TYPE * tb)
 		avg_collisions = 0;
 	}
 
-	elog(LOG, "size: " UINT64_FORMAT ", members: %u, filled: %f, total chain: %u, max chain: %u, avg chain: %f, total_collisions: %u, max_collisions: %i, avg_collisions: %f",
+	sh_log("size: " UINT64_FORMAT ", members: %u, filled: %f, total chain: %u, max chain: %u, avg chain: %f, total_collisions: %u, max_collisions: %i, avg_collisions: %f",
 		 tb->size, tb->members, fillfactor, total_chain_length, max_chain_length, avg_chain_length,
 		 total_collisions, max_collisions, avg_collisions);
+}
+
+/*
+ * Greenplum specific
+ *
+ * Collect some statistics about the state of the hashtable. Major code was
+ * copied from SH_STAT() with some modifications to keep consistent with GPDB6.
+ */
+SH_SCOPE void
+SH_COLL_STAT(SH_TYPE * tb,
+			 uint32 * max_chain_length,
+			 uint32 * total_chain_length,
+			 uint32 * chain_count)
+{
+	*total_chain_length = 0;
+	*chain_count = 0;
+	uint32 last_dist = 0;
+
+	for (int i = 0; i < tb->size; i++)
+	{
+		uint32		hash;
+		uint32		optimal;
+		uint32		dist;
+		SH_ELEMENT_TYPE *elem;
+
+		elem = &tb->data[i];
+
+		if (elem->status != SH_STATUS_IN_USE)
+			continue;
+
+		hash = SH_ENTRY_HASH(tb, elem);
+		optimal = SH_INITIAL_BUCKET(tb, hash);
+		dist = SH_DISTANCE_FROM_OPTIMAL(tb, optimal, i);
+
+		/*
+		 * Different from SH_STAT(), always calculate chain length from 1 but
+		 * not 0, e.g. when there is only one element in bucket, the length
+		 * is 1.
+		 */
+		dist++;
+
+		/*
+		 * In same chain, dist must be always increasing. If dist < last_dist,
+		 * we must hit a new chain; take the length of old chain into account.
+		 */
+		if (dist < last_dist)
+		{
+			if (last_dist > *max_chain_length)
+				*max_chain_length = last_dist;
+			*total_chain_length += last_dist;
+			(*chain_count)++;
+		}
+		last_dist = dist;
+	}
+
+	/* Count the last chain. */
+	if (last_dist != 0)
+	{
+		if (last_dist > *max_chain_length)
+			*max_chain_length = last_dist;
+		*total_chain_length += last_dist;
+		(*chain_count)++;
+	}
 }
 
 #endif							/* SH_DEFINE */

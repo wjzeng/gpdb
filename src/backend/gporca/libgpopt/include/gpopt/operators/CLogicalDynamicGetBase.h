@@ -37,7 +37,7 @@ protected:
 	const CName *m_pnameAlias;
 
 	// table descriptor
-	CTableDescriptor *m_ptabdesc;
+	CTableDescriptorHashSet *m_ptabdesc;
 
 	// dynamic scan id
 	ULONG m_scan_id;
@@ -48,7 +48,7 @@ protected:
 	// partition keys
 	CColRef2dArray *m_pdrgpdrgpcrPart;
 
-	// distribution columns (empty for master only tables)
+	// distribution columns (empty for coordinator only tables)
 	CColRefSet *m_pcrsDist;
 
 	// private copy ctor
@@ -58,10 +58,6 @@ protected:
 	void ExtractColIdsAttno(CMemoryPool *mp, CColRefSet *pcrs,
 							ULongPtrArray *colids,
 							ULongPtrArray *pdrgpulPos) const;
-
-	// derive stats from base table using filters on partition and/or index columns
-	IStatistics *PstatsDeriveFilter(CMemoryPool *mp, CExpressionHandle &exprhdl,
-									CExpression *pexprFilter) const;
 
 	// Child partitions
 	IMdIdArray *m_partition_mdids = nullptr;
@@ -73,6 +69,11 @@ protected:
 	// child partition's table descr by matching column names$
 	static ColRefToUlongMapArray *ConstructRootColMappingPerPart(
 		CMemoryPool *mp, CColRefArray *root_cols, IMdIdArray *partition_mdids);
+
+	using ColNameToIndexMap =
+		CHashMap<const CWStringConst, ULONG, CWStringConst::HashValue,
+				 CWStringConst::Equals, CleanupNULL<const CWStringConst>,
+				 CleanupDelete<ULONG>>;
 
 public:
 	// ctors
@@ -116,7 +117,7 @@ public:
 	virtual CTableDescriptor *
 	Ptabdesc() const
 	{
-		return m_ptabdesc;
+		return m_ptabdesc->First();
 	}
 
 	// return scan id
@@ -163,11 +164,12 @@ public:
 	}
 
 	// derive table descriptor
-	CTableDescriptor *
-	DeriveTableDescriptor(CMemoryPool *,	   // mp
+	CTableDescriptorHashSet *
+	DeriveTableDescriptor(CMemoryPool *mp GPOS_UNUSED,
 						  CExpressionHandle &  // exprhdl
 	) const override
 	{
+		m_ptabdesc->AddRef();
 		return m_ptabdesc;
 	}
 

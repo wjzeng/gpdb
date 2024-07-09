@@ -37,6 +37,28 @@ except:
     import subprocess
 import threading
 import pipes  # for shell-quoting, pipes.quote()
+import os
+from collections import defaultdict
+import psycopg2
+
+def run_sql(sql, host=None, port=None,
+            dbname="postgres", is_query=True,
+            is_utility=False):
+    if host is None:
+        host = os.getenv("PGHOST")
+    if port is None:
+        port = int(os.getenv("PGPORT"))
+    opt = "-c gp_role=utility" if is_utility else None
+    try:
+        with psycopg2.connect(dbname=dbname, host=host, port=port, options=opt) as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql)
+                if is_query:
+                    resultList = cur.fetchall()
+                    return resultList
+    except Exception as e:
+        print('Exception: %s while running query %s dbname = %s' % (e, sql, dbname))
+
 
 class ReplicaCheck(threading.Thread):
     def __init__(self, segrow, datname, relation_types):
@@ -47,38 +69,36 @@ class ReplicaCheck(threading.Thread):
         self.primary_status = segrow[3]
         self.ploc = segrow[4]
         self.mloc = segrow[5]
-        self.datname = datname.decode()
-        self.relation_types = relation_types;
+        self.datname = datname
+        self.relation_types = relation_types
         self.result = False
         self.lock = threading.Lock()
 
     def __str__(self):
-        return '(%s) Host: %s, Port: %s, Database: %s\n\
-Primary Data Directory Location: %s\n\
-Mirror Data Directory Location: %s' % (self.getName(), self.host, self.port, self.datname,
+        return '\n(%s) ---------\nHost: %s, Port: %s, Database: %s\n\
+Primary Location: %s\n\
+Mirror  Location: %s' % (self.getName(), self.host, self.port, self.datname,
                                           self.ploc, self.mloc)
 
     def run(self):
-        cmd = '''PGOPTIONS='-c gp_role=utility' psql -h %s -p %s -c "select * from gp_replica_check('%s', '%s', '%s')" %s''' % (self.host, self.port,
-                                                                                                                                        self.ploc, self.mloc,
-                                                                                                                                        self.relation_types,
-                                                                                                                                        pipes.quote(self.datname))
         if self.primary_status.strip() == 'd':
             print("Primary segment for content %d is down" % self.content)
         else:
             try:
-                res = subprocess.check_output(cmd, stderr=subprocess.STDOUT, shell=True).decode()
-                self.result = True if res.strip().split('\n')[-2].strip() == 't' else False
+                sql = "select * from public.gp_replica_check('%s', '%s', '%s')" % (self.ploc, self.mloc, self.relation_types)
+                res = run_sql(sql, host=self.host, port=self.port, is_utility=True, dbname=self.datname)
+                self.result = True if res and res[0] and res[0][0] else False
                 with self.lock:
                     print(self)
-                    print (res)
-                    if not self.result:
-                        print("replica check failed")
-
-            except subprocess.CalledProcessError as e:
+                    if self.result:
+                        print("(%s) ** passed **" % (self.getName()))
+                    else:
+                        print("(%s) --> failed <--" % (self.getName()))
+                        print (res)
+            except:
                 with self.lock:
                     print(self)
-                    print('returncode: (%s), cmd: (%s), output: (%s)' % (e.returncode, e.cmd, e.output))
+                    raise
 
 def create_restartpoint_on_ckpt_record_replay(set):
     if set:
@@ -101,16 +121,59 @@ timeout configurations for this case). In any case we just fail and skip
 the test. Please check the server logs to find why.''')
         sys.exit(2)
 
+def disable_autovacuum(set):
+    if set:
+        cmd = "gpconfig -c autovacuum -v off && gpstop -u"
+    else:
+        cmd = "gpconfig -r autovacuum && gpstop -u"
+    print(cmd)
+    try:
+        res = subprocess.check_output(cmd, stderr=subprocess.STDOUT, shell=True).decode()
+        print(res)
+    except subprocess.CalledProcessError as e:
+        print('returncode: (%s), cmd: (%s), output: (%s)' % (e.returncode, e.cmd, e.output))
+        if set:
+            print('''guc setting with gpconfig & then updating with "gpstop -u" failed.
+Probably there are some nodes could not be brought up and thus we
+can not run the test. That is probably because previous tests cause
+the instability of the cluster (indicate a bug usually) or because more time
+is needed for the cluster to be ready due to heavy load (consider increasing
+timeout configurations for this case). In any case we just fail and skip
+the test. Please check the server logs to find why.''')
+        sys.exit(2)
+
+def disable_bgwriter(set):
+    if set:
+        cmd = "gpconfig -c bgwriter_lru_maxpages -v 0 --skipvalidation && gpstop -u"
+    else:
+        cmd = "gpconfig -r bgwriter_lru_maxpages --skipvalidation && gpstop -u"
+    print(cmd)
+    try:
+        res = subprocess.check_output(cmd, stderr=subprocess.STDOUT, shell=True).decode()
+        print(res)
+    except subprocess.CalledProcessError as e:
+        print('returncode: (%s), cmd: (%s), output: (%s)' % (e.returncode, e.cmd, e.output))
+        if set:
+            print('''guc setting with gpconfig & then updating with "gpstop -u" failed.
+Probably there are some nodes could not be brought up and thus we
+can not run the test. That is probably because previous tests cause
+the instability of the cluster (indicate a bug usually) or because more time
+is needed for the cluster to be ready due to heavy load (consider increasing
+timeout configurations for this case). In any case we just fail and skip
+the test. Please check the server logs to find why.''')
+        sys.exit(2)
+
 def install_extension(databases):
     get_datname_sql = ''' SELECT datname FROM pg_database WHERE datname != 'template0' '''
-    create_ext_sql = ''' CREATE EXTENSION IF NOT EXISTS gp_replica_check '''
+    create_ext_sql = ''' CREATE EXTENSION IF NOT EXISTS gp_replica_check WITH SCHEMA public'''
 
     database_list = list(map(str.strip, databases.split(',')))
     print("Creating gp_replica_check extension on databases if needed:")
-    datnames = subprocess.check_output('psql postgres -t -A -c "%s"' % get_datname_sql, stderr=subprocess.STDOUT, shell=True).split(b'\n')
+    datnames = [dn for dn, in run_sql(get_datname_sql)]
     for datname in datnames:
         if len(datname) >= 1 and (datname.strip() in database_list or 'all' in database_list):
-            print(subprocess.check_output('psql %s -t -c "%s"' % (pipes.quote(datname.decode()), create_ext_sql), stderr=subprocess.STDOUT, shell=True).decode())
+            run_sql(create_ext_sql, dbname=datname, is_query=False)
+            print("CREATE EXTENSION gp_replica_check OK! DATABASE (%s), SCHEMA (%s)" % (datname, "public"))
 
 # Get the primary and mirror servers, for each content ID.
 def get_segments():
@@ -122,12 +185,10 @@ WHERE gscp.content = gscm.content
       AND gscp.role = 'p'
       AND gscm.role = 'm'
 '''
-    seglist = subprocess.check_output('psql postgres -t -c "%s"' % seglist_sql, stderr=subprocess.STDOUT, shell=True).split(b'\n')
-    segmap = {}
+    seglist = run_sql(seglist_sql)
+    segmap = defaultdict(list)
     for segrow in seglist:
-        segelements = list(map(str.strip, segrow.decode().split('|')))
-        if len(segelements) > 1:
-            segmap.setdefault(segelements[2], []).append(segelements)
+        segmap[segrow[2]].append(segrow)
 
     return segmap
 
@@ -142,8 +203,7 @@ SELECT datname FROM pg_catalog.pg_database WHERE datname != 'template0'
 '''
 
     database_list = list(map(str.strip, databases.split(',')))
-
-    dbrawlist = subprocess.check_output('psql postgres -t -A -c "%s"' % dblist_sql, stderr=subprocess.STDOUT, shell=True).split(b'\n')
+    dbrawlist = [dn for dn, in run_sql(dblist_sql)]
     dblist = []
     for dbrow in dbrawlist:
         dbname = dbrow
@@ -185,6 +245,10 @@ def defargs():
 if __name__ == '__main__':
     args = defargs()
     install_extension(args.databases)
+    disable_autovacuum(set=True)
+    disable_bgwriter(set=True)
     create_restartpoint_on_ckpt_record_replay(True)
     start_verification(get_segments(), get_databases(args.databases), args.relation_types)
+    disable_autovacuum(set=False)
+    disable_bgwriter(set=False)
     create_restartpoint_on_ckpt_record_replay(False)

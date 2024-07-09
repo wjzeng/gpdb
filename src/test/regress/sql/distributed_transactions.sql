@@ -299,7 +299,7 @@ drop table if exists dtmcurse_foo;
 drop table if exists dtmcurse_bar;
 
 -- Test distribute transaction if 'COMMIT/END' is included in a multi-queries command.
-\! psql postgres -c "begin;end; create table dtx_test1(c1 int); drop table dtx_test1;"
+\! psql postgres -Xc "begin;end; create table dtx_test1(c1 int); drop table dtx_test1;"
 
 -- Test two phase commit for extended query
 \! ./twophase_pqexecparams dbname=regression
@@ -602,3 +602,96 @@ end;
 reset test_print_direct_dispatch_info;
 reset optimizer;
 select count(gp_segment_id) from distxact1_4 group by gp_segment_id; -- sanity check: tuples should be in > 1 segments
+
+-- Tests for AND CHAIN
+CREATE TABLE abc (a int);
+
+-- set nondefault value so we have something to override below
+SET default_transaction_read_only = on;
+
+START TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ WRITE, DEFERRABLE;
+SHOW transaction_isolation;
+SHOW transaction_read_only;
+SHOW transaction_deferrable;
+INSERT INTO abc VALUES (1);
+INSERT INTO abc VALUES (2);
+COMMIT AND CHAIN;  -- TBLOCK_END
+SHOW transaction_isolation;
+SHOW transaction_read_only;
+SHOW transaction_deferrable;
+INSERT INTO abc VALUES ('error');
+INSERT INTO abc VALUES (3);  -- check it's really aborted
+COMMIT AND CHAIN;  -- TBLOCK_ABORT_END
+SHOW transaction_isolation;
+SHOW transaction_read_only;
+SHOW transaction_deferrable;
+INSERT INTO abc VALUES (4);
+COMMIT;
+
+START TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ WRITE, DEFERRABLE;
+SHOW transaction_isolation;
+SHOW transaction_read_only;
+SHOW transaction_deferrable;
+SAVEPOINT x;
+INSERT INTO abc VALUES ('error');
+
+COMMIT AND CHAIN;  -- TBLOCK_ABORT_PENDING
+SHOW transaction_isolation;
+SHOW transaction_read_only;
+SHOW transaction_deferrable;
+INSERT INTO abc VALUES (5);
+COMMIT;
+
+START TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ WRITE, DEFERRABLE;
+SHOW transaction_isolation;
+SHOW transaction_read_only;
+SHOW transaction_deferrable;
+SAVEPOINT x;
+COMMIT AND CHAIN;  -- TBLOCK_SUBCOMMIT
+SHOW transaction_isolation;
+SHOW transaction_read_only;
+SHOW transaction_deferrable;
+COMMIT;
+
+-- not allowed outside a transaction block
+COMMIT AND CHAIN;  -- error
+ROLLBACK AND CHAIN;  -- error
+
+SELECT * FROM abc ORDER BY 1;
+
+RESET default_transaction_read_only;
+ 
+DROP TABLE abc;
+
+-- Explicit transaction block will send Distributed Commit, even if there is only SET command in it.
+-- On the other hand, implicit transaction block involving only SET command will not send it.
+create table tbl_dtx(a int, b int) distributed by (a);
+insert into tbl_dtx values(1,1);
+
+create or replace function dtx_set_bug()
+  returns void
+  language plpgsql
+as $function$
+begin
+    execute 'update tbl_dtx set b = 1 where a = 1;';
+    set optimizer=off;
+end;
+$function$;
+
+set Test_print_direct_dispatch_info = true;
+
+-- 1. explicit BEGIN/END
+begin;
+set optimizer=false;
+end;
+
+-- 2. implicit transaction block with just SET
+set optimizer=false;
+
+-- 3. still implicit transaction block, but with UPDATE that will send DTX protocol command to *some* QEs
+-- due to direct dispatch. Planner needs to be used for direct dispatch here.
+-- This is to verify that the QEs that are not involved in the UDPATE won't receive DTX protocol command 
+-- that they are not supposed to see.
+select dtx_set_bug();
+
+reset Test_print_direct_dispatch_info;

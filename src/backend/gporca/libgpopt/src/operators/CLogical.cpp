@@ -27,13 +27,16 @@
 #include "gpopt/operators/CLogicalApply.h"
 #include "gpopt/operators/CLogicalBitmapTableGet.h"
 #include "gpopt/operators/CLogicalDynamicBitmapTableGet.h"
+#include "gpopt/operators/CLogicalDynamicForeignGet.h"
 #include "gpopt/operators/CLogicalDynamicGet.h"
+#include "gpopt/operators/CLogicalForeignGet.h"
 #include "gpopt/operators/CLogicalGet.h"
 #include "gpopt/operators/CLogicalNAryJoin.h"
 #include "gpopt/operators/CLogicalSelect.h"
 #include "gpopt/operators/CPredicateUtils.h"
 #include "gpopt/operators/CScalarIdent.h"
 #include "gpopt/optimizer/COptimizerConfig.h"
+#include "gpopt/xforms/CXformUtils.h"
 #include "naucrates/md/IMDCheckConstraint.h"
 #include "naucrates/md/IMDColumn.h"
 #include "naucrates/md/IMDIndex.h"
@@ -146,7 +149,8 @@ CLogical::PdrgpdrgpcrCreatePartCols(CMemoryPool *mp, CColRefArray *colref_array,
 COrderSpec *
 CLogical::PosFromIndex(CMemoryPool *mp, const IMDIndex *pmdindex,
 					   CColRefArray *colref_array,
-					   const CTableDescriptor *ptabdesc)
+					   const CTableDescriptor *ptabdesc,
+					   EIndexScanDirection scan_direction)
 {
 	// compute the order spec after getting the current position of the index key
 	// from the table descriptor. Index keys are relative to the
@@ -158,11 +162,14 @@ CLogical::PosFromIndex(CMemoryPool *mp, const IMDIndex *pmdindex,
 
 	COrderSpec *pos = GPOS_NEW(mp) COrderSpec(mp);
 
-	// GiST, GIN and BRIN indexes have no order, so return an empty order spec
+	// GiST, GIN, BRIN and Hash indexes have no order, so return an empty order spec
 	if (pmdindex->IndexType() == IMDIndex::EmdindGist ||
 		pmdindex->IndexType() == IMDIndex::EmdindGin ||
-		pmdindex->IndexType() == IMDIndex::EmdindBrin)
+		pmdindex->IndexType() == IMDIndex::EmdindBrin ||
+		pmdindex->IndexType() == IMDIndex::EmdindHash)
+	{
 		return pos;
+	}
 
 	const ULONG ulLenKeys = pmdindex->Keys();
 
@@ -183,13 +190,9 @@ CLogical::PosFromIndex(CMemoryPool *mp, const IMDIndex *pmdindex,
 		const ULONG ulPosTabDesc = ptabdesc->GetAttributePosition(attno);
 		CColRef *colref = (*colref_array)[ulPosTabDesc];
 
-		IMDId *mdid =
-			colref->RetrieveType()->GetMdidForCmpType(IMDType::EcmptL);
-		mdid->AddRef();
-
-		// TODO:  March 27th 2012; we hard-code NULL treatment
-		// need to revisit
-		pos->Append(mdid, colref, COrderSpec::EntLast);
+		// Compute and update OrderSpec for Index key
+		CXformUtils::ComputeOrderSpecForIndexKey(mp, &pos, pmdindex,
+												 scan_direction, colref, ul);
 	}
 
 	return pos;
@@ -923,26 +926,10 @@ CLogical::DeriveFunctionProperties(CMemoryPool *mp,
 	IMDFunction::EFuncStbl efs =
 		EfsDeriveFromChildren(exprhdl, IMDFunction::EfsImmutable);
 
-	return GPOS_NEW(mp)
-		CFunctionProp(efs, IMDFunction::EfdaNoSQL,
-					  exprhdl.FChildrenHaveVolatileFuncScan(), false /*fScan*/);
+	return GPOS_NEW(mp) CFunctionProp(
+		efs, exprhdl.FChildrenHaveVolatileFuncScan(), false /*fScan*/);
 }
 
-//---------------------------------------------------------------------------
-//	@function:
-//		CLogical::DeriveTableDescriptor
-//
-//	@doc:
-//		Derive table descriptor for tables used by operator
-//
-//---------------------------------------------------------------------------
-CTableDescriptor *
-CLogical::DeriveTableDescriptor(CMemoryPool *, CExpressionHandle &) const
-{
-	//currently return null unless there is a single table being used. Later we may want
-	//to make this return a set of table descriptors and pass them up all operators
-	return nullptr;
-}
 //---------------------------------------------------------------------------
 //	@function:
 //		CLogical::PfpDeriveFromScalar
@@ -952,24 +939,16 @@ CLogical::DeriveTableDescriptor(CMemoryPool *, CExpressionHandle &) const
 //
 //---------------------------------------------------------------------------
 CFunctionProp *
-CLogical::PfpDeriveFromScalar(CMemoryPool *mp, CExpressionHandle &exprhdl,
-							  ULONG ulScalarIndex)
+CLogical::PfpDeriveFromScalar(CMemoryPool *mp, CExpressionHandle &exprhdl)
 {
 	GPOS_CHECK_ABORT;
-	GPOS_ASSERT(ulScalarIndex == exprhdl.Arity() - 1);
-	GPOS_ASSERT(exprhdl.FScalarChild(ulScalarIndex));
 
 	// collect stability from all children
 	IMDFunction::EFuncStbl efs =
 		EfsDeriveFromChildren(exprhdl, IMDFunction::EfsImmutable);
 
-	// get data access from scalar child
-	CFunctionProp *pfp = exprhdl.PfpChild(ulScalarIndex);
-	GPOS_ASSERT(nullptr != pfp);
-	IMDFunction::EFuncDataAcc efda = pfp->Efda();
-
 	return GPOS_NEW(mp) CFunctionProp(
-		efs, efda, exprhdl.FChildrenHaveVolatileFuncScan(), false /*fScan*/);
+		efs, exprhdl.FChildrenHaveVolatileFuncScan(), false /*fScan*/);
 }
 
 //---------------------------------------------------------------------------
@@ -1190,7 +1169,6 @@ CLogical::PstatsBaseTable(
 	return stats;
 }
 
-
 //---------------------------------------------------------------------------
 //	@function:
 //		CLogical::PstatsDeriveDummy
@@ -1221,28 +1199,6 @@ CLogical::PstatsDeriveDummy(CMemoryPool *mp, CExpressionHandle &exprhdl,
 
 	return stats;
 }
-
-//---------------------------------------------------------------------------
-//	@function:
-//		CLogical::PexprPartPred
-//
-//	@doc:
-//		Compute partition predicate to pass down to n-th child
-//
-//---------------------------------------------------------------------------
-CExpression *
-CLogical::PexprPartPred(CMemoryPool *,		  //mp,
-						CExpressionHandle &,  //exprhdl,
-						CExpression *,		  //pexprInput,
-						ULONG				  //child_index
-) const
-{
-	GPOS_CHECK_ABORT;
-
-	// the default behavior is to never pass down any partition predicates
-	return nullptr;
-}
-
 
 //---------------------------------------------------------------------------
 //	@function:
@@ -1294,6 +1250,10 @@ CLogical::PtabdescFromTableGet(COperator *pop)
 			return CLogicalDynamicGet::PopConvert(pop)->Ptabdesc();
 		case CLogical::EopLogicalBitmapTableGet:
 			return CLogicalBitmapTableGet::PopConvert(pop)->Ptabdesc();
+		case CLogical::EopLogicalForeignGet:
+			return CLogicalForeignGet::PopConvert(pop)->Ptabdesc();
+		case CLogical::EopLogicalDynamicForeignGet:
+			return CLogicalDynamicForeignGet::PopConvert(pop)->Ptabdesc();
 		case CLogical::EopLogicalDynamicBitmapTableGet:
 			return CLogicalDynamicBitmapTableGet::PopConvert(pop)->Ptabdesc();
 		case CLogical::EopLogicalSelect:

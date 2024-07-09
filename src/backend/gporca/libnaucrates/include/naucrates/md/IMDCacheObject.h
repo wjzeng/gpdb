@@ -67,12 +67,14 @@ public:
 		EmdtAgg,
 		EmdtOp,
 		EmdtType,
-		EmdtTrigger,
 		EmdtCheckConstraint,
 		EmdtRelStats,
 		EmdtColStats,
 		EmdtCastFunc,
-		EmdtScCmp
+		EmdtScCmp,
+		EmdtExtStats,
+		EmdtExtStatsInfo,
+		EmdtSentinel
 	};
 
 	// md id of cache object
@@ -88,7 +90,7 @@ public:
 	virtual void Serialize(gpdxl::CXMLSerializer *) const = 0;
 
 	// DXL string representation of cache object
-	virtual const CWStringDynamic *GetStrRepr() const = 0;
+	virtual const CWStringDynamic *GetStrRepr() = 0;
 
 
 	// serialize the metadata id information as the attributes of an
@@ -102,7 +104,7 @@ public:
 #endif
 };
 
-typedef CDynamicPtrArray<IMDCacheObject, CleanupRelease> IMDCacheObjectArray;
+using IMDCacheObjectArray = CDynamicPtrArray<IMDCacheObject, CleanupRelease>;
 
 }  // namespace gpmd
 

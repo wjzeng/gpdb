@@ -28,29 +28,31 @@ extern "C" {
 #include "nodes/primnodes.h"
 #include "partitioning/partdesc.h"
 #include "storage/lmgr.h"
-#include "utils/partcache.h"
-#if 0
-#include "cdb/partitionselection.h"
-#endif
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
+#include "utils/partcache.h"
 #include "utils/rel.h"
 #include "utils/typcache.h"
 #include "utils/uri.h"
 }
 
 #include <algorithm>
+#include <limits>  // std::numeric_limits
 #include <numeric>
 #include <tuple>
 
 #include "gpos/base.h"
+#include "gpos/common/CBitSet.h"
+#include "gpos/common/CBitSetIter.h"
 
 #include "gpopt/base/CUtils.h"
 #include "gpopt/gpdbwrappers.h"
 #include "gpopt/mdcache/CMDAccessor.h"
 #include "gpopt/translate/CIndexQualInfo.h"
+#include "gpopt/translate/CPartPruneStepsBuilder.h"
 #include "gpopt/translate/CTranslatorDXLToPlStmt.h"
 #include "gpopt/translate/CTranslatorUtils.h"
+#include "naucrates/dxl/operators/CDXLDatumGeneric.h"
 #include "naucrates/dxl/operators/CDXLDirectDispatchInfo.h"
 #include "naucrates/dxl/operators/CDXLNode.h"
 #include "naucrates/dxl/operators/CDXLPhysicalAgg.h"
@@ -60,6 +62,11 @@ extern "C" {
 #include "naucrates/dxl/operators/CDXLPhysicalCTAS.h"
 #include "naucrates/dxl/operators/CDXLPhysicalCTEConsumer.h"
 #include "naucrates/dxl/operators/CDXLPhysicalCTEProducer.h"
+#include "naucrates/dxl/operators/CDXLPhysicalDynamicBitmapTableScan.h"
+#include "naucrates/dxl/operators/CDXLPhysicalDynamicForeignScan.h"
+#include "naucrates/dxl/operators/CDXLPhysicalDynamicIndexOnlyScan.h"
+#include "naucrates/dxl/operators/CDXLPhysicalDynamicIndexScan.h"
+#include "naucrates/dxl/operators/CDXLPhysicalDynamicTableScan.h"
 #include "naucrates/dxl/operators/CDXLPhysicalGatherMotion.h"
 #include "naucrates/dxl/operators/CDXLPhysicalHashJoin.h"
 #include "naucrates/dxl/operators/CDXLPhysicalIndexOnlyScan.h"
@@ -73,7 +80,6 @@ extern "C" {
 #include "naucrates/dxl/operators/CDXLPhysicalRoutedDistributeMotion.h"
 #include "naucrates/dxl/operators/CDXLPhysicalSort.h"
 #include "naucrates/dxl/operators/CDXLPhysicalSplit.h"
-#include "naucrates/dxl/operators/CDXLPhysicalSubqueryScan.h"
 #include "naucrates/dxl/operators/CDXLPhysicalTVF.h"
 #include "naucrates/dxl/operators/CDXLPhysicalTableScan.h"
 #include "naucrates/dxl/operators/CDXLPhysicalValuesScan.h"
@@ -83,6 +89,7 @@ extern "C" {
 #include "naucrates/dxl/operators/CDXLScalarBoolExpr.h"
 #include "naucrates/dxl/operators/CDXLScalarFuncExpr.h"
 #include "naucrates/dxl/operators/CDXLScalarHashExpr.h"
+#include "naucrates/dxl/operators/CDXLScalarNullTest.h"
 #include "naucrates/dxl/operators/CDXLScalarOpExpr.h"
 #include "naucrates/dxl/operators/CDXLScalarProjElem.h"
 #include "naucrates/dxl/operators/CDXLScalarSortCol.h"
@@ -91,12 +98,13 @@ extern "C" {
 #include "naucrates/md/IMDAggregate.h"
 #include "naucrates/md/IMDFunction.h"
 #include "naucrates/md/IMDIndex.h"
-#include "naucrates/md/IMDRelationExternal.h"
 #include "naucrates/md/IMDScalarOp.h"
 #include "naucrates/md/IMDType.h"
 #include "naucrates/md/IMDTypeBool.h"
 #include "naucrates/md/IMDTypeInt4.h"
 #include "naucrates/traceflags/traceflags.h"
+
+#include "nodes/nodeFuncs.h"
 
 using namespace gpdxl;
 using namespace gpos;
@@ -160,7 +168,7 @@ CTranslatorDXLToPlStmt::GetPlannedStmtFromDXL(const CDXLNode *dxlnode,
 {
 	GPOS_ASSERT(nullptr != dxlnode);
 
-	CDXLTranslateContext dxl_translate_ctxt(m_mp, false);
+	CDXLTranslateContext dxl_translate_ctxt(m_mp, false, orig_query);
 
 	PlanSlice *topslice;
 
@@ -175,6 +183,7 @@ CTranslatorDXLToPlStmt::GetPlannedStmtFromDXL(const CDXLNode *dxlnode,
 	topslice->directDispatch.contentIds = NIL;
 	topslice->directDispatch.haveProcessedAnyCalculations = false;
 
+	m_dxl_to_plstmt_context->m_orig_query = (Query *) orig_query;
 	m_dxl_to_plstmt_context->AddSlice(topslice);
 	m_dxl_to_plstmt_context->SetCurrentSlice(topslice);
 
@@ -189,7 +198,12 @@ CTranslatorDXLToPlStmt::GetPlannedStmtFromDXL(const CDXLNode *dxlnode,
 	// collect oids from rtable
 	List *oids_list = NIL;
 
+	// collect unique RTE in FROM Clause
+	List *oids_list_unique = NIL;
+
 	ListCell *lc_rte = nullptr;
+
+	RangeTblEntry *pRTEHashFuncCal = nullptr;
 
 	ForEach(lc_rte, m_dxl_to_plstmt_context->GetRTableEntriesList())
 	{
@@ -198,7 +212,30 @@ CTranslatorDXLToPlStmt::GetPlannedStmtFromDXL(const CDXLNode *dxlnode,
 		if (pRTE->rtekind == RTE_RELATION)
 		{
 			oids_list = gpdb::LAppendOid(oids_list, pRTE->relid);
+			if (pRTE->inFromCl || (CMD_INSERT == m_cmd_type))
+			{
+				// If we have only one RTE in the FROM clause,
+				// then we use it to extract information
+				// about the distribution policy, which gives info about the
+				// typeOid used for direct dispatch. This helps to perform
+				// direct dispatch based on the distribution column type
+				// inplace of the constant in the filter.
+				pRTEHashFuncCal = (RangeTblEntry *) lfirst(lc_rte);
+
+				// collecting only unique RTE in FROM clause
+				oids_list_unique =
+					list_append_unique_oid(oids_list_unique, pRTE->relid);
+			}
 		}
+	}
+
+	if (gpdb::ListLength(oids_list_unique) > 1)
+	{
+		// If we have a scenario with multiple unique RTE
+		// in "from" clause, then the hash function selection
+		// based on distribution policy of relation will not work
+		// and we switch back to selection based on constant type
+		pRTEHashFuncCal = nullptr;
 	}
 
 	// assemble planned stmt
@@ -209,11 +246,6 @@ CTranslatorDXLToPlStmt::GetPlannedStmtFromDXL(const CDXLNode *dxlnode,
 	planned_stmt->subplans = m_dxl_to_plstmt_context->GetSubplanEntriesList();
 	planned_stmt->planTree = plan;
 
-#if 0
-	// store partitioned table indexes in planned stmt
-	planned_stmt->queryPartOids = m_dxl_to_plstmt_context->GetPartitionedTablesList();
-	planned_stmt->numSelectorsPerScanId = m_dxl_to_plstmt_context->GetNumPartitionSelectorsList();
-#endif
 	planned_stmt->canSetTag = can_set_tag;
 	planned_stmt->relationOids = oids_list;
 
@@ -238,8 +270,8 @@ CTranslatorDXLToPlStmt::GetPlannedStmtFromDXL(const CDXLNode *dxlnode,
 	if (CMD_SELECT == m_cmd_type &&
 		nullptr != dxlnode->GetDXLDirectDispatchInfo())
 	{
-		List *direct_dispatch_segids =
-			TranslateDXLDirectDispatchInfo(dxlnode->GetDXLDirectDispatchInfo());
+		List *direct_dispatch_segids = TranslateDXLDirectDispatchInfo(
+			dxlnode->GetDXLDirectDispatchInfo(), pRTEHashFuncCal);
 
 		if (direct_dispatch_segids != NIL)
 		{
@@ -253,14 +285,15 @@ CTranslatorDXLToPlStmt::GetPlannedStmtFromDXL(const CDXLNode *dxlnode,
 		}
 	}
 
-	if (CMD_INSERT == m_cmd_type && planned_stmt->numSlices == 1 &&
+	if ((CMD_INSERT == m_cmd_type || CMD_DELETE == m_cmd_type) &&
+		planned_stmt->numSlices == 1 &&
 		dxlnode->GetOperator()->GetDXLOperator() == EdxlopPhysicalDML)
 	{
 		CDXLPhysicalDML *phy_dml_dxlop =
 			CDXLPhysicalDML::Cast(dxlnode->GetOperator());
 
 		List *direct_dispatch_segids = TranslateDXLDirectDispatchInfo(
-			phy_dml_dxlop->GetDXLDirectDispatchInfo());
+			phy_dml_dxlop->GetDXLDirectDispatchInfo(), pRTEHashFuncCal);
 		if (direct_dispatch_segids != NIL)
 		{
 			topslice->directDispatch.isDirectDispatch = true;
@@ -312,7 +345,7 @@ CTranslatorDXLToPlStmt::TranslateDXLOperatorToPlan(
 					   dxlnode->GetOperator()->GetOpNameStr()->GetBuffer());
 		}
 		case EdxlopPhysicalTableScan:
-		case EdxlopPhysicalExternalScan:
+		case EdxlopPhysicalForeignScan:
 		{
 			plan = TranslateDXLTblScan(dxlnode, output_context,
 									   ctxt_translation_prev_siblings);
@@ -387,12 +420,6 @@ CTranslatorDXLToPlStmt::TranslateDXLOperatorToPlan(
 									ctxt_translation_prev_siblings);
 			break;
 		}
-		case EdxlopPhysicalSubqueryScan:
-		{
-			plan = TranslateDXLSubQueryScan(dxlnode, output_context,
-											ctxt_translation_prev_siblings);
-			break;
-		}
 		case EdxlopPhysicalResult:
 		{
 			plan = TranslateDXLResult(dxlnode, output_context,
@@ -417,7 +444,30 @@ CTranslatorDXLToPlStmt::TranslateDXLOperatorToPlan(
 										ctxt_translation_prev_siblings);
 			break;
 		}
-		/* case EdxlopPhysicalDynamicIndexScan: { plan = TranslateDXLDynIdxScan(dxlnode, output_context, ctxt_translation_prev_siblings); break;} */
+		case EdxlopPhysicalDynamicTableScan:
+		{
+			plan = TranslateDXLDynTblScan(dxlnode, output_context,
+										  ctxt_translation_prev_siblings);
+			break;
+		}
+		case EdxlopPhysicalDynamicIndexScan:
+		{
+			plan = TranslateDXLDynIdxScan(dxlnode, output_context,
+										  ctxt_translation_prev_siblings);
+			break;
+		}
+		case EdxlopPhysicalDynamicIndexOnlyScan:
+		{
+			plan = TranslateDXLDynIdxOnlyScan(dxlnode, output_context,
+											  ctxt_translation_prev_siblings);
+			break;
+		}
+		case EdxlopPhysicalDynamicForeignScan:
+		{
+			plan = TranslateDXLDynForeignScan(dxlnode, output_context,
+											  ctxt_translation_prev_siblings);
+			break;
+		}
 		case EdxlopPhysicalTVF:
 		{
 			plan = TranslateDXLTvf(dxlnode, output_context,
@@ -436,8 +486,12 @@ CTranslatorDXLToPlStmt::TranslateDXLOperatorToPlan(
 									 ctxt_translation_prev_siblings);
 			break;
 		}
-		// GPDB_12_MERGE_FIXME: stop generating AssertOp from ORCA
-		//			case EdxlopPhysicalAssert: { plan = TranslateDXLAssert(dxlnode, output_context, ctxt_translation_prev_siblings); break;}
+		case EdxlopPhysicalAssert:
+		{
+			plan = TranslateDXLAssert(dxlnode, output_context,
+									  ctxt_translation_prev_siblings);
+			break;
+		}
 		case EdxlopPhysicalCTEProducer:
 		{
 			plan = TranslateDXLCTEProducerToSharedScan(
@@ -451,6 +505,7 @@ CTranslatorDXLToPlStmt::TranslateDXLOperatorToPlan(
 			break;
 		}
 		case EdxlopPhysicalBitmapTableScan:
+		case EdxlopPhysicalDynamicBitmapTableScan:
 		{
 			plan = TranslateDXLBitmapTblScan(dxlnode, output_context,
 											 ctxt_translation_prev_siblings);
@@ -512,6 +567,39 @@ CTranslatorDXLToPlStmt::SetParamIds(Plan *plan)
 	plan->allParam = bitmapset;
 }
 
+List *
+CTranslatorDXLToPlStmt::TranslatePartOids(IMdIdArray *parts, INT lockmode)
+{
+	List *oids_list = NIL;
+
+	for (ULONG ul = 0; ul < parts->Size(); ul++)
+	{
+		Oid part = CMDIdGPDB::CastMdid((*parts)[ul])->Oid();
+		oids_list = gpdb::LAppendOid(oids_list, part);
+		// Since parser locks only root partition, locking the leaf
+		// partitions which we have to scan.
+		gpdb::GPDBLockRelationOid(part, lockmode);
+	}
+	return oids_list;
+}
+
+List *
+CTranslatorDXLToPlStmt::TranslateJoinPruneParamids(
+	const ULongPtrArray *selector_ids, OID oid_type,
+	CContextDXLToPlStmt *dxl_to_plstmt_context)
+{
+	List *join_prune_paramids = NIL;
+
+	for (ULONG ul = 0; ul < selector_ids->Size(); ++ul)
+	{
+		ULONG selector_id = *(*selector_ids)[ul];
+		ULONG param_id =
+			dxl_to_plstmt_context->GetParamIdForSelector(oid_type, selector_id);
+		join_prune_paramids = gpdb::LAppendInt(join_prune_paramids, param_id);
+	}
+	return join_prune_paramids;
+}
+
 
 //---------------------------------------------------------------------------
 //	@function:
@@ -533,10 +621,6 @@ CTranslatorDXLToPlStmt::TranslateDXLTblScan(
 	// translation context for column mappings in the base relation
 	CDXLTranslateContextBaseTable base_table_context(m_mp);
 
-	// we will add the new range table entry as the last element of the range table
-	Index index =
-		gpdb::ListLength(m_dxl_to_plstmt_context->GetRTableEntriesList()) + 1;
-
 	const CDXLTableDescr *dxl_table_descr =
 		phy_tbl_scan_dxlop->GetDXLTableDescr();
 	const IMDRelation *md_rel =
@@ -544,15 +628,11 @@ CTranslatorDXLToPlStmt::TranslateDXLTblScan(
 
 	// Lock any table we are to scan, since it may not have been properly locked
 	// by the parser (e.g in case of generated scans for partitioned tables)
-	CMDIdGPDB *mdid = CMDIdGPDB::CastMdid(md_rel->MDId());
-	GPOS_RTL_ASSERT(dxl_table_descr->LockMode() != -1);
-	gpdb::GPDBLockRelationOid(mdid->Oid(), dxl_table_descr->LockMode());
+	OID oidRel = CMDIdGPDB::CastMdid(md_rel->MDId())->Oid();
+	GPOS_ASSERT(dxl_table_descr->LockMode() != -1);
+	gpdb::GPDBLockRelationOid(oidRel, dxl_table_descr->LockMode());
 
-	RangeTblEntry *rte = TranslateDXLTblDescrToRangeTblEntry(
-		dxl_table_descr, index, &base_table_context);
-	GPOS_ASSERT(nullptr != rte);
-	rte->requiredPerms |= ACL_SELECT;
-	m_dxl_to_plstmt_context->AddRTE(rte);
+	Index index = ProcessDXLTblDescr(dxl_table_descr, &base_table_context);
 
 	// a table scan node must have 2 children: projection list and filter
 	GPOS_ASSERT(2 == tbl_scan_dxlnode->Arity());
@@ -562,36 +642,56 @@ CTranslatorDXLToPlStmt::TranslateDXLTblScan(
 	CDXLNode *filter_dxlnode = (*tbl_scan_dxlnode)[EdxltsIndexFilter];
 
 	List *targetlist = NIL;
-	List *qual = NIL;
+
+	// List to hold the quals after translating filter_dxlnode node.
+	List *query_quals = NIL;
 
 	TranslateProjListAndFilter(
 		project_list_dxlnode, filter_dxlnode,
 		&base_table_context,  // translate context for the base table
 		nullptr,			  // translate_ctxt_left and pdxltrctxRight,
-		&targetlist, &qual, output_context);
+		&targetlist, &query_quals, output_context);
 
 	Plan *plan = nullptr;
 	Plan *plan_return = nullptr;
-	if (IMDRelation::ErelstorageExternal == md_rel->RetrieveRelStorageType())
-	{
-		OID oidRel = CMDIdGPDB::CastMdid(md_rel->MDId())->Oid();
 
-		// create foreign scan node
-		ForeignScan *foreign_scan = gpdb::CreateForeignScanForExternalTable(
-			oidRel, index, qual, targetlist);
+	if (IMDRelation::ErelstorageForeign == md_rel->RetrieveRelStorageType())
+	{
+		RangeTblEntry *rte = m_dxl_to_plstmt_context->GetRTEByIndex(index);
+
+		// The postgres_fdw wrapper does not support row level security. So
+		// passing only the query_quals while creating the foreign scan node.
+		ForeignScan *foreign_scan =
+			gpdb::CreateForeignScan(oidRel, index, query_quals, targetlist,
+									m_dxl_to_plstmt_context->m_orig_query, rte);
+		foreign_scan->scan.scanrelid = index;
 		plan = &(foreign_scan->scan.plan);
 		plan_return = (Plan *) foreign_scan;
 	}
 	else
 	{
-		// create seq scan node
 		SeqScan *seq_scan = MakeNode(SeqScan);
 		seq_scan->scanrelid = index;
 		plan = &(seq_scan->plan);
 		plan_return = (Plan *) seq_scan;
 
 		plan->targetlist = targetlist;
-		plan->qual = qual;
+
+		// List to hold the quals which contain both security quals and query
+		// quals.
+		List *security_query_quals = NIL;
+
+		// Fetching the RTE of the relation from the rewritten parse tree
+		// based on the oidRel and adding the security quals of the RTE in
+		// the security_query_quals list.
+		AddSecurityQuals(oidRel, &security_query_quals, &index);
+
+		// The security quals should always be executed first when
+		// compared to other quals. So appending query quals to the
+		// security_query_quals list after the security quals.
+		security_query_quals =
+			gpdb::ListConcat(security_query_quals, query_quals);
+		plan->qual = security_query_quals;
 	}
 
 
@@ -605,6 +705,32 @@ CTranslatorDXLToPlStmt::TranslateDXLTblScan(
 	return plan_return;
 }
 
+//---------------------------------------------------------------------------
+//	@function:
+//		CTranslatorDXLToPlStmt::SetHashKeysVarnoWalker
+//
+//	@doc:
+//		Walker to set inner var to outer.
+//
+//---------------------------------------------------------------------------
+BOOL
+CTranslatorDXLToPlStmt::SetHashKeysVarnoWalker(Node *node, void *context)
+{
+	if (nullptr == node)
+	{
+		return false;
+	}
+
+	if (IsA(node, Var) && ((Var *) node)->varno == INNER_VAR)
+	{
+		((Var *) node)->varno = OUTER_VAR;
+		return false;
+	}
+
+	return gpdb::WalkExpressionTree(
+		node, (BOOL(*)()) CTranslatorDXLToPlStmt::SetHashKeysVarnoWalker,
+		context);
+}
 
 //---------------------------------------------------------------------------
 //	@function:
@@ -680,6 +806,36 @@ CTranslatorDXLToPlStmt::TranslateDXLIndexScan(
 								 ctxt_translation_prev_siblings);
 }
 
+void
+CTranslatorDXLToPlStmt::TranslatePlan(
+	Plan *plan, const CDXLNode *dxlnode, CDXLTranslateContext *output_context,
+	CContextDXLToPlStmt *dxl_to_plstmt_context,
+	CDXLTranslateContextBaseTable *base_table_context,
+	CDXLTranslationContextArray *ctxt_translation_prev_siblings)
+{
+	plan->plan_node_id = dxl_to_plstmt_context->GetNextPlanId();
+
+	// translate operator costs
+	TranslatePlanCosts(dxlnode, plan);
+
+	// an index scan node must have 3 children: projection list, filter and index condition list
+	GPOS_ASSERT(3 == dxlnode->Arity());
+
+	// translate proj list and filter
+	CDXLNode *project_list_dxlnode = (*dxlnode)[EdxlisIndexProjList];
+	CDXLNode *filter_dxlnode = (*dxlnode)[EdxlisIndexFilter];
+
+	// translate proj list
+	plan->targetlist =
+		TranslateDXLProjList(project_list_dxlnode, base_table_context,
+							 nullptr /*child_contexts*/, output_context);
+
+	// translate index filter
+	plan->qual = TranslateDXLIndexFilter(filter_dxlnode, output_context,
+										 base_table_context,
+										 ctxt_translation_prev_siblings);
+}
+
 //---------------------------------------------------------------------------
 //	@function:
 //		CTranslatorDXLToPlStmt::TranslateDXLIndexScan
@@ -698,9 +854,6 @@ CTranslatorDXLToPlStmt::TranslateDXLIndexScan(
 	// translation context for column mappings in the base relation
 	CDXLTranslateContextBaseTable base_table_context(m_mp);
 
-	Index index =
-		gpdb::ListLength(m_dxl_to_plstmt_context->GetRTableEntriesList()) + 1;
-
 	const CDXLTableDescr *dxl_table_descr =
 		physical_idx_scan_dxlop->GetDXLTableDescr();
 	const IMDRelation *md_rel =
@@ -709,15 +862,10 @@ CTranslatorDXLToPlStmt::TranslateDXLIndexScan(
 	// Lock any table we are to scan, since it may not have been properly locked
 	// by the parser (e.g in case of generated scans for partitioned tables)
 	CMDIdGPDB *mdid = CMDIdGPDB::CastMdid(md_rel->MDId());
-	GPOS_RTL_ASSERT(dxl_table_descr->LockMode() != -1);
+	GPOS_ASSERT(dxl_table_descr->LockMode() != -1);
 	gpdb::GPDBLockRelationOid(mdid->Oid(), dxl_table_descr->LockMode());
 
-	RangeTblEntry *rte = TranslateDXLTblDescrToRangeTblEntry(
-		physical_idx_scan_dxlop->GetDXLTableDescr(), index,
-		&base_table_context);
-	GPOS_ASSERT(nullptr != rte);
-	rte->requiredPerms |= ACL_SELECT;
-	m_dxl_to_plstmt_context->AddRTE(rte);
+	Index index = ProcessDXLTblDescr(dxl_table_descr, &base_table_context);
 
 	IndexScan *index_scan = nullptr;
 	index_scan = MakeNode(IndexScan);
@@ -735,29 +883,10 @@ CTranslatorDXLToPlStmt::TranslateDXLIndexScan(
 	index_scan->indexid = index_oid;
 
 	Plan *plan = &(index_scan->scan.plan);
-	plan->plan_node_id = m_dxl_to_plstmt_context->GetNextPlanId();
 
-	// translate operator costs
-	TranslatePlanCosts(index_scan_dxlnode, plan);
-
-	// an index scan node must have 3 children: projection list, filter and index condition list
-	GPOS_ASSERT(3 == index_scan_dxlnode->Arity());
-
-	// translate proj list and filter
-	CDXLNode *project_list_dxlnode = (*index_scan_dxlnode)[EdxlisIndexProjList];
-	CDXLNode *filter_dxlnode = (*index_scan_dxlnode)[EdxlisIndexFilter];
-	CDXLNode *index_cond_list_dxlnode =
-		(*index_scan_dxlnode)[EdxlisIndexCondition];
-
-	// translate proj list
-	plan->targetlist =
-		TranslateDXLProjList(project_list_dxlnode, &base_table_context,
-							 nullptr /*child_contexts*/, output_context);
-
-	// translate index filter
-	plan->qual = TranslateDXLIndexFilter(filter_dxlnode, output_context,
-										 &base_table_context,
-										 ctxt_translation_prev_siblings);
+	TranslatePlan(plan, index_scan_dxlnode, output_context,
+				  m_dxl_to_plstmt_context, &base_table_context,
+				  ctxt_translation_prev_siblings);
 
 	index_scan->indexorderdir = CTranslatorUtils::GetScanDirection(
 		physical_idx_scan_dxlop->GetIndexScanDir());
@@ -765,15 +894,19 @@ CTranslatorDXLToPlStmt::TranslateDXLIndexScan(
 	// translate index condition list
 	List *index_cond = NIL;
 	List *index_orig_cond = NIL;
-	List *index_strategy_list = NIL;
-	List *index_subtype_list = NIL;
 
-	TranslateIndexConditions(
-		index_cond_list_dxlnode, physical_idx_scan_dxlop->GetDXLTableDescr(),
-		false,	// is_bitmap_index_probe
-		md_index, md_rel, output_context, &base_table_context,
-		ctxt_translation_prev_siblings, &index_cond, &index_orig_cond,
-		&index_strategy_list, &index_subtype_list);
+	// Translate Index Conditions if Index isn't used for order by.
+	if (!IsIndexForOrderBy(&base_table_context, ctxt_translation_prev_siblings,
+						   output_context,
+						   (*index_scan_dxlnode)[EdxlisIndexCondition]))
+	{
+		TranslateIndexConditions(
+			(*index_scan_dxlnode)[EdxlisIndexCondition],
+			physical_idx_scan_dxlop->GetDXLTableDescr(),
+			false,	// is_bitmap_index_probe
+			md_index, md_rel, output_context, &base_table_context,
+			ctxt_translation_prev_siblings, &index_cond, &index_orig_cond);
+	}
 
 	index_scan->indexqual = index_cond;
 	index_scan->indexqualorig = index_orig_cond;
@@ -795,6 +928,7 @@ TranslateDXLIndexTList(const IMDRelation *md_rel, const IMDIndex *md_index,
 
 	index_context->SetRelIndex(INDEX_VAR);
 
+	// Translate KEY columns
 	for (ULONG ul = 0; ul < md_index->Keys(); ul++)
 	{
 		ULONG key = md_index->KeyAt(ul);
@@ -829,6 +963,38 @@ TranslateDXLIndexTList(const IMDRelation *md_rel, const IMDIndex *md_index,
 		target_list = gpdb::LAppend(target_list, target_entry);
 	}
 
+	// Translate INCLUDED columns
+	for (ULONG ul = 0; ul < md_index->IncludedCols(); ul++)
+	{
+		ULONG includecol = md_index->IncludedColAt(ul);
+
+		const IMDColumn *col = md_rel->GetMdCol(includecol);
+
+		TargetEntry *target_entry = MakeNode(TargetEntry);
+		// KEY columns preceed INCLUDE columns
+		target_entry->resno = (AttrNumber) ul + 1 + md_index->Keys();
+
+		Expr *indexvar = (Expr *) gpdb::MakeVar(
+			new_varno, col->AttrNum(),
+			CMDIdGPDB::CastMdid(col->MdidType())->Oid(),
+			col->TypeModifier() /*vartypmod*/, 0 /*varlevelsup*/);
+		target_entry->expr = indexvar;
+
+		for (ULONG j = 0; j < table_descr->Arity(); j++)
+		{
+			const CDXLColDescr *dxl_col_descr =
+				table_descr->GetColumnDescrAt(j);
+			if (dxl_col_descr->AttrNum() == ((Var *) indexvar)->varattno)
+			{
+				(void) index_context->InsertMapping(dxl_col_descr->Id(),
+													target_entry->resno);
+				break;
+			}
+		}
+
+		target_list = gpdb::LAppend(target_list, target_entry);
+	}
+
 	return target_list;
 }
 
@@ -846,18 +1012,10 @@ CTranslatorDXLToPlStmt::TranslateDXLIndexOnlyScan(
 	// translation context for column mappings in the base relation
 	CDXLTranslateContextBaseTable base_table_context(m_mp);
 
-	Index index =
-		gpdb::ListLength(m_dxl_to_plstmt_context->GetRTableEntriesList()) + 1;
-
 	const IMDRelation *md_rel = m_md_accessor->RetrieveRel(
 		physical_idx_scan_dxlop->GetDXLTableDescr()->MDId());
 
-	RangeTblEntry *rte = TranslateDXLTblDescrToRangeTblEntry(
-		physical_idx_scan_dxlop->GetDXLTableDescr(), index,
-		&base_table_context);
-	GPOS_ASSERT(nullptr != rte);
-	rte->requiredPerms |= ACL_SELECT;
-	m_dxl_to_plstmt_context->AddRTE(rte);
+	Index index = ProcessDXLTblDescr(table_desc, &base_table_context);
 
 	IndexOnlyScan *index_scan = MakeNode(IndexOnlyScan);
 	index_scan->scan.scanrelid = index;
@@ -870,36 +1028,16 @@ CTranslatorDXLToPlStmt::TranslateDXLIndexOnlyScan(
 	GPOS_ASSERT(InvalidOid != index_oid);
 	index_scan->indexid = index_oid;
 
-	Plan *plan = &(index_scan->scan.plan);
-	plan->plan_node_id = m_dxl_to_plstmt_context->GetNextPlanId();
-
-	// translate operator costs
-	TranslatePlanCosts(index_scan_dxlnode, plan);
-
-	// an index scan node must have 3 children: projection list, filter and index condition list
-	GPOS_ASSERT(3 == index_scan_dxlnode->Arity());
-
-	// translate proj list and filter
-	CDXLNode *project_list_dxlnode = (*index_scan_dxlnode)[EdxlisIndexProjList];
-	CDXLNode *filter_dxlnode = (*index_scan_dxlnode)[EdxlisIndexFilter];
-	CDXLNode *index_cond_list_dxlnode =
-		(*index_scan_dxlnode)[EdxlisIndexCondition];
-
 	CDXLTranslateContextBaseTable index_context(m_mp);
 
 	// translate index targetlist
 	index_scan->indextlist = TranslateDXLIndexTList(md_rel, md_index, index,
 													table_desc, &index_context);
 
-	// translate target list
-	plan->targetlist =
-		TranslateDXLProjList(project_list_dxlnode, &index_context,
-							 nullptr /*child_contexts*/, output_context);
-
-	// translate index filter
-	plan->qual =
-		TranslateDXLIndexFilter(filter_dxlnode, output_context, &index_context,
-								ctxt_translation_prev_siblings);
+	Plan *plan = &(index_scan->scan.plan);
+	TranslatePlan(plan, index_scan_dxlnode, output_context,
+				  m_dxl_to_plstmt_context, &index_context,
+				  ctxt_translation_prev_siblings);
 
 	index_scan->indexorderdir = CTranslatorUtils::GetScanDirection(
 		physical_idx_scan_dxlop->GetIndexScanDir());
@@ -907,18 +1045,21 @@ CTranslatorDXLToPlStmt::TranslateDXLIndexOnlyScan(
 	// translate index condition list
 	List *index_cond = NIL;
 	List *index_orig_cond = NIL;
-	List *index_strategy_list = NIL;
-	List *index_subtype_list = NIL;
 
-	TranslateIndexConditions(
-		index_cond_list_dxlnode, physical_idx_scan_dxlop->GetDXLTableDescr(),
-		false,	// is_bitmap_index_probe
-		md_index, md_rel, output_context, &base_table_context,
-		ctxt_translation_prev_siblings, &index_cond, &index_orig_cond,
-		&index_strategy_list, &index_subtype_list);
+	// Translate Index Conditions if Index isn't used for order by.
+	if (!IsIndexForOrderBy(&base_table_context, ctxt_translation_prev_siblings,
+						   output_context,
+						   (*index_scan_dxlnode)[EdxlisIndexCondition]))
+	{
+		TranslateIndexConditions(
+			(*index_scan_dxlnode)[EdxlisIndexCondition],
+			physical_idx_scan_dxlop->GetDXLTableDescr(),
+			false,	// is_bitmap_index_probe
+			md_index, md_rel, output_context, &base_table_context,
+			ctxt_translation_prev_siblings, &index_cond, &index_orig_cond);
+	}
 
 	index_scan->indexqual = index_cond;
-	index_scan->indexqualorig = index_orig_cond;
 	SetParamIds(plan);
 
 	return (Plan *) index_scan;
@@ -974,8 +1115,7 @@ CTranslatorDXLToPlStmt::TranslateIndexConditions(
 	const IMDRelation *md_rel, CDXLTranslateContext *output_context,
 	CDXLTranslateContextBaseTable *base_table_context,
 	CDXLTranslationContextArray *ctxt_translation_prev_siblings,
-	List **index_cond, List **index_orig_cond, List **index_strategy_list,
-	List **index_subtype_list)
+	List **index_cond, List **index_orig_cond)
 {
 	// array of index qual info
 	CIndexQualInfoArray *index_qual_info_array =
@@ -990,19 +1130,50 @@ CTranslatorDXLToPlStmt::TranslateIndexConditions(
 	for (ULONG ul = 0; ul < arity; ul++)
 	{
 		CDXLNode *index_cond_dxlnode = (*index_cond_list_dxlnode)[ul];
+		CDXLNode *modified_null_test_cond_dxlnode = nullptr;
 
+		// FIXME: Remove this translation from BoolExpr to NullTest when ORCA gets rid of
+		// translation of 'x IS NOT NULL' to 'NOT (x IS NULL)'. Here's the ticket that tracks
+		// the issue: https://github.com/greenplum-db/gpdb/issues/16294
+
+		// Translate index condition CDXLScalarBoolExpr of format 'NOT (col IS NULL)'
+		// to CDXLScalarNullTest 'col IS NOT NULL', because IndexScan only
+		// supports indexquals of types: OpExpr, RowCompareExpr,
+		// ScalarArrayOpExpr and NullTest
+		if (index_cond_dxlnode->GetOperator()->GetDXLOperator() ==
+			EdxlopScalarBoolExpr)
+		{
+			CDXLScalarBoolExpr *boolexpr_dxlop =
+				CDXLScalarBoolExpr::Cast(index_cond_dxlnode->GetOperator());
+			if (boolexpr_dxlop->GetDxlBoolTypeStr() == Edxlnot &&
+				(*index_cond_dxlnode)[0]->GetOperator()->GetDXLOperator() ==
+					EdxlopScalarNullTest)
+			{
+				CDXLNode *null_test_cond_dxlnode = (*index_cond_dxlnode)[0];
+				CDXLNode *scalar_ident_dxlnode = (*null_test_cond_dxlnode)[0];
+				scalar_ident_dxlnode->AddRef();
+				modified_null_test_cond_dxlnode = GPOS_NEW(m_mp) CDXLNode(
+					m_mp, GPOS_NEW(m_mp) CDXLScalarNullTest(m_mp, false),
+					scalar_ident_dxlnode);
+				index_cond_dxlnode = modified_null_test_cond_dxlnode;
+			}
+		}
 		Expr *original_index_cond_expr =
 			m_translator_dxl_to_scalar->TranslateDXLToScalar(
 				index_cond_dxlnode, &colid_var_mapping);
 		Expr *index_cond_expr =
 			m_translator_dxl_to_scalar->TranslateDXLToScalar(
 				index_cond_dxlnode, &colid_var_mapping);
-		GPOS_ASSERT((IsA(index_cond_expr, OpExpr) ||
-					 IsA(index_cond_expr, ScalarArrayOpExpr)) &&
-					"expected OpExpr or ScalarArrayOpExpr in index qual");
+		GPOS_ASSERT(
+			(IsA(index_cond_expr, OpExpr) ||
+			 IsA(index_cond_expr, ScalarArrayOpExpr) ||
+			 IsA(index_cond_expr, NullTest)) &&
+			"expected OpExpr or ScalarArrayOpExpr or NullTest in index qual");
 
+		// allow Index quals with scalar array only for bitmap and btree indexes
 		if (!is_bitmap_index_probe && IsA(index_cond_expr, ScalarArrayOpExpr) &&
-			IMDIndex::EmdindBitmap != index->IndexType())
+			!(IMDIndex::EmdindBitmap == index->IndexType() ||
+			  IMDIndex::EmdindBtree == index->IndexType()))
 		{
 			GPOS_RAISE(
 				gpdxl::ExmaDXL, gpdxl::ExmiDXL2PlStmtConversion,
@@ -1019,39 +1190,57 @@ CTranslatorDXLToPlStmt::TranslateIndexConditions(
 		{
 			args_list = ((OpExpr *) index_cond_expr)->args;
 		}
-		else
+		else if (IsA(index_cond_expr, ScalarArrayOpExpr))
 		{
 			args_list = ((ScalarArrayOpExpr *) index_cond_expr)->args;
 		}
-
-		Node *left_arg = (Node *) lfirst(gpdb::ListHead(args_list));
-		Node *right_arg = (Node *) lfirst(gpdb::ListTail(args_list));
-
-		BOOL is_relabel_type = false;
-		if (IsA(left_arg, RelabelType) &&
-			IsA(((RelabelType *) left_arg)->arg, Var))
+		else
 		{
-			left_arg = (Node *) ((RelabelType *) left_arg)->arg;
-			is_relabel_type = true;
-		}
-		else if (IsA(right_arg, RelabelType) &&
-				 IsA(((RelabelType *) right_arg)->arg, Var))
-		{
-			right_arg = (Node *) ((RelabelType *) right_arg)->arg;
-			is_relabel_type = true;
+			// NullTest struct doesn't have List argument, hence ignoring
+			// assignment for that type
 		}
 
-		if (is_relabel_type)
+		Node *left_arg;
+		Node *right_arg;
+		if (IsA(index_cond_expr, NullTest))
 		{
-			List *new_args_list = ListMake2(left_arg, right_arg);
-			gpdb::GPDBFree(args_list);
-			if (IsA(index_cond_expr, OpExpr))
+			// NullTest only has one arg
+			left_arg = (Node *) (((NullTest *) index_cond_expr)->arg);
+			right_arg = nullptr;
+		}
+		else
+		{
+			left_arg = (Node *) lfirst(gpdb::ListHead(args_list));
+			right_arg = (Node *) lfirst(gpdb::ListTail(args_list));
+			// Type Coercion doesn't add much value for IS NULL and IS NOT NULL
+			// conditions, and is not supported by ORCA currently
+			BOOL is_relabel_type = false;
+			if (IsA(left_arg, RelabelType) &&
+				IsA(((RelabelType *) left_arg)->arg, Var))
 			{
-				((OpExpr *) index_cond_expr)->args = new_args_list;
+				left_arg = (Node *) ((RelabelType *) left_arg)->arg;
+				is_relabel_type = true;
 			}
-			else
+			else if (IsA(right_arg, RelabelType) &&
+					 IsA(((RelabelType *) right_arg)->arg, Var))
 			{
-				((ScalarArrayOpExpr *) index_cond_expr)->args = new_args_list;
+				right_arg = (Node *) ((RelabelType *) right_arg)->arg;
+				is_relabel_type = true;
+			}
+
+			if (is_relabel_type)
+			{
+				List *new_args_list = ListMake2(left_arg, right_arg);
+				gpdb::GPDBFree(args_list);
+				if (IsA(index_cond_expr, OpExpr))
+				{
+					((OpExpr *) index_cond_expr)->args = new_args_list;
+				}
+				else
+				{
+					((ScalarArrayOpExpr *) index_cond_expr)->args =
+						new_args_list;
+				}
 			}
 		}
 
@@ -1078,23 +1267,14 @@ CTranslatorDXLToPlStmt::TranslateIndexConditions(
 			attno = ((Var *) right_arg)->varattno;
 		}
 
-		// retrieve index strategy and subtype
-		INT strategy_num = 0;
-		OID index_subtype_oid = InvalidOid;
-
-		OID cmp_operator_oid =
-			CTranslatorUtils::OidCmpOperator(index_cond_expr);
-		GPOS_ASSERT(InvalidOid != cmp_operator_oid);
-		OID op_family_oid = CTranslatorUtils::GetOpFamilyForIndexQual(
-			attno, CMDIdGPDB::CastMdid(index->MDId())->Oid());
-		GPOS_ASSERT(InvalidOid != op_family_oid);
-		gpdb::IndexOpProperties(cmp_operator_oid, op_family_oid, &strategy_num,
-								&index_subtype_oid);
-
 		// create index qual
 		index_qual_info_array->Append(GPOS_NEW(m_mp) CIndexQualInfo(
-			attno, index_cond_expr, original_index_cond_expr,
-			(StrategyNumber) strategy_num, index_subtype_oid));
+			attno, index_cond_expr, original_index_cond_expr));
+
+		if (modified_null_test_cond_dxlnode != nullptr)
+		{
+			modified_null_test_cond_dxlnode->Release();
+		}
 	}
 
 	// the index quals much be ordered by attribute number
@@ -1107,10 +1287,6 @@ CTranslatorDXLToPlStmt::TranslateIndexConditions(
 		*index_cond = gpdb::LAppend(*index_cond, index_qual_info->m_expr);
 		*index_orig_cond =
 			gpdb::LAppend(*index_orig_cond, index_qual_info->m_original_expr);
-		*index_strategy_list = gpdb::LAppendInt(
-			*index_strategy_list, index_qual_info->m_index_subtype_oid);
-		*index_subtype_list = gpdb::LAppendOid(
-			*index_subtype_list, index_qual_info->m_index_subtype_oid);
 	}
 
 	// clean up
@@ -1395,6 +1571,50 @@ CTranslatorDXLToPlStmt::TranslateDXLHashJoin(
 
 	GPOS_ASSERT(NIL != hashjoin->hashclauses);
 
+	/*
+	 * The following code is copied from create_hashjoin_plan, only difference is
+	 * we have to deep copy the inner hashkeys since later we will modify it for
+	 * Hash Plannode.
+	 *
+	 * Collect hash related information. The hashed expressions are
+	 * deconstructed into outer/inner expressions, so they can be computed
+	 * separately (inner expressions are used to build the hashtable via Hash,
+	 * outer expressions to perform lookups of tuples from HashJoin's outer
+	 * plan in the hashtable). Also collect operator information necessary to
+	 * build the hashtable.
+	 */
+	List *hashoperators = NIL;
+	List *hashcollations = NIL;
+	List *outer_hashkeys = NIL;
+	List *inner_hashkeys = NIL;
+	ListCell *lc;
+	foreach (lc, hashjoin->hashclauses)
+	{
+		OpExpr *hclause = lfirst_node(OpExpr, lc);
+
+		hashoperators = gpdb::LAppendOid(hashoperators, hclause->opno);
+		hashcollations = gpdb::LAppendOid(hashcollations, hclause->inputcollid);
+		outer_hashkeys = gpdb::LAppend(outer_hashkeys, linitial(hclause->args));
+		inner_hashkeys = gpdb::LAppend(
+			inner_hashkeys, gpdb::CopyObject(lsecond(hclause->args)));
+	}
+
+	hashjoin->hashoperators = hashoperators;
+	hashjoin->hashcollations = hashcollations;
+	/*
+	 * The following code is a little differnt from Postgres Legacy Planner:
+	 *   * In Postgres Legacy Planner will fix variable's varno late in set_plan_references, like
+	 *     set the varno to OUTER_VAR  or INNER_VAR.
+	 *   * ORCA here, the outer_hashkeys and inner_hashkeys are already the fixed version as Planner.
+	 *     outer_hashkeys can be directly set to hashjoin, however, inner_hashkeys is used for
+	 *     the right child, Hash Plan, standing at Hash Plan, it only has lefttree (no righttree),
+	 *     so if we want to set Hash Plan's hashkeys field, we need to walk the inner_hashkeys and
+	 *     replace every INNER_VARs to OUTER_VARS.
+	 */
+	hashjoin->hashkeys = outer_hashkeys;
+	SetHashKeysVarnoWalker((Node *) inner_hashkeys, nullptr);
+	((Hash *) right_plan)->hashkeys = inner_hashkeys;
+
 	plan->lefttree = left_plan;
 	plan->righttree = right_plan;
 	SetParamIds(plan);
@@ -1463,6 +1683,7 @@ CTranslatorDXLToPlStmt::TranslateDXLTvf(
 	rtfunc->funccoltypes = NIL;
 	rtfunc->funccoltypmods = NIL;
 	rtfunc->funccolcollations = NIL;
+	rtfunc->funccolcount = gpdb::ListLength(target_list);
 	ForEach(lc_target_entry, target_list)
 	{
 		TargetEntry *target_entry = (TargetEntry *) lfirst(lc_target_entry);
@@ -1506,19 +1727,9 @@ CTranslatorDXLToPlStmt::TranslateDXLTvfToRangeTblEntry(
 	RangeTblEntry *rte = MakeNode(RangeTblEntry);
 	rte->rtekind = RTE_FUNCTION;
 
-	FuncExpr *func_expr = MakeNode(FuncExpr);
-
-	func_expr->funcid = CMDIdGPDB::CastMdid(dxlop->FuncMdId())->Oid();
-	func_expr->funcretset = gpdb::GetFuncRetset(func_expr->funcid);
-	// this is a function call, as opposed to a cast
-	func_expr->funcformat = COERCE_EXPLICIT_CALL;
-	func_expr->funcresulttype =
-		CMDIdGPDB::CastMdid(dxlop->ReturnTypeMdId())->Oid();
-
+	// get function alias
 	Alias *alias = MakeNode(Alias);
 	alias->colnames = NIL;
-
-	// get function alias
 	alias->aliasname = CTranslatorUtils::CreateMultiByteCharStringFromWCString(
 		dxlop->Pstr()->GetBuffer());
 
@@ -1545,47 +1756,91 @@ CTranslatorDXLToPlStmt::TranslateDXLTvfToRangeTblEntry(
 												 ul + 1 /*attno*/);
 	}
 
-	// function arguments
-	const ULONG num_of_child = tvf_dxlnode->Arity();
-	for (ULONG ul = 1; ul < num_of_child; ++ul)
-	{
-		CDXLNode *func_arg_dxlnode = (*tvf_dxlnode)[ul];
-
-		CMappingColIdVarPlStmt colid_var_mapping(m_mp, base_table_context,
-												 nullptr, output_context,
-												 m_dxl_to_plstmt_context);
-
-		Expr *pexprFuncArg = m_translator_dxl_to_scalar->TranslateDXLToScalar(
-			func_arg_dxlnode, &colid_var_mapping);
-		func_expr->args = gpdb::LAppend(func_expr->args, pexprFuncArg);
-	}
-
-	// GPDB_91_MERGE_FIXME: collation
-	func_expr->inputcollid = gpdb::ExprCollation((Node *) func_expr->args);
-	func_expr->funccollid = gpdb::TypeCollation(func_expr->funcresulttype);
-
-	// Populate RangeTblFunction::funcparams, by walking down the entire
-	// func_expr to capture ids of all the PARAMs
-	ListCell *lc = nullptr;
-	List *param_exprs = gpdb::ExtractNodesExpression(
-		(Node *) func_expr, T_Param, false /*descend_into_subqueries */);
-	Bitmapset *funcparams = nullptr;
-	ForEach(lc, param_exprs)
-	{
-		Param *param = (Param *) lfirst(lc);
-		funcparams = gpdb::BmsAddMember(funcparams, param->paramid);
-	}
-
 	RangeTblFunction *rtfunc = MakeNode(RangeTblFunction);
-	rtfunc->funcexpr = (Node *) func_expr;
+	Bitmapset *funcparams = nullptr;
+
+	// invalid funcid indicates TVF evaluates to const
+	if (!dxlop->FuncMdId()->IsValid())
+	{
+		Const *const_expr = MakeNode(Const);
+
+		const_expr->consttype =
+			CMDIdGPDB::CastMdid(dxlop->ReturnTypeMdId())->Oid();
+		const_expr->consttypmod = -1;
+
+		CDXLNode *constVa = (*tvf_dxlnode)[1];
+		CDXLScalarConstValue *constValue =
+			CDXLScalarConstValue::Cast(constVa->GetOperator());
+		const CDXLDatum *datum_dxl = constValue->GetDatumVal();
+		CDXLDatumGeneric *datum_generic_dxl =
+			CDXLDatumGeneric::Cast(const_cast<gpdxl::CDXLDatum *>(datum_dxl));
+		const IMDType *type =
+			m_md_accessor->RetrieveType(datum_generic_dxl->MDId());
+		const_expr->constlen = type->Length();
+		Datum val = gpdb::DatumFromPointer(datum_generic_dxl->GetByteArray());
+		ULONG length =
+			(ULONG) gpdb::DatumSize(val, false, const_expr->constlen);
+		CHAR *str = (CHAR *) gpdb::GPDBAlloc(length + 1);
+		memcpy(str, datum_generic_dxl->GetByteArray(), length);
+		str[length] = '\0';
+		const_expr->constvalue = gpdb::DatumFromPointer(str);
+
+		rtfunc->funcexpr = (Node *) const_expr;
+	}
+	else
+	{
+		FuncExpr *func_expr = MakeNode(FuncExpr);
+
+		func_expr->funcid = CMDIdGPDB::CastMdid(dxlop->FuncMdId())->Oid();
+		func_expr->funcretset = gpdb::GetFuncRetset(func_expr->funcid);
+		// this is a function call, as opposed to a cast
+		func_expr->funcformat = COERCE_EXPLICIT_CALL;
+		func_expr->funcresulttype =
+			CMDIdGPDB::CastMdid(dxlop->ReturnTypeMdId())->Oid();
+
+		// function arguments
+		const ULONG num_of_child = tvf_dxlnode->Arity();
+		for (ULONG ul = 1; ul < num_of_child; ++ul)
+		{
+			CDXLNode *func_arg_dxlnode = (*tvf_dxlnode)[ul];
+
+			CMappingColIdVarPlStmt colid_var_mapping(m_mp, base_table_context,
+													 nullptr, output_context,
+													 m_dxl_to_plstmt_context);
+
+			Expr *pexprFuncArg =
+				m_translator_dxl_to_scalar->TranslateDXLToScalar(
+					func_arg_dxlnode, &colid_var_mapping);
+			func_expr->args = gpdb::LAppend(func_expr->args, pexprFuncArg);
+		}
+
+		// GPDB_91_MERGE_FIXME: collation
+		func_expr->inputcollid = gpdb::ExprCollation((Node *) func_expr->args);
+		func_expr->funccollid = gpdb::TypeCollation(func_expr->funcresulttype);
+
+		// Populate RangeTblFunction::funcparams, by walking down the entire
+		// func_expr to capture ids of all the PARAMs
+		ListCell *lc = nullptr;
+		List *param_exprs = gpdb::ExtractNodesExpression(
+			(Node *) func_expr, T_Param, false /*descend_into_subqueries */);
+		ForEach(lc, param_exprs)
+		{
+			Param *param = (Param *) lfirst(lc);
+			funcparams = gpdb::BmsAddMember(funcparams, param->paramid);
+		}
+
+		rtfunc->funcexpr = (Node *) func_expr;
+	}
+
+	rtfunc->funccolcount = (int) num_of_cols;
 	rtfunc->funcparams = funcparams;
 	// GPDB_91_MERGE_FIXME: collation
 	// set rtfunc->funccoltypemods & rtfunc->funccolcollations?
 	rte->functions = ListMake1(rtfunc);
 
 	rte->inFromCl = true;
-	rte->eref = alias;
 
+	rte->eref = alias;
 	return rte;
 }
 
@@ -2116,9 +2371,9 @@ CTranslatorDXLToPlStmt::TranslateDXLMotion(
 		int segindex = *((*input_segids_array)[0]);
 
 		// only one segment in total
-		if (segindex == MASTER_CONTENT_ID)
+		if (segindex == COORDINATOR_CONTENT_ID)
 		{
-			// sender is on master, must be singleton gang
+			// sender is on coordinator, must be singleton gang
 			sendslice->gangType = GANGTYPE_ENTRYDB_READER;
 		}
 		else if (1 == gpdb::GetGPSegmentCount())
@@ -2552,16 +2807,23 @@ CTranslatorDXLToPlStmt::TranslateDXLAgg(
 
 	// Set the aggsplit for the agg node
 	ListCell *lc;
+	INT aggsplit = 0;
 	foreach (lc, plan->targetlist)
 	{
 		TargetEntry *te = (TargetEntry *) lfirst(lc);
 		if (IsA(te->expr, Aggref))
 		{
 			Aggref *aggref = (Aggref *) te->expr;
-			agg->aggsplit = aggref->aggsplit;
-			break;
+
+			aggsplit |= aggref->aggsplit;
+
+			if (AGGSPLIT_INTERMEDIATE == aggsplit)
+			{
+				break;
+			}
 		}
 	}
+	agg->aggsplit = (AggSplit) aggsplit;
 
 	plan->lefttree = child_plan;
 
@@ -2579,6 +2841,13 @@ CTranslatorDXLToPlStmt::TranslateDXLAgg(
 			break;
 		default:
 			GPOS_ASSERT(!"Invalid aggregation strategy");
+	}
+
+	if (agg->aggstrategy == AGG_HASHED &&
+		CTranslatorUtils::HasOrderedAggRefInProjList(project_list_dxlnode))
+	{
+		GPOS_RAISE(gpopt::ExmaDXL, gpopt::ExmiExpr2DXLUnsupportedFeature,
+				   GPOS_WSZ_LIT("Hash aggregation with ORDER BY"));
 	}
 
 	agg->streaming = dxl_phy_agg_dxlop->IsStreamSafe();
@@ -2793,16 +3062,28 @@ CTranslatorDXLToPlStmt::TranslateDXLWindow(
 			{
 				window->frameOptions |= FRAMEOPTION_ROWS;
 			}
+			else if (EdxlfsGroups == window_frame->ParseDXLFrameSpec())
+			{
+				window->frameOptions |= FRAMEOPTION_GROUPS;
+			}
 			else
 			{
 				window->frameOptions |= FRAMEOPTION_RANGE;
 			}
 
-			if (window_frame->ParseFrameExclusionStrategy() != EdxlfesNulls)
+			if (window_frame->ParseFrameExclusionStrategy() ==
+				EdxlfesCurrentRow)
 			{
-				GPOS_RAISE(gpdxl::ExmaDXL,
-						   gpdxl::ExmiQuery2DXLUnsupportedFeature,
-						   GPOS_WSZ_LIT("EXCLUDE clause in window frame"));
+				window->frameOptions |= FRAMEOPTION_EXCLUDE_CURRENT_ROW;
+			}
+			else if (window_frame->ParseFrameExclusionStrategy() ==
+					 EdxlfesGroup)
+			{
+				window->frameOptions |= FRAMEOPTION_EXCLUDE_GROUP;
+			}
+			else if (window_frame->ParseFrameExclusionStrategy() == EdxlfesTies)
+			{
+				window->frameOptions |= FRAMEOPTION_EXCLUDE_TIES;
 			}
 
 			// translate the CDXLNodes representing the leading and trailing edge
@@ -2826,22 +3107,36 @@ CTranslatorDXLToPlStmt::TranslateDXLWindow(
 					win_frame_leading_dxlnode->GetOperator())
 					->ParseDXLFrameBoundary();
 			if (lead_boundary_type == EdxlfbUnboundedPreceding)
-				window->frameOptions |= FRAMEOPTION_END_UNBOUNDED_PRECEDING;
+			{
+				window->frameOptions |= FRAMEOPTION_START_UNBOUNDED_PRECEDING;
+			}
 			if (lead_boundary_type == EdxlfbBoundedPreceding)
-				window->frameOptions |= FRAMEOPTION_END_OFFSET_PRECEDING;
+			{
+				window->frameOptions |= FRAMEOPTION_START_OFFSET_PRECEDING;
+			}
 			if (lead_boundary_type == EdxlfbCurrentRow)
-				window->frameOptions |= FRAMEOPTION_END_CURRENT_ROW;
+			{
+				window->frameOptions |= FRAMEOPTION_START_CURRENT_ROW;
+			}
 			if (lead_boundary_type == EdxlfbBoundedFollowing)
-				window->frameOptions |= FRAMEOPTION_END_OFFSET_FOLLOWING;
+			{
+				window->frameOptions |= FRAMEOPTION_START_OFFSET_FOLLOWING;
+			}
 			if (lead_boundary_type == EdxlfbUnboundedFollowing)
-				window->frameOptions |= FRAMEOPTION_END_UNBOUNDED_FOLLOWING;
+			{
+				window->frameOptions |= FRAMEOPTION_START_UNBOUNDED_FOLLOWING;
+			}
 			if (lead_boundary_type == EdxlfbDelayedBoundedPreceding)
-				window->frameOptions |= FRAMEOPTION_END_OFFSET_PRECEDING;
+			{
+				window->frameOptions |= FRAMEOPTION_START_OFFSET_PRECEDING;
+			}
 			if (lead_boundary_type == EdxlfbDelayedBoundedFollowing)
-				window->frameOptions |= FRAMEOPTION_END_OFFSET_FOLLOWING;
+			{
+				window->frameOptions |= FRAMEOPTION_START_OFFSET_FOLLOWING;
+			}
 			if (0 != win_frame_leading_dxlnode->Arity())
 			{
-				window->endOffset =
+				window->startOffset =
 					(Node *) m_translator_dxl_to_scalar->TranslateDXLToScalar(
 						(*win_frame_leading_dxlnode)[0], &colid_var_mapping);
 			}
@@ -2854,31 +3149,53 @@ CTranslatorDXLToPlStmt::TranslateDXLWindow(
 					win_frame_trailing_dxlnode->GetOperator())
 					->ParseDXLFrameBoundary();
 			if (trail_boundary_type == EdxlfbUnboundedPreceding)
-				window->frameOptions |= FRAMEOPTION_START_UNBOUNDED_PRECEDING;
+			{
+				window->frameOptions |= FRAMEOPTION_END_UNBOUNDED_PRECEDING;
+			}
 			if (trail_boundary_type == EdxlfbBoundedPreceding)
-				window->frameOptions |= FRAMEOPTION_START_OFFSET_PRECEDING;
+			{
+				window->frameOptions |= FRAMEOPTION_END_OFFSET_PRECEDING;
+			}
 			if (trail_boundary_type == EdxlfbCurrentRow)
-				window->frameOptions |= FRAMEOPTION_START_CURRENT_ROW;
+			{
+				window->frameOptions |= FRAMEOPTION_END_CURRENT_ROW;
+			}
 			if (trail_boundary_type == EdxlfbBoundedFollowing)
-				window->frameOptions |= FRAMEOPTION_START_OFFSET_FOLLOWING;
+			{
+				window->frameOptions |= FRAMEOPTION_END_OFFSET_FOLLOWING;
+			}
 			if (trail_boundary_type == EdxlfbUnboundedFollowing)
-				window->frameOptions |= FRAMEOPTION_START_UNBOUNDED_FOLLOWING;
+			{
+				window->frameOptions |= FRAMEOPTION_END_UNBOUNDED_FOLLOWING;
+			}
 			if (trail_boundary_type == EdxlfbDelayedBoundedPreceding)
-				window->frameOptions |= FRAMEOPTION_START_OFFSET_PRECEDING;
+			{
+				window->frameOptions |= FRAMEOPTION_END_OFFSET_PRECEDING;
+			}
 			if (trail_boundary_type == EdxlfbDelayedBoundedFollowing)
-				window->frameOptions |= FRAMEOPTION_START_OFFSET_FOLLOWING;
+			{
+				window->frameOptions |= FRAMEOPTION_END_OFFSET_FOLLOWING;
+			}
 			if (0 != win_frame_trailing_dxlnode->Arity())
 			{
-				window->startOffset =
+				window->endOffset =
 					(Node *) m_translator_dxl_to_scalar->TranslateDXLToScalar(
 						(*win_frame_trailing_dxlnode)[0], &colid_var_mapping);
 			}
+
+			window->startInRangeFunc = window_frame->PdxlnStartInRangeFunc();
+			window->endInRangeFunc = window_frame->PdxlnEndInRangeFunc();
+			window->inRangeColl = window_frame->PdxlnInRangeColl();
+			window->inRangeAsc = window_frame->PdxlnInRangeAsc();
+			window->inRangeNullsFirst = window_frame->PdxlnInRangeNullsFirst();
 
 			// cleanup
 			child_contexts->Release();
 		}
 		else
+		{
 			window->frameOptions = FRAMEOPTION_DEFAULTS;
+		}
 	}
 
 	SetParamIds(plan);
@@ -2902,14 +3219,16 @@ CTranslatorDXLToPlStmt::TranslateDXLSort(
 	const CDXLNode *sort_dxlnode, CDXLTranslateContext *output_context,
 	CDXLTranslationContextArray *ctxt_translation_prev_siblings)
 {
+	// Ensure operator of sort_dxlnode exists and is EdxlopPhysicalSort
+	GPOS_ASSERT(nullptr != sort_dxlnode->GetOperator());
+	GPOS_ASSERT(EdxlopPhysicalSort ==
+				sort_dxlnode->GetOperator()->GetDXLOperator());
+
 	// create sort plan node
 	Sort *sort = MakeNode(Sort);
 
 	Plan *plan = &(sort->plan);
 	plan->plan_node_id = m_dxl_to_plstmt_context->GetNextPlanId();
-
-	CDXLPhysicalSort *sort_dxlop =
-		CDXLPhysicalSort::Cast(sort_dxlnode->GetOperator());
 
 	// translate operator costs
 	TranslatePlanCosts(sort_dxlnode, plan);
@@ -2937,9 +3256,6 @@ CTranslatorDXLToPlStmt::TranslateDXLSort(
 
 	plan->lefttree = child_plan;
 
-	// set sorting info
-	sort->noduplicates = sort_dxlop->FDiscardDuplicates();
-
 	// translate sorting columns
 
 	const CDXLNode *sort_col_list_dxl =
@@ -2964,108 +3280,57 @@ CTranslatorDXLToPlStmt::TranslateDXLSort(
 	return (Plan *) sort;
 }
 
-//---------------------------------------------------------------------------
-//	@function:
-//		CTranslatorDXLToPlStmt::TranslateDXLSubQueryScan
-//
-//	@doc:
-//		Translate DXL subquery scan node into GPDB SubqueryScan plan node
-//
-//---------------------------------------------------------------------------
-Plan *
-CTranslatorDXLToPlStmt::TranslateDXLSubQueryScan(
-	const CDXLNode *subquery_scan_dxlnode, CDXLTranslateContext *output_context,
-	CDXLTranslationContextArray *ctxt_translation_prev_siblings)
+//------------------------------------------------------------------------------
+// If the top level is not a function returning set then we need to check if the
+// project element contains any SRF's deep down the tree. If we found any SRF's
+// at lower levels then we will require a result node on top of ProjectSet node.
+// Eg.
+// <dxl:ProjElem ColId="1" Alias="abs">
+//  <dxl:FuncExpr FuncId="0.1397.1.0" FuncRetSet="false" TypeMdid="0.23.1.0">
+//   <dxl:FuncExpr FuncId="0.1067.1.0" FuncRetSet="true" TypeMdid="0.23.1.0">
+//    ...
+//   </dxl:FuncExpr>
+//  </dxl:FuncExpr>
+// Here we have SRF present at a lower level. So we will require a result node
+// on top.
+//------------------------------------------------------------------------------
+static BOOL
+ContainsLowLevelSetReturningFunc(const CDXLNode *scalar_expr_dxlnode)
 {
-	// create sort plan node
-	SubqueryScan *subquery_scan = MakeNode(SubqueryScan);
-
-	Plan *plan = &(subquery_scan->scan.plan);
-	plan->plan_node_id = m_dxl_to_plstmt_context->GetNextPlanId();
-
-	CDXLPhysicalSubqueryScan *subquery_scan_dxlop =
-		CDXLPhysicalSubqueryScan::Cast(subquery_scan_dxlnode->GetOperator());
-
-	// translate operator costs
-	TranslatePlanCosts(subquery_scan_dxlnode, plan);
-
-	// translate subplan
-	CDXLNode *child_dxlnode = (*subquery_scan_dxlnode)[EdxlsubqscanIndexChild];
-	CDXLNode *project_list_dxlnode =
-		(*subquery_scan_dxlnode)[EdxlsubqscanIndexProjList];
-	CDXLNode *filter_dxlnode =
-		(*subquery_scan_dxlnode)[EdxlsubqscanIndexFilter];
-
-	CDXLTranslateContext child_context(m_mp, false,
-									   output_context->GetColIdToParamIdMap());
-
-	Plan *child_plan = TranslateDXLOperatorToPlan(
-		child_dxlnode, &child_context, ctxt_translation_prev_siblings);
-
-	// create an rtable entry for the subquery scan
-	RangeTblEntry *rte = MakeNode(RangeTblEntry);
-	rte->rtekind = RTE_SUBQUERY;
-
-	Alias *alias = MakeNode(Alias);
-	alias->colnames = NIL;
-
-	// get table alias
-	alias->aliasname = CTranslatorUtils::CreateMultiByteCharStringFromWCString(
-		subquery_scan_dxlop->MdName()->GetMDName()->GetBuffer());
-
-	// get column names from child project list
-	CDXLTranslateContextBaseTable base_table_context(m_mp);
-
-	Index index =
-		gpdb::ListLength(m_dxl_to_plstmt_context->GetRTableEntriesList()) + 1;
-	(subquery_scan->scan).scanrelid = index;
-	base_table_context.SetRelIndex(index);
-
-	ListCell *lc_tgtentry = nullptr;
-
-	CDXLNode *child_proj_list_dxlnode = (*child_dxlnode)[0];
-
-	ULONG ul = 0;
-
-	ForEach(lc_tgtentry, child_plan->targetlist)
+	const ULONG arity = scalar_expr_dxlnode->Arity();
+	for (ULONG ul = 0; ul < arity; ul++)
 	{
-		TargetEntry *target_entry = (TargetEntry *) lfirst(lc_tgtentry);
+		CDXLNode *expr_dxlnode = (*scalar_expr_dxlnode)[ul];
+		CDXLOperator *op = expr_dxlnode->GetOperator();
+		Edxlopid dxlopid = op->GetDXLOperator();
 
-		// non-system attribute
-		CHAR *col_name_char_array = PStrDup(target_entry->resname);
-		Value *val_colname = gpdb::MakeStringValue(col_name_char_array);
-		alias->colnames = gpdb::LAppend(alias->colnames, val_colname);
-
-		// get corresponding child project element
-		CDXLScalarProjElem *sc_proj_elem_dxlop = CDXLScalarProjElem::Cast(
-			(*child_proj_list_dxlnode)[ul]->GetOperator());
-
-		// save mapping col id -> index in translate context
-		(void) base_table_context.InsertMapping(sc_proj_elem_dxlop->Id(),
-												target_entry->resno);
-		ul++;
+		if ((EdxlopScalarFuncExpr == dxlopid &&
+			 CDXLScalarFuncExpr::Cast(op)->ReturnsSet()) ||
+			ContainsLowLevelSetReturningFunc(expr_dxlnode))
+		{
+			return true;
+		}
 	}
-
-	rte->eref = alias;
-
-	// add range table entry for the subquery to the list
-	m_dxl_to_plstmt_context->AddRTE(rte);
-
-	// translate proj list and filter
-	TranslateProjListAndFilter(
-		project_list_dxlnode, filter_dxlnode,
-		&base_table_context,  // translate context for the base table
-		nullptr, &plan->targetlist, &plan->qual, output_context);
-
-	subquery_scan->subplan = child_plan;
-
-	SetParamIds(plan);
-	return (Plan *) subquery_scan;
+	return false;
 }
 
-static bool
-ContainsSetReturningFuncOrOp(const CDXLNode *project_list_dxlnode,
-							 CMDAccessor *md_accessor)
+//------------------------------------------------------------------------------
+// This method is required to check if we need a result node on top of
+// ProjectSet node. If the project element contains SRF on top then we don't
+// require a result node. Eg
+//  <dxl:ProjElem ColId="1" Alias="generate_series">
+//   <dxl:FuncExpr FuncId="0.1067.1.0" FuncRetSet="true" TypeMdid="0.23.1.0">
+//    ...
+//    <dxl:FuncExpr FuncId="0.1067.1.0" FuncRetSet="true" TypeMdid="0.23.1.0">
+//     ...
+//    </dxl:FuncExpr>
+//     ...
+//   </dxl:FuncExpr>
+// Here we have a FuncExpr which returns a set on top. So we don't require a
+// result node on top of ProjectSet node.
+//------------------------------------------------------------------------------
+static BOOL
+RequiresResultNode(const CDXLNode *project_list_dxlnode)
 {
 	const ULONG arity = project_list_dxlnode->Arity();
 	for (ULONG ul = 0; ul < arity; ++ul)
@@ -3074,77 +3339,52 @@ ContainsSetReturningFuncOrOp(const CDXLNode *project_list_dxlnode,
 		GPOS_ASSERT(EdxlopScalarProjectElem ==
 					proj_elem_dxlnode->GetOperator()->GetDXLOperator());
 		GPOS_ASSERT(1 == proj_elem_dxlnode->Arity());
-
-		// translate proj element expression
 		CDXLNode *expr_dxlnode = (*proj_elem_dxlnode)[0];
-
 		CDXLOperator *op = expr_dxlnode->GetOperator();
-		switch (op->GetDXLOperator())
+		Edxlopid dxlopid = op->GetDXLOperator();
+		if (EdxlopScalarFuncExpr == dxlopid)
 		{
-			case EdxlopScalarFuncExpr:
-				if (CDXLScalarFuncExpr::Cast(op)->ReturnsSet())
-					return true;
-				break;
-			case EdxlopScalarOpExpr:
+			if (!(CDXLScalarFuncExpr::Cast(op)->ReturnsSet()) &&
+				ContainsLowLevelSetReturningFunc(expr_dxlnode))
 			{
-				const IMDScalarOp *md_sclar_op = md_accessor->RetrieveScOp(
-					CDXLScalarOpExpr::Cast(op)->MDId());
-				const IMDFunction *md_func =
-					md_accessor->RetrieveFunc(md_sclar_op->FuncMdId());
-				if (md_func->ReturnsSet())
-					return true;
-				break;
+				return true;
 			}
-			default:
-				break;
+		}
+		else
+		{
+			if (ContainsLowLevelSetReturningFunc(expr_dxlnode))
+			{
+				return true;
+			}
 		}
 	}
 	return false;
 }
 
-// GPDB_12_MERGE_FIXME: this duplicates a check in ExecInitProjectSet
-static bool
-SanityCheckProjectSetTargetList(List *targetlist)
-{
-	ListCell *lc;
-	ForEach(lc, targetlist)
-	{
-		TargetEntry *te = (TargetEntry *) lfirst(lc);
-		Expr *expr = te->expr;
-		List *args;
-		if ((IsA(expr, FuncExpr) && ((FuncExpr *) expr)->funcretset) ||
-			(IsA(expr, OpExpr) && ((OpExpr *) expr)->opretset))
-		{
-			if (IsA(expr, FuncExpr))
-				args = ((FuncExpr *) expr)->args;
-			else
-				args = ((OpExpr *) expr)->args;
-			if (gpdb::ExpressionReturnsSet((Node *) args))
-				return false;
-			continue;
-		}
-
-		if (gpdb::ExpressionReturnsSet((Node *) expr))
-			return false;
-	}
-	return true;
-}
-
-// XXX: this is a copy-pasta of TranslateDXLResult
-// Is there a way to reduce the duplication?
+//------------------------------------------------------------------------------
+//	@function:
+//		CTranslatorDXLToPlStmt::TranslateDXLProjectSet
+//
+//	@doc:
+//		Translate DXL result node into project set node if SRF's are present
+//
+//------------------------------------------------------------------------------
 Plan *
-CTranslatorDXLToPlStmt::TranslateDXLProjectSet(
-	const CDXLNode *result_dxlnode, CDXLTranslateContext *output_context,
-	CDXLTranslationContextArray *ctxt_translation_prev_siblings)
+CTranslatorDXLToPlStmt::TranslateDXLProjectSet(const CDXLNode *result_dxlnode)
 {
-	// GPDB_12_MERGE_FIXME: had we generated a DXLProjectSet in ORCA we wouldn't
-	// have needed to be defensive here...
+	// ORCA_FEATURE_NOT_SUPPORTED: The Project Set nodes don't support a qual in
+	// the planned statement. Just being defensive here for the case when the
+	// result dxl node has a set returning function in the project list and also
+	// a qual. In that case will not create a ProjectSet node and will fall back
+	// to planner.
 	if ((*result_dxlnode)[EdxlresultIndexFilter]->Arity() > 0)
+	{
 		GPOS_RAISE(
 			gpdxl::ExmaDXL, gpdxl::ExmiQuery2DXLUnsupportedFeature,
 			GPOS_WSZ_LIT("Unsupported one-time filter in ProjectSet node"));
+	}
 
-	// create project set (nee result) plan node
+	// create project set plan node
 	ProjectSet *project_set = MakeNode(ProjectSet);
 
 	Plan *plan = &(project_set->plan);
@@ -3153,81 +3393,265 @@ CTranslatorDXLToPlStmt::TranslateDXLProjectSet(
 	// translate operator costs
 	TranslatePlanCosts(result_dxlnode, plan);
 
-	CDXLNode *child_dxlnode = nullptr;
-	CDXLTranslateContext child_context(m_mp, false,
-									   output_context->GetColIdToParamIdMap());
-
-	if (result_dxlnode->Arity() - 1 == EdxlresultIndexChild)
-	{
-		// translate child plan
-		child_dxlnode = (*result_dxlnode)[EdxlresultIndexChild];
-
-		Plan *child_plan = TranslateDXLOperatorToPlan(
-			child_dxlnode, &child_context, ctxt_translation_prev_siblings);
-
-		GPOS_ASSERT(nullptr != child_plan && "child plan cannot be NULL");
-
-		project_set->plan.lefttree = child_plan;
-	}
-
-	CDXLNode *project_list_dxlnode = (*result_dxlnode)[EdxlresultIndexProjList];
-	CDXLNode *filter_dxlnode = (*result_dxlnode)[EdxlresultIndexFilter];
-
-	List *quals_list = nullptr;
-
-	CDXLTranslationContextArray *child_contexts =
-		GPOS_NEW(m_mp) CDXLTranslationContextArray(m_mp);
-	child_contexts->Append(&child_context);
-
-	// translate proj list and filter
-	TranslateProjListAndFilter(project_list_dxlnode, filter_dxlnode,
-							   nullptr,	 // translate context for the base table
-							   child_contexts, &plan->targetlist, &quals_list,
-							   output_context);
-
-
-	plan->qual = quals_list;
-
 	SetParamIds(plan);
-
-	// cleanup
-	child_contexts->Release();
-
-	// double check the targetlist is kosher
-	// we are only doing this because ORCA didn't do it...
-	if (!SanityCheckProjectSetTargetList(plan->targetlist))
-		GPOS_RAISE(
-			gpdxl::ExmaDXL, gpdxl::ExmiQuery2DXLUnsupportedFeature,
-			GPOS_WSZ_LIT("Unexpected target list entries in ProjectSet node"));
 
 	return (Plan *) project_set;
 }
 
-//---------------------------------------------------------------------------
+//------------------------------------------------------------------------------
+//	@function:
+//		CTranslatorDXLToPlStmt::CreateProjectSetNodeTree
+//
+//	@doc:
+//		Creates a tree of project set plan nodes to contain the SRF's
+//
+//------------------------------------------------------------------------------
+Plan *
+CTranslatorDXLToPlStmt::CreateProjectSetNodeTree(const CDXLNode *result_dxlnode,
+												 Plan *result_node_plan,
+												 Plan *child_plan,
+												 Plan *&project_set_child_plan,
+												 BOOL &will_require_result_node)
+{
+	// Method split_pathtarget_at_srfs will split the given PathTarget into
+	// multiple levels to position SRFs safely. This list will hold the splited
+	// PathTarget created by split_pathtarget_at_srfs method.
+	List *targets_with_srf = NIL;
+
+	// List of bool flags indicating whether the corresponding PathTarget
+	// contains any evaluatable SRFs
+	List *targets_with_srf_bool = NIL;
+
+	// Pointer to the top level ProjectSet node. If a result node is required
+	// then this will be attached to the lefttree of the result node.
+	Plan *project_set_parent_plan = nullptr;
+
+	// Create Pathtarget object from Result node's targetlist which is required
+	// by SplitPathtargetAtSrfs method
+	PathTarget *complete_result_pathtarget =
+		gpdb::MakePathtargetFromTlist(result_node_plan->targetlist);
+
+	// Split given PathTarget into multiple levels to position SRFs safely
+	gpdb::SplitPathtargetAtSrfs(nullptr, complete_result_pathtarget, nullptr,
+								&targets_with_srf, &targets_with_srf_bool);
+
+	// If the PathTarget created from Result node's targetlist does not contain
+	// any set returning functions then split_pathtarget_at_srfs method will
+	// return the same PathTarget back. In this case a ProjectSet node is not
+	// required.
+	if (1 == gpdb::ListLength(targets_with_srf))
+	{
+		return nullptr;
+	}
+
+	// Do we require a result node to be attached on top of ProjectSet node?
+	will_require_result_node =
+		RequiresResultNode((*result_dxlnode)[EdxlresultIndexProjList]);
+
+	ListCell *lc;
+	ULONG list_cell_pos = 1;
+	ULONG targets_with_srf_list_length = gpdb::ListLength(targets_with_srf);
+
+	ForEach(lc, targets_with_srf)
+	{
+		// The first element of the PathTarget list created by
+		// split_pathtarget_at_srfs method will not contain any
+		// SRF's. So skipping it.
+		if (list_cell_pos == 1)
+		{
+			list_cell_pos++;
+			continue;
+		}
+
+		// If a Result node is required on top of a ProjectSet node then the
+		// last element of PathTarget list created by split_pathtarget_at_srfs
+		// method will contain the PathTarget of the result node. Since result
+		// node is already created before, breaking out from the loop. If a
+		// result node is not required on top of a ProjectSet node, continue to
+		// create a ProjectSet node.
+		if (will_require_result_node &&
+			targets_with_srf_list_length == list_cell_pos)
+		{
+			break;
+		}
+
+		list_cell_pos++;
+
+		List *target_list_entry =
+			gpdb::MakeTlistFromPathtarget((PathTarget *) lfirst(lc));
+
+		Plan *temp_plan_project_set = TranslateDXLProjectSet(result_dxlnode);
+
+		temp_plan_project_set->targetlist = target_list_entry;
+
+		// Creating the links between all the nested ProjectSet nodes
+		if (nullptr == project_set_parent_plan)
+		{
+			project_set_parent_plan = temp_plan_project_set;
+			project_set_child_plan = temp_plan_project_set;
+		}
+		else
+		{
+			temp_plan_project_set->lefttree = project_set_parent_plan;
+			project_set_parent_plan = temp_plan_project_set;
+		}
+	}
+
+	return project_set_parent_plan;
+}
+
+//------------------------------------------------------------------------------
+// If a result plan node is not required on top of a project set node then the
+// alias parameter needs to be set for all the project set nodes else not
+// required as that information will already be present in the result node
+// created
+//------------------------------------------------------------------------------
+void
+SetupAliasParameter(const BOOL will_require_result_node,
+					const CDXLNode *project_list_dxlnode,
+					Plan *project_set_parent_plan)
+{
+	if (!will_require_result_node)
+	{
+		// Setting up the alias value (te->resname)
+		ULONG ul = 0;
+		ListCell *listcell_project_targetentry;
+
+		ForEach(listcell_project_targetentry,
+				project_set_parent_plan->targetlist)
+		{
+			TargetEntry *te =
+				(TargetEntry *) lfirst(listcell_project_targetentry);
+
+			CDXLNode *proj_elem_dxlnode = (*project_list_dxlnode)[ul];
+
+			GPOS_ASSERT(EdxlopScalarProjectElem ==
+						proj_elem_dxlnode->GetOperator()->GetDXLOperator());
+
+			CDXLScalarProjElem *sc_proj_elem_dxlop =
+				CDXLScalarProjElem::Cast(proj_elem_dxlnode->GetOperator());
+
+			GPOS_ASSERT(1 == proj_elem_dxlnode->Arity());
+
+			te->resname =
+				CTranslatorUtils::CreateMultiByteCharStringFromWCString(
+					sc_proj_elem_dxlop->GetMdNameAlias()
+						->GetMDName()
+						->GetBuffer());
+			ul++;
+		}
+	}
+}
+
+//------------------------------------------------------------------------------
+// This method is used to convert the FUNCEXPR present in upper level
+// Result/ProjectSet nodes targetlist to VAR nodes which reference the FUNCEXPR
+// present in the leftree plan targetlist.
+//------------------------------------------------------------------------------
+void
+CTranslatorDXLToPlStmt::MutateFuncExprToVarProjectSet(Plan *final_plan)
+{
+	Plan *it_set_upper_ref = final_plan;
+	while (it_set_upper_ref->lefttree != nullptr)
+	{
+		Plan *subplan = it_set_upper_ref->lefttree;
+		List *output_targetlist;
+		ListCell *l;
+		output_targetlist = NIL;
+
+		foreach (l, it_set_upper_ref->targetlist)
+		{
+			TargetEntry *tle = (TargetEntry *) lfirst(l);
+			Node *newexpr;
+
+			newexpr = FixUpperExprMutatorProjectSet((Node *) tle->expr,
+													subplan->targetlist);
+			tle = gpdb::FlatCopyTargetEntry(tle);
+			tle->expr = (Expr *) newexpr;
+			output_targetlist = lappend(output_targetlist, tle);
+		}
+		it_set_upper_ref->targetlist = output_targetlist;
+		it_set_upper_ref = it_set_upper_ref->lefttree;
+	}
+}
+
+Var *
+SearchTlistForNonVarProjectset(Expr *node, List *itlist, Index newvarno)
+{
+	TargetEntry *tle;
+
+	if (IsA(node, Const))
+	{
+		return nullptr;
+	}
+
+	tle = gpdb::TlistMember(node, itlist);
+	if (nullptr != tle)
+	{
+		/* Found a matching subplan output expression */
+		Var *newvar;
+
+		newvar = gpdb::MakeVarFromTargetEntry(newvarno, tle);
+		newvar->varnoold = 0;
+		newvar->varoattno = 0;
+		return newvar;
+	}
+	return nullptr; /* no match */
+}
+
+Node *
+CTranslatorDXLToPlStmt::FixUpperExprMutatorProjectSet(Node *node, List *context)
+{
+	Var *newvar;
+
+	if (node == nullptr)
+	{
+		return nullptr;
+	}
+
+	newvar = SearchTlistForNonVarProjectset((Expr *) node, context, OUTER_VAR);
+	if (nullptr != newvar)
+	{
+		return (Node *) newvar;
+	}
+
+	return gpdb::Expression_tree_mutator(
+		node,
+		(Node * (*) ()) CTranslatorDXLToPlStmt::FixUpperExprMutatorProjectSet,
+		(void *) context);
+}
+
+//------------------------------------------------------------------------------
 //	@function:
 //		CTranslatorDXLToPlStmt::TranslateDXLResult
 //
 //	@doc:
-//		Translate DXL result node into GPDB result plan node
-//
-//---------------------------------------------------------------------------
+//		Translate DXL result node into GPDB result plan node and create Project
+//		Set plan node if SRV are present. The current approach is to create a
+//		Project Set plan node from a result dxl node as it already contains the
+//		info to create a project set node from it. But it's not the best
+//		approach. The better approach will be to actually create a new Clogical
+//		node to handle the set returning functions and then creating CPhysical,
+//		dxl and plan nodes.
+//------------------------------------------------------------------------------
 Plan *
 CTranslatorDXLToPlStmt::TranslateDXLResult(
 	const CDXLNode *result_dxlnode, CDXLTranslateContext *output_context,
 	CDXLTranslationContextArray *ctxt_translation_prev_siblings)
 {
-	// GPDB_12_MERGE_FIXME: this *really* should be done inside ORCA
-	// at the latest during CTranslatorExprToDXL, to create a DXLProjectSet
-	// that way we don't have to "frisk" the DXLResult to distinguish it from an
-	// actual result node
-	if (ContainsSetReturningFuncOrOp((*result_dxlnode)[EdxlresultIndexProjList],
-									 m_md_accessor))
-		return TranslateDXLProjectSet(result_dxlnode, output_context,
-									  ctxt_translation_prev_siblings);
+	// Pointer to the child plan of result node
+	Plan *child_plan = nullptr;
+
+	// Pointer to the lowest level ProjectSet node. If multiple ProjectSet nodes
+	// are required then the child plan of result dxl node will be attched to
+	// its lefttree.
+	Plan *project_set_child_plan = nullptr;
+
+	// Do we require a result node to be attached on top of ProjectSet node?
+	BOOL will_require_result_node = false;
 
 	// create result plan node
 	Result *result = MakeNode(Result);
-
 	Plan *plan = &(result->plan);
 	plan->plan_node_id = m_dxl_to_plstmt_context->GetNextPlanId();
 
@@ -3242,20 +3666,15 @@ CTranslatorDXLToPlStmt::TranslateDXLResult(
 	{
 		// translate child plan
 		child_dxlnode = (*result_dxlnode)[EdxlresultIndexChild];
-
-		Plan *child_plan = TranslateDXLOperatorToPlan(
-			child_dxlnode, &child_context, ctxt_translation_prev_siblings);
-
+		child_plan = TranslateDXLOperatorToPlan(child_dxlnode, &child_context,
+												ctxt_translation_prev_siblings);
 		GPOS_ASSERT(nullptr != child_plan && "child plan cannot be NULL");
-
-		result->plan.lefttree = child_plan;
 	}
 
 	CDXLNode *project_list_dxlnode = (*result_dxlnode)[EdxlresultIndexProjList];
 	CDXLNode *filter_dxlnode = (*result_dxlnode)[EdxlresultIndexFilter];
 	CDXLNode *one_time_filter_dxlnode =
 		(*result_dxlnode)[EdxlresultIndexOneTimeFilter];
-
 	List *quals_list = nullptr;
 
 	CDXLTranslationContextArray *child_contexts =
@@ -3275,198 +3694,46 @@ CTranslatorDXLToPlStmt::TranslateDXLResult(
 								 child_contexts, output_context);
 
 	plan->qual = quals_list;
-
 	result->resconstantqual = (Node *) one_time_quals_list;
-
 	SetParamIds(plan);
+
+	// Creating project set nodes plan tree
+	Plan *project_set_parent_plan = CreateProjectSetNodeTree(
+		result_dxlnode, plan, child_plan, project_set_child_plan,
+		will_require_result_node);
+
+	// If Project Set plan nodes are not required return the result plan node
+	// created
+	if (nullptr == project_set_parent_plan)
+	{
+		result->plan.lefttree = child_plan;
+		child_contexts->Release();
+		return (Plan *) result;
+	}
+
+	SetupAliasParameter(will_require_result_node, project_list_dxlnode,
+						project_set_parent_plan);
+
+	Plan *final_plan = nullptr;
+
+	if (will_require_result_node)
+	{
+		result->plan.lefttree = project_set_parent_plan;
+		final_plan = &(result->plan);
+	}
+	else
+	{
+		final_plan = project_set_parent_plan;
+	}
+
+	MutateFuncExprToVarProjectSet(final_plan);
+
+	// Attaching the child plan
+	project_set_child_plan->lefttree = child_plan;
 
 	// cleanup
 	child_contexts->Release();
-
-	// double check the targetlist is kosher
-	// we are only doing this because ORCA didn't do it...
-	if (!SanityCheckProjectSetTargetList(plan->targetlist))
-		GPOS_RAISE(
-			gpdxl::ExmaDXL, gpdxl::ExmiQuery2DXLUnsupportedFeature,
-			GPOS_WSZ_LIT("Unexpected target list entries in ProjectSet node"));
-
-	return (Plan *) result;
-}
-
-static List *
-ExecuteSaticPruning(PartitionPruneInfo *part_prune_info, List *rtable)
-{
-	auto estate = CreateExecutorState();
-	/* We can use the estate's working context to avoid memory leaks. */
-	auto oldcontext = MemoryContextSwitchTo(estate->es_query_cxt);
-
-	ExecInitRangeTable(estate, rtable);
-	PlanState bogus_plan_state{T_PlanState, nullptr, estate};
-	ExecAssignExprContext(estate, &bogus_plan_state);
-	auto prunestate =
-		ExecCreatePartitionPruneState(&bogus_plan_state, part_prune_info);
-
-	Bitmapset *remaining_indexes =
-		ExecFindMatchingSubPlans(prunestate, estate, 0, nullptr);
-
-	/* Get back to outer memory context */
-	MemoryContextSwitchTo(oldcontext);
-
-	std::vector<Oid> universe;
-	// FIXME: I hate those ListCell variables. Extract them into an range-for iterator
-	ListCell *lc_prune_info_list;
-	ForEach(lc_prune_info_list, part_prune_info->prune_infos)
-	{
-		// We cannot use lfirst_node because it longjmp's
-		auto pinfolist = (List *) lfirst(lc_prune_info_list);
-		ListCell *lc;
-		ForEach(lc, pinfolist)
-		{
-			auto pinfo = (PartitionedRelPruneInfo *) lfirst(lc);
-			universe.insert(universe.cend(), pinfo->relid_map,
-							pinfo->relid_map + pinfo->nparts);
-		}
-	}
-
-	List *prune_result = NIL;
-	for (int i = -1; (i = bms_next_member(remaining_indexes, i)) >= 0;)
-	{
-		prune_result = gpdb::LAppendOid(prune_result, universe[i]);
-	}
-
-	// Why the for-loop, if you assume one?
-	// This is a domain-specific knowledge of ORCA plans: orca doesn't smash
-	// static pruning for different partitioned tables into one partition selector
-	GPOS_ASSERT(estate->es_range_table_size == 1);
-
-	for (ULONG ul = 0; ul < estate->es_range_table_size; ++ul)
-		if (estate->es_relations[ul])
-			// FIXME: this doesn't quite seem to handle locking, is this correct?
-			gpdb::CloseRelation(estate->es_relations[ul]);
-	FreeExecutorState(estate);
-	return prune_result;
-}
-
-static bool
-IsOneLevelPartitioned(Relation relation)
-{
-	return std::all_of(
-		relation->rd_partdesc->is_leaf,
-		relation->rd_partdesc->is_leaf + relation->rd_partdesc->nparts,
-		[](bool b) { return b; });
-}
-
-static RangeTblEntry *
-MinimalRTE(Oid oid)
-{
-	// our artisanal rte will always be the first and only entry in our isolated
-	// range table
-	RangeTblEntry *rte = MakeNode(RangeTblEntry);
-	rte->relid = oid;
-	rte->rellockmode = AccessShareLock;
-	rte->alias = MakeNode(Alias);
-	rte->eref = rte->alias;
-
-	return rte;
-}
-
-static PartitionPruneStep *
-StepFromDXLConst(CDXLNode *dxl_const, Oid supportfnoid, uint32 step_id,
-				 CTranslatorDXLToScalar *translator_dxl_to_scalar)
-{
-	auto step = MakeNode(PartitionPruneStepOp);
-	step->step.step_id = step_id;
-	auto expr =
-		translator_dxl_to_scalar->TranslateDXLToScalar(dxl_const, nullptr);
-	step->exprs = ListMake1(expr);
-	step->cmpfns = ListMake1Oid(supportfnoid);
-	step->opstrategy = BTEqualStrategyNumber;
-
-	return (PartitionPruneStep *) step;
-}
-
-static List *
-PartPruneStepsFromEqFilters(CDXLNode *eq_values, Oid supportfnoid,
-							CTranslatorDXLToScalar *translator_dxl_to_scalar,
-							CMDAccessor *md_accessor)
-{
-	GPOS_ASSERT(gpdxl::EdxlopScalarOpList ==
-				eq_values->GetOperator()->GetDXLOperator());
-	List *result = NIL;
-
-	for (ULONG i = 0; i < eq_values->Arity(); ++i)
-	{
-		auto step = StepFromDXLConst((*eq_values)[i], supportfnoid,
-									 gpdb::ListLength(result),
-									 translator_dxl_to_scalar);
-		result = gpdb::LAppend(result, step);
-	}
-
-	return result;
-}
-
-// Given a DXL Partition Selector, construct a PartitionPruneInfo
-// the pruning steps contained in the part_prune_info should be based on the
-// filter and eqFilter of the partition selector
-static std::tuple<ULONG, PartitionPruneInfo *, List *>
-PartitionPruneInfoFromPartitionSelector(
-	const CDXLNode *partition_selector_dxlnode, CMDAccessor *md_accessor,
-	CTranslatorDXLToScalar *translator_dxl_to_scalar)
-{
-	auto dxl_part_selector = dynamic_cast<CDXLPhysicalPartitionSelector *>(
-		partition_selector_dxlnode->GetOperator());
-	auto oid =
-		dynamic_cast<CMDIdGPDB *>(dxl_part_selector->GetRelMdId())->Oid();
-	gpdb::RelationWrapper relation = gpdb::GetRelation(oid);
-	if (!IsOneLevelPartitioned(relation.get()))
-		GPOS_RAISE(gpdxl::ExmaDXL, gpdxl::ExmiDXL2PlStmtConversion,
-				   GPOS_WSZ_LIT("multi-level partitioned tables"));
-
-	auto eq_filters = (*partition_selector_dxlnode)[EdxlpsIndexEqFilters];
-	auto filters = (*partition_selector_dxlnode)[EdxlpsIndexFilters];
-	auto has_trivial_eq_filters PG_USED_FOR_ASSERTS_ONLY =
-		CTranslatorDXLToScalar::HasConstTrue((*eq_filters)[0], md_accessor);
-	auto has_trivial_filters =
-		CTranslatorDXLToScalar::HasConstTrue((*filters)[0], md_accessor);
-
-	if (!has_trivial_filters)
-		GPOS_RAISE(gpdxl::ExmaDXL, gpdxl::ExmiDXL2PlStmtConversion,
-				   GPOS_WSZ_LIT("non-trivial part filter"));
-	if (has_trivial_eq_filters && has_trivial_filters)
-		GPOS_RAISE(gpdxl::ExmaDXL, gpdxl::ExmiDXL2PlStmtConversion,
-				   GPOS_WSZ_LIT("trivial eq filter"));
-
-	PartitionedRelPruneInfo *pinfo = MakeNode(PartitionedRelPruneInfo);
-
-	auto rte = MinimalRTE(oid);
-	List *range_table = ListMake1(rte);
-
-	pinfo->rtindex = 1;
-	pinfo->nparts = relation->rd_partdesc->nparts;
-	pinfo->present_parts = bms_add_range(nullptr, 0, pinfo->nparts - 1);
-	pinfo->subpart_map =
-		static_cast<int *>(palloc(sizeof(int) * pinfo->nparts));
-	std::fill(pinfo->subpart_map, pinfo->subpart_map + pinfo->nparts, -1);
-	pinfo->subplan_map =
-		static_cast<int *>(palloc(sizeof(int) * pinfo->nparts));
-	std::iota(pinfo->subplan_map, pinfo->subplan_map + pinfo->nparts, 0);
-	pinfo->relid_map = static_cast<Oid *>(palloc(sizeof(Oid) * pinfo->nparts));
-	std::copy(relation->rd_partdesc->oids,
-			  relation->rd_partdesc->oids + relation->rd_partdesc->nparts,
-			  pinfo->relid_map);
-
-	// GPDB_12_MERGE_FIXME: this is still pretty much a hack. Notice the btree
-	// support function is blindly picked from the relation definition. When the
-	// constant used in the equal filter is of a different type from that of the
-	// partition boundaries, this will be wrong.
-	pinfo->exec_pruning_steps = PartPruneStepsFromEqFilters(
-		eq_filters, relation->rd_partkey->partsupfunc[0].fn_oid,
-		translator_dxl_to_scalar, md_accessor);
-
-	auto part_prune_info = MakeNode(PartitionPruneInfo);
-	part_prune_info->prune_infos = ListMake1(ListMake1(pinfo));
-
-	return {dxl_part_selector->ScanId(), part_prune_info, range_table};
+	return final_plan;
 }
 
 //---------------------------------------------------------------------------
@@ -3483,123 +3750,77 @@ CTranslatorDXLToPlStmt::TranslateDXLPartSelector(
 	CDXLTranslateContext *output_context,
 	CDXLTranslationContextArray *ctxt_translation_prev_siblings)
 {
-	// HAAAAACK: recognize static pruning, and return a place holder partition
-	// selector
-	const bool dynamic_pruning =
-		(EdxlpsIndexChild == partition_selector_dxlnode->Arity() - 1);
-	if (!dynamic_pruning)
-	{
-		PartitionPruneInfo *part_prune_info;
-		List *range_table;
-		ULONG scanId;
-		std::tie(scanId, part_prune_info, range_table) =
-			PartitionPruneInfoFromPartitionSelector(partition_selector_dxlnode,
-													m_md_accessor,
-													m_translator_dxl_to_scalar);
-
-		// FIXME: prelinfo->nparts won't work if you have subparts
-		auto prune_result = ExecuteSaticPruning(part_prune_info, range_table);
-
-		m_dxl_to_plstmt_context->SetStaticPruneResult(scanId, prune_result);
-		return reinterpret_cast<Plan *>(MakeNode(Result));
-	}
-	else
-		return nullptr;
-
-#if 0
 	PartitionSelector *partition_selector = MakeNode(PartitionSelector);
 
 	Plan *plan = &(partition_selector->plan);
 	plan->plan_node_id = m_dxl_to_plstmt_context->GetNextPlanId();
+	CDXLPhysicalPartitionSelector *partition_selector_dxlop =
+		CDXLPhysicalPartitionSelector::Cast(
+			partition_selector_dxlnode->GetOperator());
 
-	CDXLPhysicalPartitionSelector *partition_selector_dxlop = CDXLPhysicalPartitionSelector::Cast(partition_selector_dxlnode->GetOperator());
-	const ULONG num_of_levels = partition_selector_dxlop->GetPartitioningLevel();
-	partition_selector->nLevels = num_of_levels;
-	partition_selector->scanId = partition_selector_dxlop->ScanId();
-	partition_selector->relid = CMDIdGPDB::CastMdid(partition_selector_dxlop->GetRelMdId())->Oid();
-	partition_selector->selectorId = m_partition_selector_counter++;
-
-	// translate operator costs
 	TranslatePlanCosts(partition_selector_dxlnode, plan);
 
-	CDXLNode *child_dxlnode = NULL;
-	CDXLTranslationContextArray *child_contexts = GPOS_NEW(m_mp) CDXLTranslationContextArray(m_mp);
+	CDXLNode *child_dxlnode = nullptr;
+	CDXLTranslationContextArray *child_contexts =
+		GPOS_NEW(m_mp) CDXLTranslationContextArray(m_mp);
 
-	CDXLTranslateContext child_context(m_mp, false, output_context->GetColIdToParamIdMap());
+	CDXLTranslateContext child_context(m_mp, false,
+									   output_context->GetColIdToParamIdMap());
 
-	BOOL has_childs = (EdxlpsIndexChild == partition_selector_dxlnode->Arity() - 1);
-	if (has_childs)
-	{
-		// translate child plan
-		child_dxlnode = (*partition_selector_dxlnode)[EdxlpsIndexChild];
+	// translate child plan
+	child_dxlnode = (*partition_selector_dxlnode)[2];
 
-		Plan *child_plan = TranslateDXLOperatorToPlan(child_dxlnode, &child_context, ctxt_translation_prev_siblings);
-		GPOS_ASSERT(NULL != child_plan && "child plan cannot be NULL");
+	Plan *child_plan = TranslateDXLOperatorToPlan(
+		child_dxlnode, &child_context, ctxt_translation_prev_siblings);
+	GPOS_ASSERT(nullptr != child_plan && "child plan cannot be NULL");
 
-		partition_selector->plan.lefttree = child_plan;
-	}
+	partition_selector->plan.lefttree = child_plan;
 
 	child_contexts->Append(&child_context);
 
-	CDXLNode *project_list_dxlnode = (*partition_selector_dxlnode)[EdxlpsIndexProjList];
-	CDXLNode *eq_filters_dxlnode = (*partition_selector_dxlnode)[EdxlpsIndexEqFilters];
-	CDXLNode *filters_dxlnode = (*partition_selector_dxlnode)[EdxlpsIndexFilters];
-	CDXLNode *residual_filter_dxlnode = (*partition_selector_dxlnode)[EdxlpsIndexResidualFilter];
-	CDXLNode *proj_expr_dxlnode = (*partition_selector_dxlnode)[EdxlpsIndexPropExpr];
+	CDXLNode *project_list_dxlnode = (*partition_selector_dxlnode)[0];
+	plan->targetlist = TranslateDXLProjList(project_list_dxlnode,
+											nullptr /*base_table_context*/,
+											child_contexts, output_context);
 
-	// translate proj list
-	plan->targetlist = TranslateDXLProjList(project_list_dxlnode, NULL /*base_table_context*/, child_contexts, output_context);
+	CMDIdGPDB *mdid =
+		CMDIdGPDB::CastMdid(partition_selector_dxlop->GetRelMdId());
+	gpdb::RelationWrapper relation = gpdb::GetRelation(mdid->Oid());
 
-	// translate filter lists
-	GPOS_ASSERT(eq_filters_dxlnode->Arity() == num_of_levels);
-	partition_selector->levelEqExpressions = TranslateDXLFilterList(eq_filters_dxlnode, NULL /*base_table_context*/, child_contexts, output_context);
+	CMappingColIdVarPlStmt colid_var_mapping = CMappingColIdVarPlStmt(
+		m_mp, nullptr /*base_table_context*/, child_contexts, output_context,
+		m_dxl_to_plstmt_context);
 
-	GPOS_ASSERT(filters_dxlnode->Arity() == num_of_levels);
-	partition_selector->levelExpressions = TranslateDXLFilterList(filters_dxlnode, NULL /*base_table_context*/, child_contexts, output_context);
+	// paramid
+	OID oid_type =
+		CMDIdGPDB::CastMdid(m_md_accessor->PtMDType<IMDTypeInt4>()->MDId())
+			->Oid();
+	partition_selector->paramid =
+		m_dxl_to_plstmt_context->GetParamIdForSelector(
+			oid_type, partition_selector_dxlop->SelectorId());
 
-	//translate residual filter
-	CMappingColIdVarPlStmt colid_var_mapping = CMappingColIdVarPlStmt(m_mp, NULL /*base_table_context*/, child_contexts, output_context, m_dxl_to_plstmt_context);
-	if (!m_translator_dxl_to_scalar->HasConstTrue(residual_filter_dxlnode, m_md_accessor))
-	{
-		partition_selector->residualPredicate = (Node *) m_translator_dxl_to_scalar->TranslateDXLToScalar(residual_filter_dxlnode, &colid_var_mapping);
-	}
+	// search the rtable for rtindex
+	// an Append node on the outer side of a parent HashJoin would already have
+	// beeen translated and would have populated the rtable with the root RTE
+	Index rtindex = m_dxl_to_plstmt_context->FindRTE(mdid->Oid());
+	GPOS_ASSERT(rtindex > 0);
 
-	//translate propagation expression
-	if (!m_translator_dxl_to_scalar->HasConstNull(proj_expr_dxlnode))
-	{
-		partition_selector->propagationExpression = (Node *) m_translator_dxl_to_scalar->TranslateDXLToScalar(proj_expr_dxlnode, &colid_var_mapping);
-	}
+	// part_prune_info
+	CDXLNode *filterNode = (*partition_selector_dxlnode)[1];
 
-	// no need to translate printable filter - since it is not needed by the executor
+	ULongPtrArray *part_indexes = partition_selector_dxlop->Partitions();
+	List *prune_infos = CPartPruneStepsBuilder::CreatePartPruneInfos(
+		filterNode, relation.get(), rtindex, part_indexes, &colid_var_mapping,
+		m_translator_dxl_to_scalar);
 
-	partition_selector->staticPartOids = NIL;
-	partition_selector->staticScanIds = NIL;
-	partition_selector->staticSelection = !has_childs;
-
-	if (partition_selector->staticSelection)
-	{
-		SelectedParts *sp = gpdb::RunStaticPartitionSelection(partition_selector);
-		partition_selector->staticPartOids = sp->partOids;
-		partition_selector->staticScanIds = sp->scanIds;
-		gpdb::GPDBFree(sp);
-	}
-	else
-	{
-		// if we cannot do static elimination then add this partitioned table oid
-		// to the planned stmt so we can ship the constraints with the plan
-		m_dxl_to_plstmt_context->AddPartitionedTable(partition_selector->relid);
-	}
-
-	// increment the number of partition selectors for the given scan id
-	m_dxl_to_plstmt_context->IncrementPartitionSelectors(partition_selector->scanId);
+	partition_selector->part_prune_info = MakeNode(PartitionPruneInfo);
+	partition_selector->part_prune_info->prune_infos = prune_infos;
 
 	SetParamIds(plan);
-
 	// cleanup
 	child_contexts->Release();
 
 	return (Plan *) partition_selector;
-#endif
 }
 
 //---------------------------------------------------------------------------
@@ -3829,6 +4050,7 @@ CTranslatorDXLToPlStmt::TranslateDXLCTEProducerToSharedScan(
 	// create the shared input scan representing the CTE Producer
 	ShareInputScan *shared_input_scan = MakeNode(ShareInputScan);
 	shared_input_scan->share_id = cte_id;
+	shared_input_scan->discard_output = true;
 	Plan *plan = &(shared_input_scan->scan.plan);
 	plan->plan_node_id = m_dxl_to_plstmt_context->GetNextPlanId();
 
@@ -3886,6 +4108,7 @@ CTranslatorDXLToPlStmt::TranslateDXLCTEConsumerToSharedScan(
 
 	ShareInputScan *share_input_scan_cte_consumer = MakeNode(ShareInputScan);
 	share_input_scan_cte_consumer->share_id = cte_id;
+	share_input_scan_cte_consumer->discard_output = false;
 
 	Plan *plan = &(share_input_scan_cte_consumer->scan.plan);
 	plan->plan_node_id = m_dxl_to_plstmt_context->GetNextPlanId();
@@ -3999,6 +4222,426 @@ CTranslatorDXLToPlStmt::TranslateDXLSequence(
 
 //---------------------------------------------------------------------------
 //	@function:
+//		CTranslatorDXLToPlStmt::TranslateDXLDynTblScan
+//
+//	@doc:
+//		Translates a DXL dynamic table scan node into a DynamicSeqScan node
+//
+//---------------------------------------------------------------------------
+Plan *
+CTranslatorDXLToPlStmt::TranslateDXLDynTblScan(
+	const CDXLNode *dyn_tbl_scan_dxlnode, CDXLTranslateContext *output_context,
+	CDXLTranslationContextArray *ctxt_translation_prev_siblings)
+{
+	// translate table descriptor into a range table entry
+	CDXLPhysicalDynamicTableScan *dyn_tbl_scan_dxlop =
+		CDXLPhysicalDynamicTableScan::Cast(dyn_tbl_scan_dxlnode->GetOperator());
+
+	// translation context for column mappings in the base relation
+	CDXLTranslateContextBaseTable base_table_context(m_mp);
+
+	Index index = ProcessDXLTblDescr(dyn_tbl_scan_dxlop->GetDXLTableDescr(),
+									 &base_table_context);
+
+	// create dynamic scan node
+	DynamicSeqScan *dyn_seq_scan = MakeNode(DynamicSeqScan);
+
+	dyn_seq_scan->seqscan.scanrelid = index;
+
+	const CDXLTableDescr *dxl_table_descr =
+		dyn_tbl_scan_dxlop->GetDXLTableDescr();
+	GPOS_ASSERT(dxl_table_descr->LockMode() != -1);
+
+	dyn_seq_scan->partOids = TranslatePartOids(dyn_tbl_scan_dxlop->GetParts(),
+											   dxl_table_descr->LockMode());
+
+	OID oid_type =
+		CMDIdGPDB::CastMdid(m_md_accessor->PtMDType<IMDTypeInt4>()->MDId())
+			->Oid();
+
+	const IMDRelation *md_rel =
+		m_md_accessor->RetrieveRel(dxl_table_descr->MDId());
+
+	OID oidRel = CMDIdGPDB::CastMdid(md_rel->MDId())->Oid();
+
+	dyn_seq_scan->join_prune_paramids =
+		TranslateJoinPruneParamids(dyn_tbl_scan_dxlop->GetSelectorIds(),
+								   oid_type, m_dxl_to_plstmt_context);
+
+	Plan *plan = &(dyn_seq_scan->seqscan.plan);
+	plan->plan_node_id = m_dxl_to_plstmt_context->GetNextPlanId();
+	//plan->nMotionNodes = 0;
+
+	// translate operator costs
+	TranslatePlanCosts(dyn_tbl_scan_dxlnode, plan);
+
+	GPOS_ASSERT(2 == dyn_tbl_scan_dxlnode->Arity());
+
+	// translate proj list and filter
+	CDXLNode *project_list_dxlnode =
+		(*dyn_tbl_scan_dxlnode)[EdxltsIndexProjList];
+	CDXLNode *filter_dxlnode = (*dyn_tbl_scan_dxlnode)[EdxltsIndexFilter];
+
+	// List to hold the quals which contain both security quals and query
+	// quals.
+	List *security_query_quals = NIL;
+
+	// List to hold the quals after translating filter_dxlnode node.
+	List *query_quals = NIL;
+
+	// Fetching the RTE of the relation from the rewritten parse tree
+	// based on the oidRel and adding the security quals of the RTE in
+	// the security_query_quals list.
+	AddSecurityQuals(oidRel, &security_query_quals, &index);
+
+	TranslateProjListAndFilter(
+		project_list_dxlnode, filter_dxlnode,
+		&base_table_context,  // translate context for the base table
+		nullptr,			  // translate_ctxt_left and pdxltrctxRight,
+		&plan->targetlist, &query_quals, output_context);
+
+	// The security quals should always be executed first when compared to
+	// other quals. So appending query quals to the security_query_quals
+	// list after the security quals.
+	security_query_quals = gpdb::ListConcat(security_query_quals, query_quals);
+	plan->qual = security_query_quals;
+
+	SetParamIds(plan);
+
+	return plan;
+}
+
+//---------------------------------------------------------------------------
+//	@function:
+//		CTranslatorDXLToPlStmt::TranslateDXLDynIdxOnlyScan
+//
+//	@doc:
+//		Translates a DXL dynamic index scan node into a DynamicIndexOnlyScan
+//		node
+//
+//---------------------------------------------------------------------------
+Plan *
+CTranslatorDXLToPlStmt::TranslateDXLDynIdxOnlyScan(
+	const CDXLNode *dyn_idx_only_scan_dxlnode,
+	CDXLTranslateContext *output_context,
+	CDXLTranslationContextArray *ctxt_translation_prev_siblings)
+{
+	CDXLPhysicalDynamicIndexOnlyScan *dyn_index_only_scan_dxlop =
+		CDXLPhysicalDynamicIndexOnlyScan::Cast(
+			dyn_idx_only_scan_dxlnode->GetOperator());
+
+	// translation context for column mappings in the base relation
+	CDXLTranslateContextBaseTable base_table_context(m_mp);
+
+	const CDXLTableDescr *table_desc =
+		dyn_index_only_scan_dxlop->GetDXLTableDescr();
+	const IMDRelation *md_rel = m_md_accessor->RetrieveRel(table_desc->MDId());
+
+	Index index = ProcessDXLTblDescr(table_desc, &base_table_context);
+
+	DynamicIndexOnlyScan *dyn_idx_only_scan = MakeNode(DynamicIndexOnlyScan);
+
+	dyn_idx_only_scan->indexscan.scan.scanrelid = index;
+
+	dyn_idx_only_scan->partOids = TranslatePartOids(
+		dyn_index_only_scan_dxlop->GetParts(), table_desc->LockMode());
+
+	OID oid_type =
+		CMDIdGPDB::CastMdid(m_md_accessor->PtMDType<IMDTypeInt4>()->MDId())
+			->Oid();
+	dyn_idx_only_scan->join_prune_paramids =
+		TranslateJoinPruneParamids(dyn_index_only_scan_dxlop->GetSelectorIds(),
+								   oid_type, m_dxl_to_plstmt_context);
+
+	CMDIdGPDB *mdid_index = CMDIdGPDB::CastMdid(
+		dyn_index_only_scan_dxlop->GetDXLIndexDescr()->MDId());
+	const IMDIndex *md_index = m_md_accessor->RetrieveIndex(mdid_index);
+	Oid index_oid = mdid_index->Oid();
+
+	GPOS_ASSERT(InvalidOid != index_oid);
+	dyn_idx_only_scan->indexscan.indexid = index_oid;
+
+	Plan *plan = &(dyn_idx_only_scan->indexscan.scan.plan);
+
+	CDXLTranslateContextBaseTable index_context(m_mp);
+
+	// translate index targetlist
+	dyn_idx_only_scan->indexscan.indextlist = TranslateDXLIndexTList(
+		md_rel, md_index, index, table_desc, &index_context);
+
+	TranslatePlan(plan, dyn_idx_only_scan_dxlnode, output_context,
+				  m_dxl_to_plstmt_context, &index_context,
+				  ctxt_translation_prev_siblings);
+
+	dyn_idx_only_scan->indexscan.indexorderdir =
+		CTranslatorUtils::GetScanDirection(
+			dyn_index_only_scan_dxlop->GetIndexScanDir());
+
+	// translate index condition list
+	List *index_cond = NIL;
+	List *index_orig_cond = NIL;
+
+	TranslateIndexConditions(
+		(*dyn_idx_only_scan_dxlnode)
+			[CDXLPhysicalDynamicIndexScan::EdxldisIndexCondition],
+		dyn_index_only_scan_dxlop->GetDXLTableDescr(),
+		false,	// is_bitmap_index_probe
+		md_index, md_rel, output_context, &base_table_context,
+		ctxt_translation_prev_siblings, &index_cond, &index_orig_cond);
+
+
+	dyn_idx_only_scan->indexscan.indexqual = index_cond;
+
+	SetParamIds(plan);
+
+	return (Plan *) dyn_idx_only_scan;
+}
+
+//---------------------------------------------------------------------------
+//	@function:
+//		CTranslatorDXLToPlStmt::TranslateDXLDynIdxScan
+//
+//	@doc:
+//		Translates a DXL dynamic index scan node into a DynamicIndexScan node
+//
+//---------------------------------------------------------------------------
+Plan *
+CTranslatorDXLToPlStmt::TranslateDXLDynIdxScan(
+	const CDXLNode *dyn_idx_only_scan_dxlnode,
+	CDXLTranslateContext *output_context,
+	CDXLTranslationContextArray *ctxt_translation_prev_siblings)
+{
+	CDXLPhysicalDynamicIndexScan *dyn_index_scan_dxlop =
+		CDXLPhysicalDynamicIndexScan::Cast(
+			dyn_idx_only_scan_dxlnode->GetOperator());
+
+	// translation context for column mappings in the base relation
+	CDXLTranslateContextBaseTable base_table_context(m_mp);
+
+	const CDXLTableDescr *table_desc = dyn_index_scan_dxlop->GetDXLTableDescr();
+	const IMDRelation *md_rel = m_md_accessor->RetrieveRel(table_desc->MDId());
+
+	Index index = ProcessDXLTblDescr(table_desc, &base_table_context);
+
+	DynamicIndexScan *dyn_idx_only_scan = MakeNode(DynamicIndexScan);
+
+	dyn_idx_only_scan->indexscan.scan.scanrelid = index;
+
+	GPOS_ASSERT(table_desc->LockMode() != -1);
+
+	dyn_idx_only_scan->partOids = TranslatePartOids(
+		dyn_index_scan_dxlop->GetParts(), table_desc->LockMode());
+
+	OID oid_type =
+		CMDIdGPDB::CastMdid(m_md_accessor->PtMDType<IMDTypeInt4>()->MDId())
+			->Oid();
+	dyn_idx_only_scan->join_prune_paramids =
+		TranslateJoinPruneParamids(dyn_index_scan_dxlop->GetSelectorIds(),
+								   oid_type, m_dxl_to_plstmt_context);
+
+	CMDIdGPDB *mdid_index =
+		CMDIdGPDB::CastMdid(dyn_index_scan_dxlop->GetDXLIndexDescr()->MDId());
+	const IMDIndex *md_index = m_md_accessor->RetrieveIndex(mdid_index);
+	Oid index_oid = mdid_index->Oid();
+
+	GPOS_ASSERT(InvalidOid != index_oid);
+	dyn_idx_only_scan->indexscan.indexid = index_oid;
+
+	Plan *plan = &(dyn_idx_only_scan->indexscan.scan.plan);
+
+	TranslatePlan(plan, dyn_idx_only_scan_dxlnode, output_context,
+				  m_dxl_to_plstmt_context, &base_table_context,
+				  ctxt_translation_prev_siblings);
+
+	dyn_idx_only_scan->indexscan.indexorderdir =
+		CTranslatorUtils::GetScanDirection(
+			dyn_index_scan_dxlop->GetIndexScanDir());
+
+	// translate index condition list
+	List *index_cond = NIL;
+	List *index_orig_cond = NIL;
+
+	TranslateIndexConditions(
+		(*dyn_idx_only_scan_dxlnode)
+			[CDXLPhysicalDynamicIndexScan::EdxldisIndexCondition],
+		dyn_index_scan_dxlop->GetDXLTableDescr(),
+		false,	// is_bitmap_index_probe
+		md_index, md_rel, output_context, &base_table_context,
+		ctxt_translation_prev_siblings, &index_cond, &index_orig_cond);
+
+
+	dyn_idx_only_scan->indexscan.indexqual = index_cond;
+	dyn_idx_only_scan->indexscan.indexqualorig = index_orig_cond;
+
+	SetParamIds(plan);
+
+	return (Plan *) dyn_idx_only_scan;
+}
+
+// remaps varnos qual and targetlist from one tuple descriptor to another.
+// eg: remap varnos from a root partition to a child partition, or vice-versa
+static TupleDesc
+RemapAttrsFromTupDesc(TupleDesc fromDesc, TupleDesc toDesc, Index index,
+					  List *qual, List *targetlist)
+{
+	AttrNumber *attMap;
+	attMap = convert_tuples_by_name_map_if_req(toDesc, fromDesc, "unused msg");
+
+	/* If attribute remapping is not necessary, then do not change the varattno */
+	if (attMap)
+	{
+		change_varattnos_of_a_varno((Node *) qual, attMap, index);
+		change_varattnos_of_a_varno((Node *) targetlist, attMap, index);
+		fromDesc = toDesc;
+		pfree(attMap);
+	}
+	return fromDesc;
+}
+
+//---------------------------------------------------------------------------
+//	@function:
+//		CTranslatorDXLToPlStmt::TranslateDXLDynForeignScan
+//
+//	@doc:
+//		Translates a DXL dynamic foreign scan node into a DynamicForeignScan node
+//		This is similar to TranslateDXLDynTblScan, but has additional logic to
+//		populate the fdw_private_array. Note that because we need to call
+//		CreateForeignScan to populate this array, we need to map the qual
+//		and targetlist from the child partitions from the root partition
+//		While we do some of this in the executor, since we populate the
+//		fdw_private for each child here, we also need mapping logic here
+//
+//---------------------------------------------------------------------------
+Plan *
+CTranslatorDXLToPlStmt::TranslateDXLDynForeignScan(
+	const CDXLNode *dyn_foreign_scan_dxlnode,
+	CDXLTranslateContext *output_context,
+	CDXLTranslationContextArray *ctxt_translation_prev_siblings)
+{
+	// translate table descriptor into a range table entry
+	CDXLPhysicalDynamicForeignScan *dyn_foreign_scan_dxlop =
+		CDXLPhysicalDynamicForeignScan::Cast(
+			dyn_foreign_scan_dxlnode->GetOperator());
+
+	// translation context for column mappings in the base relation
+	CDXLTranslateContextBaseTable base_table_context(m_mp);
+
+	Index index = ProcessDXLTblDescr(dyn_foreign_scan_dxlop->GetDXLTableDescr(),
+									 &base_table_context);
+	// rte of root dynamic scan
+	RangeTblEntry *rte = m_dxl_to_plstmt_context->GetRTEByIndex(index);
+	Oid oid_root = rte->relid;
+	// create dynamic scan node
+	DynamicForeignScan *dyn_foreign_scan = MakeNode(DynamicForeignScan);
+
+	IMdIdArray *parts = dyn_foreign_scan_dxlop->GetParts();
+
+	List *oids_list = NIL;
+	for (ULONG ul = 0; ul < parts->Size(); ul++)
+	{
+		Oid part = CMDIdGPDB::CastMdid((*parts)[ul])->Oid();
+		oids_list = gpdb::LAppendOid(oids_list, part);
+	}
+
+	dyn_foreign_scan->partOids = oids_list;
+
+	OID oid_type =
+		CMDIdGPDB::CastMdid(m_md_accessor->PtMDType<IMDTypeInt4>()->MDId())
+			->Oid();
+	dyn_foreign_scan->join_prune_paramids =
+		TranslateJoinPruneParamids(dyn_foreign_scan_dxlop->GetSelectorIds(),
+								   oid_type, m_dxl_to_plstmt_context);
+
+	GPOS_ASSERT(2 == dyn_foreign_scan_dxlnode->Arity());
+
+	// translate proj list and filter for root
+	CDXLNode *project_list_dxlnode =
+		(*dyn_foreign_scan_dxlnode)[EdxltsIndexProjList];
+	CDXLNode *filter_dxlnode = (*dyn_foreign_scan_dxlnode)[EdxltsIndexFilter];
+
+	List *targetlist = NIL;
+	List *qual = NIL;
+	TranslateProjListAndFilter(
+		project_list_dxlnode, filter_dxlnode,
+		&base_table_context,  // translate context for the base table
+		nullptr,			  // translate_ctxt_left and pdxltrctxRight,
+		&targetlist, &qual, output_context);
+
+	// set the rte relid to the child, since we need to call the fdw api
+	// which assumes we're working with a foreign table. The root partition is
+	// not foreign!
+	Oid oid_first_child = CMDIdGPDB::CastMdid((*parts)[0])->Oid();
+	rte->relid = oid_first_child;
+	// need to lock foreign rel when calling out to CreateForeignScan
+	gpdb::GPDBLockRelationOid(
+		oid_first_child,
+		dyn_foreign_scan_dxlop->GetDXLTableDescr()->LockMode());
+
+	gpdb::RelationWrapper rootRel = gpdb::GetRelation(oid_root);
+	gpdb::RelationWrapper childRel = gpdb::GetRelation(oid_first_child);
+
+	TupleDesc fromDesc = RemapAttrsFromTupDesc(RelationGetDescr(rootRel),
+											   RelationGetDescr(childRel),
+											   index, qual, targetlist);
+
+	ForeignScan *foreign_scan_first_part =
+		gpdb::CreateForeignScan(oid_first_child, index, qual, targetlist,
+								m_dxl_to_plstmt_context->m_orig_query, rte);
+
+	// Set the plan fields to the first partition. We still want the plan type to be
+	// a dynamic foreign scan
+	dyn_foreign_scan->foreignscan = *foreign_scan_first_part;
+	dyn_foreign_scan->foreignscan.scan.plan.type = T_DynamicForeignScan;
+	dyn_foreign_scan->foreignscan.scan.scanrelid = index;
+
+	Plan *plan = &(dyn_foreign_scan->foreignscan.scan.plan);
+	plan->plan_node_id = m_dxl_to_plstmt_context->GetNextPlanId();
+	plan->targetlist = targetlist;
+	plan->qual = qual;
+
+	// populate fdw_private_list. Each fdw_private can and typically will be different for each partition
+	// we have no way of knowing exactly what will be different, or which specific api calls will populate the
+	// different part of fdw_private. So we have to be conservative and call everything for each partition
+	// We call CreateForeignScan for each partition, and append the fdw_private to the list
+	dyn_foreign_scan->fdw_private_list = NIL;
+	for (ULONG ul = 0; ul < parts->Size(); ul++)
+	{
+		rte->relid = CMDIdGPDB::CastMdid((*parts)[ul])->Oid();
+		gpdb::RelationWrapper childRel = gpdb::GetRelation(rte->relid);
+
+		fromDesc = RemapAttrsFromTupDesc(fromDesc, RelationGetDescr(childRel),
+										 index, qual, targetlist);
+
+		// need to lock foreign rel when calling out to CreateForeignScan
+		gpdb::GPDBLockRelationOid(
+			rte->relid, dyn_foreign_scan_dxlop->GetDXLTableDescr()->LockMode());
+
+		ForeignScan *foreign_scan =
+			gpdb::CreateForeignScan(rte->relid, index, qual, targetlist,
+									m_dxl_to_plstmt_context->m_orig_query, rte);
+
+		dyn_foreign_scan->fdw_private_list = gpdb::LAppend(
+			dyn_foreign_scan->fdw_private_list, foreign_scan->fdw_private);
+	}
+	// convert qual and targetlist back to root relation. This is used by the
+	// executor node to remap to the children
+	gpdb::RelationWrapper prevRel = gpdb::GetRelation(rte->relid);
+	fromDesc = RemapAttrsFromTupDesc(RelationGetDescr(prevRel),
+									 RelationGetDescr(rootRel), index, qual,
+									 targetlist);
+
+	// set the rte relid back to the root
+	rte->relid = oid_root;
+	// translate operator costs
+	TranslatePlanCosts(dyn_foreign_scan_dxlnode, plan);
+
+	SetParamIds(plan);
+
+	return plan;
+}
+
+//---------------------------------------------------------------------------
+//	@function:
 //		CTranslatorDXLToPlStmt::TranslateDXLDml
 //
 //	@doc:
@@ -4017,26 +4660,23 @@ CTranslatorDXLToPlStmt::TranslateDXLDml(
 	// create ModifyTable node
 	ModifyTable *dml = MakeNode(ModifyTable);
 	Plan *plan = &(dml->plan);
-	AclMode acl_mode = ACL_NO_RIGHTS;
+	BOOL isSplit = phy_dml_dxlop->FSplit();
 
 	switch (phy_dml_dxlop->GetDmlOpType())
 	{
 		case gpdxl::Edxldmldelete:
 		{
 			m_cmd_type = CMD_DELETE;
-			acl_mode = ACL_DELETE;
 			break;
 		}
 		case gpdxl::Edxldmlupdate:
 		{
 			m_cmd_type = CMD_UPDATE;
-			acl_mode = ACL_UPDATE;
 			break;
 		}
 		case gpdxl::Edxldmlinsert:
 		{
 			m_cmd_type = CMD_INSERT;
-			acl_mode = ACL_INSERT;
 			break;
 		}
 		case gpdxl::EdxldmlSentinel:
@@ -4052,7 +4692,16 @@ CTranslatorDXLToPlStmt::TranslateDXLDml(
 	IMDId *mdid_target_table = phy_dml_dxlop->GetDXLTableDescr()->MDId();
 	const IMDRelation *md_rel = m_md_accessor->RetrieveRel(mdid_target_table);
 
-	if (IMDRelation::EreldistrMasterOnly != md_rel->GetRelDistribution())
+	if (md_rel->IsPartitioned())
+	{
+		dml->forceTupleRouting = true;
+	}
+	else
+	{
+		dml->forceTupleRouting = false;
+	}
+
+	if (IMDRelation::EreldistrCoordinatorOnly != md_rel->GetRelDistribution())
 	{
 		m_is_tgt_tbl_distributed = true;
 	}
@@ -4067,20 +4716,11 @@ CTranslatorDXLToPlStmt::TranslateDXLDml(
 	// translation context for column mappings in the base relation
 	CDXLTranslateContextBaseTable base_table_context(m_mp);
 
-	// add the new range table entry as the last element of the range table
-	Index index =
-		gpdb::ListLength(m_dxl_to_plstmt_context->GetRTableEntriesList()) + 1;
+	CDXLTableDescr *table_descr = phy_dml_dxlop->GetDXLTableDescr();
+
+	Index index = ProcessDXLTblDescr(table_descr, &base_table_context);
 
 	m_result_rel_list = gpdb::LAppendInt(m_result_rel_list, index);
-
-	CDXLTableDescr *table_descr = phy_dml_dxlop->GetDXLTableDescr();
-	RangeTblEntry *rte = TranslateDXLTblDescrToRangeTblEntry(
-		table_descr, index, &base_table_context);
-	GPOS_ASSERT(nullptr != rte);
-	// GPDB_12_MERGE_FIXME: Make this an parameter in TranslateDXLTblDescrToRangeTblEntry
-	rte->rellockmode = RowExclusiveLock;
-	rte->requiredPerms |= acl_mode;
-	m_dxl_to_plstmt_context->AddRTE(rte);
 
 	CDXLNode *project_list_dxlnode = (*dml_dxlnode)[0];
 	CDXLNode *child_dxlnode = (*dml_dxlnode)[1];
@@ -4095,26 +4735,31 @@ CTranslatorDXLToPlStmt::TranslateDXLDml(
 		GPOS_NEW(m_mp) CDXLTranslationContextArray(m_mp);
 	child_contexts->Append(&child_context);
 
-	// translate proj list
 	List *dml_target_list =
 		TranslateDXLProjList(project_list_dxlnode,
 							 nullptr,  // translate context for the base table
 							 child_contexts, output_context);
 
-	// pad child plan's target list with NULLs for dropped columns for all DML operator types
-	List *target_list_with_dropped_cols =
-		CreateTargetListWithNullsForDroppedCols(dml_target_list, md_rel);
-	dml_target_list = target_list_with_dropped_cols;
+	// project all columns for intermediate (mid-level) partitions, as we need to pass through the partition keys
+	// but do not have that information for intermediate partitions during Orca's optimization
+	BOOL is_intermediate_part =
+		(md_rel->IsPartitioned() && nullptr != md_rel->MDPartConstraint());
+	if (m_cmd_type != CMD_DELETE || is_intermediate_part)
+	{
+		// pad child plan's target list with NULLs for dropped columns for UPDATE/INSERTs and for DELETEs on intermeidate partitions
+		dml_target_list =
+			CreateTargetListWithNullsForDroppedCols(dml_target_list, md_rel);
+	}
 
 	// Add junk columns to the target list for the 'action', 'ctid',
-	// 'gp_segment_id', and tuple's 'oid'. The ModifyTable node will find
-	// these based on the resnames. ORCA also includes a similar column for
-	// partition Oid in the child's target list, but we don't use it for
-	// anything in GPDB.
-	if (m_cmd_type == CMD_UPDATE)
+	// 'gp_segment_id'. The ModifyTable node will find these based
+	// on the resnames.
+	if (m_cmd_type == CMD_UPDATE && isSplit)
+	{
 		(void) AddJunkTargetEntryForColId(&dml_target_list, &child_context,
 										  phy_dml_dxlop->ActionColId(),
 										  "DMLAction");
+	}
 
 	if (m_cmd_type == CMD_UPDATE || m_cmd_type == CMD_DELETE)
 	{
@@ -4124,9 +4769,6 @@ CTranslatorDXLToPlStmt::TranslateDXLDml(
 								   phy_dml_dxlop->GetSegmentIdColId(),
 								   "gp_segment_id");
 	}
-	if (m_cmd_type == CMD_UPDATE && phy_dml_dxlop->IsOidsPreserved())
-		AddJunkTargetEntryForColId(&dml_target_list, &child_context,
-								   phy_dml_dxlop->GetTupleOid(), "oid");
 
 	// Add a Result node on top of the child plan, to coerce the target
 	// list to match the exact physical layout of the target table,
@@ -4134,14 +4776,14 @@ CTranslatorDXLToPlStmt::TranslateDXLDml(
 	// needed, as the child node could do the projection, but we don't have
 	// the information to determine that here. There's a step in the
 	// backend optimize_query() function to eliminate unnecessary Results
-	// throught the plan, hopefully this Result gets eliminated there.
+	// through the plan, hopefully this Result gets eliminated there.
 	Result *result = MakeNode(Result);
 	Plan *result_plan = &(result->plan);
 
 	result_plan->plan_node_id = m_dxl_to_plstmt_context->GetNextPlanId();
 	result_plan->lefttree = child_plan;
 
-	result_plan->targetlist = target_list_with_dropped_cols;
+	result_plan->targetlist = dml_target_list;
 	SetParamIds(result_plan);
 
 	child_plan = (Plan *) result;
@@ -4151,13 +4793,16 @@ CTranslatorDXLToPlStmt::TranslateDXLDml(
 	dml->nominalRelation = index;
 	dml->resultRelations = ListMake1Int(index);
 	dml->resultRelIndex = list_length(m_result_rel_list) - 1;
+	dml->rootRelation = md_rel->IsPartitioned() ? index : 0;
 	dml->plans = ListMake1(child_plan);
 
 	dml->fdwPrivLists = ListMake1(NIL);
 
 	// ORCA plans all updates as split updates
 	if (m_cmd_type == CMD_UPDATE)
-		dml->isSplitUpdates = ListMake1Int((int) true);
+	{
+		dml->isSplitUpdates = ListMake1Int((int) isSplit);
+	}
 
 	plan->targetlist = NIL;
 	plan->plan_node_id = m_dxl_to_plstmt_context->GetNextPlanId();
@@ -4190,7 +4835,8 @@ CTranslatorDXLToPlStmt::TranslateDXLDml(
 //---------------------------------------------------------------------------
 List *
 CTranslatorDXLToPlStmt::TranslateDXLDirectDispatchInfo(
-	CDXLDirectDispatchInfo *dxl_direct_dispatch_info)
+	CDXLDirectDispatchInfo *dxl_direct_dispatch_info,
+	RangeTblEntry *pRTEHashFuncCal)
 {
 	if (!optimizer_enable_direct_dispatch ||
 		nullptr == dxl_direct_dispatch_info)
@@ -4245,14 +4891,14 @@ CTranslatorDXLToPlStmt::TranslateDXLDirectDispatchInfo(
 		return segids_list;
 	}
 
-	ULONG hash_code = GetDXLDatumGPDBHash(dxl_datum_array);
+	ULONG hash_code = GetDXLDatumGPDBHash(dxl_datum_array, pRTEHashFuncCal);
 	for (ULONG ul = 0; ul < length; ul++)
 	{
 		CDXLDatumArray *dispatch_identifier_datum_array =
 			(*dispatch_identifier_datum_arrays)[ul];
 		GPOS_ASSERT(0 < dispatch_identifier_datum_array->Size());
-		ULONG hash_code_new =
-			GetDXLDatumGPDBHash(dispatch_identifier_datum_array);
+		ULONG hash_code_new = GetDXLDatumGPDBHash(
+			dispatch_identifier_datum_array, pRTEHashFuncCal);
 
 		if (hash_code != hash_code_new)
 		{
@@ -4274,25 +4920,63 @@ CTranslatorDXLToPlStmt::TranslateDXLDirectDispatchInfo(
 //
 //---------------------------------------------------------------------------
 ULONG
-CTranslatorDXLToPlStmt::GetDXLDatumGPDBHash(CDXLDatumArray *dxl_datum_array)
+CTranslatorDXLToPlStmt::GetDXLDatumGPDBHash(CDXLDatumArray *dxl_datum_array,
+											RangeTblEntry *pRTEHashFuncCal)
 {
 	List *consts_list = NIL;
 	Oid *hashfuncs;
 
 	const ULONG length = dxl_datum_array->Size();
 
-	hashfuncs = (Oid *) gpdb::GPDBAlloc(length * sizeof(Oid));
-
-	for (ULONG ul = 0; ul < length; ul++)
+	if (pRTEHashFuncCal != nullptr)
 	{
-		CDXLDatum *datum_dxl = (*dxl_datum_array)[ul];
+		// If we have one unique RTE in FROM clause,
+		// then we do direct dispatch based on the distribution policy
 
-		Const *const_expr =
-			(Const *) m_translator_dxl_to_scalar->TranslateDXLDatumToScalar(
-				datum_dxl);
-		consts_list = gpdb::LAppend(consts_list, const_expr);
-		hashfuncs[ul] = m_dxl_to_plstmt_context->GetDistributionHashFuncForType(
-			const_expr->consttype);
+		gpdb::RelationWrapper rel = gpdb::GetRelation(pRTEHashFuncCal->relid);
+		GPOS_ASSERT(rel);
+		GpPolicy *policy = rel->rd_cdbpolicy;
+		int policy_nattrs = policy->nattrs;
+		TupleDesc desc = rel->rd_att;
+		Oid *opclasses = policy->opclasses;
+		hashfuncs = (Oid *) gpdb::GPDBAlloc(policy_nattrs * sizeof(Oid));
+
+		for (int i = 0; i < policy_nattrs; i++)
+		{
+			AttrNumber attnum = policy->attrs[i];
+			Oid typeoid = desc->attrs[attnum - 1].atttypid;
+			Oid opfamily;
+
+			opfamily = gpdb::GetOpclassFamily(opclasses[i]);
+			hashfuncs[i] = gpdb::GetHashProcInOpfamily(opfamily, typeoid);
+		}
+		for (ULONG ul = 0; ul < length; ul++)
+		{
+			CDXLDatum *datum_dxl = (*dxl_datum_array)[ul];
+			Const *const_expr =
+				(Const *) m_translator_dxl_to_scalar->TranslateDXLDatumToScalar(
+					datum_dxl);
+			consts_list = gpdb::LAppend(consts_list, const_expr);
+		}
+	}
+	else
+	{
+		// If we have multiple tables in the "from" clause,
+		// we calculate hashfunction based on the consttype
+
+		hashfuncs = (Oid *) gpdb::GPDBAlloc(length * sizeof(Oid));
+		for (ULONG ul = 0; ul < length; ul++)
+		{
+			CDXLDatum *datum_dxl = (*dxl_datum_array)[ul];
+
+			Const *const_expr =
+				(Const *) m_translator_dxl_to_scalar->TranslateDXLDatumToScalar(
+					datum_dxl);
+			consts_list = gpdb::LAppend(consts_list, const_expr);
+			hashfuncs[ul] =
+				m_dxl_to_plstmt_context->GetDistributionHashFuncForType(
+					const_expr->consttype);
+		}
 	}
 
 	ULONG hash =
@@ -4358,8 +5042,6 @@ CTranslatorDXLToPlStmt::TranslateDXLSplit(
 
 	const TargetEntry *te_action_col =
 		output_context->GetTargetEntry(phy_split_dxlop->ActionColId());
-	const TargetEntry *te_tuple_oid_col =
-		output_context->GetTargetEntry(phy_split_dxlop->GetTupleOid());
 
 	if (nullptr == te_action_col)
 	{
@@ -4368,12 +5050,6 @@ CTranslatorDXLToPlStmt::TranslateDXLSplit(
 	}
 
 	split->actionColIdx = te_action_col->resno;
-
-	split->tupleoidColIdx = FirstLowInvalidHeapAttributeNumber;
-	if (nullptr != te_tuple_oid_col)
-	{
-		split->tupleoidColIdx = te_tuple_oid_col->resno;
-	}
 
 	plan->lefttree = child_plan;
 	plan->plan_node_id = m_dxl_to_plstmt_context->GetNextPlanId();
@@ -4469,41 +5145,81 @@ CTranslatorDXLToPlStmt::TranslateDXLAssert(
 
 //---------------------------------------------------------------------------
 //	@function:
-//		CTranslatorDXLToPlStmt::TranslateDXLTblDescrToRangeTblEntry
+//		CTranslatorDXLToPlStmt::ProcessDXLTblDescr
 //
 //	@doc:
-//		Translates a DXL table descriptor into a range table entry. If an index
-//		descriptor is provided, we use the mapping from colids to index attnos
-//		instead of table attnos
+//		Translates a DXL table descriptor into a range table entry and stores
+//		it in m_dxl_to_plstmt_context if it's needed (in case of DML operations
+//		there is more than one table descriptors which point to the result
+//		relation, so if rte was alredy translated, this rte will be updated and
+//		index of this rte at m_dxl_to_plstmt_context->m_rtable_entries_list
+//		(shortened as "rte_list"), will be returned, if the rte wasn't
+//		translated, the newly created rte will be appended to rte_list and it's
+//		index returned). Also this function fills base_table_context for the
+//		mapping from colids to index attnos instead of table attnos.
+//		Returns index of translated range table entry at the rte_list.
 //
 //---------------------------------------------------------------------------
-RangeTblEntry *
-CTranslatorDXLToPlStmt::TranslateDXLTblDescrToRangeTblEntry(
-	const CDXLTableDescr *table_descr, Index index,
+Index
+CTranslatorDXLToPlStmt::ProcessDXLTblDescr(
+	const CDXLTableDescr *table_descr,
 	CDXLTranslateContextBaseTable *base_table_context)
 {
 	GPOS_ASSERT(nullptr != table_descr);
+
+	BOOL rte_was_translated = false;
+
+	ULONG assigned_query_id = table_descr->GetAssignedQueryIdForTargetRel();
+	Index index = m_dxl_to_plstmt_context->GetRTEIndexByAssignedQueryId(
+		assigned_query_id, &rte_was_translated);
 
 	const IMDRelation *md_rel = m_md_accessor->RetrieveRel(table_descr->MDId());
 	const ULONG num_of_non_sys_cols =
 		CTranslatorUtils::GetNumNonSystemColumns(md_rel);
 
-	RangeTblEntry *rte = MakeNode(RangeTblEntry);
-	rte->rtekind = RTE_RELATION;
-
 	// get oid for table
 	Oid oid = CMDIdGPDB::CastMdid(table_descr->MDId())->Oid();
 	GPOS_ASSERT(InvalidOid != oid);
 
-	rte->relid = oid;
-	rte->checkAsUser = table_descr->GetExecuteAsUserId();
-	rte->requiredPerms |= ACL_NO_RIGHTS;
-	// GPDB_12_MERGE_FIXME: Make this an parameter
-	rte->rellockmode = AccessShareLock;
-
 	// save oid and range index in translation context
 	base_table_context->SetOID(oid);
 	base_table_context->SetRelIndex(index);
+
+	// save mapping col id -> index in translate context
+	const ULONG arity = table_descr->Arity();
+	for (ULONG ul = 0; ul < arity; ++ul)
+	{
+		const CDXLColDescr *dxl_col_descr = table_descr->GetColumnDescrAt(ul);
+		GPOS_ASSERT(nullptr != dxl_col_descr);
+
+		INT attno = dxl_col_descr->AttrNum();
+		GPOS_ASSERT(0 != attno);
+
+		(void) base_table_context->InsertMapping(dxl_col_descr->Id(), attno);
+	}
+
+	ULONG acl_mode = table_descr->GetAclMode();
+	GPOS_ASSERT(acl_mode >= 0 &&
+				acl_mode <= std::numeric_limits<AclMode>::max());
+	AclMode required_perms = static_cast<AclMode>(acl_mode);
+
+	// descriptor was already processed, and translated RTE is stored at
+	// context rtable list (only update required perms of this rte is needed)
+	if (rte_was_translated)
+	{
+		RangeTblEntry *rte = m_dxl_to_plstmt_context->GetRTEByIndex(index);
+		GPOS_ASSERT(nullptr != rte);
+		rte->requiredPerms |= required_perms;
+		return index;
+	}
+
+	// create a new RTE (and it's alias) and store it at context rtable list
+	RangeTblEntry *rte = MakeNode(RangeTblEntry);
+	rte->rtekind = RTE_RELATION;
+	rte->relid = oid;
+	rte->checkAsUser = table_descr->GetExecuteAsUserId();
+	rte->requiredPerms |= required_perms;
+	rte->rellockmode = table_descr->LockMode();
 
 	Alias *alias = MakeNode(Alias);
 	alias->colnames = NIL;
@@ -4513,18 +5229,11 @@ CTranslatorDXLToPlStmt::TranslateDXLTblDescrToRangeTblEntry(
 		table_descr->MdName()->GetMDName()->GetBuffer());
 
 	// get column names
-	const ULONG arity = table_descr->Arity();
-
 	INT last_attno = 0;
-
 	for (ULONG ul = 0; ul < arity; ++ul)
 	{
 		const CDXLColDescr *dxl_col_descr = table_descr->GetColumnDescrAt(ul);
-		GPOS_ASSERT(nullptr != dxl_col_descr);
-
 		INT attno = dxl_col_descr->AttrNum();
-
-		GPOS_ASSERT(0 != attno);
 
 		if (0 < attno)
 		{
@@ -4547,9 +5256,6 @@ CTranslatorDXLToPlStmt::TranslateDXLTblDescrToRangeTblEntry(
 			alias->colnames = gpdb::LAppend(alias->colnames, val_colname);
 			last_attno = attno;
 		}
-
-		// save mapping col id -> index in translate context
-		(void) base_table_context->InsertMapping(dxl_col_descr->Id(), attno);
 	}
 
 	// if there are any dropped columns at the end, add those too to the RangeTblEntry
@@ -4560,8 +5266,65 @@ CTranslatorDXLToPlStmt::TranslateDXLTblDescrToRangeTblEntry(
 	}
 
 	rte->eref = alias;
+	rte->alias = alias;
 
-	return rte;
+	// A new RTE is added to the range table entries list if it's not found in the look
+	// up table. However, it is only added to the look up table if it's a result relation
+	// This is because the look up table is our way of merging duplicate result relations
+	m_dxl_to_plstmt_context->AddRTE(rte);
+	GPOS_ASSERT(gpdb::ListLength(
+					m_dxl_to_plstmt_context->GetRTableEntriesList()) == index);
+	if (UNASSIGNED_QUERYID != assigned_query_id)
+	{
+		m_dxl_to_plstmt_context->InsertUsedRTEIndexes(assigned_query_id, index);
+	}
+
+	return index;
+}
+
+//---------------------------------------------------------------------------
+//	@function:
+//		update_unknown_locale_walker
+//
+//	@doc:
+//		Given an expression tree and a TargetEntry pointer context, look for a
+//		matching target entry in the expression tree and overwrite the given
+//		TargetEntry context's resname with the original found in the expression
+//		tree.
+//
+//---------------------------------------------------------------------------
+static bool
+update_unknown_locale_walker(Node *node, void *context)
+{
+	if (node == nullptr)
+	{
+		return false;
+	}
+
+	TargetEntry *unknown_target_entry = (TargetEntry *) context;
+
+	if (IsA(node, TargetEntry))
+	{
+		TargetEntry *te = (TargetEntry *) node;
+
+		if (te->resorigtbl == unknown_target_entry->resorigtbl &&
+			te->resno == unknown_target_entry->resno)
+		{
+			unknown_target_entry->resname = te->resname;
+			return false;
+		}
+	}
+	else if (IsA(node, Query))
+	{
+		Query *query = (Query *) node;
+
+		return gpdb::WalkExpressionTree(
+			(Node *) query->targetList,
+			(bool (*)()) update_unknown_locale_walker, (void *) context);
+	}
+
+	return gpdb::WalkExpressionTree(
+		node, (bool (*)()) update_unknown_locale_walker, (void *) context);
 }
 
 //---------------------------------------------------------------------------
@@ -4668,6 +5431,21 @@ CTranslatorDXLToPlStmt::TranslateDXLProjList(
 				}
 				target_entry->resorigtbl = pteOriginal->resorigtbl;
 				target_entry->resorigcol = pteOriginal->resorigcol;
+
+				// ORCA represents strings using wide characters. That can
+				// require converting from multibyte characters using
+				// vswprintf(). However, vswprintf() is dependent on the system
+				// locale which is set at the database level. When that locale
+				// cannot interpret the string correctly, it fails. ORCA
+				// bypasses the failure by using a generic "UNKNOWN" string.
+				// When that happens, the following code translates it back to
+				// the original multibyte string.
+				if (strcmp(target_entry->resname, "UNKNOWN") == 0)
+				{
+					update_unknown_locale_walker(
+						(Node *) output_context->GetQuery(),
+						(void *) target_entry);
+				}
 			}
 		}
 
@@ -4693,7 +5471,16 @@ List *
 CTranslatorDXLToPlStmt::CreateTargetListWithNullsForDroppedCols(
 	List *target_list, const IMDRelation *md_rel)
 {
-	GPOS_ASSERT(nullptr != target_list);
+	// There are cases where target list can be null
+	// Eg. insert rows with no columns into a table with no columns
+	//
+	// create table foo();
+	// insert into foo default values;
+	if (nullptr == target_list)
+	{
+		return nullptr;
+	}
+
 	GPOS_ASSERT(gpdb::ListLength(target_list) <= md_rel->ColumnCount());
 
 	List *result_list = NIL;
@@ -4939,6 +5726,185 @@ CTranslatorDXLToPlStmt::TranslateProjListAndFilter(
 		child_contexts, output_context);
 }
 
+//-----------------------------------------------------------------------------
+//	@function:
+//		CTranslatorDXLToPlStmt::AddSecurityQuals
+//
+//	@doc:
+//		This method is used to fetch the range table entry from the rewritten
+//		parse tree based on the relId and add it's security quals in the quals
+//		list. It also modifies the varno of the VAR node present in the
+//		security quals and assigns it the value of the index i.e. the
+//		position of this rte at m_dxl_to_plstmt_context->m_rtable_entries_list
+//		(shortened as "rte_list")
+//
+//---------------------------------------------------------------------------
+void
+CTranslatorDXLToPlStmt::AddSecurityQuals(OID relId, List **qual, Index *index)
+{
+	SContextSecurityQuals ctxt_security_quals(relId);
+
+	// Find the RTE in the parse tree based on the relId and add the security
+	// quals of that RTE to the m_security_quals list present in
+	// ctxt_security_quals struct.
+	FetchSecurityQuals(m_dxl_to_plstmt_context->m_orig_query,
+					   &ctxt_security_quals);
+
+	// The varno of the columns related to a particular table is different in
+	// the rewritten parse tree and the planned statement tree. In planned
+	// statement the varno of the columns is based on the index of the RTE
+	// at m_dxl_to_plstmt_context->m_rtable_entries_list. Since we are adding
+	// the security quals from the rewritten parse tree to planned statement
+	// tree we need to modify the varno of all the VAR nodes present in the
+	// security quals and assign it equal to index of the RTE in the rte_list.
+	SetSecurityQualsVarnoWalker((Node *) ctxt_security_quals.m_security_quals,
+								index);
+
+	// Adding the security quals from m_security_quals list to the qual list
+	*qual = gpdb::ListConcat(*qual, ctxt_security_quals.m_security_quals);
+}
+
+//---------------------------------------------------------------------------
+//	@function:
+//		CTranslatorDXLToPlStmt::FetchSecurityQuals
+//
+//	@doc:
+//		This method is used to walk the entire rewritten parse tree and
+//		search for a range table entry whose relid is equal to the m_relId
+//		field of ctxt_security_quals struct. On finding the RTE this method
+//		will also add the security quals present in it to the
+//		m_security_quals list of ctxt_security_quals struct.
+//
+//---------------------------------------------------------------------------
+BOOL
+CTranslatorDXLToPlStmt::FetchSecurityQuals(
+	Query *parsetree, SContextSecurityQuals *ctxt_security_quals)
+{
+	ListCell *lc;
+
+	// Iterate through all the range table entries present in the the rtable
+	// of the parsetree and search for a range table entry whose relid is
+	// equal to ctxt_security_quals->m_relId. If found then add the security
+	// quals of that RTE in the ctxt_security_quals->m_security_quals list.
+	// If the range table entry contains a subquery then recurse through that
+	// subquery and continue the search.
+	foreach (lc, parsetree->rtable)
+	{
+		RangeTblEntry *rte = (RangeTblEntry *) lfirst(lc);
+		if (RTE_RELATION == rte->rtekind &&
+			rte->relid == ctxt_security_quals->m_relId)
+		{
+			ctxt_security_quals->m_security_quals = gpdb::ListConcat(
+				ctxt_security_quals->m_security_quals, rte->securityQuals);
+			return true;
+		}
+
+		if ((RTE_SUBQUERY == rte->rtekind ||
+			 RTE_TABLEFUNCTION == rte->rtekind) &&
+			FetchSecurityQuals(rte->subquery, ctxt_security_quals))
+		{
+			return true;
+		}
+	}
+
+	// Recurse into ctelist
+	foreach (lc, parsetree->cteList)
+	{
+		CommonTableExpr *cte = lfirst_node(CommonTableExpr, lc);
+
+		if (FetchSecurityQuals(castNode(Query, cte->ctequery),
+							   ctxt_security_quals))
+		{
+			return true;
+		}
+	}
+
+	// Recurse into sublink subqueries. We have already recursed the sublink
+	// subqueries present in the rtable and ctelist. QTW_IGNORE_RC_SUBQUERIES
+	// flag indicates to avoid recursing subqueries present in rtable and
+	// ctelist
+	if (parsetree->hasSubLinks)
+	{
+		return gpdb::WalkQueryTree(
+			parsetree,
+			(BOOL(*)()) CTranslatorDXLToPlStmt::FetchSecurityQualsWalker,
+			ctxt_security_quals, QTW_IGNORE_RC_SUBQUERIES);
+	}
+
+	return false;
+}
+
+//---------------------------------------------------------------------------
+//	@function:
+//		CTranslatorDXLToPlStmt::FetchSecurityQualsWalker
+//
+//	@doc:
+//		This method is a walker to recurse into SUBLINK nodes and search for
+//		an RTE having relid equal to m_relId field of ctxt_security_quals struct
+//
+//---------------------------------------------------------------------------
+BOOL
+CTranslatorDXLToPlStmt::FetchSecurityQualsWalker(
+	Node *node, SContextSecurityQuals *ctxt_security_quals)
+{
+	if (nullptr == node)
+	{
+		return false;
+	}
+
+	// If the node is a SUBLINK, fetch its subselect node and start the
+	// search again for the RTE based on the m_relId field of
+	// ctxt_security_quals struct. If we found the RTE then the flag
+	// m_found_rte would have been set to true. In that case returning true
+	// which indicates to abort the walk immediately.
+	if (IsA(node, SubLink))
+	{
+		SubLink *sub = (SubLink *) node;
+
+		if (FetchSecurityQuals(castNode(Query, sub->subselect),
+							   ctxt_security_quals))
+		{
+			return true;
+		}
+	}
+
+	return gpdb::WalkExpressionTree(
+		node, (BOOL(*)()) CTranslatorDXLToPlStmt::FetchSecurityQualsWalker,
+		ctxt_security_quals);
+}
+
+//-----------------------------------------------------------------------------
+//	@function:
+//		CTranslatorDXLToPlStmt::SetSecurityQualsVarnoWalker
+//
+//	@doc:
+//		The varno of the columns related to a particular table is different in
+//		the rewritten parse tree and the planned statement tree. In planned
+//		statement the varno of the columns is based on the index of the RTE at
+//		m_dxl_to_plstmt_context->m_rtable_entries_list. Since we are adding
+//		the security quals from the rewritten parse tree to planned statement
+//		tree we need to modify the varno of all the VAR nodes present in the
+//		security quals and assign it equal to index of the RTE in the rte_list.
+//
+//---------------------------------------------------------------------------
+BOOL
+CTranslatorDXLToPlStmt::SetSecurityQualsVarnoWalker(Node *node, Index *index)
+{
+	if (nullptr == node)
+	{
+		return false;
+	}
+
+	if (IsA(node, Var))
+	{
+		((Var *) node)->varno = *index;
+		return false;
+	}
+
+	return gpdb::WalkExpressionTree(
+		node, (BOOL(*)()) CTranslatorDXLToPlStmt::SetSecurityQualsVarnoWalker,
+		index);
+}
 
 //---------------------------------------------------------------------------
 //	@function:
@@ -5085,7 +6051,7 @@ CTranslatorDXLToPlStmt::IsTgtTblDistributed(CDXLOperator *dxlop)
 	CDXLPhysicalDML *phy_dml_dxlop = CDXLPhysicalDML::Cast(dxlop);
 	IMDId *mdid = phy_dml_dxlop->GetDXLTableDescr()->MDId();
 
-	return IMDRelation::EreldistrMasterOnly !=
+	return IMDRelation::EreldistrCoordinatorOnly !=
 		   m_md_accessor->RetrieveRel(mdid)->GetRelDistribution();
 }
 
@@ -5259,7 +6225,7 @@ CTranslatorDXLToPlStmt::TranslateDXLCtas(
 		TranslateDXLPhyCtasToDistrPolicy(phy_ctas_dxlop, target_list);
 	m_dxl_to_plstmt_context->AddCtasInfo(into_clause, distr_policy);
 
-	GPOS_ASSERT(IMDRelation::EreldistrMasterOnly !=
+	GPOS_ASSERT(IMDRelation::EreldistrCoordinatorOnly !=
 				phy_ctas_dxlop->Ereldistrpolicy());
 
 	m_is_tgt_tbl_distributed = true;
@@ -5479,41 +6445,74 @@ CTranslatorDXLToPlStmt::TranslateDXLBitmapTblScan(
 	const CDXLNode *bitmapscan_dxlnode, CDXLTranslateContext *output_context,
 	CDXLTranslationContextArray *ctxt_translation_prev_siblings)
 {
+	BOOL is_dynamic = false;
 	const CDXLTableDescr *table_descr = nullptr;
 
 	CDXLOperator *dxl_operator = bitmapscan_dxlnode->GetOperator();
+	if (EdxlopPhysicalBitmapTableScan == dxl_operator->GetDXLOperator())
+	{
+		table_descr =
+			CDXLPhysicalBitmapTableScan::Cast(dxl_operator)->GetDXLTableDescr();
+	}
+	else
+	{
+		GPOS_ASSERT(EdxlopPhysicalDynamicBitmapTableScan ==
+					dxl_operator->GetDXLOperator());
+		CDXLPhysicalDynamicBitmapTableScan *phy_dyn_bitmap_tblscan_dxlop =
+			CDXLPhysicalDynamicBitmapTableScan::Cast(dxl_operator);
+		table_descr = phy_dyn_bitmap_tblscan_dxlop->GetDXLTableDescr();
 
-	table_descr =
-		CDXLPhysicalBitmapTableScan::Cast(dxl_operator)->GetDXLTableDescr();
-
+		is_dynamic = true;
+	}
 
 	// translation context for column mappings in the base relation
 	CDXLTranslateContextBaseTable base_table_context(m_mp);
-
-	// add the new range table entry as the last element of the range table
-	Index index =
-		gpdb::ListLength(m_dxl_to_plstmt_context->GetRTableEntriesList()) + 1;
 
 	const IMDRelation *md_rel = m_md_accessor->RetrieveRel(table_descr->MDId());
 
 	// Lock any table we are to scan, since it may not have been properly locked
 	// by the parser (e.g in case of generated scans for partitioned tables)
 	CMDIdGPDB *mdid = CMDIdGPDB::CastMdid(md_rel->MDId());
-	GPOS_RTL_ASSERT(table_descr->LockMode() != -1);
+	GPOS_ASSERT(table_descr->LockMode() != -1);
 	gpdb::GPDBLockRelationOid(mdid->Oid(), table_descr->LockMode());
 
-	RangeTblEntry *rte = TranslateDXLTblDescrToRangeTblEntry(
-		table_descr, index, &base_table_context);
-	GPOS_ASSERT(nullptr != rte);
-	rte->requiredPerms |= ACL_SELECT;
+	Index index = ProcessDXLTblDescr(table_descr, &base_table_context);
 
-	m_dxl_to_plstmt_context->AddRTE(rte);
-
+	DynamicBitmapHeapScan *dscan;
 	BitmapHeapScan *bitmap_tbl_scan;
 
+	dscan = MakeNode(DynamicBitmapHeapScan);
+	if (is_dynamic)
+	{
+		bitmap_tbl_scan = &dscan->bitmapheapscan;
 
+		CDXLPhysicalDynamicBitmapTableScan *phy_dyn_bitmap_tblscan_dxlop =
+			CDXLPhysicalDynamicBitmapTableScan::Cast(dxl_operator);
 
-	bitmap_tbl_scan = MakeNode(BitmapHeapScan);
+		IMdIdArray *parts = phy_dyn_bitmap_tblscan_dxlop->GetParts();
+
+		List *oids_list = NIL;
+
+		for (ULONG ul = 0; ul < parts->Size(); ul++)
+		{
+			Oid part = CMDIdGPDB::CastMdid((*parts)[ul])->Oid();
+			oids_list = gpdb::LAppendOid(oids_list, part);
+		}
+
+		dscan->partOids = oids_list;
+
+		OID oid_type =
+			CMDIdGPDB::CastMdid(m_md_accessor->PtMDType<IMDTypeInt4>()->MDId())
+				->Oid();
+
+		dscan->join_prune_paramids = TranslateJoinPruneParamids(
+			phy_dyn_bitmap_tblscan_dxlop->GetSelectorIds(), oid_type,
+			m_dxl_to_plstmt_context);
+	}
+	else
+	{
+		bitmap_tbl_scan = MakeNode(BitmapHeapScan);
+	}
 	bitmap_tbl_scan->scan.scanrelid = index;
 
 	Plan *plan = &(bitmap_tbl_scan->scan.plan);
@@ -5547,6 +6546,10 @@ CTranslatorDXLToPlStmt::TranslateDXLBitmapTblScan(
 		&base_table_context, ctxt_translation_prev_siblings, bitmap_tbl_scan);
 	SetParamIds(plan);
 
+	if (is_dynamic)
+	{
+		return (Plan *) dscan;
+	}
 	return (Plan *) bitmap_tbl_scan;
 }
 
@@ -5556,7 +6559,7 @@ CTranslatorDXLToPlStmt::TranslateDXLBitmapTblScan(
 //
 //	@doc:
 //		Translate the tree of bitmap index operators that are under the given
-//		bitmap table scan.
+//		(dynamic) bitmap table scan.
 //
 //---------------------------------------------------------------------------
 Plan *
@@ -5650,6 +6653,7 @@ CTranslatorDXLToPlStmt::TranslateDXLBitmapBoolOp(
 //
 //	@doc:
 //		Translate CDXLScalarBitmapIndexProbe into a BitmapIndexScan
+//		or a DynamicBitmapIndexScan
 //
 //---------------------------------------------------------------------------
 Plan *
@@ -5666,8 +6670,19 @@ CTranslatorDXLToPlStmt::TranslateDXLBitmapIndexProbe(
 			bitmap_index_probe_dxlnode->GetOperator());
 
 	BitmapIndexScan *bitmap_idx_scan;
+	DynamicBitmapIndexScan *dyn_bitmap_idx_scan;
 
-	bitmap_idx_scan = MakeNode(BitmapIndexScan);
+	if (IsA(bitmap_tbl_scan, DynamicBitmapHeapScan))
+	{
+		/* It's a Dynamic Bitmap Index Scan */
+		dyn_bitmap_idx_scan = MakeNode(DynamicBitmapIndexScan);
+		bitmap_idx_scan = &(dyn_bitmap_idx_scan->biscan);
+	}
+	else
+	{
+		dyn_bitmap_idx_scan = nullptr;
+		bitmap_idx_scan = MakeNode(BitmapIndexScan);
+	}
 	bitmap_idx_scan->scan.scanrelid = bitmap_tbl_scan->scan.scanrelid;
 
 	CMDIdGPDB *mdid_index = CMDIdGPDB::CastMdid(
@@ -5687,14 +6702,11 @@ CTranslatorDXLToPlStmt::TranslateDXLBitmapIndexProbe(
 	CDXLNode *index_cond_list_dxlnode = (*bitmap_index_probe_dxlnode)[0];
 	List *index_cond = NIL;
 	List *index_orig_cond = NIL;
-	List *index_strategy_list = NIL;
-	List *index_subtype_list = NIL;
 
 	TranslateIndexConditions(
 		index_cond_list_dxlnode, table_descr, true /*is_bitmap_index_probe*/,
 		index, md_rel, output_context, base_table_context,
-		ctxt_translation_prev_siblings, &index_cond, &index_orig_cond,
-		&index_strategy_list, &index_subtype_list);
+		ctxt_translation_prev_siblings, &index_cond, &index_orig_cond);
 
 	bitmap_idx_scan->indexqual = index_cond;
 	bitmap_idx_scan->indexqualorig = index_orig_cond;
@@ -5786,5 +6798,32 @@ CTranslatorDXLToPlStmt::TranslateNestLoopParamList(
 			gpdb::LAppend(nest_params_list, (void *) nest_params);
 	}
 	return nest_params_list;
+}
+
+// A bool Const expression is used as index condition if index column is used
+// as part of ORDER BY clause. Because ORDER BY doesn't have any index conditions.
+// This function checks if index is used for Order by.
+bool
+CTranslatorDXLToPlStmt::IsIndexForOrderBy(
+	CDXLTranslateContextBaseTable *base_table_context,
+	CDXLTranslationContextArray *ctxt_translation_prev_siblings,
+	CDXLTranslateContext *output_context, CDXLNode *index_cond_list_dxlnode)
+{
+	const ULONG arity = index_cond_list_dxlnode->Arity();
+	CMappingColIdVarPlStmt colid_var_mapping(
+		m_mp, base_table_context, ctxt_translation_prev_siblings,
+		output_context, m_dxl_to_plstmt_context);
+	if (arity == 1)
+	{
+		Expr *index_cond_expr =
+			m_translator_dxl_to_scalar->TranslateDXLToScalar(
+				(*index_cond_list_dxlnode)[0], &colid_var_mapping);
+		if (IsA(index_cond_expr, Const))
+		{
+			return true;
+		}
+		return false;
+	}
+	return false;
 }
 // EOF

@@ -15,6 +15,7 @@
 
 #include "gpopt/base/CCastUtils.h"
 #include "gpopt/base/CDistributionSpecHashed.h"
+#include "gpopt/base/CDistributionSpecNonReplicated.h"
 #include "gpopt/base/CDistributionSpecNonSingleton.h"
 #include "gpopt/base/CDistributionSpecReplicated.h"
 #include "gpopt/base/CUtils.h"
@@ -126,56 +127,12 @@ CPhysicalInnerNLJoin::Ped(CMemoryPool *mp, CExpressionHandle &exprhdl,
 	{
 		if (1 == child_index)
 		{
-			// compute a matching distribution based on derived distribution of outer child
-			CDistributionSpec *pdsOuter =
-				CDrvdPropPlan::Pdpplan((*pdrgpdpCtxt)[0])->Pds();
-			if (CDistributionSpec::EdtHashed == pdsOuter->Edt())
+			CEnfdDistribution *pEnfdHashedDistribution =
+				CPhysicalJoin::PedInnerHashedFromOuterHashed(
+					mp, exprhdl, dmatch, (*pdrgpdpCtxt)[0]);
+			if (pEnfdHashedDistribution)
 			{
-				// require inner child to have matching hashed distribution
-				CExpression *pexprScPredicate = exprhdl.PexprScalarExactChild(
-					2, true /*error_on_null_return*/);
-				CExpressionArray *pdrgpexpr =
-					CPredicateUtils::PdrgpexprConjuncts(mp, pexprScPredicate);
-
-				CExpressionArray *pdrgpexprMatching =
-					GPOS_NEW(mp) CExpressionArray(mp);
-				CDistributionSpecHashed *pdshashed =
-					CDistributionSpecHashed::PdsConvert(pdsOuter);
-				CExpressionArray *pdrgpexprHashed = pdshashed->Pdrgpexpr();
-				const ULONG ulSize = pdrgpexprHashed->Size();
-
-				BOOL fSuccess = true;
-				for (ULONG ul = 0; fSuccess && ul < ulSize; ul++)
-				{
-					CExpression *pexpr = (*pdrgpexprHashed)[ul];
-					// get matching expression from predicate for the corresponding outer child
-					// to create CDistributionSpecHashed for inner child
-					CExpression *pexprMatching =
-						CUtils::PexprMatchEqualityOrINDF(pexpr, pdrgpexpr);
-					fSuccess = (nullptr != pexprMatching);
-					if (fSuccess)
-					{
-						pexprMatching->AddRef();
-						pdrgpexprMatching->Append(pexprMatching);
-					}
-				}
-				pdrgpexpr->Release();
-
-				if (fSuccess)
-				{
-					GPOS_ASSERT(pdrgpexprMatching->Size() ==
-								pdrgpexprHashed->Size());
-
-					// create a matching hashed distribution request
-					BOOL fNullsColocated = pdshashed->FNullsColocated();
-					CDistributionSpecHashed *pdshashedEquiv =
-						GPOS_NEW(mp) CDistributionSpecHashed(pdrgpexprMatching,
-															 fNullsColocated);
-					pdshashedEquiv->ComputeEquivHashExprs(mp, exprhdl);
-					return GPOS_NEW(mp)
-						CEnfdDistribution(pdshashedEquiv, dmatch);
-				}
-				pdrgpexprMatching->Release();
+				return pEnfdHashedDistribution;
 			}
 		}
 		return CPhysicalJoin::Ped(mp, exprhdl, prppInput, child_index,
@@ -196,9 +153,10 @@ CPhysicalInnerNLJoin::Ped(CMemoryPool *mp, CExpressionHandle &exprhdl,
 		CDrvdPropPlan::Pdpplan((*pdrgpdpCtxt)[0])->Pds();
 	if (CDistributionSpec::EdtUniversal == pdsOuter->Edt())
 	{
-		// first child is universal, request second child to execute on a single host to avoid duplicates
+		// Outer child is universal, request the inner child to be non-replicated.
+		// It doesn't have to be a singleton, because inner join is deduplicated.
 		return GPOS_NEW(mp) CEnfdDistribution(
-			GPOS_NEW(mp) CDistributionSpecSingleton(), dmatch);
+			GPOS_NEW(mp) CDistributionSpecNonReplicated(), dmatch);
 	}
 
 	return GPOS_NEW(mp)

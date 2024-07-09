@@ -29,7 +29,7 @@ namespace gpnaucrates
 {
 // type definitions
 // array of doubles
-typedef CDynamicPtrArray<CDouble, CleanupDelete> CDoubleArray;
+using CDoubleArray = CDynamicPtrArray<CDouble, CleanupDelete>;
 
 //---------------------------------------------------------------------------
 //	@class:
@@ -41,28 +41,26 @@ typedef CDynamicPtrArray<CDouble, CleanupDelete> CDoubleArray;
 class CHistogram : public gpos::DbgPrintMixin<CHistogram>
 {
 	// hash map from column id to a histogram
-	typedef CHashMap<ULONG, CHistogram, gpos::HashValue<ULONG>,
-					 gpos::Equals<ULONG>, CleanupDelete<ULONG>,
-					 CleanupDelete<CHistogram> >
-		UlongToHistogramMap;
+	using UlongToHistogramMap =
+		CHashMap<ULONG, CHistogram, gpos::HashValue<ULONG>, gpos::Equals<ULONG>,
+				 CleanupDelete<ULONG>, CleanupDelete<CHistogram>>;
 
 	// iterator
-	typedef CHashMapIter<ULONG, CHistogram, gpos::HashValue<ULONG>,
-						 gpos::Equals<ULONG>, CleanupDelete<ULONG>,
-						 CleanupDelete<CHistogram> >
-		UlongToHistogramMapIter;
+	using UlongToHistogramMapIter =
+		CHashMapIter<ULONG, CHistogram, gpos::HashValue<ULONG>,
+					 gpos::Equals<ULONG>, CleanupDelete<ULONG>,
+					 CleanupDelete<CHistogram>>;
 
 	// hash map from column ULONG to CDouble
-	typedef CHashMap<ULONG, CDouble, gpos::HashValue<ULONG>,
-					 gpos::Equals<ULONG>, CleanupDelete<ULONG>,
-					 CleanupDelete<CDouble> >
-		UlongToDoubleMap;
+	using UlongToDoubleMap =
+		CHashMap<ULONG, CDouble, gpos::HashValue<ULONG>, gpos::Equals<ULONG>,
+				 CleanupDelete<ULONG>, CleanupDelete<CDouble>>;
 
 	// iterator
-	typedef CHashMapIter<ULONG, CDouble, gpos::HashValue<ULONG>,
-						 gpos::Equals<ULONG>, CleanupDelete<ULONG>,
-						 CleanupDelete<CDouble> >
-		UlongToDoubleMapIter;
+	using UlongToDoubleMapIter =
+		CHashMapIter<ULONG, CDouble, gpos::HashValue<ULONG>,
+					 gpos::Equals<ULONG>, CleanupDelete<ULONG>,
+					 CleanupDelete<CDouble>>;
 
 private:
 	// shared memory pool
@@ -136,6 +134,10 @@ private:
 
 	// accessor for n-th bucket
 	CBucket *operator[](ULONG) const;
+
+	// Populate sample ratio within each bucket
+	void GetSampleRate(DOUBLE left, DOUBLE right, DOUBLE *sample_rate,
+					   ULONG index);
 
 	// compute skew estimate
 	void ComputeSkew();
@@ -213,9 +215,8 @@ private:
 			return DCost();
 		}
 	};
-	typedef CDynamicPtrArray<SAdjBucketBoundary,
-							 CleanupDelete<SAdjBucketBoundary> >
-		SAdjBucketBoundaryArray;
+	using SAdjBucketBoundaryArray =
+		CDynamicPtrArray<SAdjBucketBoundary, CleanupDelete<SAdjBucketBoundary>>;
 
 public:
 	CHistogram &operator=(const CHistogram &) = delete;

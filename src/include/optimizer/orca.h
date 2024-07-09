@@ -22,16 +22,11 @@
 #ifdef USE_ORCA
 
 extern PlannedStmt * optimize_query(Query *parse, int cursorOptions, ParamListInfo boundParams);
+extern Node *transformGroupedWindows(Node *node, void *context);
 
-#else
-
-/* Keep compilers quiet in case the build used --disable-orca */
-static PlannedStmt *
-optimize_query(Query *parse, int cursorOptions, ParamListInfo boundParams)
-{
-	Assert(false);
-	return NULL;
-}
+// plan_hint_hook generates HintState by parsing a Query.
+typedef void *(*plan_hint_hook_type) (Query *parse);
+extern PGDLLIMPORT plan_hint_hook_type plan_hint_hook;
 
 #endif
 

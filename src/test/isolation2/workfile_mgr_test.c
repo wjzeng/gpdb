@@ -41,11 +41,9 @@ int tests_total;
 
 /* Test definitions */
 static bool execworkfile_buffile_test(void);
-static bool fd_tests(void);
 static bool buffile_size_test(void);
 static bool buffile_large_file_test(void);
 static bool logicaltape_test(void);
-static bool fd_large_file_test(void);
 static bool execworkfile_create_one_MB_file(void);
 static bool workfile_fill_sharedcache(void);
 static bool workfile_create_and_set_cleanup(void);
@@ -76,11 +74,9 @@ typedef struct test_def
 static test_def test_defns[] = {
 		{"execworkfile_buffile_test", execworkfile_buffile_test},
 		{"atomic_test", atomic_test},
-		{"fd_tests", fd_tests},
 		{"buffile_size_test", buffile_size_test},
 		{"buffile_large_file_test", buffile_large_file_test},
 		{"logicaltape_test", logicaltape_test},
-		{"fd_large_file_test",fd_large_file_test},
 		{"execworkfile_create_one_MB_file",execworkfile_create_one_MB_file},
 		{"workfile_fill_sharedcache", workfile_fill_sharedcache},
 		{"workfile_create_and_set_cleanup", workfile_create_and_set_cleanup},
@@ -199,8 +195,6 @@ create_text_stringinfo(int64 n_chars)
 static bool
 execworkfile_buffile_test(void)
 {
-/* GPDB_12_MERGE_FIXME: Broken by the BufFile API changes */
-#if 0
 	int64 result = 0;
 	bool success = false;
 	int64 expected_size = 0;
@@ -222,7 +216,7 @@ execworkfile_buffile_test(void)
 
 	elog(LOG, "Running sub-test: Creating EWF/Buffile");
 
-	BufFile *ewf = BufFileCreateNamedTemp(file_name,
+	BufFile *ewf = BufFileCreateTempInSet(file_name,
 										  false /* interXact */,
 										  NULL /* work_set */);
 
@@ -273,7 +267,7 @@ execworkfile_buffile_test(void)
 
 	elog(LOG, "Running sub-test: Opening existing EWF/Buffile and checking size");
 
-	ewf = BufFileOpenNamedTemp(file_name,
+	ewf = BufFileCreateTemp(file_name,
 							   false /* interXact */);
 
 	current_size = BufFileGetSize(ewf);
@@ -303,67 +297,6 @@ execworkfile_buffile_test(void)
 	pfree(text);
 
 	return unit_test_summary();
-#else
-	elog(ERROR, "broken test");
-	return 0;
-#endif
-}
-
-/*
- * Unit test for testing the fd.c FileDiskSize and other new capabilities
- */
-static bool
-fd_tests(void)
-{
-	unit_test_reset();
-	elog(LOG, "Running test: fd_tests");
-
-	elog(LOG, "Running sub-test: Creating fd file");
-
-	File testFd = OpenNamedTemporaryFile("test_fd.dat",
-			true /* create */,
-			false /* delOnClose */,
-			true /* closeAtEOXact */);
-
-	unit_test_result(testFd > 0);
-
-	elog(LOG, "Running sub-test: Reading size of open empty file");
-	int64 fd_size = FileDiskSize(testFd);
-	unit_test_result(fd_size == 0L);
-
-	elog(LOG, "Running sub-test: Closing file");
-	FileClose(testFd);
-	unit_test_result(true);
-
-	elog(LOG, "Running sub-test: Opening existing empty file and reading size");
-	testFd = OpenNamedTemporaryFile("test_fd.dat",
-			false /* create */,
-			false /* delOnClose */,
-			true /* closeAtEOXact */);
-
-	fd_size = FileDiskSize(testFd);
-	unit_test_result(fd_size == 0L);
-
-	elog(LOG, "Running sub-test: Writing to existing open file, sync and read size");
-	int nchars = 10000;
-	StringInfo text = create_text_stringinfo(nchars);
-	int len_to_write = 5000;
-	Assert(len_to_write <= text->len);
-
-	FileWrite(testFd, text->data, len_to_write, 0, 0);
-	FileSync(testFd, 0);
-
-	fd_size = FileDiskSize(testFd);
-	unit_test_result(fd_size == len_to_write);
-
-	elog(LOG, "Running sub-test: Closing file");
-	FileClose(testFd);
-	unit_test_result(true);
-
-	pfree(text->data);
-	pfree(text);
-
-	return unit_test_summary();
 }
 
 /*
@@ -372,8 +305,6 @@ fd_tests(void)
 static bool
 buffile_size_test(void)
 {
-/* GPDB_12_MERGE_FIXME: Broken by the BufFile API changes */
-#if 0
 	unit_test_reset();
 	elog(LOG, "Running test: buffile_size_test");
 
@@ -382,7 +313,7 @@ buffile_size_test(void)
 	/* Create file name */
 	char *file_name = "test_buffile.dat";
 
-	BufFile *testBf = BufFileCreateNamedTemp(file_name,
+	BufFile *testBf = BufFileCreateTempInSet(file_name,
 											 false /* interXact */,
 											 NULL /* workfile_set */);
 
@@ -397,8 +328,6 @@ buffile_size_test(void)
 	int expected_size = nchars;
 	StringInfo text = create_text_stringinfo(nchars);
 	BufFileWrite(testBf, text->data, nchars);
-	pfree(text->data);
-	pfree(text);
 	test_size = BufFileGetSize(testBf);
 
 	unit_test_result(test_size == expected_size);
@@ -421,8 +350,7 @@ buffile_size_test(void)
 	unit_test_result(test_size == expected_size);
 
 	elog(LOG, "Running sub-test: Opening existing and testing size");
-	BufFile *testBf1 = BufFileOpenNamedTemp(file_name,
-								  false /*interXact */);
+	BufFile *testBf1 = testBf;
 	test_size = BufFileGetSize(testBf1);
 
 	unit_test_result(test_size == expected_size);
@@ -438,7 +366,6 @@ buffile_size_test(void)
 	unit_test_result(test_size == expected_size);
 
 	elog(LOG, "Running sub-test: Closing buffile");
-	BufFileClose(testBf1);
 	BufFileClose(testBf);
 	unit_test_result(true);
 
@@ -446,10 +373,6 @@ buffile_size_test(void)
 	pfree(text);
 
 	return unit_test_summary();
-#else
-	elog(ERROR, "broken test");
-	return 0;
-#endif
 }
 
 /*
@@ -530,13 +453,11 @@ atomic_test(void)
 static bool
 buffile_large_file_test(void)
 {
-/* GPDB_12_MERGE_FIXME: Broken by the BufFile API changes */
-#if 0
 	unit_test_reset();
 	elog(LOG, "Running test: buffile_large_file_test");
 	char *file_name = "Test_large_buff.dat";
 
-	BufFile *bfile = BufFileCreateNamedTemp(file_name,
+	BufFile *bfile = BufFileCreateTempInSet(file_name,
 											true /* interXact */,
 											NULL /* workfile_set */);
 
@@ -584,10 +505,6 @@ buffile_large_file_test(void)
 	pfree(test_string);
 
 	return unit_test_summary();
-#else
-	elog(ERROR, "broken test");
-	return 0;
-#endif
 }
 
 /*
@@ -596,10 +513,6 @@ buffile_large_file_test(void)
 static bool
 logicaltape_test(void)
 {
-/* GPDB_12_MERGE_FIXME: tuplesort and logtape.c were replaced with upstream versions
- * which broke this
- */
-#if 0
 	unit_test_reset();
 	elog(LOG, "Running test: logicaltape_test");
 
@@ -611,11 +524,12 @@ logicaltape_test(void)
 	/* Target record values */
 	int test_tape = 5;
 	int test_entry = 45000;
-	LogicalTapePos entryPos;
 
-	LogicalTapeSet *tape_set = LogicalTapeSetCreate(max_tapes);
+	LogicalTapeSet *tape_set = LogicalTapeSetCreate(max_tapes, false, NULL, NULL, -1);
 
-	LogicalTape *work_tape = NULL;
+	int work_tape = 0;
+	long blocknum = 0;
+	int offset = 0;
 
 	StringInfo test_string = create_text_stringinfo(nchars);
 
@@ -624,7 +538,7 @@ logicaltape_test(void)
 	/* Fill LogicalTapeSet */
 	for (int i = 0; i < max_tapes; i++)
 	{
-		work_tape = LogicalTapeSetGetTape(tape_set, i);
+		work_tape = i;
 
 		/* Create large SpillFile for LogicalTape */
 		if (test_tape == i)
@@ -634,9 +548,7 @@ logicaltape_test(void)
 			{
 				if ( j == test_entry)
 				{
-					/* Keep record position of target record in LogicalTape */
-					LogicalTapeUnfrozenTell(tape_set, work_tape, &entryPos);
-
+					LogicalTapeTell(tape_set, work_tape, &blocknum, &offset);
 					LogicalTapeWrite(tape_set, work_tape, test_string->data, (size_t)test_string->len);
 				}
 				else
@@ -665,78 +577,21 @@ logicaltape_test(void)
 	}
 
 	/* Set target LogicalTape */
-	work_tape = LogicalTapeSetGetTape(tape_set, test_tape);
+	work_tape = test_tape;
 	char *buffer = palloc(nchars * sizeof(char));
 
 	elog(LOG, "Running sub-test: Freeze LogicalTape");
-	LogicalTapeFreeze(tape_set, work_tape);
+	LogicalTapeFreeze(tape_set, work_tape, NULL);
 
 	elog(LOG, "Running sub-test: Seek in LogicalTape");
-	LogicalTapeSeek(tape_set, work_tape, &entryPos);
+	LogicalTapeSeek(tape_set, work_tape, blocknum, offset);
 
 	elog(LOG, "Running sub-test: Reading from LogicalTape");
 	LogicalTapeRead(tape_set, work_tape, buffer, (size_t)(nchars*sizeof(char)));
 
-	LogicalTapeSetClose(tape_set, NULL /* work_set */);
+	LogicalTapeSetClose(tape_set);
 
 	unit_test_result (strncmp(test_string->data, buffer, test_string->len) == 0);
-
-	return unit_test_summary();
-#else
-	elog(ERROR, "broken test");
-	return 0;
-#endif
-}
-
-/*
- * Unit test for testing large fd file.
- * This unit test verifies that the file's size on disk is as expected.
- */
-static bool
-fd_large_file_test(void)
-{
-	off_t		offset;
-
-	unit_test_reset();
-	elog(LOG, "Running test: fd_large_file_test");
-
-	elog(LOG, "Running sub-test: Creating fd file");
-
-	/* Create file name */
-	char *file_name = "test_large_fd.dat";
-
-	File testFd = OpenNamedTemporaryFile(file_name,
-			true /* create */,
-			true /* delOnClose */,
-			true /* closeAtEOXact */);
-
-	unit_test_result(testFd > 0);
-
-	elog(LOG, "Running sub-test: Writing to existing open file, sync and read size");
-	int nchars = 100000;
-	/* 4.5 GBs */
-	int total_entries = 48319;
-
-	StringInfo text = create_text_stringinfo(nchars);
-
-	offset = 0;
-	for (int i = 0; i < total_entries; i++)
-	{
-		int len = strlen(text->data);
-		FileWrite(testFd, text->data, len, offset, 0);
-		offset += len;
-		FileSync(testFd, 0);
-	}
-
-	pfree(text->data);
-	pfree(text);
-
-	int64 fd_size = FileDiskSize(testFd);
-	unit_test_result(fd_size == (int64) nchars * sizeof(char) * (int64) total_entries);
-
-	elog(LOG, "Running sub-test: Closing file");
-	FileClose(testFd);
-	unit_test_result(true);
 
 	return unit_test_summary();
 }
@@ -748,8 +603,6 @@ fd_large_file_test(void)
 static bool
 execworkfile_create_one_MB_file(void)
 {
-/* GPDB_12_MERGE_FIXME: Broken by the BufFile API changes */
-#if 0
 	unit_test_reset();
 	elog(LOG, "Running test: execworkfile_one_MB_file_test");
 
@@ -759,7 +612,7 @@ execworkfile_create_one_MB_file(void)
 					 "%s",
 					 "Test_buffile_one_MB_file_test.dat");
 
-	BufFile *ewf = BufFileCreateNamedTemp(filename->data,
+	BufFile *ewf = BufFileCreateTempInSet(filename->data,
 										  false /* interXact */,
 										  NULL /* work_set */);
 
@@ -788,10 +641,6 @@ execworkfile_create_one_MB_file(void)
 	pfree(filename);
 
 	return unit_test_summary();
-#else
-	elog(ERROR, "broken test");
-	return 0;
-#endif
 }
 
 /*
@@ -818,13 +667,6 @@ workfile_fill_sharedcache(void)
 			success = false;
 			break;
 		}
-		if (crt_entry >= gp_workfile_max_entries - 2)
-		{
-			/* Pause between adding extra ones so we can test from other sessions */
-			elog(LOG, "Added %d entries out of %d, pausing for 30 seconds before proceeding", crt_entry + 1, n_entries);
-			sleep(30);
-		}
-
 	}
 
 	unit_test_result(success);

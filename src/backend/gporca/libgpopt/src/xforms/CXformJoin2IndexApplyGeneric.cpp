@@ -21,7 +21,7 @@ using namespace gpopt;
 // Can transform left outer join to left outer index apply?
 // For hash distributed table, we can do outer index apply only
 // when the inner columns used in the join condition contains
-// the inner distribution key set. Master only table is ok to
+// the inner distribution key set. Coordinator only table is ok to
 // transform to outer index apply, but random table is not.
 // Because if the inner is random distributed, there is no way
 // to redistribute outer child to match inner on the join keys.
@@ -33,9 +33,13 @@ CXformJoin2IndexApplyGeneric::FCanLeftOuterIndexApply(
 	IMDRelation::Ereldistrpolicy ereldist = ptabDesc->GetRelDistribution();
 
 	if (ereldist == IMDRelation::EreldistrRandom)
+	{
 		return false;
-	else if (ereldist == IMDRelation::EreldistrMasterOnly)
+	}
+	else if (ereldist == IMDRelation::EreldistrCoordinatorOnly)
+	{
 		return true;
+	}
 
 	// now consider hash distributed table
 	CColRefSet *pcrsInnerOutput = pexprInner->DeriveOutputColumns();
@@ -264,10 +268,24 @@ CXformJoin2IndexApplyGeneric::Transform(CXformContext *pxfctxt,
 				distributionCols = popGet->PcrsDist();
 				pexprGet = pexprCurrInnerChild;
 
-				if (nullptr != groupingColsToCheck.Value() &&
-					!groupingColsToCheck->ContainsAll(distributionCols))
+				// We need to early exit when the relation contains security quals
+				// because we are adding the security quals when translating from DXL to
+				// Planned Statement as a filter. If we don't early exit then it may happen
+				// that we generate a plan where the index condition contains non-leakproof
+				// expressions. This can lead to data leak as we always want our security
+				// quals to be executed first.
+				if (popGet->HasSecurityQuals())
 				{
-					// the grouping columns are not a superset of the distribution columns
+					return;
+				}
+
+				if (nullptr != groupingColsToCheck.Value() &&
+					(!groupingColsToCheck->ContainsAll(distributionCols) ||
+					 ptabdescInner->GetRelDistribution() ==
+						 IMDRelation::EreldistrRandom))
+				{
+					// the grouping columns are not a superset of the distribution columns,
+					// or distribution columns are empty when the table is randomly distributed
 					return;
 				}
 			}
@@ -280,6 +298,27 @@ CXformJoin2IndexApplyGeneric::Transform(CXformContext *pxfctxt,
 				ptabdescInner = popDynamicGet->Ptabdesc();
 				distributionCols = popDynamicGet->PcrsDist();
 				pexprGet = pexprCurrInnerChild;
+
+				// We need to early exit when the relation contains security quals
+				// because we are adding the security quals when translating from DXL to
+				// Planned Statement as a filter. If we don't early exit then it may happen
+				// that we generate a plan where the index condition contains non-leakproof
+				// expressions. This can lead to data leak as we always want our security
+				// quals to be executed first.
+				if (popDynamicGet->HasSecurityQuals())
+				{
+					return;
+				}
+
+				if (nullptr != groupingColsToCheck.Value() &&
+					(!groupingColsToCheck->ContainsAll(distributionCols) ||
+					 ptabdescInner->GetRelDistribution() ==
+						 IMDRelation::EreldistrRandom))
+				{
+					// the grouping columns are not a superset of the distribution columns,
+					// or distribution columns are empty when the table is randomly distributed
+					return;
+				}
 			}
 			break;
 

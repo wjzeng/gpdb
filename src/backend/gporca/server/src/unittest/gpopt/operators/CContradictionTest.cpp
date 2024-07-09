@@ -67,7 +67,7 @@ CContradictionTest::EresUnittest_Constraint()
 	CMDAccessor mda(mp, CMDCache::Pcache(), CTestUtils::m_sysidDefault, pmdp);
 
 
-	typedef CExpression *(*Pfpexpr)(CMemoryPool *);
+	using Pfpexpr = CExpression *(*) (CMemoryPool *);
 
 	Pfpexpr rgpf[] = {
 		CTestUtils::PexprLogicalApplyWithOuterRef<CLogicalInnerApply>,
@@ -106,7 +106,7 @@ CContradictionTest::EresUnittest_Constraint()
 		CExpression *pexpr = rgpf[i](mp);
 
 		// self-match
-		GPOS_ASSERT(pexpr->FMatchDebug(pexpr));
+		GPOS_UNITTEST_ASSERT(pexpr->FMatchDebug(pexpr));
 
 		// debug print
 		CWStringDynamic str(mp, GPOS_WSZ_LIT("\n"));

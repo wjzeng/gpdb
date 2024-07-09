@@ -21,6 +21,8 @@
 #include "executor/nodeBitmapAnd.h"
 #include "executor/nodeBitmapHeapscan.h"
 #include "executor/nodeBitmapIndexscan.h"
+#include "executor/nodeDynamicBitmapHeapscan.h"
+#include "executor/nodeDynamicBitmapIndexscan.h"
 #include "executor/nodeBitmapOr.h"
 #include "executor/nodeCtescan.h"
 #include "executor/nodeCustom.h"
@@ -57,6 +59,10 @@
 #include "executor/nodeWindowAgg.h"
 #include "executor/nodeWorktablescan.h"
 #include "executor/nodeAssertOp.h"
+#include "executor/nodeDynamicSeqscan.h"
+#include "executor/nodeDynamicIndexscan.h"
+#include "executor/nodeDynamicIndexOnlyscan.h"
+#include "executor/nodeDynamicForeignscan.h"
 #include "executor/nodeMotion.h"
 #include "executor/nodeSequence.h"
 #include "executor/nodeTableFunction.h"
@@ -210,6 +216,15 @@ ExecReScan(PlanState *node)
 			ExecReScanIndexScan((IndexScanState *) node);
 			break;
 
+		case T_DynamicSeqScanState:
+			ExecReScanDynamicSeqScan((DynamicSeqScanState *) node);
+			break;
+
+		case T_DynamicIndexScanState:
+		case T_DynamicIndexOnlyScanState:
+			ExecReScanDynamicIndex((DynamicIndexScanState *) node);
+			break;
+
 		case T_IndexOnlyScanState:
 			ExecReScanIndexOnlyScan((IndexOnlyScanState *) node);
 			break;
@@ -218,8 +233,16 @@ ExecReScan(PlanState *node)
 			ExecReScanBitmapIndexScan((BitmapIndexScanState *) node);
 			break;
 
+		case T_DynamicBitmapIndexScanState:
+			ExecReScanDynamicBitmapIndex((DynamicBitmapIndexScanState *) node);
+			break;
+
 		case T_BitmapHeapScanState:
 			ExecReScanBitmapHeapScan((BitmapHeapScanState *) node);
+			break;
+
+		case T_DynamicBitmapHeapScanState:
+			ExecReScanDynamicBitmapHeapScan((DynamicBitmapHeapScanState *) node);
 			break;
 
 		case T_TidScanState:
@@ -264,6 +287,10 @@ ExecReScan(PlanState *node)
 
 		case T_ForeignScanState:
 			ExecReScanForeignScan((ForeignScanState *) node);
+			break;
+
+		case T_DynamicForeignScanState:
+			ExecReScanDynamicForeignScan((DynamicForeignScanState *) node);
 			break;
 
 		case T_CustomScanState:
@@ -400,6 +427,7 @@ ExecMarkPos(PlanState *node)
 			break;
 
 		case T_ForeignScanState:
+		case T_DynamicForeignScanState:
 			elog(ERROR, "Marking scan position for foreign relation is not supported");
 			break;
 
@@ -488,6 +516,11 @@ ExecSupportsMarkRestore(Path *pathnode)
 	{
 		case T_IndexScan:
 		case T_IndexOnlyScan:
+			/*
+			 * Not all index types support mark/restore.
+			 */
+			return castNode(IndexPath, pathnode)->indexinfo->amcanmarkpos;
+
 		case T_Material:
 		case T_Sort:
 		case T_ShareInputScan:
@@ -723,6 +756,7 @@ ExecSquelchNode(PlanState *node)
 		case T_AssertOpState:
 		case T_BitmapAndState:
 		case T_BitmapOrState:
+		case T_DynamicBitmapHeapScanState:
 		case T_LimitState:
 		case T_LockRowsState:
 		case T_NestLoopState:
@@ -743,7 +777,11 @@ ExecSquelchNode(PlanState *node)
 			 */
 		case T_SeqScanState:
 		case T_IndexScanState:
+		case T_DynamicSeqScanState:
+		case T_DynamicIndexScanState:
+		case T_DynamicIndexOnlyScanState:
 		case T_IndexOnlyScanState:
+		case T_DynamicBitmapIndexScanState:
 		case T_BitmapIndexScanState:
 		case T_TableFuncScanState:
 		case T_ValuesScanState:
@@ -767,7 +805,11 @@ ExecSquelchNode(PlanState *node)
 			 */
 			ExecShutdownForeignScan((ForeignScanState *) node);
 			break;
-
+		case T_DynamicForeignScanState:
+			/* TODO: Add logic to shutdown the dynamic foreign scan for cases of parallel
+			 * execution (currently unsupported in Orca)
+			 */
+			break;
 		case T_BitmapHeapScanState:
 			ExecSquelchBitmapHeapScan((BitmapHeapScanState *) node);
 			break;

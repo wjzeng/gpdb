@@ -62,21 +62,30 @@ external_set_env_vars_ext(extvar_t *extvar, char *uri, bool csv, char *escape, c
 	if (Gp_role != GP_ROLE_DISPATCH)
 	{
 		pg_ltoa(qdPostmasterPort, result);
+		extvar->GP_COORDINATOR_PORT = result;
+		extvar->GP_COORDINATOR_HOST = qdHostname;
 		extvar->GP_MASTER_PORT = result;
 		extvar->GP_MASTER_HOST = qdHostname;
 	}
 	else
 	{
 		CdbComponentDatabaseInfo *qdinfo =
-				cdbcomponent_getComponentInfo(MASTER_CONTENT_ID);
+				cdbcomponent_getComponentInfo(COORDINATOR_CONTENT_ID);
 
 		pg_ltoa(qdinfo->config->port, result);
+		extvar->GP_COORDINATOR_PORT = result;
 		extvar->GP_MASTER_PORT = result;
 
 		if (qdinfo->config->hostip != NULL)
+		{
+			extvar->GP_COORDINATOR_HOST = pstrdup(qdinfo->config->hostip);
 			extvar->GP_MASTER_HOST = pstrdup(qdinfo->config->hostip);
+		}
 		else
+		{
+			extvar->GP_COORDINATOR_HOST = pstrdup(qdinfo->config->hostname);
 			extvar->GP_MASTER_HOST = pstrdup(qdinfo->config->hostname);
+		}
 	}
 
 	if (MyProcPort)
@@ -89,6 +98,7 @@ external_set_env_vars_ext(extvar_t *extvar, char *uri, bool csv, char *escape, c
 												 * pg_conf file  */
 	extvar->GP_SEG_DATADIR = DataDir;	/* location of the segments
 												 * datadirectory */
+	extvar->GP_SEG_LOGDIR = Log_directory;	/* location of the segments */
 	sprintf(extvar->GP_DATE, "%04d%02d%02d",
 			1900 + tm->tm_year, 1 + tm->tm_mon, tm->tm_mday);
 	sprintf(extvar->GP_TIME, "%02d%02d%02d",

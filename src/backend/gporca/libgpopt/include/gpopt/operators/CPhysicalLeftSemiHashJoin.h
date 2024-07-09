@@ -32,10 +32,11 @@ public:
 	CPhysicalLeftSemiHashJoin(const CPhysicalLeftSemiHashJoin &) = delete;
 
 	// ctor
-	CPhysicalLeftSemiHashJoin(CMemoryPool *mp,
-							  CExpressionArray *pdrgpexprOuterKeys,
-							  CExpressionArray *pdrgpexprInnerKeys,
-							  IMdIdArray *hash_opfamilies = nullptr);
+	CPhysicalLeftSemiHashJoin(
+		CMemoryPool *mp, CExpressionArray *pdrgpexprOuterKeys,
+		CExpressionArray *pdrgpexprInnerKeys, IMdIdArray *hash_opfamilies,
+		BOOL is_null_aware = true,
+		CXform::EXformId origin_xform = CXform::ExfSentinel);
 
 	// dtor
 	~CPhysicalLeftSemiHashJoin() override;
@@ -53,6 +54,14 @@ public:
 	{
 		return "CPhysicalLeftSemiHashJoin";
 	}
+
+	CPartitionPropagationSpec *PppsRequired(
+		CMemoryPool *mp, CExpressionHandle &exprhdl,
+		CPartitionPropagationSpec *pppsRequired, ULONG child_index,
+		CDrvdPropArray *pdrgpdpCtxt, ULONG ulOptReq) const override;
+
+	CPartitionPropagationSpec *PppsDerive(
+		CMemoryPool *mp, CExpressionHandle &exprhdl) const override;
 
 	// check if required columns are included in output columns
 	BOOL FProvidesReqdCols(CExpressionHandle &exprhdl, CColRefSet *pcrsRequired,

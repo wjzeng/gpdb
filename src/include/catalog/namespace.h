@@ -37,6 +37,16 @@ typedef struct _FuncCandidateList
 }		   *FuncCandidateList;
 
 /*
+ * Result of checkTempNamespaceStatus
+ */
+typedef enum TempNamespaceStatus
+{
+	TEMP_NAMESPACE_NOT_TEMP,	/* nonexistent, or non-temp namespace */
+	TEMP_NAMESPACE_IDLE,		/* exists, belongs to no active session */
+	TEMP_NAMESPACE_IN_USE		/* belongs to some active session */
+} TempNamespaceStatus;
+
+/*
  *	Structure for xxxOverrideSearchPath functions
  */
 typedef struct OverrideSearchPath
@@ -76,6 +86,7 @@ extern Oid	RelnameGetRelid(const char *relname);
 extern bool RelationIsVisible(Oid relid);
 
 extern Oid	TypenameGetTypid(const char *typname);
+extern Oid	TypenameGetTypidExtended(const char *typname, bool temp_ok);
 extern bool TypeIsVisible(Oid typid);
 
 extern FuncCandidateList FuncnameGetCandidates(List *names,
@@ -125,6 +136,7 @@ extern Oid	LookupExplicitNamespace(const char *nspname, bool missing_ok);
 extern Oid	get_namespace_oid(const char *nspname, bool missing_ok);
 
 extern void DropTempTableNamespaceForResetSession(Oid namespaceOid);
+extern void DropTempTableNamespaceEntryForResetSession(Oid namespaceOid, Oid toastNamespaceOid);
 extern void SetTempNamespace(Oid namespaceOid, Oid toastNamespaceOid);
 extern Oid  ResetTempNamespace(void);
 extern bool TempNamespaceOidIsValid(void);  /* GPDB only:  used by cdbgang.c */
@@ -142,6 +154,8 @@ extern bool isTempToastNamespace(Oid namespaceId);
 extern bool isTempOrTempToastNamespace(Oid namespaceId);
 extern bool isAnyTempNamespace(Oid namespaceId);
 extern bool isOtherTempNamespace(Oid namespaceId);
+extern TempNamespaceStatus checkTempNamespaceStatus(Oid namespaceId);
+extern bool isTempNamespaceMustBeIdle(Oid namespaceId, HTAB *aliveSessions);
 extern bool isTempNamespaceInUse(Oid namespaceId);
 extern int	GetTempNamespaceBackendId(Oid namespaceId);
 extern Oid	GetTempToastNamespace(void);
@@ -149,6 +163,8 @@ extern void GetTempNamespaceState(Oid *tempNamespaceId,
 								  Oid *tempToastNamespaceId);
 extern void SetTempNamespaceState(Oid tempNamespaceId,
 								  Oid tempToastNamespaceId);
+extern void SetTempNamespaceStateAfterBoot(Oid tempNamespaceId,
+								  Oid tempToastNamespaceId); /* GPDB only */
 extern void ResetTempTableNamespace(void);
 
 extern OverrideSearchPath *GetOverrideSearchPath(MemoryContext context);

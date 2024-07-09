@@ -29,17 +29,23 @@
 #include "commands/portalcmds.h"
 #include "executor/executor.h"
 #include "executor/tstoreReceiver.h"
+#include "miscadmin.h"
 #include "rewrite/rewriteHandler.h"
+#include "miscadmin.h"
+#include "port/atomics.h"
 #include "tcop/pquery.h"
 #include "tcop/tcopprot.h"
 #include "utils/memutils.h"
 #include "utils/snapmgr.h"
 
+#include "cdb/cdbendpoint.h"
 #include "cdb/cdbgang.h"
 #include "cdb/cdbvars.h"
 #include "postmaster/backoff.h"
 #include "utils/resscheduler.h"
 
+extern volatile uint32 *parallelCursorCount;
+extern int gp_max_parallel_cursors;
 
 /*
  * PerformCursorOpen
@@ -71,6 +77,10 @@ PerformCursorOpen(DeclareCursorStmt *cstmt, ParamListInfo params,
 	 */
 	if (!(cstmt->options & CURSOR_OPT_HOLD))
 		RequireTransactionBlock(isTopLevel, "DECLARE CURSOR");
+	else if (InSecurityRestrictedOperation())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("cannot create a cursor WITH HOLD within security-restricted operation")));
 
 	/*
 	 * Parse analysis was done already, but we still have to run the rule
@@ -181,12 +191,32 @@ PerformCursorOpen(DeclareCursorStmt *cstmt, ParamListInfo params,
 	}
 #endif
 
+	if (PortalIsParallelRetrieveCursor(portal))
+	{
+		if (gp_max_parallel_cursors != -1 && 
+		pg_atomic_add_fetch_u32((pg_atomic_uint32 *) parallelCursorCount, 1) > gp_max_parallel_cursors)
+		{
+			pg_atomic_sub_fetch_u32((pg_atomic_uint32 *) parallelCursorCount, 1);
+			ereport(ERROR,
+				(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
+				 errmsg("Opened parallel cursor number exceeded allowed concurrency: %d", gp_max_parallel_cursors)));
+		}
+	}
+
 	/*
 	 * Start execution, inserting parameters if any.
 	 */
 	PortalStart(portal, params, 0, GetActiveSnapshot(), NULL);
 
 	Assert(portal->strategy == PORTAL_ONE_SELECT);
+
+	if (PortalIsParallelRetrieveCursor(portal))
+	{
+		WaitEndpointsReady(portal->queryDesc->estate);
+
+		/* Enable the check error timer if the alarm is not active */
+		enable_parallel_retrieve_cursor_check_timeout();
+	}
 
 	/*
 	 * We're done; the query won't actually be run until PerformPortalFetch is
@@ -230,6 +260,23 @@ PerformPortalFetch(FetchStmt *stmt,
 				(errcode(ERRCODE_UNDEFINED_CURSOR),
 				 errmsg("cursor \"%s\" does not exist", stmt->portalname)));
 		return;					/* keep compiler happy */
+	}
+
+	if (PortalIsParallelRetrieveCursor(portal))
+	{
+		if (stmt->ismove)
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("the 'MOVE' statement for PARALLEL RETRIEVE CURSOR is not supported")));
+		}
+		else
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_SYNTAX_ERROR),
+					 errmsg("cannot specify 'FETCH' for PARALLEL RETRIEVE CURSOR"),
+					 errhint("Use 'RETRIEVE' statement on endpoint instead.")));
+		}
 	}
 
 	/* Adjust dest if needed.  MOVE wants destination DestNone */
@@ -351,6 +398,11 @@ PortalCleanup(Portal portal)
 		}
 	}
 
+	if (PortalIsParallelRetrieveCursor(portal) && pg_atomic_read_u32((pg_atomic_uint32 *) parallelCursorCount) > 0)
+	{
+		pg_atomic_sub_fetch_u32((pg_atomic_uint32 *) parallelCursorCount, 1);
+	}
+
 	/* 
 	 * If resource scheduling is enabled, release the resource lock. 
 	 */
@@ -424,6 +476,8 @@ PersistHoldablePortal(Portal portal)
 	savePortalContext = PortalContext;
 	PG_TRY();
 	{
+		ScanDirection direction = ForwardScanDirection;
+
 		ActivePortal = portal;
 		if (portal->resowner)
 			CurrentResourceOwner = portal->resowner;
@@ -434,15 +488,41 @@ PersistHoldablePortal(Portal portal)
 		PushActiveSnapshot(queryDesc->snapshot);
 
 		/*
-		 * Rewind the executor: we need to store the entire result set in the
-		 * tuplestore, so that subsequent backward FETCHs can be processed.
+		 * If the portal is marked scrollable, we need to store the entire
+		 * result set in the tuplestore, so that subsequent backward FETCHs
+		 * can be processed.  Otherwise, store only the not-yet-fetched rows.
+		 * (The latter is not only more efficient, but avoids semantic
+		 * problems if the query's output isn't stable.)
+		 *
+		 * In the no-scroll case, tuple indexes in the tuplestore will not
+		 * match the cursor's nominal position (portalPos).  Currently this
+		 * causes no difficulty because we only navigate in the tuplestore by
+		 * relative position, except for the tuplestore_skiptuples call below
+		 * and the tuplestore_rescan call in DoPortalRewind, both of which are
+		 * disabled for no-scroll cursors.  But someday we might need to track
+		 * the offset between the holdStore and the cursor's nominal position
+		 * explicitly.
+		 *
+		 * Greenplum doesn't allow scanning backwards in MPP! skip this call
+		 * and skip the reset position call few lines down.
 		 */
-		/*
-		 * We don't allow scanning backwards in MPP! skip this call and 
-		 * skip the reset position call few lines down.
-		 */
-		if (Gp_role == GP_ROLE_UTILITY)
+		if (portal->cursorOptions & CURSOR_OPT_SCROLL && Gp_role == GP_ROLE_UTILITY)
+		{
 			ExecutorRewind(queryDesc);
+		}
+		else
+		{
+			/*
+			 * If we already reached end-of-query, set the direction to
+			 * NoMovement to avoid trying to fetch any tuples.  (This check
+			 * exists because not all plan node types are robust about being
+			 * called again if they've already returned NULL once.)  We'll
+			 * still set up an empty tuplestore, though, to keep this from
+			 * being a special case later.
+			 */
+			if (portal->atEnd)
+				direction = NoMovementScanDirection;
+		}
 
 		/*
 		 * Change the destination to output to the tuplestore.  Note we tell
@@ -456,7 +536,7 @@ PersistHoldablePortal(Portal portal)
 										true);
 
 		/* Fetch the result set into the tuplestore */
-		ExecutorRun(queryDesc, ForwardScanDirection, 0L, false);
+		ExecutorRun(queryDesc, direction, 0L, false);
 
 		queryDesc->dest->rDestroy(queryDesc->dest);
 		queryDesc->dest = NULL;
@@ -480,7 +560,7 @@ PersistHoldablePortal(Portal portal)
 		 * don't want to reset the position because we are already in
 		 * the position we need to be. Allow this only in utility mode.
 		 */
-		if(Gp_role == GP_ROLE_UTILITY)
+		if (Gp_role == GP_ROLE_UTILITY)
 		{
 			if (portal->atEnd)
 			{
@@ -495,10 +575,17 @@ PersistHoldablePortal(Portal portal)
 			{
 				tuplestore_rescan(portal->holdStore);
 
-				if (!tuplestore_skiptuples(portal->holdStore,
-										   portal->portalPos,
-										   true))
-					elog(ERROR, "unexpected end of tuple stream");
+				/*
+				 * In the no-scroll case, the start of the tuplestore is exactly
+				 * where we want to be, so no repositioning is wanted.
+				 */
+				if (portal->cursorOptions & CURSOR_OPT_SCROLL)
+				{
+					if (!tuplestore_skiptuples(portal->holdStore,
+											   portal->portalPos,
+											   true))
+						elog(ERROR, "unexpected end of tuple stream");
+				}
 			}
 		}
 	}

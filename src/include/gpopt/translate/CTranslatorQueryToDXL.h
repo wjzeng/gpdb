@@ -44,13 +44,13 @@ namespace gpdxl
 using namespace gpos;
 using namespace gpopt;
 
-typedef CHashMap<ULONG, BOOL, gpos::HashValue<ULONG>, gpos::Equals<ULONG>,
-				 CleanupDelete<ULONG>, CleanupDelete<BOOL> >
-	UlongBoolHashMap;
+using UlongBoolHashMap =
+	CHashMap<ULONG, BOOL, gpos::HashValue<ULONG>, gpos::Equals<ULONG>,
+			 CleanupDelete<ULONG>, CleanupDelete<BOOL>>;
 
-typedef CHashMapIter<INT, ULONG, gpos::HashValue<INT>, gpos::Equals<INT>,
-					 CleanupDelete<INT>, CleanupDelete<ULONG> >
-	IntUlongHashmapIter;
+using IntUlongHashmapIter =
+	CHashMapIter<INT, ULONG, gpos::HashValue<INT>, gpos::Equals<INT>,
+				 CleanupDelete<INT>, CleanupDelete<ULONG>>;
 
 //---------------------------------------------------------------------------
 //	@class:
@@ -129,6 +129,10 @@ private:
 	// CTE producer IDs defined at the current query level
 	UlongBoolHashMap *m_cteid_at_current_query_level_map;
 
+	// id of current query (and for nested queries), it's used for correct assigning
+	// of relation links to target relation of DML query
+	ULONG m_query_id;
+
 	//ctor
 	// private constructor, called from the public factory function QueryToDXLInstance
 	CTranslatorQueryToDXL(
@@ -142,6 +146,9 @@ private:
 	// check for unsupported node types, throws an exception if an unsupported
 	// node is found
 	static void CheckUnsupportedNodeTypes(Query *query);
+
+	// walker to check if SUBLINK node is present in the security quals
+	static BOOL CheckSublinkInSecurityQuals(Node *node, void *context);
 
 	// check for SIRV functions in the targetlist without a FROM clause and
 	// throw an exception when found
@@ -216,6 +223,10 @@ private:
 
 	// check if the argument of a DQA has already being used by another DQA
 	static BOOL IsDuplicateDqaArg(List *dqa_list, Aggref *aggref);
+
+	void CheckNoDuplicateAliasGroupingColumn(List *target_list,
+											 List *group_clause,
+											 List *grouping_set);
 
 	// translate a query with grouping sets
 	CDXLNode *TranslateGroupingSets(

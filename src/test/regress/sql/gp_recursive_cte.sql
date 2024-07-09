@@ -432,3 +432,115 @@ with recursive the_cte_here(n) as (
   select n+1 from the_cte_here join t_rand_test_rcte
 	              on t_rand_test_rcte.c = the_cte_here.n)
 select * from the_cte_here;
+
+-- WTIH RECURSIVE and subquery
+with recursive cte (n) as
+(
+  select 1
+  union all
+  select * from
+  (
+    with x(n) as (select n from cte)
+    select n + 1 from x where n < 10
+  ) q
+)
+select * from cte;
+
+-- Test recursive CTE when the non-recursive term is a table scan with a
+-- predicate on the distribution key, and the recursive term joins the CTE with
+-- the same table on its non-distribution key
+create table recursive_table_6(a numeric(4), b int);
+insert into recursive_table_6 values (0::numeric, 3);
+insert into recursive_table_6 values (2::numeric, 0);
+insert into recursive_table_6 values (5::numeric, 0);
+analyze recursive_table_6;
+
+SELECT $query$
+WITH RECURSIVE cte (i, j) AS (
+    SELECT a, b FROM recursive_table_6 WHERE a = 0::numeric::numeric
+    UNION ALL
+    SELECT a, b FROM recursive_table_6, cte WHERE cte.i = recursive_table_6.b
+)
+SELECT i, j FROM cte;
+$query$ AS qry \gset
+
+EXPLAIN (COSTS OFF)
+    :qry ;
+
+:qry ;
+
+-- Test recursive CTE doesnt create a plan with motion on top of worktablescan
+CREATE TABLE t1 (a int, b int) DISTRIBUTED BY (a);
+SET enable_nestloop = off;
+SET enable_hashjoin = off;
+SET enable_mergejoin = on;
+
+explain (costs off) with recursive rcte as
+   (
+      ( select a, b, 1::integer recursion_level from t1 order by 1 )
+      union all
+
+      select parent_table.a, parent_table.b, rcte.recursion_level + 1
+      from
+      ( select a, b from t1 order by 1 ) parent_table
+      join rcte on rcte.b = parent_table.a
+   )
+select count(*) from rcte;
+
+RESET enable_nestloop;
+RESET enable_hashjoin;
+RESET enable_mergejoin;
+
+-- using union rather than union all for recursive union
+CREATE TABLE tmp(a int, b int);
+INSERT INTO tmp SELECT generate_series(1,5);
+INSERT INTO tmp SELECT * FROM tmp;
+EXPLAIN (costs off)
+WITH RECURSIVE x(a) as
+(
+    select a from tmp
+    union
+    select a+1 from x where a<10
+)
+select * from x ;
+
+WITH RECURSIVE x(a) as
+(
+    select a from tmp
+    union
+    select a+1 from x where a<10
+)
+select * from x ;
+-- issues: https://github.com/greenplum-db/gpdb/issues/16422
+-- Without a reference to CTE in subselect and with a group clause
+CREATE TABLE test_cte (a int, b int);
+EXPLAIN (costs off)
+WITH RECURSIVE r(c1, c2) as
+(
+  select a as c1, b as c2 from test_cte
+  union all
+  select r.c1, r.c2 from r
+  join
+  (
+    select a as c1 , max(b) as c2 from test_cte group by c1
+  ) as tmp_table
+  on r.c1 = tmp_table.c1
+)
+select * from r join test_cte on r.c1 = a;
+
+-- Without a reference to CTE in subselect and with a distinct clause
+EXPLAIN (costs off)
+WITH RECURSIVE r(c1, c2) as
+(
+  select a as c1, b as c2 from test_cte
+  union all
+  select r.c1, r.c2 from r
+  join
+  (
+    select max (distinct a )as c1 ,max (distinct b) as c2 from test_cte
+  ) as tmp_table
+  on r.c1 = tmp_table.c1
+)
+select * from r join test_cte on r.c1 = a;
+
+Drop TABLE test_cte;

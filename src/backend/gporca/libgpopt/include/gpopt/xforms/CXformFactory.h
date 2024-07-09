@@ -31,9 +31,9 @@ class CXformFactory
 {
 private:
 	// definition of hash map to maintain mappings
-	typedef CHashMap<CHAR, CXform, gpos::HashValue<CHAR>, CXform::FEqualIds,
-					 CleanupDeleteArray<CHAR>, CleanupNULL<CXform> >
-		XformNameToXformMap;
+	using XformNameToXformMap =
+		CHashMap<CHAR, CXform, gpos::HashValue<CHAR>, CXform::FEqualIds,
+				 CleanupDeleteArray<CHAR>, CleanupNULL<CXform>>;
 
 	// memory pool
 	CMemoryPool *m_mp;
@@ -110,7 +110,7 @@ public:
 	}
 
 	// initialize global factory instance
-	static GPOS_RESULT Init();
+	static void Init();
 
 	// destroy global factory instance
 	static void Shutdown();

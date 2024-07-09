@@ -31,6 +31,7 @@
 #include "access/xloginsert.h"
 #include "access/xact_storage_tablespace.h"
 #include "access/xlogutils.h"
+#include "catalog/index.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_enum.h"
 #include "catalog/storage.h"
@@ -38,6 +39,7 @@
 #include "catalog/storage_database.h"
 #include "commands/async.h"
 #include "commands/dbcommands.h"
+#include "commands/extension.h"
 #include "commands/resgroupcmds.h"
 #include "commands/tablecmds.h"
 #include "commands/trigger.h"
@@ -49,6 +51,7 @@
 #include "replication/logical.h"
 #include "replication/logicallauncher.h"
 #include "replication/origin.h"
+#include "replication/snapbuild.h"
 #include "replication/syncrep.h"
 #include "replication/walsender.h"
 #include "storage/condition_variable.h"
@@ -81,6 +84,7 @@
 #include "access/distributedlog.h"
 #include "catalog/oid_dispatch.h"
 #include "cdb/cdbdistributedsnapshot.h"
+#include "cdb/cdbendpoint.h"
 #include "cdb/cdbgang.h"
 #include "cdb/cdblocaldistribxact.h"
 #include "cdb/cdbtm.h"
@@ -436,13 +440,6 @@ IsAbortInProgress(void)
 	return (s->state == TRANS_ABORT);
 }
 
-bool
-IsTransactionPreparing(void)
-{
-	TransactionState s = CurrentTransactionState;
-
-	return (s->state == TRANS_PREPARE);
-}
 /*
  *	IsAbortedTransactionBlockState
  *
@@ -872,7 +869,7 @@ GetCurrentCommandId(bool used)
 	{
 		/*
 		 * Forbid setting currentCommandIdUsed in a parallel worker, because
-		 * we have no provision for communicating this back to the master.  We
+		 * we have no provision for communicating this back to the leader.  We
 		 * could relax this restriction when currentCommandIdUsed was already
 		 * true at the start of the parallel operation.
 		 */
@@ -1254,7 +1251,7 @@ ExitParallelMode(void)
 /*
  *	IsInParallelMode
  *
- * Are we in a parallel operation, as either the master or a worker?  Check
+ * Are we in a parallel operation, as either the leader or a worker?  Check
  * this to prohibit operations that change backend-local state expected to
  * match across all workers.  Mere caches usually don't require such a
  * restriction.  State modified in a strict push/pop fashion, such as the
@@ -1614,6 +1611,7 @@ RecordTransactionCommit(void)
 		 * delayChkpt flag avoids this situation by blocking checkpointer until a
 		 * backend has finished updating the state.
 		 */
+		Assert(!MyPgXact->delayChkpt);
 		START_CRIT_SECTION();
 		MyPgXact->delayChkpt = true;
 
@@ -1789,17 +1787,23 @@ cleanup:
 /*
  *	RecordDistributedForgetCommitted
  */
-void
+XLogRecPtr
 RecordDistributedForgetCommitted(DistributedTransactionId gxid)
 {
 	xl_xact_distributed_forget xlrec;
+	XLogRecPtr recptr;
 
 	xlrec.gxid = gxid;
 
 	XLogBeginInsert();
 	XLogRegisterData((char *) &xlrec, sizeof(xl_xact_distributed_forget));
 
-	XLogInsert(RM_XACT_ID, XLOG_XACT_DISTRIBUTED_FORGET);
+	recptr = XLogInsert(RM_XACT_ID, XLOG_XACT_DISTRIBUTED_FORGET);
+	/* only flush immediately if we want to wait for remote_apply */
+	if (synchronous_commit >= SYNCHRONOUS_COMMIT_REMOTE_APPLY)
+		XLogFlush(recptr);
+
+	return recptr;
 }
 
 /*
@@ -2428,11 +2432,10 @@ StartTransaction(void)
 
 	/*
 	 * Transactions may be started while recovery is in progress, if
-	 * hot standby is enabled.  This mode is not supported in
-	 * Greenplum yet.
+	 * hot standby is enabled.
 	 */
 	AssertImply(DistributedTransactionContext != DTX_CONTEXT_LOCAL_ONLY,
-				!s->startedInRecovery);
+				EnableHotStandby || !s->startedInRecovery);
 	/*
 	 * MPP Modification
 	 *
@@ -2479,19 +2482,38 @@ StartTransaction(void)
 
 		case DTX_CONTEXT_QE_TWO_PHASE_EXPLICIT_WRITER:
 		case DTX_CONTEXT_QE_TWO_PHASE_IMPLICIT_WRITER:
+			/*
+			 * Sanity check for the global xid.
+			 * 
+			 * Note for hot standby dispatch: the standby QEs are still 
+			 * writers, just like primary QEs for SELECT queries. But 
+			 * hot standby dispatch never has a valid gxid, so we skip
+			 * the gxid checks for the standby QEs.
+			 */
+			if (!IS_HOT_STANDBY_QE())
+			{
+				if (QEDtxContextInfo.distributedXid == InvalidDistributedTransactionId)
+					elog(ERROR,
+						 "distributed transaction id is invalid in context %s",
+						 DtxContextToString(DistributedTransactionContext));
+
+				/*
+				 * Update distributed XID info, this is only used for
+				 * debugging.
+				 */
+				LocalDistribXactData *ele = &MyProc->localDistribXactData;
+				ele->distribXid = QEDtxContextInfo.distributedXid;
+				ele->state = LOCALDISTRIBXACT_STATE_ACTIVE;
+			}
+			else
+				Assert(QEDtxContextInfo.distributedXid == InvalidDistributedTransactionId);
+
+			/* fall through */
 		case DTX_CONTEXT_QE_AUTO_COMMIT_IMPLICIT:
 		{
 			/* If we're running in test-mode insert a delay in writer. */
 			if (gp_enable_slow_writer_testmode)
 				pg_usleep(500000);
-
-			if (DistributedTransactionContext != DTX_CONTEXT_QE_AUTO_COMMIT_IMPLICIT &&
-				QEDtxContextInfo.distributedXid == InvalidDistributedTransactionId)
-			{
-				elog(ERROR,
-					 "distributed transaction id is invalid in context %s",
-					 DtxContextToString(DistributedTransactionContext));
-			}
 
 			/*
 			 * Snapshot must not be created before setting transaction
@@ -2505,27 +2527,13 @@ StartTransaction(void)
 			XactReadOnly = isMppTxOptions_ReadOnly(
 				QEDtxContextInfo.distributedTxnOptions);
 
+			/* a hot standby transaction must be read-only */
+			AssertImply(IS_HOT_STANDBY_QE(), XactReadOnly);
+
 			/*
 			 * MPP: we're a QE Writer.
 			 */
 			MyTmGxact->gxid = QEDtxContextInfo.distributedXid;
-
-			if (DistributedTransactionContext ==
-				DTX_CONTEXT_QE_TWO_PHASE_EXPLICIT_WRITER ||
-				DistributedTransactionContext ==
-				DTX_CONTEXT_QE_TWO_PHASE_IMPLICIT_WRITER)
-			{
-				Assert(QEDtxContextInfo.distributedXid !=
-					   InvalidDistributedTransactionId);
-
-				/*
-				 * Update distributed XID info, this is only used for
-				 * debugging.
-				 */
-				LocalDistribXactData *ele = &MyProc->localDistribXactData;
-				ele->distribXid = QEDtxContextInfo.distributedXid;
-				ele->state = LOCALDISTRIBXACT_STATE_ACTIVE;
-			}
 
 			if (SharedLocalSnapshotSlot != NULL)
 			{
@@ -2684,21 +2692,21 @@ StartTransaction(void)
 	/*
 	 * Acquire a resource group slot.
 	 *
-	 * Slot is successfully acquired when AssignResGroupOnMaster() is returned.
+	 * Slot is successfully acquired when AssignResGroupOnCoordinator() is returned.
 	 * This slot will be released when the transaction is committed or aborted.
 	 *
-	 * Note that AssignResGroupOnMaster() can throw a PG exception. Since we
+	 * Note that AssignResGroupOnCoordinator() can throw a PG exception. Since we
 	 * have set the transaction state to TRANS_INPROGRESS by this point, any
 	 * exceptions thrown will trigger AbortTransaction() and free the slot.
 	 *
 	 * It's important that we acquire the resource group *after* starting the
 	 * transaction (i.e. setting up the per-transaction memory context).
 	 * As part of determining the resource group that the transaction should be
-	 * assigned to, AssignResGroupOnMaster() accesses pg_authid, and a
+	 * assigned to, AssignResGroupOnCoordinator() accesses pg_authid, and a
 	 * transaction should be in progress when it does so.
 	 */
-	if (ShouldAssignResGroupOnMaster())
-		AssignResGroupOnMaster();
+	if (ShouldAssignResGroupOnCoordinator())
+		AssignResGroupOnCoordinator();
 
 	initialize_wal_bytes_written();
 	ShowTransactionState("StartTransaction");
@@ -2744,9 +2752,10 @@ CommitTransaction(void)
 
 	/*
 	 * Do pre-commit processing that involves calling user-defined code, such
-	 * as triggers.  Since closing cursors could queue trigger actions,
-	 * triggers could open cursors, etc, we have to keep looping until there's
-	 * nothing left to do.
+	 * as triggers.  SECURITY_RESTRICTED_OPERATION contexts must not queue an
+	 * action that would run here, because that would bypass the sandbox.
+	 * Since closing cursors could queue trigger actions, triggers could open
+	 * cursors, etc, we have to keep looping until there's nothing left to do.
 	 */
 	for (;;)
 	{
@@ -2764,15 +2773,15 @@ CommitTransaction(void)
 			break;
 	}
 
-	CallXactCallbacks(is_parallel_worker ? XACT_EVENT_PARALLEL_PRE_COMMIT
-					  : XACT_EVENT_PRE_COMMIT);
-
 	/*
 	 * The remaining actions cannot call any user-defined code, so it's safe
 	 * to start shutting down within-transaction services.  But note that most
 	 * of this stuff could still throw an error, which would switch us into
 	 * the transaction-abort path.
 	 */
+
+	CallXactCallbacks(is_parallel_worker ? XACT_EVENT_PARALLEL_PRE_COMMIT
+					  : XACT_EVENT_PRE_COMMIT);
 
 	/* If we might have parallel workers, clean them up now. */
 	if (IsInParallelMode())
@@ -2800,6 +2809,14 @@ CommitTransaction(void)
 	AtEOXact_LargeObject(true);
 
 	/*
+	 * Insert notifications sent by NOTIFY commands into the queue.  This
+	 * should be late in the pre-commit sequence to minimize time spent
+	 * holding the notify-insertion lock.  However, this could result in
+	 * creating a snapshot, so we must do it before serializable cleanup.
+	 */
+	PreCommit_Notify();
+
+	/*
 	 * Mark serializable transaction as complete for predicate locking
 	 * purposes.  This should be done as late as we can put it and still allow
 	 * errors to be raised for failure patterns found at commit.  This is not
@@ -2808,13 +2825,6 @@ CommitTransaction(void)
 	 */
 	if (!is_parallel_worker)
 		PreCommit_CheckForSerializationFailure();
-
-	/*
-	 * Insert notifications sent by NOTIFY commands into the queue.  This
-	 * should be late in the pre-commit sequence to minimize time spent
-	 * holding the notify-insertion lock.
-	 */
-	PreCommit_Notify();
 
 	/*
 	 * Prepare all QE.
@@ -2864,13 +2874,13 @@ CommitTransaction(void)
 	else
 	{
 		/*
-		 * We must not mark our XID committed; the parallel master is
+		 * We must not mark our XID committed; the parallel leader is
 		 * responsible for that.
 		 */
 		latestXid = InvalidTransactionId;
 
 		/*
-		 * Make sure the master will know about any WAL we wrote before it
+		 * Make sure the leader will know about any WAL we wrote before it
 		 * commits.
 		 */
 		ParallelWorkerReportLastRecEnd(XactLastRecEnd);
@@ -2883,19 +2893,17 @@ CommitTransaction(void)
 	 * signals (which may attempt to abort our now partially-completed
 	 * transaction) until we've notified the QEs.
 	 *
-	 * Very important that PGPROC still thinks the transaction is still in progress so
-	 * SnapshotNow reader don't jump to the conclusion this distributed transaction is
-	 * finished.  So, notifyCommittedDtxTransaction will take responsbility to clear
-	 * PGPROC under the ProcArrayLock after the broadcast.  MPP-16087.
-	 *
-	 * And, that we have not master released locks, yet, too.
+	 * And, that we have not coordinator released locks, yet, too.
 	 *
 	 * Note:  do this BEFORE clearing the resource owner, as the dispatch
 	 * routines might want to use them.  Plus, we want AtCommit_Memory to
 	 * happen after using the dispatcher.
 	 */
 	if (notifyCommittedDtxTransactionIsNeeded())
+	{
+		SIMPLE_FAULT_INJECTOR("before_notify_commited_dtx_transaction");
 		notifyCommittedDtxTransaction();
+	}
 
 	/*
 	 * Let others know about no transaction in progress by me. Note that this
@@ -2972,13 +2980,14 @@ CommitTransaction(void)
 	DoPendingDbDeletes(true);
 
 	/*
-	 * Only QD holds the session level lock this long for a movedb operation.
+	 * QE has released the session level lock before Prepare Transaction.Only QD
+	 * and utility server hold the session lock this long for a movedb operation.
 	 * This is to prevent another transaction from moving database objects into
 	 * the source database oid directory while it is being deleted. We don't
 	 * worry about aborts as we release session level locks automatically during
 	 * an abort as opposed to a commit.
 	 */
-	if(Gp_role == GP_ROLE_DISPATCH)
+	if(Gp_role == GP_ROLE_DISPATCH || Gp_role == GP_ROLE_UTILITY)
 		MoveDbSessionLockRelease();
 
 	AtCommit_TablespaceStorage();
@@ -3037,7 +3046,7 @@ CommitTransaction(void)
 
 	/* Release resource group slot at the end of a transaction */
 	if (ShouldUnassignResGroup())
-		UnassignResGroup(false);
+		UnassignResGroup();
 }
 
 /*
@@ -3110,14 +3119,14 @@ PrepareTransaction(void)
 	/* close large objects before lower-level cleanup */
 	AtEOXact_LargeObject(true);
 
+	/* NOTIFY requires no work at this point */
+
 	/*
 	 * Mark serializable transaction as complete for predicate locking
 	 * purposes.  This should be done as late as we can put it and still allow
 	 * errors to be raised for failure patterns found at commit.
 	 */
 	PreCommit_CheckForSerializationFailure();
-
-	/* NOTIFY will be handled below */
 
 	/*
 	 * In Postgres, XACT_FLAGS_ACCESSEDTEMPNAMESPACE is used to error out if
@@ -3256,6 +3265,13 @@ PrepareTransaction(void)
 	XactLastRecEnd = 0;
 
 	/*
+	 * Transfer our locks to a dummy PGPROC.  This has to be done before
+	 * ProcArrayClearTransaction().  Otherwise, a GetLockConflicts() would
+	 * conclude "xact already committed or aborted" for our locks.
+	 */
+	PostPrepare_Locks(xid);
+
+	/*
 	 * Let others know about no transaction in progress by me.  This has to be
 	 * done *after* the prepared transaction has been marked valid, else
 	 * someone may think it is unlocked and recyclable.
@@ -3301,7 +3317,6 @@ PrepareTransaction(void)
 
 	PostPrepare_MultiXact(xid);
 
-	PostPrepare_Locks(xid);
 	PostPrepare_PredicateLocks(xid);
 
 	ResourceOwnerRelease(TopTransactionResourceOwner,
@@ -3368,7 +3383,7 @@ PrepareTransaction(void)
 
 	/* Release resource group slot at the end of prepare transaction on segment */
 	if (ShouldUnassignResGroup())
-		UnassignResGroup(false);
+		UnassignResGroup();
 }
 
 
@@ -3389,6 +3404,10 @@ AbortTransaction(void)
 
 	/* Make sure we have a valid memory context and resource owner */
 	AtAbort_Memory();
+
+	if (Gp_role == GP_ROLE_EXECUTE)
+		ResetExtensionCreatingGlobalVarsOnQE();
+
 	AtAbort_ResourceOwner();
 
 	/*
@@ -3462,6 +3481,12 @@ AbortTransaction(void)
 	 */
 	SetUserIdAndSecContext(s->prevUser, s->prevSecContext);
 
+	/* Forget about any active REINDEX. */
+	ResetReindexState(s->nestingLevel);
+
+	/* Reset snapshot export state. */
+	SnapBuildResetExportedSnapshotState();
+
 	/* If in parallel mode, clean up workers and exit parallel mode. */
 	if (IsInParallelMode())
 	{
@@ -3473,6 +3498,7 @@ AbortTransaction(void)
 	 * do abort processing
 	 */
 	AfterTriggerEndXact(false); /* 'false' means it's abort */
+	AtAbort_EndpointExecState();
 	AtAbort_Portals();
 	AtAbort_DispatcherState();
 	AtEOXact_SharedSnapshot();
@@ -3501,7 +3527,7 @@ AbortTransaction(void)
 		latestXid = InvalidTransactionId;
 
 		/*
-		 * Since the parallel master won't get our value of XactLastRecEnd in
+		 * Since the parallel leader won't get our value of XactLastRecEnd in
 		 * this case, we nudge WAL-writer ourselves in this case.  See related
 		 * comments in RecordTransactionAbort for why this matters.
 		 */
@@ -3545,7 +3571,20 @@ AbortTransaction(void)
 		AtEOXact_ComboCid_Dsm_Detach();
 		AtEOXact_Buffers(false);
 		AtEOXact_RelationCache(false);
-		AtEOXact_Inval(false);
+		/*
+		 * Greenplum specific behavior:
+		 *   We pass is_commit to true even we are here Aborting Transaction.
+		 *   Greenplum has writer gang and reader gangs, only writer gang can
+		 *   modify database (like catalog ...), and gang can be reused in
+		 *   Greenplum in the same session. Thus when we abort a transaction,
+		 *   we still have to tell other reader gangs to abort those catcaches.
+		 *   EntryDB is reader gang in coordinator, we also want to tell them
+		 *   to invalidate catcache when QD abort.
+		 *   Discussion: https://groups.google.com/a/greenplum.org/g/gpdb-dev/c/u3-D7isdvmM
+		 */
+		bool need_inval_even_for_abort = ((Gp_role == GP_ROLE_EXECUTE && Gp_is_writer) ||
+										  Gp_role == GP_ROLE_DISPATCH); /* test QD to invalidate entryDB's catcache */
+		AtEOXact_Inval(need_inval_even_for_abort);
 		AtEOXact_MultiXact();
 
 		ResourceOwnerRelease(TopTransactionResourceOwner,
@@ -3617,7 +3656,7 @@ AbortTransaction(void)
 
 	/* Release resource group slot at the end of a transaction */
 	if (ShouldUnassignResGroup())
-		UnassignResGroup(false);
+		UnassignResGroup();
 }
 
 /*
@@ -3673,7 +3712,7 @@ CleanupTransaction(void)
 
 	/* Release resource group slot at the end of a transaction */
 	if (ShouldUnassignResGroup())
-		UnassignResGroup(false);
+		UnassignResGroup();
 }
 
 /*
@@ -3898,6 +3937,9 @@ CommitTransactionCommand(void)
 			s->blockState = TBLOCK_DEFAULT;
 			if (s->chain)
 			{
+				if (Gp_role == GP_ROLE_DISPATCH)
+					setupRegularDtxContext();
+
 				StartTransaction();
 				s->blockState = TBLOCK_INPROGRESS;
 				s->chain = false;
@@ -3924,6 +3966,9 @@ CommitTransactionCommand(void)
 			s->blockState = TBLOCK_DEFAULT;
 			if (s->chain)
 			{
+				if (Gp_role == GP_ROLE_DISPATCH)
+					setupRegularDtxContext();
+
 				StartTransaction();
 				s->blockState = TBLOCK_INPROGRESS;
 				s->chain = false;
@@ -3942,6 +3987,9 @@ CommitTransactionCommand(void)
 			s->blockState = TBLOCK_DEFAULT;
 			if (s->chain)
 			{
+				if (Gp_role == GP_ROLE_DISPATCH)
+					setupRegularDtxContext();
+
 				StartTransaction();
 				s->blockState = TBLOCK_INPROGRESS;
 				s->chain = false;
@@ -4007,6 +4055,16 @@ CommitTransactionCommand(void)
 				Assert(s->parent == NULL);
 				CommitTransaction();
 				s->blockState = TBLOCK_DEFAULT;
+				if (s->chain)
+				{
+					if (Gp_role == GP_ROLE_DISPATCH)
+						setupRegularDtxContext();
+
+					StartTransaction();
+					s->blockState = TBLOCK_INPROGRESS;
+					s->chain = false;
+					RestoreTransactionCharacteristics();
+				}
 			}
 			else if (s->blockState == TBLOCK_PREPARE)
 			{
@@ -4288,6 +4346,9 @@ AbortCurrentTransaction(void)
  *	could issue more commands and possibly cause a failure after the statement
  *	completes).  Subtransactions are verboten too.
  *
+ *	We must also set XACT_FLAGS_NEEDIMMEDIATECOMMIT in MyXactFlags, to ensure
+ *	that postgres.c follows through by committing after the statement is done.
+ *
  *	isTopLevel: passed down from ProcessUtility to determine whether we are
  *	inside a function.  (We will always fail if this is false, but it's
  *	convenient to centralize the check here instead of making callers do it.)
@@ -4329,7 +4390,9 @@ PreventInTransactionBlock(bool isTopLevel, const char *stmtType)
 	if (CurrentTransactionState->blockState != TBLOCK_DEFAULT &&
 		CurrentTransactionState->blockState != TBLOCK_STARTED)
 		elog(FATAL, "cannot prevent transaction chain");
-	/* all okay */
+
+	/* All okay.  Set the flag to make sure the right thing happens later. */
+	MyXactFlags |= XACT_FLAGS_NEEDIMMEDIATECOMMIT;
 }
 
 /*
@@ -4426,6 +4489,13 @@ IsInTransactionBlock(bool isTopLevel)
 	if (CurrentTransactionState->blockState != TBLOCK_DEFAULT &&
 		CurrentTransactionState->blockState != TBLOCK_STARTED)
 		return true;
+
+	/*
+	 * If we tell the caller we're not in a transaction block, then inform
+	 * postgres.c that it had better commit when the statement is done.
+	 * Otherwise our report could be a lie.
+	 */
+	MyXactFlags |= XACT_FLAGS_NEEDIMMEDIATECOMMIT;
 
 	return false;
 }
@@ -4635,14 +4705,9 @@ BeginTransactionBlock(void)
 		case TBLOCK_SUBINPROGRESS:
 		case TBLOCK_ABORT:
 		case TBLOCK_SUBABORT:
-			if (Gp_role == GP_ROLE_EXECUTE)
-				ereport(DEBUG1,
-						(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
-						 errmsg("there is already a transaction in progress")));
-			else
-				ereport(WARNING,
-						(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
-						 errmsg("there is already a transaction in progress")));
+			ereport(Gp_role == GP_ROLE_EXECUTE ? DEBUG1 : WARNING,
+					(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
+					 errmsg("there is already a transaction in progress")));
 			break;
 
 			/* These cases are invalid. */
@@ -5452,6 +5517,7 @@ void
 BeginInternalSubTransaction(const char *name)
 {
 	TransactionState s = CurrentTransactionState;
+	SIMPLE_FAULT_INJECTOR("begin_internal_sub_transaction");
 
 	if (Gp_role == GP_ROLE_DISPATCH)
 	{
@@ -5581,7 +5647,7 @@ RollbackAndReleaseCurrentSubTransaction(void)
 
 	/*
 	 * Unlike ReleaseCurrentSubTransaction(), this is nominally permitted
-	 * during parallel operations.  That's because we may be in the master,
+	 * during parallel operations.  That's because we may be in the leader,
 	 * recovering from an error thrown while we were in parallel mode.  We
 	 * won't reach here in a worker, because BeginInternalSubTransaction()
 	 * will have failed.
@@ -5658,6 +5724,15 @@ AbortOutOfAnyTransaction(void)
 
 	/* Ensure we're not running in a doomed memory context */
 	AtAbort_Memory();
+
+	/*
+	 * Greenplum specific behavior:
+	 * Some QEs might already be in Abort State, they still need
+	 * to reset Extension related global vars, so we invoke them
+	 * here (not AbortTransction).
+	 */
+	if (Gp_role == GP_ROLE_EXECUTE)
+		ResetExtensionCreatingGlobalVarsOnQE();
 
 	/*
 	 * Get out of any transaction or nested transaction
@@ -5960,6 +6035,7 @@ CommitSubTransaction(void)
 	AfterTriggerEndSubXact(true);
 	AtSubCommit_Portals(s->subTransactionId,
 						s->parent->subTransactionId,
+						s->parent->nestingLevel,
 						s->parent->curTransactionOwner);
 	AtEOSubXact_LargeObject(true, s->subTransactionId,
 							s->parent->subTransactionId);
@@ -6100,6 +6176,14 @@ AbortSubTransaction(void)
 	 * AbortTransaction.)
 	 */
 	SetUserIdAndSecContext(s->prevUser, s->prevSecContext);
+
+	/* Forget about any active REINDEX. */
+	ResetReindexState(s->nestingLevel);
+
+	/*
+	 * No need for SnapBuildResetExportedSnapshotState() here, snapshot
+	 * exports are not supported in subtransactions.
+	 */
 
 	/* Exit from parallel mode, if necessary. */
 	if (IsInParallelMode())
@@ -6418,8 +6502,9 @@ SerializeTransactionState(Size maxsize, char *start_address)
 	{
 		if (FullTransactionIdIsValid(s->fullTransactionId))
 			workspace[i++] = XidFromFullTransactionId(s->fullTransactionId);
-		memcpy(&workspace[i], s->childXids,
-			   s->nChildXids * sizeof(TransactionId));
+		if (s->nChildXids > 0)
+			memcpy(&workspace[i], s->childXids,
+				   s->nChildXids * sizeof(TransactionId));
 		i += s->nChildXids;
 	}
 	Assert(i == nxids);
@@ -6721,8 +6806,8 @@ XactLogCommitRecord(TimestampTz commit_time,
 	xl_xact_distrib xl_distrib;
 	xl_xact_deldbs xl_deldbs;
 	XLogRecPtr recptr;
-	bool isOnePhaseQE = (Gp_role == GP_ROLE_EXECUTE && MyTmGxactLocal->isOnePhaseCommit);
 	bool isDtxPrepared = isPreparedDtxTransaction();
+	DistributedTransactionId distrib_xid = getDistributedTransactionId();
 
 	uint8		info;
 
@@ -6811,10 +6896,11 @@ XactLogCommitRecord(TimestampTz commit_time,
 		xl_origin.origin_timestamp = replorigin_session_origin_timestamp;
 	}
 
-	if (isDtxPrepared || isOnePhaseQE)
+	/* include distributed xid if there's one */
+	if (distrib_xid != InvalidDistributedTransactionId)
 	{
 		xl_xinfo.xinfo |= XACT_XINFO_HAS_DISTRIB;
-		xl_distrib.distrib_xid = getDistributedTransactionId();
+		xl_distrib.distrib_xid = distrib_xid;
 	}
 
 	if (xl_xinfo.xinfo != 0)
@@ -7172,6 +7258,7 @@ xact_redo_commit(xl_xact_parsed_commit *parsed,
 	if (parsed->ndeldbs > 0)
 	{
 		XLogFlush(lsn);
+
 		DropDatabaseDirectories(parsed->deldbs, parsed->ndeldbs, true);
 	}
 
@@ -7222,8 +7309,18 @@ xact_redo_distributed_commit(xl_xact_parsed_commit *parsed,
 	redoDistributedCommitRecord(parsed->distribXid);
 }
 
+/*
+ * Be careful with the order of execution, as with xact_redo_commit().
+ * The two functions are similar but differ in key places.
+ *
+ * Note also that an abort can be for a subtransaction and its children,
+ * not just for a top level abort. That means we have to consider
+ * topxid != xid, whereas in commit we would find topxid == xid always
+ * because subtransaction commit is never WAL logged.
+ */
 static void
-xact_redo_abort(xl_xact_parsed_abort *parsed, TransactionId xid)
+xact_redo_abort(xl_xact_parsed_abort *parsed, TransactionId xid,
+				XLogRecPtr lsn)
 {
 	TransactionId max_xid;
 
@@ -7274,8 +7371,24 @@ xact_redo_abort(xl_xact_parsed_abort *parsed, TransactionId xid)
 	}
 
 	/* Make sure files supposed to be dropped are dropped */
-	DropRelationFiles(parsed->xnodes, parsed->nrels, true);
-	DropDatabaseDirectories(parsed->deldbs, parsed->ndeldbs, true);
+	if (parsed->nrels > 0)
+	{
+		/*
+		 * See comments about update of minimum recovery point on truncation,
+		 * in xact_redo_commit().
+		 */
+		XLogFlush(lsn);
+
+		DropRelationFiles(parsed->xnodes, parsed->nrels, true);
+	}
+
+	if (parsed->ndeldbs > 0)
+	{
+		XLogFlush(lsn);
+
+		DropDatabaseDirectories(parsed->deldbs, parsed->ndeldbs, true);
+	}
+
 	DoTablespaceDeletionForRedoXlog(parsed->tablespace_oid_to_delete_on_abort);
 }
 
@@ -7323,7 +7436,7 @@ xact_redo(XLogReaderState *record)
 		xl_xact_parsed_abort parsed;
 
 		ParseAbortRecord(XLogRecGetInfo(record), xlrec, &parsed);
-		xact_redo_abort(&parsed, XLogRecGetXid(record));
+		xact_redo_abort(&parsed, XLogRecGetXid(record), record->EndRecPtr);
 	}
 	else if (info == XLOG_XACT_ABORT_PREPARED)
 	{
@@ -7331,7 +7444,7 @@ xact_redo(XLogReaderState *record)
 		xl_xact_parsed_abort parsed;
 
 		ParseAbortRecord(XLogRecGetInfo(record), xlrec, &parsed);
-		xact_redo_abort(&parsed, parsed.twophase_xid);
+		xact_redo_abort(&parsed, parsed.twophase_xid, record->EndRecPtr);
 
 		/* Delete TwoPhaseState gxact entry and/or 2PC file. */
 		LWLockAcquire(TwoPhaseStateLock, LW_EXCLUSIVE);

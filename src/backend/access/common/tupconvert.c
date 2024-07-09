@@ -144,8 +144,18 @@ convert_tuples_by_position(TupleDesc indesc,
 	{
 		for (i = 0; i < n; i++)
 		{
-			Form_pg_attribute inatt;
-			Form_pg_attribute outatt;
+			Form_pg_attribute inatt = TupleDescAttr(indesc, i);
+			Form_pg_attribute outatt = TupleDescAttr(outdesc, i);
+
+			/*
+			 * If the input column has a missing attribute, we need a
+			 * conversion.
+			 */
+			if (inatt->atthasmissing)
+			{
+				same = false;
+				break;
+			}
 
 			if (attrMap[i] == (i + 1))
 				continue;
@@ -155,8 +165,6 @@ convert_tuples_by_position(TupleDesc indesc,
 			 * also dropped, we needn't convert.  However, attlen and attalign
 			 * must agree.
 			 */
-			inatt = TupleDescAttr(indesc, i);
-			outatt = TupleDescAttr(outdesc, i);
 			if (attrMap[i] == 0 &&
 				inatt->attisdropped &&
 				inatt->attlen == outatt->attlen &&
@@ -321,6 +329,86 @@ convert_tuples_by_name_map(TupleDesc indesc,
 }
 
 /*
+ * Return a palloc'd bare attribute map for tuple conversion, matching input
+ * and output columns by name.  (Dropped columns are ignored in both input and
+ * output.)  This is normally a subroutine for convert_tuples_by_name, but can
+ * be used standalone.
+ *
+ * NOTE: this is identical to the above function, but does
+ * not throw an error if an attribute in the outdesc is missing from the indesc.
+ * Future postgres merges will add missing_ok as a parameter to the function and
+ * this can then be removed (commits e1551f9 and ad86d15)
+ */
+AttrNumber *
+convert_tuples_by_name_map_missing_ok(TupleDesc indesc,
+						   TupleDesc outdesc)
+{
+	AttrNumber *attrMap;
+	int			outnatts;
+	int			innatts;
+	int			i;
+	int			nextindesc = -1;
+
+	outnatts = outdesc->natts;
+	innatts = indesc->natts;
+
+	attrMap = (AttrNumber *) palloc0(outnatts * sizeof(AttrNumber));
+	for (i = 0; i < outnatts; i++)
+	{
+		Form_pg_attribute outatt = TupleDescAttr(outdesc, i);
+		char	   *attname;
+		Oid			atttypid;
+		int32		atttypmod;
+		int			j;
+
+		if (outatt->attisdropped)
+			continue;			/* attrMap[i] is already 0 */
+		attname = NameStr(outatt->attname);
+		atttypid = outatt->atttypid;
+		atttypmod = outatt->atttypmod;
+
+		/*
+		 * Now search for an attribute with the same name in the indesc. It
+		 * seems likely that a partitioned table will have the attributes in
+		 * the same order as the partition, so the search below is optimized
+		 * for that case.  It is possible that columns are dropped in one of
+		 * the relations, but not the other, so we use the 'nextindesc'
+		 * counter to track the starting point of the search.  If the inner
+		 * loop encounters dropped columns then it will have to skip over
+		 * them, but it should leave 'nextindesc' at the correct position for
+		 * the next outer loop.
+		 */
+		for (j = 0; j < innatts; j++)
+		{
+			Form_pg_attribute inatt;
+
+			nextindesc++;
+			if (nextindesc >= innatts)
+				nextindesc = 0;
+
+			inatt = TupleDescAttr(indesc, nextindesc);
+			if (inatt->attisdropped)
+				continue;
+			if (strcmp(attname, NameStr(inatt->attname)) == 0)
+			{
+				/* Found it, check type */
+				if (atttypid != inatt->atttypid || atttypmod != inatt->atttypmod)
+					ereport(ERROR,
+							(errcode(ERRCODE_DATATYPE_MISMATCH),
+							 errmsg("could not convert row type"),
+							 errdetail("Attribute \"%s\" of type %s does not match corresponding attribute of type %s.",
+									   attname,
+									   format_type_be(outdesc->tdtypeid),
+									   format_type_be(indesc->tdtypeid))));
+				attrMap[i] = inatt->attnum;
+				break;
+			}
+		}
+	}
+	return attrMap;
+}
+
+/*
  * Returns mapping created by convert_tuples_by_name_map, or NULL if no
  * conversion not required. This is a convenience routine for
  * convert_tuples_by_name() and other functions.
@@ -347,8 +435,18 @@ convert_tuples_by_name_map_if_req(TupleDesc indesc,
 		same = true;
 		for (i = 0; i < n; i++)
 		{
-			Form_pg_attribute inatt;
-			Form_pg_attribute outatt;
+			Form_pg_attribute inatt = TupleDescAttr(indesc, i);
+			Form_pg_attribute outatt = TupleDescAttr(outdesc, i);
+
+			/*
+			 * If the input column has a missing attribute, we need a
+			 * conversion.
+			 */
+			if (inatt->atthasmissing)
+			{
+				same = false;
+				break;
+			}
 
 			if (attrMap[i] == (i + 1))
 				continue;
@@ -358,8 +456,6 @@ convert_tuples_by_name_map_if_req(TupleDesc indesc,
 			 * also dropped, we needn't convert.  However, attlen and attalign
 			 * must agree.
 			 */
-			inatt = TupleDescAttr(indesc, i);
-			outatt = TupleDescAttr(outdesc, i);
 			if (attrMap[i] == 0 &&
 				inatt->attisdropped &&
 				inatt->attlen == outatt->attlen &&
@@ -475,6 +571,59 @@ execute_attr_map_slot(AttrNumber *attrMap,
 	ExecStoreVirtualTuple(out_slot);
 
 	return out_slot;
+}
+
+/*
+ * Perform conversion of bitmap of columns according to the map.
+ *
+ * The input and output bitmaps are offset by
+ * FirstLowInvalidHeapAttributeNumber to accommodate system cols, like the
+ * column-bitmaps in RangeTblEntry.
+ */
+Bitmapset *
+execute_attr_map_cols(Bitmapset *in_cols, TupleConversionMap *map)
+{
+	AttrNumber *attrMap = map->attrMap;
+	int			maplen = map->outdesc->natts;
+	Bitmapset  *out_cols;
+	int			out_attnum;
+
+	/* fast path for the common trivial case */
+	if (in_cols == NULL)
+		return NULL;
+
+	/*
+	 * For each output column, check which input column it corresponds to.
+	 */
+	out_cols = NULL;
+
+	for (out_attnum = FirstLowInvalidHeapAttributeNumber + 1;
+		 out_attnum <= maplen;
+		 out_attnum++)
+	{
+		int			in_attnum;
+
+		if (out_attnum < 0)
+		{
+			/* System column. No mapping. */
+			in_attnum = out_attnum;
+		}
+		else if (out_attnum == 0)
+			continue;
+		else
+		{
+			/* normal user column */
+			in_attnum = attrMap[out_attnum - 1];
+
+			if (in_attnum == 0)
+				continue;
+		}
+
+		if (bms_is_member(in_attnum - FirstLowInvalidHeapAttributeNumber, in_cols))
+			out_cols = bms_add_member(out_cols, out_attnum - FirstLowInvalidHeapAttributeNumber);
+	}
+
+	return out_cols;
 }
 
 /*

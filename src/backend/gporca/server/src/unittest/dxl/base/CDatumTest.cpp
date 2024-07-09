@@ -78,7 +78,7 @@ CDatumTest::EresUnittest_Basics()
 	CAutoOptCtxt aoc(mp, &mda, nullptr, /* pceeval */
 					 CTestUtils::GetCostModel(mp));
 
-	typedef IDatum *(*Pfpdatum)(CMemoryPool *, BOOL);
+	using Pfpdatum = IDatum *(*) (CMemoryPool *, BOOL);
 
 	Pfpdatum rgpf[] = {
 		CreateInt2Datum, CreateInt4Datum, CreateInt8Datum,
@@ -102,7 +102,7 @@ CDatumTest::EresUnittest_Basics()
 			IDatum *datum = rgpf[ul1](mp, is_null);
 			IDatum *pdatumCopy = datum->MakeCopy(mp);
 
-			GPOS_ASSERT(datum->Matches(pdatumCopy));
+			GPOS_UNITTEST_ASSERT(datum->Matches(pdatumCopy));
 
 			const CWStringConst *pstrDatum = datum->GetStrRepr(mp);
 
@@ -226,7 +226,8 @@ CDatumTest::CreateBoolDatum(CMemoryPool *mp, BOOL is_null)
 IDatum *
 CDatumTest::CreateGenericDatum(CMemoryPool *mp, BOOL is_null)
 {
-	CMDIdGPDB *pmdidChar = GPOS_NEW(mp) CMDIdGPDB(GPDB_CHAR);
+	CMDIdGPDB *pmdidChar =
+		GPOS_NEW(mp) CMDIdGPDB(IMDId::EmdidGeneral, GPDB_CHAR);
 
 	const CHAR *val = "test";
 	return GPOS_NEW(mp)
@@ -262,11 +263,11 @@ CDatumTest::StatsComparisonDoubleEqualWithinEpsilon()
 	// create accesssor
 	CMDAccessor *md_accessor = COptCtxt::PoctxtFromTLS()->Pmda();
 
-	IMDId *mdid1 = GPOS_NEW(mp) CMDIdGPDB(GPDB_FLOAT8);
+	IMDId *mdid1 = GPOS_NEW(mp) CMDIdGPDB(IMDId::EmdidGeneral, GPDB_FLOAT8);
 	IDatum *datum1 = CTestUtils::CreateDoubleDatum(mp, md_accessor, mdid1,
 												   CDouble(631.82140500000003));
 
-	IMDId *mdid2 = GPOS_NEW(mp) CMDIdGPDB(GPDB_FLOAT8);
+	IMDId *mdid2 = GPOS_NEW(mp) CMDIdGPDB(IMDId::EmdidGeneral, GPDB_FLOAT8);
 	IDatum *datum2 = CTestUtils::CreateDoubleDatum(mp, md_accessor, mdid2,
 												   CDouble(631.82140700000002));
 
@@ -309,11 +310,11 @@ CDatumTest::StatsComparisonDoubleLessThan()
 	// create accesssor
 	CMDAccessor *md_accessor = COptCtxt::PoctxtFromTLS()->Pmda();
 
-	IMDId *mdid1 = GPOS_NEW(mp) CMDIdGPDB(GPDB_FLOAT8);
+	IMDId *mdid1 = GPOS_NEW(mp) CMDIdGPDB(IMDId::EmdidGeneral, GPDB_FLOAT8);
 	IDatum *datum1 = CTestUtils::CreateDoubleDatum(mp, md_accessor, mdid1,
 												   CDouble(99.82140500000003));
 
-	IMDId *mdid2 = GPOS_NEW(mp) CMDIdGPDB(GPDB_FLOAT8);
+	IMDId *mdid2 = GPOS_NEW(mp) CMDIdGPDB(IMDId::EmdidGeneral, GPDB_FLOAT8);
 	IDatum *datum2 = CTestUtils::CreateDoubleDatum(mp, md_accessor, mdid2,
 												   CDouble(100.92140700000002));
 

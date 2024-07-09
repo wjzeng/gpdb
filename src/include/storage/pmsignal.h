@@ -34,12 +34,12 @@ typedef enum
 {
 	PMSIGNAL_RECOVERY_STARTED,	/* recovery has started */
 	PMSIGNAL_BEGIN_HOT_STANDBY, /* begin Hot Standby */
-	PMSIGNAL_WAKEN_ARCHIVER,	/* send a NOTIFY signal to xlog archiver */
 	PMSIGNAL_ROTATE_LOGFILE,	/* send SIGUSR1 to syslogger to rotate logfile */
 	PMSIGNAL_START_AUTOVAC_LAUNCHER,	/* start an autovacuum launcher */
 	PMSIGNAL_START_AUTOVAC_WORKER,	/* start an autovacuum worker */
 	PMSIGNAL_BACKGROUND_WORKER_CHANGE,	/* background worker state change */
 	PMSIGNAL_START_WALRECEIVER, /* start a walreceiver */
+	PMSIGNAL_WALRCV_STREAMING,    /* walreceiver started streaming */
 	PMSIGNAL_ADVANCE_STATE_MACHINE, /* advance postmaster's state machine */
 
 	PMSIGNAL_WAKEN_FTS,         /* wake up FTS to probe segments */

@@ -93,10 +93,9 @@ class GpStart:
                 logger.info('Coordinator-only start requested for management utilities.')
             else:
                 logger.warning("****************************************************************************")
-                logger.warning("Coordinator-only start requested. Disruptive action if standby coordinator configured.")
-                logger.warning("This is advisable only under the direct supervision of Greenplum support. ")
-                logger.warning("This mode of operation is not supported in a production environment and ")
+                logger.warning("Coordinator-only start requested. If a standby is configured, this command")
                 logger.warning("may lead to a split-brain condition and possible unrecoverable data loss.")
+                logger.warning("Maintenance mode should only be used with direction from Greenplum Support.")
                 logger.warning("****************************************************************************")
                 if self.interactive:
                     if not userinput.ask_yesno(None, "\nContinue with coordinator-only startup", 'N'):
@@ -303,17 +302,17 @@ class GpStart:
         lockfile = "/tmp/.s.PGSQL.%s" % self.port
         tmpfile_exists = os.path.exists(lockfile)
 
-        netstat_port_active = unix.PgPortIsActive.local('check netstat for coordinator port',
+        ss_port_active = unix.PgPortIsActive.local('check ss for coordinator port',
                                                         lockfile, self.port)
-        if tmpfile_exists and netstat_port_active:
+        if tmpfile_exists and ss_port_active:
             logger.info("Have lock file %s and a process running on port %s" % (lockfile, self.port))
             raise ExceptionNoStackTraceNeeded("Coordinator instance process running")
-        elif tmpfile_exists and not netstat_port_active:
+        elif tmpfile_exists and not ss_port_active:
             logger.info("Have lock file %s but no process running on port %s" % (lockfile, self.port))
-        elif not tmpfile_exists and netstat_port_active:
+        elif not tmpfile_exists and ss_port_active:
             logger.info("No lock file %s but a process running on port %s" % (lockfile, self.port))
             raise ExceptionNoStackTraceNeeded("Port %s is already in use" % self.port)
-        elif not tmpfile_exists and not netstat_port_active:
+        elif not tmpfile_exists and not ss_port_active:
             logger.info("No socket connection or lock file in /tmp found for port=%s" % self.port)
 
         logger.info("No Coordinator instance process, entering recovery startup mode")
@@ -398,17 +397,23 @@ class GpStart:
 
     ######
     def _startCoordinator(self):
-        logger.info("Starting Coordinator instance in admin mode")
+        if self.restricted:
+            logger.info("Starting Coordinator instance in admin and RESTRICTED mode")
+        else:
+            logger.info("Starting Coordinator instance in admin mode")
 
-        cmd = gp.CoordinatorStart('coordinator in utility mode', self.coordinator_datadir,
-                             self.port, self.era,
-                             wrapper=self.wrapper, wrapper_args=self.wrapper_args,
-                             specialMode=self.specialMode, timeout=self.timeout, utilityMode=True
-                             )
+        cmd = gp.CoordinatorStart('Coordinator in utility mode with restricted set to {0}'.format(self.restricted),
+                            self.coordinator_datadir, self.port, self.era, wrapper=self.wrapper,
+                            wrapper_args=self.wrapper_args, specialMode=self.specialMode,
+                            restrictedMode=self.restricted, timeout=self.timeout, utilityMode=True,
+                            max_connections=self.max_connections)
         cmd.run()
 
         if cmd.get_results().rc != 0:
-            logger.fatal("Failed to start Coordinator instance in admin mode")
+            if self.restricted:
+                logger.fatal("Failed to start Coordinator instance in admin and RESTRICTED mode")
+            else:
+                logger.fatal("Failed to start Coordinator instance in admin mode")
             cmd.validate()
 
         logger.info("Obtaining Greenplum Coordinator catalog information")

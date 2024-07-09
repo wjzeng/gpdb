@@ -14,7 +14,7 @@ from gppylib.system import faultProberInterface
 from gppylib.system.configurationInterface import GpConfigurationProvider
 from gppylib.operations.rebalanceSegments import GpSegmentRebalanceOperation
 from gppylib.utils import TableLogger
-
+from gppylib.mainUtils import ExceptionNoStackTraceNeeded
 
 class Options:
     def __init__(self):
@@ -23,14 +23,19 @@ class Options:
         self.recoveryConfigFile = None
         self.outputSpareDataDirectoryFile = None
         self.rebalanceSegments = None
+        self.disableReplayLag = None
+        self.replayLag = None
 
         self.outputSampleConfigFile = None
         self.parallelDegree = 1
+        self.parallelPerHost = 1
         self.forceFullResynchronization = None
+        self.differentialResynchronization = None
         self.persistent_check = None
         self.quiet = None
         self.interactive = False
         self.hba_hostnames = False
+        self.maxRate = None
 
 
 class GpRecoversegTestCase(GpTestCase):
@@ -66,12 +71,11 @@ class GpRecoversegTestCase(GpTestCase):
         self.gpArrayMock.getDbList.side_effect = [[self.primary0], [self.primary0], [self.primary0]]
         self.gpArrayMock.segmentPairs = []
         self.gpArrayMock.hasMirrors = True
-        self.gpArrayMock.isStandardArray.return_value = (True, None)
         self.gpArrayMock.coordinator = self.gparray.coordinator
 
         self.config_provider_mock.loadSystemConfig.return_value = self.gpArrayMock
 
-        self.mirror_to_build = GpMirrorToBuild(self.mirror0, self.primary0, None, False)
+        self.mirror_to_build = GpMirrorToBuild(self.mirror0, self.primary0, None, False, False)
         self.apply_patches([
             patch('os.environ', new=self.os_env),
             patch('gppylib.db.dbconn.connect', return_value=self.conn),
@@ -85,9 +89,10 @@ class GpRecoversegTestCase(GpTestCase):
             patch('gppylib.gparray.GpArray.getSegmentsByHostName', return_value={}),
             patch('gppylib.gplog.get_default_logger'),
             patch.object(GpMirrorListToBuild, "__init__", return_value=None),
-            patch.object(GpMirrorListToBuild, "buildMirrors"),
+            patch.object(GpMirrorListToBuild, "recover_mirrors"),
             patch.object(GpMirrorListToBuild, "getAdditionalWarnings"),
             patch.object(GpMirrorListToBuild, "getMirrorsToBuild"),
+            patch.object(GpMirrorListToBuild, "getMaxTransferRate"),
             patch.object(HeapChecksum, "check_segment_consistency"),
             patch.object(HeapChecksum, "get_segments_checksum_settings"),
         ])
@@ -95,7 +100,7 @@ class GpRecoversegTestCase(GpTestCase):
         self.call_count = 0
         self.return_one = True
 
-        self.mock_build_mirrors = self.get_mock_from_apply_patch("buildMirrors")
+        self.mock_build_mirrors = self.get_mock_from_apply_patch("recover_mirrors")
         self.mock_get_mirrors_to_build = self.get_mock_from_apply_patch('getMirrorsToBuild')
         self.mock_heap_checksum_init = self.get_mock_from_apply_patch("__init__")
         self.mock_check_segment_consistency = self.get_mock_from_apply_patch('check_segment_consistency')
@@ -142,7 +147,7 @@ class GpRecoversegTestCase(GpTestCase):
         with self.assertRaisesRegex(Exception, "Heap checksum setting differences reported on segments"):
             self.subject.run()
 
-        self.mock_get_segments_checksum_settings.assert_called_with([self.primary0])
+        self.mock_get_segments_checksum_settings.assert_called_with([self.primary0, self.mirror0])
         self.subject.logger.fatal.assert_any_call('Heap checksum setting differences reported on segments')
         self.subject.logger.fatal.assert_any_call('Failed checksum consistency validation:')
         self.subject.logger.fatal.assert_any_call('sdw1 checksum set to 0 differs from coordinator checksum set to 1')
@@ -157,7 +162,7 @@ class GpRecoversegTestCase(GpTestCase):
         with self.assertRaisesRegex(Exception, "No segments responded to ssh query for heap checksum validation."):
             self.subject.run()
 
-        self.mock_get_segments_checksum_settings.assert_called_with([self.primary0])
+        self.mock_get_segments_checksum_settings.assert_called_with([self.primary0, self.mirror0])
         mock_heap_checksum_init.assert_called_with(self.gpArrayMock, logger=self.subject.logger, num_workers=1)
 
     @patch("os._exit")
@@ -168,8 +173,8 @@ class GpRecoversegTestCase(GpTestCase):
         with self.assertRaises(SystemExit):
             # XXX Disable live FTS probes. The fact that we have to do this
             # indicates that these are not really unit tests.
-            with patch.object(self.subject, 'trigger_fts_probe'):
-                self.subject.run()
+            # with patch.object(self.subject, 'trigger_fts_probe'):
+            self.subject.run()
 
         self.subject.logger.info.assert_any_call('No checksum validation necessary when '
                                                  'there are no segments to recover.')
@@ -218,6 +223,7 @@ class GpRecoversegTestCase(GpTestCase):
         self.subject.logger.info.assert_any_call('The rebalance operation has completed with WARNINGS. '
                                                  'Please review the output in the gprecoverseg log.')
 
+    # @patch('gppylib.programs.clsRecoverSegment.GpRecoverSegmentProgram.trigger_fts_probe')
     @patch.object(TableLogger, "info")
     def test_failed_recover(self, _):
         self.gpArrayMock.get_unbalanced_segdbs.return_value = [self.primary0]
@@ -239,6 +245,7 @@ class GpRecoversegTestCase(GpTestCase):
 
         with self.assertRaises(SystemExit) as cm:
             self.subject.run()
+        # self.assertEqual(1, mock_fts_probe.call_count)
 
         self.assertEqual(cm.exception.code, 1)
 
@@ -264,10 +271,16 @@ class GpRecoversegTestCase(GpTestCase):
         with self.assertRaises(SystemExit) as cm:
             # XXX Disable live FTS probes. The fact that we have to do this
             # indicates that these are not really unit tests.
-            with patch.object(self.subject, 'trigger_fts_probe'):
-                self.subject.run()
+            # with patch.object(self.subject, 'trigger_fts_probe'):
+            self.subject.run()
 
         self.assertEqual(cm.exception.code, 0)
+
+    def test_gprecoverseg_with_mirrorless(self):
+        self.gpArrayMock.hasMirrors = False
+        with self.assertRaisesRegex(ExceptionNoStackTraceNeeded,
+                                    "GPDB Mirroring replication is not configured for this Greenplum Database instance."):
+            self.subject.run()
 
     def _create_gparray_with_2_primary_2_mirrors(self):
         coordinator = Segment.initFromString(

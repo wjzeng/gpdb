@@ -13,10 +13,12 @@
 
 #include "gpos/base.h"
 
+#include "gpopt/hints/CPlanHint.h"
 #include "gpopt/operators/CLogicalRightOuterJoin.h"
 #include "gpopt/operators/CPatternLeaf.h"
 #include "gpopt/operators/CPhysicalRightOuterHashJoin.h"
 #include "gpopt/operators/CPredicateUtils.h"
+#include "gpopt/optimizer/COptimizerConfig.h"
 #include "gpopt/xforms/CXformUtils.h"
 
 
@@ -78,15 +80,34 @@ CXformRightOuterJoin2HashJoin::Transform(CXformContext *pxfctxt,
 	GPOS_ASSERT(FPromising(pxfctxt->Pmp(), this, pexpr));
 	GPOS_ASSERT(FCheckPattern(pexpr));
 
+	// If the ROJ is being considered because of a join order hint, then add
+	// the right outer hash join alternative regardless of the stats.
+	CPlanHint *planhint =
+		COptCtxt::PoctxtFromTLS()->GetOptimizerConfig()->GetPlanHint();
+	if (nullptr != planhint && planhint->WasCreatedViaDirectedHint(pexpr))
+	{
+		CXformUtils::ImplementHashJoin<CPhysicalRightOuterHashJoin>(
+			pxfctxt, pxfres, pexpr);
+		return;
+	}
+
+	const IStatistics *outerStats = (*pexpr)[0]->Pstats();
+	const IStatistics *innerStats = (*pexpr)[1]->Pstats();
+
+	if (nullptr == outerStats || nullptr == innerStats)
+	{
+		return;
+	}
+
 	// If the inner row estimate is an arbitary factor larger than the outer, don't generate a ROJ alternative.
 	// Although the ROJ may still be better due to partition selection, which isn't considered below,
 	// we're more cautious so we don't increase optimization time too much and that we account for
 	// poor cardinality estimation. This is admittedly conservative, but mis-estimating the hash side
 	// of a ROJ can cause spilling.
-	CDouble outerRows = (*pexpr)[0]->Pstats()->Rows();
-	CDouble outerWidth = (*pexpr)[0]->Pstats()->Width();
-	CDouble innerRows = (*pexpr)[1]->Pstats()->Rows();
-	CDouble innerWidth = (*pexpr)[1]->Pstats()->Width();
+	CDouble outerRows = outerStats->Rows();
+	CDouble outerWidth = outerStats->Width();
+	CDouble innerRows = innerStats->Rows();
+	CDouble innerWidth = innerStats->Width();
 
 	CDouble confidenceFactor = 2 * (*pexpr)[1]->DeriveJoinDepth();
 	if (innerRows * innerWidth * confidenceFactor > outerRows * outerWidth)

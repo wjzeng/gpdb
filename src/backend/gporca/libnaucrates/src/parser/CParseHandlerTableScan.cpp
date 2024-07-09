@@ -12,7 +12,7 @@
 #include "naucrates/dxl/parser/CParseHandlerTableScan.h"
 
 #include "naucrates/dxl/operators/CDXLOperatorFactory.h"
-#include "naucrates/dxl/operators/CDXLPhysicalExternalScan.h"
+#include "naucrates/dxl/operators/CDXLPhysicalForeignScan.h"
 #include "naucrates/dxl/parser/CParseHandlerFactory.h"
 #include "naucrates/dxl/parser/CParseHandlerFilter.h"
 #include "naucrates/dxl/parser/CParseHandlerProjList.h"
@@ -87,8 +87,8 @@ CParseHandlerTableScan::StartElement(const XMLCh *const element_local_name,
 	}
 	else
 	{
-		GPOS_ASSERT(EdxltokenPhysicalExternalScan == token_type);
-		m_dxl_op = GPOS_NEW(m_mp) CDXLPhysicalExternalScan(m_mp);
+		GPOS_ASSERT(EdxltokenPhysicalForeignScan == token_type);
+		m_dxl_op = GPOS_NEW(m_mp) CDXLPhysicalForeignScan(m_mp);
 	}
 
 	// create child node parsers in reverse order of their expected occurrence
@@ -184,7 +184,7 @@ CParseHandlerTableScan::EndElement(const XMLCh *const element_local_name,
 	m_dxl_op->SetTableDescriptor(table_descr);
 
 	m_dxl_node = GPOS_NEW(m_mp) CDXLNode(m_mp, m_dxl_op);
-	// set statictics and physical properties
+	// set statistics and physical properties
 	CParseHandlerUtils::SetProperties(m_dxl_node, prop_parse_handler);
 
 	// add constructed children

@@ -39,7 +39,7 @@
 #include "catalog/pg_authid.h"
 
 /* segment id for the master */
-#define MASTER_SEGMENT_ID -1
+#define COORDINATOR_SEGMENT_ID -1
 
 volatile FtsProbeInfo *ftsProbeInfo = NULL;	/* Probe process updates this structure */
 
@@ -81,6 +81,10 @@ FtsNotifyProber(void)
 	int32			initial_started;
 	int32			started;
 	int32			done;
+
+	/* Ignore if we don't have a FTS probe process, like a standby QD in a mirrored cluster. */
+	if (FtsProbePID() == 0)
+		return;
 
 	if (am_ftsprobe)
 		return;
@@ -130,8 +134,8 @@ FtsNotifyProber(void)
 bool
 FtsIsSegmentDown(CdbComponentDatabaseInfo *dBInfo)
 {
-	/* master is always reported as alive */
-	if (dBInfo->config->segindex == MASTER_SEGMENT_ID)
+	/* coordinator is always reported as alive */
+	if (dBInfo->config->segindex == COORDINATOR_SEGMENT_ID)
 		return false;
 
 	return FTS_STATUS_IS_DOWN(ftsProbeInfo->status[dBInfo->config->dbid]);

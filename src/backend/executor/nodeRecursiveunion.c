@@ -98,7 +98,7 @@ ExecRecursiveUnion(PlanState *pstate)
 			if (plan->numCols > 0)
 			{
 				/* Find or build hashtable entry for this tuple's group */
-				LookupTupleHashEntry(node->hashtable, slot, &isnew);
+				LookupTupleHashEntry(node->hashtable, slot, &isnew, NULL);
 				/* Must reset temp context after each hashtable lookup */
 				MemoryContextReset(node->tempContext);
 				/* Ignore tuple if already seen */
@@ -128,6 +128,11 @@ ExecRecursiveUnion(PlanState *pstate)
 
 			/* intermediate table becomes working table */
 			node->working_table = node->intermediate_table;
+			for (int k = 1; k < node->refcount; k++)
+			{
+				/* The work table hasn't been scanned yet, it must be at start, don't need to rescan here */
+				tuplestore_alloc_read_pointer(node->working_table, EXEC_FLAG_REWIND);
+			}
 
 			/* create new empty intermediate table */
 			node->intermediate_table = tuplestore_begin_heap(false, false,
@@ -149,7 +154,7 @@ ExecRecursiveUnion(PlanState *pstate)
 		if (plan->numCols > 0)
 		{
 			/* Find or build hashtable entry for this tuple's group */
-			LookupTupleHashEntry(node->hashtable, slot, &isnew);
+			LookupTupleHashEntry(node->hashtable, slot, &isnew, NULL);
 			/* Must reset temp context after each hashtable lookup */
 			MemoryContextReset(node->tempContext);
 			/* Ignore tuple if already seen */
@@ -199,6 +204,7 @@ ExecInitRecursiveUnion(RecursiveUnion *node, EState *estate, int eflags)
 	rustate->intermediate_empty = true;
 	rustate->working_table = tuplestore_begin_heap(false, false, work_mem);
 	rustate->intermediate_table = tuplestore_begin_heap(false, false, work_mem);
+	rustate->refcount = 0;
 
 	/*
 	 * If hashing, we need a per-tuple memory context for comparisons, and a

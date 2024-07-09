@@ -119,6 +119,7 @@ CdbDispatchDtxProtocolCommand(DtxProtocolCommand dtxProtocolCommand,
 
 	if (!pr)
 	{
+		*numresults = 0;
 		cdbdisp_destroyDispatcherState(ds);
 		return NULL;
 	}
@@ -159,7 +160,7 @@ qdSerializeDtxContextInfo(int *size, bool wantSnapshot, bool inCursor,
 	{
 		case DTX_CONTEXT_QD_DISTRIBUTED_CAPABLE:
 		case DTX_CONTEXT_LOCAL_ONLY:
-			DtxContextInfo_CreateOnMaster(&TempQDDtxContextInfo, inCursor,
+			DtxContextInfo_CreateOnCoordinator(&TempQDDtxContextInfo, inCursor,
 										  txnOptions, snapshot);
 
 			if (DistributedTransactionContext ==

@@ -24,6 +24,7 @@
 /* flag bits for CheckAttributeType/CheckAttributeNamesTypes */
 #define CHKATYPE_ANYARRAY		0x01	/* allow ANYARRAY */
 #define CHKATYPE_ANYRECORD		0x02	/* allow RECORD and RECORD[] */
+#define CHKATYPE_IS_PARTKEY		0x04	/* attname is part key # not column */
 
 typedef struct RawColumnDefault
 {
@@ -133,6 +134,7 @@ extern List *AddRelationConstraints(Relation rel,
 						  List *constraints);
 
 extern void RelationClearMissing(Relation rel);
+extern void RelationClearMissingByAttname(Relation rel, char *attname);
 extern void SetAttrMissing(Oid relid, char *attname, char *value);
 
 extern Oid	StoreAttrDefault(Relation rel, AttrNumber attnum,
@@ -157,6 +159,7 @@ extern void RemoveAttributeById(Oid relid, AttrNumber attnum);
 extern void RemoveAttrDefault(Oid relid, AttrNumber attnum,
 							  DropBehavior behavior, bool complain, bool internal);
 extern void RemoveAttrDefaultById(Oid attrdefId);
+extern void CopyStatistics(Oid fromrelid, Oid torelid);
 extern void RemoveStatistics(Oid relid, AttrNumber attnum);
 
 extern const FormData_pg_attribute *SystemAttributeDefinition(AttrNumber attno);
@@ -182,6 +185,8 @@ extern void StorePartitionKey(Relation rel,
 extern void RemovePartitionKeyByRelId(Oid relid);
 extern void StorePartitionBound(Relation rel, Relation parent,
 								PartitionBoundSpec *bound);
+extern void StorePartitionBoundSkipInvalidation(Relation rel, Relation parent,
+												PartitionBoundSpec *bound);
 
 /* MPP-6929: metadata tracking */
 extern void MetaTrackAddObject(Oid		classid, 

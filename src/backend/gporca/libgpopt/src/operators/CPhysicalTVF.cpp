@@ -42,14 +42,20 @@ CPhysicalTVF::CPhysicalTVF(CMemoryPool *mp, IMDId *mdid_func,
 	  m_pdrgpcoldesc(pdrgpcoldesc),
 	  m_pcrsOutput(pcrsOutput)
 {
-	GPOS_ASSERT(m_func_mdid->IsValid());
 	GPOS_ASSERT(m_return_type_mdid->IsValid());
 	GPOS_ASSERT(nullptr != m_pstr);
 	GPOS_ASSERT(nullptr != m_pdrgpcoldesc);
 	GPOS_ASSERT(nullptr != m_pcrsOutput);
 
 	CMDAccessor *md_accessor = COptCtxt::PoctxtFromTLS()->Pmda();
-	m_pmdfunc = md_accessor->RetrieveFunc(m_func_mdid);
+	if (m_func_mdid->IsValid())
+	{
+		m_pmdfunc = md_accessor->RetrieveFunc(m_func_mdid);
+	}
+	else
+	{
+		m_pmdfunc = nullptr;
+	}
 }
 
 
@@ -292,6 +298,13 @@ CPhysicalTVF::PrsDerive(CMemoryPool *mp, CExpressionHandle &exprhdl) const
 	// TVF scan materializes the results of its execution, and so is rewindable.
 	return GPOS_NEW(mp) CRewindabilitySpec(CRewindabilitySpec::ErtRewindable,
 										   CRewindabilitySpec::EmhtNoMotion);
+}
+
+// derive partition propagation
+CPartitionPropagationSpec *
+CPhysicalTVF::PppsDerive(CMemoryPool *mp, CExpressionHandle &) const
+{
+	return GPOS_NEW(mp) CPartitionPropagationSpec(mp);
 }
 
 //---------------------------------------------------------------------------

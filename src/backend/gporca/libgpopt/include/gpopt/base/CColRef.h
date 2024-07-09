@@ -29,18 +29,21 @@ using namespace gpmd;
 class CColRef;
 
 // colref array
-typedef CDynamicPtrArray<CColRef, CleanupNULL> CColRefArray;
-typedef CDynamicPtrArray<CColRefArray, CleanupRelease> CColRef2dArray;
+using CColRefArray = CDynamicPtrArray<CColRef, CleanupNULL>;
+using CColRef2dArray = CDynamicPtrArray<CColRefArray, CleanupRelease>;
 
 // hash map mapping ULONG -> CColRef
-typedef CHashMap<ULONG, CColRef, gpos::HashValue<ULONG>, gpos::Equals<ULONG>,
-				 CleanupDelete<ULONG>, CleanupNULL<CColRef> >
-	UlongToColRefMap;
+using UlongToColRefMap =
+	CHashMap<ULONG, CColRef, gpos::HashValue<ULONG>, gpos::Equals<ULONG>,
+			 CleanupDelete<ULONG>, CleanupNULL<CColRef>>;
+// hash map mapping ULONG -> const CColRef
+using UlongToConstColRefMap =
+	CHashMap<ULONG, const CColRef, gpos::HashValue<ULONG>, gpos::Equals<ULONG>,
+			 CleanupDelete<ULONG>, CleanupNULL<const CColRef>>;
 // iterator
-typedef CHashMapIter<ULONG, CColRef, gpos::HashValue<ULONG>,
-					 gpos::Equals<ULONG>, CleanupDelete<ULONG>,
-					 CleanupNULL<CColRef> >
-	UlongToColRefMapIter;
+using UlongToColRefMapIter =
+	CHashMapIter<ULONG, CColRef, gpos::HashValue<ULONG>, gpos::Equals<ULONG>,
+				 CleanupDelete<ULONG>, CleanupNULL<CColRef>>;
 
 //---------------------------------------------------------------------------
 //	@class:
@@ -171,6 +174,9 @@ public:
 	// is column a distribution column?
 	virtual BOOL IsDistCol() const = 0;
 
+	// is column a partition column?
+	virtual BOOL IsPartCol() const = 0;
+
 	// print
 	IOstream &OsPrint(IOstream &) const;
 
@@ -206,8 +212,7 @@ public:
 	GetUsage(BOOL check_system_col = false,
 			 BOOL check_distribution_col = false) const
 	{
-		if (GPOS_FTRACE(EopttraceTranslateUnusedColrefs) ||
-			(!check_system_col && IsSystemCol()) ||
+		if ((!check_system_col && IsSystemCol()) ||
 			(!check_distribution_col && IsDistCol()))
 		{
 			return EUsed;
@@ -238,12 +243,12 @@ operator<<(IOstream &os, CColRef &cr)
 }
 
 // hash map: CColRef -> ULONG
-typedef CHashMap<CColRef, ULONG, CColRef::HashValue, gpos::Equals<CColRef>,
-				 CleanupNULL<CColRef>, CleanupDelete<ULONG> >
-	ColRefToUlongMap;
+using ColRefToUlongMap =
+	CHashMap<CColRef, ULONG, CColRef::HashValue, gpos::Equals<CColRef>,
+			 CleanupNULL<CColRef>, CleanupDelete<ULONG>>;
 
-typedef CDynamicPtrArray<ColRefToUlongMap, CleanupRelease>
-	ColRefToUlongMapArray;
+using ColRefToUlongMapArray =
+	CDynamicPtrArray<ColRefToUlongMap, CleanupRelease>;
 
 }  // namespace gpopt
 

@@ -31,7 +31,6 @@ OBJS        = CAutoOptCtxt.o \
               CCostContext.o \
               CDatumSortedSet.o \
               CDefaultComparator.o \
-              CDistributionSpecExternal.o \
               CDistributionSpecHashed.o \
               CDistributionSpecHashedNoOp.o \
               CDistributionSpecNonSingleton.o \
@@ -51,6 +50,7 @@ OBJS        = CAutoOptCtxt.o \
               CDrvdPropScalar.o \
               CEnfdDistribution.o \
               CEnfdOrder.o \
+              CEnfdPartitionPropagation.o \
               CEnfdProp.o \
               CEnfdRewindability.o \
               CFunctionProp.o \
@@ -62,6 +62,7 @@ OBJS        = CAutoOptCtxt.o \
               COrderSpec.o \
               CPartInfo.o \
               CPartKeys.o \
+              CPartitionPropagationSpec.o \
               CPrintPrefix.o \
               CPropConstraint.o \
               CQueryContext.o \

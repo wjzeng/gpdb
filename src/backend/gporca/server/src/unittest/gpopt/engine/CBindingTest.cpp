@@ -130,7 +130,7 @@ CBindingTest::EresUnittest_Basic()
 
 	// extract plan
 	CExpression *pexprPlan = eng.PexprExtractPlan();
-	GPOS_ASSERT(nullptr != pexprPlan);
+	GPOS_UNITTEST_ASSERT(nullptr != pexprPlan);
 
 	UlongPtrArray *number_of_bindings = eng.GetNumberOfBindings();
 	ULONG search_stage = 0;
@@ -140,7 +140,9 @@ CBindingTest::EresUnittest_Basic()
 	GPOS_RESULT eres = GPOS_FAILED;
 
 	if (bindings_for_xform == EXPECTED_BINDING)
+	{
 		eres = GPOS_OK;
+	}
 
 	// clean up
 	pexprPlan->Release();

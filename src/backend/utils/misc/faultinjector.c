@@ -22,10 +22,13 @@
 #include "postgres.h"
 
 #include <signal.h>
+#include <unistd.h>
 
 #include "access/xact.h"
 #include "catalog/pg_type.h"
 #include "cdb/cdbutil.h"
+#include "cdb/cdbvars.h"
+#include "common/hashfn.h"
 #include "libpq/libpq.h"
 #include "libpq/pqformat.h"
 #include "postmaster/autovacuum.h"
@@ -34,7 +37,6 @@
 #include "storage/shmem.h"
 #include "tcop/dest.h"
 #include "utils/faultinjector.h"
-#include "utils/hsearch.h"
 #include "miscadmin.h"
 
 /*
@@ -192,7 +194,7 @@ FaultInjector_ShmemSize(void)
  * Hash table contains fault injection that are set on the system waiting to be injected.
  * FaultInjector identifier is the key in the hash table.
  * Hash table in shared memory is initialized only on primary and mirror segment. 
- * It is not initialized on master host.
+ * It is not initialized on coordinator host.
  */
 void
 FaultInjector_ShmemInit(void)
@@ -241,6 +243,44 @@ FaultInjector_ShmemInit(void)
 	return;						  
 }
 
+static bool
+checkBgProcessSkipFault(const char* faultName)
+{
+	if (IsAutoVacuumLauncherProcess())
+	{
+		/* autovacuum launcher process */
+		elog(LOG, "skipped fault '%s' in autovacuum launcher process", faultName);
+		return true;
+	}
+	else if (IsAutoVacuumWorkerProcess())
+	{
+		/* autovacuum worker process */
+		 if (0 != strcmp("vacuum_update_dat_frozen_xid", faultName) &&
+				0 != strcmp("auto_vac_worker_before_do_autovacuum", faultName) &&
+				0 != strcmp("auto_vac_worker_after_report_activity", faultName) &&
+				0 != strcmp("auto_vac_worker_abort", faultName) &&
+				0 != strcmp("analyze_after_hold_lock", faultName) &&
+				0 != strcmp("analyze_finished_one_relation", faultName))
+		{
+			elog(LOG, "skipped fault '%s' in autovacuum worker process", faultName);
+			return true;
+		}
+	}
+	else if (IsDtxRecoveryProcess())
+	{
+		/* dtx recovery process */
+		 if (0 != strcmp("before_orphaned_check", faultName) &&
+				0 != strcmp("after_orphaned_check", faultName) &&
+				0 != strcmp("post_in_doubt_tx_in_progress", faultName) &&
+				0 != strcmp("post_progress_recovery_comitted", faultName))
+		{
+			elog(LOG, "skipped fault '%s' in dtx recovery process", faultName);
+			return true;
+		}
+	}
+	return false;
+}
+
 FaultInjectorType_e
 FaultInjector_InjectFaultIfSet_out_of_line(
 							   const char*				 faultName,
@@ -267,20 +307,12 @@ FaultInjector_InjectFaultIfSet_out_of_line(
 		elog(ERROR, "table name too long: '%s'", tableName);
 
 	/*
-	 * Auto-vacuum worker and launcher process, may run at unpredictable times
-	 * while running tests. So, skip setting any faults for auto-vacuum
-	 * launcher or worker. If anytime in future need to test these processes
-	 * using fault injector framework, this restriction needs to be lifted and
-	 * some other mechanism needs to be placed to avoid flaky failures.
+	 * Some background processes may run at unpredictable times and hit faults that
+	 * are desired for other backends. So, skip setting any faults for the processes
+	 * we've found problems with, except for a few faults that we want to test for
+	 * those processes. 
 	 */
-	if (IsAutoVacuumLauncherProcess() ||
-		(IsAutoVacuumWorkerProcess() &&
-		 !(0 == strcmp("vacuum_update_dat_frozen_xid", faultName) ||
-		   0 == strcmp("auto_vac_worker_before_do_autovacuum", faultName) ||
-		   0 == strcmp("auto_vac_worker_after_report_activity", faultName) ||
-		   0 == strcmp("auto_vac_worker_abort", faultName) ||
-		   0 == strcmp("analyze_after_hold_lock", faultName) ||
-		   0 == strcmp("analyze_finished_one_relation", faultName))))
+	if (checkBgProcessSkipFault(faultName))
 		return FaultInjectorTypeNotSpecified;
 
 	/*
@@ -311,6 +343,10 @@ FaultInjector_InjectFaultIfSet_out_of_line(
 			/* fault injection is not set */
 			break;
 
+		if (entryShared->gpSessionid != InvalidGpSessionId && entryShared->gpSessionid != gp_session_id)
+			/* fault injection is not set for the specified session */
+			break;
+
 		if (entryShared->ddlStatement != ddlStatement)
 			/* fault injection is not set for the specified DDL */
 			break;
@@ -319,7 +355,7 @@ FaultInjector_InjectFaultIfSet_out_of_line(
 			/* fault injection is not set for the specified database name */
 			break;
 	
-		if (strcmp(entryShared->tableName, tableNameLocal) != 0)
+		if (strlen(entryShared->tableName) > 0 && strcmp(entryShared->tableName, tableNameLocal) != 0)
 			/* fault injection is not set for the specified table name */
 			break;
 
@@ -433,6 +469,7 @@ FaultInjector_InjectFaultIfSet_out_of_line(
 			while ((entry = FaultInjector_LookupHashEntry(entryLocal->faultName)) != NULL &&
 				   entry->faultInjectorType != FaultInjectorTypeResume)
 			{
+				CHECK_FOR_INTERRUPTS();
 				pg_usleep(1000000L);  // 1 sec
 			}
 
@@ -506,6 +543,17 @@ FaultInjector_InjectFaultIfSet_out_of_line(
 							entryLocal->faultName,
 							FaultInjectorTypeEnumToString[entryLocal->faultInjectorType])));
 			QueryFinishPending = true;
+			break;
+		}
+
+		case FaultInjectorTypeExitNoCallbacks:
+		{
+			ereport(LOG,
+					(errcode(ERRCODE_FAULT_INJECT),
+						errmsg("fault triggered, fault name:'%s' fault type:'%s' ",
+							   entryLocal->faultName,
+							   FaultInjectorTypeEnumToString[entryLocal->faultInjectorType])));
+			_exit(entryLocal->extraArg);
 			break;
 		}
 
@@ -683,6 +731,8 @@ FaultInjector_NewHashEntry(
 	
 	entryLocal->startOccurrence = entry->startOccurrence;
 	entryLocal->endOccurrence = entry->endOccurrence;
+
+	entryLocal->gpSessionid = entry->gpSessionid;
 
 	entryLocal->numTimesTriggered = 0;
 	strcpy(entryLocal->databaseName, entry->databaseName);
@@ -925,12 +975,13 @@ HandleFaultMessage(const char* msg)
 	int start;
 	int end;
 	int extra;
+	int sid;
 	char *result;
 	int len;
 
 	if (sscanf(msg, "faultname=%s type=%s ddl=%s db=%s table=%s "
-			   "start=%d end=%d extra=%d",
-			   name, type, ddl, db, table, &start, &end, &extra) != 8)
+			   "start=%d end=%d extra=%d sid=%d",
+			   name, type, ddl, db, table, &start, &end, &extra, &sid) != 9)
 		elog(ERROR, "invalid fault message: %s", msg);
 	/* The value '#' means not specified. */
 	if (ddl[0] == '#')
@@ -940,7 +991,7 @@ HandleFaultMessage(const char* msg)
 	if (table[0] == '#')
 		table[0] = '\0';
 
-	result = InjectFault(name, type, ddl, db, table, start, end, extra);
+	result = InjectFault(name, type, ddl, db, table, start, end, extra, sid);
 	len = strlen(result);
 
 	StringInfoData buf;
@@ -969,20 +1020,21 @@ HandleFaultMessage(const char* msg)
 
 char *
 InjectFault(char *faultName, char *type, char *ddlStatement, char *databaseName,
-			char *tableName, int startOccurrence, int endOccurrence, int extraArg)
+			char *tableName, int startOccurrence, int endOccurrence, int extraArg, int gpSessionid)
 {
 	StringInfo buf = makeStringInfo();
 	FaultInjectorEntry_s faultEntry;
 
-	elog(DEBUG1, "injecting fault: name %s, type %s, DDL %s, db %s, table %s, startOccurrence %d, endOccurrence %d, extraArg %d",
+	elog(DEBUG1, "injecting fault: name %s, type %s, DDL %s, db %s, table %s, startOccurrence %d, endOccurrence %d, extraArg %d, sid %d",
 		 faultName, type, ddlStatement, databaseName, tableName,
-		 startOccurrence, endOccurrence, extraArg );
+		 startOccurrence, endOccurrence, extraArg, gpSessionid );
 
 	faultEntry.faultInjectorType = FaultInjectorTypeStringToEnum(type);
 	faultEntry.ddlStatement = FaultInjectorDDLStringToEnum(ddlStatement);
 	faultEntry.extraArg = extraArg;
 	faultEntry.startOccurrence = startOccurrence;
 	faultEntry.endOccurrence = endOccurrence;
+	faultEntry.gpSessionid = gpSessionid;
 	faultEntry.numTimesTriggered = 0;
 
 	/*

@@ -17,6 +17,7 @@
 
 #include <float.h>
 
+#include "access/brin.h"
 #include "access/gist_private.h"
 #include "access/hash.h"
 #include "access/htup_details.h"
@@ -115,7 +116,7 @@ static relopt_bool boolRelOpts[] =
 		{
 			"autovacuum_enabled",
 			"Enables autovacuum in this relation",
-			RELOPT_KIND_HEAP | RELOPT_KIND_TOAST,
+			RELOPT_KIND_HEAP | RELOPT_KIND_TOAST | RELOPT_KIND_APPENDOPTIMIZED,
 			ShareUpdateExclusiveLock
 		},
 		true
@@ -151,7 +152,7 @@ static relopt_bool boolRelOpts[] =
 		{
 			"vacuum_index_cleanup",
 			"Enables index vacuuming and index cleanup",
-			RELOPT_KIND_HEAP | RELOPT_KIND_TOAST,
+			RELOPT_KIND_HEAP | RELOPT_KIND_TOAST | RELOPT_KIND_APPENDOPTIMIZED,
 			ShareUpdateExclusiveLock
 		},
 		true
@@ -160,7 +161,7 @@ static relopt_bool boolRelOpts[] =
 		{
 			"vacuum_truncate",
 			"Enables vacuum to truncate empty pages at the end of this table",
-			RELOPT_KIND_HEAP | RELOPT_KIND_TOAST,
+			RELOPT_KIND_HEAP | RELOPT_KIND_TOAST | RELOPT_KIND_APPENDOPTIMIZED,
 			ShareUpdateExclusiveLock
 		},
 		true
@@ -225,7 +226,7 @@ static relopt_int intRelOpts[] =
 		{
 			"autovacuum_vacuum_threshold",
 			"Minimum number of tuple updates or deletes prior to vacuum",
-			RELOPT_KIND_HEAP | RELOPT_KIND_TOAST,
+			RELOPT_KIND_HEAP | RELOPT_KIND_TOAST | RELOPT_KIND_APPENDOPTIMIZED,
 			ShareUpdateExclusiveLock
 		},
 		-1, 0, INT_MAX
@@ -234,7 +235,7 @@ static relopt_int intRelOpts[] =
 		{
 			"autovacuum_analyze_threshold",
 			"Minimum number of tuple inserts, updates or deletes prior to analyze",
-			RELOPT_KIND_HEAP,
+			RELOPT_KIND_HEAP | RELOPT_KIND_APPENDOPTIMIZED,
 			ShareUpdateExclusiveLock
 		},
 		-1, 0, INT_MAX
@@ -243,7 +244,7 @@ static relopt_int intRelOpts[] =
 		{
 			"autovacuum_vacuum_cost_limit",
 			"Vacuum cost amount available before napping, for autovacuum",
-			RELOPT_KIND_HEAP | RELOPT_KIND_TOAST,
+			RELOPT_KIND_HEAP | RELOPT_KIND_TOAST | RELOPT_KIND_APPENDOPTIMIZED,
 			ShareUpdateExclusiveLock
 		},
 		-1, 1, 10000
@@ -252,7 +253,7 @@ static relopt_int intRelOpts[] =
 		{
 			"autovacuum_freeze_min_age",
 			"Minimum age at which VACUUM should freeze a table row, for autovacuum",
-			RELOPT_KIND_HEAP | RELOPT_KIND_TOAST,
+			RELOPT_KIND_HEAP | RELOPT_KIND_TOAST | RELOPT_KIND_APPENDOPTIMIZED,
 			ShareUpdateExclusiveLock
 		},
 		-1, 0, 1000000000
@@ -261,7 +262,7 @@ static relopt_int intRelOpts[] =
 		{
 			"autovacuum_multixact_freeze_min_age",
 			"Minimum multixact age at which VACUUM should freeze a row multixact's, for autovacuum",
-			RELOPT_KIND_HEAP | RELOPT_KIND_TOAST,
+			RELOPT_KIND_HEAP | RELOPT_KIND_TOAST | RELOPT_KIND_APPENDOPTIMIZED,
 			ShareUpdateExclusiveLock
 		},
 		-1, 0, 1000000000
@@ -270,7 +271,7 @@ static relopt_int intRelOpts[] =
 		{
 			"autovacuum_freeze_max_age",
 			"Age at which to autovacuum a table to prevent transaction ID wraparound",
-			RELOPT_KIND_HEAP | RELOPT_KIND_TOAST,
+			RELOPT_KIND_HEAP | RELOPT_KIND_TOAST | RELOPT_KIND_APPENDOPTIMIZED,
 			ShareUpdateExclusiveLock
 		},
 		-1, 100000, 2000000000
@@ -279,7 +280,7 @@ static relopt_int intRelOpts[] =
 		{
 			"autovacuum_multixact_freeze_max_age",
 			"Multixact age at which to autovacuum a table to prevent multixact wraparound",
-			RELOPT_KIND_HEAP | RELOPT_KIND_TOAST,
+			RELOPT_KIND_HEAP | RELOPT_KIND_TOAST | RELOPT_KIND_APPENDOPTIMIZED,
 			ShareUpdateExclusiveLock
 		},
 		-1, 10000, 2000000000
@@ -288,7 +289,7 @@ static relopt_int intRelOpts[] =
 		{
 			"autovacuum_freeze_table_age",
 			"Age at which VACUUM should perform a full table sweep to freeze row versions",
-			RELOPT_KIND_HEAP | RELOPT_KIND_TOAST,
+			RELOPT_KIND_HEAP | RELOPT_KIND_TOAST | RELOPT_KIND_APPENDOPTIMIZED,
 			ShareUpdateExclusiveLock
 		}, -1, 0, 2000000000
 	},
@@ -296,7 +297,7 @@ static relopt_int intRelOpts[] =
 		{
 			"autovacuum_multixact_freeze_table_age",
 			"Age of multixact at which VACUUM should perform a full table sweep to freeze row versions",
-			RELOPT_KIND_HEAP | RELOPT_KIND_TOAST,
+			RELOPT_KIND_HEAP | RELOPT_KIND_TOAST | RELOPT_KIND_APPENDOPTIMIZED,
 			ShareUpdateExclusiveLock
 		}, -1, 0, 2000000000
 	},
@@ -304,7 +305,7 @@ static relopt_int intRelOpts[] =
 		{
 			"log_autovacuum_min_duration",
 			"Sets the minimum execution time above which autovacuum actions will be logged",
-			RELOPT_KIND_HEAP | RELOPT_KIND_TOAST,
+			RELOPT_KIND_HEAP | RELOPT_KIND_TOAST | RELOPT_KIND_APPENDOPTIMIZED,
 			ShareUpdateExclusiveLock
 		},
 		-1, -1, INT_MAX
@@ -320,11 +321,17 @@ static relopt_int intRelOpts[] =
 	},
 	{
 		{
+			/*
+			 * GPDB: We use a sentinel value of BRIN_UNDEFINED_PAGES_PER_RANGE
+			 * to indicate that the default assigned in the relcache is AM
+			 * agnostic. The actual default will be determined later in
+			 * BrinGetPagesPerRange().
+			 */
 			"pages_per_range",
 			"Number of pages that each page range covers in a BRIN index",
 			RELOPT_KIND_BRIN,
 			AccessExclusiveLock
-		}, 128, 1, 131072
+		}, BRIN_UNDEFINED_PAGES_PER_RANGE, BRIN_UNDEFINED_PAGES_PER_RANGE, 131072
 	},
 	{
 		{
@@ -368,7 +375,7 @@ static relopt_real realRelOpts[] =
 		{
 			"autovacuum_vacuum_cost_delay",
 			"Vacuum cost delay in milliseconds, for autovacuum",
-			RELOPT_KIND_HEAP | RELOPT_KIND_TOAST,
+			RELOPT_KIND_HEAP | RELOPT_KIND_TOAST | RELOPT_KIND_APPENDOPTIMIZED,
 			ShareUpdateExclusiveLock
 		},
 		-1, 0.0, 100.0
@@ -377,7 +384,7 @@ static relopt_real realRelOpts[] =
 		{
 			"autovacuum_vacuum_scale_factor",
 			"Number of tuple updates or deletes prior to vacuum as a fraction of reltuples",
-			RELOPT_KIND_HEAP | RELOPT_KIND_TOAST,
+			RELOPT_KIND_HEAP | RELOPT_KIND_TOAST | RELOPT_KIND_APPENDOPTIMIZED,
 			ShareUpdateExclusiveLock
 		},
 		-1, 0.0, 100.0
@@ -386,7 +393,7 @@ static relopt_real realRelOpts[] =
 		{
 			"autovacuum_analyze_scale_factor",
 			"Number of tuple inserts, updates or deletes prior to analyze as a fraction of reltuples",
-			RELOPT_KIND_HEAP,
+			RELOPT_KIND_HEAP | RELOPT_KIND_APPENDOPTIMIZED,
 			ShareUpdateExclusiveLock
 		},
 		-1, 0.0, 100.0
@@ -630,7 +637,8 @@ add_reloption(relopt_gen *newoption)
  *		(for types other than string)
  */
 static relopt_gen *
-allocate_reloption(bits32 kinds, int type, const char *name, const char *desc)
+allocate_reloption(bits32 kinds, int type, const char *name, const char *desc,
+				   LOCKMODE lockmode)
 {
 	MemoryContext oldcxt;
 	size_t		size;
@@ -667,6 +675,7 @@ allocate_reloption(bits32 kinds, int type, const char *name, const char *desc)
 	newoption->kinds = kinds;
 	newoption->namelen = strlen(name);
 	newoption->type = type;
+	newoption->lockmode = lockmode;
 
 	MemoryContextSwitchTo(oldcxt);
 
@@ -674,35 +683,17 @@ allocate_reloption(bits32 kinds, int type, const char *name, const char *desc)
 }
 
 /*
- * GPDB: the add_*_reloption() functions don't take 'lockmode' argument,but
- * we need to set it correctly for the GPDB-specific options. So use this
- * to set it after calling add_*_reloption() function.
- */
-void
-set_reloption_lockmode(const char *name, LOCKMODE lockmode)
-{
-	for (int i = num_custom_options - 1; i >= 0; i--)
-	{
-		if (strcmp(custom_options[i]->name, name) == 0)
-		{
-			custom_options[i]->lockmode = lockmode;
-			return;
-		}
-	}
-	elog(ERROR, "could not find reloption \"%s\"", name);
-}
-
-/*
  * add_bool_reloption
  *		Add a new boolean reloption
  */
 void
-add_bool_reloption(bits32 kinds, const char *name, const char *desc, bool default_val)
+add_bool_reloption(bits32 kinds, const char *name, const char *desc,
+				   bool default_val, LOCKMODE lockmode)
 {
 	relopt_bool *newoption;
 
 	newoption = (relopt_bool *) allocate_reloption(kinds, RELOPT_TYPE_BOOL,
-												   name, desc);
+												   name, desc, lockmode);
 	newoption->default_val = default_val;
 
 	add_reloption((relopt_gen *) newoption);
@@ -714,12 +705,12 @@ add_bool_reloption(bits32 kinds, const char *name, const char *desc, bool defaul
  */
 void
 add_int_reloption(bits32 kinds, const char *name, const char *desc, int default_val,
-				  int min_val, int max_val)
+				  int min_val, int max_val, LOCKMODE lockmode)
 {
 	relopt_int *newoption;
 
 	newoption = (relopt_int *) allocate_reloption(kinds, RELOPT_TYPE_INT,
-												  name, desc);
+												  name, desc, lockmode);
 	newoption->default_val = default_val;
 	newoption->min = min_val;
 	newoption->max = max_val;
@@ -733,12 +724,12 @@ add_int_reloption(bits32 kinds, const char *name, const char *desc, int default_
  */
 void
 add_real_reloption(bits32 kinds, const char *name, const char *desc, double default_val,
-				   double min_val, double max_val)
+				   double min_val, double max_val, LOCKMODE lockmode)
 {
 	relopt_real *newoption;
 
 	newoption = (relopt_real *) allocate_reloption(kinds, RELOPT_TYPE_REAL,
-												   name, desc);
+												   name, desc, lockmode);
 	newoption->default_val = default_val;
 	newoption->min = min_val;
 	newoption->max = max_val;
@@ -757,7 +748,7 @@ add_real_reloption(bits32 kinds, const char *name, const char *desc, double defa
  */
 void
 add_string_reloption(bits32 kinds, const char *name, const char *desc, const char *default_val,
-					 validate_string_relopt validator)
+					 validate_string_relopt validator, LOCKMODE lockmode)
 {
 	relopt_string *newoption;
 
@@ -766,7 +757,7 @@ add_string_reloption(bits32 kinds, const char *name, const char *desc, const cha
 		(validator) (default_val);
 
 	newoption = (relopt_string *) allocate_reloption(kinds, RELOPT_TYPE_STRING,
-													 name, desc);
+													 name, desc, lockmode);
 	newoption->validate_cb = validator;
 	if (default_val)
 	{
@@ -1050,6 +1041,20 @@ extractRelOptions(HeapTuple tuple, TupleDesc tupdesc,
 		return NULL;
 
 	classForm = (Form_pg_class) GETSTRUCT(tuple);
+
+	/*
+	 * For appendonly table, its relkind is RELKIND_RELATION
+	 * but its relopt_kind is RELOPT_KIND_APPENDOPTIMIZED
+	 * so cannot use heap_reloptions to generate options
+	 * for it.
+	 */
+	if (classForm->relam == AO_COLUMN_TABLE_AM_OID ||
+			classForm->relam == AO_ROW_TABLE_AM_OID)
+	{
+		return default_reloptions(datum, false,
+				RELOPT_KIND_APPENDOPTIMIZED);
+
+	}
 
 	/* Parse into appropriate format; don't error out here */
 	switch (classForm->relkind)
@@ -1447,7 +1452,10 @@ default_reloptions(Datum reloptions, bool validate, relopt_kind kind)
 		{"vacuum_index_cleanup", RELOPT_TYPE_BOOL,
 		offsetof(StdRdOptions, vacuum_index_cleanup)},
 		{"vacuum_truncate", RELOPT_TYPE_BOOL,
-		offsetof(StdRdOptions, vacuum_truncate)}
+		offsetof(StdRdOptions, vacuum_truncate)},
+		{SOPT_ANALYZEHLL, RELOPT_TYPE_BOOL,
+		offsetof(StdRdOptions, analyze_hll_non_part_table)}
+
 	};
 
 	options = parseRelOptions(reloptions, validate, kind, &numoptions);
@@ -1461,9 +1469,9 @@ default_reloptions(Datum reloptions, bool validate, relopt_kind kind)
 	fillRelOptions((void *) rdopts, sizeof(StdRdOptions), options, numoptions,
 				   validate, tab, lengthof(tab));
 
-	validate_and_refill_options(rdopts, options, numoptions, kind, validate);
+	validate_and_adjust_options(rdopts, options, numoptions, kind, validate);
 
-	pfree(options);
+	free_options_deep(options, numoptions);
 
 	return (bytea *) rdopts;
 }
@@ -1495,7 +1503,7 @@ view_reloptions(Datum reloptions, bool validate)
 	fillRelOptions((void *) vopts, sizeof(ViewOptions), options, numoptions,
 				   validate, tab, lengthof(tab));
 
-	pfree(options);
+	free_options_deep(options, numoptions);
 
 	return (bytea *) vopts;
 }
@@ -1527,12 +1535,11 @@ heap_reloptions(char relkind, Datum reloptions, bool validate)
 										  RELOPT_KIND_HEAP);
 		case RELKIND_PARTITIONED_TABLE:
 			/*
-			 * GPDB_12_AFTER_MERGE_FIXME: should we accept AO-related options for
-			 * partitioned tables? A partitioned table has no data, but the options
-			 * might be inherited by partitions.
+			 * GPDB: we maintain reloptions for partition roots to support reloption
+			 * inheritance and hierarchy wide ALTER TABLE SET().
 			 */
 			return default_reloptions(reloptions, validate,
-									  RELOPT_KIND_PARTITIONED);
+									  RELOPT_KIND_HEAP);
 		default:
 			/* other relkinds are not supported */
 			return NULL;
@@ -1584,7 +1591,7 @@ attribute_reloptions(Datum reloptions, bool validate)
 	fillRelOptions((void *) aopts, sizeof(AttributeOpts), options, numoptions,
 				   validate, tab, lengthof(tab));
 
-	pfree(options);
+	free_options_deep(options, numoptions);
 
 	return (bytea *) aopts;
 }
@@ -1616,7 +1623,7 @@ tablespace_reloptions(Datum reloptions, bool validate)
 	fillRelOptions((void *) tsopts, sizeof(TableSpaceOpts), options, numoptions,
 				   validate, tab, lengthof(tab));
 
-	pfree(options);
+	free_options_deep(options, numoptions);
 
 	return (bytea *) tsopts;
 }

@@ -112,6 +112,7 @@ static int	port = -1;
 static bool port_specified_by_user = false;
 static char *dlpath = PKGLIBDIR;
 static char *user = NULL;
+static char *sslmode = NULL;
 static _stringlist *extraroles = NULL;
 static char *config_auth_datadir = NULL;
 static bool  ignore_plans = false;
@@ -1156,6 +1157,10 @@ doputenv(const char *var, const char *val)
 static void
 initialize_environment(void)
 {
+	/*
+	 * Set default application_name.  (The test_function may choose to
+	 * override this, but if it doesn't, we have something useful in place.)
+	 */
 	putenv("PGAPPNAME=pg_regress");
 
 	if (nolocale)
@@ -1232,14 +1237,33 @@ initialize_environment(void)
 		 * we also use psql's -X switch consistently, so that ~/.psqlrc files
 		 * won't mess things up.)  Also, set PGPORT to the temp port, and set
 		 * PGHOST depending on whether we are using TCP or Unix sockets.
+		 *
+		 * This list should be kept in sync with PostgreSQL/Test/Utils.pm.
 		 */
-		unsetenv("PGDATABASE");
-		unsetenv("PGUSER");
-		unsetenv("PGSERVICE");
-		unsetenv("PGSSLMODE");
-		unsetenv("PGREQUIRESSL");
+		/* PGCLIENTENCODING, see above */
 		unsetenv("PGCONNECT_TIMEOUT");
 		unsetenv("PGDATA");
+		unsetenv("PGDATABASE");
+		unsetenv("PGGSSENCMODE");
+		unsetenv("PGGSSLIB");
+		/* PGHOSTADDR, see below */
+		unsetenv("PGKRBSRVNAME");
+		unsetenv("PGPASSFILE");
+		unsetenv("PGPASSWORD");
+		unsetenv("PGREQUIREPEER");
+		unsetenv("PGREQUIRESSL");
+		unsetenv("PGSERVICE");
+		unsetenv("PGSERVICEFILE");
+		unsetenv("PGSSLCERT");
+		unsetenv("PGSSLCRL");
+		unsetenv("PGSSLKEY");
+		unsetenv("PGSSLMODE");
+		unsetenv("PGSSLROOTCERT");
+		unsetenv("PGTARGETSESSIONATTRS");
+		unsetenv("PGUSER");
+		/* PGPORT, see below */
+		/* PGHOST, see below */
+
 #ifdef HAVE_UNIX_SOCKETS
 		if (hostname != NULL)
 			doputenv("PGHOST", hostname);
@@ -1286,6 +1310,8 @@ initialize_environment(void)
 		}
 		if (user != NULL)
 			doputenv("PGUSER", user);
+		if (sslmode != NULL)
+			doputenv("PGSSLMODE", sslmode);
 
 		/*
 		 * Report what we're connecting to
@@ -1812,9 +1838,11 @@ results_differ(const char *testname, const char *resultsfile, const char *defaul
     char		diff_opts[MAXPGPATH];
 	char	   *diff_opts_st = diff_opts;
 	char	   *diff_opts_en = diff_opts + sizeof(diff_opts);
-    char		m_pretty_diff_opts[MAXPGPATH];
-    char	   *pretty_diff_opts_st = m_pretty_diff_opts;
-    char	   *pretty_diff_opts_en = m_pretty_diff_opts + sizeof(m_pretty_diff_opts);
+	char		m_pretty_diff_opts[MAXPGPATH];
+	char		generated_initfile[MAXPGPATH];
+	char	   *pretty_diff_opts_st = m_pretty_diff_opts;
+	char	   *pretty_diff_opts_en = m_pretty_diff_opts + sizeof(m_pretty_diff_opts);
+	char		buf[MAXPGPATH];
 	FILE	   *difffile;
 	int			best_line_count;
 	int			i;
@@ -1862,10 +1890,22 @@ results_differ(const char *testname, const char *resultsfile, const char *defaul
 										" --gpd_init %s", sl->str);
 	}
 
+	/* Add auto generated init file if it is generated */
+	snprintf(buf, sizeof(buf), "%s.initfile", resultsfile);
+	if (file_exists(buf))
+	{
+		snprintf(generated_initfile, sizeof(generated_initfile),
+				 "--gpd_init %s", buf);
+	}
+	else
+	{
+		memset(generated_initfile, '\0', sizeof(generated_initfile));
+	}
+
 	/* OK, run the diff */
 	snprintf(cmd, sizeof(cmd),
-			 "%s %s \"%s\" \"%s\" > \"%s\"",
-			 gpdiffprog, diff_opts, expectfile, resultsfile, diff);
+			 "%s %s %s \"%s\" \"%s\" > \"%s\"",
+			 gpdiffprog, diff_opts, generated_initfile, expectfile, resultsfile, diff);
 
 	/* Is the diff file empty? */
 	if (run_diff(cmd, diff) == 0)
@@ -1897,8 +1937,8 @@ results_differ(const char *testname, const char *resultsfile, const char *defaul
 		}
 
 		snprintf(cmd, sizeof(cmd),
-				 "%s %s \"%s\" \"%s\" > \"%s\"",
-				 gpdiffprog, diff_opts, alt_expectfile, resultsfile, diff);
+				 "%s %s %s \"%s\" \"%s\" > \"%s\"",
+				 gpdiffprog, diff_opts, generated_initfile, alt_expectfile, resultsfile, diff);
 
 		if (run_diff(cmd, diff) == 0)
 		{
@@ -1933,8 +1973,8 @@ results_differ(const char *testname, const char *resultsfile, const char *defaul
 	if (platform_expectfile)
 	{
 		snprintf(cmd, sizeof(cmd),
-				 "%s %s \"%s\" \"%s\" > \"%s\"",
-				 gpdiffprog, diff_opts, default_expectfile, resultsfile, diff);
+				 "%s %s %s \"%s\" \"%s\" > \"%s\"",
+				 gpdiffprog, diff_opts, generated_initfile, default_expectfile, resultsfile, diff);
 
 		if (run_diff(cmd, diff) == 0)
 		{
@@ -1969,8 +2009,8 @@ results_differ(const char *testname, const char *resultsfile, const char *defaul
 
 	/* Run diff */
 	snprintf(cmd, sizeof(cmd),
-			 "%s %s \"%s\" \"%s\" >> \"%s\"",
-			 gpdiffprog, m_pretty_diff_opts, best_expect_file, resultsfile, difffilename);
+			 "%s %s %s \"%s\" \"%s\" >> \"%s\"",
+			 gpdiffprog, m_pretty_diff_opts, generated_initfile, best_expect_file, resultsfile, difffilename);
 	run_diff(cmd, difffilename);
 
 	unlink(diff);
@@ -2437,37 +2477,53 @@ run_single_test(const char *test, test_function tfunc)
 }
 
 /*
+ * Get error message pattern based on return code
+ */
+static const char *
+get_helper_err_pattern(int rc)
+{
+	if (rc == -2)
+	{
+		return "The program \"%s\" is needed by %s "
+			"has differece in build version (check \"GpTest.pm\" import) with "
+			"\"%s\".\nPlease rebuild tests or reconfigure the project.\n";
+	}
+	/* default error message pattern */
+	return "The program \"%s\" is needed by %s "
+		"but was not found in the same directory as \"%s\".\n"
+		"Please check that file exists (or is it a regular file).\n";
+}
+
+/*
  * Find the other binaries that we need. Currently, gpdiff.pl and
  * gpstringsubs.pl.
  */
 static void
 find_helper_programs(const char *argv0)
 {
-	if (find_other_exec(argv0, "gpdiff.pl", "gpdiff.pl " GP_VERSION"\n", gpdiffprog) != 0)
+	int 		rc;
+	char		full_path[MAXPGPATH];
+	const char 	*msg;
+
+	if ((rc = find_other_exec(argv0, "gpdiff.pl", "gpdiff.pl " GP_VERSION"\n", gpdiffprog)) != 0)
 	{
-		char		full_path[MAXPGPATH];
+		msg = get_helper_err_pattern(rc);
 
 		if (find_my_exec(argv0, full_path) < 0)
 			strlcpy(full_path, progname, sizeof(full_path));
 
-		fprintf(stderr,
-				_("The program \"gpdiff.pl\" is needed by %s "
-				  "but was not found in the same directory as \"%s\".\n"),
-				progname, full_path);
+		fprintf(stderr, _(msg), "gpdiff.pl", progname, full_path);
 		exit(1);
 	}
 
-	if (find_other_exec(argv0, "gpstringsubs.pl", "gpstringsubs.pl " GP_VERSION"\n", gpstringsubsprog) != 0)
+	if ((rc = find_other_exec(argv0, "gpstringsubs.pl", "gpstringsubs.pl " GP_VERSION"\n", gpstringsubsprog)) != 0)
 	{
-		char		full_path[MAXPGPATH];
+		msg = get_helper_err_pattern(rc);
 
 		if (find_my_exec(argv0, full_path) < 0)
 			strlcpy(full_path, progname, sizeof(full_path));
 
-		fprintf(stderr,
-				_("The program \"gpstringsubs.pl\" is needed by %s "
-				  "but was not found in the same directory as \"%s\".\n"),
-				progname, full_path);
+		fprintf(stderr, _(msg), "gpstringsubs.pl", progname, full_path);
 		exit(1);
 	}
 }
@@ -2558,7 +2614,19 @@ create_database(const char *dbname)
 	/*
 	 * Install any requested extensions.  We use CREATE IF NOT EXISTS so that
 	 * this will work whether or not the extension is preinstalled.
+	 *
+	 * Starting GPDB 7X, gp_toolkit is made an extension. In order to minimize impact
+	 * we decided to still pre-bake it into template1 and postgres. But template0
+	 * should be as vanilla as possible so we do not install it there. Regress test
+	 * is a rare case where template0 is used instead of template1 while gp_toolkit is
+	 * relied heavily. So let's just load gp_toolkit here.
 	 */
+	add_stringlist_item(&loadextension, "gp_toolkit");
+	/*
+	 * GPDB: We rely heavily on pageinspect for many tests, especially for BRIN,
+	 * so load it here.
+	 */
+	add_stringlist_item(&loadextension, "pageinspect");
 	for (sl = loadextension; sl != NULL; sl = sl->next)
 	{
 		header(_("installing %s"), sl->str);
@@ -2725,7 +2793,7 @@ help(void)
 	printf(_("      --use-existing            use an existing installation\n"));
 	/* Please put GPDB specific options here, at the end */
 	printf(_("      --prehook=NAME            pre-hook name (default \"\")\n"));
-	printf(_("      --exclude-tests=TEST      command or space delimited tests to exclude from running\n"));
+	printf(_("      --exclude-tests=TEST      comma or space delimited tests to exclude from running\n"));
 	printf(_("      --exclude-file=FILE       file with tests to exclude from running, one test name per line\n"));
     printf(_("      --init-file=GPD_INIT_FILE  init file to be used for gpdiff (could be used multiple times)\n"));
 	printf(_("      --ignore-plans            ignore any explain plan diffs\n"));
@@ -2743,6 +2811,7 @@ help(void)
 	printf(_("      --host=HOST               use postmaster running on HOST\n"));
 	printf(_("      --port=PORT               use postmaster running at PORT\n"));
 	printf(_("      --user=USER               connect as USER\n"));
+	printf(_("      --sslmode=SSLMODE         connect with SSLMODE\n"));
 	printf(_("\n"));
 	printf(_("The exit status is 0 if all tests passed, 1 if some tests failed, and 2\n"));
 	printf(_("if the tests could not be run for some reason.\n"));
@@ -2785,6 +2854,7 @@ regression_main(int argc, char *argv[], init_function ifunc, test_function tfunc
 		{"print-failure-diffs", no_argument, NULL, 84},
 		{"tablespace-dir", required_argument, NULL, 85},
 		{"exclude-file", required_argument, NULL, 87}, /* 86 conflicts with 'V' */
+		{"sslmode", required_argument, NULL, 88},
 		{NULL, 0, NULL, 0}
 	};
 
@@ -2928,6 +2998,10 @@ regression_main(int argc, char *argv[], init_function ifunc, test_function tfunc
 				exclude_tests_file = strdup(optarg);
 				load_exclude_tests_file(&exclude_tests, exclude_tests_file);
 				break;
+			case 88:
+				sslmode = strdup(optarg);
+				break;
+
 			default:
 				/* getopt_long already emitted a complaint */
 				fprintf(stderr, _("\nTry \"%s -h\" for more information.\n"),

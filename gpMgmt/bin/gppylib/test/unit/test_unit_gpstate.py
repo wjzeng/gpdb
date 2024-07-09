@@ -1,8 +1,10 @@
 import unittest
 import mock
-import pgdb
+import psycopg2
+import tempfile
 
 from gppylib import gparray
+from .gp_unittest import GpTestCase
 from gppylib.programs.clsSystemState import *
 
 #
@@ -38,6 +40,118 @@ def create_mirror(**kwargs):
     kwargs['role'] = gparray.ROLE_MIRROR
     return create_segment(**kwargs)
 
+class RecoveryProgressTestCase(unittest.TestCase):
+    """
+        A test case for GpSystemStateProgram.parseRecoveryProgressData().
+    """
+
+    def setUp(self):
+
+        self.primary1 = create_primary(dbid=1)
+        self.primary2 = create_primary(dbid=2)
+        self.primary3 = create_primary(dbid=3)
+
+        self.data = GpStateData()
+        self.data.beginSegment(self.primary1)
+        self.data.beginSegment(self.primary2)
+        self.data.beginSegment(self.primary3)
+
+        self.gpArrayMock = mock.MagicMock(spec=gparray.GpArray)
+        self.gpArrayMock.getSegDbList.return_value = [self.primary1, self.primary2, self.primary3]
+
+    def check_recovery_fields(self, segment, type, completed, total, percentage, stage=None):
+        self.assertEqual(type, self.data.getStrValue(segment, VALUE_RECOVERY_TYPE))
+        self.assertEqual(completed, self.data.getStrValue(segment, VALUE_RECOVERY_COMPLETED_BYTES))
+
+        self.assertEqual(percentage, self.data.getStrValue(segment, VALUE_RECOVERY_PERCENTAGE))
+        if type == "differential":
+            self.assertEqual(stage, self.data.getStrValue(segment, VALUE_RECOVERY_STAGE))
+        else:
+            self.assertEqual(total, self.data.getStrValue(segment, VALUE_RECOVERY_TOTAL_BYTES))
+
+    def test_parse_recovery_progress_data_returns_empty_when_file_does_not_exist(self):
+        self.assertEqual([], GpSystemStateProgram._parse_recovery_progress_data(self.data, '/file/does/not/exist', self.gpArrayMock))
+
+        self.check_recovery_fields(self.primary1, '', '', '', '')
+        self.check_recovery_fields(self.primary2, '', '', '', '')
+        self.check_recovery_fields(self.primary3, '', '', '', '')
+
+    def test_parse_recovery_progress_data_adds_recovery_progress_data_during_recovery(self):
+        with tempfile.NamedTemporaryFile() as f:
+            f.write("full:1: 1164848/1371715 kB (84%), 0/1 tablespace (...t1/demoDataDir0/base/16384/40962)".encode("utf-8"))
+            f.flush()
+            self.assertEqual([self.primary1], GpSystemStateProgram._parse_recovery_progress_data(self.data, f.name, self.gpArrayMock))
+
+            self.check_recovery_fields(self.primary1, 'full', '1164848', '1371715', '84%')
+            self.check_recovery_fields(self.primary2, '', '', '', '')
+            self.check_recovery_fields(self.primary3, '', '', '', '')
+
+    def test_parse_recovery_progress_data_adds_recovery_progress_data_during_multiple_recoveries(self):
+        with tempfile.NamedTemporaryFile() as f:
+            f.write("full:1: 1164848/1371715 kB (0%), 0/1 tablespace (...t1/demoDataDir0/base/16384/40962)\n".encode("utf-8"))
+            f.write("incremental:2: 1171384/1371875 kB (85%)anything can appear here\n".encode('utf-8'))
+            f.write("differential:3:    122,017,543  74%   74.02MB/s    0:00:01 (xfr#1994, to-chk=963/2979) :Syncing pg_data of dbid 1\n".encode("utf-8"))
+            f.flush()
+            self.assertEqual([self.primary1, self.primary2, self.primary3], GpSystemStateProgram._parse_recovery_progress_data(self.data, f.name, self.gpArrayMock))
+
+            self.check_recovery_fields(self.primary1,'full', '1164848', '1371715', '0%')
+            self.check_recovery_fields(self.primary2, 'incremental', '1171384', '1371875', '85%')
+            self.check_recovery_fields(self.primary3, 'differential', '122,017,543', '', '74%', 'Syncing pg_data of dbid 1')
+
+    def test_parse_recovery_progress_data_doesnt_adds_recovery_progress_data_only_for_completed_recoveries(self):
+        with tempfile.NamedTemporaryFile() as f:
+            f.write("full:1: 1164848/1371715 kB (84%), 0/1 tablespace (...t1/demoDataDir0/base/16384/40962)\n".encode("utf-8"))
+            f.write("full:2: 1164848/1371715 kB (100%), 0/1 tablespace (...t1/demoDataDir0/base/16384/40962)\n".encode("utf-8"))
+            f.write("full:3: 1164848/1371715 kB (100#), 0/1 tablespace (...t1/demoDataDir0/base/16384/40962)\n".encode("utf-8"))
+            f.write("full:3: 1164848/1371715 kB 84%, 0/1 tablespace (...t1/demoDataDir0/base/16384/40962)\n".encode("utf-8"))
+            f.write("full:3: 1164848/1371715 kB (100), 0/1 tablespace (...t1/demoDataDir0/base/16384/40962)\n".encode("utf-8"))
+            f.write("full:3: /1371715 kB (100%, 0/1 tablespace (...t1/demoDataDir0/base/16384/40962)\n".encode("utf-8"))
+            f.write("full:3: 1/1371715 KB (100%), 0/1 tablespace (...t1/demoDataDir0/base/16384/40962)\n".encode("utf-8"))
+            f.write("full:3: 1/1371715 kB 100%), 0/1 tablespace (...t1/demoDataDir0/base/16384/40962)\n".encode("utf-8"))
+            f.write("full:3: 1/1371715 kB (100%, 0/1 tablespace (...t1/demoDataDir0/base/16384/40962)\n".encode("utf-8"))
+            f.write("full:3: 1/1371715 MB (100%), 0/1 tablespace (...t1/demoDataDir0/base/16384/40962)\n".encode("utf-8"))
+            f.write("full:3: 1/1371715 B (100%), 0/1 tablespace (...t1/demoDataDir0/base/16384/40962)\n".encode("utf-8"))
+            f.write("full:3: 1164848/1371715 kB (84%%), 0/1 tablespace (...t1/demoDataDir0/base/16384/40962)\n".encode("utf-8"))
+            f.write("full:3: 1164848/1371715 kB (84%a), 0/1 tablespace (...t1/demoDataDir0/base/16384/40962)\n".encode("utf-8"))
+            f.write("full:3: 1164848/1371715 kB (a84%), 0/1 tablespace (...t1/demoDataDir0/base/16384/40962)\n".encode("utf-8"))
+            f.write("full:3: 1164848/1371715 kB ((84%), 0/1 tablespace (...t1/demoDataDir0/base/16384/40962)\n".encode("utf-8"))
+            f.write("incremental:2: pg_rewind: done.\n".encode('utf-8'))
+            f.write("incremental:3: pg_rewind: Error \n".encode('utf-8'))
+            f.write("incremental:3: 1171384/1371875 kB (a8ab5%)\n".encode('utf-8'))
+            f.write("incremental:3: 1171384/1371875 kB ((85%)\n".encode('utf-8'))
+            f.write("incremental:3: 1171384/1371875 kB (85%%1))\n".encode('utf-8'))
+            f.write("incremental:3: 1171384/1371875 kB (foo%))\n".encode('utf-8'))
+            f.flush()
+            self.assertEqual([self.primary1, self.primary2], GpSystemStateProgram._parse_recovery_progress_data(self.data, f.name, self.gpArrayMock))
+
+            self.check_recovery_fields(self.primary1,'full', '1164848', '1371715', '84%')
+            self.check_recovery_fields(self.primary2,'full', '1164848', '1371715', '100%')
+            self.check_recovery_fields(self.primary3, '', '', '', '')
+
+
+    def test_parse_recovery_progress_data_adds_differential_recovery_progress_data_during_single_recovery(self):
+        with tempfile.NamedTemporaryFile() as f:
+            f.write("differential:1:     38,861,653   7%   43.45MB/s    0:00:00 (xfr#635, ir-chk=9262/9919) :Syncing pg_data of dbid 1\n".encode("utf-8"))
+            f.flush()
+            self.assertEqual([self.primary1], GpSystemStateProgram._parse_recovery_progress_data(self.data, f.name, self.gpArrayMock))
+
+            self.check_recovery_fields(self.primary1, 'differential', '38,861,653', '', '7%', "Syncing pg_data of dbid 1")
+            self.check_recovery_fields(self.primary2, '', '', '', '')
+            self.check_recovery_fields(self.primary3, '', '', '', '')
+
+
+    def test_parse_recovery_progress_data_adds_differential_recovery_progress_data_during_multiple_recovery(self):
+        with tempfile.NamedTemporaryFile() as f:
+            f.write("differential:1:     38,861,653   7%   43.45MB/s    0:00:00 (xfr#635, ir-chk=9262/9919) :Syncing pg_data of dbid 1\n".encode("utf-8"))
+            f.write("differential:2:    122,017,543  74%   74.02MB/s    0:00:01 (xfr#1994, to-chk=963/2979) :Syncing tablespace of dbid 2 for oid 17934\n".encode("utf-8"))
+            f.write("differential:3:    122,017,543  (74%)   74.02MB/s    0:00:01 (xfr#1994, to-chk=963/2979) :Invalid format\n".encode("utf-8"))
+            f.flush()
+            self.assertEqual([self.primary1, self.primary2], GpSystemStateProgram._parse_recovery_progress_data(self.data, f.name, self.gpArrayMock))
+
+            self.check_recovery_fields(self.primary1, 'differential', '38,861,653', '', '7%', "Syncing pg_data of dbid 1")
+            self.check_recovery_fields(self.primary2, 'differential', '122,017,543', '', '74%', "Syncing tablespace of dbid 2 for oid 17934")
+            self.check_recovery_fields(self.primary3, '', '', '', '')
+
 class ReplicationInfoTestCase(unittest.TestCase):
     """
     A test case for GpSystemStateProgram._add_replication_info().
@@ -71,6 +185,8 @@ class ReplicationInfoTestCase(unittest.TestCase):
         rows = None
 
         # Try to match the query() query against one of our stored fragments.
+        # If there is an overlap in fragments, we can get wrong results.
+        # Make sure none of the fragments in a test is a subset of another fragment.
         for fragment in self._pg_rows:
             if fragment in query:
                 rows = self._pg_rows[fragment]
@@ -96,6 +212,10 @@ class ReplicationInfoTestCase(unittest.TestCase):
         self._pg_rows['pg_stat_replication'] = rows
         mock_query.side_effect = self._get_rows_for_query
 
+    def mock_pg_current_wal_lsn(self, mock_query, rows):
+        self._pg_rows['SELECT pg_current_wal_lsn'] = rows
+        mock_query.side_effect = self._get_rows_for_query
+
     def stub_replication_entry(self, **kwargs):
         # The row returned here must match the order and contents expected by
         # the pg_stat_replication query performed in _add_replication_info().
@@ -109,7 +229,8 @@ class ReplicationInfoTestCase(unittest.TestCase):
             kwargs.get('flush_left', 0),
             kwargs.get('replay_lsn', '0/0'),
             kwargs.get('replay_left', 0),
-            kwargs.get('backend_start', None)
+            kwargs.get('backend_start', None),
+            kwargs.get('sent_left', '0')
         )
 
     def mock_pg_stat_activity(self, mock_query, rows):
@@ -135,7 +256,7 @@ class ReplicationInfoTestCase(unittest.TestCase):
     @mock.patch('gppylib.db.dbconn.connect', autospec=True)
     def test_add_replication_info_adds_unknowns_if_connection_cannot_be_made(self, mock_connect):
         # Simulate a connection failure in dbconn.connect().
-        mock_connect.side_effect = pgdb.InternalError('connection failure forced by unit test')
+        mock_connect.side_effect = psycopg2.InternalError('connection failure forced by unit test')
         GpSystemStateProgram._add_replication_info(self.data, self.primary, self.mirror)
 
         self.assertEqual('Unknown', self.data.getStrValue(self.mirror, VALUE__REPL_SENT_LSN))
@@ -146,6 +267,7 @@ class ReplicationInfoTestCase(unittest.TestCase):
     @mock.patch('gppylib.db.dbconn.connect', autospec=True)
     def test_add_replication_info_adds_unknowns_if_pg_stat_replication_has_no_entries(self, mock_connect, mock_query):
         self.mock_pg_stat_replication(mock_query, [])
+        self.mock_pg_current_wal_lsn(mock_query, [])
 
         GpSystemStateProgram._add_replication_info(self.data, self.primary, self.mirror)
 
@@ -160,6 +282,7 @@ class ReplicationInfoTestCase(unittest.TestCase):
             self.stub_replication_entry(application_name='gp_walreceiver'),
             self.stub_replication_entry(application_name='gp_walreceiver'),
         ])
+        self.mock_pg_current_wal_lsn(mock_query, [])
 
         GpSystemStateProgram._add_replication_info(self.data, self.primary, self.mirror)
 
@@ -178,15 +301,21 @@ class ReplicationInfoTestCase(unittest.TestCase):
                 flush_left=2048,
                 replay_lsn='0/0000',
                 replay_left=4096,
+                sent_left=1024,
             )
         ])
+        self.mock_pg_current_wal_lsn(mock_query, [])
 
         GpSystemStateProgram._add_replication_info(self.data, self.primary, self.mirror)
 
+        self.assertEqual('1024', self.data.getStrValue(self.primary, VALUE__REPL_SENT_LEFT))
+
         self.assertEqual('Streaming', self.data.getStrValue(self.mirror, VALUE__MIRROR_STATUS))
         self.assertEqual('0/1000', self.data.getStrValue(self.mirror, VALUE__REPL_SENT_LSN))
-        self.assertEqual('0/0800 (2048 bytes left)', self.data.getStrValue(self.mirror, VALUE__REPL_FLUSH_LSN))
-        self.assertEqual('0/0000 (4096 bytes left)', self.data.getStrValue(self.mirror, VALUE__REPL_REPLAY_LSN))
+        self.assertEqual('0/0800', self.data.getStrValue(self.mirror, VALUE__REPL_FLUSH_LSN))
+        self.assertEqual('0/0000', self.data.getStrValue(self.mirror, VALUE__REPL_REPLAY_LSN))
+        self.assertEqual('2048', self.data.getStrValue(self.mirror, VALUE__REPL_FLUSH_LEFT))
+        self.assertEqual('4096', self.data.getStrValue(self.mirror, VALUE__REPL_REPLAY_LEFT))
 
     @mock.patch('gppylib.db.dbconn.query', autospec=True)
     @mock.patch('gppylib.db.dbconn.connect', autospec=True)
@@ -199,14 +328,20 @@ class ReplicationInfoTestCase(unittest.TestCase):
                 flush_left=0,
                 replay_lsn='0/1000',
                 replay_left=0,
+                sent_left=0,
             )
         ])
+        self.mock_pg_current_wal_lsn(mock_query, [])
 
         GpSystemStateProgram._add_replication_info(self.data, self.primary, self.mirror)
+
+        self.assertEqual('0', self.data.getStrValue(self.primary, VALUE__REPL_SENT_LEFT))
 
         self.assertEqual('0/1000', self.data.getStrValue(self.mirror, VALUE__REPL_SENT_LSN))
         self.assertEqual('0/1000', self.data.getStrValue(self.mirror, VALUE__REPL_FLUSH_LSN))
         self.assertEqual('0/1000', self.data.getStrValue(self.mirror, VALUE__REPL_REPLAY_LSN))
+        self.assertEqual('0', self.data.getStrValue(self.mirror, VALUE__REPL_FLUSH_LEFT))
+        self.assertEqual('0', self.data.getStrValue(self.mirror, VALUE__REPL_REPLAY_LEFT))
 
     @mock.patch('gppylib.db.dbconn.query', autospec=True)
     @mock.patch('gppylib.db.dbconn.connect', autospec=True)
@@ -219,19 +354,26 @@ class ReplicationInfoTestCase(unittest.TestCase):
                 flush_left=None,
                 replay_lsn=None,
                 replay_left=None,
+                sent_left=None,
             )
         ])
+        self.mock_pg_current_wal_lsn(mock_query, [])
 
         GpSystemStateProgram._add_replication_info(self.data, self.primary, self.mirror)
+
+        self.assertEqual('Unknown', self.data.getStrValue(self.primary, VALUE__REPL_SENT_LEFT))
 
         self.assertEqual('Unknown', self.data.getStrValue(self.mirror, VALUE__REPL_SENT_LSN))
         self.assertEqual('Unknown', self.data.getStrValue(self.mirror, VALUE__REPL_FLUSH_LSN))
         self.assertEqual('Unknown', self.data.getStrValue(self.mirror, VALUE__REPL_REPLAY_LSN))
+        self.assertEqual('Unknown', self.data.getStrValue(self.mirror, VALUE__REPL_FLUSH_LEFT))
+        self.assertEqual('Unknown', self.data.getStrValue(self.mirror, VALUE__REPL_REPLAY_LEFT))
 
     @mock.patch('gppylib.db.dbconn.query', autospec=True)
     @mock.patch('gppylib.db.dbconn.connect', autospec=True)
     def test_add_replication_info_closes_connections(self, mock_connect, mock_query):
         self.mock_pg_stat_replication(mock_query, [])
+        self.mock_pg_current_wal_lsn(mock_query, [])
 
         GpSystemStateProgram._add_replication_info(self.data, self.primary, self.mirror)
 
@@ -251,6 +393,7 @@ class ReplicationInfoTestCase(unittest.TestCase):
                 replay_left=None,
             )
         ])
+        self.mock_pg_current_wal_lsn(mock_query, [])
 
         GpSystemStateProgram._add_replication_info(self.data, self.primary, self.mirror)
 
@@ -271,6 +414,7 @@ class ReplicationInfoTestCase(unittest.TestCase):
                 backend_start='1970-01-01 00:00:00.000000-00'
             )
         ])
+        self.mock_pg_current_wal_lsn(mock_query, [])
 
         GpSystemStateProgram._add_replication_info(self.data, self.primary, self.mirror)
 
@@ -293,6 +437,7 @@ class ReplicationInfoTestCase(unittest.TestCase):
                 state='streaming',
             ),
         ])
+        self.mock_pg_current_wal_lsn(mock_query, [])
 
         GpSystemStateProgram._add_replication_info(self.data, self.primary, self.mirror)
 
@@ -303,6 +448,7 @@ class ReplicationInfoTestCase(unittest.TestCase):
     @mock.patch('gppylib.db.dbconn.connect', autospec=True)
     def test_add_replication_info_displays_status_when_pg_rewind_is_active_and_mirror_is_down(self, mock_connect, mock_query):
         self.mock_pg_stat_replication(mock_query, [])
+        self.mock_pg_current_wal_lsn(mock_query, [])
         self.mirror.status = gparray.STATUS_DOWN
         self.mock_pg_stat_activity(mock_query, [self.stub_activity_entry()])
 
@@ -314,6 +460,7 @@ class ReplicationInfoTestCase(unittest.TestCase):
     @mock.patch('gppylib.db.dbconn.connect', autospec=True)
     def test_add_replication_info_does_not_update_mirror_status_when_mirror_is_down_and_there_is_no_recovery_underway(self, mock_connect, mock_query):
         self.mock_pg_stat_replication(mock_query, [])
+        self.mock_pg_current_wal_lsn(mock_query, [])
         self.mirror.status = gparray.STATUS_DOWN
         self.mock_pg_stat_activity(mock_query, [])
 
@@ -329,6 +476,7 @@ class ReplicationInfoTestCase(unittest.TestCase):
     def test_add_replication_info_displays_start_time_when_pg_rewind_is_active_and_mirror_is_down(self, mock_connect, mock_query):
         mock_date = '1970-01-01 00:00:00.000000-00'
         self.mock_pg_stat_replication(mock_query, [self.stub_replication_entry()])
+        self.mock_pg_current_wal_lsn(mock_query, [])
         self.mock_pg_stat_activity(mock_query, [self.stub_activity_entry(backend_start=mock_date)])
         self.mirror.status = gparray.STATUS_DOWN
 
@@ -340,6 +488,7 @@ class ReplicationInfoTestCase(unittest.TestCase):
     @mock.patch('gppylib.db.dbconn.connect', autospec=True)
     def test_add_replication_info_does_not_query_pg_stat_activity_when_mirror_is_up(self, mock_connect, mock_query):
         self.mock_pg_stat_replication(mock_query, [])
+        self.mock_pg_current_wal_lsn(mock_query, [])
         self.mock_pg_stat_activity(mock_query, [self.stub_activity_entry()])
 
         GpSystemStateProgram._add_replication_info(self.data, self.primary, self.mirror)
@@ -352,6 +501,49 @@ class ReplicationInfoTestCase(unittest.TestCase):
     def test_set_mirror_replication_values_complains_about_incorrect_kwargs(self):
         with self.assertRaises(TypeError):
             GpSystemStateProgram._set_mirror_replication_values(self.data, self.mirror, badarg=1)
+
+class SegmentsReqAttentionTestCase(GpTestCase):
+
+    def setUp(self):
+        coordinator = create_segment(content=-1, dbid=0)
+        self.primary1 = create_primary(content=0, dbid=1)
+        self.primary2 = create_primary(content=1, dbid=2)
+        mirror1 = create_mirror(content=0, dbid=3)
+        mirror2 = create_mirror(content=1, dbid=4)
+        self.gpArray = gparray.GpArray([coordinator, self.primary1, self.primary2, mirror1, mirror2])
+
+        self.data = GpStateData()
+        self.data.beginSegment(self.primary1)
+        self.data.beginSegment(self.primary2)
+
+        self.apply_patches([mock.patch('gppylib.db.dbconn.connect', autospec=True)])
+
+    def test_WalSyncRemainingBytes_multiple_segments_both_catchup(self):
+        m = mock.Mock()
+        m.fetchall.side_effect = [[[100, 'async']], [[10, 'async']]]
+        with mock.patch('gppylib.db.dbconn.query', return_value=m) as mock_query:
+            GpSystemStateProgram._get_unsync_segs_add_wal_remaining_bytes(self.data, self.gpArray)
+            self.assertEqual(mock_query.call_count, 2)
+            self.assertEqual('100', self.data.getStrValue(self.primary1, VALUE__REPL_SYNC_REMAINING_BYTES))
+            self.assertEqual('10', self.data.getStrValue(self.primary2, VALUE__REPL_SYNC_REMAINING_BYTES))
+
+    def test_WalSyncRemainingBytes_multiple_segments_one_sync(self):
+        m = mock.Mock()
+        m.fetchall.side_effect = [[[100, 'async']], [[10, 'sync']]]
+        with mock.patch('gppylib.db.dbconn.query', return_value=m) as mock_query:
+            GpSystemStateProgram._get_unsync_segs_add_wal_remaining_bytes(self.data, self.gpArray)
+            self.assertEqual(mock_query.call_count, 2)
+            self.assertEqual('100', self.data.getStrValue(self.primary1, VALUE__REPL_SYNC_REMAINING_BYTES))
+            self.assertEqual('', self.data.getStrValue(self.primary2, VALUE__REPL_SYNC_REMAINING_BYTES))
+
+    def test_WalSyncRemainingBytes_multiple_segments_one_down(self):
+        m = mock.Mock()
+        m.fetchall.side_effect = [[[100, 'async']], []]
+        with mock.patch('gppylib.db.dbconn.query', return_value=m) as mock_query:
+            GpSystemStateProgram._get_unsync_segs_add_wal_remaining_bytes(self.data, self.gpArray)
+            self.assertEqual(mock_query.call_count, 2)
+            self.assertEqual('100', self.data.getStrValue(self.primary1, VALUE__REPL_SYNC_REMAINING_BYTES))
+            self.assertEqual('Unknown', self.data.getStrValue(self.primary2, VALUE__REPL_SYNC_REMAINING_BYTES))
 
 class GpStateDataTestCase(unittest.TestCase):
     def test_switchSegment_sets_current_segment_correctly(self):

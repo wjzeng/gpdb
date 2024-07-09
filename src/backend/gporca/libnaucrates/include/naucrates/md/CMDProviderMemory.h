@@ -38,9 +38,9 @@ class CMDProviderMemory : public IMDProvider
 {
 protected:
 	// hash map of serialized MD objects indexed by their MD id
-	typedef CHashMap<IMDId, CWStringDynamic, IMDId::MDIdHash,
-					 IMDId::MDIdCompare, CleanupRelease, CleanupDelete>
-		MDIdToSerializedMDIdMap;
+	using MDIdToSerializedMDIdMap =
+		CHashMap<IMDId, CWStringDynamic, IMDId::MDIdHash, IMDId::MDIdCompare,
+				 CleanupRelease, CleanupDelete>;
 
 	// metadata objects indexed by their metadata id
 	MDIdToSerializedMDIdMap *m_mdmap;
@@ -68,7 +68,8 @@ public:
 
 	// returns the requested metadata object
 	IMDCacheObject *GetMDObj(CMemoryPool *mp, CMDAccessor *md_accessor,
-							 IMDId *mdid) const override;
+							 IMDId *mdid,
+							 IMDCacheObject::Emdtype mdtype) const override;
 
 	// return the mdid for the specified system id and type
 	IMDId *MDId(CMemoryPool *mp, CSystemId sysid,

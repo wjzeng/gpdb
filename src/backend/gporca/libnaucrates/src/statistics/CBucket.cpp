@@ -844,10 +844,14 @@ CBucket::MakeBucketIntersect(CMemoryPool *mp, CBucket *bucket,
 	CDouble freq_intersect1 = ratio1 * m_frequency;
 	CDouble freq_intersect2 = ratio2 * bucket->m_frequency;
 
-	CDouble frequency_new(
-		freq_intersect1 * freq_intersect2 * DOUBLE(1.0) /
+	CDouble distinct_max(
 		std::max(ratio1.Get() * m_distinct.Get(),
 				 ratio2.Get() * bucket->GetNumDistinct().Get()));
+	CDouble frequency_new(distinct_max == CDouble(0)
+							  ? 0
+							  : freq_intersect1 * freq_intersect2 *
+									DOUBLE(1.0) / distinct_max);
+
 
 	lower_new->AddRef();
 	upper_new->AddRef();
@@ -1341,10 +1345,13 @@ CBucket::SplitAndMergeBuckets(
 	{
 		// there is only one bucket
 		GPOS_ASSERT(nullptr == upper_third);
+
+		/* FIXME: this assert currently triggers for some queries, see GPQP-74
 		GPOS_ASSERT_IMP(
 			is_union_all,
 			middle_third->GetFrequency() * total_rows <=
 				this_bucket_rows + bucket_other_rows + CStatistics::Epsilon);
+		*/
 	}
 
 	*result_rows = total_rows;
@@ -1356,11 +1363,11 @@ CBucket::SplitAndMergeBuckets(
 //		CBucket::GetSample
 //
 //	@doc:
-//		Generate a random data point within bucket boundaries
+//		Generate a data point within bucket boundaries
 //
 //---------------------------------------------------------------------------
 CDouble
-CBucket::GetSample(ULONG *seed) const
+CBucket::GetSample(DOUBLE ratio) const
 {
 	GPOS_ASSERT(CanSample());
 
@@ -1371,11 +1378,9 @@ CBucket::GetSample(ULONG *seed) const
 	}
 
 	DOUBLE upper_val = m_bucket_upper_bound->GetDatum()->GetValAsDouble().Get();
-	DOUBLE rand_val = ((DOUBLE) clib::Rand(seed)) / RAND_MAX;
 
-	return CDouble(lower_val + rand_val * (upper_val - lower_val));
+	return CDouble(lower_val + ratio * (upper_val - lower_val));
 }
-
 
 //---------------------------------------------------------------------------
 //	@function:

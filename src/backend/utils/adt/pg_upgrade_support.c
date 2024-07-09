@@ -67,20 +67,6 @@ binary_upgrade_set_next_array_pg_type_oid(PG_FUNCTION_ARGS)
 }
 
 Datum
-binary_upgrade_set_next_toast_pg_type_oid(PG_FUNCTION_ARGS)
-{
-	Oid			typoid = PG_GETARG_OID(0);
-	Oid			typnamespaceoid = PG_GETARG_OID(1);
-	char	   *typname = GET_STR(PG_GETARG_TEXT_P(2));
-
-	CHECK_IS_BINARY_UPGRADE;
-	AddPreassignedOidFromBinaryUpgrade(typoid, TypeRelationId, typname,
-						typnamespaceoid, InvalidOid, InvalidOid);
-
-	PG_RETURN_VOID();
-}
-
-Datum
 binary_upgrade_set_next_heap_pg_class_oid(PG_FUNCTION_ARGS)
 {
 	Oid			reloid = PG_GETARG_OID(0);
@@ -139,13 +125,13 @@ binary_upgrade_set_next_pg_enum_oid(PG_FUNCTION_ARGS)
 Datum
 binary_upgrade_set_next_pg_authid_oid(PG_FUNCTION_ARGS)
 {
-	Oid			roleid = PG_GETARG_OID(0);
+	Oid			authoid = PG_GETARG_OID(0);
 	char	   *rolename = GET_STR(PG_GETARG_TEXT_P(1));
 
 	CHECK_IS_BINARY_UPGRADE;
 	if (Gp_role == GP_ROLE_UTILITY)
 	{
-		AddPreassignedOidFromBinaryUpgrade(roleid, AuthIdRelationId, rolename,
+		AddPreassignedOidFromBinaryUpgrade(authoid, AuthIdRelationId, rolename,
 										   InvalidOid, InvalidOid, InvalidOid);
 	}
 

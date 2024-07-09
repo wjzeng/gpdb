@@ -3,13 +3,12 @@
 --
 -- Clean up in case a prior regression run failed
 SET client_min_messages TO 'warning';
+SET optimizer_trace_fallback = on;
 DROP ROLE IF EXISTS regress_file_fdw_superuser, regress_file_fdw_user, regress_no_priv_user;
 RESET client_min_messages;
 CREATE ROLE regress_file_fdw_superuser LOGIN SUPERUSER; -- is a superuser
 CREATE ROLE regress_file_fdw_user LOGIN;                -- has priv and user mapping
-NOTICE:  resource queue required -- using default resource queue "pg_default"
 CREATE ROLE regress_no_priv_user LOGIN;                 -- has priv but no user mapping
-NOTICE:  resource queue required -- using default resource queue "pg_default"
 -- Install file_fdw
 CREATE EXTENSION file_fdw;
 -- regress_file_fdw_superuser owns fdw-related objects
@@ -174,7 +173,7 @@ EXPLAIN (VERBOSE, COSTS FALSE) SELECT * FROM agg_csv;
  Foreign Scan on public.agg_csv
    Output: a, b
    Foreign File: @abs_srcdir@/data/agg.csv
- Optimizer: Postgres query optimizer
+ Optimizer: Postgres-based planner
  Settings: optimizer=off
 
 \t off
@@ -226,7 +225,7 @@ EXPLAIN (VERBOSE, COSTS FALSE) SELECT * FROM agg_csv WHERE a < 0;
  Result
    Output: a, b
    One-Time Filter: false
- Optimizer: Postgres query optimizer
+ Optimizer: Postgres-based planner
  Settings: optimizer=off
 
 \t off
@@ -241,7 +240,7 @@ EXPLAIN (VERBOSE, COSTS FALSE) SELECT * FROM agg_csv WHERE a < 0;
  Result
    Output: a, b
    One-Time Filter: false
- Optimizer: Postgres query optimizer
+ Optimizer: Postgres-based planner
  Settings: constraint_exclusion=on, optimizer=off
 
 \t off
@@ -416,7 +415,7 @@ EXPLAIN (VERBOSE, COSTS FALSE) SELECT * FROM agg_text WHERE a > 0;
    Output: a, b
    Filter: (agg_text.a > 0)
    Foreign File: @abs_srcdir@/data/agg.data
- Optimizer: Postgres query optimizer
+ Optimizer: Postgres-based planner
  Settings: optimizer=off
 
 \t off

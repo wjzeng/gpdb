@@ -252,6 +252,7 @@ shm_toc_lookup(shm_toc *toc, uint64 key, bool noError)
 	if (!noError)
 		elog(ERROR, "could not find key " UINT64_FORMAT " in shm TOC at %p",
 			 key, toc);
+
 	return NULL;
 }
 
@@ -265,8 +266,8 @@ shm_toc_estimate(shm_toc_estimator *e)
 	Size		sz;
 
 	sz = offsetof(shm_toc, toc_entry);
-	sz += add_size(sz, mul_size(e->number_of_keys, sizeof(shm_toc_entry)));
-	sz += add_size(sz, e->space_for_chunks);
+	sz = add_size(sz, mul_size(e->number_of_keys, sizeof(shm_toc_entry)));
+	sz = add_size(sz, e->space_for_chunks);
 
 	return BUFFERALIGN(sz);
 }

@@ -2,15 +2,24 @@ from gppylib import gplog
 from gppylib.commands.base import Command
 from gppylib.commands import base
 from gppylib.gparray import STATUS_DOWN
+import socket
 
 logger = gplog.get_default_logger()
 
 
 def get_unreachable_segment_hosts(hosts, num_workers):
+    if not hosts:
+        return []
+
     pool = base.WorkerPool(numWorkers=num_workers)
     try:
-        for host in hosts:
-            cmd = Command(name='check %s is up' % host, cmdStr="ssh %s 'echo %s'" % (host, host))
+        localhost = socket.gethostname()
+        for host in set(hosts):
+            cmd = None
+            if host != localhost:
+                cmd = Command(name='check %s is up' % host, cmdStr="ssh %s 'echo %s'" % (host, host))
+            else:
+                cmd = Command(name='check %s is up' % host, cmdStr="echo {}".format(host))
             pool.addCommand(cmd)
         pool.join()
     finally:
@@ -23,7 +32,8 @@ def get_unreachable_segment_hosts(hosts, num_workers):
     for item in pool.getCompletedItems():
         result = item.get_results()
         if result.rc == 0:
-            host = result.stdout.strip()
+            # Remove login(banner) messages
+            host = result.stdout.strip().split('\n')[-1]
             reachable_hosts.add(host)
 
     unreachable_hosts = list(set(hosts).difference(reachable_hosts))
@@ -34,6 +44,16 @@ def get_unreachable_segment_hosts(hosts, num_workers):
             logger.warning("Host %s is unreachable" % host)
 
     return unreachable_hosts
+
+
+def update_unreachable_flag_for_segments(gparray, unreachable_hosts):
+    for i, segmentPair in enumerate(gparray.segmentPairs):
+        if segmentPair.primaryDB and segmentPair.primaryDB.getSegmentHostName() in unreachable_hosts:
+            gparray.segmentPairs[i].primaryDB.unreachable = True
+
+        if segmentPair.mirrorDB and segmentPair.mirrorDB.getSegmentHostName() in unreachable_hosts:
+            gparray.segmentPairs[i].mirrorDB.unreachable = True
+
 
 def mark_segments_down_for_unreachable_hosts(segmentPairs, unreachable_hosts):
     # We only mark the segment down in gparray for use by later checks, as

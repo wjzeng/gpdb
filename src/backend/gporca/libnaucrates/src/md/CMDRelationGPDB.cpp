@@ -31,19 +31,20 @@ using namespace gpmd;
 //---------------------------------------------------------------------------
 CMDRelationGPDB::CMDRelationGPDB(
 	CMemoryPool *mp, IMDId *mdid, CMDName *mdname, BOOL fTemporary,
-	Erelstoragetype rel_storage_type, Ereldistrpolicy rel_distr_policy,
-	CMDColumnArray *mdcol_array, ULongPtrArray *distr_col_array,
-	IMdIdArray *distr_opfamilies, ULongPtrArray *partition_cols_array,
-	CharPtrArray *str_part_types_array, ULONG num_of_partitions,
+	Erelstoragetype rel_storage_type, Erelaoversion rel_ao_version,
+	Ereldistrpolicy rel_distr_policy, CMDColumnArray *mdcol_array,
+	ULongPtrArray *distr_col_array, IMdIdArray *distr_opfamilies,
+	ULongPtrArray *partition_cols_array, CharPtrArray *str_part_types_array,
 	IMdIdArray *partition_oids, BOOL convert_hash_to_random,
 	ULongPtr2dArray *keyset_array, CMDIndexInfoArray *md_index_info_array,
-	IMdIdArray *mdid_triggers_array, IMdIdArray *mdid_check_constraint_array,
-	CDXLNode *mdpart_constraint, BOOL has_oids)
+	IMdIdArray *mdid_check_constraint_array, CDXLNode *mdpart_constraint,
+	IMDId *foreign_server, CDouble rows)
 	: m_mp(mp),
 	  m_mdid(mdid),
 	  m_mdname(mdname),
 	  m_is_temp_table(fTemporary),
 	  m_rel_storage_type(rel_storage_type),
+	  m_rel_ao_version(rel_ao_version),
 	  m_rel_distr_policy(rel_distr_policy),
 	  m_md_col_array(mdcol_array),
 	  m_dropped_cols(0),
@@ -52,23 +53,21 @@ CMDRelationGPDB::CMDRelationGPDB(
 	  m_convert_hash_to_random(convert_hash_to_random),
 	  m_partition_cols_array(partition_cols_array),
 	  m_str_part_types_array(str_part_types_array),
-	  m_num_of_partitions(num_of_partitions),
 	  m_partition_oids(partition_oids),
 	  m_keyset_array(keyset_array),
 	  m_mdindex_info_array(md_index_info_array),
-	  m_mdid_trigger_array(mdid_triggers_array),
 	  m_mdid_check_constraint_array(mdid_check_constraint_array),
 	  m_mdpart_constraint(mdpart_constraint),
-	  m_has_oids(has_oids),
 	  m_system_columns(0),
+	  m_foreign_server(foreign_server),
 	  m_colpos_nondrop_colpos_map(nullptr),
 	  m_attrno_nondrop_col_pos_map(nullptr),
-	  m_nondrop_col_pos_array(nullptr)
+	  m_nondrop_col_pos_array(nullptr),
+	  m_rows(rows)
 {
 	GPOS_ASSERT(mdid->IsValid());
 	GPOS_ASSERT(nullptr != mdcol_array);
 	GPOS_ASSERT(nullptr != md_index_info_array);
-	GPOS_ASSERT(nullptr != mdid_triggers_array);
 	GPOS_ASSERT(nullptr != mdid_check_constraint_array);
 	GPOS_ASSERT_IMP(
 		convert_hash_to_random,
@@ -114,8 +113,6 @@ CMDRelationGPDB::CMDRelationGPDB(
 
 		m_col_width_array->Append(GPOS_NEW(mp) CDouble(mdcol->Length()));
 	}
-	m_dxl_str = CDXLUtils::SerializeMDObj(
-		m_mp, this, false /*fSerializeHeader*/, false /*indentation*/);
 }
 
 //---------------------------------------------------------------------------
@@ -129,7 +126,10 @@ CMDRelationGPDB::CMDRelationGPDB(
 CMDRelationGPDB::~CMDRelationGPDB()
 {
 	GPOS_DELETE(m_mdname);
-	GPOS_DELETE(m_dxl_str);
+	if (nullptr != m_dxl_str)
+	{
+		GPOS_DELETE(m_dxl_str);
+	}
 	m_mdid->Release();
 	m_md_col_array->Release();
 	CRefCount::SafeRelease(m_distr_col_array);
@@ -139,13 +139,24 @@ CMDRelationGPDB::~CMDRelationGPDB()
 	CRefCount::SafeRelease(m_str_part_types_array);
 	CRefCount::SafeRelease(m_keyset_array);
 	m_mdindex_info_array->Release();
-	m_mdid_trigger_array->Release();
 	m_mdid_check_constraint_array->Release();
 	m_col_width_array->Release();
+	CRefCount::SafeRelease(m_foreign_server);
 	CRefCount::SafeRelease(m_mdpart_constraint);
 	CRefCount::SafeRelease(m_colpos_nondrop_colpos_map);
 	CRefCount::SafeRelease(m_attrno_nondrop_col_pos_map);
 	CRefCount::SafeRelease(m_nondrop_col_pos_array);
+}
+
+const CWStringDynamic *
+CMDRelationGPDB::GetStrRepr()
+{
+	if (nullptr == m_dxl_str)
+	{
+		m_dxl_str = CDXLUtils::SerializeMDObj(
+			m_mp, this, false /*fSerializeHeader*/, false /*indentation*/);
+	}
+	return m_dxl_str;
 }
 
 //---------------------------------------------------------------------------
@@ -202,6 +213,12 @@ IMDRelation::Erelstoragetype
 CMDRelationGPDB::RetrieveRelStorageType() const
 {
 	return m_rel_storage_type;
+}
+
+IMDRelation::Erelaoversion
+CMDRelationGPDB::GetRelAOVersion() const
+{
+	return m_rel_ao_version;
 }
 
 //---------------------------------------------------------------------------
@@ -385,20 +402,6 @@ CMDRelationGPDB::DistrColumnCount() const
 
 //---------------------------------------------------------------------------
 //	@function:
-//		CMDRelationGPDB::HasOids
-//
-//	@doc:
-//		Does this table have oids
-//
-//---------------------------------------------------------------------------
-BOOL
-CMDRelationGPDB::HasOids() const
-{
-	return m_has_oids;
-}
-
-//---------------------------------------------------------------------------
-//	@function:
 //		CMDRelationGPDB::IsPartitioned
 //
 //	@doc:
@@ -409,20 +412,6 @@ BOOL
 CMDRelationGPDB::IsPartitioned() const
 {
 	return (0 < PartColumnCount());
-}
-
-//---------------------------------------------------------------------------
-//	@function:
-//		CMDRelationGPDB::PartitionCount
-//
-//	@doc:
-//		number of partitions
-//
-//---------------------------------------------------------------------------
-ULONG
-CMDRelationGPDB::PartitionCount() const
-{
-	return m_num_of_partitions;
 }
 
 //---------------------------------------------------------------------------
@@ -483,20 +472,6 @@ ULONG
 CMDRelationGPDB::IndexCount() const
 {
 	return m_mdindex_info_array->Size();
-}
-
-//---------------------------------------------------------------------------
-//	@function:
-//		CMDRelationGPDB::TriggerCount
-//
-//	@doc:
-//		Returns the number of triggers of this relation
-//
-//---------------------------------------------------------------------------
-ULONG
-CMDRelationGPDB::TriggerCount() const
-{
-	return m_mdid_trigger_array->Size();
 }
 
 //---------------------------------------------------------------------------
@@ -574,20 +549,6 @@ CMDRelationGPDB::IndexMDidAt(ULONG pos) const
 
 //---------------------------------------------------------------------------
 //	@function:
-//		CMDRelationGPDB::TriggerMDidAt
-//
-//	@doc:
-//		Returns the id of the trigger at the specified position of the trigger array
-//
-//---------------------------------------------------------------------------
-IMDId *
-CMDRelationGPDB::TriggerMDidAt(ULONG pos) const
-{
-	return (*m_mdid_trigger_array)[pos];
-}
-
-//---------------------------------------------------------------------------
-//	@function:
 //		CMDRelationGPDB::CheckConstraintCount
 //
 //	@doc:
@@ -629,6 +590,17 @@ CMDRelationGPDB::MDPartConstraint() const
 	return m_mdpart_constraint;
 }
 
+IMDId *
+CMDRelationGPDB::ForeignServer() const
+{
+	return m_foreign_server;
+}
+
+CDouble
+CMDRelationGPDB::Rows() const
+{
+	return m_rows;
+}
 
 //---------------------------------------------------------------------------
 //	@function:
@@ -653,11 +625,23 @@ CMDRelationGPDB::Serialize(CXMLSerializer *xml_serializer) const
 								 m_mdname->GetMDName());
 	xml_serializer->AddAttribute(
 		CDXLTokens::GetDXLTokenStr(EdxltokenRelTemporary), m_is_temp_table);
-	xml_serializer->AddAttribute(
-		CDXLTokens::GetDXLTokenStr(EdxltokenRelHasOids), m_has_oids);
+
+	if (m_rows > 0)
+	{
+		xml_serializer->AddAttribute(CDXLTokens::GetDXLTokenStr(EdxltokenRows),
+									 m_rows);
+	}
+
 	xml_serializer->AddAttribute(
 		CDXLTokens::GetDXLTokenStr(EdxltokenRelStorageType),
 		IMDRelation::GetStorageTypeStr(m_rel_storage_type));
+	if (IsAORowOrColTable() ||
+		IMDRelation::ErelstorageMixedPartitioned == RetrieveRelStorageType())
+	{
+		xml_serializer->AddAttribute(
+			CDXLTokens::GetDXLTokenStr(EdxltokenRelAppendOnlyVersion),
+			m_rel_ao_version);
+	}
 	xml_serializer->AddAttribute(
 		CDXLTokens::GetDXLTokenStr(EdxltokenRelDistrPolicy),
 		GetDistrPolicyStr(m_rel_distr_policy));
@@ -718,10 +702,12 @@ CMDRelationGPDB::Serialize(CXMLSerializer *xml_serializer) const
 			m_convert_hash_to_random);
 	}
 
-	xml_serializer->AddAttribute(
-		CDXLTokens::GetDXLTokenStr(EdxltokenNumLeafPartitions),
-		m_num_of_partitions);
-
+	if (m_foreign_server)
+	{
+		m_foreign_server->Serialize(
+			xml_serializer,
+			CDXLTokens::GetDXLTokenStr(EdxltokenRelForeignServer));
+	}
 	// serialize columns
 	xml_serializer->OpenElement(
 		CDXLTokens::GetDXLTokenStr(EdxltokenNamespacePrefix),
@@ -756,11 +742,6 @@ CMDRelationGPDB::Serialize(CXMLSerializer *xml_serializer) const
 		CDXLTokens::GetDXLTokenStr(EdxltokenIndexInfoList));
 
 
-	// serialize trigger information
-	SerializeMDIdList(xml_serializer, m_mdid_trigger_array,
-					  CDXLTokens::GetDXLTokenStr(EdxltokenTriggers),
-					  CDXLTokens::GetDXLTokenStr(EdxltokenTrigger));
-
 	// serialize check constraint information
 	SerializeMDIdList(xml_serializer, m_mdid_check_constraint_array,
 					  CDXLTokens::GetDXLTokenStr(EdxltokenCheckConstraints),
@@ -784,7 +765,9 @@ CMDRelationGPDB::Serialize(CXMLSerializer *xml_serializer) const
 
 		// serialize the scalar expression
 		if (nullptr != m_mdpart_constraint)
+		{
 			m_mdpart_constraint->SerializeToDXL(xml_serializer);
+		}
 
 		xml_serializer->CloseElement(
 			CDXLTokens::GetDXLTokenStr(EdxltokenNamespacePrefix),
@@ -835,6 +818,8 @@ CMDRelationGPDB::DebugPrint(IOstream &os) const
 	   << IMDRelation::GetStorageTypeStr(m_rel_storage_type)->GetBuffer()
 	   << std::endl;
 
+	os << "AO version: " << m_rel_ao_version << std::endl;
+
 	os << "Distribution policy: "
 	   << GetDistrPolicyStr(m_rel_distr_policy)->GetBuffer() << std::endl;
 
@@ -884,9 +869,6 @@ CMDRelationGPDB::DebugPrint(IOstream &os) const
 		CMDIndexInfo *mdindex_info = (*m_mdindex_info_array)[ul];
 		mdindex_info->DebugPrint(os);
 	}
-
-	os << "Triggers: ";
-	CDXLUtils::DebugPrintMDIdArray(os, m_mdid_trigger_array);
 
 	os << "Check Constraint: ";
 	CDXLUtils::DebugPrintMDIdArray(os, m_mdid_check_constraint_array);

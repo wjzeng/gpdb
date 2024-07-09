@@ -6,6 +6,10 @@
 -- the count(*) calculated for each value below was 1, but it should be
 -- equal to the number of segments, because this external table produces
 -- the same rows on every segment.
+-- start_matchsubs
+-- m/\(cost=.*\)/
+-- s/\(cost=.*\)//
+-- end_matchsubs
 
 CREATE EXTERNAL WEB TABLE echotable (c1 int, c2 int, c3 int) EXECUTE
 'echo "1,2,3"; echo "4,5,6";' FORMAT 'TEXT' (DELIMITER ',');
@@ -63,3 +67,17 @@ $$ language plpgsql;
 
 -- Run the function in QEs.
 select number_of_days(start, stop) from datetab;
+
+-- Check delay eager free in squelch functions
+CREATE TABLE subselect2_foo (a int, b int);
+CREATE TABLE subselect2_bar (c int, d int);
+CREATE TABLE subselect2_baz (x int, y int);
+
+INSERT INTO subselect2_foo VALUES (1,1), (1,2);
+INSERT INTO subselect2_bar VALUES (1,1);
+
+SELECT *, (SELECT x FROM subselect2_baz EXCEPT SELECT c FROM subselect2_bar WHERE d = a) FROM subselect2_foo;
+
+
+
+

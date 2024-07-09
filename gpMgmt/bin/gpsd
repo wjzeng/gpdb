@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # Copyright (c) 2014 Pivotal inc.
+# Copyright (c) 2023 VMware, Inc. or its affiliates. All Rights Reserved.
 
 
 import datetime
@@ -10,10 +11,9 @@ import pwd
 import sys
 import re
 from contextlib import closing
-from distutils.version import LooseVersion
 from optparse import OptionParser
-import pgdb
-from gppylib.utils import formatInsertValuesList, Escape
+from gppylib.utils import formatInsertValuesList, escape_string
+import psycopg2
 
 gpsd_version = '%prog 1.0'
 
@@ -21,7 +21,6 @@ sysnslist = "('pg_toast', 'pg_bitmapindex', 'pg_temp_1', 'pg_catalog', 'informat
 # turn off optimizer to fall back to planner and speed up statistic queries
 # unset search path due to CVE-2018-1058
 pgoptions = '-c optimizer=off -c gp_role=utility -c search_path='
-
 
 def ResultIter(cursor, arraysize=1000):
     'An iterator that uses fetchmany to keep memory usage down'
@@ -36,10 +35,19 @@ def ResultIter(cursor, arraysize=1000):
 def getVersion(envOpts):
     cmd = subprocess.Popen('psql --pset footer -Atqc "select version()" template1', shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=envOpts)
     if cmd.wait() != 0:
-        sys.stderr.write('\nError while trying to find HAWQ/GPDB version.\n\n' + cmd.communicate()[1].decode('ascii') + '\n\n')
+        sys.stderr.write('\nError while trying to find GPDB version.\n\n' + cmd.communicate()[1].decode('ascii') + '\n\n')
         sys.exit(1)
     return cmd.communicate()[0].decode('ascii')
 
+def get_num_segments(cursor):
+    query = "select count(*) from gp_segment_configuration where role='p' and content >=0;"
+    try:
+        cursor.execute(query)
+    except psycopg2.DatabaseError as e:
+        sys.stderr.write('\nError while trying to retrieve number of segments.\n\n' + str(e) + '\n\n')
+        sys.exit(1)
+    vals = cursor.fetchone()
+    return vals[0]
 
 def dumpSchema(connectionInfo, envOpts):
     dump_cmd = 'pg_dump -h {host} -p {port} -U {user} -s -x -O {database}'.format(**connectionInfo)
@@ -75,7 +83,13 @@ def dumpTupleCount(cur):
 
 
 def dumpStats(cur, inclHLL):
-    query = 'SELECT pgc.relname, pgn.nspname, pga.attname, pgtn.nspname, pgt.typname, pgs.* ' \
+    query = 'SELECT pgc.relname, pgn.nspname, pga.attname, pgtn.nspname, pgt.typname, ' \
+        'pgs.starelid, pgs.staattnum, pgs.stainherit, pgs.stanullfrac, pgs.stawidth, pgs.stadistinct, ' \
+        'pgs.stakind1, pgs.stakind2, pgs.stakind3, pgs.stakind4, pgs.stakind5, ' \
+        'pgs.staop1, pgs.staop2, pgs.staop3, pgs.staop4, pgs.staop5, ' \
+        'pgs.stacoll1, pgs.stacoll2, pgs.stacoll3, pgs.stacoll4, pgs.stacoll5, ' \
+        'pgs.stanumbers1, pgs.stanumbers2, pgs.stanumbers3, pgs.stanumbers4, pgs.stanumbers5, ' \
+        'pgs.stavalues1::text::text[], pgs.stavalues2::text::text[], pgs.stavalues3::text::text[], pgs.stavalues4::text::text[], pgs.stavalues5::text::text[] ' \
         'FROM pg_class pgc, pg_statistic pgs, pg_namespace pgn, pg_attribute pga, pg_type pgt, pg_namespace pgtn ' \
         'WHERE pgc.relnamespace = pgn.oid and pgn.nspname NOT IN ' + \
         sysnslist + \
@@ -94,10 +108,34 @@ def dumpStats(cur, inclHLL):
     cur.execute(query)
 
     for vals in ResultIter(cur):
-        starelid = "'%s.%s'::regclass" % (Escape(vals[1]), Escape(vals[0]))
+        starelid = "'%s.%s'::regclass" % (escape_string(vals[1]), escape_string(vals[0]))
         rowVals = formatInsertValuesList(vals, starelid, inclHLL)
         print(pstring.format(vals[0], vals[2], ',\n'.join(rowVals)))
 
+
+#Collect extended statistics
+def dumpExtStats(cur):
+    query = 'select pge.stxname, pgc.relname, nsp.nspname, pgd.stxdndistinct, pgd.stxddependencies, pgd.stxdmcv' \
+            ' from pg_class pgc, pg_statistic_ext pge, pg_statistic_ext_data pgd, pg_namespace nsp ' \
+            'where pgd.stxoid = pge.oid and pge.stxrelid=pgc.oid and pgc.relnamespace=nsp.oid '
+
+    # pg_statistic_ext_data has stxoid which gets populated when creating the statistics object,
+    # So we can not use stxoid of pg_statistic_ext_data while dumping the statistics. Hence we are populating
+    # the content of pg_statistic_ext_data based on stxname in pg_statistic_ext.
+
+    setStmt = '-- Table: pg_statistic_ext_data, stxname: {0}, schema: {1}\n' \
+              'UPDATE pg_statistic_ext_data\nSET\n' \
+              '{2}\n' \
+              'WHERE stxoid = (select pge.oid from pg_statistic_ext pge, pg_namespace pgn, pg_class pgc ' \
+              'WHERE pge.stxrelid=pgc.oid and pgc.relnamespace=pgn.oid and pge.stxname =\'{3}\' and pgn.nspname=\'{1}\') ;\n\n'
+
+    cur.execute(query)
+    columns = [x[0] for x in    cur.description]
+    types = ['pg_ndistinct', 'pg_dependencies', 'pg_mcv_list']
+
+    for vals in ResultIter(cur):
+        print(setStmt.format(vals[0], vals[2], ',\n'.join(['\t%s = %s::%s' %
+                                         t for t in zip(columns[3:], ['NULL' if x is None else "'" + x + "'" for x in vals[3:]], types)]),  vals[0]))
 
 def parseCmdLine():
     p = OptionParser(usage='Usage: %prog [options] <database>', version=gpsd_version, conflict_handler="resolve", epilog="WARNING: This tool collects statistics about your data, including most common values, which requires some data elements to be included in the output file. Please review output file to ensure it is within corporate policy to transport the output file.")
@@ -134,6 +172,7 @@ def main():
 
     version = getVersion(envOpts)
 
+
     timestamp = datetime.datetime.today()
 
     connectionInfo = {
@@ -143,9 +182,13 @@ def main():
     'database': db,
     'options': pgoptions
     }
+    num_segments = 0
+    with closing(psycopg2.connect(**connectionInfo)) as connection:
+        with closing(connection.cursor()) as cursor:
+            num_segments = get_num_segments(cursor)
     sys.stdout.writelines(['\n-- Greenplum database Statistics Dump',
-                           '\n-- Copyright (C) 2007 - 2014 Pivotal'
                            '\n-- Database: ' + db,
+                           '\n-- Num Segments: ' + str(num_segments),
                            '\n-- Date:     ' + timestamp.date().isoformat(),
                            '\n-- Time:     ' + timestamp.time().isoformat(),
                            '\n-- CmdLine:  ' + ' '.join(sys.argv),
@@ -169,23 +212,26 @@ def main():
                            '\n-- Allow system table modifications',
                            '\n-- ',
                            '\nset allow_system_table_mods=true;\n\n'])
+    # turn off optimizer when loading stats. Orca adds a bit of overhead, but it's significant when small insrt queries take 1 vs .1ms
+    sys.stdout.writelines('set optimizer to off;\n\n')
     sys.stdout.flush()
 
     try:
-        with closing(pgdb.connect(**connectionInfo)) as connection:
+        with closing(psycopg2.connect(**connectionInfo)) as connection:
             with closing(connection.cursor()) as cursor:
                 dumpTupleCount(cursor)
                 dumpStats(cursor, inclHLL)
+                dumpExtStats(cursor)
         # Upon success, leave a warning message about data collected
         sys.stderr.writelines(['WARNING: This tool collects statistics about your data, including most common values, '
                                'which requires some data elements to be included in the output file.\n',
                                'Please review output file to ensure it is within corporate policy to transport the output file.\n'])
 
-    except pgdb.DatabaseError as err:  # catch *all* exceptions
+    except psycopg2.DatabaseError as err:  # catch *all* exceptions
         sys.stderr.write('Error while dumping statistics:\n')
         sys.stderr.write(err.message)
         sys.exit(1)
 
 
 if __name__ == "__main__":
-        main()
+    main()

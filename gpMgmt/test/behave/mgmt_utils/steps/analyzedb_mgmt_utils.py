@@ -37,7 +37,6 @@ DEFAULT PARTITION default_dates);
 """
 
 
-
 @given('there is a regular "{storage_type}" table "{tablename}" with column name list "{col_name_list}" and column type list "{col_type_list}" in schema "{schemaname}"')
 def impl(context, storage_type, tablename, col_name_list, col_type_list, schemaname):
     schemaname_no_quote = schemaname
@@ -96,6 +95,13 @@ def impl(context, view_name, table_name, schema_name):
 def impl(context, view_name, table_name):
     with closing(dbconn.connect(dbconn.DbURL(dbname=context.dbname))) as conn:
         create_view_on_table(context.conn, view_name, table_name)
+
+
+@given('a materialized view "{view_name}" exists on table "{table_name}"')
+def impl(context, view_name, table_name):
+    with closing(dbconn.connect(dbconn.DbURL(dbname=context.dbname))) as conn:
+        create_materialized_view_on_table_in_schema(context.conn, viewname=view_name,
+                                                     tablename=table_name)
 
 
 @given('"{qualified_table}" appears in the latest state files')
@@ -266,8 +272,10 @@ def impl(context, num_dirs, dbname):
 
 @given('the user waits {num_secs} seconds')
 @when('the user waits {num_secs} seconds')
+@then('the user waits {num_secs} seconds')
 @given('the user waits {num_secs} second')
 @when('the user waits {num_secs} second')
+@then('the user waits {num_secs} second')
 def impl(context, num_secs):
     time.sleep(int(num_secs))
 
@@ -457,6 +465,14 @@ def create_view_on_table_in_schema(conn, schemaname, tablename, viewname):
 
 def create_view_on_table(conn, viewname, tablename):
     query = "CREATE OR REPLACE VIEW " + viewname + \
+            " AS SELECT * FROM " + tablename
+    dbconn.execSQL(conn, query)
+    conn.commit()
+
+
+def create_materialized_view_on_table_in_schema(conn, tablename, viewname):
+    query = "DROP MATERIALIZED VIEW IF EXISTS " + viewname + ";" \
+            "CREATE MATERIALIZED VIEW " + viewname + \
             " AS SELECT * FROM " + tablename
     dbconn.execSQL(conn, query)
     conn.commit()

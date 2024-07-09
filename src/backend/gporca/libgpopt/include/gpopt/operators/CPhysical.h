@@ -18,8 +18,10 @@
 #include "gpopt/base/CDrvdPropPlan.h"
 #include "gpopt/base/CEnfdDistribution.h"
 #include "gpopt/base/CEnfdOrder.h"
+#include "gpopt/base/CEnfdPartitionPropagation.h"
 #include "gpopt/base/CEnfdRewindability.h"
 #include "gpopt/base/COrderSpec.h"
+#include "gpopt/base/CPartitionPropagationSpec.h"
 #include "gpopt/base/CRewindabilitySpec.h"
 #include "gpopt/operators/COperator.h"
 
@@ -32,7 +34,7 @@ namespace gpopt
 using namespace gpos;
 
 // arrays of unsigned integer arrays
-typedef CDynamicPtrArray<ULONG_PTR, CleanupDeleteArray> UlongPtrArray;
+using UlongPtrArray = CDynamicPtrArray<ULONG_PTR, CleanupDeleteArray>;
 
 class CTableDescriptor;
 class CCTEMap;
@@ -136,10 +138,10 @@ private:
 	};	// class CReqdColsRequest
 
 	// map of incoming required columns request to computed column sets
-	typedef CHashMap<CReqdColsRequest, CColRefSet, CReqdColsRequest::HashValue,
-					 CReqdColsRequest::Equals, CleanupRelease<CReqdColsRequest>,
-					 CleanupRelease<CColRefSet> >
-		ReqdColsReqToColRefSetMap;
+	using ReqdColsReqToColRefSetMap =
+		CHashMap<CReqdColsRequest, CColRefSet, CReqdColsRequest::HashValue,
+				 CReqdColsRequest::Equals, CleanupRelease<CReqdColsRequest>,
+				 CleanupRelease<CColRefSet>>;
 
 	// hash map of child columns requests
 	ReqdColsReqToColRefSetMap *m_phmrcr;
@@ -263,10 +265,6 @@ protected:
 												  CDistributionSpec *pds,
 												  ULONG child_index);
 
-	// helper to compute skew estimate based on given stats and distribution spec
-	static CDouble GetSkew(IStatistics *stats, CDistributionSpec *pds);
-
-
 	// return true if the given column set includes any of the columns defined by
 	// the unary node, as given by the handle
 	static BOOL FUnaryUsesDefinedColumns(CColRefSet *pcrs,
@@ -297,6 +295,9 @@ public:
 		CRefCount::SafeRelease(m_phmrcr);
 		CRefCount::SafeRelease(m_pdrgpulpOptReqsExpanded);
 	}
+
+	// helper to compute skew estimate based on given stats and distribution spec
+	static CDouble GetSkew(IStatistics *stats, CDistributionSpec *pds);
 
 	// type of operator
 	BOOL
@@ -330,7 +331,8 @@ public:
 	// compute distribution spec from the table descriptor
 	static CDistributionSpec *PdsCompute(CMemoryPool *mp,
 										 const CTableDescriptor *ptabdesc,
-										 CColRefArray *pdrgpcrOutput);
+										 CColRefArray *pdrgpcrOutput,
+										 CColRef *gp_segment_id);
 
 	// compute required sort order of the n-th child
 	virtual COrderSpec *PosRequired(CMemoryPool *mp, CExpressionHandle &exprhdl,
@@ -345,6 +347,13 @@ public:
 											ULONG child_index,
 											CDrvdPropArray *pdrgpdpCtxt,
 											ULONG ulOptReq) const = 0;
+
+	// compute required partition propagation spec of the n-th child
+	virtual CPartitionPropagationSpec *PppsRequired(
+		CMemoryPool *mp, CExpressionHandle &exprhdl,
+		CPartitionPropagationSpec *pppsRequired, ULONG child_index,
+		CDrvdPropArray *pdrgpdpCtxt, ULONG ulOptReq) const;
+
 
 	// required properties: check if required columns are included in output columns
 	virtual BOOL FProvidesReqdCols(CExpressionHandle &exprhdl,
@@ -371,6 +380,10 @@ public:
 	virtual CRewindabilitySpec *PrsDerive(CMemoryPool *mp,
 										  CExpressionHandle &exprhdl) const = 0;
 
+	// derived properties: derive partition propagation spec
+	virtual CPartitionPropagationSpec *PppsDerive(
+		CMemoryPool *mp, CExpressionHandle &exprhdl) const;
+
 	// derive cte map
 	virtual CCTEMap *PcmDerive(CMemoryPool *mp,
 							   CExpressionHandle &exprhdl) const;
@@ -391,6 +404,10 @@ public:
 	// return rewindability property enforcing type for this operator
 	virtual CEnfdProp::EPropEnforcingType EpetRewindability(
 		CExpressionHandle &exprhdl, const CEnfdRewindability *per) const = 0;
+
+	// return partition propagation property enforcing type for this operator
+	virtual CEnfdProp::EPropEnforcingType EpetPartitionPropagation(
+		CExpressionHandle &exprhdl, const CEnfdPartitionPropagation *per) const;
 
 	// order matching type
 	virtual CEnfdOrder::EOrderMatching Eom(CReqdPropPlan *prppInput,

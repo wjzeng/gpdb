@@ -1,294 +1,166 @@
 #!/bin/bash
 set -exo pipefail
 
-GREENPLUM_INSTALL_DIR=/usr/local/greenplum-db-devel
-export GPDB_ARTIFACTS_DIR=$(pwd)/${OUTPUT_ARTIFACT_DIR}
-CWDIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-GPDB_SRC_PATH=${GPDB_SRC_PATH:=gpdb_src}
-
-GPDB_BIN_FILENAME=${GPDB_BIN_FILENAME:="bin_gpdb.tar.gz"}
-GREENPLUM_CL_INSTALL_DIR=/usr/local/greenplum-clients-devel
-GPDB_CL_FILENAME=${GPDB_CL_FILENAME:="gpdb-clients-${TARGET_OS}${TARGET_OS_VERSION}.tar.gz"}
-
+CWDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${CWDIR}/common.bash"
 
-function expand_glob_ensure_exists() {
-  local -a glob=($*)
-  [ -e "${glob[0]}" ]
-  echo "${glob[0]}"
-}
-
 function prep_env() {
-  case "${TARGET_OS}" in
-  centos)
-    case "${TARGET_OS_VERSION}" in
-    6 | 7) BLD_ARCH=rhel${TARGET_OS_VERSION}_x86_64 ;;
-    *)
-      echo "TARGET_OS_VERSION not set or recognized for Centos/RHEL"
-      exit 1
-      ;;
-    esac
-    ;;
-  ubuntu)
-    case "${TARGET_OS_VERSION}" in
-    18.04) BLD_ARCH=ubuntu18.04_x86_64 ;;
-    *)
-      echo "TARGET_OS_VERSION not set or recognized for Ubuntu"
-      exit 1
-      ;;
-    esac
-    ;;
-  sles)
-    case "${TARGET_OS_VERSION}" in
-    12) export BLD_ARCH=sles12_x86_64 ;;
-    *)
-      echo "TARGET_OS_VERSION not set or recognized for SLES"
-      exit 1
-      ;;
-    esac
-    ;;
-  esac
-}
+	OUTPUT_ARTIFACT_DIR=${OUTPUT_ARTIFACT_DIR:=gpdb_artifacts}
 
-function install_libuv() {
-  local includedir=/usr/include
-  local libdir
+	export CONFIGURE_FLAGS=${CONFIGURE_FLAGS}
+	export GPDB_ARTIFACTS_DIR=$(pwd)/${OUTPUT_ARTIFACT_DIR}
+	export BLD_ARCH=$(build_arch)
 
-  case "${TARGET_OS}" in
-    centos | sles) libdir=/usr/lib64 ;;
-    ubuntu) libdir=/usr/lib/x86_64-linux-gnu ;;
-    *) return ;;
-  esac
-  # provided by build container
-  cp -a /usr/local/include/uv* ${includedir}/
-  cp -a /usr/local/lib/libuv* ${libdir}/
-}
+	GPDB_SRC_PATH=${GPDB_SRC_PATH:=gpdb_src}
+	GPDB_EXT_PATH=${GPDB_SRC_PATH}/gpAux/ext/${BLD_ARCH}
+	GPDB_BIN_FILENAME=${GPDB_BIN_FILENAME:="bin_gpdb.tar.gz"}
+	GPDB_CL_FILENAME=${GPDB_CL_FILENAME:="bin_gpdb_clients.tar.gz"}
 
+	GREENPLUM_INSTALL_DIR=/usr/local/greenplum-db-devel
+	GREENPLUM_CL_INSTALL_DIR=/usr/local/greenplum-clients-devel
 
-function install_deps_for_centos_or_sles() {
-  rpm -i libquicklz-installer/libquicklz-*.rpm
-  rpm -i libquicklz-devel-installer/libquicklz-*.rpm
-}
+	mkdir -p "${GPDB_ARTIFACTS_DIR}"
 
-function install_deps_for_ubuntu() {
-  dpkg --install libquicklz-installer/libquicklz-*.deb
-}
-
-function install_deps() {
-  case "${TARGET_OS}" in
-    centos | sles) install_deps_for_centos_or_sles;;
-    ubuntu) install_deps_for_ubuntu;;
-  esac
-  install_libuv
+	# By default, only GPDB Server binary is build.
+	# Use BLD_TARGETS flag with appropriate value string to generate client, loaders
+	# connectors binaries
+	if [ -n "${BLD_TARGETS}" ]; then
+		BLD_TARGET_OPTION=("BLD_TARGETS=\"$BLD_TARGETS\"")
+	else
+		BLD_TARGET_OPTION=("")
+	fi
 }
 
 function generate_build_number() {
-  pushd ${GPDB_SRC_PATH}
-    #Only if its git repro, add commit SHA as build number
-    # BUILD_NUMBER file is used by getversion file in GPDB to append to version
-    if [ -d .git ] ; then
-      echo "commit:`git rev-parse HEAD`" > BUILD_NUMBER
-    fi
-  popd
+	pushd ${GPDB_SRC_PATH}
+	# Only if its git repo, add commit SHA as build number
+	# BUILD_NUMBER file is used by getversion file in GPDB to append to version
+	if [ -d .git ]; then
+		echo "commit:$(git rev-parse HEAD)" >BUILD_NUMBER
+	fi
+	popd
 }
 
 function build_gpdb() {
-  pushd ${GPDB_SRC_PATH}/gpAux
-    # Use -j4 to speed up the build. (Doesn't seem worth trying to guess a better
-    # value based on number of CPUs or anything like that. Going above -j4 wouldn't
-    # make it much faster, and -j4 is small enough to not hurt too badly even on
-    # a single-CPU system
-    if [ -n "$1" ]; then
-      make "$1" GPROOT=/usr/local PARALLEL_MAKE_OPTS=-j4 -s dist
-    else
-      make GPROOT=/usr/local PARALLEL_MAKE_OPTS=-j4 -s dist
-    fi
-  popd
+	pushd ${GPDB_SRC_PATH}/gpAux
+	if [ -n "$1" ]; then
+		make "$1" GPROOT=/usr/local PARALLEL_MAKE_OPTS=-j"$(nproc)" -s dist
+	else
+		make GPROOT=/usr/local PARALLEL_MAKE_OPTS=-j"$(nproc)" -s dist
+	fi
+	popd
 }
 
 function git_info() {
-  pushd ${GPDB_SRC_PATH}
+	pushd ${GPDB_SRC_PATH}
+	if [[ -d .git ]]; then
+		"${CWDIR}/git_info.bash" | tee ${GREENPLUM_INSTALL_DIR}/etc/git-info.json
 
-  "${CWDIR}/git_info.bash" | tee ${GREENPLUM_INSTALL_DIR}/etc/git-info.json
+		PREV_TAG=$(git describe --tags --abbrev=0 HEAD^)
 
-  PREV_TAG=$(git describe --tags --abbrev=0 HEAD^)
+		cat >${GREENPLUM_INSTALL_DIR}/etc/git-current-changelog.txt <<-EOF
+			======================================================================
+			Git log since previous release tag (${PREV_TAG})
+			----------------------------------------------------------------------
+		EOF
 
-  cat > ${GREENPLUM_INSTALL_DIR}/etc/git-current-changelog.txt <<-EOF
-	======================================================================
-	Git log since previous release tag (${PREV_TAG})
-	----------------------------------------------------------------------
-
-	EOF
-
-  git log --abbrev-commit --date=relative "${PREV_TAG}..HEAD" >> ${GREENPLUM_INSTALL_DIR}/etc/git-current-changelog.txt
-
-  popd
+		git log --abbrev-commit --date=relative "${PREV_TAG}..HEAD" >>${GREENPLUM_INSTALL_DIR}/etc/git-current-changelog.txt
+	fi
+	popd
 }
 
 function unittest_check_gpdb() {
-  pushd ${GPDB_SRC_PATH}
-    source ${GREENPLUM_INSTALL_DIR}/greenplum_path.sh
-    make GPROOT=/usr/local -s unittest-check
-  popd
+	pushd ${GPDB_SRC_PATH}
+	source ${GREENPLUM_INSTALL_DIR}/greenplum_path.sh
+	make GPROOT=/usr/local -s unittest-check
+	popd
 }
 
-function include_zstd() {
-  local libdir
-  case "${TARGET_OS}" in
-    centos | sles) libdir=/usr/lib64 ;;
-    ubuntu) libdir=/usr/lib ;;
-    *) return ;;
-  esac
-  pushd ${GREENPLUM_INSTALL_DIR}
-    cp ${libdir}/pkgconfig/libzstd.pc lib/pkgconfig
-    cp -d ${libdir}/libzstd.so* lib
-    cp /usr/include/zstd*.h include
-  popd
-}
+function include_dependencies() {
 
-function include_quicklz() {
-  local libdir
-  case "${TARGET_OS}" in
-    centos | sles) libdir=/usr/lib64 ;;
-    ubuntu) libdir=/usr/local/lib ;;
-    *) return ;;
-  esac
-  pushd ${GREENPLUM_INSTALL_DIR}
-    cp -d ${libdir}/libquicklz.so* lib
-  popd
-}
+	declare -a library_search_path vendored_libs
 
-function include_libuv() {
-  local includedir=/usr/include
-  local libdir
-  case "${TARGET_OS}" in
-    centos | sles) libdir=/usr/lib64 ;;
-    ubuntu) libdir=/usr/lib/x86_64-linux-gnu ;;
-    *) return ;;
-  esac
-  pushd ${GREENPLUM_INSTALL_DIR}
-    # need to include both uv.h and uv/*.h
-    cp -a ${includedir}/uv* include
-    cp -a ${libdir}/libuv.so* lib
-  popd
-}
+	library_search_path+=($(cat /etc/ld.so.conf.d/*.conf | grep -v '#'))
+	library_search_path+=(/lib64 /usr/lib64 /lib /usr/lib)
 
+	vendored_libs=(libxerces-c{,-3.1}.so libLLVM{,-15,-15.0.7}.so)
+
+	# Vendor shared libraries - follow symlinks
+	for path in "${library_search_path[@]}"; do if [[ -d "${path}" ]]; then for lib in "${vendored_libs[@]}"; do find -L $path -name $lib -exec cp -avn '{}' ${GREENPLUM_INSTALL_DIR}/lib \;; done; fi; done
+}
 function export_gpdb() {
-  TARBALL="${GPDB_ARTIFACTS_DIR}/${GPDB_BIN_FILENAME}"
-  local server_version
-  server_version="$("${GPDB_SRC_PATH}"/getversion --short)"
+	TARBALL="${GPDB_ARTIFACTS_DIR}/${GPDB_BIN_FILENAME}"
+	local server_version
+	server_version="$("${GPDB_SRC_PATH}"/getversion --short)"
 
-  local server_build
-  server_build="${GPDB_ARTIFACTS_DIR}/server-build-${server_version}-${BLD_ARCH}${RC_BUILD_TYPE_GCS}.tar.gz"
+	local server_build
+	server_build="${GPDB_ARTIFACTS_DIR}/server-build-${server_version}-${BLD_ARCH}${RC_BUILD_TYPE_GCS}.tar.gz"
 
-  pushd ${GREENPLUM_INSTALL_DIR}
-    source greenplum_path.sh
-    python3 -m compileall -q -x test .
-    chmod -R 755 .
-    tar -czf "${TARBALL}" ./*
-  popd
+	pushd ${GREENPLUM_INSTALL_DIR}
+	chmod -R 755 .
+	# Remove python bytecode
+	find . -type f \( -iname \*.pyc -o -iname \*.pyo \) -delete
+	tar -czf "${TARBALL}" ./*
+	popd
 
-  cp "${TARBALL}" "${server_build}"
+	cp "${TARBALL}" "${server_build}"
 }
 
 function export_gpdb_extensions() {
-  pushd ${GPDB_SRC_PATH}/gpAux
-    if ls greenplum-*zip* 1>/dev/null 2>&1; then
-      chmod 755 greenplum-*zip*
-      cp greenplum-*zip* "${GPDB_ARTIFACTS_DIR}/"
-    fi
-  popd
-}
-
-function export_gpdb_win32_ccl() {
-    pushd ${GPDB_SRC_PATH}/gpAux
-    if [ -f "$(find . -maxdepth 1 -name 'greenplum-*.msi' -print -quit)" ] ; then
-        cp greenplum-*.msi "${GPDB_ARTIFACTS_DIR}/"
-    fi
-    popd
+	pushd ${GPDB_SRC_PATH}/gpAux
+	if ls greenplum-*zip* 1>/dev/null 2>&1; then
+		chmod 755 greenplum-*zip*
+		cp greenplum-*zip* "${GPDB_ARTIFACTS_DIR}/"
+	fi
+	popd
 }
 
 function export_gpdb_clients() {
-  TARBALL="${GPDB_ARTIFACTS_DIR}/${GPDB_CL_FILENAME}"
-  pushd ${GREENPLUM_CL_INSTALL_DIR}
-    source ./greenplum_clients_path.sh
-    mkdir -p bin/ext/gppylib
-    cp ${GREENPLUM_INSTALL_DIR}/lib/python/gppylib/__init__.py ./bin/ext/gppylib
-    cp  ${GREENPLUM_INSTALL_DIR}/lib/python/gppylib/gpversion.py ./bin/ext/gppylib
-    # GPHOME_LOADERS and greenplum_loaders_path.sh are still requried by some users
-    # So link greenplum_loaders_path.sh to greenplum_clients_path.sh for compatible
-    ln -sf greenplum_clients_path.sh greenplum_loaders_path.sh
-    chmod -R 755 .
-    tar -czf "${TARBALL}" ./*
-  popd
-}
-
-function build_xerces()
-{
-    OUTPUT_DIR="gpdb_src/gpAux/ext/${BLD_ARCH}"
-    mkdir -p xerces_patch/concourse
-    cp -r gpdb_src/src/backend/gporca/concourse/xerces-c xerces_patch/concourse
-    /usr/bin/python xerces_patch/concourse/xerces-c/build_xerces.py --output_dir=${OUTPUT_DIR}
-    rm -rf build
+	TARBALL="${GPDB_ARTIFACTS_DIR}/${GPDB_CL_FILENAME}"
+	pushd ${GREENPLUM_CL_INSTALL_DIR}
+	source ./greenplum_clients_path.sh
+	mkdir -p bin/ext/gppylib
+	cp ${GREENPLUM_INSTALL_DIR}/lib/python/gppylib/__init__.py ./bin/ext/gppylib
+	cp ${GREENPLUM_INSTALL_DIR}/lib/python/gppylib/gpversion.py ./bin/ext/gppylib
+	# GPHOME_LOADERS and greenplum_loaders_path.sh are still requried by some users
+	# So link greenplum_loaders_path.sh to greenplum_clients_path.sh for compatible
+	ln -sf greenplum_clients_path.sh greenplum_loaders_path.sh
+	chmod -R 755 .
+	tar -czf "${TARBALL}" ./*
+	popd
 }
 
 function _main() {
 
-  ## Add CCache Support (?)
-  add_ccache_support "${TARGET_OS}"
+	prep_env
 
-  mkdir gpdb_src/gpAux/ext
+	## Add CCache Support (?)
+	add_ccache_support "${OS}"
 
-  case "${TARGET_OS}" in
-    centos|ubuntu|sles)
-      prep_env
-      build_xerces
-      install_deps
-      ;;
-    win32)
-        export BLD_ARCH=win32
-        ;;
-    *)
-        echo "only centos, ubuntu, sles and win32 are supported TARGET_OS'es"
-        false
-        ;;
-  esac
 
-  generate_build_number
+	# The WITH_ASSERTIONS state should keep the same between build and test.
+	# Or LLVM_ABI_BREAKING_CHECKS will fail the loading of libllvmjit
+	setup_llvm
 
-  # By default, only GPDB Server binary is build.
-  # Use BLD_TARGETS flag with appropriate value string to generate client, loaders
-  # connectors binaries
-  if [ -n "${BLD_TARGETS}" ]; then
-    BLD_TARGET_OPTION=("BLD_TARGETS=\"$BLD_TARGETS\"")
-  else
-    BLD_TARGET_OPTION=("")
-  fi
+	generate_build_number
+	build_gpdb "${BLD_TARGET_OPTION[@]}"
+	git_info
 
-  export CONFIGURE_FLAGS=${CONFIGURE_FLAGS}
+	if [[ -z "${SKIP_UNITTESTS}" ]]; then
+		unittest_check_gpdb
+	fi
 
-  build_gpdb "${BLD_TARGET_OPTION[@]}"
-  git_info
+	include_dependencies
 
-  if [[ "${TARGET_OS}" != "win32" ]] && [[ -z "${SKIP_UNITTESTS}" ]]; then
-      # Don't unit test when cross compiling. Tests don't build because they
-      # require `./configure --with-zlib`.
-      unittest_check_gpdb
-  fi
-  include_zstd
-  include_quicklz
-  include_libuv
-  export_gpdb
-  export_gpdb_extensions
-  export_gpdb_win32_ccl
+	export_gpdb
+	export_gpdb_extensions
 
-  if echo "${BLD_TARGETS}" | grep -qwi "clients"
-  then
-      export_gpdb_clients
-  fi
+	if echo "${BLD_TARGETS}" | grep -qwi "clients"; then
+		export_gpdb_clients
+	fi
 
-  ## Display CCache Stats
-  display_ccache_stats
+	## Display CCache Stats
+	display_ccache_stats
 }
 
 _main "$@"

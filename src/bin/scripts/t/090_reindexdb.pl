@@ -1,19 +1,19 @@
 use strict;
 use warnings;
 
-use PostgresNode;
-use TestLib;
-use Test::More tests => 34;
+use PostgreSQL::Test::Cluster;
+use PostgreSQL::Test::Utils;
+use Test::More;
 
 program_help_ok('reindexdb');
 program_version_ok('reindexdb');
 program_options_handling_ok('reindexdb');
 
-my $node = get_new_node('main');
+my $node = PostgreSQL::Test::Cluster->new('main');
 $node->init;
 $node->start;
 
-$ENV{PGOPTIONS} = '-c gp_role=utility --client-min-messages=WARNING';
+$ENV{PGOPTIONS} = '-c gp_session_role=utility --client-min-messages=WARNING';
 
 $node->issues_sql_like(
 	[ 'reindexdb', 'postgres' ],
@@ -67,11 +67,11 @@ $node->issues_sql_like(
 	'reindex specific schema concurrently');
 $node->command_fails([ 'reindexdb', '--concurrently', '-s', 'postgres' ],
 	'reindex system tables concurrently');
-} # end SKIP
 $node->issues_sql_like(
-	[ 'reindexdb', '-v', '-t', 'test1', 'postgres' ],
-	qr/statement: REINDEX \(VERBOSE\) TABLE public\.test1;/,
-	'reindex with verbose output');
+	[ 'reindexdb', '--concurrently', '-v', '-t', 'test1', 'postgres' ],
+	qr/statement: REINDEX \(VERBOSE\) TABLE CONCURRENTLY public\.test1;/,
+	'reindex with verbose output concurrently');
+} # end SKIP
 
 # connection strings
 $node->command_ok([qw(reindexdb --echo --table=pg_am dbname=template1)],
@@ -82,3 +82,5 @@ $node->command_ok(
 $node->command_ok(
 	[qw(reindexdb --echo --system dbname=template1)],
 	'reindexdb system with connection string');
+
+done_testing();

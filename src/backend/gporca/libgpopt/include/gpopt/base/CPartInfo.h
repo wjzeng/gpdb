@@ -27,8 +27,6 @@ namespace gpopt
 using namespace gpos;
 using namespace gpmd;
 
-// fwd decl
-class CPartConstraint;
 
 //---------------------------------------------------------------------------
 //	@class:
@@ -107,8 +105,8 @@ private:
 
 	};	// CPartInfoEntry
 
-	typedef CDynamicPtrArray<CPartInfoEntry, CleanupRelease>
-		CPartInfoEntryArray;
+	using CPartInfoEntryArray =
+		CDynamicPtrArray<CPartInfoEntry, CleanupRelease>;
 
 	// partition table consumers
 	CPartInfoEntryArray *m_pdrgppartentries;

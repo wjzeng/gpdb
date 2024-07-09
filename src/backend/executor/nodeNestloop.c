@@ -31,7 +31,6 @@
 #include "miscadmin.h"
 #include "utils/memutils.h"
 
-extern bool Test_print_prefetch_joinqual;
 
 static void splitJoinQualExpr(List *joinqual, List **inner_join_keys_p, List **outer_join_keys_p);
 static void extractFuncExprArgs(Expr *clause, List **lclauses, List **rclauses);
@@ -167,17 +166,6 @@ ExecNestLoop_guts(PlanState *pstate)
 
 		node->prefetch_inner = false;
 		node->reset_inner = false;
-	}
-
-	/*
-	 * Prefetch JoinQual to prevent motion hazard.
-	 *
-	 * See ExecPrefetchJoinQual() for details.
-	 */
-	if (node->prefetch_joinqual)
-	{
-		ExecPrefetchJoinQual(&node->js);
-		node->prefetch_joinqual = false;
 	}
 
 	/*
@@ -419,12 +407,6 @@ ExecInitNestLoop(NestLoop *node, EState *estate, int eflags)
 	nlstate->shared_outer = node->shared_outer;
 
 	nlstate->prefetch_inner = node->join.prefetch_inner;
-	nlstate->prefetch_joinqual = node->join.prefetch_joinqual;
-
-	if (Test_print_prefetch_joinqual && nlstate->prefetch_joinqual)
-		elog(NOTICE,
-			 "prefetch join qual in slice %d of plannode %d",
-			 currentSliceId, ((Plan *) node)->plan_node_id);
 
 	/*CDB-OLAP*/
 	nlstate->reset_inner = false;
@@ -684,13 +666,11 @@ splitJoinQualExpr(List *joinqual, List **inner_join_keys_p, List **outer_join_ke
 				}
 				break;
 
-			case T_DistinctExpr:
 			case T_Const:
-
 				/*
-				 * Distinct and constant expressions do not need to be
-				 * splitted into left and right as they don't need to be
-				 * considered for NULL value special cases
+				 * Constant expressions do not need to be splitted into left and
+				 * right as they don't need to be considered for NULL value special
+				 * cases
 				 */
 				break;
 
@@ -750,6 +730,36 @@ extractFuncExprArgs(Expr *clause, List **lclauses, List **rclauses)
 
 		*lclauses = lappend(*lclauses, linitial(fexpr->args));
 		*rclauses = lappend(*rclauses, lsecond(fexpr->args));
+	}
+	else if (IsA(clause, Const) && ((Const *) clause)->constisnull)
+	{
+		/*
+		 * Greenplum will pull up not-in sublink to a specific join LASJ,
+		 * this kind of join's joinqual might contain a NULL const here,
+		 * for such case we do not need to split it. A case that can
+		 * reach here is:
+		 *
+		 *   create table t1(a int not null, b int not null);
+		 *   create table t2(a int not null, b int not null);
+		 *   explain  select 1 from t1 where (NULL, b) not in (select a, b from t2);
+		 *
+		 * The above SQL in Greenplum will be turned in a join whose qual contains
+		 * a bool expr (NULL = t2.a) and (t1.b = t2.b), this piece of expr will be
+		 * evaluated to (t1.b = t2.b) and NULL by the following code path:
+		 *   subquery_planner
+		 *     -> preprocess_qual_conditions(root, (Node *) parse->jointree)
+		 *     -> preprocess_expression
+		 *     -> eval_const_expressions
+		 *     -> eval_const_expressions_mutator
+		 *
+		 * That is why here we have to consider const case, and only null const
+		 * (other const cases, true or false will be simplified during the above
+		 * code path).
+		 *
+		 * We do nothing here for NULL const.
+		 *
+		 * See Issue: https://github.com/greenplum-db/gpdb/issues/13212 for details.
+		 */
 	}
 	else
 		elog(ERROR, "unexpected join qual in JOIN_LASJ_NOTIN join");

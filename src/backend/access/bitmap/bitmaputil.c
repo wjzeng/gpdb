@@ -260,9 +260,23 @@ _bitmap_findnexttids(BMBatchWords *words, BMIterateResult *result,
 
 	result->nextTidLoc = result->numOfTids = 0;
 
-	_bitmap_catchup_to_next_tid(words, result);
-
-	Assert(words->firstTid == result->nextTid);
+	/*
+	 * Only in the situation that there have concurrent read/write on two
+	 * adjacent bitmap index pages, and inserting a tid into PAGE_FULL cause expand
+	 * compressed words to new words, and rearrange those words into PAGE_NEXT,
+	 * and we ready to read a new page, we should adjust result-> lastScanWordNo
+	 * to the current position.
+	 *
+	 * The value of words->startNo will always be 0, this value will only used at
+	 * _bitmap_union to union a bunch of bitmaps, the union result will be stored
+	 * at words. result->lastScanWordNo indicates the location in words->cwords that
+	 * BMIterateResult will read the word next, it's start from 0, and will
+	 * self-incrementing during the scan. So if result->lastScanWordNo equals to
+	 * words->startNo, means we will scan a new bitmap index pages.
+	 */
+	if (result->lastScanWordNo == words->startNo &&
+			words->firstTid < result->nextTid)
+		_bitmap_catchup_to_next_tid(words, result);
 
 	while (words->nwords > 0 && result->numOfTids < maxTids && !done)
 	{
@@ -355,10 +369,8 @@ _bitmap_findnexttids(BMBatchWords *words, BMIterateResult *result,
 
 /*
  * _bitmap_catchup_to_next_tid - Catch up to the nextTid we need to check
- * from last iteration.
+ * from last iteration, in the following cases:
  *
- * Normally words->firstTid should equal to result->nextTid. But there
- * are exceptions:
  * 1: When the concurrent insert causes bitmap items from previous full page
  * to spill over to current page in the window when we (the read transaction)
  * had released the lock on the previous page and not locked the current page.
@@ -376,7 +388,7 @@ _bitmap_catchup_to_next_tid(BMBatchWords *words, BMIterateResult *result)
 	/*
 	 * Iterate each word until catch up to the next tid to search.
 	 */
-	for(; result->lastScanWordNo < words->nwords && words->firstTid < result->nextTid;
+	for(; words->nwords > 0 && words->firstTid < result->nextTid;
 		result->lastScanWordNo++)
 	{
 		if (IS_FILL_WORD(words->hwords, result->lastScanWordNo))
@@ -391,38 +403,42 @@ _bitmap_catchup_to_next_tid(BMBatchWords *words, BMIterateResult *result)
 			{
 				fillLength = 1;
 				/* Skip all empty bits, this may cause words->firstTid > result->nextTid */
-				words->firstTid = fillLength * BM_HRL_WORD_SIZE;
+				words->firstTid += fillLength * BM_HRL_WORD_SIZE;
 				words->nwords--;
 
 				/* reset next tid to skip all empty words */
 				if (words->firstTid > result->nextTid)
 					result->nextTid = words->firstTid;
+
 				continue;
 			}
-			else
+
+			if (fillLength > 0)
 			{
-				while (fillLength > 0 && words->firstTid < result->nextTid)
-				{
-					/* update fill word to reflect expansion */
-					words->cwords[result->lastScanWordNo]--;
-					words->firstTid += BM_HRL_WORD_SIZE;
-					fillLength--;
-				}
+				/* update fill word to reflect expansion */
 
-				/* comsume all the fill words, try to fetch next words */
-				if (fillLength == 0)
-				{
-					words->nwords--;
-					continue;
-				}
+				uint64 fillToUse = (result->nextTid - words->firstTid) / BM_HRL_WORD_SIZE + 1;
+				if (fillToUse > fillLength)
+					fillToUse = fillLength;
 
-				/*
-				* Catch up the next tid to search, but there still fill words.
-				* Return current state.
-				*/
-				if (words->firstTid >= result->nextTid)
-					return;
+				words->cwords[result->lastScanWordNo] -= fillToUse;
+				words->firstTid += fillToUse * BM_HRL_WORD_SIZE;
+				fillLength -= fillToUse;
 			}
+
+			/* comsume all the fill words, try to fetch next words */
+			if (fillLength == 0)
+			{
+				words->nwords--;
+				continue;
+			}
+
+			/*
+			 * Catch up the next tid to search, but there still fill words.
+			 * Return current state.
+			 */
+			if (words->firstTid >= result->nextTid)
+				return;
 		}
 		else
 		{
@@ -668,6 +684,15 @@ _bitmap_union(BMBatchWords **batches, uint32 numBatches, BMBatchWords *result)
 
 	/* save batch->startNo for each input bitmap vector */
 	prevstarts = (uint32 *)palloc0(numBatches * sizeof(uint32));
+
+	/*
+	 * Update the real firstTid for the bachwords with unioned batches.
+	 * This is required because we may result->firstTid is set to nextTid
+	 * to fetch in _bitmap_nextbatchwords for bitmap index scan, but the
+	 * read words may not reach this position yet, the below calculation
+	 * will set it back to the real first tid of current result batch.
+	 */
+	result->firstTid = ((batches[0]->nextread - 1) * BM_HRL_WORD_SIZE) + 1;
 
 	/* 
 	 * Compute the next read offset. We fast forward compressed
@@ -1012,6 +1037,7 @@ _bitmap_log_bitmapwords(Relation rel,
 	ListCell   *lcb;
 	bool		init_page;
 	int			num_bm_pages = list_length(xl_bm_bitmapword_pages);
+	int 		current_page = 0;
 
 	Assert(list_length(bitmapBuffers) == num_bm_pages);
 	if (num_bm_pages > MAX_BITMAP_PAGES_PER_INSERT)
@@ -1020,7 +1046,7 @@ _bitmap_log_bitmapwords(Relation rel,
 	MemSet(&xlBitmapWords, 0, sizeof(xlBitmapWords));
 
 	xlBitmapWords.bm_node = rel->rd_node;
-	xlBitmapWords.bm_num_pages = list_length(xl_bm_bitmapword_pages);
+	xlBitmapWords.bm_num_pages = num_bm_pages;
 	xlBitmapWords.bm_init_first_page = init_first_page;
 
 	xlBitmapWords.bm_lov_blkno = BufferGetBlockNumber(lovBuffer);
@@ -1050,6 +1076,13 @@ _bitmap_log_bitmapwords(Relation rel,
 
 		Assert(BufferIsValid(bitmapBuffer));
 
+		/* fill bm_next_blkno field */
+		if (current_page + 1 < num_bm_pages)
+		{
+			xl_bm_bitmapwords_perpage *next_xl_bm_bitmapwords_perpage = lfirst(lnext(lcp));
+			xlBitmapwordsPage->bm_next_blkno = next_xl_bm_bitmapwords_perpage->bmp_blkno;
+		}
+
 		XLogRegisterBuffer(rdata_no, bitmapBuffer, 0);
 
 		XLogRegisterBufData(rdata_no, (char *) xlBitmapwordsPage, sizeof(xl_bm_bitmapwords_perpage));
@@ -1058,6 +1091,7 @@ _bitmap_log_bitmapwords(Relation rel,
 		XLogRegisterBufData(rdata_no, (char *) &bitmap->cwords[xlBitmapwordsPage->bmp_start_cword_no],
 							xlBitmapwordsPage->bmp_num_cwords * sizeof(BM_HRL_WORD));
 		rdata_no++;
+		current_page++;
 	}
 
 	recptr = XLogInsert(RM_BITMAP_ID, XLOG_BITMAP_INSERT_WORDS);
@@ -1110,7 +1144,7 @@ _bitmap_log_updateword(Relation rel, Buffer bitmapBuffer, int word_no)
 
 	XLogBeginInsert();
 	XLogRegisterData((char*)&xlBitmapWord, sizeof(xl_bm_updateword));
-	XLogRegisterBuffer(0, bitmapBuffer, REGBUF_STANDARD);
+	XLogRegisterBuffer(0, bitmapBuffer, 0);
 
 	recptr = XLogInsert(RM_BITMAP_ID, XLOG_BITMAP_UPDATEWORD);
 
@@ -1185,10 +1219,10 @@ _bitmap_log_updatewords(Relation rel,
 
 	XLogBeginInsert();
 	XLogRegisterData((char*)&xlBitmapWords, sizeof(xl_bm_updatewords));
-	XLogRegisterBuffer(0, firstBuffer, REGBUF_STANDARD);
+	XLogRegisterBuffer(0, firstBuffer, 0);
 
 	if (BufferIsValid(secondBuffer))
-		XLogRegisterBuffer(1, secondBuffer, REGBUF_STANDARD);
+		XLogRegisterBuffer(1, secondBuffer, 0);
 
 	if (new_lastpage)
 	{
@@ -1225,8 +1259,8 @@ _bitmap_log_updatewords(Relation rel,
  * a cluster with mirroring enabled. Add _dump_page() calls in the routine
  * that writes a certain WAL record type, and in the corresponding WAL
  * replay routine. Run a test workload. This produces a bmdump_* file
- * in the master and the mirror. Run 'diff' to compare them: if the WAL
- * replay recreated the same changes that were made on the master, the
+ * in the primary and the mirror. Run 'diff' to compare them: if the WAL
+ * replay recreated the same changes that were made on the primary, the
  * files should be identical.
  */
 #ifdef DUMP_BITMAPAM_INSERT_RECORDS

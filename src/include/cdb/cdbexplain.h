@@ -66,7 +66,6 @@ cdbexplain_agg_avg(CdbExplain_Agg *agg)
                            : 0;
 }
 
-
 /*
  * cdbexplain_localExecStats
  *    Called by qDisp to build NodeSummary and SliceSummary blocks
@@ -123,6 +122,20 @@ cdbexplain_recvExecStats(struct PlanState              *planstate,
 struct CdbExplain_ShowStatCtx *
 cdbexplain_showExecStatsBegin(struct QueryDesc *queryDesc,
                               instr_time        querystarttime);
+
+/*
+ * cdbexplain_showStatCtxFree
+ *	  Release memory allocated for CdbExplain_ShowStatCtx structure and its
+ *	  internals. Memory for insides of the slices array elements is allocated
+ *	  in ExplainPrintPlan(). If ExplainPrintPlan() is called from the
+ *	  auto_explain extension, then this memory is released in
+ *	  standard_ExecutorEnd() -> FreeExecutorState() to avoid memory leak in the
+ *	  case of queries with multiple call of SQL functions.
+ *	  If ExplainPrintPlan() is called from ExplainOnePlan(), then this memory
+ *	  is released in PortalDrop().
+ */
+void
+cdbexplain_showStatCtxFree(struct CdbExplain_ShowStatCtx *ctx);
 
 
 

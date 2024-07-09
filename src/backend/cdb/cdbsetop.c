@@ -39,13 +39,15 @@
  * See the comments in cdbsetop.h for discussion of types of setop plan.
  */
 GpSetOpType
-choose_setop_type(List *pathlist)
+choose_setop_type(List *pathlist, List *tlist_list)
 {
 	ListCell   *cell;
+	ListCell   *tlistcell;
 	bool		ok_general = true;
 	bool		ok_partitioned = true;
 	bool		ok_single_qe = true;
 	bool		has_partitioned = false;
+	bool 		all_resjunk = true;
 
 	Assert(Gp_role == GP_ROLE_DISPATCH || Gp_role == GP_ROLE_UTILITY);
 
@@ -92,9 +94,27 @@ choose_setop_type(List *pathlist)
 		}
 	}
 
+	/*
+	 * This is for handling the case when there is no targetList in the ouput.
+	 * For example: select from generate_series(1,10) except select from a;
+	 */
+	foreach(tlistcell, tlist_list)
+	{
+		List	   *subtlist = (List *) lfirst(tlistcell);
+		foreach(cell, subtlist)
+		{
+			TargetEntry *tle = (TargetEntry *) lfirst(cell);
+			if (!tle->resjunk)
+			{
+				all_resjunk = false;
+				break;
+			}
+		}
+	}
+
 	if (ok_general)
 		return PSETOP_GENERAL;
-	else if (ok_partitioned && has_partitioned)
+	else if (ok_partitioned && has_partitioned && !all_resjunk)
 		return PSETOP_PARALLEL_PARTITIONED;
 	else if (ok_single_qe)
 		return PSETOP_SEQUENTIAL_QE;
@@ -129,22 +149,21 @@ adjust_setop_arguments(PlannerInfo *root, List *pathlist, List *tlist_list, GpSe
 					case CdbLocusType_Hashed:
 					case CdbLocusType_HashedOJ:
 					case CdbLocusType_Strewn:
-						break;
 					case CdbLocusType_SingleQE:
 					case CdbLocusType_General:
 					case CdbLocusType_SegmentGeneral:
 						/*
-						 * The setop itself will run on an N-gang, so we need
-						 * to arrange for the singleton input to be separately
-						 * dispatched to a 1-gang and collect its result on
-						 * one of our N QEs. Hence ...
+						 * Collocate non-distinct tuples prior to sort or hash. We must
+						 * put the Redistribute nodes below the Append, otherwise we lose
+						 * the order of the firstFlags.
 						 */
 						adjusted_path = make_motion_hash_all_targets(root, subpath, subtlist);
 						break;
 					case CdbLocusType_Null:
 					case CdbLocusType_Entry:
 					case CdbLocusType_Replicated:
-					default:
+					case CdbLocusType_OuterQuery:
+					case CdbLocusType_End:
 						ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
 										errmsg("unexpected argument locus to set operation")));
 						break;
@@ -163,6 +182,7 @@ adjust_setop_arguments(PlannerInfo *root, List *pathlist, List *tlist_list, GpSe
 						break;
 
 					case CdbLocusType_SingleQE:
+					case CdbLocusType_SegmentGeneral:
 						/*
 						 * The input was focused on a single QE, but we need it in the QD.
 						 * It's bit silly to add a Motion to just move the whole result from
@@ -182,7 +202,7 @@ adjust_setop_arguments(PlannerInfo *root, List *pathlist, List *tlist_list, GpSe
 
 					case CdbLocusType_Null:
 					case CdbLocusType_Replicated:
-					default:
+					case CdbLocusType_End:
 						ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
 										errmsg("unexpected argument locus to set operation")));
 						break;
@@ -219,7 +239,7 @@ adjust_setop_arguments(PlannerInfo *root, List *pathlist, List *tlist_list, GpSe
 					case CdbLocusType_Entry:
 					case CdbLocusType_Null:
 					case CdbLocusType_Replicated:
-					default:
+					case CdbLocusType_End:
 						ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
 										errmsg("unexpected argument locus to set operation")));
 						break;

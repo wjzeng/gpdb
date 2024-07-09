@@ -2,6 +2,13 @@
 -- and EXPLAIN ANALYZE. Also instrumentation slots
 -- are correctly recycled.
 -- This test can not run in parallel with other tests.
+-- start_matchsubs
+-- m/\(cost=.*\)/
+-- s/\(cost=.*\)//
+--
+-- m/\(slice\d+; segments: \d+\)/
+-- s/\(slice\d+; segments: \d+\)//
+-- end_matchsubs
 
 -- default value
 SHOW GP_ENABLE_QUERY_METRICS;
@@ -85,7 +92,7 @@ ANALYZE a;
 -- If more than one row returned, means previous test has leaked slots.
 SELECT count(*) FROM (SELECT 1 FROM gp_instrument_shmem_detail GROUP BY ssid, ccnt) t;
 
--- regression to EXPLAN ANALZE
+-- regression to EXPLAN ANALYZE
 EXPLAIN ANALYZE SELECT 1/0;
 EXPLAIN ANALYZE SELECT count(*) FROM a where id < (1/(select count(*) where 1=0));
 EXPLAIN ANALYZE SELECT count(*) FROM a a1, a a2, a a3;

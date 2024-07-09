@@ -359,8 +359,8 @@ typedef struct HashJoinTableData
 	 * These arrays are allocated for the life of the hash join, but only if
 	 * nbatch > 1.  A file is opened only when we first write a tuple into it
 	 * (otherwise its pointer remains NULL).  Note that the zero'th array
-	 * elements never get used, since we will process rather than dump out any
-	 * tuples of batch zero.
+	 * elements can still get used while nbatch > 1 in GPDB to support rescan
+	 * of hashjoin.
 	 */
 	BufFile	  **innerBatchFile; /* buffered virtual temp file per batch */
 	BufFile   **outerBatchFile; /* buffered virtual temp file per batch */
@@ -405,6 +405,19 @@ typedef struct HashJoinTableData
 	ParallelHashJoinState *parallel_state;
 	ParallelHashJoinBatchAccessor *batches;
 	dsa_pointer current_chunk_shared;
+
+	/* Statistic info of work file set, copied from work_set */
+	uint32		workset_num_files;
+	uint32		workset_num_files_compressed;
+	uint64		workset_avg_file_size;
+	/*
+	 * GP_ABI_BUMP_FIXME
+	 *
+	 * Not used, just for ABI compatibility, remove this when we decide to bump
+	 * the ABI version.
+	 */
+	uint64		workset_abi_reserved;
+	uint64		workset_compression_buf_total;
 }			HashJoinTableData;
 
 #endif							/* HASHJOIN_H */

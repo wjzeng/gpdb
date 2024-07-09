@@ -22,7 +22,7 @@ using namespace gpopt;
 
 // initialization of static variables
 const CHAR *CDistributionSpecSingleton::m_szSegmentType[EstSentinel] = {
-	"master", "segment"};
+	"coordinator", "segment"};
 
 
 //---------------------------------------------------------------------------
@@ -41,7 +41,7 @@ CDistributionSpecSingleton::CDistributionSpecSingleton(ESegmentType est)
 
 CDistributionSpecSingleton::CDistributionSpecSingleton()
 {
-	m_est = EstMaster;
+	m_est = EstCoordinator;
 
 	if (COptCtxt::PoctxtFromTLS()->OptimizeDMLQueryWithSingletonSegment())
 	{
@@ -72,9 +72,9 @@ CDistributionSpecSingleton::FSatisfies(const CDistributionSpec *pds) const
 		return false;
 	}
 
-	if (EdtAny == pds->Edt())
+	if (EdtAny == pds->Edt() || EdtNonReplicated == pds->Edt())
 	{
-		// a singleton distribution satisfies "any" distributions
+		// a singleton distribution satisfies "any" and "non-replicated" distributions
 		return true;
 	}
 
@@ -126,8 +126,7 @@ CDistributionSpecSingleton::AppendEnforcers(CMemoryPool *mp,
 		CExpression(mp, GPOS_NEW(mp) CPhysicalMotionGather(mp, m_est), pexpr);
 	pdrgpexpr->Append(pexprMotion);
 
-	if (!prpp->Peo()->PosRequired()->IsEmpty() &&
-		CDistributionSpecSingleton::EstMaster == m_est)
+	if (!prpp->Peo()->PosRequired()->IsEmpty())
 	{
 		COrderSpec *pos = prpp->Peo()->PosRequired();
 		pos->AddRef();

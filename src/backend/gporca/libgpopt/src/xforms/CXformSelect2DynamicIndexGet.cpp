@@ -15,7 +15,6 @@
 
 #include "gpopt/base/CConstraint.h"
 #include "gpopt/base/CUtils.h"
-#include "gpopt/metadata/CPartConstraint.h"
 #include "gpopt/operators/CLogicalDynamicGet.h"
 #include "gpopt/operators/CLogicalSelect.h"
 #include "gpopt/xforms/CXformUtils.h"
@@ -83,6 +82,25 @@ CXformSelect2DynamicIndexGet::Transform(CXformContext *pxfctxt,
 	GPOS_ASSERT(FPromising(pxfctxt->Pmp(), this, pexpr));
 	GPOS_ASSERT(FCheckPattern(pexpr));
 
+	CLogicalDynamicGet *popGet =
+		CLogicalDynamicGet::PopConvert((*pexpr)[0]->Pop());
+	// Do not run if contains foreign partitions, instead run CXformExpandDynamicGetWithForeignPartitions
+	if (popGet->ContainsForeignParts())
+	{
+		return;
+	}
+
+	// We need to early exit when the relation contains security quals
+	// because we are adding the security quals when translating from DXL to
+	// Planned Statement as a filter. If we don't early exit then it may happen
+	// that we generate a plan where the index condition contains non-leakproof
+	// expressions. This can lead to data leak as we always want our security
+	// quals to be executed first.
+	if (popGet->HasSecurityQuals())
+	{
+		return;
+	}
+
 	CMemoryPool *mp = pxfctxt->Pmp();
 
 	// extract components
@@ -104,12 +122,7 @@ CXformSelect2DynamicIndexGet::Transform(CXformContext *pxfctxt,
 	GPOS_ASSERT(0 < pdrgpexpr->Size());
 
 	// derive the scalar and relational properties to build set of required columns
-	CColRefSet *pcrsOutput = pexpr->DeriveOutputColumns();
 	CColRefSet *pcrsScalarExpr = pexprScalar->DeriveUsedColumns();
-
-	CColRefSet *pcrsReqd = GPOS_NEW(mp) CColRefSet(mp);
-	pcrsReqd->Include(pcrsOutput);
-	pcrsReqd->Include(pcrsScalarExpr);
 
 	// find the indexes whose included columns meet the required columns
 	CMDAccessor *md_accessor = COptCtxt::PoctxtFromTLS()->Pmda();
@@ -120,9 +133,17 @@ CXformSelect2DynamicIndexGet::Transform(CXformContext *pxfctxt,
 	{
 		IMDId *pmdidIndex = pmdrel->IndexMDidAt(ul);
 		const IMDIndex *pmdindex = md_accessor->RetrieveIndex(pmdidIndex);
-		CExpression *pexprDynamicIndexGet = CXformUtils::PexprLogicalIndexGet(
-			mp, md_accessor, pexprRelational, pexpr->Pop()->UlOpId(), pdrgpexpr,
-			pcrsReqd, pcrsScalarExpr, nullptr /*outer_refs*/, pmdindex, pmdrel);
+		// We consider ForwardScan here because, because ORCA currently doesn't
+		// support BackwardScan on partition tables. Moreover, BackwardScan is
+		// only supported in the case where we have Order by clause in the
+		// query, but this xform handles scenario of a filter on top of a
+		// partitioned table.
+		CExpression *pexprDynamicIndexGet =
+			CXformUtils::PexprBuildBtreeIndexPlan(
+				mp, md_accessor, pexprRelational, pexpr->Pop()->UlOpId(),
+				pdrgpexpr, pcrsScalarExpr, nullptr /*outer_refs*/, pmdindex,
+				pmdrel, EForwardScan /*indexScanDirection*/,
+				false /*indexForOrderBy*/, false /*indexonly*/);
 		if (nullptr != pexprDynamicIndexGet)
 		{
 			// create a redundant SELECT on top of DynamicIndexGet to be able to use predicate in partition elimination
@@ -135,7 +156,6 @@ CXformSelect2DynamicIndexGet::Transform(CXformContext *pxfctxt,
 		}
 	}
 
-	pcrsReqd->Release();
 	pdrgpexpr->Release();
 }
 

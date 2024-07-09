@@ -120,7 +120,7 @@ USAGE () {
 		$ECHO "      -q, quiet mode, do not log progress to screen [default:- verbose output to screen]"
 		$ECHO
 		$ECHO "      Configuration options:"
-		$ECHO "      -b, shared_buffers per instance [default $DEFAULT_BUFFERS]"
+		$ECHO "      -b, <size> shared_buffers per instance [default $DEFAULT_BUFFERS]"
 		$ECHO "          Specify either the number of database I/O buffers (without suffix) or the"
 		$ECHO "          amount of memory to use for buffers (with suffix 'kB', 'MB' or 'GB')."
 		$ECHO "          Applies to coordinator and all segments."
@@ -129,7 +129,7 @@ USAGE () {
 		$ECHO "          Supplies all Greenplum configuration information required by this utility."
 		$ECHO "          Full description of all parameters contained within the example file"
 		$ECHO "          supplied with this distribution."
-		$ECHO "          Also see gpinitsystem_INSTRUCTIONS file for greater detail on"
+		$ECHO "          Also see file $HELP_DOC_NAME for greater detail on"
 		$ECHO "          the operation and configuration of this script"
 		$ECHO "      -e, <password>, password to set for Greenplum superuser in database [default $GP_PASSWD]"
 		$ECHO "      -S, standby_datadir [optional]"
@@ -210,8 +210,8 @@ USE_FIRST_SET_ARG (){
 CHK_PARAMS () {
 		LOG_MSG "[INFO]:-Start Function $FUNCNAME"
 		LOG_MSG "[INFO]:-Checking configuration parameters, please wait..." 1
-		if [ $USER_NAME == "root" ]; then
-				ERROR_EXIT "[FATAL]:-Unable to run this script as $USER"
+		if [ "$EUID" -eq 0 ] || [ $(id -u) = 0 ]; then
+				ERROR_EXIT "[FATAL]:-Unable to run this script as root user: $USER."
 		fi
 		if [ x"" = x"$GPHOME" ]; then
 				LOG_MSG "[FATAL]:-Environment variable \$GPHOME not set" 1
@@ -456,13 +456,13 @@ CHK_PARAMS () {
 		COORDINATOR_IP_ADDRESS=(`$ECHO ${COORDINATOR_IP_ADDRESS_ALL[@]} ${COORDINATOR_IPV6_LOCAL_ADDRESS_ALL[@]}|$TR ' ' '\n'|$SORT -u|$TR '\n' ' '`)
 		LOG_MSG "[INFO]:-Coordinator IP address array = ${COORDINATOR_IP_ADDRESS[@]}"
 		if [ x"" != x"$STANDBY_HOSTNAME" ];then
-			STANDBY_IP_ADDRESS_ALL=(`$TRUSTED_SHELL $STANDBY_HOSTNAME "$IPV4_ADDR_LIST_CMD |$GREP inet|$GREP -v \"127.0.0\"|$AWK '{print \\$2}'|$CUT -d'/' -f1" 2>>$LOG_FILE`) 
-            STANDBY_IPV6_ADDRESS_ALL=(`$TRUSTED_SHELL $STANDBY_HOSTNAME "$IPV6_ADDR_LIST_CMD |$GREP inet6|$AWK '{print \\$2}' |$CUT -d'/' -f1" 2>>$LOG_FILE`)
+			STANDBY_IP_ADDRESS_ALL=( $( REMOTE_EXECUTE_AND_GET_OUTPUT $STANDBY_HOSTNAME "$IPV4_ADDR_LIST_CMD |$GREP inet|$GREP -v \"127.0.0\"|$AWK '{print \$2}'|$CUT -d'/' -f1" 2>>$LOG_FILE ))
+			STANDBY_IPV6_ADDRESS_ALL=( $( REMOTE_EXECUTE_AND_GET_OUTPUT $STANDBY_HOSTNAME "$IPV6_ADDR_LIST_CMD |$GREP inet6|$AWK '{print \$2}' |$CUT -d'/' -f1" 2>>$LOG_FILE ))
 			STANDBY_IP_ADDRESS=(`$ECHO ${STANDBY_IP_ADDRESS_ALL[@]} ${STANDBY_IPV6_ADDRESS_ALL[@]}|$TR ' ' '\n'|$SORT -u|$TR '\n' ' '`)
 			ERROR_CHK $? "obtain IP address of standby Coordinator host" 2
 			LOG_MSG "[INFO]:-Standby IP address array = ${STANDBY_IP_ADDRESS[@]}"
 			#Check open files value
-			STANDBY_COORDINATOR_OPEN=`$TRUSTED_SHELL $STANDBY_HOSTNAME "ulimit -n"`
+			STANDBY_COORDINATOR_OPEN=$( REMOTE_EXECUTE_AND_GET_OUTPUT $STANDBY_HOSTNAME "ulimit -n" )
 			if [ $STANDBY_COORDINATOR_OPEN -lt $OS_OPENFILES ];then
 				LOG_MSG "[WARN]:-Standby Coordinator open file limit is $STANDBY_COORDINATOR_OPEN should be >= $OS_OPENFILES" 1
 				ULIMIT_WARN=1
@@ -477,7 +477,7 @@ CHK_PARAMS () {
 		# segment hosts.
 		LOCALE_SETTING=$(USE_FIRST_SET_ARG $REQ_LOCALE_SETTING $LC_ALL)
 		if [ x"" != x"$LOCALE_SETTING" ]; then
-			IN_ARRAY $LOCALE_SETTING "`locale -a`"
+			LOCALE_IS_AVAILABLE $LOCALE_SETTING
 			if [ $? -eq 0 ]; then
 				ERROR_EXIT "[FATAL]-Value $LOCALE_SETTING is not a valid value for --locale on this system."
 			fi
@@ -485,7 +485,7 @@ CHK_PARAMS () {
 
 		LCCOLLATE=$(USE_FIRST_SET_ARG $LCCOLLATE $LC_COLLATE $LOCALE_SETTING)
 		if [ x"" != x"$LCCOLLATE" ]; then
-			IN_ARRAY $LCCOLLATE "`locale -a`"
+			LOCALE_IS_AVAILABLE $LCCOLLATE
 			if [ $? -eq 0 ]; then
 				ERROR_EXIT "[FATAL]-Value $LCCOLLATE is not a valid value for --lc-collate on this system."
 			fi	
@@ -493,7 +493,7 @@ CHK_PARAMS () {
 
 		LCCTYPE=$(USE_FIRST_SET_ARG $LCCTYPE $LC_CTYPE $LOCALE_SETTING)
 		if [ x"" != x"$LCCTYPE" ]; then
-			IN_ARRAY $LCCTYPE "`locale -a`"
+			LOCALE_IS_AVAILABLE $LCCTYPE
 			if [ $? -eq 0 ]; then
 				ERROR_EXIT "[FATAL]-Value $LCCTYPE is not a valid value for --lc-ctype on this system."
 			fi
@@ -501,7 +501,7 @@ CHK_PARAMS () {
 
 		LCMESSAGES=$(USE_FIRST_SET_ARG $LCMESSAGES $LC_MESSAGES $LOCALE_SETTING)
 		if [ x"" != x"$LCMESSAGES" ]; then
-			IN_ARRAY $LCMESSAGES "`locale -a`"
+			LOCALE_IS_AVAILABLE $LCMESSAGES
 			if [ $? -eq 0 ]; then
 				ERROR_EXIT "[FATAL]-Value $LCMESSAGES is not a valid value for --lc-messages on this system."
 			fi
@@ -509,7 +509,7 @@ CHK_PARAMS () {
 		
 		LCMONETARY=$(USE_FIRST_SET_ARG $LCMONETARY $LC_MONETARY $LOCALE_SETTING)
 		if [ x"" != x"$LCMONETARY" ]; then
-			IN_ARRAY $LCMONETARY "`locale -a`"
+			LOCALE_IS_AVAILABLE $LCMONETARY
 			if [ $? -eq 0 ]; then
 				ERROR_EXIT "[FATAL]-Value $LCMONETARY is not a valid value for --lc-monetary on this system."
 			fi
@@ -517,7 +517,7 @@ CHK_PARAMS () {
 		
 		LCNUMERIC=$(USE_FIRST_SET_ARG $LCNUMERIC $LC_NUMERIC $LOCALE_SETTING)
 		if [ x"" != x"$LCNUMERIC" ]; then
-			IN_ARRAY $LCNUMERIC "`locale -a`"
+			LOCALE_IS_AVAILABLE $LCNUMERIC
 			if [ $? -eq 0 ]; then
 				ERROR_EXIT "[FATAL]-Value $LCNUMERIC is not a valid value for --lc-numeric on this system."
 			fi
@@ -525,7 +525,7 @@ CHK_PARAMS () {
 		
 		LCTIME=$(USE_FIRST_SET_ARG $LCTIME $LC_TIME $LOCALE_SETTING)
 		if [ x"" != x"$LCTIME" ]; then
-			IN_ARRAY $LCTIME "`locale -a`"
+			LOCALE_IS_AVAILABLE $LCTIME
 			if [ $? -eq 0 ]; then
 				ERROR_EXIT "[FATAL]-Value $LCTIME is not a valid value for --lc-time on this system."
 			fi
@@ -545,13 +545,10 @@ CHK_MULTI_HOME () {
 	do
 		if [ $DEBUG_LEVEL -eq 0 ] && [ x"" != x"$VERBOSE" ];then $NOLINE_ECHO ".\c";fi
 		PING_HOST $MHOST
-		SEG_HOSTNAME=`$TRUSTED_SHELL $MHOST "$HOSTNAME"`
+		SEG_HOSTNAME=$( REMOTE_EXECUTE_AND_GET_OUTPUT $MHOST "$HOSTNAME" )
 		if [ $? -ne 0 ];then
-			LOG_MSG "[FATAL]:-Remote command to host $MHOST failed to get value of hostname"
-			$ECHO "[FATAL]:-Remote command to host $MHOST failed to get value of hostname"
-			LOG_MSG "[FATAL]:-Check to see that you have setup trusted remote ssh on all hosts"
-			$ECHO "[FATAL]:-Check to see that you have setup trusted remote ssh on all hosts"
-
+			LOG_MSG "[FATAL]:-Remote command to host $MHOST failed to get value of hostname" 1
+			LOG_MSG "[FATAL]:-Check to see that you have setup trusted remote ssh on all hosts" 1
 			ERROR_EXIT "[FATAL]:-Unable to get hostname output for $MHOST"
 		fi
 		if [ `$ECHO ${T_SEG_ARRAY[@]}|$TR ' ' '\n'|$GREP -c "^${SEG_HOSTNAME}$"` -eq 0 ];then
@@ -641,7 +638,8 @@ CHK_LOCALE_KNOWN () {
 
 	LOG_MSG "[INFO]:-Start Function $FUNCNAME"
 	if [ $# -eq 0 ];then
-		if [ `$LOCALE -a |$GREP -ic $LOCALE_SETTING` -eq 0 ];then
+		if [ `$LOCALE -a |$GREP -ic $(NORMALIZE_CODESET_IN_LOCALE $LOCALE_SETTING)` -eq 0 ] \
+			&& [`$LOCALE -a |$GREP -ic $LOCALE_SETTING` -eq 0];then
 			LOG_MSG "[INFO]:-Coordinator host available locale values"
 			$LOCALE -a >> $LOG_FILE
 			LOG_MSG "[FATAL]:-Unable to locate locale value $LOCALE_SETTING on this host" 1
@@ -653,7 +651,8 @@ CHK_LOCALE_KNOWN () {
 		fi
 	else
 		# Hostname has been passed so check remote locale value
-		if [ `$TRUSTED_SHELL $1 "$LOCALE -a|$GREP -ic '$LOCALE_SETTING'"` -eq 0 ];then
+		if [ $( REMOTE_EXECUTE_AND_GET_OUTPUT $1 "$LOCALE -a|$GREP -ic '$(NORMALIZE_CODESET_IN_LOCALE $LOCALE_SETTING)'" ) -eq 0 ] \
+			&& [ $( REMOTE_EXECUTE_AND_GET_OUTPUT $1 "$LOCALE -a|$GREP -ic '$LOCALE_SETTING'" ) -eq 0 ] ;then
 			LOG_MSG "[INFO]:-Host $1 available locale values"
 			`$TRUSTED_SHELL $1 "$LOCALE -a"` >> $LOG_FILE
 			LOG_MSG "[FATAL]:-Unable to locate locale value $LOCALE_SETTING on $1" 1
@@ -680,7 +679,7 @@ CHK_DUPLICATES () {
 CHK_OPEN_FILES () {
 	LOG_MSG "[INFO]:-Start Function $FUNCNAME"
 	LOG_MSG "[INFO]:-Checking $1"
-	OPEN_VALUE=`$TRUSTED_SHELL $1 "ulimit -n"`
+	OPEN_VALUE=$( REMOTE_EXECUTE_AND_GET_OUTPUT $1 "ulimit -n" )
 	if [ $OPEN_VALUE -lt $OS_OPENFILES ];then
 		LOG_MSG "[WARN]:-Host $1 open files limit is $OPEN_VALUE should be >= $OS_OPENFILES" 1
 		ULIMIT_WARN=1
@@ -746,7 +745,7 @@ CHK_QES () {
         fi
         # Check that the hostname is not associated with local host
         LOG_MSG "[INFO]:-Checking $GP_HOSTADDRESS $HOSTFILE for localhost set as $GP_HOSTADDRESS"
-        LOCAL_COUNT=`$TRUSTED_SHELL $GP_HOSTADDRESS "$GREP $GP_HOSTADDRESS $HOSTFILE|$GREP -c localhost"`
+        LOCAL_COUNT=$( REMOTE_EXECUTE_AND_GET_OUTPUT $GP_HOSTADDRESS "$GREP $GP_HOSTADDRESS $HOSTFILE|$GREP -c localhost")
         if [ $LOCAL_COUNT -ne 0 ];then
             LOG_MSG "[WARN]:-----------------------------------------------------------" 1
             LOG_MSG "[WARN]:-Host $GP_HOSTADDRESS is assigned as localhost in $HOSTFILE"  1
@@ -764,6 +763,10 @@ CHK_QES () {
         else
             $TRUSTED_SHELL $GP_HOSTADDRESS "$RM -f ${W_DIR}/tmp_file_test"
             LOG_MSG "[INFO]:-Write test passed on $GP_HOSTADDRESS $W_DIR directory"
+            $ECHO "$ECHO \"Stopping segment instance on $GP_HOSTADDRESS\"" >> $BACKOUT_FILE
+            $ECHO "$TRUSTED_SHELL $GP_HOSTADDRESS \"if [ -f $GP_DIR/postmaster.pid ]; then  ${EXPORT_LIB_PATH};export PGPORT=${GP_PORT}; $PG_CTL -w -D $GP_DIR -o \"-i -p ${GP_PORT}\" -m immediate  stop; fi\"" >> $BACKOUT_FILE
+            $ECHO "$ECHO \"removing directory $GP_DIR on $GP_HOSTADDRESS\"" >> $BACKOUT_FILE
+            $ECHO "$TRUSTED_SHELL ${GP_HOSTADDRESS} \"$RM -rf $GP_DIR > /dev/null 2>&1\"" >> $BACKOUT_FILE
         fi
 
     done
@@ -789,6 +792,10 @@ CHK_QES () {
             else
                 $TRUSTED_SHELL $GP_HOSTADDRESS "$RM -f ${W_DIR}/tmp_file_test"
                 LOG_MSG "[INFO]:-Write test passed on $GP_HOSTADDRESS $W_DIR directory"
+                $ECHO "$ECHO \"Stopping segment instance on $GP_HOSTADDRESS\"" >> $BACKOUT_FILE
+                $ECHO "$TRUSTED_SHELL $GP_HOSTADDRESS \"if [ -f $GP_DIR/postmaster.pid ]; then  ${EXPORT_LIB_PATH};export PGPORT=${GP_PORT}; $PG_CTL -w -D $GP_DIR -o \"-i -p ${GP_PORT}\" -m immediate  stop; fi\"" >> $BACKOUT_FILE
+                $ECHO "$ECHO \"removing directory $GP_DIR on $GP_HOSTADDRESS\"" >> $BACKOUT_FILE
+                $ECHO "$TRUSTED_SHELL ${GP_HOSTADDRESS} \"$RM -rf $GP_DIR > /dev/null 2>&1\"" >> $BACKOUT_FILE
             fi
         done
     else
@@ -1121,29 +1128,6 @@ DISPLAY_CONFIG () {
 	LOG_MSG "[INFO]:-End Function $FUNCNAME"
 }
 
-SET_VAR () {
-    # 
-    # MPP-13617: If segment contains a ~, we assume ~ is the field delimiter.
-    # Otherwise we assume : is the delimiter.  This allows us to easily 
-    # handle IPv6 addresses which may contain a : by using a ~ as a delimiter. 
-    # 
-    I=$1
-    case $I in
-        *~*)
-	    S="~"
-            ;;
-        *)
-	    S=":"
-            ;;
-    esac
-    GP_HOSTNAME=`$ECHO $I|$CUT -d$S -f1`
-    GP_HOSTADDRESS=`$ECHO $I|$CUT -d$S -f2`
-    GP_PORT=`$ECHO $I|$CUT -d$S -f3`
-    GP_DIR=`$ECHO $I|$CUT -d$S -f4`
-    GP_DBID=`$ECHO $I|$CUT -d$S -f5`
-    GP_CONTENT=`$ECHO $I|$CUT -d$S -f6`
-}
-
 # Retrieve locale settings from the coordinator and set locale variables
 # appropriately so those values can be used when initializing the segments.
 SET_LOCALE_VARS_BASED_ON_COORDINATOR() {
@@ -1159,7 +1143,7 @@ SET_LOCALE_VARS_BASED_ON_COORDINATOR() {
 	#
 	# --lc-collate=en_US.utf8 --lc-ctype=en_US.utf8 ...
 	psql_cmd="SELECT '--' || REPLACE(name, '_', '-') || '=' || setting FROM pg_settings WHERE name LIKE 'lc_%' ORDER BY name"
-	export LC_ALL_SETTINGS=$($PSQL -d template1 -X -A -t -c "$psql_cmd")
+	export LC_ALL_SETTINGS=$(env PGOPTIONS="-c gp_role=utility" $PSQL -d template1 -X -A -t -c "$psql_cmd")
 }
 
 CREATE_QD_DB () {
@@ -1259,7 +1243,7 @@ CREATE_QD_DB () {
 		export PGPORT=$GP_PORT;$PG_CTL -w -l $GP_DIR/log/startup.log -D $GP_DIR -o "-i -p $GP_PORT -c gp_role=utility \
 		-m" start >> ${LOG_FILE} 2>&1
 		RET_TEXT="`$PG_CTL status -D $GP_DIR`"
-		RUNNING=`$ECHO $RET_TEXT|$EGREP -c "not running|neither"`
+		RUNNING=`$ECHO $RET_TEXT|$GREP -E -c "not running|neither"`
 		if [ $RUNNING -ne 0 ]; then
 				$CAT ${GP_DIR}.log|$TEE -a $LOG_FILE
 				ERROR_EXIT "[FATAL]:-Failed to start the Coordinator database in admin mode"
@@ -1271,8 +1255,7 @@ CREATE_QD_DB () {
 		BACKOUT_COMMAND "if [ -d $GP_DIR ]; then $EXPORT_LIB_PATH;export PGPORT=$GP_PORT; $PG_CTL -D $GP_DIR stop; fi"
 		BACKOUT_COMMAND "$ECHO \"Stopping Coordinator instance\""
 		LOG_MSG "[INFO]:-Completed starting the Coordinator in admin mode"
-		GP_HOSTNAME=$GP_HOSTADDRESS
-		PING_HOST $GP_HOSTNAME
+		PING_HOST $GP_HOSTADDRESS
 		RETVAL=$?
 		if [ $RETVAL -ne 0 ]; then
 			ERROR_EXIT "[FATAL]:-Could not establish connection to hostname $GP_HOSTNAME. Please check your configuration."
@@ -1318,8 +1301,7 @@ LOAD_QE_SYSTEM_DATA () {
 		do
 				SET_VAR $I
 				LOG_MSG "[INFO]:-Adding segment $GP_HOSTADDRESS to Coordinator system tables"
-				GP_HOSTNAME=$GP_HOSTADDRESS
-				PING_HOST $GP_HOSTNAME
+				PING_HOST $GP_HOSTADDRESS
 				RETVAL=$?
 				if [ $RETVAL -ne 0 ]; then
 					ERROR_EXIT "[FATAL]:-Could not establish connection to hostname $GP_HOSTNAME. Please check your configuration."
@@ -1391,7 +1373,7 @@ CREATE_SEGMENT () {
 			# SEGMENT_INFO: ~ separated value, ex: host1~port1~data_dir~dbid1~contentid
 			# PAIR_SEGMENT_INFO: corresponding pair, ex: host2~port2~data_dir~dbid2~contentid
 			# INST_COUNT: Number of parallel script count
-			COORDINATOR_HOSTNAME=${COORDINATOR_HOSTNAME} HBA_HOSTNAMES=${HBA_HOSTNAMES} $GPCREATESEG $FLAG $$ $PREFERRED_ROLE $SEGMENT_INFO "${PAIR_SEGMENT_INFO}" $INST_COUNT  $LOG_FILE $HEAP_CHECKSUM \
+			COORDINATOR_HOSTNAME=${COORDINATOR_HOSTNAME} HBA_HOSTNAMES=${HBA_HOSTNAMES} TRUSTED_SHELL=${TRUSTED_SHELL} $GPCREATESEG $FLAG $$ $PREFERRED_ROLE $SEGMENT_INFO "${PAIR_SEGMENT_INFO}" $INST_COUNT  $LOG_FILE $HEAP_CHECKSUM \
 `$ECHO ${COORDINATOR_IP_ADDRESS[@]}|$TR ' ' '~'` \
 `$ECHO ${STANDBY_IP_ADDRESS[@]}|$TR ' ' '~'` &
 			PARALLEL_COUNT $BATCH_LIMIT $BATCH_DEFAULT
@@ -1521,6 +1503,41 @@ START_QD_PRODUCTION () {
     LOG_MSG "[INFO]:-End Function $FUNCNAME"
 }
 
+# Important system collations through pg_import_system_collations.
+# This is borrowed from initdb.c:setup_collation(). At the end of this routine, we also ANALYZE and VACUUM FREEZE 
+# the built-in databases (borrowed from initdb.c:vacuum_db()), to leave them in a similar state as initdb would have.
+# In GPDB we cannot do it at initdb time because pg_import_system_collations needs to be dispatched and run after cluster has been set up.
+IMPORT_COLLATION () {
+		LOG_MSG "[INFO]:-Start Function $FUNCNAME"
+		LOG_MSG "[INFO]:-Importing system collations" 1
+
+		# temporarily allow connection for template0, so we can import collations to it.
+		$PSQL -p $GP_PORT -d postgres -A -t -c "ALTER DATABASE template0 ALLOW_CONNECTIONS on" >> $LOG_FILE 2>&1;
+		$PSQL -p $GP_PORT -d template0 -A -t -c "SELECT pg_import_system_collations('pg_catalog')" >> $LOG_FILE 2>&1;
+		ERROR_CHK $? "importing system collations to 'template0' database" 1
+		$PSQL -p $GP_PORT -d template0 -A -t -c "ANALYZE" >> $LOG_FILE 2>&1;
+		ERROR_CHK $? "ANALYZE 'template0' database" 1
+		$PSQL -p $GP_PORT -d template0 -A -t -c "VACUUM FREEZE" >> $LOG_FILE 2>&1;
+		ERROR_CHK $? "VACUUM FREEZE 'template0' database" 1
+		$PSQL -p $GP_PORT -d postgres -A -t -c "ALTER DATABASE template0 ALLOW_CONNECTIONS off" >> $LOG_FILE 2>&1;
+
+		# import to template1
+		$PSQL -p $GP_PORT -d template1 -A -t -c "SELECT pg_import_system_collations('pg_catalog')" >> $LOG_FILE 2>&1;
+		ERROR_CHK $? "importing system collations to 'template1' database" 1
+		$PSQL -p $GP_PORT -d template1 -A -t -c "ANALYZE" >> $LOG_FILE 2>&1;
+		ERROR_CHK $? "ANALYZE 'template1' database" 1
+		$PSQL -p $GP_PORT -d template1 -A -t -c "VACUUM FREEZE" >> $LOG_FILE 2>&1;
+		ERROR_CHK $? "VACUUM FREEZE 'template1' database" 1
+
+		# import to postgres
+		$PSQL -p $GP_PORT -d postgres -A -t -c "SELECT pg_import_system_collations('pg_catalog')" >> $LOG_FILE 2>&1;
+		ERROR_CHK $? "importing system collations to 'postgres' database" 1
+		$PSQL -p $GP_PORT -d postgres -A -t -c "ANALYZE" >> $LOG_FILE 2>&1;
+		ERROR_CHK $? "ANALYZE 'postgres' database" 1
+		$PSQL -p $GP_PORT -d postgres -A -t -c "VACUUM FREEZE" >> $LOG_FILE 2>&1;
+		ERROR_CHK $? "VACUUM FREEZE 'postgres' database" 1
+}
+
 CREATE_DATABASE () {
 		LOG_MSG "[INFO]:-Start Function $FUNCNAME"
 		SET_VAR $QD_PRIMARY_ARRAY
@@ -1528,6 +1545,19 @@ CREATE_DATABASE () {
 		ERROR_CHK $? "create database $DATABASE_NAME" 2
 		LOG_MSG "[INFO]:-End Function $FUNCNAME"
 }
+
+# Creating core GPDB extension(s) in 'template1' and 'postgres' databases
+CREATE_GPEXTENSIONS() {
+		LOG_MSG "[INFO]:-Start Function $FUNCNAME"
+		LOG_MSG "[INFO]:-Creating core GPDB extensions" 1
+		declare -a extnames=("gp_toolkit")
+		for ext in ${extnames[@]};
+		do
+			$PSQL -d template1 -X -A -t -c "CREATE EXTENSION $ext" >> $LOG_FILE 2>&1;
+			$PSQL -d postgres -X -A -t -c "CREATE EXTENSION $ext" >> $LOG_FILE 2>&1;
+		done
+}
+
 
 FORCE_FTS_PROBE () {
     LOG_MSG "[INFO]:-Start Function $FUNCNAME"
@@ -1557,7 +1587,7 @@ SCAN_LOG () {
 	LOG_MSG "[INFO]:-Start Function $FUNCNAME"
 	LOG_MSG "[INFO]:-Scanning utility log file for any warning messages" 1
 	SCAN_STRING="\[WARN\]|invalid|warning:|fatal|error"
-	if [ `$EGREP -i -w "$SCAN_STRING" $LOG_FILE|$GREP -v "\[INFO\]"|$GREP -v "[Start|End] Function ERROR_CHK"|$GREP -v "warning: enabling \"trust\" authentication for local connections"|$GREP -v "to the list of known hosts"|$GREP -v "LOG"|$WC -w` -ne 0 ];then
+	if [ `$GREP -E -i -w "$SCAN_STRING" $LOG_FILE|$GREP -v "\[INFO\]"|$GREP -v "[Start|End] Function ERROR_CHK"|$GREP -v "warning: enabling \"trust\" authentication for local connections"|$GREP -v "to the list of known hosts"|$GREP -v "LOG"|$WC -w` -ne 0 ];then
 		LOG_MSG "[WARN]:-*******************************************************" 1
 		LOG_MSG "[WARN]:-Scan of log file indicates that some warnings or errors" 1
 		LOG_MSG "[WARN]:-were generated during the array creation" 1
@@ -1946,21 +1976,8 @@ CREATE_SEGMENT IS_PRIMARY
 if [ $REPORT_FAIL -ne 0 ];then
 	LOG_MSG "[FATAL]:-Errors generated from parallel processes" 1
 	LOG_MSG "[INFO]:-Dumped contents of status file to the log file" 1
-	# Need to build a central backout file
-	LOG_MSG "[INFO]:-Building composite backout file" 1
-	for I in /tmp/gpsegcreate.sh_backout*
-	do
-		$CAT $I >> $BACKOUT_FILE
-		$RM -f $I
-	done
-	$ECHO "$RM -f $BACKOUT_FILE" >> $BACKOUT_FILE
 	ERROR_EXIT "[FATAL]:-Failures detected, see log file $LOG_FILE for more detail"
 else
-	LOG_MSG "[INFO]:-Deleting distributed backout files" 1
-	for I in ls /tmp/gpsegcreate.sh_backout*
-	do
-		$RM -f $I
-	done
 	LOG_MSG "[INFO]:-Removing back out file" 1
 	$RM -f $BACKOUT_FILE
 	LOG_MSG "[INFO]:-No errors generated from parallel processes" 1
@@ -1972,6 +1989,9 @@ fi
 
 STOP_QD_PRODUCTION
 START_QD_PRODUCTION
+
+CREATE_GPEXTENSIONS
+IMPORT_COLLATION
 
 if [ x"" != x"$DATABASE_NAME" ]; then
 	CREATE_DATABASE

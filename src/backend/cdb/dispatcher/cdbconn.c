@@ -89,6 +89,7 @@ cdbconn_createSegmentDescriptor(struct CdbComponentDatabaseInfo *cdbinfo, int id
 	segdbDesc->whoami = NULL;
 	segdbDesc->identifier = identifier;
 	segdbDesc->isWriter = isWriter;
+	segdbDesc->establishConnTime = 0;
 
 	MemoryContextSwitchTo(oldContext);
 	return segdbDesc;
@@ -125,14 +126,18 @@ cdbconn_termSegmentDescriptor(SegmentDatabaseDescriptor *segdbDesc)
 void
 cdbconn_doConnectStart(SegmentDatabaseDescriptor *segdbDesc,
 					   const char *gpqeid,
-					   const char *options)
+					   const char *options,
+					   const char *diff_options)
 {
-#define MAX_KEYWORDS 10
+#define MAX_KEYWORDS 15
 #define MAX_INT_STRING_LEN 20
 	CdbComponentDatabaseInfo *cdbinfo = segdbDesc->segment_database_info;
 	const char *keywords[MAX_KEYWORDS];
 	const char *values[MAX_KEYWORDS];
 	char		portstr[MAX_INT_STRING_LEN];
+	char		keepalivesIdleStr[MAX_INT_STRING_LEN];
+	char		keepalivesCountStr[MAX_INT_STRING_LEN];
+	char		keepalivesIntervalStr[MAX_INT_STRING_LEN];
 	int			nkeywords = 0;
 
 	keywords[nkeywords] = "gpqeid";
@@ -148,17 +153,26 @@ cdbconn_doConnectStart(SegmentDatabaseDescriptor *segdbDesc,
 		values[nkeywords] = options;
 		nkeywords++;
 	}
+	if (diff_options)
+	{
+		keywords[nkeywords] = "diff_options";
+		values[nkeywords] = diff_options;
+		nkeywords++;
+	}
 
 	/*
 	 * For entry DB connection, we make sure both "hostaddr" and "host" are
-	 * empty string. Or else, it will fall back to environment variables and
-	 * won't use domain socket in function connectDBStart. Also we set the
+	 * empty string, as we want to force Unix domain socket usage. The reason is
+	 * that for same host communication, Unix domain sockets are more performant.
+	 * However, if the PGHOST or PGHOSTADDR variables are set in the coordinator
+	 * postmaster environment, TCP/IP sockets will still be used. Also, we set the
 	 * connection type for entrydb connection so that QE could change Gp_role
 	 * from DISPATCH to EXECUTE.
 	 *
-	 * For other QE connections, we set "hostaddr". "host" is not used.
+	 * For other QE connections, we set "hostaddr". "host" is not used, as
+	 * hostaddr saves on the cost of hostname resolution.
 	 */
-	if (segdbDesc->segindex == MASTER_CONTENT_ID &&
+	if (segdbDesc->segindex == COORDINATOR_CONTENT_ID &&
 		IS_QUERY_DISPATCHER())
 	{
 		keywords[nkeywords] = "hostaddr";
@@ -230,9 +244,37 @@ cdbconn_doConnectStart(SegmentDatabaseDescriptor *segdbDesc,
 	nkeywords++;
 
 	keywords[nkeywords] = GPCONN_TYPE;
-	values[nkeywords] = GPCONN_TYPE_INTERNAL;
+	values[nkeywords] = GPCONN_TYPE_DEFAULT;
 	nkeywords++;
 
+	/*
+	 * Set QD-QE dispatch keepalive settings.
+	 * We only set the value if it is non-zero as setsockopt() with option_value=0 results in:
+	 * 'Invalid argument' on Linux based systems
+	 */
+	if (gp_dispatch_keepalives_idle > 0)
+	{
+		keywords[nkeywords] = "keepalives_idle";
+		snprintf(keepalivesIdleStr, sizeof(keepalivesIdleStr), "%d", gp_dispatch_keepalives_idle);
+		values[nkeywords] = keepalivesIdleStr;
+		nkeywords++;
+	}
+
+	if (gp_dispatch_keepalives_interval > 0)
+	{
+		keywords[nkeywords] = "keepalives_interval";
+		snprintf(keepalivesIntervalStr, sizeof(keepalivesIntervalStr), "%d", gp_dispatch_keepalives_interval);
+		values[nkeywords] = keepalivesIntervalStr;
+		nkeywords++;
+	}
+
+	if (gp_dispatch_keepalives_count > 0)
+	{
+		keywords[nkeywords] = "keepalives_count";
+		snprintf(keepalivesCountStr, sizeof(keepalivesCountStr), "%d", gp_dispatch_keepalives_count);
+		values[nkeywords] = keepalivesCountStr;
+		nkeywords++;
+	}
 	keywords[nkeywords] = NULL;
 	values[nkeywords] = NULL;
 
@@ -484,9 +526,10 @@ struct QENotice
 	char		sqlstate[6];
 	char		severity[10];
 	char	   *file;
-	char		line[10];
+	char	   *line;
 	char	   *func;
 	char	   *message;
+	char	   *whoami;
 	char	   *detail;
 	char	   *hint;
 	char	   *context;
@@ -506,7 +549,7 @@ static QENotice *qeNotices_tail = NULL;
  * that we cannot call palloc()!
  *
  * A QENotice struct is created for each incoming Notice, and put in a
- * queue for later processing. The QENotices are allocatd with good old
+ * queue for later processing. The QENotices are allocated with good old
  * malloc()!
  */
 static void
@@ -516,14 +559,14 @@ MPPnoticeReceiver(void *arg, const PGresult *res)
 	int			elevel = INFO;
 	char	   *sqlstate = "00000";
 	char	   *severity = "WARNING";
-	char	   *file = "";
+	char	   *file = NULL;
 	char	   *line = NULL;
-	char	   *func = "";
-	char		message[1024];
+	char	   *func = NULL;
+	char	   *message= "missing error text";
 	char	   *detail = NULL;
 	char	   *hint = NULL;
 	char	   *context = NULL;
-
+	char		whoami[200] = { 0 };
 	SegmentDatabaseDescriptor *segdbDesc = (SegmentDatabaseDescriptor *) arg;
 
 	/*
@@ -533,7 +576,8 @@ MPPnoticeReceiver(void *arg, const PGresult *res)
 	if (!res || MyProcPort == NULL) 
 		return;
 
-	strcpy(message, "missing error text");
+	if (segdbDesc && segdbDesc->whoami)
+		snprintf(whoami, sizeof(whoami), "  (%s)", segdbDesc->whoami);
 
 	for (pfield = res->errFields; pfield != NULL; pfield = pfield->next)
 	{
@@ -563,14 +607,7 @@ MPPnoticeReceiver(void *arg, const PGresult *res)
 				sqlstate = pfield->contents;
 				break;
 			case PG_DIAG_MESSAGE_PRIMARY:
-				strncpy(message, pfield->contents, 800);
-				message[800] = '\0';
-				if (segdbDesc && segdbDesc->whoami && strlen(segdbDesc->whoami) < 200)
-				{
-					strcat(message, "  (");
-					strcat(message, segdbDesc->whoami);
-					strcat(message, ")");
-				}
+				message = pfield->contents;
 				break;
 			case PG_DIAG_MESSAGE_DETAIL:
 				detail = pfield->contents;
@@ -612,11 +649,13 @@ MPPnoticeReceiver(void *arg, const PGresult *res)
 		uint64		size;
 		char	   *bufptr;
 		int			file_len;
+		int			line_len;
 		int			func_len;
-		int			message_len;
 		int			detail_len;
 		int			hint_len;
 		int			context_len;
+		int			message_len;
+		int			whoami_len;
 
 		/*
 		 * We use malloc(), because we are in a libpq callback, and we CANNOT
@@ -640,11 +679,13 @@ MPPnoticeReceiver(void *arg, const PGresult *res)
 
 		size = offsetof(QENotice, buf);
 		SIZE_VARLEN_FIELD(file);
+		SIZE_VARLEN_FIELD(line);
 		SIZE_VARLEN_FIELD(func);
-		SIZE_VARLEN_FIELD(message);
 		SIZE_VARLEN_FIELD(detail);
 		SIZE_VARLEN_FIELD(hint);
 		SIZE_VARLEN_FIELD(context);
+		SIZE_VARLEN_FIELD(message);
+		SIZE_VARLEN_FIELD(whoami);
 
 		/*
 		 * Perform the allocation.  Put a limit on the max size, as a sanity
@@ -680,14 +721,17 @@ MPPnoticeReceiver(void *arg, const PGresult *res)
 		strlcpy(notice->sqlstate, sqlstate, sizeof(notice->sqlstate));
 		strlcpy(notice->severity, severity, sizeof(notice->severity));
 		COPY_VARLEN_FIELD(file);
-		strlcpy(notice->line, line, sizeof(notice->line));
+		COPY_VARLEN_FIELD(line);
 		COPY_VARLEN_FIELD(func);
-		COPY_VARLEN_FIELD(message);
 		COPY_VARLEN_FIELD(detail);
 		COPY_VARLEN_FIELD(hint);
 		COPY_VARLEN_FIELD(context);
+		/* Concatenate message and whoami string together */
+		COPY_VARLEN_FIELD(message);
+		bufptr--; /* lets whoami overwrite '\0' byte of message body */
+		COPY_VARLEN_FIELD(whoami);
 
-		Assert(bufptr - (char *) notice == size);
+		Assert(bufptr - (char *) notice == (size - 1));
 
 		/* Link it to the queue */
 		notice->next = NULL;
@@ -776,7 +820,7 @@ forwardQENotices(void)
 					pq_sendstring(&msgbuf, notice->file);
 				}
 
-				if (notice->line[0])
+				if (notice->line)
 				{
 					pq_sendbyte(&msgbuf,PG_DIAG_SOURCE_LINE);
 					pq_sendstring(&msgbuf, notice->line);

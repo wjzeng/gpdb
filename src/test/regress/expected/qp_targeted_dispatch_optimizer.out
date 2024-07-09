@@ -1,6 +1,10 @@
 -- ----------------------------------------------------------------------
 -- Test: setup.sql
 -- ----------------------------------------------------------------------
+-- start_matchsubs
+-- m/\(cost=.*\)/
+-- s/\(cost=.*\)//
+-- end_matchsubs
 create schema qp_targeted_dispatch;
 set search_path to qp_targeted_dispatch;
 -- ----------------------------------------------------------------------
@@ -183,7 +187,7 @@ INFO:  (slice 0) Dispatch command to ALL contents: 0 1 2
 INFO:  Distributed transaction command 'Distributed Prepare' to ALL contents: 0 1 2
 INFO:  Distributed transaction command 'Distributed Commit Prepared' to ALL contents: 0 1 2
 select * from boolean where boo='t' and b=2;
-INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
+INFO:  (slice 1) Dispatch command to SINGLE content
  boo | b 
 -----+---
  t   | 2
@@ -323,7 +327,7 @@ INFO:  (slice 0) Dispatch command to ALL contents: 0 1 2
 INFO:  Distributed transaction command 'Distributed Prepare' to ALL contents: 0 1 2
 INFO:  Distributed transaction command 'Distributed Commit Prepared' to ALL contents: 0 1 2
 select * from bytea where bytea1='d' and cidr1='0.0.0.1';
-INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
+INFO:  (slice 1) Dispatch command to SINGLE content
  bytea1 |   cidr1    
 --------+------------
  \x64   | 0.0.0.1/32
@@ -486,7 +490,6 @@ insert into mpp7638 select i, i+1, i+2, i+3 from generate_series(1, 5) i;
 set test_print_direct_dispatch_info=on;
 insert into mpp7638 select i, i+1, i+2, i+3 from generate_series(1, 6) i;
 INFO:  (slice 0) Dispatch command to ALL contents: 0 1 2
-INFO:  (slice 1) Dispatch command to SINGLE content
 INFO:  Distributed transaction command 'Distributed Prepare' to ALL contents: 0 1 2
 INFO:  Distributed transaction command 'Distributed Commit Prepared' to ALL contents: 0 1 2
 select count(*) from mpp7638 where a =1;
@@ -497,32 +500,15 @@ INFO:  (slice 1) Dispatch command to SINGLE content
 (1 row)
 
 explain select count(*) from mpp7638 where a =1;
-                                       QUERY PLAN                                        
------------------------------------------------------------------------------------------
+                                     QUERY PLAN                                     
+------------------------------------------------------------------------------------
  Aggregate  (cost=0.00..431.00 rows=1 width=8)
    ->  Gather Motion 1:1  (slice1; segments: 1)  (cost=0.00..431.00 rows=1 width=1)
-         ->  Result  (cost=0.00..431.00 rows=1 width=1)
-               ->  Append  (cost=0.00..431.00 rows=1 width=4)
-                     ->  Seq Scan on mpp7638_1_prt_1  (cost=0.00..431.00 rows=1 width=4)
-                           Filter: (a = 1)
-                     ->  Seq Scan on mpp7638_1_prt_2  (cost=0.00..431.00 rows=1 width=4)
-                           Filter: (a = 1)
-                     ->  Seq Scan on mpp7638_1_prt_3  (cost=0.00..431.00 rows=1 width=4)
-                           Filter: (a = 1)
-                     ->  Seq Scan on mpp7638_1_prt_4  (cost=0.00..431.00 rows=1 width=4)
-                           Filter: (a = 1)
-                     ->  Seq Scan on mpp7638_1_prt_5  (cost=0.00..431.00 rows=1 width=4)
-                           Filter: (a = 1)
-                     ->  Seq Scan on mpp7638_1_prt_6  (cost=0.00..431.00 rows=1 width=4)
-                           Filter: (a = 1)
-                     ->  Seq Scan on mpp7638_1_prt_7  (cost=0.00..431.00 rows=1 width=4)
-                           Filter: (a = 1)
-                     ->  Seq Scan on mpp7638_1_prt_8  (cost=0.00..431.00 rows=1 width=4)
-                           Filter: (a = 1)
-                     ->  Seq Scan on mpp7638_1_prt_9  (cost=0.00..431.00 rows=1 width=4)
-                           Filter: (a = 1)
+         ->  Dynamic Seq Scan on mpp7638  (cost=0.00..431.00 rows=1 width=4)
+               Number of partitions to scan: 9 (out of 9)
+               Filter: (a = 1)
  Optimizer: Pivotal Optimizer (GPORCA)
-(23 rows)
+(6 rows)
 
 alter table mpp7638 set distributed by (a, b, c);
 INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
@@ -753,17 +739,17 @@ explain select * from table_a where a0=3;
 explain select a0 from table_a where a0 in (select max(a1) from table_a);
                                               QUERY PLAN                                              
 ------------------------------------------------------------------------------------------------------
- Gather Motion 3:1  (slice3; segments: 3)  (cost=0.00..862.00 rows=1 width=4)
+ Gather Motion 3:1  (slice1; segments: 3)  (cost=0.00..862.00 rows=1 width=4)
    ->  Hash Join  (cost=0.00..862.00 rows=1 width=4)
          Hash Cond: ((max(table_a.a1)) = table_a_1.a0)
          ->  Redistribute Motion 1:3  (slice2)  (cost=0.00..431.00 rows=1 width=4)
                Hash Key: (max(table_a.a1))
                ->  Aggregate  (cost=0.00..431.00 rows=1 width=4)
-                     ->  Gather Motion 3:1  (slice1; segments: 3)  (cost=0.00..431.00 rows=1 width=4)
+                     ->  Gather Motion 3:1  (slice3; segments: 3)  (cost=0.00..431.00 rows=1 width=4)
                            ->  Seq Scan on table_a  (cost=0.00..431.00 rows=1 width=4)
          ->  Hash  (cost=431.00..431.00 rows=1 width=4)
                ->  Seq Scan on table_a table_a_1  (cost=0.00..431.00 rows=1 width=4)
- Optimizer: Pivotal Optimizer (GPORCA) version 3.64.0
+ Optimizer: Pivotal Optimizer (GPORCA)
 (11 rows)
 
 select a0 from table_a where a0 in (select max(a1) from table_a);
@@ -791,18 +777,18 @@ INFO:  (slice 1) Dispatch command to SINGLE content
 explain select a0 from table_a where a0 in (select max(a1) from table_a where a0=1);
                                               QUERY PLAN                                              
 ------------------------------------------------------------------------------------------------------
- Gather Motion 3:1  (slice3; segments: 3)  (cost=0.00..862.00 rows=1 width=4)
+ Gather Motion 3:1  (slice1; segments: 3)  (cost=0.00..862.00 rows=1 width=4)
    ->  Hash Join  (cost=0.00..862.00 rows=1 width=4)
          Hash Cond: ((max(table_a.a1)) = table_a_1.a0)
          ->  Redistribute Motion 1:3  (slice2)  (cost=0.00..431.00 rows=1 width=4)
                Hash Key: (max(table_a.a1))
                ->  Aggregate  (cost=0.00..431.00 rows=1 width=4)
-                     ->  Gather Motion 3:1  (slice1; segments: 3)  (cost=0.00..431.00 rows=1 width=4)
+                     ->  Gather Motion 3:1  (slice3; segments: 3)  (cost=0.00..431.00 rows=1 width=4)
                            ->  Seq Scan on table_a  (cost=0.00..431.00 rows=1 width=4)
                                  Filter: (a0 = 1)
          ->  Hash  (cost=431.00..431.00 rows=1 width=4)
                ->  Seq Scan on table_a table_a_1  (cost=0.00..431.00 rows=1 width=4)
- Optimizer: Pivotal Optimizer (GPORCA) version 3.64.0
+ Optimizer: Pivotal Optimizer (GPORCA)
 (12 rows)
 
 reset test_print_direct_dispatch_info;

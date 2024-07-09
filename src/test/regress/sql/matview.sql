@@ -1,3 +1,7 @@
+-- start_matchsubs
+-- m/\(cost=.*\)/
+-- s/\(cost=.*\)//
+-- end_matchsubs
 -- create a table to use as a basis for views and materialized views in various combinations
 CREATE TABLE mvtest_t (id int NOT NULL PRIMARY KEY, type text NOT NULL, amt numeric NOT NULL);
 INSERT INTO mvtest_t VALUES
@@ -14,8 +18,8 @@ SELECT * FROM mvtest_tv ORDER BY type;
 
 -- create a materialized view with no data, and confirm correct behavior
 EXPLAIN (costs off)
-  CREATE MATERIALIZED VIEW mvtest_tm AS SELECT type, sum(amt) AS totamt FROM mvtest_t GROUP BY type WITH NO DATA distributed by(type);
-CREATE MATERIALIZED VIEW mvtest_tm AS SELECT type, sum(amt) AS totamt FROM mvtest_t GROUP BY type WITH NO DATA distributed by(type);
+  CREATE MATERIALIZED VIEW IF NOT EXISTS mvtest_tm AS SELECT type, sum(amt) AS totamt FROM mvtest_t GROUP BY type WITH NO DATA distributed by(type);
+CREATE MATERIALIZED VIEW IF NOT EXISTS mvtest_tm AS SELECT type, sum(amt) AS totamt FROM mvtest_t GROUP BY type WITH NO DATA distributed by(type);
 SELECT relispopulated FROM pg_class WHERE oid = 'mvtest_tm'::regclass;
 SELECT * FROM mvtest_tm ORDER BY type;
 REFRESH MATERIALIZED VIEW mvtest_tm;
@@ -210,7 +214,15 @@ DROP TABLE mvtest_v CASCADE;
 -- make sure running as superuser works when MV owned by another role (bug #11208)
 CREATE ROLE regress_user_mvtest;
 SET ROLE regress_user_mvtest;
-CREATE TABLE mvtest_foo_data AS SELECT i, md5(random()::text)
+-- this test case also checks for ambiguity in the queries issued by
+-- refresh_by_match_merge(), by choosing column names that intentionally
+-- duplicate all the aliases used in those queries
+CREATE TABLE mvtest_foo_data AS SELECT i,
+  i+1 AS tid,
+  md5(random()::text) AS mv,
+  md5(random()::text) AS newdata,
+  md5(random()::text) AS newdata2,
+  md5(random()::text) AS diff
   FROM generate_series(1, 10) i;
 CREATE MATERIALIZED VIEW mvtest_mv_foo AS SELECT * FROM mvtest_foo_data distributed by(i);
 CREATE MATERIALIZED VIEW mvtest_mv_foo AS SELECT * FROM mvtest_foo_data distributed by(i);
@@ -235,3 +247,57 @@ SELECT mvtest_func();
 SELECT * FROM mvtest1;
 SELECT * FROM mvtest2;
 ROLLBACK;
+
+-- make sure refresh mat view will dispatch oid at the final
+-- execution of the mat view's body query. See Github Issue
+-- https://github.com/greenplum-db/gpdb/issues/11956 for details.
+
+create table t_github_issue_11956(a int, b int) distributed randomly;
+insert into t_github_issue_11956 values (1, 1);
+
+create function f_github_issue_11956() returns int as
+$$
+select sum(a+b)::int from t_github_issue_11956
+$$
+language sql stable;
+
+create materialized view mat_view_github_issue_11956
+as
+select * from t_github_issue_11956 where a > f_github_issue_11956()
+distributed randomly;
+
+refresh materialized view mat_view_github_issue_11956;
+
+drop materialized view mat_view_github_issue_11956;
+drop table t_github_issue_11956;
+
+-- test REFRESH MATERIALIZED VIEW with 'WITH NO DATA' option can be executed immediately.
+DROP TABLE IF EXISTS mvtest_twn;
+CREATE TABLE mvtest_twn(a int);
+CREATE MATERIALIZED VIEW mat_view_twn as SELECT a.a as p, b.a as q, c.a as x, d.a as y FROM mvtest_twn a, mvtest_twn b, mvtest_twn c, mvtest_twn d;
+INSERT INTO mvtest_twn SELECT i FROM generate_series(1,10000)i;
+-- t1 contains 10000 tuples, after cross join it four times, the output is much too huge
+-- refresh with 'no data' should not actually execute the sql
+set statement_timeout = 5000;
+REFRESH MATERIALIZED VIEW mat_view_twn WITH NO DATA;
+reset statement_timeout;
+SELECT relispopulated FROM pg_class WHERE oid = 'mat_view_twn'::regclass;
+SELECT relispopulated FROM gp_dist_random('pg_class') WHERE oid = 'mat_view_twn'::regclass;
+SELECT * FROM mat_view_twn;
+
+DROP MATERIALIZED VIEW mat_view_twn;
+DROP TABLE mvtest_twn;
+
+-- test REFRESH MATERIALIZED VIEW on AO table with index
+-- more details could be found at https://github.com/greenplum-db/gpdb/issues/16447
+CREATE TABLE base_table (idn character varying(10) NOT NULL);
+INSERT INTO base_table select i from generate_series(1, 5000) i;
+CREATE MATERIALIZED VIEW base_view WITH (APPENDONLY=true) AS SELECT tt1.idn AS idn_ban FROM base_table tt1;
+CREATE INDEX test_id1 on base_view using btree(idn_ban);
+REFRESH MATERIALIZED VIEW base_view ;
+SELECT * FROM base_view where idn_ban = '10';
+-- should use index scan rather than seq scan
+EXPLAIN SELECT * FROM base_view where idn_ban = '10';
+
+DROP MATERIALIZED VIEW base_view;
+DROP TABLE base_table;

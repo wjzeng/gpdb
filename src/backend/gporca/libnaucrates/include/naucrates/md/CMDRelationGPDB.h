@@ -48,7 +48,7 @@ private:
 	CMemoryPool *m_mp;
 
 	// DXL for object
-	const CWStringDynamic *m_dxl_str;
+	const CWStringDynamic *m_dxl_str = nullptr;
 
 	// relation mdid
 	IMDId *m_mdid;
@@ -61,6 +61,9 @@ private:
 
 	// storage type
 	Erelstoragetype m_rel_storage_type;
+
+	// append only table version
+	Erelaoversion m_rel_ao_version;
 
 	// distribution policy
 	Ereldistrpolicy m_rel_distr_policy;
@@ -85,9 +88,6 @@ private:
 	// partition types
 	CharPtrArray *m_str_part_types_array;
 
-	// number of partition
-	ULONG m_num_of_partitions;
-
 	// Child partition oids
 	IMdIdArray *m_partition_oids;
 
@@ -97,20 +97,17 @@ private:
 	// array of index info
 	CMDIndexInfoArray *m_mdindex_info_array;
 
-	// array of trigger ids
-	IMdIdArray *m_mdid_trigger_array;
-
 	// array of check constraint mdids
 	IMdIdArray *m_mdid_check_constraint_array;
 
 	// partition constraint
 	CDXLNode *m_mdpart_constraint;
 
-	// does this table have oids
-	BOOL m_has_oids;
-
 	// number of system columns
 	ULONG m_system_columns;
+
+	// oid of foreign server if this is a foreign relation
+	IMDId *m_foreign_server;
 
 	// mapping of column position to positions excluding dropped columns
 	UlongToUlongMap *m_colpos_nondrop_colpos_map;
@@ -125,33 +122,29 @@ private:
 	// array of column widths including dropped columns
 	CDoubleArray *m_col_width_array;
 
+	// rows
+	CDouble m_rows;
+
 public:
 	CMDRelationGPDB(const CMDRelationGPDB &) = delete;
 
 	// ctor
-	CMDRelationGPDB(CMemoryPool *mp, IMDId *mdid, CMDName *mdname,
-					BOOL is_temp_table, Erelstoragetype rel_storage_type,
-					Ereldistrpolicy rel_distr_policy,
-					CMDColumnArray *mdcol_array, ULongPtrArray *distr_col_array,
-					IMdIdArray *distr_opfamilies,
-					ULongPtrArray *partition_cols_array,
-					CharPtrArray *str_part_types_array, ULONG num_of_partitions,
-					IMdIdArray *partition_oids, BOOL convert_hash_to_random,
-					ULongPtr2dArray *keyset_array,
-					CMDIndexInfoArray *md_index_info_array,
-					IMdIdArray *mdid_triggers_array,
-					IMdIdArray *mdid_check_constraint_array,
-					CDXLNode *mdpart_constraint, BOOL has_oids);
+	CMDRelationGPDB(
+		CMemoryPool *mp, IMDId *mdid, CMDName *mdname, BOOL is_temp_table,
+		Erelstoragetype rel_storage_type, Erelaoversion rel_ao_version,
+		Ereldistrpolicy rel_distr_policy, CMDColumnArray *mdcol_array,
+		ULongPtrArray *distr_col_array, IMdIdArray *distr_opfamilies,
+		ULongPtrArray *partition_cols_array, CharPtrArray *str_part_types_array,
+		IMdIdArray *partition_oids, BOOL convert_hash_to_random,
+		ULongPtr2dArray *keyset_array, CMDIndexInfoArray *md_index_info_array,
+		IMdIdArray *mdid_check_constraint_array, CDXLNode *mdpart_constraint,
+		IMDId *foreign_server, CDouble rows);
 
 	// dtor
 	~CMDRelationGPDB() override;
 
 	// accessors
-	const CWStringDynamic *
-	GetStrRepr() const override
-	{
-		return m_dxl_str;
-	}
+	const CWStringDynamic *GetStrRepr() override;
 
 	// the metadata id
 	IMDId *MDId() const override;
@@ -164,6 +157,9 @@ public:
 
 	// storage type (heap, appendonly, ...)
 	Erelstoragetype RetrieveRelStorageType() const override;
+
+	// append only table version
+	Erelaoversion GetRelAOVersion() const override;
 
 	// distribution policy (none, hash, random)
 	Ereldistrpolicy GetRelDistribution() const override;
@@ -212,17 +208,11 @@ public:
 	// return true if a hash distributed table needs to be considered as random
 	BOOL ConvertHashToRandom() const override;
 
-	// does this table have oids
-	BOOL HasOids() const override;
-
 	// is this a partitioned table
 	BOOL IsPartitioned() const override;
 
 	// number of partition keys
 	ULONG PartColumnCount() const override;
-
-	// number of partitions
-	ULONG PartitionCount() const override;
 
 	// retrieve the partition key column at the given position
 	const IMDColumn *PartColAt(ULONG pos) const override;
@@ -236,14 +226,8 @@ public:
 	// number of indices
 	ULONG IndexCount() const override;
 
-	// number of triggers
-	ULONG TriggerCount() const override;
-
 	// retrieve the id of the metadata cache index at the given position
 	IMDId *IndexMDidAt(ULONG pos) const override;
-
-	// retrieve the id of the metadata cache trigger at the given position
-	IMDId *TriggerMDidAt(ULONG pos) const override;
 
 	// serialize metadata relation in DXL format given a serializer object
 	void Serialize(gpdxl::CXMLSerializer *) const override;
@@ -259,6 +243,10 @@ public:
 
 	// child partition oids
 	IMdIdArray *ChildPartitionMdids() const override;
+
+	IMDId *ForeignServer() const override;
+
+	CDouble Rows() const override;
 
 #ifdef GPOS_DEBUG
 	// debug print of the metadata relation

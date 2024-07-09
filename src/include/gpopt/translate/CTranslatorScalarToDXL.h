@@ -117,6 +117,10 @@ private:
 	CDXLNode *TranslateScalarArrayOpExprToDXL(
 		const Expr *expr, const CMappingVarColId *var_colid_mapping);
 
+	// create a DXL node for a fieldselect node from gpdb expression
+	CDXLNode *TranslateFieldSelectToDXL(
+		const Expr *expr, const CMappingVarColId *var_colid_mapping);
+
 	// create a DXL scalar array comparison node from a GPDB expression
 	CDXLNode *CreateScalarArrayCompFromExpr(
 		const Expr *expr, const CMappingVarColId *var_colid_mapping);
@@ -196,6 +200,9 @@ private:
 	CDXLNode *TranslateVarToDXL(const Expr *expr,
 								const CMappingVarColId *var_colid_mapping);
 
+	CDXLNode *TranslateParamToDXL(const Expr *expr,
+								  const CMappingVarColId *var_colid_mapping);
+
 	CDXLNode *CreateInitPlanFromParam(const Param *param) const;
 
 	// create a DXL SubPlan node for a from a GPDB SubPlan
@@ -224,6 +231,9 @@ private:
 	// translate an arrayref expression
 	CDXLNode *TranslateArrayRefToDXL(const Expr *expr,
 									 const CMappingVarColId *var_colid_mapping);
+
+	CDXLNode *TranslateSortGroupClauseToDXL(
+		const Expr *expr, const CMappingVarColId *var_colid_mapping);
 
 	// add an indexlist to the given DXL arrayref node
 	void AddArrayIndexList(
@@ -276,6 +286,8 @@ public:
 	// create a DXL WindowFrame node from a GPDB expression
 	CDXLWindowFrame *TranslateWindowFrameToDXL(
 		int frame_options, const Node *start_offset, const Node *end_offset,
+		Oid start_in_range_func, Oid end_in_range_func, Oid in_range_coll,
+		bool in_range_asc, bool in_range_nulls_first,
 		const CMappingVarColId *var_colid_mapping,
 		CDXLNode *new_scalar_proj_list);
 
@@ -309,7 +321,8 @@ public:
 
 	// extract the long int value of a datum
 	static LINT ExtractLintValueFromDatum(const IMDType *md_type, BOOL is_null,
-										  BYTE *bytes, ULONG len);
+										  BYTE *bytes, ULONG len,
+										  IMDId *base_mdid);
 
 	// datum to oid CDXLDatum
 	static CDXLDatum *TranslateOidDatumToDXL(CMemoryPool *mp,

@@ -2,6 +2,13 @@
 -- NOTIN 
 -- Test NOTIN clauses
 --
+-- start_matchsubs
+-- m/\(cost=.*\)/
+-- s/\(cost=.*\)//
+--
+-- m/\(slice\d+; segments: \d+\)/
+-- s/\(slice\d+; segments: \d+\)//
+-- end_matchsubs
 
 create schema notin;
 set search_path=notin;
@@ -424,6 +431,165 @@ select * from table_source3 where c3 = 'INC' and c4 = '0000000001' and c2 not in
 explain select * from table_source4 where c3 = 'INC' and c4 = '0000000001' and c2 not in (SELECT c1 from table_config where c2='test');
 select * from table_source4 where c3 = 'INC' and c4 = '0000000001' and c2 not in (SELECT c1 from table_config where c2='test');
 
+--
+-- Multi Column NOT-IN
+-- Please refer to https://github.com/greenplum-db/gpdb/issues/12930
+--
+create table t1_12930(a int not null, b int not null);
+create table t2_12930(a int not null, b int not null);
+
+-- non-nullable: t1.a, t1.b, t2.a, t2.b
+insert into t1_12930 values (1, 1), (2, 2);
+insert into t2_12930 values (1, 1), (2, 3), (3,3);
+explain select * from t1_12930 where (a, b) not in (select a, b from t2_12930);
+select * from t1_12930 where (a, b) not in (select a, b from t2_12930);
+explain select * from t1_12930 where (a+1, b+1) not in (select a, b from t2_12930);
+select * from t1_12930 where (a+1, b+1) not in (select a, b from t2_12930);
+explain select * from t1_12930 where (a,b) <> ALL (select a, b from t2_12930);
+select * from t1_12930 where (a,b) <> ALL (select a, b from t2_12930);
+
+-- non-nullable: t1.a, t2.a, t2.b
+-- nullable: t1.b
+truncate t1_12930;
+truncate t2_12930;
+alter table t2_12930 alter column b set not null;
+alter table t1_12930 alter column b drop not null;
+insert into t1_12930 values (1, null);
+insert into t2_12930 values (1, 1);
+explain select * from t1_12930 where (a, b) <>ALL (select a, b from t2_12930);
+select * from t1_12930 where (a, b) <>ALL (select a, b from t2_12930);
+
+-- non-nullable: t1.a, t1.b, t2.a
+-- nullable: t2.b
+truncate t1_12930;
+truncate t2_12930;
+alter table t2_12930 alter column b drop not null;
+insert into t1_12930 values (1, 1);
+insert into t2_12930 values (1, null);
+explain select * from t1_12930 where (a, b) not in (select a, b from t2_12930);
+select * from t1_12930 where (a, b) not in (select a, b from t2_12930);
+
+-- non-nullable: t1.a, t2.a, t2.b
+-- nullable: t1.b
+truncate t1_12930;
+truncate t2_12930;
+alter table t2_12930 alter column b set not null;
+alter table t1_12930 alter column b drop not null;
+insert into t1_12930 values (1, null);
+insert into t2_12930 values (1, 1);
+explain select * from t1_12930 where (a, b) not in (select a, b from t2_12930);
+select * from t1_12930 where (a, b) not in (select a, b from t2_12930);
+explain select * from t1_12930 where (a, b) not in (select a, b from t2_12930) and b is not null;
+select * from t1_12930 where (a, b) not in (select a, b from t2_12930) and b is not null;
+
+-- outer plan's target list does not contain the columns in qual
+-- non-nullable: t1.a, t1.b, t2.a, t2.b
+truncate t1_12930;
+truncate t2_12930;
+alter table t1_12930 alter column b set not null;
+insert into t1_12930 values (1, 1);
+insert into t2_12930 values (1, 1);
+explain select 1 from t1_12930 where (a, b) not in (select a, b from t2_12930);
+select 1 from t1_12930 where (a, b) not in (select a, b from t2_12930);
+
+-- RTE contains view 
+-- non-nullable: t1.a, t1.b, t2.a, t2.b
+create view v_12930 as select a,b from t1_12930;
+explain select * from t2_12930 where (a,b) not in (select a,b from v_12930);
+select * from t2_12930 where (a,b) not in (select a,b from v_12930);
+explain select * from v_12930 where (a,b) not in (select a,b from t2_12930);
+select * from v_12930 where (a,b) not in (select a,b from t2_12930);
+
+-- var from RTE_JOIN
+-- non-nullable: t1.a, t1.b, t2.a, t2.b, r1.x, r1.y
+truncate t1_12930;
+truncate t2_12930;
+create table r1_12930(x int not null, y int not null);
+insert into t1_12930 values (1, 2), (1, 3);
+insert into t2_12930 values (1, 3), (1, 4);
+insert into r1_12930 values (1, 2), (1, 5);
+explain select * from r1_12930
+inner join t1_12930 on a = x
+where (x, b) not in (select a,b from t2_12930);
+select * from r1_12930
+inner join t1_12930 on a = x
+where (x, b) not in (select a,b from t2_12930);
+
+-- test for issue https://github.com/greenplum-db/gpdb/issues/13212
+create table t1_13212(a int not null, b int not null);
+create table t2_13212(a int not null, b int not null);
+explain (costs off)  select 1 from t1_13212 where (NULL, b) not in (select a, b from t2_13212);
+select 1 from t1_13212 where (NULL, b) not in (select a, b from t2_13212);
+insert into t1_13212 values (1, 1);
+insert into t2_13212 values (1, 1);
+select 1 from t1_13212 where (NULL, b) not in (select a, b from t2_13212);
+update t2_13212 set b = 2;
+select 1 from t1_13212 where (NULL, b) not in (select a, b from t2_13212);
+
+-- test for params of not-in sublink
+create table t1p(a int, b int, c int);
+create table t2p(b int, a int);
+explain (costs off)
+update
+  t1p
+set
+  a = age.aging
+from
+  (
+    select
+      c,
+      (
+        select
+            diff
+        from
+            generate_series(1, 10) diff
+        where
+            (diff, t1p.b) not in (select a, b from t2p)
+      ) as aging
+    from
+      t1p
+  ) age
+where a = age.c;
+
+update
+  t1p
+set
+  a = age.aging
+from
+  (
+    select
+      c,
+      (
+        select
+            diff
+        from
+            generate_series(1, 10) diff
+        where
+            (diff, t1p.b) not in (select a, b from t2p)
+      ) as aging
+    from
+      t1p
+  ) age
+where a = age.c;
+
+drop table t1p;
+drop table t2p;
+
+-- test for github issue 14858
+create table t1_14858(a varchar(32), b varchar(32), c int, d int);
+create table t2_14858(a varchar(32), b varchar(32), c int, d int);
+create table t3_14858(a varchar(32), b varchar(32), c int, d int);
+
+create view mv_14858 as select * from t1_14858 full join
+(select a, b, count(c) from t2_14858 group by a,b union
+ select a, b, count(c) from t3_14858 group by a, b) x using (a, b);
+
+select * from mv_14858 where a not in (select a from t1_14858);
+
+drop view mv_14858;
+drop table t1_14858;
+drop table t2_14858;
+drop table t3_14858;
 
 reset search_path;
 drop schema notin cascade;

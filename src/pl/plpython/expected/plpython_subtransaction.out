@@ -236,8 +236,11 @@ with plpy.subtransaction() as s:
 $$ LANGUAGE plpythonu;
 CREATE FUNCTION subtransaction_exit_subtransaction_in_with() RETURNS void
 AS $$
-with plpy.subtransaction() as s:
-    s.__exit__(None, None, None)
+try:
+    with plpy.subtransaction() as s:
+        s.__exit__(None, None, None)
+except ValueError as e:
+    raise ValueError(e)
 $$ LANGUAGE plpythonu;
 SELECT subtransaction_exit_without_enter();
 ERROR:  ValueError: this subtransaction has not been entered
@@ -289,8 +292,8 @@ PL/Python function "subtransaction_enter_subtransaction_in_with"
 SELECT subtransaction_exit_subtransaction_in_with();
 ERROR:  ValueError: this subtransaction has already been exited
 CONTEXT:  Traceback (most recent call last):
-  PL/Python function "subtransaction_exit_subtransaction_in_with", line 3, in <module>
-    s.__exit__(None, None, None)
+  PL/Python function "subtransaction_exit_subtransaction_in_with", line 6, in <module>
+    raise ValueError(e)
 PL/Python function "subtransaction_exit_subtransaction_in_with"
 -- Make sure we don't get a "current transaction is aborted" error
 SELECT 1 as test;
@@ -461,3 +464,48 @@ CONTEXT:  Traceback (most recent call last):
   PL/Python function "cursor_close_aborted_subxact", line 7, in <module>
     cur.close()
 PL/Python function "cursor_close_aborted_subxact"
+-- error report test in subtransaction begin
+-- prepare function
+CREATE OR REPLACE FUNCTION test_func() RETURNS SETOF int AS
+$$
+plpy.execute("select pg_backend_pid()")
+
+for i in range(0, 5):
+    yield (i)
+
+$$ LANGUAGE plpython3u;
+-- inject fault and wait for trigger
+select gp_inject_fault_infinite('begin_internal_sub_transaction', 'error', 1);
+ gp_inject_fault_infinite 
+--------------------------
+ Success:
+(1 row)
+
+SELECT test_func();
+ERROR:  function "test_func" error fetching next item from iterator
+DETAIL:  spiexceptions.FaultInject: fault triggered, fault name:'begin_internal_sub_transaction' fault type:'error'
+CONTEXT:  Traceback (most recent call last):
+PL/Python function "test_func"
+select gp_wait_until_triggered_fault('begin_internal_sub_transaction', 1, 1);
+ gp_wait_until_triggered_fault 
+-------------------------------
+ Success:
+(1 row)
+
+select gp_inject_fault('begin_internal_sub_transaction', 'reset', 1);
+ gp_inject_fault 
+-----------------
+ Success:
+(1 row)
+
+SELECT test_func();
+ test_func 
+-----------
+         0
+         1
+         2
+         3
+         4
+(5 rows)
+
+DROP FUNCTION test_func();

@@ -31,11 +31,12 @@ using namespace gpopt;
 //		Ctor
 //
 //---------------------------------------------------------------------------
-CLogicalJoin::CLogicalJoin(CMemoryPool *mp) : CLogical(mp)
+
+CLogicalJoin::CLogicalJoin(CMemoryPool *mp, CXform::EXformId origin_xform)
+	: CLogical(mp), m_origin_xform(origin_xform)
 {
 	GPOS_ASSERT(nullptr != mp);
 }
-
 
 //---------------------------------------------------------------------------
 //	@function:
@@ -63,7 +64,24 @@ IStatistics *
 CLogicalJoin::PstatsDerive(CMemoryPool *mp, CExpressionHandle &exprhdl,
 						   IStatisticsArray *stats_ctxt) const
 {
-	return CJoinStatsProcessor::DeriveJoinStats(mp, exprhdl, stats_ctxt);
+	IStatistics *pstats =
+		CJoinStatsProcessor::DeriveJoinStats(mp, exprhdl, stats_ctxt);
+
+	// Check whether a row plan hint exists for this join operators relations.
+	// And if one does exist, then evaluate the hint to overwrite the estimated
+	// rows.
+	CPlanHint *planhint =
+		COptCtxt::PoctxtFromTLS()->GetOptimizerConfig()->GetPlanHint();
+	if (nullptr != planhint)
+	{
+		CRowHint *rowhint =
+			planhint->GetRowHint(exprhdl.DeriveTableDescriptor());
+		if (nullptr != rowhint)
+		{
+			pstats->SetRows(rowhint->ComputeRows(pstats->Rows()));
+		}
+	}
+	return pstats;
 }
 
 // EOF

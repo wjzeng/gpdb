@@ -24,7 +24,10 @@
 #include "gpopt/operators/CExpressionHandle.h"
 #include "gpopt/operators/CExpressionUtils.h"
 #include "gpopt/operators/CLogicalDynamicIndexGet.h"
+#include "gpopt/operators/CLogicalDynamicIndexOnlyGet.h"
 #include "gpopt/operators/CLogicalIndexGet.h"
+#include "gpopt/operators/CLogicalIndexOnlyGet.h"
+#include "gpopt/operators/CPhysicalDynamicScan.h"
 #include "gpopt/operators/CPredicateUtils.h"
 #include "gpopt/optimizer/COptimizerConfig.h"
 #include "naucrates/base/IDatumInt2.h"
@@ -38,6 +41,7 @@
 #include "naucrates/md/IMDTypeInt4.h"
 #include "naucrates/md/IMDTypeInt8.h"
 #include "naucrates/md/IMDTypeOid.h"
+#include "naucrates/statistics/CExtendedStatsProcessor.h"
 #include "naucrates/statistics/CFilterStatsProcessor.h"
 #include "naucrates/statistics/CHistogram.h"
 #include "naucrates/statistics/CJoinStatsProcessor.h"
@@ -1037,33 +1041,56 @@ CStatisticsUtils::DatumNull(const CColRef *colref)
 //
 //---------------------------------------------------------------------------
 IStatistics *
-CStatisticsUtils::DeriveStatsForDynamicScan(CMemoryPool *mp GPOS_UNUSED,
-											CExpressionHandle &expr_handle,
-											ULONG part_idx_id GPOS_UNUSED)
+CStatisticsUtils::DeriveStatsForDynamicScan(CMemoryPool *mp,
+											CExpressionHandle &exprhdl,
+											ULONG scan_id,
+											CPartitionPropagationSpec *pps_reqd)
 {
 	// extract part table base stats from passed handle
-	IStatistics *base_table_stats = expr_handle.Pstats();
+	IStatistics *base_table_stats = exprhdl.Pstats();
 	GPOS_ASSERT(nullptr != base_table_stats);
-
-	// GPDB_12_MERGE_FIXME: Re-enable this when DPE is re-implemented
-	if (true || !GPOS_FTRACE(EopttraceDeriveStatsForDPE))
+	if (nullptr == base_table_stats)
 	{
-		// if stats derivation with dynamic partition elimitaion is disabled, we return base stats
+		GPOS_RAISE(gpopt::ExmaGPOPT, gpopt::ExmiNoStats,
+				   GPOS_WSZ_LIT("CPhysicalDynamicScan"));
+	}
+
+	if (!GPOS_FTRACE(EopttraceDeriveStatsForDPE))
+	{
+		// return base stats if stats derivation with dynamic partition
+		// elimination is disabled
 		base_table_stats->AddRef();
 		return base_table_stats;
 	}
 
-#if 0
-	if (!part_filter_map->FContainsScanId(part_idx_id) ||
-		NULL == part_filter_map->Pstats(part_idx_id))
+	const CBitSet *selector_ids = pps_reqd->SelectorIds(scan_id);
+	if (!pps_reqd->Contains(scan_id) || selector_ids->Size() == 0)
 	{
-		// no corresponding entry is found in map, return base stats
+		// no corresponding partition selector is present, return base stats
 		base_table_stats->AddRef();
 		return base_table_stats;
 	}
 
-	IStatistics *part_selector_stats = part_filter_map->Pstats(part_idx_id);
-	CExpression *scalar_expr = part_filter_map->Pexpr(part_idx_id);
+	GPOS_ASSERT(pps_reqd->SelectorIds(scan_id)->Size() > 0);
+
+	// GPDB_12_MERGE_FEATURE_NOT_SUPPORTED:
+	// each Dynamic Scan may have multiple associated PartitionSelectors;
+	// for now just use the first one in the list (similar to 6X, which used
+	// the PartitionSelector on the top-most Join node). Ideally, we would
+	// combine partition selectors here to get a more accurate stats estimate
+	const SPartSelectorInfoEntry *part_selector_info = nullptr;
+	{
+		CBitSetIter it(*selector_ids);
+		it.Advance();
+		ULONG selector_id = it.Bit();
+
+		part_selector_info =
+			COptCtxt::PoctxtFromTLS()->GetPartSelectorInfo(selector_id);
+		GPOS_ASSERT(part_selector_info != nullptr);
+	}
+
+	IStatistics *part_selector_stats = part_selector_info->m_stats;
+	CExpression *scalar_expr = part_selector_info->m_filter_expr;
 
 	CColRefSetArray *output_colrefs = GPOS_NEW(mp) CColRefSetArray(mp);
 	output_colrefs->Append(base_table_stats->GetColRefSet(mp));
@@ -1078,7 +1105,7 @@ CStatisticsUtils::DeriveStatsForDynamicScan(CMemoryPool *mp GPOS_UNUSED,
 	CColRefSet *outer_refs = GPOS_NEW(mp) CColRefSet(mp);
 
 	// extract all the conjuncts
-	CStatsPred *unsupported_pred_stats = NULL;
+	CStatsPred *unsupported_pred_stats = nullptr;
 	CStatsPredJoinArray *join_preds_stats =
 		CStatsPredUtils::ExtractJoinStatsFromJoinPredArray(
 			mp, scalar_expr, output_colrefs, outer_refs,
@@ -1088,7 +1115,7 @@ CStatisticsUtils::DeriveStatsForDynamicScan(CMemoryPool *mp GPOS_UNUSED,
 	IStatistics *left_semi_join_stats = base_table_stats->CalcLSJoinStats(
 		mp, part_selector_stats, join_preds_stats);
 
-	if (NULL != unsupported_pred_stats)
+	if (nullptr != unsupported_pred_stats)
 	{
 		// apply the unsupported join filters as a filter on top of the join results.
 		// TODO,  June 13 2014 we currently only cap NDVs for filters
@@ -1107,8 +1134,6 @@ CStatisticsUtils::DeriveStatsForDynamicScan(CMemoryPool *mp GPOS_UNUSED,
 	join_preds_stats->Release();
 
 	return left_semi_join_stats;
-#endif
-	return nullptr;
 }
 
 //---------------------------------------------------------------------------
@@ -1126,6 +1151,8 @@ CStatisticsUtils::DeriveStatsForIndexGet(CMemoryPool *mp,
 {
 	COperator::EOperatorId operator_id = expr_handle.Pop()->Eopid();
 	GPOS_ASSERT(CLogical::EopLogicalIndexGet == operator_id ||
+				CLogical::EopLogicalIndexOnlyGet == operator_id ||
+				CLogical::EopLogicalDynamicIndexOnlyGet == operator_id ||
 				CLogical::EopLogicalDynamicIndexGet == operator_id);
 
 	// collect columns used by index conditions and distribution of the table
@@ -1141,6 +1168,26 @@ CStatisticsUtils::DeriveStatsForIndexGet(CMemoryPool *mp,
 		if (nullptr != index_get_op->PcrsDist())
 		{
 			used_col_refset->Include(index_get_op->PcrsDist());
+		}
+	}
+	else if (CLogical::EopLogicalIndexOnlyGet == operator_id)
+	{
+		CLogicalIndexOnlyGet *index_only_get_op =
+			CLogicalIndexOnlyGet::PopConvert(expr_handle.Pop());
+		table_descriptor = index_only_get_op->Ptabdesc();
+		if (nullptr != index_only_get_op->PcrsDist())
+		{
+			used_col_refset->Include(index_only_get_op->PcrsDist());
+		}
+	}
+	else if (CLogical::EopLogicalDynamicIndexOnlyGet == operator_id)
+	{
+		CLogicalDynamicIndexOnlyGet *dynamic_index_only_get_op =
+			CLogicalDynamicIndexOnlyGet::PopConvert(expr_handle.Pop());
+		table_descriptor = dynamic_index_only_get_op->Ptabdesc();
+		if (nullptr != dynamic_index_only_get_op->PcrsDist())
+		{
+			used_col_refset->Include(dynamic_index_only_get_op->PcrsDist());
 		}
 	}
 	else
@@ -1202,7 +1249,10 @@ CStatisticsUtils::DeriveStatsForBitmapTableGet(CMemoryPool *mp,
 					expr_handle.Pop()->Eopid() ||
 				CLogical::EopLogicalDynamicBitmapTableGet ==
 					expr_handle.Pop()->Eopid());
-	CTableDescriptor *table_descriptor = expr_handle.DeriveTableDescriptor();
+
+	CTableDescriptorHashSet *table_descriptor_set =
+		expr_handle.DeriveTableDescriptor();
+	CTableDescriptor *table_descriptor = table_descriptor_set->First();
 
 	// the index of the condition
 	ULONG child_cond_index = 0;
@@ -1486,8 +1536,37 @@ CStatisticsUtils::MaxNumGroupsForGivenSrcGprCols(
 	CColRef *first_colref = col_factory->LookupColRef(*(*src_grouping_cols)[0]);
 	CDouble upper_bound_ndvs = input_stats->GetColUpperBoundNDVs(first_colref);
 
+	DOUBLE mvndistinct;
+	ULongPtrArray *updated_src_grouping_cols = GPOS_NEW(mp) ULongPtrArray(mp);
+	for (ULONG ul = 0; ul < src_grouping_cols->Size(); ul++)
+	{
+		updated_src_grouping_cols->Append(GPOS_NEW(mp)
+											  ULONG(*(*src_grouping_cols)[ul]));
+	}
+
 	CDoubleArray *ndvs = GPOS_NEW(mp) CDoubleArray(mp);
-	AddNdvForAllGrpCols(mp, input_stats, src_grouping_cols, ndvs);
+
+	// Use all applicable multivariate n-distinct correlated stats
+	while (true)
+	{
+		if (CExtendedStatsProcessor::ApplyCorrelatedStatsToNDistinctCalculation(
+				mp, input_stats->GetExtStatsInfo(),
+				input_stats->GetColidToAttnoMapping(),
+				updated_src_grouping_cols, &mvndistinct))
+		{
+			ndvs->Append(GPOS_NEW(mp) CDouble(mvndistinct));
+		}
+		else
+		{
+			// No more relevant multivariate n-distinct stats
+			break;
+		}
+	}
+
+	// add any remaining columns not covered by multivariate n-distinct
+	// correlated stats
+	AddNdvForAllGrpCols(mp, input_stats, updated_src_grouping_cols, ndvs);
+	updated_src_grouping_cols->Release();
 
 	// take the minimum of (a) the estimated number of groups from the columns of this source,
 	// (b) input rows, and (c) cardinality upper bound for the given source in the

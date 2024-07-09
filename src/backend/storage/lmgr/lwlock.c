@@ -131,7 +131,6 @@ LWLockPadded *MainLWLockArray = NULL;
  * extension locks all buffer partitions simultaneously.
  */
 #define MAX_SIMUL_LWLOCKS	200
-#define MAX_FRAME_DEPTH  	64
 
 /* struct representing the LWLocks we're holding */
 typedef struct LWLockHandle
@@ -311,6 +310,7 @@ get_lwlock_stats_entry(LWLock *lock)
 		return &lwlock_stats_dummy;
 
 	/* Fetch or create the entry. */
+	MemSet(&key, 0, sizeof(key));
 	key.tranche = lock->tranche;
 	key.instance = lock;
 	lwstats = hash_search(lwlock_stats_htab, &key, HASH_ENTER, &found);
@@ -576,31 +576,6 @@ GetNamedLWLockTranche(const char *tranche_name)
 	/* just to keep compiler quiet */
 	return NULL;
 }
-
-#ifdef LOCK_DEBUG
-
-static void
-LWLockTryLockWaiting(PGPROC *proc, volatile LWLock *l)
-{
-	int 		milliseconds = 0;
-	
-	while(true)
-	{
-		pg_usleep(5000L);
-		if (PGSemaphoreTryLock(&proc->sem))
-		{
-			if (milliseconds >= 750)
-				elog(LOG, "Done waiting on lockid %d", T_ID(l));
-			return;
-		}
-
-		milliseconds += 5;
-		if (milliseconds == 750)
-			elog(LOG, "Waited .75 seconds on lockid %d with no success", T_ID(l));
-	}
-}
-
-#endif
 
 /*
  * Allocate a new tranche ID.
@@ -1247,14 +1222,10 @@ LWLockAcquire(LWLock *lock, LWLockMode mode)
 		/*
 		 * Wait until awakened.
 		 *
-		 * Since we share the process wait semaphore with the regular lock
-		 * manager and ProcWaitForSignal, and we may need to acquire an LWLock
-		 * while one of those is pending, it is possible that we get awakened
-		 * for a reason other than being signaled by LWLockRelease. If so,
-		 * loop back and wait again.  Once we've gotten the LWLock,
-		 * re-increment the sema by the number of additional signals received,
-		 * so that the lock manager or signal manager will see the received
-		 * signal when it next waits.
+		 * It is possible that we get awakened for a reason other than being
+		 * signaled by LWLockRelease.  If so, loop back and wait again.  Once
+		 * we've gotten the LWLock, re-increment the sema by the number of
+		 * additional signals received.
 		 */
 		LOG_LWDEBUG("LWLockAcquire", lock, "waiting");
 
@@ -1267,12 +1238,7 @@ LWLockAcquire(LWLock *lock, LWLockMode mode)
 
 		for (;;)
 		{
-			/* "false" means cannot accept cancel/die interrupt here. */
-#ifndef LOCK_DEBUG
 			PGSemaphoreLock(proc->sem);
-#else
-			LWLockTryLockWaiting(proc, lock);
-#endif
 			if (!proc->lwWaiting)
 				break;
 			extraWaits++;
@@ -1419,8 +1385,7 @@ LWLockAcquireOrWait(LWLock *lock, LWLockMode mode)
 		{
 			/*
 			 * Wait until awakened.  Like in LWLockAcquire, be prepared for
-			 * bogus wakeups, because we share the semaphore with
-			 * ProcWaitForSignal.
+			 * bogus wakeups.
 			 */
 			LOG_LWDEBUG("LWLockAcquireOrWait", lock, "waiting");
 
@@ -1629,14 +1594,10 @@ LWLockWaitForVar(LWLock *lock, uint64 *valptr, uint64 oldval, uint64 *newval)
 		/*
 		 * Wait until awakened.
 		 *
-		 * Since we share the process wait semaphore with the regular lock
-		 * manager and ProcWaitForSignal, and we may need to acquire an LWLock
-		 * while one of those is pending, it is possible that we get awakened
-		 * for a reason other than being signaled by LWLockRelease. If so,
-		 * loop back and wait again.  Once we've gotten the LWLock,
-		 * re-increment the sema by the number of additional signals received,
-		 * so that the lock manager or signal manager will see the received
-		 * signal when it next waits.
+		 * It is possible that we get awakened for a reason other than being
+		 * signaled by LWLockRelease.  If so, loop back and wait again.  Once
+		 * we've gotten the LWLock, re-increment the sema by the number of
+		 * additional signals received.
 		 */
 		LOG_LWDEBUG("LWLockWaitForVar", lock, "waiting");
 
@@ -1776,12 +1737,7 @@ LWLockRelease(LWLock *lock)
 
 	num_held_lwlocks--;
 	for (; i < num_held_lwlocks; i++)
-	{
 		held_lwlocks[i] = held_lwlocks[i + 1];
-	}
-
-	// Clear out old last entry.
-	held_lwlocks[num_held_lwlocks].lock = 0;
 
 	PRINT_LWDEBUG("LWLockRelease", lock, mode);
 
@@ -1888,6 +1844,32 @@ LWLockHeldByMe(LWLock *l)
 }
 
 /*
+ * LWLockHeldByMe - test whether my process holds any of an array of locks
+ *
+ * This is meant as debug support only.
+ */
+bool
+LWLockAnyHeldByMe(LWLock *l, int nlocks, size_t stride)
+{
+	char	   *held_lock_addr;
+	char	   *begin;
+	char	   *end;
+	int			i;
+
+	begin = (char *) l;
+	end = begin + nlocks * stride;
+	for (i = 0; i < num_held_lwlocks; i++)
+	{
+		held_lock_addr = (char *) held_lwlocks[i].lock;
+		if (held_lock_addr >= begin &&
+			held_lock_addr < end &&
+			(held_lock_addr - begin) % stride == 0)
+			return true;
+	}
+	return false;
+}
+
+/*
  * LWLockHeldByMeInMode - test whether my process holds a lock in given mode
  *
  * This is meant as debug support only.
@@ -1903,4 +1885,16 @@ LWLockHeldByMeInMode(LWLock *l, LWLockMode mode)
 			return true;
 	}
 	return false;
+}
+
+/*
+ * GPDB: LWLockIsExclusive - test whether a lock is an exclusive one
+ *
+ * Note: this does not assume any other facts about the lock, like whether it
+ * is being held. Caller needs to make sure of that if that is the intention.
+ */
+bool
+LWLockIsExclusive(LWLock *l)
+{
+	return pg_atomic_read_u32(&l->state) & LW_VAL_EXCLUSIVE;
 }

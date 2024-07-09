@@ -4,12 +4,6 @@
  *	  Functions for asynchronous implementation of dispatching
  *	  commands to QExecutors.
  *
- * GPDB_12_MERGE_FIXME: We should switch to using WaitEventSetWait() instead
- * of straight poll() in this file. WaitEventSetWait() would report the status
- * using the new wait event infrastructure, so that it would show up as a
- * separate state in pg_stat_activity. It's also potentially more efficient.
- *
- *
  * Portions Copyright (c) 2005-2008, Greenplum inc
  * Portions Copyright (c) 2012-Present VMware, Inc. or its affiliates.
  *
@@ -29,6 +23,7 @@
 #include <sys/poll.h>
 #endif
 
+#include "pgstat.h"
 #include "storage/ipc.h"		/* For proc_exit_inprogress  */
 #include "tcop/tcopprot.h"
 #include "cdb/cdbdisp.h"
@@ -53,6 +48,13 @@
  */
 #define DISPATCH_WAIT_CANCEL_TIMEOUT_MSEC 100
 
+/*
+ * DISPATCH_NO_WAIT means return immediate when there's no more data,
+ * DISPATCH_WAIT_UNTIL_FINISH means wait until all dispatch works are completed.
+ */
+#define DISPATCH_NO_WAIT 0
+#define DISPATCH_WAIT_UNTIL_FINISH -1
+
 typedef struct CdbDispatchCmdAsync
 {
 
@@ -74,6 +76,13 @@ typedef struct CdbDispatchCmdAsync
 	volatile DispatchWaitMode waitMode;
 
 	/*
+	 * When waitMode is set to DISPATCH_WAIT_ACK_ROOT,
+	 * the expected acknowledge message from QE should be specified.
+	 * This field stores the expected acknowledge message.
+	 */
+	const char	*ackMessage;
+
+	/*
 	 * Text information to dispatch: The format is type(1 byte) + length(size
 	 * of int) + content(n bytes)
 	 *
@@ -88,6 +97,9 @@ typedef struct CdbDispatchCmdAsync
 
 static void *cdbdisp_makeDispatchParams_async(int maxSlices, int largestGangSize, char *queryText, int len);
 
+static bool cdbdisp_checkAckMessage_async(struct CdbDispatcherState *ds, const char *message,
+									int timeout_sec);
+
 static void cdbdisp_checkDispatchResult_async(struct CdbDispatcherState *ds,
 								  DispatchWaitMode waitMode);
 
@@ -97,13 +109,14 @@ static void cdbdisp_dispatchToGang_async(struct CdbDispatcherState *ds,
 static void	cdbdisp_waitDispatchFinish_async(struct CdbDispatcherState *ds);
 
 static bool	cdbdisp_checkForCancel_async(struct CdbDispatcherState *ds);
-static int cdbdisp_getWaitSocketFd_async(struct CdbDispatcherState *ds);
+static int *cdbdisp_getWaitSocketFds_async(struct CdbDispatcherState *ds, int *nsocks);
 
 DispatcherInternalFuncs DispatcherAsyncFuncs =
 {
 	cdbdisp_checkForCancel_async,
-	cdbdisp_getWaitSocketFd_async,
+	cdbdisp_getWaitSocketFds_async,
 	cdbdisp_makeDispatchParams_async,
+	cdbdisp_checkAckMessage_async,
 	cdbdisp_checkDispatchResult_async,
 	cdbdisp_dispatchToGang_async,
 	cdbdisp_waitDispatchFinish_async
@@ -114,8 +127,7 @@ static void dispatchCommand(CdbDispatchResult *dispatchResult,
 				const char *query_text,
 				int query_text_len);
 
-static void checkDispatchResult(CdbDispatcherState *ds,
-					bool wait);
+static void checkDispatchResult(CdbDispatcherState *ds, int timeout_sec);
 
 static bool processResults(CdbDispatchResult *dispatchResult);
 
@@ -129,7 +141,10 @@ static void
 			handlePollError(CdbDispatchCmdAsync *pParms);
 
 static void
-			handlePollSuccess(CdbDispatchCmdAsync *pParms, struct pollfd *fds);
+			handlePollSuccess(CdbDispatchCmdAsync *pParms, WaitEvent *revents, int nready);
+
+static bool
+			checkAckMessage(CdbDispatchResult *dispatchResult, const char *message);
 
 /*
  * Check dispatch result.
@@ -142,23 +157,32 @@ cdbdisp_checkForCancel_async(struct CdbDispatcherState *ds)
 {
 	Assert(ds);
 
-	checkDispatchResult(ds, false);
+	checkDispatchResult(ds, DISPATCH_NO_WAIT);
 	return cdbdisp_checkResultsErrcode(ds->primaryResults);
 }
 
 /*
- * Return a FD to wait for, after dispatching.
+ * Return all FDs to wait for, after dispatching.
+ *
+ * nsocks is the returned socket fds number (as an output param):
+ *
+ * Return value is the array of waiting socket fds.
+ * It's be palloced in this function, so caller need to pfree it.
  */
-static int
-cdbdisp_getWaitSocketFd_async(struct CdbDispatcherState *ds)
+static int *
+cdbdisp_getWaitSocketFds_async(struct CdbDispatcherState *ds, int *nsocks)
 {
 	CdbDispatchCmdAsync *pParms = (CdbDispatchCmdAsync *) ds->dispatchParams;
 	int			i;
+	int			*fds = NULL;
 
 	Assert(ds);
 
+	*nsocks = 0;
 	if (proc_exit_inprogress)
-		return PGINVALID_SOCKET;
+		return NULL;
+
+	fds = palloc(pParms->dispatchCount * sizeof(int));
 
 	/*
 	 * This should match the logic in cdbdisp_checkForCancel_async(). In
@@ -174,18 +198,12 @@ cdbdisp_getWaitSocketFd_async(struct CdbDispatcherState *ds)
 		dispatchResult = pParms->dispatchResultPtrArray[i];
 		segdbDesc = dispatchResult->segdbDesc;
 
-		/*
-		 * Already finished with this QE?
-		 */
-		if (!dispatchResult->stillRunning)
-			continue;
-
 		Assert(!cdbconn_isBadConnection(segdbDesc));
 
-		return PQsocket(segdbDesc->conn);
+		(fds)[(*nsocks)++] = PQsocket(segdbDesc->conn);
 	}
 
-	return PGINVALID_SOCKET;
+	return fds;
 }
 
 /*
@@ -194,28 +212,30 @@ cdbdisp_getWaitSocketFd_async(struct CdbDispatcherState *ds)
 static void
 cdbdisp_waitDispatchFinish_async(struct CdbDispatcherState *ds)
 {
-	const static int DISPATCH_POLL_TIMEOUT = 500;
-	struct pollfd *fds;
-	int			nfds,
-				i;
 	CdbDispatchCmdAsync *pParms = (CdbDispatchCmdAsync *) ds->dispatchParams;
-	int			dispatchCount = pParms->dispatchCount;
+	int				dispatchCount = pParms->dispatchCount;
+	const static int DISPATCH_POLL_TIMEOUT = 500;
+	int			i;
 
-	fds = (struct pollfd *) palloc(dispatchCount * sizeof(struct pollfd));
+	/*
+	 * DispWaitSet's lifecycle is in the whole QD process,
+	 * so alloc it in the TopMemoryContext (rather than DispatcherContext)
+	 */
+	ResetWaitEventSet(&DispWaitSet, TopMemoryContext, dispatchCount);
 
+	WaitEvent 		*revents = palloc(sizeof(WaitEvent) * dispatchCount);
+	int 			*added = palloc0(sizeof(int) * dispatchCount);
 	while (true)
 	{
 		int			pollRet;
-
-		nfds = 0;
-		memset(fds, 0, dispatchCount * sizeof(struct pollfd));
+		bool		allFlushed = true;
 
 		for (i = 0; i < dispatchCount; i++)
 		{
 			CdbDispatchResult *qeResult = pParms->dispatchResultPtrArray[i];
 			SegmentDatabaseDescriptor *segdbDesc = qeResult->segdbDesc;
 			PGconn	   *conn = segdbDesc->conn;
-			int			ret;
+			int			ret = 0;
 
 			/* skip already completed connections */
 			if (conn->outCount == 0)
@@ -231,12 +251,16 @@ cdbdisp_waitDispatchFinish_async(struct CdbDispatcherState *ds)
 				continue;
 			else if (ret > 0)
 			{
-				int			sock = PQsocket(segdbDesc->conn);
+				/* add segment sock to the waitset */
+				if (!added[i])
+				{
+					int 	sock = PQsocket(conn);
+					Assert(sock >= 0);
+					AddWaitEventToSet(DispWaitSet, WL_SOCKET_WRITEABLE, sock, NULL, NULL);
+					added[i] = 1;
+				}
 
-				Assert(sock >= 0);
-				fds[nfds].fd = sock;
-				fds[nfds].events = POLLOUT;
-				nfds++;
+				allFlushed = false;
 			}
 			else if (ret < 0)
 			{
@@ -246,11 +270,11 @@ cdbdisp_waitDispatchFinish_async(struct CdbDispatcherState *ds)
 				qeResult->stillRunning = false;
 				ereport(ERROR,
 						(errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
-						 errmsg("Command could not be dispatch to segment %s: %s", qeResult->segdbDesc->whoami, msg ? msg : "unknown error")));
+						errmsg("Command could not be dispatch to segment %s: %s", qeResult->segdbDesc->whoami, msg ? msg : "unknown error")));
 			}
 		}
 
-		if (nfds == 0)
+		if (allFlushed)
 			break;
 
 		/* guarantee poll() is interruptible */
@@ -258,17 +282,15 @@ cdbdisp_waitDispatchFinish_async(struct CdbDispatcherState *ds)
 		{
 			CHECK_FOR_INTERRUPTS();
 
-			pollRet = poll(fds, nfds, DISPATCH_POLL_TIMEOUT);
+			pollRet = WaitEventSetWait(DispWaitSet, DISPATCH_POLL_TIMEOUT, revents, dispatchCount, WAIT_EVENT_DISP_FINISH);
+			Assert(pollRet >= 0);
 			if (pollRet == 0)
 				ELOG_DISPATCHER_DEBUG("cdbdisp_waitDispatchFinish_async(): Dispatch poll timeout after %d ms", DISPATCH_POLL_TIMEOUT);
 		}
-		while (pollRet == 0 || (pollRet < 0 && (SOCK_ERRNO == EINTR || SOCK_ERRNO == EAGAIN)));
-
-		if (pollRet < 0)
-			elog(ERROR, "Poll failed during dispatch");
+		while (pollRet == 0);
 	}
-
-	pfree(fds);
+	pfree(revents);
+	pfree(added);
 }
 
 /*
@@ -312,6 +334,57 @@ cdbdisp_dispatchToGang_async(struct CdbDispatcherState *ds,
 }
 
 /*
+ * Check the specified acknowledge messages from QEs.
+ *
+ * Check all dispatch connections to get expected acknowledge message.
+ * Return true if all required QEs' acknowledge messages have been received.
+ *
+ * message: specifies the expected ACK message to check.
+ * timeout_sec: the second that the dispatcher waits for the ack messages at most.
+ *              0 means checking immediately, and -1 means waiting until all ack
+ *              messages are received.
+ */
+static bool
+cdbdisp_checkAckMessage_async(struct CdbDispatcherState *ds, const char *message,
+							  int timeout_sec)
+{
+	DispatchWaitMode prevWaitMode;
+	CdbDispatchCmdAsync *pParms;
+	bool receivedAll = true;
+
+	Assert(ds);
+
+	pParms = (CdbDispatchCmdAsync *) ds->dispatchParams;
+	/* If cdbdisp_destroyDispatcherState is called */
+	if (pParms == NULL || message == NULL)
+		return false;
+
+	pParms->ackMessage = message;
+	prevWaitMode = pParms->waitMode;
+	pParms->waitMode = DISPATCH_WAIT_ACK_ROOT;
+
+	for (int i = 0; i < pParms->dispatchCount; i++)
+		pParms->dispatchResultPtrArray[i]->receivedAckMsg = false;
+
+	checkDispatchResult(ds, timeout_sec);
+
+	for (int i = 0; i < pParms->dispatchCount; i++)
+	{
+		if (!pParms->dispatchResultPtrArray[i]->receivedAckMsg &&
+			pParms->dispatchResultPtrArray[i]->stillRunning)
+		{
+			receivedAll = false;
+			break;
+		}
+	}
+
+	pParms->waitMode = prevWaitMode;
+	pParms->ackMessage = NULL;
+
+	return receivedAll;
+}
+
+/*
  * Check dispatch result.
  *
  * Wait all dispatch work to complete, either success or fail.
@@ -335,16 +408,7 @@ cdbdisp_checkDispatchResult_async(struct CdbDispatcherState *ds,
 	if (waitMode != DISPATCH_WAIT_NONE)
 		pParms->waitMode = waitMode;
 
-	checkDispatchResult(ds, true);
-
-	/*
-	 * It looks like everything went fine, make sure we don't miss a user
-	 * cancellation?
-	 *
-	 * The waitMode argument is NONE when we are doing "normal work".
-	 */
-	if (waitMode == DISPATCH_WAIT_NONE || waitMode == DISPATCH_WAIT_FINISH)
-		CHECK_FOR_INTERRUPTS();
+	checkDispatchResult(ds, DISPATCH_WAIT_UNTIL_FINISH);
 }
 
 /*
@@ -365,6 +429,7 @@ cdbdisp_makeDispatchParams_async(int maxSlices, int largestGangSize, char *query
 	pParms->dispatchResultPtrArray = (CdbDispatchResult **) palloc0(size);
 	pParms->dispatchCount = 0;
 	pParms->waitMode = DISPATCH_WAIT_NONE;
+	pParms->ackMessage = NULL;
 	pParms->query_text = queryText;
 	pParms->query_text_len = len;
 
@@ -373,40 +438,40 @@ cdbdisp_makeDispatchParams_async(int maxSlices, int largestGangSize, char *query
 
 /*
  * Receive and process results from all running QEs.
- *
- * wait: true, wait until all dispatch works are completed.
- *       false, return immediate when there's no more data.
- *
- * Don't throw out error, instead, append the error message to
- * CdbDispatchResult.error_message.
+ * timeout_sec: the second that the dispatcher waits for the ack messages at most.
+ *              DISPATCH_NO_WAIT(0): return immediate when there's no more data.
+ *              DISPATCH_WAIT_UNTIL_FINISH(-1): wait until all dispatch works are completed.
  */
 static void
-checkDispatchResult(CdbDispatcherState *ds,
-					bool wait)
+checkDispatchResult(CdbDispatcherState *ds, int timeout_sec)
 {
+	int			i;
+	int			timeout = 0;
+	bool		sentSignal = false;
+	uint8 ftsVersion = 0;
+	struct timeval start_ts, now;
+	int64		diff_us;
+
 	CdbDispatchCmdAsync *pParms = (CdbDispatchCmdAsync *) ds->dispatchParams;
 	CdbDispatchResults *meleeResults = ds->primaryResults;
 	SegmentDatabaseDescriptor *segdbDesc;
 	CdbDispatchResult *dispatchResult;
-	int			i;
-	int			db_count = 0;
-	int			timeout = 0;
-	bool		sentSignal = false;
-	struct pollfd *fds;
-	uint8 ftsVersion = 0;
 
-	db_count = pParms->dispatchCount;
-	fds = (struct pollfd *) palloc(db_count * sizeof(struct pollfd));
+	int 	db_count = pParms->dispatchCount;
+	ResetWaitEventSet(&DispWaitSet, TopMemoryContext, db_count);
+	int 	*added = palloc0(db_count * sizeof(int));
+	WaitEvent *revents = palloc(sizeof(WaitEvent) * db_count);
 
 	/*
 	 * OK, we are finished submitting the command to the segdbs. Now, we have
 	 * to wait for them to finish.
 	 */
+	gettimeofday(&start_ts, NULL);
 	for (;;)
 	{
-		int			sock;
 		int			n;
 		int			nfds = 0;
+		int			ack_count = 0;
 		PGconn		*conn;
 
 		/*
@@ -417,11 +482,17 @@ checkDispatchResult(CdbDispatcherState *ds,
 			break;
 
 		/*
-		 * escalate waitMode to cancel if: - user interrupt has occurred, - or
-		 * an error has been reported by any QE, - in case the caller wants
-		 * cancelOnError
+		 * Current loop might last for the long time so check on interrupts.
 		 */
-		if ((InterruptPending || meleeResults->errcode) && meleeResults->cancelOnError)
+		CHECK_FOR_INTERRUPTS();
+
+		/*
+		 * escalate waitMode to cancel if:
+		 * - user cancel request has occurred,
+		 * - or an error has been reported by any QE,
+		 * - in case the caller wants cancelOnError
+		 */
+		if ((CancelRequested() || meleeResults->errcode) && meleeResults->cancelOnError)
 			pParms->waitMode = DISPATCH_WAIT_CANCEL;
 
 		/*
@@ -432,6 +503,13 @@ checkDispatchResult(CdbDispatcherState *ds,
 			dispatchResult = pParms->dispatchResultPtrArray[i];
 			segdbDesc = dispatchResult->segdbDesc;
 			conn = segdbDesc->conn;
+
+			if (pParms->waitMode == DISPATCH_WAIT_ACK_ROOT &&
+				checkAckMessage(dispatchResult, pParms->ackMessage))
+			{
+				ack_count++;
+				continue;
+			}
 
 			/*
 			 * Already finished with this QE?
@@ -457,20 +535,65 @@ checkDispatchResult(CdbDispatcherState *ds,
 						 segdbDesc->whoami, PQerrorMessage(conn));
 			}
 
+#ifdef FAULT_INJECTOR
+			/* inject invalid sock to simulate an pqFlush() error */
+			static int saved_sock = -1;
+			if (FaultInjector_InjectFaultIfSet("inject_invalid_sock_for_checkDispatchResult",
+						DDLNotSpecified,
+						"" /* databaseName */,
+						"" /* tableName */) == FaultInjectorTypeSkip)
+			{
+				if (i == 0 && saved_sock == -1)
+				{
+					saved_sock = conn->sock;
+					conn->sock = -1;
+					strlcpy(conn->errorMessage.data, "inject invalid sock\n", conn->errorMessage.maxlen);
+					conn->errorMessage.len = strlen(conn->errorMessage.data);
+					i--;
+				}
+			}
+#endif
+
 			/*
-			 * Add socket to fd_set if still connected.
+			 * When the connection was broken, the previous pqFlush() set:
+			 * 			sock = -1 and status = CONNECTION_BAD
+			 * it will cause an infinite hang when poll() it later, so need to skip it here
 			 */
-			sock = PQsocket(conn);
-			Assert(sock >= 0);
-			fds[nfds].fd = sock;
-			fds[nfds].events = POLLIN;
+			if (cdbconn_isBadConnection(segdbDesc))
+			{
+				elog(WARNING, "Connection (%s) is broken, PQerrorMessage:%s",
+					segdbDesc->whoami, PQerrorMessage(conn));
+				dispatchResult->stillRunning = false;
+#ifdef FAULT_INJECTOR
+				/* restore the saved sock */
+				if (i == -1)
+				{
+					conn->sock = saved_sock;
+					conn->errorMessage.data[0] = '\0';
+					conn->errorMessage.len = 0;
+					dispatchResult->stillRunning = true;
+				}
+#endif
+				continue;
+			}
+
+			/* add segment sock to the waitset */
+			if (!added[i])
+			{
+				int 	sock = PQsocket(conn);
+				long 	ev_userdata = i; /* the index "i" as the event's userdata */
+				Assert(sock >= 0);
+				AddWaitEventToSet(DispWaitSet, WL_SOCKET_READABLE, sock, NULL, (void *)ev_userdata);
+				added[i] = 1;
+			}
 			nfds++;
 		}
 
 		/*
-		 * Break out when no QEs still running.
+		 * Break out when no QEs still running or required QEs acked.
 		 */
-		if (nfds <= 0)
+		if (nfds <= 0 ||
+			(pParms->waitMode == DISPATCH_WAIT_ACK_ROOT && ack_count == ds->rootGangSize))
 			break;
 
 		/*
@@ -481,14 +604,16 @@ checkDispatchResult(CdbDispatcherState *ds,
 		 *
 		 * Lower the timeout if: - we need send signal to QEs.
 		 */
-		if (!wait)
+		if (timeout_sec == 0)
 			timeout = 0;
-		else if (pParms->waitMode == DISPATCH_WAIT_NONE || sentSignal)
+		else if (pParms->waitMode == DISPATCH_WAIT_NONE ||
+				 pParms->waitMode == DISPATCH_WAIT_ACK_ROOT ||
+				 sentSignal)
 			timeout = DISPATCH_WAIT_TIMEOUT_MSEC;
 		else
 			timeout = DISPATCH_WAIT_CANCEL_TIMEOUT_MSEC;
 
-		n = poll(fds, nfds, timeout);
+		n = WaitEventSetWait(DispWaitSet, timeout, revents, db_count, WAIT_EVENT_DISP_RESULT);
 
 		/*
 		 * poll returns with an error, including one due to an interrupted
@@ -513,19 +638,24 @@ checkDispatchResult(CdbDispatcherState *ds,
 			FtsNotifyProber();
 			checkSegmentAlive(pParms);
 
-			if (pParms->waitMode != DISPATCH_WAIT_NONE)
+			if (pParms->waitMode != DISPATCH_WAIT_NONE &&
+				pParms->waitMode != DISPATCH_WAIT_ACK_ROOT)
 			{
 				signalQEs(pParms);
 				sentSignal = true;
 			}
 
-			if (!wait)
+			gettimeofday(&now, NULL);
+			diff_us = (now.tv_sec - start_ts.tv_sec) * 1000000;
+			diff_us += (int) now.tv_usec - (int) start_ts.tv_usec;
+			if (timeout_sec >= 0 && diff_us >= timeout_sec * 1000000L)
 				break;
 		}
 		/* If the time limit expires, poll() returns 0 */
 		else if (n == 0)
 		{
-			if (pParms->waitMode != DISPATCH_WAIT_NONE)
+			if (pParms->waitMode != DISPATCH_WAIT_NONE &&
+				pParms->waitMode != DISPATCH_WAIT_ACK_ROOT)
 			{
 				signalQEs(pParms);
 				sentSignal = true;
@@ -544,15 +674,19 @@ checkDispatchResult(CdbDispatcherState *ds,
 				checkSegmentAlive(pParms);
 			}
 
-			if (!wait)
+			gettimeofday(&now, NULL);
+			diff_us = (now.tv_sec - start_ts.tv_sec) * 1000000;
+			diff_us += (int) now.tv_usec - (int) start_ts.tv_usec;
+			if (timeout_sec >= 0 && diff_us >= timeout_sec * 1000000L)
 				break;
 		}
 		/* We have data waiting on one or more of the connections. */
 		else
-			handlePollSuccess(pParms, fds);
-	}
+			handlePollSuccess(pParms, revents, n);
+	} /* for (;;) */
 
-	pfree(fds);
+	pfree(revents);
+	pfree(added);
 }
 
 /*
@@ -606,6 +740,38 @@ dispatchCommand(CdbDispatchResult *dispatchResult,
 }
 
 /*
+ * Helper function to check whether specified acknowledge message has been
+ * received.
+ *
+ * Check whether the current required acknowledge message is already received
+ * in the ackPGNotifies queue.
+ */
+static bool
+checkAckMessage(CdbDispatchResult *dispatchResult, const char *message)
+{
+	bool received = false;
+	PGnotify* ackNotifies = (PGnotify *) dispatchResult->ackPGNotifies;
+
+	if (!message)
+		elog(ERROR, "Notify ACK message is required.");
+
+	if (dispatchResult->receivedAckMsg)
+		return true;
+
+	while (ackNotifies)
+	{
+		if (strcmp(ackNotifies->extra, message) == 0)
+		{
+			received = true;
+			dispatchResult->receivedAckMsg = true;
+			break;
+		}
+		ackNotifies = ackNotifies->next;
+	}
+	return received;
+}
+
+/*
  * Helper function to checkDispatchResult that handles errors that occur
  * during the poll() call.
  *
@@ -623,6 +789,10 @@ handlePollError(CdbDispatchCmdAsync *pParms)
 
 		/* Skip if already finished or didn't dispatch. */
 		if (!dispatchResult->stillRunning)
+			continue;
+
+		if (pParms->waitMode == DISPATCH_WAIT_ACK_ROOT &&
+				 dispatchResult->receivedAckMsg)
 			continue;
 
 		/* We're done with this QE, sadly. */
@@ -656,19 +826,19 @@ handlePollError(CdbDispatchCmdAsync *pParms)
  */
 static void
 handlePollSuccess(CdbDispatchCmdAsync *pParms,
-				  struct pollfd *fds)
+				  WaitEvent *revents, int nready)
 {
-	int			currentFdNumber = 0;
 	int			i = 0;
 
 	/*
 	 * We have data waiting on one or more of the connections.
 	 */
-	for (i = 0; i < pParms->dispatchCount; i++)
+	for (i = 0; i < nready; i++)
 	{
+		long pos = (long)(revents[i].user_data); /* original position */
 		bool		finished;
 		int			sock;
-		CdbDispatchResult *dispatchResult = pParms->dispatchResultPtrArray[i];
+		CdbDispatchResult *dispatchResult = pParms->dispatchResultPtrArray[pos];
 		SegmentDatabaseDescriptor *segdbDesc = dispatchResult->segdbDesc;
 
 		/*
@@ -677,21 +847,25 @@ handlePollSuccess(CdbDispatchCmdAsync *pParms,
 		if (!dispatchResult->stillRunning)
 			continue;
 
-		ELOG_DISPATCHER_DEBUG("looking for results from %d of %d (%s)",
-							  i + 1, pParms->dispatchCount, segdbDesc->whoami);
+		if (pParms->waitMode == DISPATCH_WAIT_ACK_ROOT &&
+				 dispatchResult->receivedAckMsg)
+			continue;
+
+		ELOG_DISPATCHER_DEBUG("looking for results from %ld of %d (%s)",
+							  pos + 1, pParms->dispatchCount, segdbDesc->whoami);
 
 		sock = PQsocket(segdbDesc->conn);
 		Assert(sock >= 0);
-		Assert(sock == fds[currentFdNumber].fd);
+		Assert(sock == revents[i].fd);
 
 		/*
 		 * Skip this connection if it has no input available.
-		 */
 		if (!(fds[currentFdNumber++].revents & POLLIN))
 			continue;
+		 */
 
-		ELOG_DISPATCHER_DEBUG("PQsocket says there are results from %d of %d (%s)",
-							  i + 1, pParms->dispatchCount, segdbDesc->whoami);
+		ELOG_DISPATCHER_DEBUG("PQsocket says there are results from %ld of %d (%s)",
+							  pos + 1, pParms->dispatchCount, segdbDesc->whoami);
 
 		/*
 		 * Receive and process results from this QE.
@@ -705,8 +879,8 @@ handlePollSuccess(CdbDispatchCmdAsync *pParms,
 		{
 			dispatchResult->stillRunning = false;
 
-			ELOG_DISPATCHER_DEBUG("processResults says we are finished with %d of %d (%s)",
-								  i + 1, pParms->dispatchCount, segdbDesc->whoami);
+			ELOG_DISPATCHER_DEBUG("processResults says we are finished with %ld of %d (%s)",
+								  pos + 1, pParms->dispatchCount, segdbDesc->whoami);
 
 			if (DEBUG1 >= log_min_messages)
 			{
@@ -716,18 +890,19 @@ handlePollSuccess(CdbDispatchCmdAsync *pParms,
 				{
 					case 1:
 					case 2:
-						elog(LOG, "duration to dispatch result received from %d (seg %d): %s ms",
-							 i + 1, dispatchResult->segdbDesc->segindex, msec_str);
+						elog(LOG, "duration to dispatch result received from %ld (seg %d): %s ms",
+							 pos + 1, dispatchResult->segdbDesc->segindex, msec_str);
 						break;
 				}
 			}
 
 			if (PQisBusy(dispatchResult->segdbDesc->conn))
-				elog(LOG, "We thought we were done, because finished==true, but libpq says we are still busy");
+				elog(DEBUG1, "did not receive query results on libpq connection %s",
+					 dispatchResult->segdbDesc->whoami);
 		}
 		else
-			ELOG_DISPATCHER_DEBUG("processResults says we have more to do with %d of %d (%s)",
-								  i + 1, pParms->dispatchCount, segdbDesc->whoami);
+			ELOG_DISPATCHER_DEBUG("processResults says we have more to do with %ld of %d (%s)",
+								  pos + 1, pParms->dispatchCount, segdbDesc->whoami);
 	}
 }
 
@@ -756,6 +931,8 @@ signalQEs(CdbDispatchCmdAsync *pParms)
 
 		if (!dispatchResult->stillRunning ||
 			dispatchResult->wasCanceled ||
+			(pParms->waitMode == DISPATCH_WAIT_ACK_ROOT &&
+			 dispatchResult->receivedAckMsg) ||
 			cdbconn_isBadConnection(segdbDesc))
 			continue;
 
@@ -963,7 +1140,7 @@ processResults(CdbDispatchResult *dispatchResult)
 				dispatchResult->numrowsrejected += pRes->numRejected;
 
 			/*
-			 * COPY FROM ON SEGMENT - get the number of rows completed by QE
+			 * COPY FROM - get the number of rows completed by QE
 			 * if any
 			 */
 			if (pRes->numCompleted > 0)
@@ -1008,49 +1185,69 @@ processResults(CdbDispatchResult *dispatchResult)
 
 	forwardQENotices();
 
-	/*
-	 * If there was nextval request then respond back on this libpq connection
-	 * with the next value. Check and process nextval message only if QD has not
-	 * already hit the error. Since QD could have hit the error while processing
-	 * the previous nextval_qd() request itself and since full error handling is
-	 * not complete yet like releasing all the locks, etc.., shouldn't attempt
-	 * to call nextval_qd() again.
-	 */
-	PGnotify *nextval = PQnotifies(segdbDesc->conn);
-	if ((elog_geterrcode() == 0) && nextval &&
-		strcmp(nextval->relname, "nextval") == 0)
+	PGnotify *qnotifies = PQnotifies(segdbDesc->conn);
+	while(qnotifies && elog_geterrcode() == 0)
 	{
-		int64 last;
-		int64 cached;
-		int64 increment;
-		bool overflow;
-		int dbid;
-		int seq_oid;
-
-		if (sscanf(nextval->extra, "%d:%d", &dbid, &seq_oid) != 2)
-			elog(ERROR, "invalid nextval message");
-
-		if (dbid != MyDatabaseId)
-			elog(ERROR, "nextval message database id:%d doesn't match my database id:%d",
-				 dbid, MyDatabaseId);
-
-		PG_TRY();
+		if (strcmp(qnotifies->relname, CDB_NOTIFY_NEXTVAL) == 0)
 		{
-			nextval_qd(seq_oid, &last, &cached, &increment, &overflow);
+			/*
+			 * If there was nextval request then respond back on this libpq
+			 * connection with the next value. Check and process nextval
+			 * message only if QD has not already hit the error. Since QD could
+			 * have hit the error while processing the previous nextval_qd()
+			 * request itself and since full error handling is not complete yet
+			 * (ex: releasing all the locks, etc.), shouldn't attempt to call
+			 * nextval_qd() again.
+			 */
+
+			CHECK_FOR_INTERRUPTS();
+
+			int64 last;
+			int64 cached;
+			int64 increment;
+			bool overflow;
+			Oid dbid;
+			Oid seq_oid;
+
+			if (sscanf(qnotifies->extra, "%u:%u", &dbid, &seq_oid) != 2)
+				elog(ERROR, "invalid nextval message");
+
+			if (dbid != MyDatabaseId)
+				elog(ERROR, "nextval message database id:%u doesn't match my database id:%u",
+					 dbid, MyDatabaseId);
+
+			PG_TRY();
+			{
+				nextval_qd(seq_oid, &last, &cached, &increment, &overflow);
+			}
+			PG_CATCH();
+			{
+				send_sequence_response(segdbDesc->conn, seq_oid, last, cached, increment, overflow, true /* error */);
+				PG_RE_THROW();
+			}
+			PG_END_TRY();
+			/* respond back on this libpq connection with the next value */
+			send_sequence_response(segdbDesc->conn, seq_oid, last, cached, increment, overflow, false /* error */);
 		}
-		PG_CATCH();
+		else if (strcmp(qnotifies->relname, CDB_NOTIFY_ENDPOINT_ACK) == 0)
 		{
-			send_sequence_response(segdbDesc->conn, seq_oid, last, cached, increment, overflow, true /* error */);
-			PG_RE_THROW();
+			qnotifies->next = (struct pgNotify *) dispatchResult->ackPGNotifies;
+			dispatchResult->ackPGNotifies = (struct PGnotify *) qnotifies;
+
+			/* Don't free the notify here since it in queue now */
+			qnotifies = NULL;
 		}
-		PG_END_TRY();
-		/*
-		 * respond back on this libpq connection with the next value
-		 */
-		send_sequence_response(segdbDesc->conn, seq_oid, last, cached, increment, overflow, false /* error */);
+		else
+		{
+			/* Got an unknown PGnotify, just record it in log */
+			if (qnotifies->relname)
+				elog(LOG, "got an unknown notify message : %s", qnotifies->relname);
+		}
+
+		if (qnotifies)
+			PQfreemem(qnotifies);
+		qnotifies = PQnotifies(segdbDesc->conn);
 	}
-	if (nextval)
-		PQfreemem(nextval);
 
 	forwardQENotices();
 

@@ -5,7 +5,7 @@
  *    execution.  This is, essentially, an extension of the file
  *    optimizer/plan/planner.c, although some functions are not
  *    externalized.
-
+ *
  *
  * The general shape of the generated plan is similar to the parallel
  * aggregation plans in upstream:
@@ -64,10 +64,14 @@
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
 #include "optimizer/tlist.h"
+#include "optimizer/planner.h"
 #include "parser/parse_clause.h"
 #include "parser/parse_oper.h"
 #include "utils/lsyscache.h"
 #include "utils/selfuncs.h"
+#include "foreign/fdwapi.h"
+
+# define FOUND_DQA_EXPR		-1
 
 typedef enum
 {
@@ -84,10 +88,17 @@ typedef enum
  */
 typedef struct
 {
+	/* From the Query */
+	bool		hasAggs;
+	List	   *groupClause;	/* a list of SortGroupClause's */
+	List	   *groupingSets;	/* a list of GroupingSet's if present */
+	List	   *group_tles;
+
 	/* Inputs from the caller */
-	DQAType     type;
-	List	   *havingQual;
+	List	   *havingQual;		/* qualifications applied to groups */
 	PathTarget *target;			/* targetlist of final aggregated result */
+	bool		can_sort;
+	bool		can_hash;
 	double		dNumGroupsTotal;		/* total number of groups in the result, across all QEs */
 	const AggClauseCosts *agg_costs;
 	const AggClauseCosts *agg_partial_costs;
@@ -96,13 +107,39 @@ typedef struct
 	List       *new_rollups;
 	AggStrategy strat;
 
-	List	   *group_tles;
-
 	PathTarget *partial_grouping_target;	/* targetlist of partially aggregated result */
 	List	   *final_groupClause;			/* SortGroupClause for final grouping */
 	List	   *final_group_tles;
-	List	   *final_group_input_pathkeys;	/* order of the input to (sorted) second stage */
-	List	   *final_group_pathkeys;		/* order of the result of sorted second stage */
+	Index		gsetid_sortref;
+
+	/*
+	 * Pathkeys representing GROUP BY.
+	 *
+	 * 'partial_needed_pathkeys' represents a sort order that's needed for
+	 * doing a sorted GroupAggregate in the first
+	 * stage. 'partial_sort_pathkey' is normally the same, but in case of
+	 * DISTINCT ON and ORDER BY it can include extra columns that are presentt
+	 * in the ORDER BY but not in DISTINCT ON. The idea is the needed_pathkeys
+	 * are sufficient to perform the grouping, but if we have to sort the
+	 * input, we sort using sort_pathkeys. By including the extra columns in
+	 * the Sort we can avoid sorting the data again later to satisfy the ORDER
+	 * BY.
+	 *
+	 * 'final_needed_pathkeys' is the sort order needed to perform the 2nd
+	 * stage by sorted GroupAggregate.  In normal GROUP BY it is the same as
+	 * 'partial_needed_pathkeys', but if there are GROUPING SETS,
+	 * 'final_needed_pathkeys' includes the internal GROUPINGSET_ID()
+	 * expression, used to distinguish the rolled up rows. And
+	 * 'final_sort_pathkeys' is the same, but might include extra ORDER BY
+	 * columns.
+	 *
+	 */
+	List	   *partial_needed_pathkeys;
+	List	   *partial_sort_pathkeys;
+	List	   *final_needed_pathkeys;
+	List	   *final_sort_pathkeys;
+
+	DQAType     type;
 
 	/*
 	 * partial_rel holds the partially aggregated results from the first stage.
@@ -124,19 +161,25 @@ typedef struct
 	List        *dqa_expr_lst;          /* DQAExpr list */
 	double		 dNumDistinctGroups;	/* # of distinct combinations of GROUP BY and DISTINCT exprs */
 
-} cdb_multi_dqas_info;
+} cdb_dqas_info;
 
-static List *get_common_group_tles(PathTarget *target,
-								   List *groupClause,
-								   List *rollups);
+typedef struct
+{
+	PathTarget *proj_target;            /* targetlist of subpath */
+	List	   *dqa_expr_lst;           /* DQAExpr lists */
+	Index	   *maxRef;                  /* may inplace modify during pull_dqa_expr_walker */
+	DQAExpr    *dqa;                    /* result DQAExpr */
+	Bitmapset  *bms;                    /* those vars needed projection affiliated with DQAExpr*/
+} dqa_expr_context;
+
+static void create_two_stage_paths(PlannerInfo *root, cdb_agg_planning_context *ctx,
+								   RelOptInfo *input_rel, RelOptInfo *output_rel, GroupPathExtraData *extra);
 static List *get_all_rollup_groupclauses(List *rollups);
-static CdbPathLocus choose_grouping_locus(PlannerInfo *root, Path *path,
-										  List *group_tles,
-										  bool *need_redistribute_p);
 
 static Index add_gsetid_tlist(List *tlist);
 
 static SortGroupClause *create_gsetid_groupclause(Index groupref);
+static List *strip_gsetid_from_pathkeys(Index gsetid_sortref, List *pathkeys);
 
 static void add_first_stage_group_agg_path(PlannerInfo *root,
 										   Path *path,
@@ -164,27 +207,40 @@ static void add_single_dqa_hash_agg_path(PlannerInfo *root,
 static void add_single_mixed_dqa_hash_agg_path(PlannerInfo *root,
                                                Path *path,
                                                cdb_agg_planning_context *ctx,
-                                               RelOptInfo *output_rel,
-                                               PathTarget *input_target,
-                                               List       *dqa_group_clause);
+                                               cdb_dqas_info *info,
+                                               RelOptInfo *output_rel);
 static void
 add_multi_dqas_hash_agg_path(PlannerInfo *root,
 							 Path *path,
 							 cdb_agg_planning_context *ctx,
 							 RelOptInfo *output_rel,
-							 cdb_multi_dqas_info *info);
+							 cdb_dqas_info *info);
+
+static void
+add_multi_mixed_dqas_hash_agg_path(PlannerInfo *root,
+							 Path *path,
+							 cdb_agg_planning_context *ctx,
+							 RelOptInfo *output_rel,
+							 cdb_dqas_info *info);
 
 static void
 fetch_single_dqa_info(PlannerInfo *root,
 					  Path *path,
 					  cdb_agg_planning_context *ctx,
-					  cdb_multi_dqas_info *info);
+					  cdb_dqas_info *info);
+
+static void
+fetch_partial_target_info(cdb_agg_planning_context *ctx,
+						  cdb_dqas_info *info);
 
 static void
 fetch_multi_dqas_info(PlannerInfo *root,
 					  Path *path,
 					  cdb_agg_planning_context *ctx,
-					  cdb_multi_dqas_info *info);
+					  cdb_dqas_info *info);
+
+static bool
+check_multi_dqas_with_agg(cdb_agg_planning_context *ctx);
 
 static DQAType
 recognize_dqa_type(cdb_agg_planning_context *ctx);
@@ -192,37 +248,41 @@ recognize_dqa_type(cdb_agg_planning_context *ctx);
 static PathTarget *
 strip_aggdistinct(PathTarget *target);
 
+static bool
+is_normal_agg(Node *node);
+
 /*
- * Function: cdb_grouping_planner
+ * cdb_create_multistage_grouping_paths
  *
  * This is basically an extension of the function create_grouping_paths() from
  * planner.c.  It creates two- and three-stage Paths to implement aggregates
  * and/or GROUP BY.
  *
- * The caller already constructed a one-stage plan, we are only concerned
- * about more complicated multi-stage plans here.
+ * The caller already constructed Paths for one-stage plans, we are only
+ * concerned about more complicated multi-stage plans here.
  */
 void
-cdb_create_twostage_grouping_paths(PlannerInfo *root,
+cdb_create_multistage_grouping_paths(PlannerInfo *root,
 								   RelOptInfo *input_rel,
 								   RelOptInfo *output_rel,
 								   PathTarget *target,
 								   PathTarget *partial_grouping_target,
 								   List *havingQual,
-								   bool can_sort,
-								   bool can_hash,
 								   double dNumGroupsTotal,
 								   const AggClauseCosts *agg_costs,
 								   const AggClauseCosts *agg_partial_costs,
 								   const AggClauseCosts *agg_final_costs,
 								   List *rollups,
 								   List *new_rollups,
-								   AggStrategy strat)
+								   AggStrategy strat,
+								   GroupPathExtraData *extra)
 {
 	Query	   *parse = root->parse;
 	Path	   *cheapest_path = input_rel->cheapest_total_path;
 	bool		has_ordered_aggs = agg_costs->numPureOrderedAggs > 0;
 	cdb_agg_planning_context ctx;
+	bool		can_sort;
+	bool		can_hash;
 
 	/* The caller should've checked these already */
 	Assert(parse->hasAggs || parse->groupClause);
@@ -251,11 +311,22 @@ cdb_create_twostage_grouping_paths(PlannerInfo *root,
 		return;
 
 	/*
+	 * Is the input hashable / sortable? This is largely the same logic as in
+	 * upstream create_grouping_paths(), but we can do hashing in limited ways
+	 * even if there are DISTINCT aggs or grouping sets.
+	 */
+	can_sort = grouping_is_sortable(parse->groupClause);
+	can_hash = (parse->groupClause != NIL &&
+				agg_costs->numPureOrderedAggs == 0 &&
+				grouping_is_hashable(parse->groupClause));
+
+	/*
 	 * Prepare a struct to hold the arguments and intermediate results
 	 * across subroutines.
 	 */
 	memset(&ctx, 0, sizeof(ctx));
-	ctx.havingQual = havingQual;
+	ctx.can_sort = can_sort;
+	ctx.can_hash = can_hash;
 	ctx.target = target;
 	ctx.dNumGroupsTotal = dNumGroupsTotal;
 	ctx.agg_costs = agg_costs;
@@ -265,6 +336,11 @@ cdb_create_twostage_grouping_paths(PlannerInfo *root,
 	ctx.new_rollups = new_rollups;
 	ctx.strat = strat;
 
+	ctx.hasAggs = parse->hasAggs;
+	ctx.groupClause = parse->groupClause;
+	ctx.groupingSets = parse->groupingSets;
+	ctx.havingQual = havingQual;
+	ctx.partial_rel = fetch_upper_rel(root, UPPERREL_CDB_FIRST_STAGE_GROUP_AGG, NULL);
 	/* create a partial rel similar to make_grouping_rel() */
 	if (IS_OTHER_REL(input_rel))
 	{
@@ -277,6 +353,8 @@ cdb_create_twostage_grouping_paths(PlannerInfo *root,
 		ctx.partial_rel = fetch_upper_rel(root, UPPERREL_CDB_FIRST_STAGE_GROUP_AGG,
 										  NULL);
 	}
+	ctx.partial_needed_pathkeys = root->group_pathkeys;
+	ctx.partial_sort_pathkeys = root->group_pathkeys;
 
 	ctx.group_tles = get_common_group_tles(target,
 										   parse->groupClause,
@@ -337,166 +415,59 @@ cdb_create_twostage_grouping_paths(PlannerInfo *root,
 	 */
 	if (parse->groupingSets)
 	{
-		Index		groupref;
 		GroupingSetId *gsetid;
 		List	   *grouping_sets_tlist;
 		SortGroupClause *gsetcl;
 		List	   *gcls;
 		List	   *tlist;
-		List	   *pl;
-
-		/* GPDB_12_MERGE_FIXME: For now, bail out if there are any unsortable
-		 * refs. PostgreSQL supports hashing with grouping sets nowadays, but
-		 * the code in this file hasn't been updated to deal with it yet.
-		 */
-		ListCell   *lc;
-		foreach(lc, parse->groupClause)
-		{
-			SortGroupClause *gc = lfirst_node(SortGroupClause, lc);
-
-			if (!OidIsValid(gc->sortop))
-				return;
-		}
 
 		gsetid = makeNode(GroupingSetId);
 		grouping_sets_tlist = copyObject(root->processed_tlist);
-		groupref = add_gsetid_tlist(grouping_sets_tlist);
+		ctx.gsetid_sortref = add_gsetid_tlist(grouping_sets_tlist);
 
-		gsetcl = create_gsetid_groupclause(groupref);
+		gsetcl = create_gsetid_groupclause(ctx.gsetid_sortref);
 
 		ctx.final_groupClause = lappend(copyObject(parse->groupClause), gsetcl);
 
 		ctx.partial_grouping_target = copyObject(partial_grouping_target);
 		if (!list_member(ctx.partial_grouping_target->exprs, gsetid))
 			add_column_to_pathtarget(ctx.partial_grouping_target,
-									 (Expr *) gsetid, groupref);
+									 (Expr *) gsetid, ctx.gsetid_sortref);
 
 		gcls = get_all_rollup_groupclauses(rollups);
+		gcls = lappend(gcls, gsetcl);
 		tlist = make_tlist_from_pathtarget(ctx.partial_grouping_target);
 
-		/* The final result will be sorted by this */
-		ctx.final_group_pathkeys = make_pathkeys_for_sortclauses(root, gcls, tlist);
-
 		/*
-		 * The input to the second-stage sorted Agg has GROUPINGSET_ID() as the last
-		 * sort key. It is not present in the final Agg result.
+		 * The input to the final stage will be sorted by this. It includes the
+		 * GROUPINGSET_ID() column.
 		 */
-		pl = make_pathkeys_for_sortclauses(root, list_make1(gsetcl), tlist);
-		ctx.final_group_input_pathkeys = list_concat(list_copy(ctx.final_group_pathkeys), pl);
+		ctx.final_needed_pathkeys = make_pathkeys_for_sortclauses(root, gcls, tlist);
 	}
 	else
 	{
 		ctx.partial_grouping_target = partial_grouping_target;
 		ctx.final_groupClause = parse->groupClause;
-		ctx.final_group_input_pathkeys = root->group_pathkeys;
-		ctx.final_group_pathkeys = root->group_pathkeys;
+		ctx.final_needed_pathkeys = root->group_pathkeys;
+		ctx.gsetid_sortref = 0;
 	}
+	ctx.final_sort_pathkeys = ctx.final_needed_pathkeys;
 	ctx.final_group_tles = get_common_group_tles(ctx.partial_grouping_target,
 												 ctx.final_groupClause,
 												 NIL);
 	ctx.partial_rel->reltarget = ctx.partial_grouping_target;
 
 	/*
-	 * Consider ways to do the first Aggregate stage.
-	 *
-	 * The first stage's output is Partially Aggregated. The paths are
-	 * collected to the ctx->partial_rel, by calling add_path(). We do *not*
-	 * use add_partial_path(), these partially aggregated paths are considered
-	 * more like MPP paths in Greenplum in general.
-	 *
-	 * First consider sorted Aggregate paths.
+	 * All set, generate the two-stage paths.
 	 */
-	if (can_sort)
-	{
-		ListCell   *lc;
-
-		foreach(lc, input_rel->pathlist)
-		{
-			Path	   *path = (Path *) lfirst(lc);
-			bool		is_sorted;
-
-			/*
-			 * If the input is neatly distributed along the GROUP BY columns,
-			 * there's no point in a two-stage plan. The code in planner.c
-			 * already created the straightforward one-stage plan.
-			 */
-			if (cdbpathlocus_collocates_tlist(root, path->locus, ctx.group_tles))
-				continue;
-
-			/*
-			 * Consider input paths that are already sorted, and the one with
-			 * the lowest total cost.
-			 */
-			is_sorted = pathkeys_contained_in(root->group_pathkeys,
-											  path->pathkeys);
-			if (path == cheapest_path || is_sorted)
-				add_first_stage_group_agg_path(root, path, is_sorted, &ctx);
-		}
-	}
-
-	/*
-	 * Consider Hash Aggregate over the cheapest input path.
-	 *
-	 * Hashing is not possible with DQAs.
-	 */
-	if (can_hash &&
-		list_length(agg_costs->distinctAggrefs) == 0)
-	{
-		/*
-		 * If the input is neatly distributed along the GROUP BY columns,
-		 * there's no point in a two-stage plan. The code in planner.c already
-		 * created the straightforward one-stage plan.
-		 */
-		if (!cdbpathlocus_collocates_tlist(root, cheapest_path->locus, ctx.group_tles))
-			add_first_stage_hash_agg_path(root, cheapest_path, &ctx);
-	}
-
-	/*
-	 * We now have partially aggregated paths in ctx->partial_rel. Consider
-	 * different ways of performing the Finalize Aggregate stage.
-	 */
-	if (ctx.partial_rel->pathlist)
-	{
-		Path	   *cheapest_first_stage_path;
-
-		set_cheapest(ctx.partial_rel);
-		cheapest_first_stage_path = ctx.partial_rel->cheapest_total_path;
-		if (can_sort)
-		{
-			ListCell   *lc;
-
-			foreach(lc, ctx.partial_rel->pathlist)
-			{
-				Path	   *path = (Path *) lfirst(lc);
-				bool		is_sorted;
-
-				/*
-				 * In two-stage GROUPING SETS paths, the second stage's grouping
-				 * will include GROUPINGSET_ID(), which is not included in
-				 * root->pathkeys. The first stage's sort order does not include
-				 * that, so we know it's not sorted.
-				 */
-				if (!parse->groupingSets)
-					is_sorted = pathkeys_contained_in(root->group_pathkeys,
-													  path->pathkeys);
-				else
-					is_sorted = false;
-				if (path == cheapest_first_stage_path || is_sorted)
-					add_second_stage_group_agg_path(root, path, is_sorted,
-													&ctx, output_rel);
-			}
-		}
-
-		if (can_hash && list_length(agg_costs->distinctAggrefs) == 0)
-			add_second_stage_hash_agg_path(root, cheapest_first_stage_path,
-										   &ctx, output_rel);
-	}
+	create_two_stage_paths(root, &ctx, input_rel, output_rel, extra);
 
 	/*
 	 * Aggregates with DISTINCT arguments are more complicated, and are not
-	 * handled above (except for the case of a single DQA that happens to
-	 * be collocated with the input, see add_first_stage_group_agg_path()).
-	 * Consider ways to implement them, too.
+	 * handled by create_two_stage_paths() (except for the case of a single
+	 * DQA that happens to be collocated with the input, see
+	 * add_first_stage_group_agg_path()). Consider ways to implement them,
+	 * too.
 	 */
 	if ((can_hash || parse->groupClause == NIL) &&
 		!parse->groupingSets &&
@@ -505,7 +476,7 @@ cdb_create_twostage_grouping_paths(PlannerInfo *root,
 		/*
 		 * Try possible plans for DISTINCT-qualified aggregate.
 		 */
-		cdb_multi_dqas_info info = {};
+		cdb_dqas_info info = {};
 		DQAType type = recognize_dqa_type(&ctx);
 		switch (type)
 		{
@@ -525,13 +496,13 @@ cdb_create_twostage_grouping_paths(PlannerInfo *root,
 		case SINGLE_DQA_WITHAGG:
 			{
 				fetch_single_dqa_info(root, cheapest_path, &ctx, &info);
+				fetch_partial_target_info(&ctx, &info);
 
 				add_single_mixed_dqa_hash_agg_path(root,
-				                                   cheapest_path,
-				                                   &ctx,
-				                                   output_rel,
-				                                   info.input_proj_target,
-				                                   info.dqa_group_clause);
+												   cheapest_path,
+												   &ctx,
+												   &info,
+												   output_rel);
 			}
 			break;
 		case MULTI_DQAS:
@@ -546,12 +517,290 @@ cdb_create_twostage_grouping_paths(PlannerInfo *root,
 			}
 			break;
 		case MULTI_DQAS_WITHAGG:
+			{
+				/*
+				 * If check multidqa with agg failed then back to groupagg instead.
+				 */
+				if (check_multi_dqas_with_agg(&ctx))
+				{
+					fetch_multi_dqas_info(root, cheapest_path, &ctx, &info);
+					fetch_partial_target_info(&ctx, &info);
+
+					add_multi_mixed_dqas_hash_agg_path(root,
+													   cheapest_path,
+													   &ctx,
+													   output_rel,
+													   &info);
+				}
+			}
 			break;
 		default:
 			break;
 		}
 	}
 }
+
+/*
+ * cdb_create_twostage_distinct_paths
+ *
+ * Alternative entry point for DISTINCT planning.
+ *
+ * This is basically an extension of the function create_distinct_paths() in
+ * planner.c.  It creates two-stage Aggregate Paths to implement DISTINCT.
+ * The caller already constructed a Paths for one-stage plans.
+ *
+ * 'input_rel' is usually the result of query_planner(), but it can also be
+ * the result of windowing and/or GROUP BY planning, if the query contains
+ * both DISTINCT and GROUP BY/windowing.
+ */
+void
+cdb_create_twostage_distinct_paths(PlannerInfo *root,
+								   RelOptInfo *input_rel,
+								   RelOptInfo *output_rel,
+								   PathTarget *target,
+								   double dNumGroupsTotal)
+{
+	Query	   *parse = root->parse;
+	Path	   *cheapest_path = input_rel->cheapest_total_path;
+	AggClauseCosts zero_agg_costs;
+	cdb_agg_planning_context ctx;
+	bool		allow_sort;
+	bool		allow_hash;
+
+	/*
+	 * We are currently unwilling to redistribute a gathered intermediate
+	 * across the cluster.  This might change one day.
+	 */
+	if (!CdbPathLocus_IsPartitioned(cheapest_path->locus))
+		return;
+
+	/*
+	 * Is the input hashable / sortable?
+	 */
+	allow_sort = grouping_is_sortable(parse->distinctClause);
+	if (parse->hasDistinctOn || !enable_hashagg)
+		allow_hash = false;		/* policy-based decision not to hash */
+	else if (!grouping_is_hashable(parse->distinctClause))
+		allow_hash = false;
+	else
+		allow_hash = true;
+
+	/* Set up a dummy AggClauseCosts struct. There are no aggregates. */
+	memset(&zero_agg_costs, 0, sizeof(zero_agg_costs));
+
+	memset(&ctx, 0, sizeof(ctx));
+	ctx.can_sort = allow_sort;
+	ctx.can_hash = allow_hash;
+	ctx.target = target;
+	ctx.partial_grouping_target = target;
+	ctx.dNumGroupsTotal = dNumGroupsTotal;
+	ctx.agg_costs = &zero_agg_costs;
+	ctx.agg_partial_costs = &zero_agg_costs;
+	ctx.agg_final_costs = &zero_agg_costs;
+	ctx.rollups = NIL;
+	ctx.partial_rel = fetch_upper_rel(root, UPPERREL_CDB_FIRST_STAGE_DISTINCT, NULL);
+
+	/*
+	 * Set up these fields to look like a query with a GROUP BY on all the
+	 * DISTINCT columns. No HAVING or aggregates; the DISTINCT processing happens
+	 * logically after grouping and aggregation, so those have already been
+	 * handled in the grouping stage.
+	 */
+	ctx.hasAggs = false;
+	ctx.groupingSets = NIL;
+	ctx.havingQual = NULL;
+	ctx.groupClause = parse->distinctClause;
+	ctx.group_tles = get_common_group_tles(target, parse->distinctClause, NIL);
+	ctx.final_groupClause = ctx.groupClause;
+	ctx.final_group_tles = ctx.group_tles;
+	ctx.gsetid_sortref = 0;
+
+	if (ctx.can_sort)
+	{
+		/*
+		 * First, if we have any adequately-presorted paths, just stick a
+		 * Unique node on those.  Then consider doing an explicit sort of the
+		 * cheapest input path and Unique'ing that.
+		 *
+		 * When we have DISTINCT ON, we must sort by the more rigorous of
+		 * DISTINCT and ORDER BY, else it won't have the desired behavior.
+		 * Also, if we do have to do an explicit sort, we might as well use
+		 * the more rigorous ordering to avoid a second sort later.  (Note
+		 * that the parser will have ensured that one clause is a prefix of
+		 * the other.)
+		 */
+		if (parse->hasDistinctOn &&
+			list_length(root->distinct_pathkeys) <
+			list_length(root->sort_pathkeys))
+			ctx.partial_needed_pathkeys = root->sort_pathkeys;
+		else
+			ctx.partial_needed_pathkeys = root->distinct_pathkeys;
+
+		/* For explicit-sort case, always use the more rigorous clause */
+		if (list_length(root->distinct_pathkeys) <
+			list_length(root->sort_pathkeys))
+		{
+			ctx.partial_sort_pathkeys = root->sort_pathkeys;
+			/* Assert checks that parser didn't mess up... */
+			Assert(pathkeys_contained_in(root->distinct_pathkeys,
+										 ctx.partial_sort_pathkeys));
+		}
+		else
+			ctx.partial_sort_pathkeys = root->distinct_pathkeys;
+		ctx.final_needed_pathkeys = ctx.partial_needed_pathkeys;
+		ctx.final_sort_pathkeys = ctx.partial_sort_pathkeys;
+	}
+
+	/*
+	 * All set, generate the two-stage paths.
+	 */
+	create_two_stage_paths(root, &ctx, input_rel, output_rel, NULL);
+}
+
+/*
+ * Is DQA(Distinct Qualified Aggregate) or not
+ */
+static bool
+is_normal_agg(Node *node)
+{
+	if (!IsA(node, Aggref))
+		return false;
+
+	Aggref *agg = (Aggref *)node;
+	if (agg->aggdistinct != NULL)
+		return false;
+
+	return true;
+}
+
+/*
+ * Guts of GROUP BY and DISTINCT planning.
+ */
+static void
+create_two_stage_paths(PlannerInfo *root, cdb_agg_planning_context *ctx,
+					   RelOptInfo *input_rel, RelOptInfo *output_rel, GroupPathExtraData *extra)
+{
+	Path	   *cheapest_path = input_rel->cheapest_total_path;
+
+	/*
+	 * Consider ways to do the first Aggregate stage.
+	 *
+	 * The first stage's output is Partially Aggregated. The paths are
+	 * collected to the ctx->partial_rel, by calling add_path(). We do *not*
+	 * use add_partial_path(), these partially aggregated paths are considered
+	 * more like MPP paths in Greenplum in general.
+	 *
+	 * First consider sorted Aggregate paths.
+	 */
+	if (ctx->can_sort)
+	{
+		ListCell   *lc;
+
+		foreach(lc, input_rel->pathlist)
+		{
+			Path	   *path = (Path *) lfirst(lc);
+			bool		is_sorted;
+
+			/*
+			 * If the input is neatly distributed along the GROUP BY columns,
+			 * there's no point in a two-stage plan. The code in planner.c
+			 * already created the straightforward one-stage plan.
+			 */
+			if (cdbpathlocus_collocates_tlist(root, path->locus, ctx->group_tles))
+				continue;
+
+			/*
+			 * Consider input paths that are already sorted, and the one with
+			 * the lowest total cost.
+			 */
+			is_sorted = pathkeys_contained_in(ctx->partial_needed_pathkeys,
+											  path->pathkeys);
+			if (path == cheapest_path || is_sorted)
+				add_first_stage_group_agg_path(root, path, is_sorted, ctx);
+		}
+	}
+
+	/*
+	 * Consider Hash Aggregate over the cheapest input path.
+	 *
+	 * Hashing is not possible with DQAs.
+	 */
+	if (ctx->can_hash &&
+		list_length(ctx->agg_costs->distinctAggrefs) == 0)
+	{
+		/*
+		 * If the input is neatly distributed along the GROUP BY columns,
+		 * there's no point in a two-stage plan. The code in planner.c already
+		 * created the straightforward one-stage plan.
+		 */
+		if (!cdbpathlocus_collocates_tlist(root, cheapest_path->locus, ctx->group_tles))
+			add_first_stage_hash_agg_path(root, cheapest_path, ctx);
+	}
+
+	/*
+	 * Only when option mpp_execute is set to 'all segments',
+	 * we try to add two-phase aggregate path for foreign table
+	 * and call FDW routine to consider partial aggregate pushdown.
+	 */
+	if (input_rel->exec_location == FTEXECLOCATION_ALL_SEGMENTS)
+	{
+		ctx->partial_rel->serverid = input_rel->serverid;
+		ctx->partial_rel->userid = input_rel->userid;
+		ctx->partial_rel->useridiscurrent = input_rel->useridiscurrent;
+		ctx->partial_rel->fdwroutine = input_rel->fdwroutine;
+		ctx->partial_rel->exec_location = input_rel->exec_location;
+		ctx->partial_rel->cdbpolicy = input_rel->cdbpolicy;
+		if (ctx->partial_rel->fdwroutine &&
+		    (ctx->partial_rel->fdwroutine->IsMPPPlanNeeded && ctx->partial_rel->fdwroutine->IsMPPPlanNeeded()) &&
+		    ctx->partial_rel->fdwroutine->GetForeignUpperPaths)
+		{
+			ctx->partial_rel->fdwroutine->GetForeignUpperPaths(root, UPPERREL_CDB_FIRST_STAGE_GROUP_AGG,
+																input_rel, ctx->partial_rel, extra);
+		}
+	}
+
+	/*
+	 * We now have partially aggregated paths in ctx->partial_rel. Consider
+	 * different ways of performing the Finalize Aggregate stage.
+	 */
+	if (ctx->partial_rel->pathlist)
+	{
+		Path	   *cheapest_first_stage_path;
+
+		set_cheapest(ctx->partial_rel);
+		cheapest_first_stage_path = ctx->partial_rel->cheapest_total_path;
+		if (ctx->can_sort)
+		{
+			ListCell   *lc;
+
+			foreach(lc, ctx->partial_rel->pathlist)
+			{
+				Path	   *path = (Path *) lfirst(lc);
+				bool		is_sorted;
+
+				/*
+				 * In two-stage GROUPING SETS paths, the second stage's grouping
+				 * will include GROUPINGSET_ID(), which is not included in
+				 * root->pathkeys. The first stage's sort order does not include
+				 * that, so we know it's not sorted.
+				 */
+				if (!root->parse->groupingSets)
+					is_sorted = pathkeys_contained_in(ctx->final_needed_pathkeys,
+													  path->pathkeys);
+				else
+					is_sorted = false;
+				if (path == cheapest_first_stage_path || is_sorted)
+					add_second_stage_group_agg_path(root, path, is_sorted,
+													ctx, output_rel);
+			}
+		}
+
+		if (ctx->can_hash && list_length(ctx->agg_costs->distinctAggrefs) == 0)
+			add_second_stage_hash_agg_path(root, cheapest_first_stage_path,
+										   ctx, output_rel);
+	}
+}
+
 
 /*
  * Add a TargetEntry node of type GroupingSetId to the tlist.
@@ -607,6 +856,36 @@ create_gsetid_groupclause(Index groupref)
 	return gc;
 }
 
+static List *
+strip_gsetid_from_pathkeys(Index gsetid_sortref, List *pathkeys)
+{
+	ListCell   *lc;
+	List	   *new_pathkeys;
+
+	if (gsetid_sortref == 0)
+		return pathkeys;
+
+	new_pathkeys = NIL;
+	foreach(lc, pathkeys)
+	{
+		PathKey	   *pathkey = lfirst(lc);
+		EquivalenceClass *eclass = pathkey->pk_eclass;
+
+		if (eclass->ec_sortref == gsetid_sortref)
+		{
+			/*
+			 * The GROUPINGSETID_EXPR() should be the last pathkey. But just in
+			 * case it's not, any columns after it won't be in right order i
+			 * we remove it from the middle.
+			 */
+			break;
+		}
+
+		new_pathkeys = lappend(new_pathkeys, pathkey);
+	}
+	return new_pathkeys;
+}
+
 /*
  * Create a partially aggregated path from given input 'path' by sorting (if
  * input isn't sorted already).
@@ -617,7 +896,6 @@ add_first_stage_group_agg_path(PlannerInfo *root,
 							   bool is_sorted,
 							   cdb_agg_planning_context *ctx)
 {
-	Query	   *parse = root->parse;
 	DQAType     dqa_type;
 
 	/*
@@ -627,7 +905,7 @@ add_first_stage_group_agg_path(PlannerInfo *root,
 	 */
 	if (ctx->agg_costs->distinctAggrefs)
 	{
-		cdb_multi_dqas_info info = {};
+		cdb_dqas_info info = {};
 		List	   *dqa_group_tles;
 
 		dqa_type = recognize_dqa_type(ctx);
@@ -664,11 +942,11 @@ add_first_stage_group_agg_path(PlannerInfo *root,
 		path = (Path *) create_sort_path(root,
 										 ctx->partial_rel,
 										 path,
-										 root->group_pathkeys,
+										 ctx->partial_sort_pathkeys,
 										 -1.0);
 	}
 
-	if (parse->groupingSets)
+	if (ctx->groupingSets)
 	{
 		/*
 		 * We have grouping sets, possibly with aggregation.  Make
@@ -688,22 +966,20 @@ add_first_stage_group_agg_path(PlannerInfo *root,
 											  NIL,
 											  AGG_SORTED,
 											  ctx->rollups,
-											  ctx->agg_partial_costs,
-											  estimate_num_groups_on_segment(ctx->dNumGroupsTotal,
-																			 path->rows, path->locus));
+											  ctx->agg_partial_costs);
 		add_path(ctx->partial_rel, first_stage_agg_path);
 	}
-	else if (parse->hasAggs || parse->groupClause)
+	else if (ctx->hasAggs || ctx->groupClause)
 	{
 		add_path(ctx->partial_rel,
 			(Path *) create_agg_path(root,
 									 ctx->partial_rel,
 									 path,
 									 ctx->partial_grouping_target,
-									 parse->groupClause ? AGG_SORTED : AGG_PLAIN,
-									 AGGSPLIT_INITIAL_SERIAL,
+									 ctx->groupClause ? AGG_SORTED : AGG_PLAIN,
+									 ctx->hasAggs ? AGGSPLIT_INITIAL_SERIAL : AGGSPLIT_SIMPLE,
 									 false, /* streaming */
-									 parse->groupClause,
+									 ctx->groupClause,
 									 NIL,
 									 ctx->agg_partial_costs,
 									 estimate_num_groups_on_segment(ctx->dNumGroupsTotal,
@@ -726,7 +1002,6 @@ add_second_stage_group_agg_path(PlannerInfo *root,
 								RelOptInfo *output_rel)
 {
 	Path	   *path;
-	List	   *pathkeys;
 	CdbPathLocus singleQE_locus;
 	CdbPathLocus group_locus;
 	bool		need_redistribute;
@@ -759,32 +1034,31 @@ add_second_stage_group_agg_path(PlannerInfo *root,
 	 * We generate a Path for both, and let add_path() decide which ones
 	 * to keep.
 	 */
-	pathkeys = ctx->final_group_input_pathkeys;
-
 	/* Alternative 1: Redistribute -> Sort -> Agg */
 	if (CdbPathLocus_IsHashed(group_locus))
 	{
 		path = cdbpath_create_motion_path(root, initial_agg_path, NIL,
 											 false, group_locus);
 
-		path = (Path *) create_sort_path(root,
-										 output_rel,
-										 path,
-										 pathkeys,
-										 -1.0);
+		if (ctx->final_sort_pathkeys)
+			path = (Path *) create_sort_path(root,
+											 output_rel,
+											 path,
+											 ctx->final_sort_pathkeys,
+											 -1.0);
 
 		path = (Path *) create_agg_path(root,
 										output_rel,
 										path,
 										ctx->target,
 										(ctx->final_groupClause ? AGG_SORTED : AGG_PLAIN),
-										AGGSPLIT_FINAL_DESERIAL,
+										ctx->hasAggs ? AGGSPLIT_FINAL_DESERIAL : AGGSPLIT_SIMPLE,
 										false, /* streaming */
 										ctx->final_groupClause,
 										ctx->havingQual,
 										ctx->agg_final_costs,
 										ctx->dNumGroupsTotal);
-		path->pathkeys = ctx->final_group_pathkeys;
+		path->pathkeys = strip_gsetid_from_pathkeys(ctx->gsetid_sortref, path->pathkeys);
 
 		add_path(output_rel, path);
 	}
@@ -800,12 +1074,12 @@ add_second_stage_group_agg_path(PlannerInfo *root,
 		path = (Path *) create_sort_path(root,
 										 output_rel,
 										 path,
-										 pathkeys,
+										 ctx->final_sort_pathkeys,
 										 -1.0);
 	}
 
 	path = cdbpath_create_motion_path(root, path,
-									  pathkeys,
+									  path->pathkeys,
 									  false, singleQE_locus);
 
 	path = (Path *) create_agg_path(root,
@@ -813,13 +1087,13 @@ add_second_stage_group_agg_path(PlannerInfo *root,
 									path,
 									ctx->target,
 									(ctx->final_groupClause ? AGG_SORTED : AGG_PLAIN),
-									AGGSPLIT_FINAL_DESERIAL,
+									ctx->hasAggs ? AGGSPLIT_FINAL_DESERIAL : AGGSPLIT_SIMPLE,
 									false, /* streaming */
 									ctx->final_groupClause,
 									ctx->havingQual,
 									ctx->agg_final_costs,
 									ctx->dNumGroupsTotal);
-	path->pathkeys = ctx->final_group_pathkeys;
+	path->pathkeys = strip_gsetid_from_pathkeys(ctx->gsetid_sortref, path->pathkeys);
 	add_path(output_rel, path);
 }
 
@@ -838,12 +1112,8 @@ add_first_stage_hash_agg_path(PlannerInfo *root,
 	dNumGroups = estimate_num_groups_on_segment(ctx->dNumGroupsTotal,
 												path->rows, path->locus);
 
-	/*
-	 * FIXME:
-	 * Shall we compute hash table size and compare with work_mem here?
-	 */
 
-	if (parse->groupingSets)
+	if (parse->groupingSets && ctx->new_rollups)
 	{
 		first_stage_agg_path =
 			(Path *) create_groupingsets_path(root,
@@ -853,8 +1123,7 @@ add_first_stage_hash_agg_path(PlannerInfo *root,
 											  NIL,
 											  ctx->strat,
 											  ctx->new_rollups,
-											  ctx->agg_partial_costs,
-											  dNumGroups);
+											  ctx->agg_partial_costs);
 		CdbPathLocus_MakeStrewn(&(first_stage_agg_path->locus),
 								CdbPathLocus_NumSegments(first_stage_agg_path->locus));
 		add_path(ctx->partial_rel, first_stage_agg_path);
@@ -867,9 +1136,9 @@ add_first_stage_hash_agg_path(PlannerInfo *root,
 										  path,
 										  ctx->partial_grouping_target,
 										  AGG_HASHED,
-										  AGGSPLIT_INITIAL_SERIAL,
+										  ctx->hasAggs ? AGGSPLIT_INITIAL_SERIAL : AGGSPLIT_SIMPLE,
 										  false, /* streaming */
-										  parse->groupClause,
+										  ctx->groupClause,
 										  NIL,
 										  ctx->agg_partial_costs,
 										  dNumGroups));
@@ -885,7 +1154,6 @@ add_second_stage_hash_agg_path(PlannerInfo *root,
 							   cdb_agg_planning_context *ctx,
 							   RelOptInfo *output_rel)
 {
-	Query	   *parse = root->parse;
 	CdbPathLocus group_locus;
 	bool		needs_redistribute;
 	double		dNumGroups;
@@ -923,7 +1191,7 @@ add_second_stage_hash_agg_path(PlannerInfo *root,
 										path,
 										ctx->target,
 										AGG_HASHED,
-										AGGSPLIT_FINAL_DESERIAL,
+										ctx->hasAggs ? AGGSPLIT_FINAL_DESERIAL : AGGSPLIT_SIMPLE,
 										false, /* streaming */
 										ctx->final_groupClause,
 										ctx->havingQual,
@@ -960,10 +1228,10 @@ add_second_stage_hash_agg_path(PlannerInfo *root,
 											path,
 											ctx->target,
 											AGG_HASHED,
-											AGGSPLIT_FINAL_DESERIAL,
+											ctx->hasAggs ? AGGSPLIT_FINAL_DESERIAL : AGGSPLIT_SIMPLE,
 											false, /* streaming */
 											ctx->final_groupClause,
-											(List *) parse->havingQual,
+											ctx->havingQual,
 											ctx->agg_final_costs,
 											ctx->dNumGroupsTotal);
 			add_path(output_rel, path);
@@ -1001,26 +1269,48 @@ strip_aggdistinct(PathTarget *target)
 
 /*
  * Create Paths for an Aggregate with one DISTINCT-qualified aggregate and
- * multi normal aggregate.
+ * multi normal aggregate(DQA_WITHAGG).
+ * 
+ * Ex:
+ * select sum(disintct a), count(b) from t1 group by c;
+ * 
+ *	->HashAgg (to aggregate)
+ *	  output: sum(a), c, count(b)
+ *		-> HashAgg (to eliminate duplicates)
+ *		   output: a, c, count(b)
+ *			-> Streaming HashAgg (to eliminate duplicates)
+ *			   output: a, c, count(b)
+ *				-> input
+ *
+ *	As plan case above, we could call the middle HashAgg is an Intermedaite Agg Plan
+ *	node here, like the Aggref count(b) above case, because output of this node 
+ *	has as the same combining type as input.
  */
-static void add_single_mixed_dqa_hash_agg_path(PlannerInfo *root,
-                                               Path *path,
-                                               cdb_agg_planning_context *ctx,
-                                               RelOptInfo *output_rel,
-                                               PathTarget *input_target,
-                                               List       *dqa_group_clause)
+static void 
+add_single_mixed_dqa_hash_agg_path(PlannerInfo *root,
+								   Path *path,
+								   cdb_agg_planning_context *ctx,
+								   cdb_dqas_info *info,
+								   RelOptInfo *output_rel)
 {
-	Query	   *parse = root->parse;
-	List	   *dqa_group_tles;
-	CdbPathLocus distinct_locus;
-	bool		distinct_need_redistribute;
-	CdbPathLocus singleQE_locus;
+	List			*dqa_group_tles;
+	List 			*group_tles;
+	CdbPathLocus	distinct_locus;
+	CdbPathLocus	group_locus;
+	bool			distinct_need_redistribute;
+	bool			group_need_redistribute;
+	double			num_groups;
+	double			dnum_groups;
+	List			*dqa_group_clause;
+	List			*group_clause;
 
 	if (!gp_enable_agg_distinct)
 		return;
 
-	if (parse->groupClause)
-		return;
+	/*
+	 * intermediate_target fetched by fetch_single_dqa_target()
+	 */
+	PathTarget *intermediate_target = info->partial_target;
 
 	/*
 	 * If subpath is projection capable, we do not want to generate a
@@ -1028,48 +1318,197 @@ static void add_single_mixed_dqa_hash_agg_path(PlannerInfo *root,
 	 * constrain a child tlist when it creates subplan. Thus, GROUP BY expr
 	 * may not be found in the scan targetlist.
 	 */
-	path = apply_projection_to_path(root, path->parent, path, input_target);
+	path = apply_projection_to_path(root, path->parent, path, info->input_proj_target);
 
-	dqa_group_tles = get_common_group_tles(input_target, dqa_group_clause, NIL  );
+	/* 
+	 * dqa_group_clause is (DISTINCT + GROUP BY) and group_clause is (GROUP BY)
+	 * so group_clause is always subset of dqa_group_clause.
+	 */
+	dqa_group_clause = info->dqa_group_clause;
+	group_clause = ctx->groupClause;
+
+	/*
+	 * Calculate the number of groups in the deduplicated stage, per segment.
+	 * distinct_locus is the corresponding locus for the deduplicated stage.
+	 */
+	dqa_group_tles = get_common_group_tles(intermediate_target, dqa_group_clause, NIL);
 	distinct_locus = choose_grouping_locus(root, path,
 										   dqa_group_tles,
 										   &distinct_need_redistribute);
+	dnum_groups = estimate_num_groups_on_segment(info->dNumDistinctGroups, path->rows, path->locus);
 
-	if (!CdbPathLocus_IsPartitioned(distinct_locus))
-		return;
+	/*
+	 * Calculate the number of groups in the final stage, per segment.
+	 * group_locus is the corresponding locus for the final stage.
+	 */
+	group_tles = get_common_group_tles(intermediate_target, group_clause, NIL);
+	group_locus = choose_grouping_locus(root, path,
+										group_tles,
+										&group_need_redistribute);
 
-	if (distinct_need_redistribute)
+	if (CdbPathLocus_IsPartitioned(group_locus))
+		num_groups = clamp_row_est(ctx->dNumGroupsTotal /
+								   CdbPathLocus_NumSegments(path->locus));
+	else
+		num_groups = ctx->dNumGroupsTotal;
+
+	if (!distinct_need_redistribute || !group_need_redistribute)
+	{
+		/*
+		 * 1. If the input's locus matches the DISTINCT, but not GROUP BY:
+		 *
+		 *  HashAggregate
+		 *     -> Redistribute (according to GROUP BY)
+		 *         -> HashAggregate (to eliminate duplicates)
+		 *             -> input (hashed by GROUP BY + DISTINCT)
+		 *
+		 * 2. If the input's locus matches the GROUP BY(don't care DISTINCT any more):
+		 *
+		 *  HashAggregate (to aggregate)
+		 *     -> HashAggregate (to eliminate duplicates)
+		 *           -> input (hashed by GROUP BY)
+		 *
+		 */
+		path = (Path *) create_agg_path(root,
+										output_rel,
+										path,
+										intermediate_target,
+										AGG_HASHED,
+										AGGSPLIT_INITIAL_SERIAL,
+										false, /* streaming */
+										dqa_group_clause,
+										NIL,
+										ctx->agg_partial_costs, /* FIXME */
+										dnum_groups);
+
+		if (group_need_redistribute)
+			path = cdbpath_create_motion_path(root, path, NIL, false,
+											group_locus);
+
+		path = (Path *) create_agg_path(root,
+										output_rel,
+										path,
+										ctx->target,
+										ctx->groupClause ? AGG_HASHED : AGG_PLAIN,
+										AGGSPLIT_FINAL_DESERIAL | AGGSPLIT_DQAWITHAGG,
+										false, /* streaming */
+										ctx->groupClause,
+										ctx->havingQual,
+										ctx->agg_final_costs,
+		 								num_groups);
+
+		add_path(output_rel, path);
+	}
+	else if (CdbPathLocus_IsHashed(group_locus))
+	{
+		/*
+		 *  HashAgg (to aggregate)
+		 *     -> HashAgg (to eliminate duplicates)
+		 *          -> Redistribute (according to GROUP BY)
+		 *               -> Streaming HashAgg (to eliminate duplicates)
+		 *                    -> input
+		 *
+		 * It may seem silly to have two Aggs on top of each other like this,
+		 * but the Agg node can't do DISTINCT-aggregation by hashing at the
+		 * moment. So we have to do it with two separate Aggs steps.
+		 */
+		if (gp_enable_dqa_pruning)
+			path = (Path *) create_agg_path(root,
+											output_rel,
+											path,
+											intermediate_target,
+											AGG_HASHED,
+											AGGSPLIT_INITIAL_SERIAL,
+											true, /* streaming */
+											dqa_group_clause,
+											NIL,
+											ctx->agg_partial_costs, /* FIXME */
+											dnum_groups);
+
 		path = cdbpath_create_motion_path(root, path, NIL, false,
-										  distinct_locus);
+										group_locus);
+		path = (Path *) create_agg_path(root,
+										output_rel,
+										path,
+										intermediate_target,
+										AGG_HASHED,
+										gp_enable_dqa_pruning ? AGGSPLIT_INTERMEDIATE : AGGSPLIT_INITIAL_SERIAL,
+										false, /* streaming */
+										dqa_group_clause,
+										NIL,
+										ctx->agg_partial_costs, /* FIXME */
+										dnum_groups);
 
-	path = (Path *) create_agg_path(root,
-									output_rel,
-									path,
-									ctx->partial_grouping_target,
-									AGG_PLAIN,
-									AGGSPLIT_INITIAL_SERIAL,
-									false, /* streaming */
-									parse->groupClause,
-									NIL,
-									ctx->agg_partial_costs, /* FIXME */
-									estimate_num_groups_on_segment(ctx->dNumGroupsTotal,
-																   path->rows, path->locus));
+		path = (Path *) create_agg_path(root,
+										output_rel,
+										path,
+										ctx->target,
+										ctx->groupClause ? AGG_HASHED : AGG_PLAIN,
+										AGGSPLIT_FINAL_DESERIAL | AGGSPLIT_DQAWITHAGG,
+										false, /* streaming */
+										ctx->groupClause,
+										ctx->havingQual,
+										ctx->agg_final_costs,
+										num_groups);
+		add_path(output_rel, path);
+	}
+	else if (CdbPathLocus_IsHashed(distinct_locus))
+	{
+		/*
+		 *  Finalize Aggregate
+		 *     -> Gather Motion
+		 *          -> Partial Aggregate
+		 *              -> HashAggregate, to remove duplicates
+		 *                  -> Redistribute Motion (according to DISTINCT arg)
+		 *                      -> Streaming HashAgg (to eliminate duplicates)
+		 *                          -> input
+		 */
+		path = (Path *) create_agg_path(root,
+										output_rel,
+										path,
+										intermediate_target,
+										AGG_HASHED,
+										AGGSPLIT_INITIAL_SERIAL,
+										true, /* streaming */
+										dqa_group_clause,
+										NIL,
+										ctx->agg_partial_costs, /* FIXME */
+										dnum_groups);
 
-	CdbPathLocus_MakeSingleQE(&singleQE_locus, getgpsegmentCount());
-	path = cdbpath_create_motion_path(root, path, NIL, false, singleQE_locus);
+		path = cdbpath_create_motion_path(root, path, NIL, false,
+										distinct_locus);
+		path = (Path *) create_agg_path(root,
+										output_rel,
+										path,
+										intermediate_target,
+										AGG_HASHED,
+										AGGSPLIT_INTERMEDIATE,
+										false, /* streaming */
+										dqa_group_clause,
+										NIL,
+										ctx->agg_partial_costs, /* FIXME */
+										dnum_groups);
 
-	path = (Path *) create_agg_path(root,
-									output_rel,
-									path,
-									ctx->target,
-									AGG_PLAIN,
-									AGGSPLIT_FINAL_DESERIAL,
-									false, /* streaming */
-									parse->groupClause,
-									ctx->havingQual,
-									ctx->agg_final_costs,
-									ctx->dNumGroupsTotal);
-	add_path(output_rel, path);
+		path = cdbpath_create_motion_path(root, path, NIL, false,
+										group_locus);
+
+		path = (Path *) create_agg_path(root,
+										output_rel,
+										path,
+										ctx->target,
+										ctx->groupClause ? AGG_HASHED : AGG_PLAIN,
+										AGGSPLIT_FINAL_DESERIAL | AGGSPLIT_DQAWITHAGG,
+										false, /* streaming */
+										ctx->groupClause,
+										ctx->havingQual,
+										ctx->agg_final_costs,
+										num_groups);
+		add_path(output_rel, path);
+	}
+	else
+		elog(LOG, "cannot generate multi-stage hashagg path for intermediate agg of single-dqa");
+
+	return;
 }
 
 /*
@@ -1084,7 +1523,6 @@ add_single_dqa_hash_agg_path(PlannerInfo *root,
 							 List       *dqa_group_clause,
 							 double dNumDistinctGroups)
 {
-	Query	   *parse = root->parse;
 	List	   *dqa_group_tles;
 	int			num_input_segments;
 	List	   *group_tles;
@@ -1119,7 +1557,7 @@ add_single_dqa_hash_agg_path(PlannerInfo *root,
 	 * Calculate the number of groups in the final stage, per segment.
 	 * group_locus is the corresponding locus for the final stage.
 	 */
-	group_tles = get_common_group_tles(input_target, parse->groupClause, NIL);
+	group_tles = get_common_group_tles(input_target, ctx->groupClause, NIL);
 	group_locus = choose_grouping_locus(root, path,
 										group_tles,
 										&group_need_redistribute);
@@ -1171,11 +1609,11 @@ add_single_dqa_hash_agg_path(PlannerInfo *root,
 										output_rel,
 										path,
 										ctx->target,
-										parse->groupClause ? AGG_HASHED : AGG_PLAIN,
+										ctx->groupClause ? AGG_HASHED : AGG_PLAIN,
 										AGGSPLIT_DEDUPLICATED,
 										false, /* streaming */
-										parse->groupClause,
-										(List *) parse->havingQual,
+										ctx->groupClause,
+										ctx->havingQual,
 										ctx->agg_final_costs,
 										dNumGroups);
 		add_path(output_rel, path);
@@ -1227,11 +1665,11 @@ add_single_dqa_hash_agg_path(PlannerInfo *root,
 										output_rel,
 										path,
 										ctx->target,
-										parse->groupClause ? AGG_HASHED : AGG_PLAIN,
+										ctx->groupClause ? AGG_HASHED : AGG_PLAIN,
 										AGGSPLIT_DEDUPLICATED,
 										false, /* streaming */
-										parse->groupClause,
-										(List *) parse->havingQual,
+										ctx->groupClause,
+										ctx->havingQual,
 										ctx->agg_final_costs,
 										dNumGroups);
 		add_path(output_rel, path);
@@ -1280,10 +1718,10 @@ add_single_dqa_hash_agg_path(PlannerInfo *root,
 										output_rel,
 										path,
 										strip_aggdistinct(ctx->partial_grouping_target),
-										parse->groupClause ? AGG_HASHED : AGG_PLAIN,
+										ctx->groupClause ? AGG_HASHED : AGG_PLAIN,
 										AGGSPLIT_INITIAL_SERIAL | AGGSPLITOP_DEDUPLICATED,
 										false, /* streaming */
-										parse->groupClause,
+										ctx->groupClause,
 										NIL,
 										ctx->agg_partial_costs,
 										estimate_num_groups_on_segment(ctx->dNumGroupsTotal, input_rows, path->locus));
@@ -1294,11 +1732,11 @@ add_single_dqa_hash_agg_path(PlannerInfo *root,
 										output_rel,
 										path,
 										ctx->target,
-										parse->groupClause ? AGG_HASHED : AGG_PLAIN,
+										ctx->groupClause ? AGG_HASHED : AGG_PLAIN,
 										AGGSPLIT_FINAL_DESERIAL | AGGSPLITOP_DEDUPLICATED,
 										false, /* streaming */
-										parse->groupClause,
-										(List *) parse->havingQual,
+										ctx->groupClause,
+										ctx->havingQual,
 										ctx->agg_final_costs,
 										dNumGroups);
 
@@ -1335,7 +1773,7 @@ add_multi_dqas_hash_agg_path(PlannerInfo *root,
 							 Path *path,
 							 cdb_agg_planning_context *ctx,
 							 RelOptInfo *output_rel,
-							 cdb_multi_dqas_info *info)
+							 cdb_dqas_info *info)
 {
 	List	   *dqa_group_tles;
 	CdbPathLocus distinct_locus;
@@ -1362,7 +1800,7 @@ add_multi_dqas_hash_agg_path(PlannerInfo *root,
 										  output_rel,
 										  path,
 										  info->tup_split_target,
-										  root->parse->groupClause,
+										  ctx->groupClause,
 										  info->dqa_expr_lst);
 
 	AggClauseCosts DedupCost = {};
@@ -1408,16 +1846,25 @@ add_multi_dqas_hash_agg_path(PlannerInfo *root,
 	distinct_locus = choose_grouping_locus(root, path, dqa_group_tles,
 										   &distinct_need_redistribute);
 
+	/*
+	 * Motion always need to be added above TupleSplit for deduplication
+	 * because of junk column AggExprId. After junk column added, no subpath
+	 * locus could match it because subpath never contain AggExprId column.
+	 */
 	if (distinct_need_redistribute)
+	{
 		path = cdbpath_create_motion_path(root, path, NIL, false,
 										  distinct_locus);
+	}
+	else
+		elog(ERROR, "TupleSplit Node needs to be redistributed for deduplication");
 
 	AggStrategy split = AGG_PLAIN;
 	unsigned long DEDUPLICATED_FLAG = 0;
 	PathTarget *partial_target = info->partial_target;
 	double		input_rows = path->rows;
 
-	if (root->parse->groupClause)
+	if (ctx->groupClause)
 	{
 		path = (Path *) create_agg_path(root,
 										output_rel,
@@ -1443,7 +1890,7 @@ add_multi_dqas_hash_agg_path(PlannerInfo *root,
 									split,
 									AGGSPLIT_INITIAL_SERIAL | DEDUPLICATED_FLAG,
 									false, /* streaming */
-									root->parse->groupClause,
+									ctx->groupClause,
 									NIL,
 									ctx->agg_partial_costs,
 									estimate_num_groups_on_segment(ctx->dNumGroupsTotal,
@@ -1464,13 +1911,151 @@ add_multi_dqas_hash_agg_path(PlannerInfo *root,
 									split,
 									AGGSPLIT_FINAL_DESERIAL | DEDUPLICATED_FLAG,
 									false, /* streaming */
-									root->parse->groupClause,
-									(List *) root->parse->havingQual,
+									ctx->groupClause,
+									ctx->havingQual,
 									ctx->agg_final_costs,
 									ctx->dNumGroupsTotal);
 
 	add_path(output_rel, path);
 }
+
+static void
+add_multi_mixed_dqas_hash_agg_path(PlannerInfo *root,
+							Path *path,
+							cdb_agg_planning_context *ctx,
+							RelOptInfo *output_rel,
+							cdb_dqas_info *info)
+{
+	List			*dqa_group_tles;
+	CdbPathLocus 	distinct_locus;
+	bool			distinct_need_redistribute;
+
+	/*
+	 * If subpath is projection capable, we do not want to generate a
+	 * projection plan. The reason is that the projection plan does not
+	 * constrain a child tlist when it creates subplan. Thus, GROUP BY expr
+	 * may not be found in the scan targetlist.
+	 */
+	path = apply_projection_to_path(root, path->parent, path, info->input_proj_target);
+
+	/*
+	 * Finalize Aggregate
+	 *   -> Gather Motion
+	 * 		-> HashAggregate, to remote duplicates
+	 *     		-> Redistribute Motion
+	 *       		-> TupleSplit (according to DISTINCT expr)
+	 *             		-> input
+	 */
+	path = (Path *) create_tup_split_path(root,
+										  output_rel,
+										  path,
+										  info->tup_split_target,
+										  ctx->groupClause,
+										  info->dqa_expr_lst);
+
+	if (gp_enable_dqa_pruning)
+	{
+		AggClauseCosts DedupCost = {};
+		get_agg_clause_costs(root, (Node *) info->tup_split_target->exprs,
+							AGGSPLIT_SIMPLE,
+							&DedupCost);
+		/*
+		 * If we are grouping, we charge an additional cpu_operator_cost per
+		 * **grouping column** per input tuple for grouping comparisons.
+		 *
+		 * But in the tuple split case, other columns not for this DQA are
+		 * NULLs, the actual cost is way less than the number calculating based
+		 * on the length of grouping clause.
+		 *
+		 * So here we create a dummy grouping clause whose length is 1 (the
+		 * most common case of DQA), use it to calculate the cost, then set the
+		 * actual one back into the path.
+		 */
+		List *dummy_group_clause = list_make1(list_head(info->dqa_group_clause));
+
+		path = (Path *) create_agg_path(root,
+										output_rel,
+										path,
+										info->partial_target,
+										AGG_HASHED,
+										AGGSPLIT_INITIAL_SERIAL,
+										true, /* streaming */
+										dummy_group_clause, /* only its length 1 is being used here */
+										NIL,
+										&DedupCost,
+										estimate_num_groups_on_segment(info->dNumDistinctGroups,
+																	   path->rows, path->locus));
+
+		/* set the actual group clause back */
+		((AggPath *)path)->groupClause = info->dqa_group_clause;
+	}
+
+	dqa_group_tles = get_common_group_tles(info->tup_split_target,
+										   info->dqa_group_clause, NIL);
+	distinct_locus = choose_grouping_locus(root, path, dqa_group_tles,
+										   &distinct_need_redistribute);
+
+	/*
+	 * Motion always need to be added above TupleSplit for deduplication
+	 * because of junk column AggExprId. After junk column added, no subpath
+	 * locus could match it because subpath never contain AggExprId column.
+	 */
+	if (distinct_need_redistribute)
+		path = cdbpath_create_motion_path(root, path, NIL, false,
+										  distinct_locus);
+	else
+		elog(ERROR, "TupleSplit Node needs to be redistributed for deduplication");
+
+	path = (Path *) create_agg_path(root,
+									output_rel,
+									path,
+									info->partial_target,
+									AGG_HASHED,
+									gp_enable_dqa_pruning ? AGGSPLIT_INTERMEDIATE : AGGSPLIT_INITIAL_SERIAL,
+									false, /* streaming */
+									info->dqa_group_clause,
+									NIL,
+									ctx->agg_partial_costs,
+									estimate_num_groups_on_segment(ctx->dNumGroupsTotal,
+																   path->rows, path->locus));
+
+	path = (Path *) create_agg_path(root,
+									output_rel,
+									path,
+									ctx->partial_grouping_target,
+									AGG_HASHED,
+									AGGSPLIT_INTERMEDIATE | AGGSPLIT_DQAWITHAGG,
+									false, /* streaming */
+									ctx->groupClause,
+									NIL,
+									ctx->agg_partial_costs,
+									estimate_num_groups_on_segment(ctx->dNumGroupsTotal,
+																   path->rows, path->locus));
+
+	CdbPathLocus singleQE_locus;
+	CdbPathLocus_MakeSingleQE(&singleQE_locus, getgpsegmentCount());
+	path = cdbpath_create_motion_path(root,
+									  path,
+									  NIL,
+									  false,
+									  singleQE_locus);
+
+	path = (Path *) create_agg_path(root,
+									output_rel,
+									path,
+									info->final_target,
+									AGG_HASHED,
+									AGGSPLIT_FINAL_DESERIAL,
+									false, /* streaming */
+									ctx->groupClause,
+									ctx->havingQual,
+									ctx->agg_final_costs,
+									ctx->dNumGroupsTotal);
+
+	add_path(output_rel, path);
+}
+
+
 
 /*
  * Get the common expressions in all grouping sets as a target list.
@@ -1483,7 +2068,7 @@ add_multi_dqas_hash_agg_path(PlannerInfo *root,
  *
  * the common cols are b and c.
  */
-static List *
+List *
 get_common_group_tles(PathTarget *target,
 					  List *groupClause,
 					  List *rollups)
@@ -1592,7 +2177,7 @@ get_all_rollup_groupclauses(List *rollups)
  * multple grouping sets. Use get_common_group_tles() to build that
  * list.
  */
-static CdbPathLocus
+CdbPathLocus
 choose_grouping_locus(PlannerInfo *root, Path *path,
 					  List *group_tles,
 					  bool *need_redistribute_p)
@@ -1769,6 +2354,215 @@ recognize_dqa_type(cdb_agg_planning_context *ctx)
 }
 
 /*
+ * check_multi_dqas_with_agg
+ * 		check support multi-dqa with normal agg or not
+ *
+ * there are two special case could not be supported:
+ * case 1: vars in normal agg from two differing distinct-DQAExpr
+ *	--> select count(distinct a), count(distinct b), sum(a + b) from t1;
+ * 		`a` and `b` are from two different count(distinct xxx), and could not
+ * 		supported by our TupleSplit.
+ * 
+ * case2: filter in DQAEXpr
+ *	--> select count(distinct a) filter(where a > 1), count(distinct b), sum(c) form t1;
+ *		not support filter exist in multi-dqas with normal agg.
+ */
+static bool
+check_multi_dqas_with_agg(cdb_agg_planning_context *ctx)
+{
+	ListCell 	*lc = NULL;
+	ListCell 	*lcc = NULL;
+	List 		*nvars = NULL;
+
+	foreach(lc, ctx->partial_grouping_target->exprs)
+	{
+		Node 	*node = lfirst(lc);
+		int 	dups = 0;
+
+		if(!is_normal_agg(node))
+			continue;
+
+		/* extract vars of normal agg here */
+		nvars = pull_var_clause(node, PVC_RECURSE_AGGREGATES |
+										PVC_RECURSE_WINDOWFUNCS |
+										PVC_RECURSE_PLACEHOLDERS);
+
+		foreach(lcc, ctx->agg_partial_costs->distinctAggrefs)
+		{
+			Aggref			*aggref = (Aggref *) lfirst(lcc);
+			SortGroupClause *arg_sortcl;
+			TargetEntry     *arg_tle;
+			ListCell		*dlc;
+			List 			*dvars = NULL;
+
+			/* found unsupported case2 just return */
+			if (nvars != NULL && aggref->aggfilter != NULL)
+				return false;
+
+			foreach (dlc, aggref->aggdistinct)
+			{
+				arg_sortcl = (SortGroupClause *) lfirst(dlc);
+				arg_tle = get_sortgroupclause_tle(arg_sortcl, aggref->args);
+
+				/* extract vars of aggdistinct */
+				List *vars = pull_var_clause((Node *)arg_tle->expr,
+											PVC_RECURSE_AGGREGATES |
+											PVC_RECURSE_WINDOWFUNCS |
+											PVC_RECURSE_PLACEHOLDERS);
+
+				dvars = list_concat_unique(dvars, vars);
+			}
+
+			/* 
+			 * dvars of current distinctAggref are intersect with vars in normal aggref
+			 * then rise dups count for this normal aggref.
+			 */
+			if (list_intersection(nvars, dvars) != NULL)
+				dups++;
+
+			/*
+			 * found unsupported case1. If dups count for current agg are more than two,
+			 * we have two differing distinctAggref pointing to one same normal aggref.
+			 */
+			if (dups > 1)
+				return false;
+		}
+	}
+
+	return true;
+}
+
+/*
+ * Seek a DQAExpr for var and output relative position in function arguments.
+ */
+static int
+get_dqa_tlist_idx(Node *node, dqa_expr_context *context, bool *dqa_expr_exists)
+{
+	int idx = 0;
+	ListCell *lc = NULL;
+
+	foreach_with_count(lc, context->proj_target->exprs, idx)
+	{
+		Node *expr = lfirst(lc);
+
+		if (equal(node, expr))
+			break;
+	}
+
+	if (idx == list_length(context->proj_target->exprs))
+		elog(ERROR, "not found var in sub projection targetlist");
+
+	/* Match DQAEXpr for current var */
+	foreach(lc, context->dqa_expr_lst)
+	{
+		DQAExpr *dqa_expr = (DQAExpr *)lfirst(lc);
+
+		if (bms_is_member(context->proj_target->sortgrouprefs[idx],
+							dqa_expr->agg_args_id_bms))
+		{
+			/*
+			 * Ideally, columns in normal agg could not refer to
+			 * two differenct DQAExprs, which is the case we didn't
+			 * support now and has been checked in check_multi_dqas_with_agg().
+			 *
+			 * But if we hit the situation here, we just pop out ERROR
+			 * to catch exception cases missed by check_multi_dqas_with_agg().
+			 */
+			if (context->dqa != NULL && !equal(context->dqa, dqa_expr))
+				elog(ERROR, "found two different dqaexprs");
+
+			context->dqa = dqa_expr;
+
+			if (dqa_expr_exists)
+				*dqa_expr_exists = true;
+
+			return idx;
+		}
+	}
+
+	if (dqa_expr_exists)
+		*dqa_expr_exists = false;
+
+	return idx;
+}
+
+/*
+ * walk through the tree, find related dqaExpr depending on context,
+ * and update context accordingly.
+ */
+static bool
+find_dqa_expr_by_normal_agg_walker(Node *node, dqa_expr_context *context)
+{
+	bool dqa_expr_exists;
+
+	if (node == NULL)
+		return false;
+
+	/* need to add vars */
+	if (IsA(node, Var))
+	{
+		/*
+		 * If we find DQAExpr for current var then just return.
+		 * Otherwise, we should add it bms which will be attached
+		 * to suitable DQAExpr later.
+		 */
+		int idx = get_dqa_tlist_idx(node, context, &dqa_expr_exists);
+		if (dqa_expr_exists)
+			return false;
+
+		if (context->proj_target->sortgrouprefs[idx] == 0)
+		{
+			/* just add non-distinct var to dqa->agg_vars_ref */
+			(*context->maxRef)++;
+			context->proj_target->sortgrouprefs[idx] = *context->maxRef;
+			context->bms = bms_add_member(context->bms, *context->maxRef);
+		}
+
+		return false;
+	}
+
+	if (list_member(context->proj_target->exprs, node))
+	{
+		(void)get_dqa_tlist_idx(node, context, &dqa_expr_exists);
+		if (dqa_expr_exists)
+			return false;
+	}
+
+	return expression_tree_walker(node, find_dqa_expr_by_normal_agg_walker,
+								  (void *)context);
+}
+
+/*
+ * find_dqa_expr_by_normal_agg
+ *		Seek a DQAExpr for current node and put it into agg_vars_ref as nomal-column
+ *		which we should also do projection for it in ExecTupleSplit, then return
+ *		this DQAExpr.
+ *
+ * For those nodes that we couldn't find a DQAExpr, we put them into First DQAExpr.
+ * And re-assigning maxRef again after find_dqa_expr_by_normal_agg_walker is also necessary.
+ */
+static DQAExpr *
+find_dqa_expr_by_normal_agg(Node *node, List *dqa_expr_lst, PathTarget *proj_target, Index *maxRef)
+{
+	DQAExpr *dqa = NULL;
+
+	dqa_expr_context context;
+	context.dqa = NULL;
+	context.bms = NULL;
+	context.proj_target = proj_target;
+	context.dqa_expr_lst = dqa_expr_lst;
+	context.maxRef = maxRef;
+
+	find_dqa_expr_by_normal_agg_walker(node, &context);
+
+	dqa = (context.dqa == NULL) ? linitial(dqa_expr_lst) : context.dqa;
+
+	dqa->agg_vars_ref = bms_union(dqa->agg_vars_ref, context.bms);
+
+	return dqa;
+}
+
+/*
  * fetch_multi_dqas_info
  *
  * 1. fetch all dqas path required information as single dqa's function.
@@ -1780,7 +2574,7 @@ static void
 fetch_multi_dqas_info(PlannerInfo *root,
 					  Path *path,
 					  cdb_agg_planning_context *ctx,
-					  cdb_multi_dqas_info *info)
+					  cdb_dqas_info *info)
 {
 	ListCell    *lc;
 	ListCell    *lcc;
@@ -1797,7 +2591,7 @@ fetch_multi_dqas_info(PlannerInfo *root,
 		num_input_segments = 1;
 	num_total_input_rows = path->rows * num_input_segments;
 
-	group_exprs = get_sortgrouplist_exprs(root->parse->groupClause,
+	group_exprs = get_sortgrouplist_exprs(ctx->groupClause,
 										  make_tlist_from_pathtarget(path->pathtarget));
 
 	proj_target = copy_pathtarget(path->pathtarget);
@@ -1839,12 +2633,29 @@ fetch_multi_dqas_info(PlannerInfo *root,
 			arg_tle = get_sortgroupclause_tle(arg_sortcl, aggref->args);
 			ListCell    *lc3;
 			int         dqa_idx = 0;
+			Expr		*naked_tle_expr = arg_tle->expr;
+
+			/*
+			 * When conversions between two binary-compatible types happen in
+			 * DQA expressions, the expr(s) in arg_tle and proj_target->exprs
+			 * may be wrapped with a RelabelType node. The RelabelType node doesn't
+			 * affect the semantics, so we ignore it here.
+			 * For conversions that are not binary-compatible, the exprs are wrapped
+			 * with other types of node, e.g., CoerceViaIO.
+			 * Relevent bug report: https://github.com/greenplum-db/gpdb/issues/14096
+			 */
+			while (naked_tle_expr && IsA(naked_tle_expr, RelabelType))
+				naked_tle_expr = ((RelabelType *) naked_tle_expr)->arg;
 
 			foreach (lc3, proj_target->exprs)
 			{
 				Expr    *expr = lfirst(lc3);
+				Expr	*naked_expr = expr;
+				/* Ignore the RelabelType node. */
+				while (naked_expr && IsA(naked_expr, RelabelType))
+					naked_expr = ((RelabelType *) naked_expr)->arg;
 
-				if (equal(arg_tle->expr, expr))
+				if (equal(naked_tle_expr, naked_expr))
 					break;
 
 				dqa_idx++;
@@ -1952,11 +2763,39 @@ fetch_multi_dqas_info(PlannerInfo *root,
 		/* assign an agg_expr_id value to aggref*/
 		aggref->agg_expr_id = agg_expr_id;
 
-		/* rid of filter in aggref */
+		/* rid of filter in aggref, will push them down to the TupleSplit node */
 		aggref->aggfilter = NULL;
 		aggref_final->aggfilter = NULL;
 	}
 	info->dNumDistinctGroups = dNumDistinctGroups;
+
+	/*
+	 * Find DQAExpr for vars in normal agg, if not found
+	 * then use the first DQAExpr for these vars.
+	 *
+	 * select count(distinct a), count(distinct b), sum(b+e), sum(c+d) from t1;
+	 * 				|					|
+	 * 			DQAExpr_1			DQAExpr_2
+	 * 
+	 * for sum(b+e), `b` is the distinct var in DQAExpr_2, so `b` and `e` will
+	 * be assinged to DQAExpr_2, also include sum(b+e)
+	 * 
+	 * for sum(c+d), we could not find a DQAExpr for `c` and `d`, we just assign
+	 * these unrelated vars to DQAExpr_1
+	 */
+	foreach(lc, ctx->partial_grouping_target->exprs)
+	{
+		Node		*node = lfirst(lc);
+		DQAExpr 	*dqa = NULL;
+
+		if(!is_normal_agg(node))
+			continue;
+
+		dqa = find_dqa_expr_by_normal_agg(node, info->dqa_expr_lst, proj_target, &maxRef);
+
+		/* assgin DQAExpr id to current aggref */
+		((Aggref *)node)->agg_expr_id = dqa->agg_expr_id;
+	}
 
 	info->input_proj_target = proj_target;
 	info->tup_split_target = copy_pathtarget(proj_target);
@@ -1977,7 +2816,7 @@ fetch_multi_dqas_info(PlannerInfo *root,
 	}
 
 	info->dqa_group_clause = list_concat(info->dqa_group_clause,
-										 list_copy(root->parse->groupClause));
+										 list_copy(ctx->groupClause));
 
 	info->partial_target= ctx->partial_grouping_target;
 	info->final_target = ctx->target;
@@ -1986,7 +2825,7 @@ fetch_multi_dqas_info(PlannerInfo *root,
 /*
  * fetch_single_dqa_info
  *
- * fetch single dqa path required information and store in cdb_multi_dqas_info
+ * fetch single dqa path required information and store in cdb_dqas_info
  *
  * info->input_target contains subpath target expr + all DISTINCT expr
  *
@@ -1996,7 +2835,7 @@ static void
 fetch_single_dqa_info(PlannerInfo *root,
 					  Path *path,
 					  cdb_agg_planning_context *ctx,
-					  cdb_multi_dqas_info *info)
+					  cdb_dqas_info *info)
 {
 	Index		maxRef;
 	List	   *dqa_group_exprs;
@@ -2016,7 +2855,7 @@ fetch_single_dqa_info(PlannerInfo *root,
 	else
 		info->input_proj_target->sortgrouprefs = (Index *) palloc0(list_length(exprLst) * sizeof(Index));
 
-	dqa_group_exprs = get_sortgrouplist_exprs(root->parse->groupClause,
+	dqa_group_exprs = get_sortgrouplist_exprs(ctx->groupClause,
 											  make_tlist_from_pathtarget(path->pathtarget));
 
 	Aggref	   *aggref = list_nth(ctx->agg_costs->distinctAggrefs, 0);
@@ -2052,11 +2891,26 @@ fetch_single_dqa_info(PlannerInfo *root,
 		sortcl->tleSortGroupRef = info->input_proj_target->sortgrouprefs[idx];
 		sortcl->hashable = true;	/* we verified earlier that it's hashable */
 
-		info->dqa_group_clause = lappend(info->dqa_group_clause, sortcl);
+		if (ctx->groupClause == NULL)
+		{
+			info->dqa_group_clause = lappend(info->dqa_group_clause, sortcl);
+		} else
+		{
+			foreach (lcc, ctx->groupClause)
+			{
+				SortGroupClause *ctx_sortcl = (SortGroupClause *)lfirst(lcc);
+
+				if (!equal(ctx_sortcl, sortcl))
+				{
+					info->dqa_group_clause = lappend(info->dqa_group_clause, sortcl);
+				}
+			}
+		}
+
 		dqa_group_exprs = lappend(dqa_group_exprs, arg_tle->expr);
 	}
 
-	info->dqa_group_clause = list_concat(list_copy(root->parse->groupClause),
+	info->dqa_group_clause = list_concat(list_copy(ctx->groupClause),
 										 info->dqa_group_clause);
 
 	/*
@@ -2076,6 +2930,64 @@ fetch_single_dqa_info(PlannerInfo *root,
 												   dqa_group_exprs,
 												   num_total_input_rows,
 												   NULL);
+}
+
+/*
+ * fetch_partial_target_info
+ *
+ * Fetch partial target for dqa_withagg aggregate.
+ * partial target consist of Distinct column and non-distinct agg column
+ * we also call these partial target as intermediate target as below
+ */
+static void
+fetch_partial_target_info(cdb_agg_planning_context *ctx,
+					    cdb_dqas_info *info)
+{
+	int idx = 0;
+	ListCell *lc = NULL;
+	PathTarget *intermediate_target = NULL;
+	PathTarget *partial_target = ctx->partial_grouping_target;
+
+	if (ctx->type == MULTI_DQAS_WITHAGG)
+		intermediate_target = copy_pathtarget(info->tup_split_target);
+	else if (ctx->type == SINGLE_DQA_WITHAGG)
+		intermediate_target = copy_pathtarget(info->input_proj_target);
+	else
+		elog(ERROR, "only DQA_WITHAGG strategy acceptable as generating intermediate targetlist");
+
+	/* 
+	 * Construct intermidate target which consist of subtarget and 
+	 * partial aggregate target.
+	 */
+	foreach(lc, partial_target->exprs)
+	{
+		Expr *expr = (Expr *)lfirst(lc);
+
+		if(!is_normal_agg((Node *)expr))
+			continue;
+
+		add_column_to_pathtarget(intermediate_target, expr, 0);
+	}
+
+	/*
+	 * Check unexpected type column in targetlist
+	 */
+	foreach_with_count(lc, intermediate_target->exprs, idx)
+	{
+		Expr	*expr = (Expr *) lfirst(lc);
+		Index	sgref = get_pathtarget_sortgroupref(intermediate_target, idx);
+
+		if (!sgref)
+		{
+			if (IsA(expr, Var) || IsA(expr, Aggref) || IsA(expr, AggExprId))
+				continue;
+			else
+				elog(ERROR, "unrecognized node %d when add intermedate target.", expr->type);
+		}
+	}
+
+	info->partial_target = intermediate_target;
+	return;
 }
 
 /*

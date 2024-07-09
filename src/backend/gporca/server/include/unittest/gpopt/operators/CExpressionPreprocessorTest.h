@@ -32,8 +32,7 @@ class CExpressionPreprocessorTest
 {
 private:
 	// shorthand for functions for generating the expression for unnest test
-	typedef CExpression *(FnPexprUnnestTestCase)(CMemoryPool *mp,
-												 CExpression *pexpr);
+	using FnPexprUnnestTestCase = CExpression *(CMemoryPool *, CExpression *);
 
 	// unnest scalar subqueries test cases
 	struct SUnnestSubqueriesTestCase
@@ -83,7 +82,6 @@ private:
 	static GPOS_RESULT EresCheckQuantifiedSubqueryType(
 		CExpression *pexpr, COperator::EOperatorId eopidPresent);
 
-#ifdef GPOS_DEBUG
 	// check if a given expression has no Outer Join nodes
 	static BOOL FHasNoOuterJoin(CExpression *pexpr);
 
@@ -95,8 +93,6 @@ private:
 
 	// check if a given expression has IS DISTINCT FROM nodes
 	static BOOL FHasIDF(CExpression *pexpr);
-
-#endif	// GPOS_DEBUG
 
 	// create a conjunction of comparisons using the given columns
 	static CExpression *PexprCreateConjunction(CMemoryPool *mp,
@@ -159,7 +155,6 @@ public:
 	static GPOS_RESULT EresUnittest_PreProcessWindowFunc();
 	static GPOS_RESULT EresUnittest_PreProcessWindowFuncWithLOJ();
 	static GPOS_RESULT EresUnittest_PreProcessWindowFuncWithOuterRefs();
-	static GPOS_RESULT EresUnittest_PreProcessWindowFuncWithDistinctAggs();
 	static GPOS_RESULT EresUnittest_PreProcessNestedScalarSubqueries();
 	static GPOS_RESULT EresUnittest_UnnestSubqueries();
 	static GPOS_RESULT EresUnittest_PreProcessOuterJoin();

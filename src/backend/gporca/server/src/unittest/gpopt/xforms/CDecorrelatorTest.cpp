@@ -62,7 +62,7 @@ CDecorrelatorTest::EresUnittest_Decorrelate()
 	CMDAccessor mda(mp, CMDCache::Pcache(), CTestUtils::m_sysidDefault, pmdp);
 
 	// test cases
-	typedef CExpression *(*Pfpexpr)(CMemoryPool *);
+	using Pfpexpr = CExpression *(*) (CMemoryPool *);
 	Pfpexpr rgpf[] = {CTestUtils::PexprLogicalGbAggCorrelated,
 					  CTestUtils::PexprLogicalSelectCorrelated,
 					  CTestUtils::PexprLogicalJoinCorrelated,
@@ -86,12 +86,10 @@ CDecorrelatorTest::EresUnittest_Decorrelate()
 		CExpression *pexprResult = nullptr;
 		CExpressionArray *pdrgpexpr = GPOS_NEW(mp) CExpressionArray(mp);
 		CColRefSet *outerRefs = pexpr->DeriveOuterReferences();
-#ifdef GPOS_DEBUG
 		BOOL fSuccess =
-#endif	// GPOS_DEBUG
 			CDecorrelator::FProcess(mp, pexpr, false /*fEqualityOnly*/,
 									&pexprResult, pdrgpexpr, outerRefs);
-		GPOS_ASSERT(fSuccess);
+		GPOS_UNITTEST_ASSERT(fSuccess);
 
 		// convert residuals into one single conjunct
 		CExpression *pexprResidual =

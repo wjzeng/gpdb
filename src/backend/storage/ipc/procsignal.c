@@ -18,19 +18,19 @@
 #include <unistd.h>
 
 #include "access/parallel.h"
+#include "cdb/cdbvars.h"
 #include "commands/async.h"
 #include "miscadmin.h"
 #include "replication/walsender.h"
-#include "storage/latch.h"
 #include "storage/ipc.h"
+#include "storage/latch.h"
 #include "storage/latch.h"
 #include "storage/proc.h"
 #include "storage/shmem.h"
 #include "storage/sinval.h"
 #include "tcop/tcopprot.h"
+#include "utils/memutils.h"
 #include "utils/resgroup.h"
-
-#include "cdb/cdbvars.h"
 
 /*
  * The SIGUSR1 signal is multiplexed to support signalling multiple event
@@ -287,17 +287,14 @@ procsignal_sigusr1_handler(SIGNAL_ARGS)
 	if (CheckProcSignal(PROCSIG_NOTIFY_INTERRUPT))
 		HandleNotifyInterrupt();
 
-	if (CheckProcSignal(PROCSIG_QUERY_FINISH))
-		QueryFinishHandler();
-
-	if (CheckProcSignal(PROCSIG_WALSND_INIT_STOPPING))
-		HandleWalSndInitStopping();
-
 	if (CheckProcSignal(PROCSIG_PARALLEL_MESSAGE))
 		HandleParallelMessageInterrupt();
 
 	if (CheckProcSignal(PROCSIG_WALSND_INIT_STOPPING))
 		HandleWalSndInitStopping();
+
+	if (CheckProcSignal(PROCSIG_LOG_MEMORY_CONTEXT))
+		HandleLogMemoryContextInterrupt();
 
 	if (CheckProcSignal(PROCSIG_RECOVERY_CONFLICT_DATABASE))
 		RecoveryConflictInterrupt(PROCSIG_RECOVERY_CONFLICT_DATABASE);
@@ -316,6 +313,9 @@ procsignal_sigusr1_handler(SIGNAL_ARGS)
 
 	if (CheckProcSignal(PROCSIG_RECOVERY_CONFLICT_BUFFERPIN))
 		RecoveryConflictInterrupt(PROCSIG_RECOVERY_CONFLICT_BUFFERPIN);
+
+	if (CheckProcSignal(PROCSIG_QUERY_FINISH))
+		QueryFinishHandler();
 
 	if (CheckProcSignal(PROCSIG_RESOURCE_GROUP_MOVE_QUERY))
 		HandleMoveResourceGroup();

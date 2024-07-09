@@ -19,8 +19,9 @@
 #ifndef CDBVARS_H
 #define CDBVARS_H
 
+#include "access/xlog.h"  /*RecoveryInProgress*/
 #include "access/xlogdefs.h"  /*XLogRecPtr*/
-#include "catalog/gp_segment_configuration.h" /* MASTER_CONTENT_ID */
+#include "catalog/gp_segment_configuration.h" /* COORDINATOR_CONTENT_ID */
 
 /*
  * ----- Declarations of Greenplum-specific global variables ------
@@ -31,6 +32,7 @@
 #ifndef PRIO_MAX
 #define PRIO_MAX 20
 #endif
+
 /*
  * Parameters gp_role
  *
@@ -121,6 +123,9 @@ extern int			gp_reject_percent_threshold;
  */
 extern bool           gp_select_invisible;
 
+/* Detect if the current partitioning of the table or data distribution is correct */
+extern bool			gp_detect_data_correctness;
+
 /*
  * Used to set the maximum length of the current query which is displayed
  * when the user queries pg_stat_activty table.
@@ -204,21 +209,6 @@ extern bool verify_gpfdists_cert;
 extern int gp_command_count;
 
 /*
- * gp_safefswritesize
- *
- * should only be set to <N bytes> on file systems that the so called
- * 'torn-write' problem may occur. This guc should be set for the minimum
- * write size that is always safe on this particular file system. The side
- * effect of increasing this value for torn write protection is that single row
- * INSERTs into append only tables will use <N bytes> of space and therefore
- * also slow down SELECTs and become strongly discouraged.
- *
- * On mature file systems where torn write may not occur this GUC should be
- * set to 0 (the default).
- */
-extern int gp_safefswritesize;
-
-/*
  * Gp_write_shared_snapshot
  *
  * The value of this variable is actually meaningless. We use it simply
@@ -247,13 +237,22 @@ extern int	gp_snapshotadd_timeout; /* GUC var - timeout specifier for snapshot-c
 extern int	gp_fts_probe_retries; /* GUC var - specifies probe number of retries for FTS */
 extern int	gp_fts_probe_timeout; /* GUC var - specifies probe timeout for FTS */
 extern int	gp_fts_probe_interval; /* GUC var - specifies polling interval for FTS */
-extern int gp_fts_mark_mirror_down_grace_period;
+extern int	gp_fts_mark_mirror_down_grace_period;
 extern int	gp_fts_replication_attempt_count; /* GUC var - specifies replication max attempt count for FTS */
-extern int  gp_dtx_recovery_interval;
-extern int  gp_dtx_recovery_prepared_period;
+extern int	gp_dtx_recovery_interval;
+extern int	gp_dtx_recovery_prepared_period;
 
 extern int gp_gang_creation_retry_count; /* How many retries ? */
 extern int gp_gang_creation_retry_timer; /* How long between retries */
+
+/* GUCs to control TCP keepalive settings for dispatch libpq connections */
+extern int 			gp_dispatch_keepalives_idle;
+extern int			gp_dispatch_keepalives_interval;
+extern int			gp_dispatch_keepalives_count;
+
+#define MAX_GP_DISPATCH_KEEPALIVES_IDLE 32767 /* Linux MAX_TCP_KEEPIDLE */
+#define MAX_GP_DISPATCH_KEEPALIVES_INTERVAL 32767 /* Linux MAX_TCP_KEEPINTVL */
+#define MAX_GP_DISPATCH_KEEPALIVES_COUNT 127 /* Linux MAX_TCP_KEEPCNT */
 
 /*
  * Parameter Gp_max_packet_size
@@ -287,6 +286,42 @@ typedef enum GpVars_Interconnect_Type
 
 extern int Gp_interconnect_type;
 
+/*
+ * We support different strategies for address binding for sockets used for
+ * motion communication over the interconnect.
+ *
+ * One approach is to use an unicast address, specifically the segment's
+ * gp_segment_configuration.address field to perform the address binding. This
+ * has the benefits of reducing port usage on a segment host and ensures that
+ * the NIC backed by the address field is the only one used for communication
+ * (and not an externally facing slower NIC, like the ones that typically back
+ * the gp_segment_configuration.hostname field)
+ *
+ * In some cases, inter-segment communication using the unicast address
+ * mentioned above, may not be possible. One such example is if the source
+ * segment's address field and the destination segment's address field are on
+ * different subnets and/or existing routing rules don't allow for such
+ * communication. In these cases, using a wildcard address for address binding
+ * is the only available fallback, enabling the use of any network interface
+ * compliant with routing rules.
+ */
+typedef enum GpVars_Interconnect_Address_Type
+{
+	INTERCONNECT_ADDRESS_TYPE_UNICAST = 0,
+	INTERCONNECT_ADDRESS_TYPE_WILDCARD
+} GpVars_Interconnect_Address_Type;
+
+extern int Gp_interconnect_address_type;
+
+typedef enum GpVars_Postmaster_Address_Family_Type
+{
+	POSTMASTER_ADDRESS_FAMILY_TYPE_AUTO = 0,
+	POSTMASTER_ADDRESS_FAMILY_TYPE_IPV4 = 1,
+	POSTMASTER_ADDRESS_FAMILY_TYPE_IPV6 = 2,
+} GpVars_Postmaster_Address_Family_Type;
+
+extern int Gp_postmaster_address_family_type;
+
 extern char *gp_interconnect_proxy_addresses;
 
 typedef enum GpVars_Interconnect_Method
@@ -319,6 +354,16 @@ extern int	Gp_interconnect_queue_depth;
  *
  */
 extern int	Gp_interconnect_snd_queue_depth;
+
+/*
+ * Cursor IC table size.
+ *
+ * For cursor case, there may be several concurrent interconnect
+ * instances on QD. The table is used to track the status of the
+ * instances, which is quite useful for "ACK the past and NAK the future" paradigm.
+ *
+ */
+extern int  Gp_interconnect_cursor_ic_table_size;
 extern int	Gp_interconnect_timer_period;
 extern int	Gp_interconnect_timer_checking_period;
 extern int	Gp_interconnect_default_rtt;
@@ -502,7 +547,6 @@ extern bool gp_adjust_selectivity_for_outerjoins;
  * Target density for hash-node (HJ).
  */
 extern int gp_hashjoin_tuples_per_bucket;
-extern int gp_hashagg_groups_per_bucket;
 
 /*
  * Damping of selectivities of clauses which pertain to the same base
@@ -580,15 +624,10 @@ extern int explain_memory_verbosity;
  */
 extern bool gp_enable_sort_limit;
 
-/* May Greenplum discard duplicate rows in sort if it is is wrapped by a
- * DISTINCT clause (unique aggregation operator)?
- *
- * The code does not currently use planner estimates for this.  If enabled,
- * the tactic is used whenever possible.
- *
- * GPDB_12_MERGE_FIXME: Resurrect this
+/*
+ * May planner consider regular Index Scans on append-optimized tables?
  */
-extern bool gp_enable_sort_distinct;
+extern bool gp_enable_ao_indexscan;
 
 extern bool trace_sort;
 
@@ -611,11 +650,6 @@ extern int gp_segworker_relative_priority;
 /*  Max size of dispatched plans; 0 if no limit */
 extern int gp_max_plan_size;
 
-/* The default number of batches to use when the hybrid hashed aggregation
- * algorithm (re-)spills in-memory groups to disk.
- */
-extern int gp_hashagg_default_nbatches;
-
 /* Get statistics for partitioned parent from a child */
 extern bool 	gp_statistics_pullup_from_child_partition;
 
@@ -624,6 +658,9 @@ extern bool		gp_statistics_use_fkeys;
 
 /* Allow user to force tow stage agg */
 extern bool     gp_eager_two_phase_agg;
+
+/* Force redistribution of insert into randomly-distributed table */
+extern bool     gp_force_random_redistribution;
 
 /* Analyze tools */
 extern int gp_motion_slice_noop;
@@ -640,6 +677,7 @@ extern bool dml_ignore_target_partition_check;
 extern int gp_workfile_limit_per_segment;
 extern int gp_workfile_limit_per_query;
 extern int gp_workfile_limit_files_per_query;
+extern int gp_workfile_compression_overhead_limit;
 extern int gp_workfile_caching_loglevel;
 extern int gp_sessionstate_loglevel;
 extern int gp_workfile_bytes_to_checksum;
@@ -660,10 +698,14 @@ typedef enum
 									 * insert if no stats are present */
 } GpAutoStatsModeValue;
 
+extern bool	gp_autostats_lock_wait;
 extern int	gp_autostats_mode;
 extern int	gp_autostats_mode_in_functions;
 extern int	gp_autostats_on_change_threshold;
+extern bool	gp_autostats_allow_nonowner;
 extern bool	log_autostats;
+
+extern bool	gp_explain_jit;
 
 
 /* --------------------------------------------------------------------------------------------------
@@ -712,9 +754,11 @@ extern GpId GpIdentity;
 #define MAX_DBID_STRING_LENGTH  11
 
 #define UNINITIALIZED_GP_IDENTITY_VALUE (-10000)
-#define IS_QUERY_DISPATCHER() (GpIdentity.segindex == MASTER_CONTENT_ID)
+#define IS_QUERY_DISPATCHER() (GpIdentity.segindex == COORDINATOR_CONTENT_ID)
+#define IS_HOT_STANDBY_QD() (EnableHotStandby && IS_QUERY_DISPATCHER() && RecoveryInProgress())
 
 #define IS_QUERY_EXECUTOR_BACKEND() (Gp_role == GP_ROLE_EXECUTE && gp_session_id > 0)
+#define IS_HOT_STANDBY_QE() (EnableHotStandby && IS_QUERY_EXECUTOR_BACKEND() && RecoveryInProgress())
 
 /* Stores the listener port that this process uses to listen for incoming
  * Interconnect connections from other Motion nodes.
@@ -734,5 +778,14 @@ extern bool gp_create_table_random_default_distribution;
 
 /* Functions in guc_gp.c to lookup values in enum GUCs */
 extern const char * lookup_autostats_mode_by_value(GpAutoStatsModeValue val);
+
+/* notification condition name of next value, used in PGnotify */
+#define CDB_NOTIFY_NEXTVAL "nextval"
+
+/*
+ * notification condition name of endpoint ack information. Used in PGnotify
+ * for parallel retrieve cursor.
+ */
+#define CDB_NOTIFY_ENDPOINT_ACK "ack_notify"
 
 #endif   /* CDBVARS_H */

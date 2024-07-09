@@ -36,7 +36,8 @@ using namespace gpopt;
 //		Ctor
 //
 //---------------------------------------------------------------------------
-CPhysicalJoin::CPhysicalJoin(CMemoryPool *mp) : CPhysical(mp)
+CPhysicalJoin::CPhysicalJoin(CMemoryPool *mp, CXform::EXformId origin_xform)
+	: CPhysical(mp), m_origin_xform(origin_xform)
 {
 }
 
@@ -286,6 +287,19 @@ CPhysicalJoin::Ped(CMemoryPool *mp, CExpressionHandle &exprhdl,
 				dmatch);
 		}
 
+		if ((GPOS_FTRACE(EopttraceEnableRedistributeNLLOJInnerChild) &&
+			 this->Eopid() == COperator::EopPhysicalLeftOuterNLJoin))
+		{
+			CEnfdDistribution *pEnfdHashedDistribution =
+				CPhysicalJoin::PedInnerHashedFromOuterHashed(
+					mp, exprhdl, dmatch, (*pdrgpdpCtxt)[0]);
+			if (pEnfdHashedDistribution)
+			{
+				return pEnfdHashedDistribution;
+			}
+		}
+
+
 		// otherwise, require inner child to be replicated
 		return GPOS_NEW(mp) CEnfdDistribution(
 			GPOS_NEW(mp)
@@ -296,6 +310,87 @@ CPhysicalJoin::Ped(CMemoryPool *mp, CExpressionHandle &exprhdl,
 	// no distribution requirement on the outer side
 	return GPOS_NEW(mp) CEnfdDistribution(
 		GPOS_NEW(mp) CDistributionSpecAny(this->Eopid()), dmatch);
+}
+
+CEnfdDistribution *
+CPhysicalJoin::PedInnerHashedFromOuterHashed(
+	CMemoryPool *mp, CExpressionHandle &exprhdl,
+	CEnfdDistribution::EDistributionMatching dmatch, CDrvdProp *outerDrvdProp)
+{
+	// compute a matching distribution based on derived distribution of outer child
+	CDistributionSpec *pdsOuter = CDrvdPropPlan::Pdpplan(outerDrvdProp)->Pds();
+	if (CDistributionSpec::EdtHashed == pdsOuter->Edt())
+	{
+		// require inner child to have matching hashed distribution
+		CExpression *pexprScPredicate =
+			exprhdl.PexprScalarExactChild(2, true /*error_on_null_return*/);
+
+		CExpressionArray *pdrgpexpr =
+			CPredicateUtils::PdrgpexprConjuncts(mp, pexprScPredicate);
+
+		CExpressionArray *pdrgpexprMatching = GPOS_NEW(mp) CExpressionArray(mp);
+		CDistributionSpecHashed *pdshashed =
+			CDistributionSpecHashed::PdsConvert(pdsOuter);
+		CExpressionArray *pdrgpexprHashed = pdshashed->Pdrgpexpr();
+		const ULONG ulSize = pdrgpexprHashed->Size();
+
+		BOOL fSuccess = true;
+		for (ULONG ul = 0; fSuccess && ul < ulSize; ul++)
+		{
+			CExpression *pexpr = (*pdrgpexprHashed)[ul];
+			// get matching expression from predicate for the corresponding outer child
+			// to create CDistributionSpecHashed for inner child
+			CExpression *pexprMatching =
+				CUtils::PexprMatchEqualityOrINDF(pexpr, pdrgpexpr);
+			fSuccess = (nullptr != pexprMatching &&
+						CUtils::FScalarIdent(pexprMatching));
+			if (fSuccess)
+			{
+				IMDId *pmdidTypeInner =
+					CScalar::PopConvert(pexprMatching->Pop())->MdidType();
+
+				IMDId *pmdidTypeOuter =
+					CScalar::PopConvert(pexpr->Pop())->MdidType();
+
+				CMDAccessor *mdAccessor = COptCtxt::PoctxtFromTLS()->Pmda();
+
+				IMDId *mdidOpfamilyInner =
+					mdAccessor->RetrieveType(pmdidTypeInner)
+						->GetDistrOpfamilyMdid();
+
+				IMDId *mdidOpfamilyOuter =
+					mdAccessor->RetrieveType(pmdidTypeOuter)
+						->GetDistrOpfamilyMdid();
+
+				if (mdidOpfamilyOuter->Equals(mdidOpfamilyInner) &&
+					mdAccessor->RetrieveType(pmdidTypeInner)->IsHashable())
+				{
+					pexprMatching->AddRef();
+					pdrgpexprMatching->Append(pexprMatching);
+				}
+				else
+				{
+					fSuccess = false;
+				}
+			}
+		}
+		pdrgpexpr->Release();
+
+		if (fSuccess)
+		{
+			GPOS_ASSERT(pdrgpexprMatching->Size() == pdrgpexprHashed->Size());
+
+			// create a matching hashed distribution request
+			BOOL fNullsColocated = pdshashed->FNullsColocated();
+			CDistributionSpecHashed *pdshashedEquiv = GPOS_NEW(mp)
+				CDistributionSpecHashed(pdrgpexprMatching, fNullsColocated);
+			pdshashedEquiv->ComputeEquivHashExprs(mp, exprhdl);
+			return GPOS_NEW(mp) CEnfdDistribution(pdshashedEquiv, dmatch);
+		}
+		pdrgpexprMatching->Release();
+	}
+
+	return nullptr;
 }
 
 
@@ -324,10 +419,13 @@ CPhysicalJoin::PdsDerive(CMemoryPool *mp, CExpressionHandle &exprhdl) const
 
 	CDistributionSpec *pds;
 
-	if (CDistributionSpec::EdtStrictReplicated == pdsOuter->Edt() ||
-		CDistributionSpec::EdtUniversal == pdsOuter->Edt())
+	if ((CDistributionSpec::EdtStrictReplicated == pdsOuter->Edt() ||
+		 CDistributionSpec::EdtTaintedReplicated == pdsOuter->Edt() ||
+		 CDistributionSpec::EdtUniversal == pdsOuter->Edt()) &&
+		CDistributionSpec::EdtUniversal != pdsInner->Edt())
 	{
-		// if outer is replicated/universal, return inner distribution
+		// if outer is replicated/universal and inner is not universal
+		// then return inner distribution
 		pds = pdsInner;
 	}
 	else
@@ -346,9 +444,15 @@ CPhysicalJoin::PdsDerive(CMemoryPool *mp, CExpressionHandle &exprhdl) const
 		if (!pdsHashed->HasCompleteEquivSpec(mp))
 		{
 			CExpressionArray *pdrgpexpr = pdsHashed->Pdrgpexpr();
+			IMdIdArray *opfamilies = pdsHashed->Opfamilies();
+
+			if (nullptr != opfamilies)
+			{
+				opfamilies->AddRef();
+			}
 			pdrgpexpr->AddRef();
 			return GPOS_NEW(mp) CDistributionSpecHashed(
-				pdrgpexpr, pdsHashed->FNullsColocated());
+				pdrgpexpr, pdsHashed->FNullsColocated(), opfamilies);
 		}
 	}
 
@@ -531,6 +635,20 @@ CPhysicalJoin::FHashJoinCompatible(
 		nullptr == scop->HashOpfamilyMdid())
 	{
 		return false;
+	}
+
+	// This check is mainly added for RANGE TYPES; RANGE's are treated as
+	// containers and whether a range type can support hashing is decided
+	// based on hashing support of its subtype
+	if (COperator::EopScalarCast == pexprPredOuter->Pop()->Eopid())
+	{
+		pmdidTypeOuter =
+			CScalar::PopConvert((*pexprPredOuter)[0]->Pop())->MdidType();
+	}
+	if (COperator::EopScalarCast == pexprPredInner->Pop()->Eopid())
+	{
+		pmdidTypeInner =
+			CScalar::PopConvert((*pexprPredInner)[0]->Pop())->MdidType();
 	}
 
 	if (md_accessor->RetrieveType(pmdidTypeOuter)->IsHashable() &&

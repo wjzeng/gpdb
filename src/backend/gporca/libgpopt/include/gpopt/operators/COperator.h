@@ -20,6 +20,7 @@
 #include "gpopt/base/CFunctionProp.h"
 #include "gpopt/base/CReqdPropPlan.h"
 #include "gpopt/base/CReqdPropRelational.h"
+#include "gpopt/metadata/CTableDescriptor.h"
 
 namespace gpopt
 {
@@ -31,12 +32,12 @@ class CReqdPropPlan;
 class CReqdPropRelational;
 
 // dynamic array for operators
-typedef CDynamicPtrArray<COperator, CleanupRelease> COperatorArray;
+using COperatorArray = CDynamicPtrArray<COperator, CleanupRelease>;
 
 // hash map mapping CColRef -> CColRef
-typedef CHashMap<CColRef, CColRef, CColRef::HashValue, CColRef::Equals,
-				 CleanupNULL<CColRef>, CleanupNULL<CColRef> >
-	ColRefToColRefMap;
+using ColRefToColRefMap =
+	CHashMap<CColRef, CColRef, CColRef::HashValue, CColRef::Equals,
+			 CleanupNULL<CColRef>, CleanupNULL<CColRef>>;
 
 //---------------------------------------------------------------------------
 //	@class:
@@ -63,10 +64,6 @@ protected:
 	// return an addref'ed copy of the operator
 	virtual COperator *PopCopyDefault();
 
-	// derive data access function property from children
-	static IMDFunction::EFuncDataAcc EfdaDeriveFromChildren(
-		CExpressionHandle &exprhdl, IMDFunction::EFuncDataAcc efdaDefault);
-
 	// derive stability function property from children
 	static IMDFunction::EFuncStbl EfsDeriveFromChildren(
 		CExpressionHandle &exprhdl, IMDFunction::EFuncStbl efsDefault);
@@ -74,8 +71,7 @@ protected:
 	// derive function properties from children
 	static CFunctionProp *PfpDeriveFromChildren(
 		CMemoryPool *mp, CExpressionHandle &exprhdl,
-		IMDFunction::EFuncStbl efsDefault,
-		IMDFunction::EFuncDataAcc efdaDefault, BOOL fHasVolatileFunctionScan,
+		IMDFunction::EFuncStbl efsDefault, BOOL fHasVolatileFunctionScan,
 		BOOL fScan);
 
 	// generate unique operator ids
@@ -88,7 +84,7 @@ public:
 	enum EOperatorId
 	{
 		EopLogicalGet,
-		EopLogicalExternalGet,
+		EopLogicalForeignGet,
 		EopLogicalIndexGet,
 		EopLogicalBitmapTableGet,
 		EopLogicalSelect,
@@ -138,7 +134,6 @@ public:
 		EopLogicalUpdate,
 		EopLogicalDML,
 		EopLogicalSplit,
-		EopLogicalRowTrigger,
 		EopLogicalPartitionSelector,
 		EopLogicalAssert,
 		EopLogicalMaxOneRow,
@@ -146,6 +141,7 @@ public:
 		EopScalarCmp,
 		EopScalarIsDistinctFrom,
 		EopScalarIdent,
+		EopScalarParam,
 		EopScalarProjectElement,
 		EopScalarProjectList,
 		EopScalarNAryJoinPredList,
@@ -172,10 +168,12 @@ public:
 		EopScalarArrayCmp,
 		EopScalarArrayRef,
 		EopScalarArrayRefIndexList,
+		EopScalarValuesList,
 
 		EopScalarAssertConstraintList,
 		EopScalarAssertConstraint,
 
+		EopScalarSortGroupClause,
 		EopScalarSubquery,
 		EopScalarSubqueryAny,
 		EopScalarSubqueryAll,
@@ -187,8 +185,10 @@ public:
 		EopScalarBitmapIndexProbe,
 		EopScalarBitmapBoolOp,
 
+		EopScalarFieldSelect,
+
 		EopPhysicalTableScan,
-		EopPhysicalExternalScan,
+		EopPhysicalForeignScan,
 		EopPhysicalIndexScan,
 		EopPhysicalIndexOnlyScan,
 		EopPhysicalBitmapTableScan,
@@ -221,6 +221,7 @@ public:
 		EopPhysicalLeftAntiSemiHashJoin,
 		EopPhysicalLeftAntiSemiHashJoinNotIn,
 		EopPhysicalRightOuterHashJoin,
+		EopPhysicalFullHashJoin,
 
 		EopPhysicalMotionGather,
 		EopPhysicalMotionBroadcast,
@@ -242,13 +243,11 @@ public:
 		EopPhysicalComputeScalar,
 		EopPhysicalSpool,
 		EopPhysicalPartitionSelector,
-		EopPhysicalPartitionSelectorDML,
 
 		EopPhysicalConstTableGet,
 
 		EopPhysicalDML,
 		EopPhysicalSplit,
-		EopPhysicalRowTrigger,
 
 		EopPhysicalAssert,
 
@@ -261,6 +260,12 @@ public:
 		EopLogicalDynamicBitmapTableGet,
 		EopPhysicalDynamicBitmapTableScan,
 
+		EopLogicalDynamicForeignGet,
+		EopPhysicalDynamicForeignScan,
+		EopPhysicalDynamicIndexOnlyScan,
+
+		EopLogicalIndexOnlyGet,
+		EopLogicalDynamicIndexOnlyGet,
 		EopSentinel
 	};
 
@@ -351,6 +356,9 @@ public:
 	// return a copy of the operator with remapped columns
 	virtual COperator *PopCopyWithRemappedColumns(
 		CMemoryPool *mp, UlongToColRefMap *colref_mapping, BOOL must_exist) = 0;
+
+	virtual CTableDescriptorHashSet *DeriveTableDescriptor(
+		CMemoryPool *mp, CExpressionHandle &exprhdl) const;
 
 	// print
 	virtual IOstream &OsPrint(IOstream &os) const;

@@ -1,3 +1,7 @@
+-- start_matchsubs
+-- m/\(cost=.*\)/
+-- s/\(cost=.*\)//
+-- end_matchsubs
 create table cost_agg_t1(a int, b int, c int);
 insert into cost_agg_t1 select i, random() * 99999, i % 2000 from generate_series(1, 1000000) i;
 create table cost_agg_t2 as select * from cost_agg_t1 with no data;
@@ -47,3 +51,24 @@ set gp_eager_two_phase_agg = on;
 explain (costs off) select b, sum(a) from t_planner_force_multi_stage group by b;
 reset gp_eager_two_phase_agg;
 drop table t_planner_force_multi_stage;
+
+-- Test user-defined aggregate marked safe to execute on replicated slices without motion
+CREATE AGGREGATE my_unsafe_avg (float8)
+(
+    sfunc = float8_accum,
+    stype = float8[],
+    finalfunc = float8_avg,
+    initcond = '{0,0,0}'
+);
+CREATE AGGREGATE my_safe_avg (float8)
+(
+    sfunc = float8_accum,
+    stype = float8[],
+    finalfunc = float8_avg,
+    initcond = '{0,0,0}',
+    repsafe = true
+);
+CREATE TABLE a_reptable (a int) DISTRIBUTED REPLICATED;
+CREATE TABLE b_reptable (b int) DISTRIBUTED REPLICATED;
+EXPLAIN INSERT INTO a_reptable(a) SELECT my_unsafe_avg(b) FROM b_reptable;
+EXPLAIN INSERT INTO a_reptable(a) SELECT my_safe_avg(b) FROM b_reptable;

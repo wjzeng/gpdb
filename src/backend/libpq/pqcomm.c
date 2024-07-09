@@ -69,6 +69,9 @@
 #include "postgres.h"
 #include <pthread.h>
 
+#ifdef HAVE_POLL_H
+#include <poll.h>
+#endif
 #include <signal.h>
 #include <fcntl.h>
 #include <grp.h>
@@ -278,29 +281,26 @@ socket_close(int code, Datum arg)
 	/* Nothing to do in a standalone backend, where MyProcPort is NULL. */
 	if (MyProcPort != NULL)
 	{
-#if defined(ENABLE_GSS) || defined(ENABLE_SSPI)
 #ifdef ENABLE_GSS
-		OM_uint32	min_s;
-
 		/*
 		 * Shutdown GSSAPI layer.  This section does nothing when interrupting
 		 * BackendInitialize(), because pg_GSS_recvauth() makes first use of
 		 * "ctx" and "cred".
+		 *
+		 * Note that we don't bother to free MyProcPort->gss, since we're
+		 * about to exit anyway.
 		 */
-		if (MyProcPort->gss->ctx != GSS_C_NO_CONTEXT)
-			gss_delete_sec_context(&min_s, &MyProcPort->gss->ctx, NULL);
+		if (MyProcPort->gss)
+		{
+			OM_uint32	min_s;
 
-		if (MyProcPort->gss->cred != GSS_C_NO_CREDENTIAL)
-			gss_release_cred(&min_s, &MyProcPort->gss->cred);
+			if (MyProcPort->gss->ctx != GSS_C_NO_CONTEXT)
+				gss_delete_sec_context(&min_s, &MyProcPort->gss->ctx, NULL);
+
+			if (MyProcPort->gss->cred != GSS_C_NO_CREDENTIAL)
+				gss_release_cred(&min_s, &MyProcPort->gss->cred);
+		}
 #endif							/* ENABLE_GSS */
-
-		/*
-		 * GSS and SSPI share the port->gss struct.  Since nowhere else does a
-		 * postmaster child free this, doing so is safe when interrupting
-		 * BackendInitialize().
-		 */
-		free(MyProcPort->gss);
-#endif							/* ENABLE_GSS || ENABLE_SSPI */
 
 		/*
 		 * Cleanly shut down SSL layer.  Nowhere else does a postmaster child
@@ -423,6 +423,17 @@ StreamServerPort(int family, char *hostName, unsigned short portNumber,
 	{
 		snprintf(portNumberStr, sizeof(portNumberStr), "%d", portNumber);
 		service = portNumberStr;
+		if (Gp_postmaster_address_family_type == POSTMASTER_ADDRESS_FAMILY_TYPE_IPV4)
+			hint.ai_family = AF_INET;
+		else if (Gp_postmaster_address_family_type == POSTMASTER_ADDRESS_FAMILY_TYPE_IPV6)
+			hint.ai_family = AF_INET6;
+		else if (Gp_postmaster_address_family_type)
+		{
+			ereport(LOG,
+					(errmsg("Unknown gp_postmaster_address_family: %d",
+							Gp_postmaster_address_family_type)));
+			return STATUS_ERROR;
+		}
 	}
 
 	ret = pg_getaddrinfo_all(hostName, service, &hint, &addrs);
@@ -745,8 +756,8 @@ Setup_AF_UNIX(char *sock_path)
  *		server port.  Set port->sock to the FD of the new connection.
  *
  * ASSUME: that this doesn't need to be non-blocking because
- *		the Postmaster uses select() to tell when the server master
- *		socket is ready for accept().
+ *		the Postmaster uses select() to tell when the socket is ready for
+ *		accept().
  *
  * RETURNS: STATUS_OK or STATUS_ERROR
  */
@@ -785,7 +796,7 @@ StreamConnection(pgsocket server_fd, Port *port)
 	}
 
 	/* 
-	 * Set a send timeout on the socket if specified, on the master only
+	 * Set a send timeout on the socket if specified, on the coordinator only
 	 * Solaris doesn't support setting SO_SNDTIMEO, so setting this won't work on Solaris (MPP-22526) 
 	 */ 
 	if (IS_QUERY_DISPATCHER() && gp_connection_send_timeout > 0)
@@ -1314,6 +1325,18 @@ pq_getstring(StringInfo s)
 							   PqRecvLength - PqRecvPointer);
 		PqRecvPointer = PqRecvLength;
 	}
+}
+
+/* --------------------------------
+ *		pq_buffer_has_data		- is any buffered data available to read?
+ *
+ * This will *not* attempt to read more data.
+ * --------------------------------
+ */
+bool
+pq_buffer_has_data(void)
+{
+	return (PqRecvPointer < PqRecvLength);
 }
 
 
@@ -2124,4 +2147,54 @@ pq_settcpusertimeout(int timeout, Port *port)
 #endif
 
 	return STATUS_OK;
+}
+
+/*
+ * Check if the client is still connected.
+ */
+bool
+pq_check_connection(void)
+{
+	struct pollfd pollfd;
+	int         rc;
+	short		poll_ev_aux;
+
+#if defined(POLLRDHUP)
+	/*
+	 * POLLRDHUP is a Linux extension to poll(2) to detect sockets closed by the
+	 * other end.
+	 * We don't have a portable way to do that without actually trying to read
+	 * or write data on other systems. We don't want to read because that would
+	 * be confused by pipelined queries and COPY data. Perhaps in future we'll
+	 * try to write a heartbeat message instead.
+	 */
+	poll_ev_aux = POLLRDHUP;
+#elif defined(__darwin__)
+	/*
+	 * OSX is able to detect closed sockets via single POSIX-compliant POLLHUP
+	 * option
+	 */
+	poll_ev_aux = 0;
+#else
+	return true;
+#endif
+
+	pollfd.fd = MyProcPort->sock;
+	pollfd.events = POLLOUT | POLLIN | poll_ev_aux;
+
+	pollfd.revents = 0;
+
+	rc = poll(&pollfd, 1, 0);
+
+	if (rc < 0)
+	{
+		ereport(COMMERROR,
+				(errcode_for_socket_access(),
+				 errmsg("could not poll socket: %m")));
+		return false;
+	}
+	else if (rc == 1 && (pollfd.revents & (POLLHUP | poll_ev_aux)))
+		return false;
+
+	return true;
 }

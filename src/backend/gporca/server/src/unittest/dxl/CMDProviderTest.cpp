@@ -113,15 +113,17 @@ CMDProviderTest::TestMDLookup(CMemoryPool *mp, IMDProvider *pmdp)
 						 CMDCache::Pcache());
 
 	// lookup different objects
-	CMDIdGPDB *pmdid1 = GPOS_NEW(mp) CMDIdGPDB(
-		GPOPT_MDCACHE_TEST_OID, 1 /* major version */, 1 /* minor version */);
-	CMDIdGPDB *pmdid2 = GPOS_NEW(mp) CMDIdGPDB(
-		GPOPT_MDCACHE_TEST_OID, 12 /* version */, 1 /* minor version */);
+	CMDIdGPDB *pmdid1 =
+		GPOS_NEW(mp) CMDIdGPDB(IMDId::EmdidRel, GPOPT_MDCACHE_TEST_OID,
+							   1 /* major version */, 1 /* minor version */);
+	CMDIdGPDB *pmdid2 =
+		GPOS_NEW(mp) CMDIdGPDB(IMDId::EmdidRel, GPOPT_MDCACHE_TEST_OID,
+							   12 /* version */, 1 /* minor version */);
 
 	CWStringBase *pstrMDObject1 = pmdp->GetMDObjDXLStr(mp, amda.Pmda(), pmdid1);
 	CWStringBase *pstrMDObject2 = pmdp->GetMDObjDXLStr(mp, amda.Pmda(), pmdid2);
 
-	GPOS_ASSERT(nullptr != pstrMDObject1 && nullptr != pstrMDObject2);
+	GPOS_UNITTEST_ASSERT(nullptr != pstrMDObject1 && nullptr != pstrMDObject2);
 
 	IMDCacheObject *pimdobj1 =
 		CDXLUtils::ParseDXLToIMDIdCacheObj(mp, pstrMDObject1, nullptr);
@@ -129,8 +131,10 @@ CMDProviderTest::TestMDLookup(CMemoryPool *mp, IMDProvider *pmdp)
 	IMDCacheObject *pimdobj2 =
 		CDXLUtils::ParseDXLToIMDIdCacheObj(mp, pstrMDObject2, nullptr);
 
-	GPOS_ASSERT(nullptr != pimdobj1 && pmdid1->Equals(pimdobj1->MDId()));
-	GPOS_ASSERT(nullptr != pimdobj2 && pmdid2->Equals(pimdobj2->MDId()));
+	GPOS_UNITTEST_ASSERT(nullptr != pimdobj1 &&
+						 pmdid1->Equals(pimdobj1->MDId()));
+	GPOS_UNITTEST_ASSERT(nullptr != pimdobj2 &&
+						 pmdid2->Equals(pimdobj2->MDId()));
 
 	// cleanup
 	pmdid1->Release();
@@ -164,26 +168,27 @@ CMDProviderTest::EresUnittest_Stats()
 							 CMDCache::Pcache());
 
 		// lookup different objects
-		CMDIdRelStats *rel_stats_mdid = GPOS_NEW(mp)
-			CMDIdRelStats(GPOS_NEW(mp) CMDIdGPDB(GPOPT_MDCACHE_TEST_OID, 1, 1));
+		CMDIdRelStats *rel_stats_mdid = GPOS_NEW(mp) CMDIdRelStats(GPOS_NEW(
+			mp) CMDIdGPDB(IMDId::EmdidRel, GPOPT_MDCACHE_TEST_OID, 1, 1));
 
 		CWStringBase *pstrRelStats =
 			pmdpFile->GetMDObjDXLStr(mp, amda.Pmda(), rel_stats_mdid);
-		GPOS_ASSERT(nullptr != pstrRelStats);
+		GPOS_UNITTEST_ASSERT(nullptr != pstrRelStats);
 		IMDCacheObject *pmdobjRelStats =
 			CDXLUtils::ParseDXLToIMDIdCacheObj(mp, pstrRelStats, nullptr);
-		GPOS_ASSERT(nullptr != pmdobjRelStats);
+		GPOS_UNITTEST_ASSERT(nullptr != pmdobjRelStats);
 
-		CMDIdColStats *mdid_col_stats = GPOS_NEW(mp)
-			CMDIdColStats(GPOS_NEW(mp) CMDIdGPDB(GPOPT_MDCACHE_TEST_OID, 1, 1),
-						  1 /* attno */);
+		CMDIdColStats *mdid_col_stats = GPOS_NEW(mp) CMDIdColStats(
+			GPOS_NEW(mp)
+				CMDIdGPDB(IMDId::EmdidRel, GPOPT_MDCACHE_TEST_OID, 1, 1),
+			1 /* attno */);
 
 		CWStringBase *pstrColStats =
 			pmdpFile->GetMDObjDXLStr(mp, amda.Pmda(), mdid_col_stats);
-		GPOS_ASSERT(nullptr != pstrColStats);
+		GPOS_UNITTEST_ASSERT(nullptr != pstrColStats);
 		IMDCacheObject *pmdobjColStats =
 			CDXLUtils::ParseDXLToIMDIdCacheObj(mp, pstrColStats, nullptr);
-		GPOS_ASSERT(nullptr != pmdobjColStats);
+		GPOS_UNITTEST_ASSERT(nullptr != pmdobjColStats);
 
 		// cleanup
 		rel_stats_mdid->Release();
@@ -232,8 +237,8 @@ CMDProviderTest::EresUnittest_Negative()
 
 		// lookup a non-existing objects
 		CMDIdGPDB *mdid = GPOS_NEW(mp)
-			CMDIdGPDB(GPOPT_MDCACHE_TEST_OID, 15 /* major version */,
-					  1 /* minor version */);
+			CMDIdGPDB(IMDId::EmdidGeneral, GPOPT_MDCACHE_TEST_OID,
+					  15 /* major version */, 1 /* minor version */);
 
 		// call should result in an exception
 		(void) pmdpFile->GetMDObjDXLStr(mp, amda.Pmda(), mdid);

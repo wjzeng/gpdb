@@ -18,10 +18,9 @@
 
 namespace gpopt
 {
-typedef CHashMap<CExpression, CExpression, CExpression::HashValue,
-				 CUtils::Equals, CleanupRelease<CExpression>,
-				 CleanupRelease<CExpression> >
-	ExprPredToExprPredPartMap;
+using ExprPredToExprPredPartMap =
+	CHashMap<CExpression, CExpression, CExpression::HashValue, CUtils::Equals,
+			 CleanupRelease<CExpression>, CleanupRelease<CExpression>>;
 
 //---------------------------------------------------------------------------
 //	@class:
@@ -94,19 +93,6 @@ public:
 	{
 		return PpcDeriveConstraintFromPredicates(mp, exprhdl);
 	}
-
-	// derive table descriptor
-	CTableDescriptor *
-	DeriveTableDescriptor(CMemoryPool *,  // mp
-						  CExpressionHandle &exprhdl) const override
-	{
-		return exprhdl.DeriveTableDescriptor(0);
-	}
-
-	// compute partition predicate to pass down to n-th child
-	CExpression *PexprPartPred(CMemoryPool *mp, CExpressionHandle &exprhdl,
-							   CExpression *pexprInput,
-							   ULONG child_index) const override;
 
 	//-------------------------------------------------------------------------------------
 	// Transformations

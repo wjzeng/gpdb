@@ -26,6 +26,7 @@
 #include "naucrates/dxl/parser/CParseHandlerFactory.h"
 #include "naucrates/dxl/parser/CParseHandlerHint.h"
 #include "naucrates/dxl/parser/CParseHandlerManager.h"
+#include "naucrates/dxl/parser/CParseHandlerPlanHint.h"
 #include "naucrates/dxl/parser/CParseHandlerStatisticsConfig.h"
 #include "naucrates/dxl/parser/CParseHandlerTraceFlags.h"
 #include "naucrates/dxl/parser/CParseHandlerWindowOids.h"
@@ -87,6 +88,20 @@ CParseHandlerOptimizerConfig::StartElement(
 		CParseHandlerBase *pphHint = CParseHandlerFactory::GetParseHandler(
 			m_mp, CDXLTokens::XmlstrToken(EdxltokenHint), m_parse_handler_mgr,
 			this);
+		m_parse_handler_mgr->ActivateParseHandler(pphHint);
+		pphHint->startElement(element_uri, element_local_name, element_qname,
+							  attrs);
+		this->Append(pphHint);
+		return;
+	}
+	else if (0 == XMLString::compareString(
+					  CDXLTokens::XmlstrToken(EdxltokenPlanHint),
+					  element_local_name))
+	{
+		// install a parse handler for the plan hint config
+		CParseHandlerBase *pphHint = CParseHandlerFactory::GetParseHandler(
+			m_mp, CDXLTokens::XmlstrToken(EdxltokenPlanHint),
+			m_parse_handler_mgr, this);
 		m_parse_handler_mgr->ActivateParseHandler(pphHint);
 		pphHint->startElement(element_uri, element_local_name, element_qname,
 							  attrs);
@@ -178,6 +193,8 @@ CParseHandlerOptimizerConfig::EndElement(const XMLCh *const,  // element_uri,
 										 const XMLCh *const	 // element_qname
 )
 {
+#define MAX_CONFIG_FIELDS 8
+
 	if (0 != XMLString::compareString(
 				 CDXLTokens::XmlstrToken(EdxltokenOptimizerConfig),
 				 element_local_name))
@@ -189,7 +206,7 @@ CParseHandlerOptimizerConfig::EndElement(const XMLCh *const,  // element_uri,
 	}
 
 	GPOS_ASSERT(nullptr == m_optimizer_config);
-	GPOS_ASSERT(7 >= this->Length());
+	GPOS_ASSERT(MAX_CONFIG_FIELDS >= this->Length());
 
 	CParseHandlerEnumeratorConfig *pphEnumeratorConfig =
 		dynamic_cast<CParseHandlerEnumeratorConfig *>((*this)[0]);
@@ -214,7 +231,10 @@ CParseHandlerOptimizerConfig::EndElement(const XMLCh *const,  // element_uri,
 
 	ICostModel *pcm = nullptr;
 	CHint *phint = nullptr;
-	if (5 == this->Length())
+	// XXX: ICostModel and CHint are special fields that have default values
+	//      and may therefore be omitted from the MDP. If they are explicitly
+	//      declared, they use slots 4 and 5 in the config
+	if ((MAX_CONFIG_FIELDS - 2) == this->Length())
 	{
 		// no cost model: use default one
 		pcm = ICostModel::PcmDefault(m_mp);
@@ -228,7 +248,7 @@ CParseHandlerOptimizerConfig::EndElement(const XMLCh *const,  // element_uri,
 		GPOS_ASSERT(nullptr != pcm);
 		pcm->AddRef();
 
-		if (6 == this->Length())
+		if ((MAX_CONFIG_FIELDS - 1) == this->Length())
 		{
 			phint = CHint::PhintDefault(m_mp);
 		}
@@ -242,8 +262,18 @@ CParseHandlerOptimizerConfig::EndElement(const XMLCh *const,  // element_uri,
 		}
 	}
 
+	// XXX: Add new fields to COptimizerConfig at (*this)[Length - N].
+
+	CParseHandlerPlanHint *pphHint =
+		dynamic_cast<CParseHandlerPlanHint *>((*this)[this->Length() - 2]);
+	CPlanHint *pplanhint = pphHint->GetPlanHint();
+	if (nullptr != pplanhint)
+	{
+		pplanhint->AddRef();
+	}
+
 	m_optimizer_config = GPOS_NEW(m_mp) COptimizerConfig(
-		pec, stats_config, pcteconfig, pcm, phint, pwindowoidsGPDB);
+		pec, stats_config, pcteconfig, pcm, phint, pplanhint, pwindowoidsGPDB);
 
 	CParseHandlerTraceFlags *pphTraceFlags =
 		dynamic_cast<CParseHandlerTraceFlags *>((*this)[this->Length() - 1]);

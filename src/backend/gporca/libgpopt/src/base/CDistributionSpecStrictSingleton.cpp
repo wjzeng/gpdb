@@ -53,15 +53,15 @@ CDistributionSpecStrictSingleton::FSatisfies(
 		return false;
 	}
 
-	if (EdtAny == pdss->Edt())
+	if (EdtAny == pdss->Edt() || EdtNonReplicated == pdss->Edt())
 	{
-		// a singleton distribution satisfies "any"
+		// a singleton distribution satisfies "any" and "non-replicated" distribution
 		return true;
 	}
 
 	return (
 		(EdtSingleton == pdss->Edt() || EdtStrictSingleton == pdss->Edt()) &&
-		m_est == ((CDistributionSpecStrictSingleton *) pdss)->Est());
+		m_est == static_cast<const CDistributionSpecSingleton *>(pdss)->Est());
 }
 
 

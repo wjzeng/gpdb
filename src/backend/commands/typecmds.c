@@ -115,7 +115,6 @@ static char *domainAddConstraint(Oid domainOid, Oid domainNamespace,
 								 const char *domainName, ObjectAddress *constrAddr);
 static Node *replace_domain_constraint_value(ParseState *pstate,
 											 ColumnRef *cref);
-static void remove_type_encoding(Oid typid);
 
 
 /*
@@ -314,17 +313,14 @@ DefineType(ParseState *pstate, List *names, List *parameters)
 			defelp = &collatableEl;
 		else if (is_storage_encoding_directive(defel->defname))
 		{
-			/*
-			 * GPDB_12_MERGE_FIXME:
-			 *		There might be discrepancies between the comment and the
-			 *		command using the type. Validate that the comment is correct
-			 *		for both CREATE and ALTER statements.
-			 */
 			/* 
 			 * This is to define default block size, compress type, and
 			 * compress level. When this type is used in an append only column
 			 * oriented table, the column's encoding will be defaulted to these
 			 * values.
+			 * We have to do this instead of having a list of encoding clauses as 
+			 * in ALTER TYPE because the way the encoding clauses are consumed 
+			 * in the parser for CREATE TYPE.
 			 */
 			encoding = lappend(encoding, defel);
 			continue;
@@ -463,13 +459,7 @@ DefineType(ParseState *pstate, List *names, List *parameters)
 	if (collatableEl)
 		collation = defGetBoolean(collatableEl) ? DEFAULT_COLLATION_OID : InvalidOid;
 
-	/*
-	 * GPDB_12_MERGE_FIXME:
-	 *		Try to use a common function that does the transformation and
-	 *		setting like bellow. This pattern seems to be scattered in various
-	 *		places withing tablecmds, tablecmds_gp, reloptions_gp and possibly
-	 *		others.
-	 */
+	/* transform the encoding clause and then get the typoptions */
 	if (encoding)
 	{
 		encoding = transformStorageEncodingClause(encoding, true);
@@ -999,10 +989,12 @@ DefineDomain(CreateDomainStmt *stmt)
 					pstate = make_parsestate(NULL);
 
 					/*
-					 * Cook the constr->raw_expr into an expression. Note:
-					 * name is strictly for error message
+					 * Cook the constr->raw_expr into an expression; copy it
+					 * in case the input is in plan cache.  Note: name is used
+					 * only for error messages.
 					 */
-					defaultExpr = cookDefault(pstate, constr->raw_expr,
+					defaultExpr = cookDefault(pstate,
+											  copyObject(constr->raw_expr),
 											  basetypeoid,
 											  basetypeMod,
 											  domainName,
@@ -1791,7 +1783,6 @@ makeRangeConstructors(const char *name, Oid namespace,
 								 InvalidOid,	/* prosupport */
 								 1.0,	/* procost */
 								 0.0,	/* prorows */
-								 PRODATAACCESS_NONE,
 								 PROEXECLOCATION_ANY);
 
 		/*
@@ -1815,7 +1806,11 @@ static Oid
 findTypeInputFunction(List *procname, Oid typeOid)
 {
 	Oid			argList[3];
+	int			nmatches = 0;
 	Oid			procOid;
+	Oid			procOid2;
+	Oid			procOid3;
+	Oid			procOid4;
 
 	/*
 	 * Input functions can take a single argument of type CSTRING, or three
@@ -1823,32 +1818,45 @@ findTypeInputFunction(List *procname, Oid typeOid)
 	 *
 	 * For backwards compatibility we allow OPAQUE in place of CSTRING; if we
 	 * see this, we issue a warning and fix up the pg_proc entry.
+	 *
+	 * Whine about ambiguity if multiple forms exist.
 	 */
 	argList[0] = CSTRINGOID;
-
-	procOid = LookupFuncName(procname, 1, argList, true);
-	if (OidIsValid(procOid))
-		return procOid;
-
 	argList[1] = OIDOID;
 	argList[2] = INT4OID;
 
-	procOid = LookupFuncName(procname, 3, argList, true);
+	procOid = LookupFuncName(procname, 1, argList, true);
 	if (OidIsValid(procOid))
-		return procOid;
+		nmatches++;
+	procOid2 = LookupFuncName(procname, 3, argList, true);
+	if (OidIsValid(procOid2))
+		nmatches++;
 
-	/* No luck, try it with OPAQUE */
 	argList[0] = OPAQUEOID;
 
-	procOid = LookupFuncName(procname, 1, argList, true);
+	procOid3 = LookupFuncName(procname, 1, argList, true);
+	if (OidIsValid(procOid3))
+		nmatches++;
+	procOid4 = LookupFuncName(procname, 3, argList, true);
+	if (OidIsValid(procOid4))
+		nmatches++;
 
-	if (!OidIsValid(procOid))
-	{
-		argList[1] = OIDOID;
-		argList[2] = INT4OID;
+	if (nmatches > 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_AMBIGUOUS_FUNCTION),
+				 errmsg("type input function %s has multiple matches",
+						NameListToString(procname))));
 
-		procOid = LookupFuncName(procname, 3, argList, true);
-	}
+	if (OidIsValid(procOid))
+		return procOid;
+	if (OidIsValid(procOid2))
+		return procOid2;
+
+	/* Cases with OPAQUE need adjustment */
+	if (OidIsValid(procOid3))
+		procOid = procOid3;
+	else
+		procOid = procOid4;
 
 	if (OidIsValid(procOid))
 	{
@@ -1934,24 +1942,32 @@ findTypeReceiveFunction(List *procname, Oid typeOid)
 {
 	Oid			argList[3];
 	Oid			procOid;
+	Oid			procOid2;
 
 	/*
 	 * Receive functions can take a single argument of type INTERNAL, or three
-	 * arguments (internal, typioparam OID, typmod).
+	 * arguments (internal, typioparam OID, typmod).  Whine about ambiguity if
+	 * both forms exist.
 	 */
 	argList[0] = INTERNALOID;
-
-	procOid = LookupFuncName(procname, 1, argList, true);
-	if (OidIsValid(procOid))
-		return procOid;
-
 	argList[1] = OIDOID;
 	argList[2] = INT4OID;
 
-	procOid = LookupFuncName(procname, 3, argList, true);
+	procOid = LookupFuncName(procname, 1, argList, true);
+	procOid2 = LookupFuncName(procname, 3, argList, true);
 	if (OidIsValid(procOid))
+	{
+		if (OidIsValid(procOid2))
+			ereport(ERROR,
+					(errcode(ERRCODE_AMBIGUOUS_FUNCTION),
+					 errmsg("type receive function %s has multiple matches",
+							NameListToString(procname))));
 		return procOid;
+	}
+	else if (OidIsValid(procOid2))
+		return procOid2;
 
+	/* If not found, reference the 1-argument signature in error msg */
 	ereport(ERROR,
 			(errcode(ERRCODE_UNDEFINED_FUNCTION),
 			 errmsg("function %s does not exist",
@@ -2203,7 +2219,6 @@ findRangeSubtypeDiffFunction(List *procname, Oid subtype)
 Oid
 AssignTypeArrayOid(char *arrayTypeName, Oid typeNamespace)
 {
-	/* GPDB_12_MERGE_FIXME: do we need some special code for IsBinaryUpgrade here? */
 	Oid			type_array_oid;
 	Relation	pg_type;
 
@@ -2254,6 +2269,7 @@ DefineCompositeType(RangeVar *typevar, List *coldeflist)
 	createStmt->oncommit = ONCOMMIT_NOOP;
 	createStmt->tablespacename = NULL;
 	createStmt->if_not_exists = false;
+	createStmt->origin = ORIGIN_NO_GEN;
 
 	/*
 	 * Check for collision with an existing type name. If there is one and
@@ -2340,10 +2356,10 @@ AlterDomainDefault(List *names, Node *defaultRaw)
 		pstate = make_parsestate(NULL);
 
 		/*
-		 * Cook the colDef->raw_expr into an expression. Note: Name is
-		 * strictly for error message
+		 * Cook the raw default into an expression; copy it in case the input
+		 * is in plan cache.  Note: name is used only for error messages.
 		 */
-		defaultExpr = cookDefault(pstate, defaultRaw,
+		defaultExpr = cookDefault(pstate, copyObject(defaultRaw),
 								  typTup->typbasetype,
 								  typTup->typtypmod,
 								  NameStr(typTup->typname),
@@ -3235,11 +3251,11 @@ domainAddConstraint(Oid domainOid, Oid domainNamespace, Oid baseTypeOid,
 	pstate->p_ref_hook_state = (void *) domVal;
 
 	/*
-	 * GPDB: transformExpr scribbles on the input, but we need to keep it intact
-	 * because we dispatch it afterwards.
+	 * Transform the expression; first we must copy the input, in case it's in
+	 * plan cache.
 	 */
-	constr = (Constraint *) copyObject(constr);
-	expr = transformExpr(pstate, constr->raw_expr, EXPR_KIND_DOMAIN_CHECK);
+	expr = transformExpr(pstate, copyObject(constr->raw_expr),
+						 EXPR_KIND_DOMAIN_CHECK);
 
 	/*
 	 * Make sure it yields a boolean result.
@@ -3844,16 +3860,14 @@ AlterType(AlterTypeStmt *stmt)
 {
 	TypeName   *typname;
 	Oid			typid;
-	HeapTuple	tup;
+	Oid			arrtypid;
 	Datum		typoptions;
 	List	   *encoding;
-	Relation 	pgtypeenc;
-	ScanKeyData	scankey;
-	SysScanDesc scan;
 
 	/* Make a TypeName so we can use standard type lookup machinery */
 	typname = makeTypeNameFromNameList(stmt->typeName);
 	typid = typenameTypeId(NULL, typname);
+	arrtypid = get_array_type(typid);
 
 	if (type_is_rowtype(typid))
 		ereport(ERROR,
@@ -3868,53 +3882,21 @@ AlterType(AlterTypeStmt *stmt)
 		aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_TYPE,
 					   format_type_be(typid));
 
+	/* transform the encoding clause and then get the typoptions from it */
 	encoding = transformStorageEncodingClause(stmt->encoding, true);
-
 	typoptions = transformRelOptions(PointerGetDatum(NULL),
 									 encoding, NULL, NULL,
 									 false,
 									 false);
 
-	/*
-	 * GPDB_12_MERGE_FIXME:
-	 *		Consider moving this under pg_type that is the owner of that catalog
-	 *		table.
-	 */
-	/* SELECT * FROM pg_type_encoding WHERE typid = :1 FOR UPDATE */
-	pgtypeenc = heap_open(TypeEncodingRelationId, RowExclusiveLock);
-	ScanKeyInit(&scankey, Anum_pg_type_encoding_typid,
-				BTEqualStrategyNumber, F_OIDEQ,
-				ObjectIdGetDatum(typid));
-	scan = systable_beginscan(pgtypeenc, TypeEncodingTypidIndexId, true,
-							  NULL, 1, &scankey);
+	if (arrtypid == InvalidOid)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("failed to get the array type of type \"%s\"",
+						TypeNameToString(typname))));
 
-	tup = systable_getnext(scan);
-	if (HeapTupleIsValid(tup))
-	{
-		/* update case */
-		Datum values[Natts_pg_type_encoding];
-		bool nulls[Natts_pg_type_encoding];
-		bool replaces[Natts_pg_type_encoding];
-		HeapTuple newtuple;
-
-		MemSet(values, 0, sizeof(values));
-		MemSet(nulls, false, sizeof(nulls));
-		MemSet(replaces, false, sizeof(replaces));
-
-		replaces[Anum_pg_type_encoding_typoptions - 1] = true;
-		values[Anum_pg_type_encoding_typoptions - 1] = typoptions;
-
-		newtuple = heap_modify_tuple(tup, RelationGetDescr(pgtypeenc),
-									 values, nulls, replaces);
-
-		CatalogTupleUpdate(pgtypeenc, &tup->t_self, newtuple);
-	}
-	else
-	{
-		add_type_encoding(typid, typoptions);
-	}	
-	systable_endscan(scan);
-	heap_close(pgtypeenc, NoLock);
+	update_type_encoding(typid, typoptions);
+	update_type_encoding(arrtypid, typoptions);
 
 	if (Gp_role == GP_ROLE_DISPATCH)
 		CdbDispatchUtilityStatement((Node *) stmt,
@@ -3926,34 +3908,106 @@ AlterType(AlterTypeStmt *stmt)
 }
 
 /*
- * GPDB_12_MERGE_FIXME:
- *		Move this function together with add_type_encoding under pg_type.
+ * Create the type oldrelform[] during an AT SET AM operation from an
+ * append-optimized to a heap table. This is necessary here since we omit
+ * creating the array type for append-optimized tables.
  */
-/*
- * Remove the default type encoding for typid.
- */
-static void
-remove_type_encoding(Oid typid)
+void
+AlterAMAddArrayType(Form_pg_class oldrelform)
 {
-	Relation rel;
-	ScanKeyData scankey;
-	SysScanDesc sscan;
-	HeapTuple tuple;
+	Oid          	new_array_oid = InvalidOid;
+	char         	*relarrayname = NULL;
+	HeapTuple    	base_type_tup;
+	Form_pg_type 	base_type;
+	Relation     	pg_type_desc;
 
-	rel = heap_open(TypeEncodingRelationId, RowExclusiveLock);
+	Assert(oldrelform->relam == AO_ROW_TABLE_AM_OID ||
+			oldrelform->relam == AO_COLUMN_TABLE_AM_OID);
 
-	ScanKeyInit(&scankey,
-				Anum_pg_type_encoding_typid,
-				BTEqualStrategyNumber, F_OIDEQ,
-				ObjectIdGetDatum(typid));
+	/* Assign the array type name and array type oid first */
+	relarrayname =
+		makeArrayTypeName(NameStr(oldrelform->relname), oldrelform->relnamespace);
+	new_array_oid =
+		AssignTypeArrayOid(relarrayname, oldrelform->relnamespace);
 
-	sscan = systable_beginscan(rel, TypeEncodingTypidIndexId, true,
-							   NULL, 1, &scankey);
-	while((tuple = systable_getnext(sscan)) != NULL)
-	{
-		simple_heap_delete(rel, &tuple->t_self);
-	}
-	systable_endscan(sscan);
+	/* Look up the base type oid */
+	base_type_tup = SearchSysCacheCopy1(TYPEOID,
+										ObjectIdGetDatum(oldrelform->reltype));
+	if (!HeapTupleIsValid(base_type_tup))
+		elog(ERROR, "cache lookup failed for type %u", oldrelform->reltype);
+	base_type = (Form_pg_type) GETSTRUCT(base_type_tup);
 
-	heap_close(rel, RowExclusiveLock);
+	TypeCreate(new_array_oid,    /* force the type's OID to this */
+			   relarrayname,    /* Array type name */
+			   oldrelform->relnamespace,    /* Same namespace as parent */
+			   InvalidOid,    /* Not composite, no relationOid */
+			   0,            /* relkind, also N/A here */
+			   oldrelform->relowner,        /* owner's ID */
+			   -1,            /* Internal size (varlena) */
+			   TYPTYPE_BASE,    /* Not composite - typelem is */
+			   TYPCATEGORY_ARRAY,    /* type-category (array) */
+			   false,        /* array types are never preferred */
+			   DEFAULT_TYPDELIM,    /* default array delimiter */
+			   F_ARRAY_IN,    /* array input proc */
+			   F_ARRAY_OUT, /* array output proc */
+			   F_ARRAY_RECV,    /* array recv (bin) proc */
+			   F_ARRAY_SEND,    /* array send (bin) proc */
+			   InvalidOid,    /* typmodin procedure - none */
+			   InvalidOid,    /* typmodout procedure - none */
+			   F_ARRAY_TYPANALYZE,    /* array analyze procedure */
+			   base_type->oid,    /* array element type - the rowtype */
+			   true,        /* yes, this is an array type */
+			   InvalidOid,    /* this has no array type */
+			   InvalidOid,    /* domain base type - irrelevant */
+			   NULL,        /* default value - none */
+			   NULL,        /* default binary representation */
+			   false,        /* passed by reference */
+			   'd',            /* alignment - must be the largest! */
+			   'x',            /* fully TOASTable */
+			   -1,            /* typmod */
+			   0,            /* array dimensions for typBaseType */
+			   false,        /* Type NOT NULL */
+			   InvalidOid); /* rowtypes never have a collation */
+
+	/* Now open the base type and get ready to update the typarray field */
+	pg_type_desc = table_open(TypeRelationId, RowExclusiveLock);
+	base_type->typarray = new_array_oid;
+	CatalogTupleUpdate(pg_type_desc, &base_type_tup->t_self, base_type_tup);
+	table_close(pg_type_desc, RowExclusiveLock);
+
+	pfree(relarrayname);
+	heap_freetuple(base_type_tup);
+}
+
+/*
+ * While altering the access method from heap -> append-optimized, remove the
+ * array type of the table from the catalog. This is because we don't maintain
+ * array types for append-optimized tables.
+ */
+void
+AlterAMRemoveArrayType(Form_pg_class oldrelform)
+{
+	HeapTuple    	base_type_tup;
+	Form_pg_type 	base_type;
+	Relation		pg_type_desc;
+
+	Assert(oldrelform->relam == HEAP_TABLE_AM_OID);
+
+	base_type_tup = SearchSysCacheCopy1(TYPEOID, ObjectIdGetDatum(oldrelform->reltype));
+	if (!HeapTupleIsValid(base_type_tup))
+		elog(ERROR, "cache lookup failed for type %u", oldrelform->reltype);
+	base_type = (Form_pg_type) GETSTRUCT(base_type_tup);
+
+	/* delete array type -> base type pg_depend dependency */
+	deleteDependencyRecordsFor(TypeRelationId, base_type->typarray, true);
+
+	/* remove array type */
+	RemoveTypeById(base_type->typarray);
+
+	/* now update base type's typarray linkage */
+	pg_type_desc = table_open(TypeRelationId, RowExclusiveLock);
+	base_type->typarray = InvalidOid;
+	CatalogTupleUpdate(pg_type_desc, &base_type_tup->t_self, base_type_tup);
+	heap_freetuple(base_type_tup);
+	table_close(pg_type_desc, RowExclusiveLock);
 }

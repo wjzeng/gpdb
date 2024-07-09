@@ -54,8 +54,7 @@ CXformSelect2DynamicBitmapBoolOp::CXformSelect2DynamicBitmapBoolOp(
 //
 //---------------------------------------------------------------------------
 CXform::EXformPromise
-CXformSelect2DynamicBitmapBoolOp::Exfp(CExpressionHandle &	// exprhdl
-) const
+CXformSelect2DynamicBitmapBoolOp::Exfp(CExpressionHandle &) const
 {
 	return CXform::ExfpHigh;
 }
@@ -76,6 +75,25 @@ CXformSelect2DynamicBitmapBoolOp::Transform(CXformContext *pxfctxt,
 	GPOS_ASSERT(nullptr != pxfctxt);
 	GPOS_ASSERT(FPromising(pxfctxt->Pmp(), this, pexpr));
 	GPOS_ASSERT(FCheckPattern(pexpr));
+
+	CLogicalDynamicGet *popGet =
+		CLogicalDynamicGet::PopConvert((*pexpr)[0]->Pop());
+	// Do not run if contains foreign partitions, instead run CXformExpandDynamicGetWithForeignPartitions
+	if (popGet->ContainsForeignParts())
+	{
+		return;
+	}
+
+	// We need to early exit when the relation contains security quals
+	// because we are adding the security quals when translating from DXL to
+	// Planned Statement as a filter. If we don't early exit then it may happen
+	// that we generate a plan where the index condition contains non-leakproof
+	// expressions. This can lead to data leak as we always want our security
+	// quals to be executed first.
+	if (popGet->HasSecurityQuals())
+	{
+		return;
+	}
 
 	CMemoryPool *mp = pxfctxt->Pmp();
 	CExpression *pexprResult = CXformUtils::PexprSelect2BitmapBoolOp(mp, pexpr);

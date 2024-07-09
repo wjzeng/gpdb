@@ -32,8 +32,12 @@ typedef enum
 	DTX_STATE_NONE = 0,
 
 	/**
-	 * The distributed transaction is active and requires distributed coordination
-	 *   (because it is explicit or an implicit writer transaction)
+	 * The distributed transaction is active.
+	 * For a primary, this state means the transaction requires distributed
+	 * coordination (because it is explicit or an implicit writer transaction),
+	 * and it will switch to other dtx states in different phases.
+	 * For a hot standby, there is no coordination necessary so transaction 
+	 * will stay in this state until the end of the commit.
 	 */
 	DTX_STATE_ACTIVE_DISTRIBUTED,
 
@@ -119,7 +123,7 @@ typedef enum
 {
 	/**
 	 * There is no distributed transaction.  This is the initial state and,
-	 *   for utility mode connections or master-only queries, the only state.
+	 *   for utility mode connections or coordinator-only queries, the only state.
 	 *
 	 * It is also the state to which the QD and QE return to between transactions.
 	 */
@@ -222,6 +226,7 @@ typedef struct TMGXACTLOCAL
 {
 	/*
 	 * Memory only fields.
+	 * If we are in hot standby, only 'state' is relevant.
 	 */
  	DtxState				state;
 	
@@ -265,6 +270,10 @@ typedef enum
 extern int max_tm_gxacts;
 extern int gp_gxid_prefetch_num;
 
+/* whether we need a distributed snapshot or not, updated before each
+ * query been dispatched. */
+extern bool needDistributedSnapshot;
+
 extern DtxContext DistributedTransactionContext;
 
 /* state variables for how much of the log file has been flushed */
@@ -280,6 +289,8 @@ extern slock_t *shmGxidGenLock;
 extern DistributedTransactionId *shmCommittedGxidArray;
 extern volatile int *shmNumCommittedGxacts;
 
+extern bool IsDtxRecoveryProcess(void);
+
 extern char *DtxStateToString(DtxState state);
 extern char *DtxProtocolCommandToString(DtxProtocolCommand command);
 extern char *DtxContextToString(DtxContext context);
@@ -288,6 +299,8 @@ extern void dtxDeformGid(const char	*gid,
 extern void dtxFormGid(char *gid, DistributedTransactionId gxid);
 extern DistributedTransactionId getDistributedTransactionId(void);
 extern bool getDistributedTransactionIdentifier(char *id);
+
+extern void setDistributedTransactionContext(DtxContext context);
 
 extern void resetTmGxact(void);
 extern void	prepareDtxTransaction(void);

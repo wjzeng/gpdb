@@ -13,6 +13,7 @@
  */
 #include "postgres.h"
 
+#include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/reloptions.h"
 #include "access/table.h"
@@ -39,12 +40,15 @@
 #include "tcop/utility.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
+#include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
 
 #include "catalog/oid_dispatch.h"
 
+/* Same as MAXNUMMESSAGES in sinvaladt.c */
+#define MAX_RELCACHE_INVAL_MSGS 4096
 
 typedef struct
 {
@@ -188,12 +192,19 @@ transformGenericOptions(Oid catalogId,
 	result = optionListToArray(resultOptions);
 
 	/*
-	 * Check and separate out the mpp_execute option, fdwvalidator doesn't have
+	 * Check and separate out the extra options, fdwvalidator doesn't have
 	 * to handle it. USER MAPPING doesn't have the mpp_execute option.
 	 */
 	if (catalogId != UserMappingRelationId)
+	{
 		SeparateOutMppExecute(&resultOptions);
+	}
 
+	if (catalogId == ForeignServerRelationId)
+	{
+		SeparateOutNumSegments(&resultOptions);
+	}
+	
 	if (OidIsValid(fdwvalidator))
 	{
 		Datum valarg = optionListToArray(resultOptions);
@@ -491,13 +502,12 @@ static Oid
 lookup_fdw_handler_func(DefElem *handler)
 {
 	Oid			handlerOid;
-	Oid			funcargtypes[1];	/* dummy */
 
 	if (handler == NULL || handler->arg == NULL)
 		return InvalidOid;
 
 	/* handlers have no arguments */
-	handlerOid = LookupFuncName((List *) handler->arg, 0, funcargtypes, false);
+	handlerOid = LookupFuncName((List *) handler->arg, 0, NULL, false);
 
 	/* check that handler has correct return type */
 	if (get_func_rettype(handlerOid) != FDW_HANDLEROID)
@@ -788,6 +798,19 @@ AlterForeignDataWrapper(AlterFdwStmt *stmt)
 	 */
 	if (stmt->options)
 	{
+		ListCell *optcell;
+		foreach(optcell, stmt->options)
+		{
+			DefElem *od = lfirst(optcell);
+
+			if (strcmp(od->defname, "mpp_execute") == 0)
+			{
+				ereport(ERROR,
+						(errcode(ERRCODE_SYNTAX_ERROR),
+						 errmsg("\"%s\" of foreign data wrapper is not allowed to be altered", od->defname)));
+			}
+		}
+
 		/* Extract the current options */
 		datum = SysCacheGetAttr(FOREIGNDATAWRAPPEROID,
 								tp,
@@ -916,13 +939,22 @@ CreateForeignServer(CreateForeignServerStmt *stmt)
 	ownerId = GetUserId();
 
 	/*
-	 * Check that there is no other foreign server by this name. Do nothing if
-	 * IF NOT EXISTS was enforced.
+	 * Check that there is no other foreign server by this name.  If there is
+	 * one, do nothing if IF NOT EXISTS was specified.
 	 */
-	if (GetForeignServerByName(stmt->servername, true) != NULL)
+	srvId = get_foreign_server_oid(stmt->servername, true);
+	if (OidIsValid(srvId))
 	{
 		if (stmt->if_not_exists)
 		{
+			/*
+			 * If we are in an extension script, insist that the pre-existing
+			 * object be a member of the extension, to avoid security risks.
+			 */
+			ObjectAddressSet(myself, ForeignServerRelationId, srvId);
+			checkMembershipInCurrentExtension(&myself);
+
+			/* OK to skip */
 			ereport(NOTICE,
 					(errcode(ERRCODE_DUPLICATE_OBJECT),
 					 errmsg("server \"%s\" already exists, skipping",
@@ -1129,6 +1161,63 @@ AlterForeignServer(AlterForeignServerStmt *stmt)
 									NULL);
 	}
 
+	if (stmt->options)
+	{
+		ListCell *optcell;
+		foreach(optcell, stmt->options)
+		{
+			DefElem *od = lfirst(optcell);
+
+			/*
+			 * Foreign tables' policy depends on the foreign server's option,
+			 * to force update the cached policy, if the option would impact,
+			 * invalidate the relcache of this server's every foreign table.
+			 */
+			if (strcmp(od->defname, "mpp_execute") == 0 ||
+				strcmp(od->defname, "num_segments") == 0)
+			{
+				Relation relation_rel;
+				TableScanDesc scan;
+				HeapTuple tuple;
+				List *relids = NIL;
+				int num_tables = 0;
+
+				relation_rel = table_open(ForeignTableRelationId, AccessShareLock);
+
+				scan = table_beginscan_catalog(relation_rel, 0, NULL);
+
+				while ((tuple = heap_getnext(scan, ForwardScanDirection)) != NULL)
+				{
+					Form_pg_foreign_table ftbl = (Form_pg_foreign_table)GETSTRUCT(tuple);
+
+					if (ftbl->ftserver == srvId)
+					{
+						relids = lappend_oid(relids, ftbl->ftrelid);
+						num_tables++;
+						if (num_tables >= MAX_RELCACHE_INVAL_MSGS)
+							break;
+					}
+				}
+
+				if (num_tables >= MAX_RELCACHE_INVAL_MSGS)
+					CacheInvalidateRelcacheAll();
+				else
+				{
+					ListCell *lc;
+					foreach(lc, relids)
+					{
+						CacheInvalidateRelcacheByRelid(lfirst_oid(lc));
+					}
+				}
+
+				table_endscan(scan);
+				table_close(relation_rel, AccessShareLock);
+
+				break;
+			}
+		}
+	}
+
 	table_close(rel, RowExclusiveLock);
 
 	return address;
@@ -1228,6 +1317,10 @@ CreateUserMapping(CreateUserMappingStmt *stmt)
 	{
 		if (stmt->if_not_exists)
 		{
+			/*
+			 * Since user mappings aren't members of extensions (see comments
+			 * below), no need for checkMembershipInCurrentExtension here.
+			 */
 			ereport(NOTICE,
 					(errcode(ERRCODE_DUPLICATE_OBJECT),
 					 errmsg("user mapping for \"%s\" already exists for server \"%s\", skipping",

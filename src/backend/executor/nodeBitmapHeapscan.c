@@ -63,15 +63,13 @@
 #include "cdb/cdbvars.h" /* gp_select_invisible */
 
 static TupleTableSlot *BitmapHeapNext(BitmapHeapScanState *node);
-static inline void BitmapDoneInitializingSharedState(
-													 ParallelBitmapHeapState *pstate);
+static inline void BitmapDoneInitializingSharedState(ParallelBitmapHeapState *pstate);
 static inline void BitmapAdjustPrefetchIterator(BitmapHeapScanState *node,
 												TBMIterateResult *tbmres);
 static inline void BitmapAdjustPrefetchTarget(BitmapHeapScanState *node);
 static inline void BitmapPrefetch(BitmapHeapScanState *node,
 								  TableScanDesc scan);
-static bool BitmapShouldInitializeSharedState(
-											  ParallelBitmapHeapState *pstate);
+static bool BitmapShouldInitializeSharedState(ParallelBitmapHeapState *pstate);
 static void ExecEagerFreeBitmapHeapScan(BitmapHeapScanState *node);
 
 
@@ -169,7 +167,7 @@ BitmapHeapNext(BitmapHeapScanState *node)
 		else
 		{
 			/*
-			 * GPDB_12_MERGE_FIXME the parallel StreamBitmap scan is not
+			 * GPDB_12_MERGE_FEATURE_NOT_SUPPORTED: the parallel StreamBitmap scan is not
 			 * implemented, it must be a TIDBitmap here
 			 */
 			/*
@@ -719,9 +717,6 @@ ExecEndBitmapHeapScan(BitmapHeapScanState *node)
 	/*
 	 * release bitmaps and buffers if any
 	 */
-	/* GPDB: release the iterators before closing down subplans, because
-	 * the bitmap is owned by the BitmapIndex scan.
-	 */
 	if (node->tbmiterator)
 		tbm_generic_end_iterate(node->tbmiterator);
 	if (node->prefetch_iterator)
@@ -752,8 +747,37 @@ ExecEndBitmapHeapScan(BitmapHeapScanState *node)
 BitmapHeapScanState *
 ExecInitBitmapHeapScan(BitmapHeapScan *node, EState *estate, int eflags)
 {
-	BitmapHeapScanState *scanstate;
 	Relation	currentRelation;
+	BitmapHeapScanState *bhsState;
+
+	/* check for unsupported flags */
+	Assert(!(eflags & (EXEC_FLAG_BACKWARD | EXEC_FLAG_MARK)));
+
+	/*
+	 * open the scan relation
+	 */
+	currentRelation = ExecOpenScanRelation(estate, node->scan.scanrelid, eflags);
+
+	bhsState =  ExecInitBitmapHeapScanForPartition(node, estate, eflags,
+												   currentRelation);
+
+	/*
+	 * initialize child nodes
+	 *
+	 * We do this last because the child nodes will open indexscans on our
+	 * relation's indexes, and we want to be sure we have acquired a lock on
+	 * the relation first.
+	 */
+	outerPlanState(bhsState) = ExecInitNode(outerPlan(node), estate, eflags);
+
+	return bhsState;
+}
+
+BitmapHeapScanState *
+ExecInitBitmapHeapScanForPartition(BitmapHeapScan *node, EState *estate, int eflags,
+								   Relation currentRelation)
+{
+	BitmapHeapScanState *scanstate;
 	int			io_concurrency;
 
 	/* check for unsupported flags */
@@ -813,16 +837,6 @@ ExecInitBitmapHeapScan(BitmapHeapScan *node, EState *estate, int eflags)
 	ExecAssignExprContext(estate, &scanstate->ss.ps);
 
 	/*
-	 * open the scan relation
-	 */
-	currentRelation = ExecOpenScanRelation(estate, node->scan.scanrelid, eflags);
-
-	/*
-	 * initialize child nodes
-	 */
-	outerPlanState(scanstate) = ExecInitNode(outerPlan(node), estate, eflags);
-
-	/*
 	 * get the scan type from the relation descriptor.
 	 */
 	ExecInitScanTupleSlot(estate, &scanstate->ss,
@@ -850,7 +864,7 @@ ExecInitBitmapHeapScan(BitmapHeapScan *node, EState *estate, int eflags)
 	 * by the GUC machinery.
 	 */
 	io_concurrency =
-		get_tablespace_io_concurrency(currentRelation->rd_rel->reltablespace);
+			get_tablespace_io_concurrency(currentRelation->rd_rel->reltablespace);
 	if (io_concurrency != effective_io_concurrency)
 	{
 		double		maximum;
@@ -860,7 +874,7 @@ ExecInitBitmapHeapScan(BitmapHeapScan *node, EState *estate, int eflags)
 	}
 
 	/* Prefetching hasn't been implemented for AO tables */
-	if (RelationIsAppendOptimized(currentRelation))
+	if (RelationStorageIsAO(currentRelation))
 		scanstate->prefetch_maximum = 0;
 
 	scanstate->ss.ss_currentRelation = currentRelation;

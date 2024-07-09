@@ -17,9 +17,11 @@
  *
  *-------------------------------------------------------------------------
  */
+#include "catalog/pg_collation_d.h"
 #include "postgres.h"
 
 #include "miscadmin.h"
+#include "regex/regex.h"
 #include "utils/guc.h"
 #include "cdb/cdbvars.h"
 #include "libpq-fe.h"
@@ -32,7 +34,6 @@
 #include "libpq/libpq-be.h"
 #include "postmaster/backoff.h"
 #include "utils/resource_manager.h"
-#include "utils/resgroup-ops.h"
 #include "storage/proc.h"
 #include "storage/procarray.h"
 #include "cdb/memquota.h"
@@ -78,8 +79,6 @@ bool		verify_gpfdists_cert; /* verifies gpfdist's certificate */
 
 int			gp_external_max_segs;	/* max segdbs per gpfdist/gpfdists URI */
 
-int			gp_safefswritesize; /* set for safe AO writes in non-mature fs */
-
 int			gp_cached_gang_threshold;	/* How many gangs to keep around from
 										 * stmt to stmt. */
 
@@ -103,6 +102,8 @@ int         gp_segment_connect_timeout = 180;  /* Maximum time (in seconds) allo
 												* for a new worker process to start
 												* or a mirror to respond.
 												*/
+
+bool		gp_detect_data_correctness;		/* Detect if the current data distribution is correct */
 
 /*
  * Configurable timeout for snapshot add: exceptionally busy systems may take
@@ -161,6 +162,14 @@ int			gp_gang_creation_retry_count = 5;	/* disable by default */
 int			gp_gang_creation_retry_timer = 2000;	/* 2000ms */
 
 /*
+ * These are GUCs to tune the TCP_KEEPALIVE parameters
+ * for QD/QE libpq connections
+ */
+int			gp_dispatch_keepalives_idle = 0;
+int			gp_dispatch_keepalives_interval = 0;
+int			gp_dispatch_keepalives_count = 0;
+
+/*
  * gp_enable_slow_writer_testmode
  *
  * In order facilitate testing of reader-gang/writer-gang synchronization,
@@ -189,6 +198,7 @@ int			Gp_interconnect_queue_depth = 4;	/* max number of messages
 												 * waiting in rx-queue before
 												 * we drop. */
 int			Gp_interconnect_snd_queue_depth = 2;
+int			Gp_interconnect_cursor_ic_table_size = 128;
 int			Gp_interconnect_timer_period = 5;
 int			Gp_interconnect_timer_checking_period = 20;
 int			Gp_interconnect_default_rtt = 20;
@@ -201,6 +211,7 @@ int			Gp_interconnect_debug_retry_interval = 10;
 int			interconnect_setup_timeout = 7200;
 
 int			Gp_interconnect_type = INTERCONNECT_TYPE_UDPIFC;
+int 		Gp_interconnect_address_type = INTERCONNECT_ADDRESS_TYPE_UNICAST;
 
 bool		gp_interconnect_aggressive_retry = true;	/* fast-track app-level
 														 * retry */
@@ -210,6 +221,8 @@ bool		gp_interconnect_full_crc = false;	/* sanity check UDP data. */
 bool		gp_interconnect_log_stats = false;	/* emit stats at log-level */
 
 bool		gp_interconnect_cache_future_packets = true;
+
+int			Gp_postmaster_address_family_type = POSTMASTER_ADDRESS_FAMILY_TYPE_AUTO;
 
 /*
  * format: dbid:content:address:port,dbid:content:address:port ...
@@ -249,8 +262,6 @@ uint32		gp_interconnect_id = 0;
 double		gp_motion_cost_per_row = 0;
 int			gp_segments_for_planner = 0;
 
-int			gp_hashagg_default_nbatches = 32;
-
 bool		gp_adjust_selectivity_for_outerjoins = true;
 bool		gp_selectivity_damping_for_scans = false;
 bool		gp_selectivity_damping_for_joins = false;
@@ -258,7 +269,6 @@ double		gp_selectivity_damping_factor = 1;
 bool		gp_selectivity_damping_sigsort = true;
 
 int			gp_hashjoin_tuples_per_bucket = 5;
-int			gp_hashagg_groups_per_bucket = 5;
 
 /* Analyzing aid */
 int			gp_motion_slice_noop = 0;
@@ -282,8 +292,6 @@ int			gp_max_plan_size = 0;
 /* Disable setting of tuple hints while reading */
 bool		gp_disable_tuple_hints = false;
 
-int			gp_workfile_compress_algorithm = 0;
-bool		gp_workfile_checksumming = false;
 int			gp_workfile_caching_loglevel = DEBUG1;
 int			gp_sessionstate_loglevel = DEBUG1;
 
@@ -295,6 +303,12 @@ int			gp_workfile_limit_per_query = 0;
 
 /* Maximum number of workfiles to be created by a query */
 int			gp_workfile_limit_files_per_query = 0;
+
+/*
+ * The overhead memory (kB) used by all compressed workfiles of a single
+ * workfile_set
+ */
+int			gp_workfile_compression_overhead_limit = 0;
 
 /* Enable single-slice single-row inserts ?*/
 bool		gp_enable_fast_sri = true;
@@ -311,7 +325,12 @@ char	   *gp_autostats_mode_string;
 int			gp_autostats_mode_in_functions;
 char	   *gp_autostats_mode_in_functions_string;
 int			gp_autostats_on_change_threshold = 100000;
+bool		gp_autostats_allow_nonowner = false;
+bool		gp_autostats_lock_wait = false;
 bool		log_autostats = true;
+
+/* GUC to toggle JIT instrumentation output for EXPLAIN */
+bool		gp_explain_jit = true;
 
 /* --------------------------------------------------------------------------------------------------
  * Server debugging
@@ -431,6 +450,9 @@ assign_gp_role(const char *newval, void *extra)
 
 	if (Gp_role == GP_ROLE_UTILITY && MyProc != NULL)
 		MyProc->mppIsWriter = false;
+
+	if (Gp_role == GP_ROLE_UTILITY)
+		should_reject_connection = false;
 }
 
 /*
@@ -503,8 +525,10 @@ gpvars_check_gp_resource_manager_policy(char **newval, void **extra, GucSource s
 {
 	if (*newval == NULL ||
 		*newval[0] == 0 ||
+		!pg_strcasecmp("none", *newval) ||
 		!pg_strcasecmp("queue", *newval) ||
-		!pg_strcasecmp("group", *newval))
+		!pg_strcasecmp("group", *newval) ||
+		!pg_strcasecmp("group-v2", *newval))
 		return true;
 
 	GUC_check_errmsg("invalid value for resource manager policy: \"%s\"", *newval);
@@ -514,21 +538,20 @@ gpvars_check_gp_resource_manager_policy(char **newval, void **extra, GucSource s
 void
 gpvars_assign_gp_resource_manager_policy(const char *newval, void *extra)
 {
-	/*
-	 * Probe resgroup configurations even not in resgroup mode,
-	 * variables like gp_resource_group_enable_cgroup_memory need to
-	 * be properly set in all modes.
-	 */
-	ResGroupOps_Probe();
-
 	if (newval == NULL || newval[0] == 0)
-		Gp_resource_manager_policy = RESOURCE_MANAGER_POLICY_QUEUE;
+		Gp_resource_manager_policy = RESOURCE_MANAGER_POLICY_NONE;
+	else if (!pg_strcasecmp("none", newval))
+		Gp_resource_manager_policy = RESOURCE_MANAGER_POLICY_NONE;
 	else if (!pg_strcasecmp("queue", newval))
 		Gp_resource_manager_policy = RESOURCE_MANAGER_POLICY_QUEUE;
 	else if (!pg_strcasecmp("group", newval))
 	{
-		ResGroupOps_Bless();
 		Gp_resource_manager_policy = RESOURCE_MANAGER_POLICY_GROUP;
+		gp_enable_resqueue_priority = false;
+	}
+	else if (!pg_strcasecmp("group-v2", newval))
+	{
+		Gp_resource_manager_policy = RESOURCE_MANAGER_POLICY_GROUP_V2;
 		gp_enable_resqueue_priority = false;
 	}
 	/*
@@ -541,14 +564,56 @@ gpvars_show_gp_resource_manager_policy(void)
 {
 	switch (Gp_resource_manager_policy)
 	{
+		case RESOURCE_MANAGER_POLICY_NONE:
+			return "none";
 		case RESOURCE_MANAGER_POLICY_QUEUE:
 			return "queue";
 		case RESOURCE_MANAGER_POLICY_GROUP:
 			return "group";
+		case RESOURCE_MANAGER_POLICY_GROUP_V2:
+			return "group-v2";
 		default:
 			Assert(!"unexpected resource manager policy");
 			return "unknown";
 	}
+}
+
+bool gpvars_check_gp_resource_group_cgroup_parent(char **newval, void **extra, GucSource source)
+{
+	int		  regres;
+	char	  err[128];
+	regex_t  re;
+	char	 *pattern = "^[0-9a-zA-Z][-._0-9a-zA-Z]*$";
+	pg_wchar *wpattern = palloc((strlen(pattern) + 1) * sizeof(pg_wchar));
+	int		  wlen = pg_mb2wchar_with_len(pattern, wpattern, strlen(pattern));
+	pg_wchar *data = palloc((strlen(*newval) + 1) * sizeof(pg_wchar));
+	int		  data_len = pg_mb2wchar_with_len(*newval, data, sizeof(*newval));
+	bool	  match = true;
+
+	regres = pg_regcomp(&re, wpattern, wlen, REG_ADVANCED, DEFAULT_COLLATION_OID);
+	if (regres != REG_OKAY)
+	{
+		pg_regerror(regres, &re, err, sizeof(err));
+		GUC_check_errmsg("compile regex failed: %s", err);
+
+		pfree(wpattern);
+		pfree(data);
+
+		return false;
+	}
+
+	regres = pg_regexec(&re, data, data_len, 0, NULL, 0, NULL, 0);
+	if (regres != REG_OKAY)
+	{
+		match = false;
+		GUC_check_errmsg("gp_resource_group_cgroup_parent can only contains alphabet, number and non-leading . _ -");
+	}
+
+	pg_regfree(&re);
+	pfree(wpattern);
+	pfree(data);
+
+	return match;
 }
 
 /*
@@ -561,6 +626,23 @@ gpvars_check_statement_mem(int *newval, void **extra, GucSource source)
 	{
 		GUC_check_errmsg("Invalid input for statement_mem, must be less than max_statement_mem (%d kB)",
 						 max_statement_mem);
+		return false;
+	}
+
+	return true;
+}
+
+/*
+ * gpvars_check_rg_query_fixed_mem
+ */
+bool
+gpvars_check_rg_query_fixed_mem(int *newval, void **extra, GucSource source)
+{
+	if (*newval >= max_statement_mem)
+	{
+		GUC_check_errmsg("Invalid input for gp_resgroup_memory_query_fixed_mem, must be less than max_statement_mem (%d kB)",
+						 max_statement_mem);
+		return false;
 	}
 
 	return true;

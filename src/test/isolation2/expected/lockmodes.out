@@ -1,14 +1,19 @@
--- table to just store the master's data directory path on segment.
+-- start_matchsubs
+-- m/\(cost=.*\)/
+-- s/\(cost=.*\)//
+-- end_matchsubs
+--
+-- table to just store the coordinator's data directory path on segment.
 CREATE TABLE lockmodes_datadir(a int, dir text);
-CREATE
+CREATE TABLE
 INSERT INTO lockmodes_datadir select 1,datadir from gp_segment_configuration where role='p' and content=-1;
-INSERT 1
+INSERT 0 1
 
 1: set optimizer = off;
 SET
 
 create or replace view show_locks_lockmodes as select locktype, mode, granted, relation::regclass from pg_locks where gp_segment_id = -1 and locktype = 'relation' and relation::regclass::text like 't_lockmods%';
-CREATE
+CREATE VIEW
 
 show gp_enable_global_deadlock_detector;
  gp_enable_global_deadlock_detector 
@@ -22,25 +27,25 @@ show gp_enable_global_deadlock_detector;
 
 -- 1.1 test for heap tables
 create table t_lockmods (c int) distributed randomly;
-CREATE
+CREATE TABLE
 insert into t_lockmods select * from generate_series(1, 5);
-INSERT 5
+INSERT 0 5
 analyze t_lockmods;
 ANALYZE
 
 create table t_lockmods1 (c int) distributed randomly;
-CREATE
+CREATE TABLE
 
 create table t_lockmods_rep(c int) distributed replicated;
-CREATE
+CREATE TABLE
 
 -- See github issue: https://github.com/greenplum-db/gpdb/issues/9449
 -- upsert may lock tuples on segment, so we should upgrade lock level
 -- on QD if GDD is disabled.
 create table t_lockmods_upsert(a int, b int) distributed by (a);
-CREATE
+CREATE TABLE
 create unique index uidx_t_lockmodes_upsert on t_lockmods_upsert(a, b);
-CREATE
+CREATE INDEX
 -- add analyze to avoid auto vacuum when executing first insert
 analyze t_lockmods_upsert;
 ANALYZE
@@ -71,7 +76,7 @@ BEGIN
  relation | ExclusiveLock   | t       | t_lockmods 
 (2 rows)
 1: abort;
-ABORT
+ROLLBACK
 
 1: begin;
 BEGIN
@@ -98,7 +103,7 @@ BEGIN
  relation | ExclusiveLock   | t       | t_lockmods 
 (2 rows)
 1: abort;
-ABORT
+ROLLBACK
 
 1: begin;
 BEGIN
@@ -125,7 +130,7 @@ BEGIN
  relation | ExclusiveLock   | t       | t_lockmods 
 (2 rows)
 1: abort;
-ABORT
+ROLLBACK
 
 1: begin;
 BEGIN
@@ -152,19 +157,19 @@ BEGIN
  relation | ExclusiveLock   | t       | t_lockmods 
 (2 rows)
 1: abort;
-ABORT
+ROLLBACK
 
 1: begin;
 BEGIN
 1: explain select * from t_lockmods, t_lockmods1 for update;
  QUERY PLAN                                                                                           
 ------------------------------------------------------------------------------------------------------
- Gather Motion 3:1  (slice2; segments: 3)  (cost=10000000000.00..10000016715.06 rows=481500 width=20) 
-   ->  Nested Loop  (cost=10000000000.00..10000016715.06 rows=160500 width=20)                        
-         ->  Seq Scan on t_lockmods1  (cost=0.00..1063.00 rows=32100 width=10)                        
-         ->  Materialize  (cost=0.00..3.33 rows=5 width=10)                                           
-               ->  Broadcast Motion 3:3  (slice1; segments: 3)  (cost=0.00..3.25 rows=5 width=10)     
-                     ->  Seq Scan on t_lockmods  (cost=0.00..3.05 rows=2 width=10)                    
+ Gather Motion 3:1  (slice1; segments: 3)  (cost=10000000000.00..10000008862.58 rows=481500 width=20) 
+   ->  Nested Loop  (cost=10000000000.00..10000002442.58 rows=160500 width=20)                        
+         ->  Broadcast Motion 3:3  (slice2; segments: 3)  (cost=0.00..1.08 rows=5 width=10)           
+               ->  Seq Scan on t_lockmods  (cost=0.00..1.02 rows=2 width=10)                          
+         ->  Materialize  (cost=0.00..515.50 rows=32100 width=10)                                     
+               ->  Seq Scan on t_lockmods1  (cost=0.00..355.00 rows=32100 width=10)                   
  Optimizer: Postgres query optimizer                                                                  
 (7 rows)
 1: select * from t_lockmods, t_lockmods1 for update;
@@ -180,19 +185,19 @@ BEGIN
  relation | ExclusiveLock   | t       | t_lockmods  
 (4 rows)
 1: abort;
-ABORT
+ROLLBACK
 
 1: begin;
 BEGIN
 1: explain select * from t_lockmods, t_lockmods1 for no key update;
  QUERY PLAN                                                                                           
 ------------------------------------------------------------------------------------------------------
- Gather Motion 3:1  (slice2; segments: 3)  (cost=10000000000.00..10000016715.06 rows=481500 width=20) 
-   ->  Nested Loop  (cost=10000000000.00..10000016715.06 rows=160500 width=20)                        
-         ->  Seq Scan on t_lockmods1  (cost=0.00..1063.00 rows=32100 width=10)                        
-         ->  Materialize  (cost=0.00..3.33 rows=5 width=10)                                           
-               ->  Broadcast Motion 3:3  (slice1; segments: 3)  (cost=0.00..3.25 rows=5 width=10)     
-                     ->  Seq Scan on t_lockmods  (cost=0.00..3.05 rows=2 width=10)                    
+ Gather Motion 3:1  (slice1; segments: 3)  (cost=10000000000.00..10000008862.58 rows=481500 width=20) 
+   ->  Nested Loop  (cost=10000000000.00..10000002442.58 rows=160500 width=20)                        
+         ->  Broadcast Motion 3:3  (slice2; segments: 3)  (cost=0.00..1.08 rows=5 width=10)           
+               ->  Seq Scan on t_lockmods  (cost=0.00..1.02 rows=2 width=10)                          
+         ->  Materialize  (cost=0.00..515.50 rows=32100 width=10)                                     
+               ->  Seq Scan on t_lockmods1  (cost=0.00..355.00 rows=32100 width=10)                   
  Optimizer: Postgres query optimizer                                                                  
 (7 rows)
 1: select * from t_lockmods, t_lockmods1 for no key update;
@@ -208,19 +213,19 @@ BEGIN
  relation | ExclusiveLock   | t       | t_lockmods  
 (4 rows)
 1: abort;
-ABORT
+ROLLBACK
 
 1: begin;
 BEGIN
 1: explain select * from t_lockmods, t_lockmods1 for share;
  QUERY PLAN                                                                                           
 ------------------------------------------------------------------------------------------------------
- Gather Motion 3:1  (slice2; segments: 3)  (cost=10000000000.00..10000016715.06 rows=481500 width=20) 
-   ->  Nested Loop  (cost=10000000000.00..10000016715.06 rows=160500 width=20)                        
-         ->  Seq Scan on t_lockmods1  (cost=0.00..1063.00 rows=32100 width=10)                        
-         ->  Materialize  (cost=0.00..3.33 rows=5 width=10)                                           
-               ->  Broadcast Motion 3:3  (slice1; segments: 3)  (cost=0.00..3.25 rows=5 width=10)     
-                     ->  Seq Scan on t_lockmods  (cost=0.00..3.05 rows=2 width=10)                    
+ Gather Motion 3:1  (slice1; segments: 3)  (cost=10000000000.00..10000008862.58 rows=481500 width=20) 
+   ->  Nested Loop  (cost=10000000000.00..10000002442.58 rows=160500 width=20)                        
+         ->  Broadcast Motion 3:3  (slice2; segments: 3)  (cost=0.00..1.08 rows=5 width=10)           
+               ->  Seq Scan on t_lockmods  (cost=0.00..1.02 rows=2 width=10)                          
+         ->  Materialize  (cost=0.00..515.50 rows=32100 width=10)                                     
+               ->  Seq Scan on t_lockmods1  (cost=0.00..355.00 rows=32100 width=10)                   
  Optimizer: Postgres query optimizer                                                                  
 (7 rows)
 1: select * from t_lockmods, t_lockmods1 for share;
@@ -236,19 +241,19 @@ BEGIN
  relation | ExclusiveLock   | t       | t_lockmods  
 (4 rows)
 1: abort;
-ABORT
+ROLLBACK
 
 1: begin;
 BEGIN
 1: explain select * from t_lockmods, t_lockmods1 for key share;
  QUERY PLAN                                                                                           
 ------------------------------------------------------------------------------------------------------
- Gather Motion 3:1  (slice2; segments: 3)  (cost=10000000000.00..10000016715.06 rows=481500 width=20) 
-   ->  Nested Loop  (cost=10000000000.00..10000016715.06 rows=160500 width=20)                        
-         ->  Seq Scan on t_lockmods1  (cost=0.00..1063.00 rows=32100 width=10)                        
-         ->  Materialize  (cost=0.00..3.33 rows=5 width=10)                                           
-               ->  Broadcast Motion 3:3  (slice1; segments: 3)  (cost=0.00..3.25 rows=5 width=10)     
-                     ->  Seq Scan on t_lockmods  (cost=0.00..3.05 rows=2 width=10)                    
+ Gather Motion 3:1  (slice1; segments: 3)  (cost=10000000000.00..10000008862.58 rows=481500 width=20) 
+   ->  Nested Loop  (cost=10000000000.00..10000002442.58 rows=160500 width=20)                        
+         ->  Broadcast Motion 3:3  (slice2; segments: 3)  (cost=0.00..1.08 rows=5 width=10)           
+               ->  Seq Scan on t_lockmods  (cost=0.00..1.02 rows=2 width=10)                          
+         ->  Materialize  (cost=0.00..515.50 rows=32100 width=10)                                     
+               ->  Seq Scan on t_lockmods1  (cost=0.00..355.00 rows=32100 width=10)                   
  Optimizer: Postgres query optimizer                                                                  
 (7 rows)
 1: select * from t_lockmods, t_lockmods1 for key share;
@@ -264,7 +269,7 @@ BEGIN
  relation | ExclusiveLock   | t       | t_lockmods  
 (4 rows)
 1: abort;
-ABORT
+ROLLBACK
 
 -- 1.1.2 update | delete should hold ExclusiveLock on result relations
 1: begin;
@@ -277,7 +282,7 @@ UPDATE 5
  relation | ExclusiveLock | t       | t_lockmods 
 (1 row)
 1: abort;
-ABORT
+ROLLBACK
 
 1: begin;
 BEGIN
@@ -289,33 +294,33 @@ DELETE 5
  relation | ExclusiveLock | t       | t_lockmods 
 (1 row)
 1: abort;
-ABORT
+ROLLBACK
 
 -- 1.1.3 insert should hold RowExclusiveLock on result relations
 1: begin;
 BEGIN
 1: insert into t_lockmods select * from generate_series(1, 5);
-INSERT 5
+INSERT 0 5
 2: select * from show_locks_lockmodes;
  locktype | mode             | granted | relation   
 ----------+------------------+---------+------------
  relation | RowExclusiveLock | t       | t_lockmods 
 (1 row)
 1: abort;
-ABORT
+ROLLBACK
 
 -- 1.1.4 upsert should hold ExclusiveLock on result relations
 1: begin;
 BEGIN
 1: insert into t_lockmods_upsert values (1, 1) on conflict(a, b) do update set b = 99;
-INSERT 1
+INSERT 0 1
 2: select * from show_locks_lockmodes;
  locktype | mode          | granted | relation          
 ----------+---------------+---------+-------------------
  relation | ExclusiveLock | t       | t_lockmods_upsert 
 (1 row)
 1: abort;
-ABORT
+ROLLBACK
 
 -- 1.1.5 use cached plan should be consistent with no cached plan
 1: prepare select_for_update as select * from t_lockmods for update;
@@ -352,7 +357,7 @@ BEGIN
  relation | ExclusiveLock | t       | t_lockmods 
 (1 row)
 1: abort;
-ABORT
+ROLLBACK
 
 1: begin;
 BEGIN
@@ -371,7 +376,7 @@ BEGIN
  relation | ExclusiveLock | t       | t_lockmods 
 (1 row)
 1: abort;
-ABORT
+ROLLBACK
 
 1: begin;
 BEGIN
@@ -390,7 +395,7 @@ BEGIN
  relation | ExclusiveLock | t       | t_lockmods 
 (1 row)
 1: abort;
-ABORT
+ROLLBACK
 
 1: begin;
 BEGIN
@@ -409,66 +414,65 @@ BEGIN
  relation | ExclusiveLock | t       | t_lockmods 
 (1 row)
 1: abort;
-ABORT
+ROLLBACK
 
 1: begin;
 BEGIN
 1: execute update_tlockmods;
-EXECUTE 5
+UPDATE 5
 2: select * from show_locks_lockmodes;
  locktype | mode          | granted | relation   
 ----------+---------------+---------+------------
  relation | ExclusiveLock | t       | t_lockmods 
 (1 row)
 1: abort;
-ABORT
+ROLLBACK
 
 1: begin;
 BEGIN
 1: execute delete_tlockmods;
-EXECUTE 5
+DELETE 5
 2: select * from show_locks_lockmodes;
  locktype | mode          | granted | relation   
 ----------+---------------+---------+------------
  relation | ExclusiveLock | t       | t_lockmods 
 (1 row)
 1: abort;
-ABORT
+ROLLBACK
 
 1: begin;
 BEGIN
 1: execute insert_tlockmods;
-EXECUTE 5
+INSERT 0 5
 2: select * from show_locks_lockmodes;
  locktype | mode             | granted | relation   
 ----------+------------------+---------+------------
  relation | RowExclusiveLock | t       | t_lockmods 
 (1 row)
 1: abort;
-ABORT
+ROLLBACK
 
 1: begin;
 BEGIN
 1: execute upsert_tlockmods;
-EXECUTE 1
+INSERT 0 1
 2: select * from show_locks_lockmodes;
- locktype | mode            | granted | relation          
-----------+-----------------+---------+-------------------
- relation | AccessShareLock | t       | t_lockmods_upsert 
- relation | ExclusiveLock   | t       | t_lockmods_upsert 
-(2 rows)
+ locktype | mode          | granted | relation          
+----------+---------------+---------+-------------------
+ relation | ExclusiveLock | t       | t_lockmods_upsert 
+(1 row)
 1: abort;
-ABORT
+ROLLBACK
 
 -- 1.2 test for AO table
 create table t_lockmods_ao (c int) with (appendonly=true) distributed randomly;
-CREATE
+CREATE TABLE
 insert into t_lockmods_ao select * from generate_series(1, 8);
-INSERT 8
+INSERT 0 8
 analyze t_lockmods_ao;
 ANALYZE
 create table t_lockmods_ao1 (c int) with (appendonly=true) distributed randomly;
-CREATE
+CREATE TABLE
 
 -- 1.2.1 select for (update|share|key share|no key update) should hold ExclusiveLock on range tables
 1: begin;
@@ -499,7 +503,7 @@ BEGIN
  relation | ExclusiveLock   | t       | t_lockmods_ao 
 (2 rows)
 1: abort;
-ABORT
+ROLLBACK
 
 1: begin;
 BEGIN
@@ -529,7 +533,7 @@ BEGIN
  relation | ExclusiveLock   | t       | t_lockmods_ao 
 (2 rows)
 1: abort;
-ABORT
+ROLLBACK
 
 1: begin;
 BEGIN
@@ -559,7 +563,7 @@ BEGIN
  relation | ExclusiveLock   | t       | t_lockmods_ao 
 (2 rows)
 1: abort;
-ABORT
+ROLLBACK
 
 1: begin;
 BEGIN
@@ -589,19 +593,19 @@ BEGIN
  relation | ExclusiveLock   | t       | t_lockmods_ao 
 (2 rows)
 1: abort;
-ABORT
+ROLLBACK
 
 1: begin;
 BEGIN
 1: explain select * from t_lockmods_ao, t_lockmods_ao1 for update;
  QUERY PLAN                                                                                           
 ------------------------------------------------------------------------------------------------------
- Gather Motion 3:1  (slice2; segments: 3)  (cost=10000000000.00..10000026102.50 rows=770400 width=20) 
-   ->  Nested Loop  (cost=10000000000.00..10000026102.50 rows=256800 width=20)                        
-         ->  Seq Scan on t_lockmods_ao1  (cost=0.00..1063.00 rows=32100 width=10)                     
-         ->  Materialize  (cost=0.00..1.52 rows=8 width=10)                                           
-               ->  Broadcast Motion 3:3  (slice1; segments: 3)  (cost=0.00..1.40 rows=8 width=10)     
-                     ->  Seq Scan on t_lockmods_ao  (cost=0.00..1.08 rows=3 width=10)                 
+ Gather Motion 3:1  (slice1; segments: 3)  (cost=10000000000.00..10000013918.38 rows=770400 width=20) 
+   ->  Nested Loop  (cost=10000000000.00..10000003646.38 rows=256800 width=20)                        
+         ->  Broadcast Motion 3:3  (slice2; segments: 3)  (cost=0.00..1.13 rows=8 width=10)           
+               ->  Seq Scan on t_lockmods_ao  (cost=0.00..1.03 rows=3 width=10)                       
+         ->  Materialize  (cost=0.00..515.50 rows=32100 width=10)                                     
+               ->  Seq Scan on t_lockmods_ao1  (cost=0.00..355.00 rows=32100 width=10)                
  Optimizer: Postgres query optimizer                                                                  
 (7 rows)
 1: select * from t_lockmods_ao, t_lockmods_ao1 for update;
@@ -617,19 +621,19 @@ BEGIN
  relation | ExclusiveLock   | t       | t_lockmods_ao  
 (4 rows)
 1: abort;
-ABORT
+ROLLBACK
 
 1: begin;
 BEGIN
 1: explain select * from t_lockmods_ao, t_lockmods_ao1 for no key update;
  QUERY PLAN                                                                                           
 ------------------------------------------------------------------------------------------------------
- Gather Motion 3:1  (slice2; segments: 3)  (cost=10000000000.00..10000026102.50 rows=770400 width=20) 
-   ->  Nested Loop  (cost=10000000000.00..10000026102.50 rows=256800 width=20)                        
-         ->  Seq Scan on t_lockmods_ao1  (cost=0.00..1063.00 rows=32100 width=10)                     
-         ->  Materialize  (cost=0.00..1.52 rows=8 width=10)                                           
-               ->  Broadcast Motion 3:3  (slice1; segments: 3)  (cost=0.00..1.40 rows=8 width=10)     
-                     ->  Seq Scan on t_lockmods_ao  (cost=0.00..1.08 rows=3 width=10)                 
+ Gather Motion 3:1  (slice1; segments: 3)  (cost=10000000000.00..10000013918.38 rows=770400 width=20) 
+   ->  Nested Loop  (cost=10000000000.00..10000003646.38 rows=256800 width=20)                        
+         ->  Broadcast Motion 3:3  (slice2; segments: 3)  (cost=0.00..1.13 rows=8 width=10)           
+               ->  Seq Scan on t_lockmods_ao  (cost=0.00..1.03 rows=3 width=10)                       
+         ->  Materialize  (cost=0.00..515.50 rows=32100 width=10)                                     
+               ->  Seq Scan on t_lockmods_ao1  (cost=0.00..355.00 rows=32100 width=10)                
  Optimizer: Postgres query optimizer                                                                  
 (7 rows)
 1: select * from t_lockmods_ao, t_lockmods_ao1 for no key update;
@@ -645,19 +649,19 @@ BEGIN
  relation | ExclusiveLock   | t       | t_lockmods_ao  
 (4 rows)
 1: abort;
-ABORT
+ROLLBACK
 
 1: begin;
 BEGIN
 1: explain select * from t_lockmods_ao, t_lockmods_ao1 for share;
  QUERY PLAN                                                                                           
 ------------------------------------------------------------------------------------------------------
- Gather Motion 3:1  (slice2; segments: 3)  (cost=10000000000.00..10000026102.50 rows=770400 width=20) 
-   ->  Nested Loop  (cost=10000000000.00..10000026102.50 rows=256800 width=20)                        
-         ->  Seq Scan on t_lockmods_ao1  (cost=0.00..1063.00 rows=32100 width=10)                     
-         ->  Materialize  (cost=0.00..1.52 rows=8 width=10)                                           
-               ->  Broadcast Motion 3:3  (slice1; segments: 3)  (cost=0.00..1.40 rows=8 width=10)     
-                     ->  Seq Scan on t_lockmods_ao  (cost=0.00..1.08 rows=3 width=10)                 
+ Gather Motion 3:1  (slice1; segments: 3)  (cost=10000000000.00..10000013918.38 rows=770400 width=20) 
+   ->  Nested Loop  (cost=10000000000.00..10000003646.38 rows=256800 width=20)                        
+         ->  Broadcast Motion 3:3  (slice2; segments: 3)  (cost=0.00..1.13 rows=8 width=10)           
+               ->  Seq Scan on t_lockmods_ao  (cost=0.00..1.03 rows=3 width=10)                       
+         ->  Materialize  (cost=0.00..515.50 rows=32100 width=10)                                     
+               ->  Seq Scan on t_lockmods_ao1  (cost=0.00..355.00 rows=32100 width=10)                
  Optimizer: Postgres query optimizer                                                                  
 (7 rows)
 1: select * from t_lockmods_ao, t_lockmods_ao1 for share;
@@ -673,19 +677,19 @@ BEGIN
  relation | ExclusiveLock   | t       | t_lockmods_ao  
 (4 rows)
 1: abort;
-ABORT
+ROLLBACK
 
 1: begin;
 BEGIN
 1: explain select * from t_lockmods_ao, t_lockmods_ao1 for key share;
  QUERY PLAN                                                                                           
 ------------------------------------------------------------------------------------------------------
- Gather Motion 3:1  (slice2; segments: 3)  (cost=10000000000.00..10000026102.50 rows=770400 width=20) 
-   ->  Nested Loop  (cost=10000000000.00..10000026102.50 rows=256800 width=20)                        
-         ->  Seq Scan on t_lockmods_ao1  (cost=0.00..1063.00 rows=32100 width=10)                     
-         ->  Materialize  (cost=0.00..1.52 rows=8 width=10)                                           
-               ->  Broadcast Motion 3:3  (slice1; segments: 3)  (cost=0.00..1.40 rows=8 width=10)     
-                     ->  Seq Scan on t_lockmods_ao  (cost=0.00..1.08 rows=3 width=10)                 
+ Gather Motion 3:1  (slice1; segments: 3)  (cost=10000000000.00..10000013918.38 rows=770400 width=20) 
+   ->  Nested Loop  (cost=10000000000.00..10000003646.38 rows=256800 width=20)                        
+         ->  Broadcast Motion 3:3  (slice2; segments: 3)  (cost=0.00..1.13 rows=8 width=10)           
+               ->  Seq Scan on t_lockmods_ao  (cost=0.00..1.03 rows=3 width=10)                       
+         ->  Materialize  (cost=0.00..515.50 rows=32100 width=10)                                     
+               ->  Seq Scan on t_lockmods_ao1  (cost=0.00..355.00 rows=32100 width=10)                
  Optimizer: Postgres query optimizer                                                                  
 (7 rows)
 1: select * from t_lockmods_ao, t_lockmods_ao1 for key share;
@@ -701,7 +705,7 @@ BEGIN
  relation | ExclusiveLock   | t       | t_lockmods_ao  
 (4 rows)
 1: abort;
-ABORT
+ROLLBACK
 
 -- 1.2.2 update | delete should hold ExclusiveLock on result relations
 1: begin;
@@ -714,7 +718,7 @@ UPDATE 8
  relation | ExclusiveLock | t       | t_lockmods_ao 
 (1 row)
 1: abort;
-ABORT
+ROLLBACK
 
 1: begin;
 BEGIN
@@ -726,20 +730,20 @@ DELETE 8
  relation | ExclusiveLock | t       | t_lockmods_ao 
 (1 row)
 1: abort;
-ABORT
+ROLLBACK
 
 -- 1.2.3 insert should hold RowExclusiveLock on result relations
 1: begin;
 BEGIN
 1: insert into t_lockmods_ao select * from generate_series(1, 5);
-INSERT 5
+INSERT 0 5
 2: select * from show_locks_lockmodes;
  locktype | mode             | granted | relation      
 ----------+------------------+---------+---------------
  relation | RowExclusiveLock | t       | t_lockmods_ao 
 (1 row)
 1: abort;
-ABORT
+ROLLBACK
 
 -- 1.2.4 use cached plan should be consistent with no cached plan
 1: prepare select_for_update_ao as select * from t_lockmods_ao for update;
@@ -777,7 +781,7 @@ BEGIN
  relation | ExclusiveLock | t       | t_lockmods_ao 
 (1 row)
 1: abort;
-ABORT
+ROLLBACK
 
 1: begin;
 BEGIN
@@ -799,7 +803,7 @@ BEGIN
  relation | ExclusiveLock | t       | t_lockmods_ao 
 (1 row)
 1: abort;
-ABORT
+ROLLBACK
 
 1: begin;
 BEGIN
@@ -821,7 +825,7 @@ BEGIN
  relation | ExclusiveLock | t       | t_lockmods_ao 
 (1 row)
 1: abort;
-ABORT
+ROLLBACK
 
 1: begin;
 BEGIN
@@ -843,43 +847,43 @@ BEGIN
  relation | ExclusiveLock | t       | t_lockmods_ao 
 (1 row)
 1: abort;
-ABORT
+ROLLBACK
 
 1: begin;
 BEGIN
 1: execute update_tlockmods_ao;
-EXECUTE 8
+UPDATE 8
 2: select * from show_locks_lockmodes;
  locktype | mode          | granted | relation      
 ----------+---------------+---------+---------------
  relation | ExclusiveLock | t       | t_lockmods_ao 
 (1 row)
 1: abort;
-ABORT
+ROLLBACK
 
 1: begin;
 BEGIN
 1: execute delete_tlockmods_ao;
-EXECUTE 8
+DELETE 8
 2: select * from show_locks_lockmodes;
  locktype | mode          | granted | relation      
 ----------+---------------+---------+---------------
  relation | ExclusiveLock | t       | t_lockmods_ao 
 (1 row)
 1: abort;
-ABORT
+ROLLBACK
 
 1: begin;
 BEGIN
 1: execute insert_tlockmods_ao;
-EXECUTE 5
+INSERT 0 5
 2: select * from show_locks_lockmodes;
  locktype | mode             | granted | relation      
 ----------+------------------+---------+---------------
  relation | RowExclusiveLock | t       | t_lockmods_ao 
 (1 row)
 1: abort;
-ABORT
+ROLLBACK
 
 -- 1.3 With limit clause, such case should
 -- acquire ExclusiveLock on the whole table and do not generate lockrows node
@@ -909,7 +913,7 @@ BEGIN
  relation | ExclusiveLock   | t       | t_lockmods 
 (2 rows)
 1: abort;
-ABORT
+ROLLBACK
 
 -- 1.4 For replicated table, we should lock the entire table on ExclusiveLock
 1: begin;
@@ -932,7 +936,7 @@ BEGIN
  relation | ExclusiveLock   | t       | t_lockmods_rep 
 (2 rows)
 1: abort;
-ABORT
+ROLLBACK
 
 -- 1.5 test order-by's plan
 1: begin;
@@ -963,7 +967,7 @@ BEGIN
  relation | ExclusiveLock   | t       | t_lockmods 
 (2 rows)
 1: abort;
-ABORT
+ROLLBACK
 
 -- 1.6 select for update NOWAIT/SKIP LOCKED
 -- NOWAIT/SKIP LOCKED should not affect the table-level lock
@@ -980,7 +984,7 @@ BEGIN
 (5 rows)
 2&: select * from t_lockmods for update nowait;  <waiting ...>
 1: abort;
-ABORT
+ROLLBACK
 2<:  <... completed>
  c 
 ---
@@ -1004,7 +1008,7 @@ BEGIN
 (5 rows)
 2&: select * from t_lockmods for update skip locked;  <waiting ...>
 1: abort;
-ABORT
+ROLLBACK
 2<:  <... completed>
  c 
 ---
@@ -1024,33 +1028,45 @@ ABORT
 --   * DML on one specific leaf
 -- For detailed behavior and notes, please refer below
 -- cases's comments.
--- GPDB_12_MERGE_FIXME: DML lockmodes on partition table
--- is a bit in disorder, we shoule correct them.
 -- Details: https://groups.google.com/a/greenplum.org/g/gpdb-dev/c/wAPKpJzhbpM
--- start_ignore
-1:DROP TABLE IF EXISTS t_lockmods_part_tbl_upd_del;
-DROP
--- end_ignore
+-- Issue: https://github.com/greenplum-db/gpdb/issues/13652
+1:DROP TABLE IF EXISTS t_lockmods_part_tbl_dml;
+DROP TABLE
 
-1:CREATE TABLE t_lockmods_part_tbl_upd_del (a int, b int, c int) PARTITION BY RANGE(b) (START(1) END(3) EVERY(1));
-CREATE
-1:INSERT INTO t_lockmods_part_tbl_upd_del SELECT i, 1, i FROM generate_series(1,10)i;
-INSERT 10
+1:CREATE TABLE t_lockmods_part_tbl_dml (a int, b int, c int) PARTITION BY RANGE(b) (START(1) END(3) EVERY(1));
+CREATE TABLE
+1:INSERT INTO t_lockmods_part_tbl_dml SELECT i, 1, i FROM generate_series(1,10)i;
+INSERT 0 10
 
 --
 1: BEGIN;
 BEGIN
-1: DELETE FROM t_lockmods_part_tbl_upd_del;
+1: DELETE FROM t_lockmods_part_tbl_dml;
 DELETE 10
 -- on QD, there's a lock on the root and the target partition
 1: select * from show_locks_lockmodes;
- locktype | mode             | granted | relation                            
-----------+------------------+---------+-------------------------------------
- relation | RowExclusiveLock | t       | t_lockmods_part_tbl_upd_del_1_prt_2 
- relation | RowExclusiveLock | t       | t_lockmods_part_tbl_upd_del_1_prt_1 
- relation | AccessShareLock  | t       | t_lockmods_part_tbl_upd_del         
- relation | ExclusiveLock    | t       | t_lockmods_part_tbl_upd_del         
+ locktype | mode            | granted | relation                        
+----------+-----------------+---------+---------------------------------
+ relation | AccessShareLock | t       | t_lockmods_part_tbl_dml         
+ relation | ExclusiveLock   | t       | t_lockmods_part_tbl_dml         
+ relation | ExclusiveLock   | t       | t_lockmods_part_tbl_dml_1_prt_2 
+ relation | ExclusiveLock   | t       | t_lockmods_part_tbl_dml_1_prt_1 
 (4 rows)
+1: ROLLBACK;
+ROLLBACK
+
+1: BEGIN;
+BEGIN
+1: INSERT INTO t_lockmods_part_tbl_dml SELECT i, 1, i FROM generate_series(1,10)i;
+INSERT 0 10
+-- without GDD, it will lock all leaf partitions on QD
+1: select * from show_locks_lockmodes;
+ locktype | mode             | granted | relation                        
+----------+------------------+---------+---------------------------------
+ relation | RowExclusiveLock | t       | t_lockmods_part_tbl_dml_1_prt_2 
+ relation | RowExclusiveLock | t       | t_lockmods_part_tbl_dml_1_prt_1 
+ relation | RowExclusiveLock | t       | t_lockmods_part_tbl_dml         
+(3 rows)
 1: ROLLBACK;
 ROLLBACK
 
@@ -1079,16 +1095,16 @@ ROLLBACK
 
 1: BEGIN;
 BEGIN
-1: UPDATE t_lockmods_part_tbl_upd_del SET c = 1 WHERE c = 1;
+1: UPDATE t_lockmods_part_tbl_dml SET c = 1 WHERE c = 1;
 UPDATE 1
 -- on QD, there's a lock on the root and the target partition
 1: select * from show_locks_lockmodes;
- locktype | mode             | granted | relation                            
-----------+------------------+---------+-------------------------------------
- relation | RowExclusiveLock | t       | t_lockmods_part_tbl_upd_del_1_prt_2 
- relation | RowExclusiveLock | t       | t_lockmods_part_tbl_upd_del_1_prt_1 
- relation | AccessShareLock  | t       | t_lockmods_part_tbl_upd_del         
- relation | ExclusiveLock    | t       | t_lockmods_part_tbl_upd_del         
+ locktype | mode            | granted | relation                        
+----------+-----------------+---------+---------------------------------
+ relation | AccessShareLock | t       | t_lockmods_part_tbl_dml         
+ relation | ExclusiveLock   | t       | t_lockmods_part_tbl_dml         
+ relation | ExclusiveLock   | t       | t_lockmods_part_tbl_dml_1_prt_2 
+ relation | ExclusiveLock   | t       | t_lockmods_part_tbl_dml_1_prt_1 
 (4 rows)
 1: ROLLBACK;
 ROLLBACK
@@ -1096,14 +1112,14 @@ ROLLBACK
 
 1: BEGIN;
 BEGIN
-1: DELETE FROM t_lockmods_part_tbl_upd_del_1_prt_1;
+1: DELETE FROM t_lockmods_part_tbl_dml_1_prt_1;
 DELETE 10
 -- since the delete operation is on leaf part, there will be a lock on QD
 1: select * from show_locks_lockmodes;
- locktype | mode            | granted | relation                            
-----------+-----------------+---------+-------------------------------------
- relation | AccessShareLock | t       | t_lockmods_part_tbl_upd_del         
- relation | ExclusiveLock   | t       | t_lockmods_part_tbl_upd_del_1_prt_1 
+ locktype | mode            | granted | relation                        
+----------+-----------------+---------+---------------------------------
+ relation | AccessShareLock | t       | t_lockmods_part_tbl_dml         
+ relation | ExclusiveLock   | t       | t_lockmods_part_tbl_dml_1_prt_1 
 (2 rows)
 1: ROLLBACK;
 ROLLBACK
@@ -1111,14 +1127,14 @@ ROLLBACK
 
 1: BEGIN;
 BEGIN
-1: UPDATE t_lockmods_part_tbl_upd_del_1_prt_1 SET c = 1 WHERE c = 1;
+1: UPDATE t_lockmods_part_tbl_dml_1_prt_1 SET c = 1 WHERE c = 1;
 UPDATE 1
 -- since the update operation is on leaf part, there will be a lock on QD
 1: select * from show_locks_lockmodes;
- locktype | mode            | granted | relation                            
-----------+-----------------+---------+-------------------------------------
- relation | AccessShareLock | t       | t_lockmods_part_tbl_upd_del         
- relation | ExclusiveLock   | t       | t_lockmods_part_tbl_upd_del_1_prt_1 
+ locktype | mode            | granted | relation                        
+----------+-----------------+---------+---------------------------------
+ relation | AccessShareLock | t       | t_lockmods_part_tbl_dml         
+ relation | ExclusiveLock   | t       | t_lockmods_part_tbl_dml_1_prt_1 
 (2 rows)
 1: ROLLBACK;
 ROLLBACK
@@ -1126,8 +1142,8 @@ ROLLBACK
 
 -- enable gdd
 ALTER SYSTEM SET gp_enable_global_deadlock_detector TO on;
-ALTER
--- Use utility session on seg 0 to restart master. This way avoids the
+ALTER SYSTEM
+-- Use utility session on seg 0 to restart coordinator. This way avoids the
 -- situation where session issuing the restart doesn't disappear
 -- itself.
 1U:SELECT pg_ctl(dir, 'restart') from lockmodes_datadir;
@@ -1183,7 +1199,7 @@ BEGIN
  relation | RowShareLock    | t       | t_lockmods 
 (2 rows)
 1: abort;
-ABORT
+ROLLBACK
 
 1: begin;
 BEGIN
@@ -1211,7 +1227,7 @@ BEGIN
  relation | RowShareLock    | t       | t_lockmods 
 (2 rows)
 1: abort;
-ABORT
+ROLLBACK
 
 1: begin;
 BEGIN
@@ -1239,7 +1255,7 @@ BEGIN
  relation | RowShareLock    | t       | t_lockmods 
 (2 rows)
 1: abort;
-ABORT
+ROLLBACK
 
 1: begin;
 BEGIN
@@ -1267,19 +1283,19 @@ BEGIN
  relation | RowShareLock    | t       | t_lockmods 
 (2 rows)
 1: abort;
-ABORT
+ROLLBACK
 
 1: begin;
 BEGIN
 1: explain select * from t_lockmods, t_lockmods1 for update;
  QUERY PLAN                                                                                           
 ------------------------------------------------------------------------------------------------------
- Gather Motion 3:1  (slice2; segments: 3)  (cost=10000000000.00..10000016715.06 rows=481500 width=20) 
-   ->  Nested Loop  (cost=10000000000.00..10000016715.06 rows=160500 width=20)                        
-         ->  Seq Scan on t_lockmods1  (cost=0.00..1063.00 rows=32100 width=10)                        
-         ->  Materialize  (cost=0.00..3.33 rows=5 width=10)                                           
-               ->  Broadcast Motion 3:3  (slice1; segments: 3)  (cost=0.00..3.25 rows=5 width=10)     
-                     ->  Seq Scan on t_lockmods  (cost=0.00..3.05 rows=2 width=10)                    
+ Gather Motion 3:1  (slice1; segments: 3)  (cost=10000000000.00..10000008862.58 rows=481500 width=20) 
+   ->  Nested Loop  (cost=10000000000.00..10000002442.58 rows=160500 width=20)                        
+         ->  Broadcast Motion 3:3  (slice2; segments: 3)  (cost=0.00..1.08 rows=5 width=10)           
+               ->  Seq Scan on t_lockmods  (cost=0.00..1.02 rows=2 width=10)                          
+         ->  Materialize  (cost=0.00..515.50 rows=32100 width=10)                                     
+               ->  Seq Scan on t_lockmods1  (cost=0.00..355.00 rows=32100 width=10)                   
  Optimizer: Postgres query optimizer                                                                  
 (7 rows)
 1: select * from t_lockmods, t_lockmods1 for update;
@@ -1295,19 +1311,19 @@ BEGIN
  relation | ExclusiveLock   | t       | t_lockmods  
 (4 rows)
 1: abort;
-ABORT
+ROLLBACK
 
 1: begin;
 BEGIN
 1: explain select * from t_lockmods, t_lockmods1 for no key update;
  QUERY PLAN                                                                                           
 ------------------------------------------------------------------------------------------------------
- Gather Motion 3:1  (slice2; segments: 3)  (cost=10000000000.00..10000016715.06 rows=481500 width=20) 
-   ->  Nested Loop  (cost=10000000000.00..10000016715.06 rows=160500 width=20)                        
-         ->  Seq Scan on t_lockmods1  (cost=0.00..1063.00 rows=32100 width=10)                        
-         ->  Materialize  (cost=0.00..3.33 rows=5 width=10)                                           
-               ->  Broadcast Motion 3:3  (slice1; segments: 3)  (cost=0.00..3.25 rows=5 width=10)     
-                     ->  Seq Scan on t_lockmods  (cost=0.00..3.05 rows=2 width=10)                    
+ Gather Motion 3:1  (slice1; segments: 3)  (cost=10000000000.00..10000008862.58 rows=481500 width=20) 
+   ->  Nested Loop  (cost=10000000000.00..10000002442.58 rows=160500 width=20)                        
+         ->  Broadcast Motion 3:3  (slice2; segments: 3)  (cost=0.00..1.08 rows=5 width=10)           
+               ->  Seq Scan on t_lockmods  (cost=0.00..1.02 rows=2 width=10)                          
+         ->  Materialize  (cost=0.00..515.50 rows=32100 width=10)                                     
+               ->  Seq Scan on t_lockmods1  (cost=0.00..355.00 rows=32100 width=10)                   
  Optimizer: Postgres query optimizer                                                                  
 (7 rows)
 1: select * from t_lockmods, t_lockmods1 for no key update;
@@ -1323,19 +1339,19 @@ BEGIN
  relation | ExclusiveLock   | t       | t_lockmods  
 (4 rows)
 1: abort;
-ABORT
+ROLLBACK
 
 1: begin;
 BEGIN
 1: explain select * from t_lockmods, t_lockmods1 for share;
  QUERY PLAN                                                                                           
 ------------------------------------------------------------------------------------------------------
- Gather Motion 3:1  (slice2; segments: 3)  (cost=10000000000.00..10000016715.06 rows=481500 width=20) 
-   ->  Nested Loop  (cost=10000000000.00..10000016715.06 rows=160500 width=20)                        
-         ->  Seq Scan on t_lockmods1  (cost=0.00..1063.00 rows=32100 width=10)                        
-         ->  Materialize  (cost=0.00..3.33 rows=5 width=10)                                           
-               ->  Broadcast Motion 3:3  (slice1; segments: 3)  (cost=0.00..3.25 rows=5 width=10)     
-                     ->  Seq Scan on t_lockmods  (cost=0.00..3.05 rows=2 width=10)                    
+ Gather Motion 3:1  (slice1; segments: 3)  (cost=10000000000.00..10000008862.58 rows=481500 width=20) 
+   ->  Nested Loop  (cost=10000000000.00..10000002442.58 rows=160500 width=20)                        
+         ->  Broadcast Motion 3:3  (slice2; segments: 3)  (cost=0.00..1.08 rows=5 width=10)           
+               ->  Seq Scan on t_lockmods  (cost=0.00..1.02 rows=2 width=10)                          
+         ->  Materialize  (cost=0.00..515.50 rows=32100 width=10)                                     
+               ->  Seq Scan on t_lockmods1  (cost=0.00..355.00 rows=32100 width=10)                   
  Optimizer: Postgres query optimizer                                                                  
 (7 rows)
 1: select * from t_lockmods, t_lockmods1 for share;
@@ -1351,19 +1367,19 @@ BEGIN
  relation | ExclusiveLock   | t       | t_lockmods  
 (4 rows)
 1: abort;
-ABORT
+ROLLBACK
 
 1: begin;
 BEGIN
 1: explain select * from t_lockmods, t_lockmods1 for key share;
  QUERY PLAN                                                                                           
 ------------------------------------------------------------------------------------------------------
- Gather Motion 3:1  (slice2; segments: 3)  (cost=10000000000.00..10000016715.06 rows=481500 width=20) 
-   ->  Nested Loop  (cost=10000000000.00..10000016715.06 rows=160500 width=20)                        
-         ->  Seq Scan on t_lockmods1  (cost=0.00..1063.00 rows=32100 width=10)                        
-         ->  Materialize  (cost=0.00..3.33 rows=5 width=10)                                           
-               ->  Broadcast Motion 3:3  (slice1; segments: 3)  (cost=0.00..3.25 rows=5 width=10)     
-                     ->  Seq Scan on t_lockmods  (cost=0.00..3.05 rows=2 width=10)                    
+ Gather Motion 3:1  (slice1; segments: 3)  (cost=10000000000.00..10000008862.58 rows=481500 width=20) 
+   ->  Nested Loop  (cost=10000000000.00..10000002442.58 rows=160500 width=20)                        
+         ->  Broadcast Motion 3:3  (slice2; segments: 3)  (cost=0.00..1.08 rows=5 width=10)           
+               ->  Seq Scan on t_lockmods  (cost=0.00..1.02 rows=2 width=10)                          
+         ->  Materialize  (cost=0.00..515.50 rows=32100 width=10)                                     
+               ->  Seq Scan on t_lockmods1  (cost=0.00..355.00 rows=32100 width=10)                   
  Optimizer: Postgres query optimizer                                                                  
 (7 rows)
 1: select * from t_lockmods, t_lockmods1 for key share;
@@ -1379,7 +1395,7 @@ BEGIN
  relation | ExclusiveLock   | t       | t_lockmods  
 (4 rows)
 1: abort;
-ABORT
+ROLLBACK
 
 
 -- 2.1.2 update | delete should hold RowExclusiveLock on result relations
@@ -1393,7 +1409,7 @@ UPDATE 5
  relation | RowExclusiveLock | t       | t_lockmods 
 (1 row)
 1: abort;
-ABORT
+ROLLBACK
 
 1: begin;
 BEGIN
@@ -1405,33 +1421,33 @@ DELETE 5
  relation | RowExclusiveLock | t       | t_lockmods 
 (1 row)
 1: abort;
-ABORT
+ROLLBACK
 
 -- 2.1.3 insert should hold RowExclusiveLock on result relations
 1: begin;
 BEGIN
 1: insert into t_lockmods select * from generate_series(1, 5);
-INSERT 5
+INSERT 0 5
 2: select * from show_locks_lockmodes;
  locktype | mode             | granted | relation   
 ----------+------------------+---------+------------
  relation | RowExclusiveLock | t       | t_lockmods 
 (1 row)
 1: abort;
-ABORT
+ROLLBACK
 
 -- 2.1.4 upsert should hold RowExclusiveLock on result relations
 1: begin;
 BEGIN
 1: insert into t_lockmods_upsert values (1, 1) on conflict(a, b) do update set b = 99;
-INSERT 1
+INSERT 0 1
 2: select * from show_locks_lockmodes;
  locktype | mode             | granted | relation          
 ----------+------------------+---------+-------------------
  relation | RowExclusiveLock | t       | t_lockmods_upsert 
 (1 row)
 1: abort;
-ABORT
+ROLLBACK
 
 -- 2.1.5 use cached plan should be consistent with no cached plan
 1: prepare select_for_update as select * from t_lockmods for update;
@@ -1468,7 +1484,7 @@ BEGIN
  relation | RowShareLock | t       | t_lockmods 
 (1 row)
 1: abort;
-ABORT
+ROLLBACK
 
 1: begin;
 BEGIN
@@ -1487,7 +1503,7 @@ BEGIN
  relation | RowShareLock | t       | t_lockmods 
 (1 row)
 1: abort;
-ABORT
+ROLLBACK
 
 1: begin;
 BEGIN
@@ -1506,7 +1522,7 @@ BEGIN
  relation | RowShareLock | t       | t_lockmods 
 (1 row)
 1: abort;
-ABORT
+ROLLBACK
 
 1: begin;
 BEGIN
@@ -1525,56 +1541,55 @@ BEGIN
  relation | RowShareLock | t       | t_lockmods 
 (1 row)
 1: abort;
-ABORT
+ROLLBACK
 
 1: begin;
 BEGIN
 1: execute update_tlockmods;
-EXECUTE 5
+UPDATE 5
 2: select * from show_locks_lockmodes;
  locktype | mode             | granted | relation   
 ----------+------------------+---------+------------
  relation | RowExclusiveLock | t       | t_lockmods 
 (1 row)
 1: abort;
-ABORT
+ROLLBACK
 
 1: begin;
 BEGIN
 1: execute delete_tlockmods;
-EXECUTE 5
+DELETE 5
 2: select * from show_locks_lockmodes;
  locktype | mode             | granted | relation   
 ----------+------------------+---------+------------
  relation | RowExclusiveLock | t       | t_lockmods 
 (1 row)
 1: abort;
-ABORT
+ROLLBACK
 
 1: begin;
 BEGIN
 1: execute insert_tlockmods;
-EXECUTE 5
+INSERT 0 5
 2: select * from show_locks_lockmodes;
  locktype | mode             | granted | relation   
 ----------+------------------+---------+------------
  relation | RowExclusiveLock | t       | t_lockmods 
 (1 row)
 1: abort;
-ABORT
+ROLLBACK
 
 1: begin;
 BEGIN
 1: execute upsert_tlockmods;
-EXECUTE 1
+INSERT 0 1
 2: select * from show_locks_lockmodes;
  locktype | mode             | granted | relation          
 ----------+------------------+---------+-------------------
- relation | AccessShareLock  | t       | t_lockmods_upsert 
  relation | RowExclusiveLock | t       | t_lockmods_upsert 
-(2 rows)
+(1 row)
 1: abort;
-ABORT
+ROLLBACK
 
 -- 2.2 test for AO table
 
@@ -1607,7 +1622,7 @@ BEGIN
  relation | ExclusiveLock   | t       | t_lockmods_ao 
 (2 rows)
 1: abort;
-ABORT
+ROLLBACK
 
 1: begin;
 BEGIN
@@ -1637,7 +1652,7 @@ BEGIN
  relation | ExclusiveLock   | t       | t_lockmods_ao 
 (2 rows)
 1: abort;
-ABORT
+ROLLBACK
 
 1: begin;
 BEGIN
@@ -1667,7 +1682,7 @@ BEGIN
  relation | ExclusiveLock   | t       | t_lockmods_ao 
 (2 rows)
 1: abort;
-ABORT
+ROLLBACK
 
 1: begin;
 BEGIN
@@ -1697,19 +1712,19 @@ BEGIN
  relation | ExclusiveLock   | t       | t_lockmods_ao 
 (2 rows)
 1: abort;
-ABORT
+ROLLBACK
 
 1: begin;
 BEGIN
 1: explain select * from t_lockmods_ao, t_lockmods_ao1 for update;
  QUERY PLAN                                                                                           
 ------------------------------------------------------------------------------------------------------
- Gather Motion 3:1  (slice2; segments: 3)  (cost=10000000000.00..10000026102.50 rows=770400 width=20) 
-   ->  Nested Loop  (cost=10000000000.00..10000026102.50 rows=256800 width=20)                        
-         ->  Seq Scan on t_lockmods_ao1  (cost=0.00..1063.00 rows=32100 width=10)                     
-         ->  Materialize  (cost=0.00..1.52 rows=8 width=10)                                           
-               ->  Broadcast Motion 3:3  (slice1; segments: 3)  (cost=0.00..1.40 rows=8 width=10)     
-                     ->  Seq Scan on t_lockmods_ao  (cost=0.00..1.08 rows=3 width=10)                 
+ Gather Motion 3:1  (slice1; segments: 3)  (cost=10000000000.00..10000013918.38 rows=770400 width=20) 
+   ->  Nested Loop  (cost=10000000000.00..10000003646.38 rows=256800 width=20)                        
+         ->  Broadcast Motion 3:3  (slice2; segments: 3)  (cost=0.00..1.13 rows=8 width=10)           
+               ->  Seq Scan on t_lockmods_ao  (cost=0.00..1.03 rows=3 width=10)                       
+         ->  Materialize  (cost=0.00..515.50 rows=32100 width=10)                                     
+               ->  Seq Scan on t_lockmods_ao1  (cost=0.00..355.00 rows=32100 width=10)                
  Optimizer: Postgres query optimizer                                                                  
 (7 rows)
 1: select * from t_lockmods_ao, t_lockmods_ao1 for update;
@@ -1725,19 +1740,19 @@ BEGIN
  relation | ExclusiveLock   | t       | t_lockmods_ao  
 (4 rows)
 1: abort;
-ABORT
+ROLLBACK
 
 1: begin;
 BEGIN
 1: explain select * from t_lockmods_ao, t_lockmods_ao1 for no key update;
  QUERY PLAN                                                                                           
 ------------------------------------------------------------------------------------------------------
- Gather Motion 3:1  (slice2; segments: 3)  (cost=10000000000.00..10000026102.50 rows=770400 width=20) 
-   ->  Nested Loop  (cost=10000000000.00..10000026102.50 rows=256800 width=20)                        
-         ->  Seq Scan on t_lockmods_ao1  (cost=0.00..1063.00 rows=32100 width=10)                     
-         ->  Materialize  (cost=0.00..1.52 rows=8 width=10)                                           
-               ->  Broadcast Motion 3:3  (slice1; segments: 3)  (cost=0.00..1.40 rows=8 width=10)     
-                     ->  Seq Scan on t_lockmods_ao  (cost=0.00..1.08 rows=3 width=10)                 
+ Gather Motion 3:1  (slice1; segments: 3)  (cost=10000000000.00..10000013918.38 rows=770400 width=20) 
+   ->  Nested Loop  (cost=10000000000.00..10000003646.38 rows=256800 width=20)                        
+         ->  Broadcast Motion 3:3  (slice2; segments: 3)  (cost=0.00..1.13 rows=8 width=10)           
+               ->  Seq Scan on t_lockmods_ao  (cost=0.00..1.03 rows=3 width=10)                       
+         ->  Materialize  (cost=0.00..515.50 rows=32100 width=10)                                     
+               ->  Seq Scan on t_lockmods_ao1  (cost=0.00..355.00 rows=32100 width=10)                
  Optimizer: Postgres query optimizer                                                                  
 (7 rows)
 1: select * from t_lockmods_ao, t_lockmods_ao1 for no key update;
@@ -1753,19 +1768,19 @@ BEGIN
  relation | ExclusiveLock   | t       | t_lockmods_ao  
 (4 rows)
 1: abort;
-ABORT
+ROLLBACK
 
 1: begin;
 BEGIN
 1: explain select * from t_lockmods_ao, t_lockmods_ao1 for share;
  QUERY PLAN                                                                                           
 ------------------------------------------------------------------------------------------------------
- Gather Motion 3:1  (slice2; segments: 3)  (cost=10000000000.00..10000026102.50 rows=770400 width=20) 
-   ->  Nested Loop  (cost=10000000000.00..10000026102.50 rows=256800 width=20)                        
-         ->  Seq Scan on t_lockmods_ao1  (cost=0.00..1063.00 rows=32100 width=10)                     
-         ->  Materialize  (cost=0.00..1.52 rows=8 width=10)                                           
-               ->  Broadcast Motion 3:3  (slice1; segments: 3)  (cost=0.00..1.40 rows=8 width=10)     
-                     ->  Seq Scan on t_lockmods_ao  (cost=0.00..1.08 rows=3 width=10)                 
+ Gather Motion 3:1  (slice1; segments: 3)  (cost=10000000000.00..10000013918.38 rows=770400 width=20) 
+   ->  Nested Loop  (cost=10000000000.00..10000003646.38 rows=256800 width=20)                        
+         ->  Broadcast Motion 3:3  (slice2; segments: 3)  (cost=0.00..1.13 rows=8 width=10)           
+               ->  Seq Scan on t_lockmods_ao  (cost=0.00..1.03 rows=3 width=10)                       
+         ->  Materialize  (cost=0.00..515.50 rows=32100 width=10)                                     
+               ->  Seq Scan on t_lockmods_ao1  (cost=0.00..355.00 rows=32100 width=10)                
  Optimizer: Postgres query optimizer                                                                  
 (7 rows)
 1: select * from t_lockmods_ao, t_lockmods_ao1 for share;
@@ -1781,19 +1796,19 @@ BEGIN
  relation | ExclusiveLock   | t       | t_lockmods_ao  
 (4 rows)
 1: abort;
-ABORT
+ROLLBACK
 
 1: begin;
 BEGIN
 1: explain select * from t_lockmods_ao, t_lockmods_ao1 for key share;
  QUERY PLAN                                                                                           
 ------------------------------------------------------------------------------------------------------
- Gather Motion 3:1  (slice2; segments: 3)  (cost=10000000000.00..10000026102.50 rows=770400 width=20) 
-   ->  Nested Loop  (cost=10000000000.00..10000026102.50 rows=256800 width=20)                        
-         ->  Seq Scan on t_lockmods_ao1  (cost=0.00..1063.00 rows=32100 width=10)                     
-         ->  Materialize  (cost=0.00..1.52 rows=8 width=10)                                           
-               ->  Broadcast Motion 3:3  (slice1; segments: 3)  (cost=0.00..1.40 rows=8 width=10)     
-                     ->  Seq Scan on t_lockmods_ao  (cost=0.00..1.08 rows=3 width=10)                 
+ Gather Motion 3:1  (slice1; segments: 3)  (cost=10000000000.00..10000013918.38 rows=770400 width=20) 
+   ->  Nested Loop  (cost=10000000000.00..10000003646.38 rows=256800 width=20)                        
+         ->  Broadcast Motion 3:3  (slice2; segments: 3)  (cost=0.00..1.13 rows=8 width=10)           
+               ->  Seq Scan on t_lockmods_ao  (cost=0.00..1.03 rows=3 width=10)                       
+         ->  Materialize  (cost=0.00..515.50 rows=32100 width=10)                                     
+               ->  Seq Scan on t_lockmods_ao1  (cost=0.00..355.00 rows=32100 width=10)                
  Optimizer: Postgres query optimizer                                                                  
 (7 rows)
 1: select * from t_lockmods_ao, t_lockmods_ao1 for key share;
@@ -1809,7 +1824,7 @@ BEGIN
  relation | ExclusiveLock   | t       | t_lockmods_ao  
 (4 rows)
 1: abort;
-ABORT
+ROLLBACK
 
 -- 2.2.2 update | delete should hold ExclusiveLock on result relations
 1: begin;
@@ -1822,7 +1837,7 @@ UPDATE 8
  relation | ExclusiveLock | t       | t_lockmods_ao 
 (1 row)
 1: abort;
-ABORT
+ROLLBACK
 
 1: begin;
 BEGIN
@@ -1834,20 +1849,20 @@ DELETE 8
  relation | ExclusiveLock | t       | t_lockmods_ao 
 (1 row)
 1: abort;
-ABORT
+ROLLBACK
 
 -- 2.2.3 insert should hold RowExclusiveLock on result relations
 1: begin;
 BEGIN
 1: insert into t_lockmods_ao select * from generate_series(1, 5);
-INSERT 5
+INSERT 0 5
 2: select * from show_locks_lockmodes;
  locktype | mode             | granted | relation      
 ----------+------------------+---------+---------------
  relation | RowExclusiveLock | t       | t_lockmods_ao 
 (1 row)
 1: abort;
-ABORT
+ROLLBACK
 
 -- 2.2.4 use cached plan should be consistent with no cached plan
 1: prepare select_for_update_ao as select * from t_lockmods_ao for update;
@@ -1885,7 +1900,7 @@ BEGIN
  relation | ExclusiveLock | t       | t_lockmods_ao 
 (1 row)
 1: abort;
-ABORT
+ROLLBACK
 
 1: begin;
 BEGIN
@@ -1907,7 +1922,7 @@ BEGIN
  relation | ExclusiveLock | t       | t_lockmods_ao 
 (1 row)
 1: abort;
-ABORT
+ROLLBACK
 
 1: begin;
 BEGIN
@@ -1929,7 +1944,7 @@ BEGIN
  relation | ExclusiveLock | t       | t_lockmods_ao 
 (1 row)
 1: abort;
-ABORT
+ROLLBACK
 
 1: begin;
 BEGIN
@@ -1951,43 +1966,43 @@ BEGIN
  relation | ExclusiveLock | t       | t_lockmods_ao 
 (1 row)
 1: abort;
-ABORT
+ROLLBACK
 
 1: begin;
 BEGIN
 1: execute update_tlockmods_ao;
-EXECUTE 8
+UPDATE 8
 2: select * from show_locks_lockmodes;
  locktype | mode          | granted | relation      
 ----------+---------------+---------+---------------
  relation | ExclusiveLock | t       | t_lockmods_ao 
 (1 row)
 1: abort;
-ABORT
+ROLLBACK
 
 1: begin;
 BEGIN
 1: execute delete_tlockmods_ao;
-EXECUTE 8
+DELETE 8
 2: select * from show_locks_lockmodes;
  locktype | mode          | granted | relation      
 ----------+---------------+---------+---------------
  relation | ExclusiveLock | t       | t_lockmods_ao 
 (1 row)
 1: abort;
-ABORT
+ROLLBACK
 
 1: begin;
 BEGIN
 1: execute insert_tlockmods_ao;
-EXECUTE 5
+INSERT 0 5
 2: select * from show_locks_lockmodes;
  locktype | mode             | granted | relation      
 ----------+------------------+---------+---------------
  relation | RowExclusiveLock | t       | t_lockmods_ao 
 (1 row)
 1: abort;
-ABORT
+ROLLBACK
 
 -- 2.3 With limit clause, such case should
 -- acquire ExclusiveLock on the whole table and do not generate lockrows node
@@ -2019,7 +2034,7 @@ BEGIN
  relation | RowShareLock    | t       | t_lockmods 
 (2 rows)
 1: abort;
-ABORT
+ROLLBACK
 
 -- 2.4 For replicated table, we should lock the entire table on ExclusiveLock
 1: begin;
@@ -2042,7 +2057,7 @@ BEGIN
  relation | ExclusiveLock   | t       | t_lockmods_rep 
 (2 rows)
 1: abort;
-ABORT
+ROLLBACK
 
 -- 2.5 test order-by's plan
 1: begin;
@@ -2074,7 +2089,7 @@ BEGIN
  relation | RowShareLock    | t       | t_lockmods 
 (2 rows)
 1: abort;
-ABORT
+ROLLBACK
 
 -- 2.6 select for update NOWAIT/SKIP LOCKED
 -- with GDD, select for update could be optimized to not upgrade lock.
@@ -2116,7 +2131,7 @@ BEGIN
 2: select * from t_lockmods for update nowait;
 ERROR:  could not obtain lock on row in relation "t_lockmods"  (seg1 slice1 10.140.0.3:7003 pid=15182)
 1: abort;
-ABORT
+ROLLBACK
 
 1q: ... <quitting>
 2q: ... <quitting>
@@ -2130,16 +2145,16 @@ ABORT
 
 1: BEGIN;
 BEGIN
-1: DELETE FROM t_lockmods_part_tbl_upd_del;
+1: DELETE FROM t_lockmods_part_tbl_dml;
 DELETE 10
 -- on QD, there's a lock on the root and the target partition
 1: select * from show_locks_lockmodes;
- locktype | mode             | granted | relation                            
-----------+------------------+---------+-------------------------------------
- relation | RowExclusiveLock | t       | t_lockmods_part_tbl_upd_del_1_prt_2 
- relation | RowExclusiveLock | t       | t_lockmods_part_tbl_upd_del_1_prt_1 
- relation | AccessShareLock  | t       | t_lockmods_part_tbl_upd_del         
- relation | RowExclusiveLock | t       | t_lockmods_part_tbl_upd_del         
+ locktype | mode             | granted | relation                        
+----------+------------------+---------+---------------------------------
+ relation | RowExclusiveLock | t       | t_lockmods_part_tbl_dml_1_prt_2 
+ relation | RowExclusiveLock | t       | t_lockmods_part_tbl_dml_1_prt_1 
+ relation | AccessShareLock  | t       | t_lockmods_part_tbl_dml         
+ relation | RowExclusiveLock | t       | t_lockmods_part_tbl_dml         
 (4 rows)
 1: ROLLBACK;
 ROLLBACK
@@ -2147,16 +2162,16 @@ ROLLBACK
 
 1: BEGIN;
 BEGIN
-1: UPDATE t_lockmods_part_tbl_upd_del SET c = 1 WHERE c = 1;
+1: UPDATE t_lockmods_part_tbl_dml SET c = 1 WHERE c = 1;
 UPDATE 1
 -- on QD, there's a lock on the root and the target partition
 1: select * from show_locks_lockmodes;
- locktype | mode             | granted | relation                            
-----------+------------------+---------+-------------------------------------
- relation | RowExclusiveLock | t       | t_lockmods_part_tbl_upd_del_1_prt_2 
- relation | RowExclusiveLock | t       | t_lockmods_part_tbl_upd_del_1_prt_1 
- relation | AccessShareLock  | t       | t_lockmods_part_tbl_upd_del         
- relation | RowExclusiveLock | t       | t_lockmods_part_tbl_upd_del         
+ locktype | mode             | granted | relation                        
+----------+------------------+---------+---------------------------------
+ relation | RowExclusiveLock | t       | t_lockmods_part_tbl_dml_1_prt_2 
+ relation | RowExclusiveLock | t       | t_lockmods_part_tbl_dml_1_prt_1 
+ relation | AccessShareLock  | t       | t_lockmods_part_tbl_dml         
+ relation | RowExclusiveLock | t       | t_lockmods_part_tbl_dml         
 (4 rows)
 1: ROLLBACK;
 ROLLBACK
@@ -2164,14 +2179,14 @@ ROLLBACK
 
 1: BEGIN;
 BEGIN
-1: DELETE FROM t_lockmods_part_tbl_upd_del_1_prt_1;
+1: DELETE FROM t_lockmods_part_tbl_dml_1_prt_1;
 DELETE 10
 -- since the delete operation is on leaf part, there will be a lock on QD
 1: select * from show_locks_lockmodes;
- locktype | mode             | granted | relation                            
-----------+------------------+---------+-------------------------------------
- relation | AccessShareLock  | t       | t_lockmods_part_tbl_upd_del         
- relation | RowExclusiveLock | t       | t_lockmods_part_tbl_upd_del_1_prt_1 
+ locktype | mode             | granted | relation                        
+----------+------------------+---------+---------------------------------
+ relation | AccessShareLock  | t       | t_lockmods_part_tbl_dml         
+ relation | RowExclusiveLock | t       | t_lockmods_part_tbl_dml_1_prt_1 
 (2 rows)
 1: ROLLBACK;
 ROLLBACK
@@ -2179,34 +2194,249 @@ ROLLBACK
 
 1: BEGIN;
 BEGIN
-1: UPDATE t_lockmods_part_tbl_upd_del_1_prt_1 SET c = 1 WHERE c = 1;
+1: UPDATE t_lockmods_part_tbl_dml_1_prt_1 SET c = 1 WHERE c = 1;
 UPDATE 1
 -- since the update operation is on leaf part, there will be a lock on QD
 1: select * from show_locks_lockmodes;
- locktype | mode             | granted | relation                            
-----------+------------------+---------+-------------------------------------
- relation | AccessShareLock  | t       | t_lockmods_part_tbl_upd_del         
- relation | RowExclusiveLock | t       | t_lockmods_part_tbl_upd_del_1_prt_1 
+ locktype | mode             | granted | relation                        
+----------+------------------+---------+---------------------------------
+ relation | AccessShareLock  | t       | t_lockmods_part_tbl_dml         
+ relation | RowExclusiveLock | t       | t_lockmods_part_tbl_dml_1_prt_1 
 (2 rows)
 1: ROLLBACK;
 ROLLBACK
 1q: ... <quitting>
 
+1: BEGIN;
+BEGIN
+1: INSERT INTO t_lockmods_part_tbl_dml SELECT i, 1, i FROM generate_series(1,10)i;
+INSERT 0 10
+-- With GDD enabled, QD will only hold lock on root for insert
+1: select * from show_locks_lockmodes;
+ locktype | mode             | granted | relation                
+----------+------------------+---------+-------------------------
+ relation | RowExclusiveLock | t       | t_lockmods_part_tbl_dml 
+(1 row)
+1: ROLLBACK;
+ROLLBACK
+1q: ... <quitting>
+
+1: CREATE TABLE t_lockmods_aopart(i int, t text) USING ao_row PARTITION BY RANGE(i) (START(1) END(5) EVERY(1));
+CREATE TABLE
+1: BEGIN;
+BEGIN
+1: DELETE FROM t_lockmods_aopart WHERE i = 4;
+DELETE 0
+-- With GDD enabled, QD will only hold lock on root for delete
+1: select * from show_locks_lockmodes;
+ locktype | mode            | granted | relation                  
+----------+-----------------+---------+---------------------------
+ relation | ExclusiveLock   | t       | t_lockmods_aopart_1_prt_4 
+ relation | AccessShareLock | t       | t_lockmods_aopart         
+ relation | ExclusiveLock   | t       | t_lockmods_aopart         
+(3 rows)
+1: COMMIT;
+COMMIT
+1: DROP TABLE t_lockmods_aopart;
+DROP TABLE
+1q: ... <quitting>
+
+-- 2.8 Verify behaviors of select with locking clause (i.e. select for update)
+-- when running concurrently with index creation, for Heap tables.
+-- For AO/CO tables, refer to create_index_allows_readonly.source.
+
+1: CREATE TABLE create_index_select_for_update_tbl(a int, b int);
+CREATE TABLE
+1: INSERT INTO create_index_select_for_update_tbl SELECT i,i FROM generate_series(1,10)i;
+INSERT 0 10
+1: set optimizer = off;
+SET
+
+-- 2.8.1 with GDD enabled, expect no blocking
+1: show gp_enable_global_deadlock_detector;
+ gp_enable_global_deadlock_detector 
+------------------------------------
+ on                                 
+(1 row)
+
+1: BEGIN;
+BEGIN
+1: SELECT * FROM create_index_select_for_update_tbl WHERE a = 2 FOR UPDATE;
+ a | b 
+---+---
+ 2 | 2 
+(1 row)
+
+2: set optimizer = off;
+SET
+
+2: BEGIN;
+BEGIN
+-- expect no blocking
+2: CREATE INDEX create_index_select_for_update_idx ON create_index_select_for_update_tbl(a);
+CREATE INDEX
+2: COMMIT;
+COMMIT
+
+1: COMMIT;
+COMMIT
+
+2: DROP INDEX create_index_select_for_update_idx;
+DROP INDEX
+
+2: BEGIN;
+BEGIN
+2: CREATE INDEX create_index_select_for_update_idx ON create_index_select_for_update_tbl(a);
+CREATE INDEX
+
+1: BEGIN;
+BEGIN
+-- expect no blocking
+1: SELECT * FROM create_index_select_for_update_tbl WHERE a = 2 FOR UPDATE;
+ a | b 
+---+---
+ 2 | 2 
+(1 row)
+1: COMMIT;
+COMMIT
+-- close session to avoid renew session failure after restart
+1q: ... <quitting>
+
+2: COMMIT;
+COMMIT
+
+2: DROP INDEX create_index_select_for_update_idx;
+DROP INDEX
+
+-- 2.8.2 with GDD disabled, expect blocking
 -- reset gdd
 2: ALTER SYSTEM RESET gp_enable_global_deadlock_detector;
-ALTER
+ALTER SYSTEM
+-- close session to avoid renew session failure after restart
+2q: ... <quitting>
 1U:SELECT pg_ctl(dir, 'restart') from lockmodes_datadir;
  pg_ctl 
 --------
  OK     
 (1 row)
 
+1: set optimizer = off;
+SET
 1: show gp_enable_global_deadlock_detector;
  gp_enable_global_deadlock_detector 
 ------------------------------------
  off                                
 (1 row)
 
+1: BEGIN;
+BEGIN
+1: SELECT * FROM create_index_select_for_update_tbl WHERE a = 2 FOR UPDATE;
+ a | b 
+---+---
+ 2 | 2 
+(1 row)
+
+2: set optimizer = off;
+SET
+
+2: BEGIN;
+BEGIN
+-- expect blocking
+2&: CREATE INDEX create_index_select_for_update_idx ON create_index_select_for_update_tbl(a);  <waiting ...>
+
+1: COMMIT;
+COMMIT
+
+2<:  <... completed>
+CREATE INDEX
+2: COMMIT;
+COMMIT
+
+2: DROP INDEX create_index_select_for_update_idx;
+DROP INDEX
+
+2: BEGIN;
+BEGIN
+2: CREATE INDEX create_index_select_for_update_idx ON create_index_select_for_update_tbl(a);
+CREATE INDEX
+
+1: BEGIN;
+BEGIN
+-- expect blocking
+1&: SELECT * FROM create_index_select_for_update_tbl WHERE a = 2 FOR UPDATE;  <waiting ...>
+
+2: COMMIT;
+COMMIT
+
+1<:  <... completed>
+ a | b 
+---+---
+ 2 | 2 
+(1 row)
+1: COMMIT;
+COMMIT
+
 1: drop table lockmodes_datadir;
-DROP
+DROP TABLE
 1q: ... <quitting>
+2q: ... <quitting>
+
+-- Check that concurrent DROP on leaf partition won't impact analyze on the
+-- parent since analyze will hold a ShareUpdateExclusiveLock and DROP will
+-- require an AccessExclusiveLock.
+-- Case 1. The analyze result is expected when there's concurrent drop on child.
+1:create table analyzedrop(a int) partition by range(a);
+CREATE TABLE
+1:create table analyzedrop_1 partition of analyzedrop for values from (0) to (10);
+CREATE TABLE
+1:create table analyzedrop_2 partition of analyzedrop for values from (10) to (20);
+CREATE TABLE
+1:insert into analyzedrop select * from generate_series(0,19);
+INSERT 0 20
+1:select gp_inject_fault_infinite('merge_leaf_stats_after_find_children', 'suspend', dbid) from gp_segment_configuration where content = -1 and role = 'p';
+ gp_inject_fault_infinite 
+--------------------------
+ Success:                 
+(1 row)
+1&: analyze analyzedrop;  <waiting ...>
+2&: drop table analyzedrop_1;  <waiting ...>
+3:select gp_inject_fault_infinite('merge_leaf_stats_after_find_children', 'reset', dbid) from gp_segment_configuration where content = -1 and role = 'p';
+ gp_inject_fault_infinite 
+--------------------------
+ Success:                 
+(1 row)
+1<:  <... completed>
+ANALYZE
+2<:  <... completed>
+DROP TABLE
+3:select * from pg_stats where tablename like 'analyzedrop%';
+ schemaname | tablename     | attname | inherited | null_frac | avg_width | n_distinct | most_common_vals | most_common_freqs | histogram_bounds                                 | correlation | most_common_elems | most_common_elem_freqs | elem_count_histogram 
+------------+---------------+---------+-----------+-----------+-----------+------------+------------------+-------------------+--------------------------------------------------+-------------+-------------------+------------------------+----------------------
+ public     | analyzedrop   | a       | t         | 0         | 4         | -1         |                  |                   | {0,1,2,3,4,5,6,7,8,9,11,12,13,14,15,16,17,18,19} |             |                   |                        |                      
+ public     | analyzedrop_2 | a       | f         | 0         | 4         | -1         |                  |                   | {10,11,12,13,14,15,16,17,18,19}                  | 1           |                   |                        |                      
+(2 rows)
+-- Case 2. No failure should happen when there's concurrent drop on parent as well.
+1:select gp_inject_fault_infinite('merge_leaf_stats_after_find_children', 'suspend', dbid) from gp_segment_configuration where content = -1 and role = 'p';
+ gp_inject_fault_infinite 
+--------------------------
+ Success:                 
+(1 row)
+1&: analyze analyzedrop;  <waiting ...>
+2&: drop table analyzedrop_2;  <waiting ...>
+3&: drop table analyzedrop;  <waiting ...>
+4:select gp_inject_fault_infinite('merge_leaf_stats_after_find_children', 'reset', dbid) from gp_segment_configuration where content = -1 and role = 'p';
+ gp_inject_fault_infinite 
+--------------------------
+ Success:                 
+(1 row)
+1<:  <... completed>
+ANALYZE
+2<:  <... completed>
+DROP TABLE
+3<:  <... completed>
+DROP TABLE
+--empty as table is dropped
+4:select * from pg_stats where tablename like 'analyzedrop%';
+ schemaname | tablename | attname | inherited | null_frac | avg_width | n_distinct | most_common_vals | most_common_freqs | histogram_bounds | correlation | most_common_elems | most_common_elem_freqs | elem_count_histogram 
+------------+-----------+---------+-----------+-----------+-----------+------------+------------------+-------------------+------------------+-------------+-------------------+------------------------+----------------------
+(0 rows)

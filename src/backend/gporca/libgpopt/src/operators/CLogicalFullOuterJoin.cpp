@@ -28,7 +28,9 @@ using namespace gpopt;
 //		ctor
 //
 //---------------------------------------------------------------------------
-CLogicalFullOuterJoin::CLogicalFullOuterJoin(CMemoryPool *mp) : CLogicalJoin(mp)
+CLogicalFullOuterJoin::CLogicalFullOuterJoin(CMemoryPool *mp,
+											 CXform::EXformId origin_xform)
+	: CLogicalJoin(mp, origin_xform)
 {
 	GPOS_ASSERT(nullptr != mp);
 }
@@ -78,6 +80,8 @@ CLogicalFullOuterJoin::PxfsCandidates(CMemoryPool *mp) const
 	CXformSet *xform_set = GPOS_NEW(mp) CXformSet(mp);
 	(void) xform_set->ExchangeSet(CXform::ExfExpandFullOuterJoin);
 	(void) xform_set->ExchangeSet(CXform::ExfImplementFullOuterMergeJoin);
+	(void) xform_set->ExchangeSet(CXform::ExfFullJoinCommutativity);
+	(void) xform_set->ExchangeSet(CXform::ExfFullOuterJoin2HashJoin);
 	return xform_set;
 }
 

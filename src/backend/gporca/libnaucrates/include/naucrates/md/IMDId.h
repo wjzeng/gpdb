@@ -16,6 +16,7 @@
 
 #include "gpos/base.h"
 #include "gpos/common/CDynamicPtrArray.h"
+#include "gpos/common/CHashMap.h"
 #include "gpos/common/CHashSet.h"
 #include "gpos/common/CHashSetIter.h"
 #include "gpos/common/DbgPrintMixin.h"
@@ -67,12 +68,17 @@ public:
 	//------------------------------------------------------------------
 	enum EMDIdType
 	{
-		EmdidGPDB = 0,
+		EmdidGeneral = 0,
 		EmdidColStats = 1,
 		EmdidRelStats = 2,
 		EmdidCastFunc = 3,
 		EmdidScCmp = 4,
 		EmdidGPDBCtas = 5,
+		EmdidRel = 6,
+		EmdidInd = 7,
+		EmdidCheckConstraint = 8,
+		EmdidExtStats = 9,
+		EmdidExtStatsInfo = 10,
 		EmdidSentinel
 	};
 
@@ -146,6 +152,25 @@ public:
 		return left_mdid->Equals(right_mdid);
 	}
 
+	// Compare function used by CDynamicPtrArray::Sort
+	static INT
+	CompareHashVal(const void *left, const void *right)
+	{
+		if ((*((IMDId **) left))->HashValue() <
+			(*((IMDId **) right))->HashValue())
+		{
+			return -1;
+		}
+		else if ((*((IMDId **) left))->HashValue() >
+				 ((*(IMDId **) right))->HashValue())
+		{
+			return 1;
+		}
+
+		GPOS_ASSERT((*((IMDId **) left))->HashValue() ==
+					((*(IMDId **) right))->HashValue());
+		return 0;
+	}
 
 	// is the mdid valid
 	virtual BOOL IsValid() const = 0;
@@ -168,17 +193,16 @@ public:
 };
 
 // common structures over metadata id elements
-typedef CDynamicPtrArray<IMDId, CleanupRelease> IMdIdArray;
+using IMdIdArray = CDynamicPtrArray<IMDId, CleanupRelease>;
 
 // hash set for mdid
-typedef CHashSet<IMDId, IMDId::MDIdHash, IMDId::MDIdCompare,
-				 CleanupRelease<IMDId> >
-	MdidHashSet;
+using MdidHashSet =
+	CHashSet<IMDId, IMDId::MDIdHash, IMDId::MDIdCompare, CleanupRelease<IMDId>>;
 
 // iterator over the hash set for column id information for missing statistics
-typedef CHashSetIter<IMDId, IMDId::MDIdHash, IMDId::MDIdCompare,
-					 CleanupRelease<IMDId> >
-	MdidHashSetIter;
+using MdidHashSetIter = CHashSetIter<IMDId, IMDId::MDIdHash, IMDId::MDIdCompare,
+									 CleanupRelease<IMDId>>;
+
 }  // namespace gpmd
 
 FORCE_GENERATE_DBGSTR(gpmd::IMDId);

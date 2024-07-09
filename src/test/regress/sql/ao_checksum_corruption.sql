@@ -7,6 +7,8 @@
 -- start_matchsubs
 -- m/^ERROR:  (block|header) checksum does not match./
 -- s/expected 0x(........) and found 0x(........)/expected 0xXXXXXXXX and found 0xXXXXXXXX/
+-- m/^ERROR:  VarBlock is not valid, valid block check error 12, detail .* /
+-- s/detail.*//
 -- end_matchsubs
 
 -- Ignore the status messages from the helper function. They're useful for
@@ -48,7 +50,7 @@ $$ language sql VOLATILE;
 -- do a SUM() over the return values, and it's always 0, regardless of the
 -- number of segemnts in the cluster.)
 CREATE FUNCTION corrupt_file(data_file text, corruption_offset int4)
-RETURNS integer as $$
+RETURNS setof integer as $$
   import os;
 
   if not os.path.isfile(data_file):
@@ -68,13 +70,13 @@ RETURNS integer as $$
       f.write(write_char)
       f.close()
 
-  return 0
+  return []
 $$ LANGUAGE plpython3u EXECUTE ON ALL SEGMENTS;
 
 -- Corrupt a file by replacing the last occurrence of 'str' within the file
 -- with 'replacement'
 CREATE FUNCTION corrupt_file(data_file text, target bytea, replacement bytea)
-RETURNS integer as $$
+RETURNS setof integer as $$
   import os;
 
   if not os.path.isfile(data_file):
@@ -96,52 +98,56 @@ RETURNS integer as $$
 
       f.close()
 
-  return 0
+  return []
 $$ LANGUAGE plpython3u EXECUTE ON ALL SEGMENTS;
 
 
 -- Large content, corrupt block header
 create table corrupt_header_large_co(comment bytea ) with (appendonly=true, orientation=column, checksum=true) DISTRIBUTED RANDOMLY;
 insert into corrupt_header_large_co select ("decode"(repeat('a',33554432),'escape')) from generate_series(1,8)  ;
-select SUM(corrupt_file(get_aoseg1_path('corrupt_header_large_co'), 8));
+select corrupt_file(get_aoseg1_path('corrupt_header_large_co'), 8);
 
 SELECT COUNT(*) FROM corrupt_header_large_co;
 
 -- Large content, corrupt content
 create table corrupt_content_large_co(comment bytea ) with (appendonly=true, orientation=column, checksum=true) DISTRIBUTED RANDOMLY;
 insert into corrupt_content_large_co select ("decode"(repeat('a',33554432),'escape')) from generate_series(1,8)  ;
-select SUM(corrupt_file(get_aoseg1_path('corrupt_content_large_co'), -3));
+select corrupt_file(get_aoseg1_path('corrupt_content_large_co'), -3);
 
 SELECT COUNT(*) FROM corrupt_content_large_co;
 
 -- Small content, corrupt block header
 create table corrupt_header_small_co(a int) with (appendonly=true, orientation=column, checksum=true);
 insert into corrupt_header_small_co values (1),(1),(1),(-1),(1),(1),(1),(2),(2),(2),(2),(2),(2),(2),(33),(3),(3),(3),(1),(8),(19),(20),(31),(32),(33),(34),(5),(5),(5),(5),(5),(6),(6),(6),(6),(6),(6),(7),(7),(7),(7),(7),(7),(7),(7), (null),(7),(7),(7),(null),(8),(8),(8),(8),(8),(8),(4),(4),(null),(4),(17),(17),(17),(null),(null),(null);
-select SUM(corrupt_file(get_aoseg1_path('corrupt_header_small_co'), 8));
+select corrupt_file(get_aoseg1_path('corrupt_header_small_co'), 8);
 
 SELECT COUNT(*) FROM corrupt_header_small_co;
 
 -- Small content, corrupt content
 create table corrupt_content_small_co(a int) with (appendonly=true, orientation=column, checksum=true);
 insert into corrupt_content_small_co values (1),(1),(1),(-1),(1),(1),(1),(2),(2),(2),(2),(2),(2),(2),(33),(3),(3),(3),(1),(8),(19),(20),(31),(32),(33),(34),(5),(5),(5),(5),(5),(6),(6),(6),(6),(6),(6),(7),(7),(7),(7),(7),(7),(7),(7), (null),(7),(7),(7),(null),(8),(8),(8),(8),(8),(8),(4),(4),(null),(4),(17),(17),(17),(null),(null),(null);
-select SUM(corrupt_file(get_aoseg1_path('corrupt_content_small_co'), -3));
+select corrupt_file(get_aoseg1_path('corrupt_content_small_co'), -3);
 
 SELECT COUNT(*) FROM corrupt_content_small_co;
 
 -- Row-oriented, Small content, corrupt block header
 create table corrupt_header_small_ao(a int) with (appendonly=true, orientation=row, checksum=true);
 insert into corrupt_header_small_ao values (1),(1),(1),(-1),(1),(1),(1),(2),(2),(2),(2),(2),(2),(2),(33),(3),(3),(3),(1),(8),(19),(20),(31),(32),(33),(34),(5),(5),(5),(5),(5),(6),(6),(6),(6),(6),(6),(7),(7),(7),(7),(7),(7),(7),(7), (null),(7),(7),(7),(null),(8),(8),(8),(8),(8),(8),(4),(4),(null),(4),(17),(17),(17),(null),(null),(null);
-select SUM(corrupt_file(get_aoseg1_path('corrupt_header_small_ao'), 8));
+select corrupt_file(get_aoseg1_path('corrupt_header_small_ao'), 8);
 
 SELECT COUNT(*) FROM corrupt_header_small_ao;
 
 -- Row-oriented, Small content, corrupt content
 create table corrupt_content_small_ao(a int) with (appendonly=true, orientation=row, checksum=true);
 insert into corrupt_content_small_ao values (1),(1),(1),(-1),(1),(1),(1),(2),(2),(2),(2),(2),(2),(2),(33),(3),(3),(3),(1),(8),(19),(20),(31),(32),(33),(34),(5),(5),(5),(5),(5),(6),(6),(6),(6),(6),(6),(7),(7),(7),(7),(7),(7),(7),(7), (null),(7),(7),(7),(null),(8),(8),(8),(8),(8),(8),(4),(4),(null),(4),(17),(17),(17),(null),(null),(null);
-select SUM(corrupt_file(get_aoseg1_path('corrupt_content_small_ao'), -3));
+select corrupt_file(get_aoseg1_path('corrupt_content_small_ao'), -3);
 
 SELECT COUNT(*) FROM corrupt_content_small_ao;
 
+-- try again, check varblock content offset validation w/ checksum disabled
+set gp_appendonly_verify_block_checksums = off;
+SELECT COUNT(*) FROM corrupt_content_small_ao;
+reset gp_appendonly_verify_block_checksums;
 
 -- Also test gp_appendonly_verify_block_checksums=off.
 create table appendonly_verify_block_checksums_co (t text)  with (checksum=true, appendonly=true, orientation=column, compresstype=none);
@@ -149,7 +155,7 @@ insert into appendonly_verify_block_checksums_co
   select 'abcdefghijlmnopqrstuvxyz' from generate_series(1, 5);
 
 -- Corrupt the table by flip the 'xyz' on the last row with ###
-select SUM(corrupt_file(get_aoseg1_path('appendonly_verify_block_checksums_co'), 'xyz', '###'));
+select corrupt_file(get_aoseg1_path('appendonly_verify_block_checksums_co'), 'xyz', '###');
 
 -- Fails, checksum is wrong.
 SELECT * FROM appendonly_verify_block_checksums_co;

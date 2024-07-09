@@ -73,7 +73,7 @@ matrix:
           dist: bionic
           compiler: gcc
           env:
-              - T=debug C="--without-zlib --without-libbz2 --without-zstd --without-quicklz"
+              - T=debug C="--without-zlib --without-libbz2 --without-zstd"
               - LC_CTYPE="en_US.utf8" LC_ALL="en_US.utf8" # see NOTE above
         # ARM64, Ubuntu Bionic, gcc 7, unit tests
         # For arm64, disable orca to avoid job timeouts
@@ -99,6 +99,7 @@ matrix:
           addons:
             apt:
               packages:
+                - bear
                 - ninja-build
                 - clang-11
                 - clang-tidy-11
@@ -109,10 +110,38 @@ matrix:
           before_script: ~
           after_script: ~
           script:
+            - |
+              (
+              set -e
+              mkdir ../vpath.debug
+              cd ../vpath.debug
+              ../gpdb/configure \
+                --enable-debug \
+                --enable-cassert \
+                --enable-orca \
+                --without-zstd --disable-gpfdist \
+                CC="ccache clang-11" CXX="ccache clang++-11" CFLAGS=-O0 CXXFLAGS=-O0
+              bear --append make -s -C src/backend/gpopt
+              )
+              CLANG_TIDY=clang-tidy-11 src/tools/tidy chk-gpopt ../vpath.debug
+            - |
+              (
+              set -e
+              mkdir ../vpath.release
+              cd ../vpath.release
+              ../gpdb/configure \
+                --enable-debug \
+                --disable-cassert \
+                --enable-orca \
+                --without-zstd --disable-gpfdist \
+                CC="ccache clang-11" CXX="ccache clang++-11" CFLAGS=-O0 CXXFLAGS=-O0
+              bear --append make -s -C src/backend/gpopt
+              )
+              CLANG_TIDY=clang-tidy-11 src/tools/tidy chk-gpopt ../vpath.release
             - CXX=clang++-11 cmake -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -GNinja -DCMAKE_BUILD_TYPE=Debug -Hsrc/backend/gporca -Bbuild.debug
-            - CLANG_TIDY=clang-tidy-11 src/tools/tidy chk build.debug
+            - CLANG_TIDY=clang-tidy-11 src/tools/tidy chk-orca build.debug
             - CXX=clang++-11 cmake -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -GNinja -DCMAKE_BUILD_TYPE=RelWithDebInfo -Hsrc/backend/gporca -Bbuild.relwithdebinfo
-            - CLANG_TIDY=clang-tidy-11 src/tools/tidy chk build.relwithdebinfo
+            - CLANG_TIDY=clang-tidy-11 src/tools/tidy chk-orca build.relwithdebinfo
 
         - name: check-format
           stage: lint
@@ -121,16 +150,16 @@ matrix:
           addons:
             apt:
               packages:
-                - clang-format-10
+                - clang-format-11
                 - parallel
           before_install: ~
           install: ~
           before_script: ~
           after_script: ~
           script:
-            - env CLANG_FORMAT=clang-format-10 src/tools/fmt gen
+            - env CLANG_FORMAT=clang-format-11 src/tools/fmt gen
             - git diff --exit-code
-            - env CLANG_FORMAT=clang-format-10 src/tools/fmt chk
+            - env CLANG_FORMAT=clang-format-11 src/tools/fmt chk
 
 stages:
   - lint
@@ -199,7 +228,6 @@ script:
             --with-ldap \
             --with-libcurl \
             --with-libxml \
-            --enable-mapreduce \
             --enable-orafce \
             --enable-ic-proxy \
             $C
@@ -212,6 +240,13 @@ script:
         if [ -z "$tests" ] || [ "$tests" = "installcheck" ]; then
             make -C gpAux/gpdemo cluster
             source gpAux/gpdemo/gpdemo-env.sh
+            trap look4diffs ERR
+            function look4diffs() {
+                echo ========regression.diffs========
+                cat src/test/regress/regression.diffs
+                echo ========regression.diffs========
+                exit 1
+            }
             make -C src/test/regress installcheck-small
         fi
       fi
@@ -227,7 +262,6 @@ script:
             --with-ldap \
             --with-libcurl \
             --with-libxml \
-            --enable-mapreduce \
             --enable-orafce \
             --enable-ic-proxy \
             $C
@@ -237,6 +271,13 @@ script:
         make -s unittest-check
         make -C gpAux/gpdemo cluster
         source gpAux/gpdemo/gpdemo-env.sh
+        trap look4diffs ERR
+        function look4diffs() {
+            echo ========regression.diffs========
+            cat src/test/regress/regression.diffs
+            echo ========regression.diffs========
+            exit 1
+        }
         make -C src/test/regress installcheck-small
       fi
   - |

@@ -228,14 +228,19 @@ ExecCloseIndices(ResultRelInfo *resultRelInfo)
 	int			i;
 	int			numIndices;
 	RelationPtr indexDescs;
+	IndexInfo **indexInfos;
 
 	numIndices = resultRelInfo->ri_NumIndices;
 	indexDescs = resultRelInfo->ri_IndexRelationDescs;
+	indexInfos = resultRelInfo->ri_IndexRelationInfo;
 
 	for (i = 0; i < numIndices; i++)
 	{
 		if (indexDescs[i] == NULL)
 			continue;			/* shouldn't happen? */
+
+		/* Give the index a chance to do some post-insert cleanup */
+		index_insert_cleanup(indexDescs[i], indexInfos[i]);
 
 		/* Drop lock acquired by ExecOpenIndices */
 		index_close(indexDescs[i], RowExclusiveLock);
@@ -263,6 +268,10 @@ ExecCloseIndices(ResultRelInfo *resultRelInfo)
  *
  *		If 'arbiterIndexes' is nonempty, noDupErr applies only to
  *		those indexes.  NIL means noDupErr applies to all indexes.
+ *
+ *		GPDB: gp_bypass_unique_check is introduced so that routines
+ *		such as AO vacuum which don't need to run uniqueness checks
+ *		while inserting tuples can do so.
  *
  *		CAUTION: this must not be called for a HOT update.
  *		We can't defend against that here for lack of info.
@@ -381,7 +390,7 @@ ExecInsertIndexTuples(TupleTableSlot *slot,
 		 * For a speculative insertion (used by INSERT ... ON CONFLICT), do
 		 * the same as for a deferrable unique index.
 		 */
-		if (!indexRelation->rd_index->indisunique)
+		if (!indexRelation->rd_index->indisunique || estate->gp_bypass_unique_check)
 			checkUnique = UNIQUE_CHECK_NO;
 		else if (applyNoDupErr)
 			checkUnique = UNIQUE_CHECK_PARTIAL;

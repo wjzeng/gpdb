@@ -39,7 +39,6 @@ CLogicalTVF::CLogicalTVF(CMemoryPool *mp)
 	  m_pdrgpcoldesc(nullptr),
 	  m_pdrgpcrOutput(nullptr),
 	  m_efs(IMDFunction::EfsImmutable),
-	  m_efda(IMDFunction::EfdaNoSQL),
 	  m_returns_set(true)
 {
 	m_fPattern = true;
@@ -64,7 +63,6 @@ CLogicalTVF::CLogicalTVF(CMemoryPool *mp, IMDId *mdid_func,
 	  m_pdrgpcoldesc(pdrgpcoldesc),
 	  m_pdrgpcrOutput(nullptr)
 {
-	GPOS_ASSERT(mdid_func->IsValid());
 	GPOS_ASSERT(mdid_return_type->IsValid());
 	GPOS_ASSERT(nullptr != str);
 	GPOS_ASSERT(nullptr != pdrgpcoldesc);
@@ -73,11 +71,18 @@ CLogicalTVF::CLogicalTVF(CMemoryPool *mp, IMDId *mdid_func,
 	m_pdrgpcrOutput = PdrgpcrCreateMapping(mp, pdrgpcoldesc, UlOpId());
 
 	CMDAccessor *md_accessor = COptCtxt::PoctxtFromTLS()->Pmda();
-	const IMDFunction *pmdfunc = md_accessor->RetrieveFunc(m_func_mdid);
+	if (mdid_func->IsValid())
+	{
+		const IMDFunction *pmdfunc = md_accessor->RetrieveFunc(m_func_mdid);
 
-	m_efs = pmdfunc->GetFuncStability();
-	m_efda = pmdfunc->GetFuncDataAccess();
-	m_returns_set = pmdfunc->ReturnsSet();
+		m_efs = pmdfunc->GetFuncStability();
+		m_returns_set = pmdfunc->ReturnsSet();
+	}
+	else
+	{
+		m_efs = gpmd::IMDFunction::EfsImmutable;
+		m_returns_set = false;
+	}
 }
 
 //---------------------------------------------------------------------------
@@ -109,7 +114,6 @@ CLogicalTVF::CLogicalTVF(CMemoryPool *mp, IMDId *mdid_func,
 	const IMDFunction *pmdfunc = md_accessor->RetrieveFunc(m_func_mdid);
 
 	m_efs = pmdfunc->GetFuncStability();
-	m_efda = pmdfunc->GetFuncDataAccess();
 	m_returns_set = pmdfunc->ReturnsSet();
 }
 
@@ -148,6 +152,7 @@ CLogicalTVF::HashValue() const
 			gpos::CombineHashes(
 				m_return_type_mdid->HashValue(),
 				gpos::HashPtr<CColumnDescriptorArray>(m_pdrgpcoldesc))));
+
 	ulHash =
 		gpos::CombineHashes(ulHash, CUtils::UlHashColArray(m_pdrgpcrOutput));
 	return ulHash;
@@ -243,7 +248,7 @@ CLogicalTVF::DeriveFunctionProperties(CMemoryPool *mp,
 									  CExpressionHandle &exprhdl) const
 {
 	BOOL fVolatileScan = (IMDFunction::EfsVolatile == m_efs);
-	return PfpDeriveFromChildren(mp, exprhdl, m_efs, m_efda, fVolatileScan,
+	return PfpDeriveFromChildren(mp, exprhdl, m_efs, fVolatileScan,
 								 true /*fScan*/);
 }
 

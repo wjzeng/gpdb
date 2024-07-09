@@ -14,7 +14,5 @@ include $(top_builddir)/src/Makefile.global
 include $(top_srcdir)/contrib/contrib-global.mk
 endif
 
-# GPDB_94_MERGE_FIXME: Enable btree, gin and gist when physical and logical
-# order is equivalent.
 installcheck: install
-	gp_replica_check.py -r="heap, sequence, ao"
+	gp_replica_check.py -d=all -r=all

@@ -56,6 +56,15 @@ typedef enum
 								*/
 } FtsMessageState;
 
+/* States indicating what status PM is in restarting. */
+typedef enum PMRestartState
+{
+	PM_NOT_IN_RESTART, /* PM is not restarting */
+	PM_IN_RESETTING, /* PM is in resetting */
+	PM_IN_RECOVERY_MAKING_PROGRESS, /* PM is in recovery and is making progress */
+	PM_IN_RECOVERY_NOT_MAKING_PROGRESS /* PM is in recovery but not making progress*/
+} PMRestartState;
+
 #define IsFtsMessageStateSuccess(state) (state == FTS_PROBE_SUCCESS || \
 		state == FTS_SYNCREP_OFF_SUCCESS || state == FTS_PROMOTE_SUCCESS)
 #define IsFtsMessageStateFailed(state) (state == FTS_PROBE_FAILED || \
@@ -83,11 +92,25 @@ typedef struct
 	struct pg_conn *conn;         /* libpq connection object */
 	int retry_count;
 	XLogRecPtr xlogrecptr;
-	bool recovery_making_progress;
+	PMRestartState restart_state;
+	/*
+	 * How many times of time error (reported by poll()) we have got
+	 * when gp_fts_probe_timeout is exceeded
+	 *
+	 * Say by default the timeout parameter passed to poll() is 50 ms
+	 * (see ftsPoll()), and gp_fts_probe_timeout is 20 sec. If we hit
+	 * gp_fts_probe_timeout:
+	 * 1. If the congestion is on network or segs, timeout_count should
+	 *    be near to 20000 / 50 = 400.
+	 * 2. If timeout_count is much less than 400, it means that FTS did
+	 *    not get enough CPU chance and the congestion must be on master.
+	 */
+	int timeout_count;
 } fts_segment_info;
 
 typedef struct
 {
+	bool has_mirrors; /* mirrored or mirrorless cluster */
 	int num_pairs; /* number of primary-mirror pairs FTS wants to probe */
 	fts_segment_info *perSegInfos;
 } fts_context;

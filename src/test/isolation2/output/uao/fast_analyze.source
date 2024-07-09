@@ -1,0 +1,976 @@
+--
+-- Test AO/CO sampling method.
+--
+-- These tests ensure that we achieve our ANALYZE targets for AO/CO tables.
+--
+CREATE TABLE fast_analyze_@amname@_1(i int, j int) USING @amname@ DISTRIBUTED BY (j);
+CREATE TABLE
+
+-- Stats target info shows that we will sample 300 * (100) rows.
+SHOW default_statistics_target;
+ default_statistics_target 
+---------------------------
+ 100                       
+(1 row)
+SELECT attstattarget FROM pg_attribute WHERE attrelid = 'fast_analyze_@amname@_1'::regclass AND attname IN ('i', 'j');
+ attstattarget 
+---------------
+ -1            
+ -1            
+(2 rows)
+
+--------------------------------------------------------------------------------
+-- Scenario 1:
+-- We have MORE than 300 * default_statistics_target = 30k rows for a 2 int table,
+-- spread across 3 segments, with no aborted rows [2 subcases -> blkdir and
+-- non-blkdir].
+-- Expectation: We have collected 30k live rows.
+--------------------------------------------------------------------------------
+
+-- (a) Without blkdir subcase
+
+-- Insert 10.5k rows in each QE.
+1: BEGIN;
+BEGIN
+2: BEGIN;
+BEGIN
+3: BEGIN;
+BEGIN
+1: INSERT INTO fast_analyze_@amname@_1 SELECT i, 2 FROM generate_series(1, 10500) i;
+INSERT 0 10500
+2: INSERT INTO fast_analyze_@amname@_1 SELECT i, 1 FROM generate_series(1, 10500) i;
+INSERT 0 10500
+3: INSERT INTO fast_analyze_@amname@_1 SELECT i, 5 FROM generate_series(1, 10500) i;
+INSERT 0 10500
+1: COMMIT;
+COMMIT
+2: COMMIT;
+COMMIT
+3: COMMIT;
+COMMIT
+
+-- make sure new column does not affect the result
+ALTER TABLE fast_analyze_@amname@_1 ADD COLUMN newcol int;
+ALTER TABLE
+
+SELECT gp_inject_fault_infinite('returned_sample_row', 'skip', dbid) FROM gp_segment_configuration WHERE content != -1 AND role = 'p';
+ gp_inject_fault_infinite 
+--------------------------
+ Success:                 
+ Success:                 
+ Success:                 
+(3 rows)
+
+ANALYZE fast_analyze_@amname@_1;
+ANALYZE
+
+-- We have sampled 10k live rows.
+SELECT gp_inject_fault('returned_sample_row', 'status', dbid) FROM gp_segment_configuration WHERE content != -1 AND role = 'p';
+ gp_inject_fault                                                                                                                                                                                                               
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Success: fault name:'returned_sample_row' fault type:'skip' ddl statement:'' database name:'' table name:'' start occurrence:'1' end occurrence:'-1' extra arg:'0' fault injection state:'triggered'  num times hit:'10000' 
+ 
+ Success: fault name:'returned_sample_row' fault type:'skip' ddl statement:'' database name:'' table name:'' start occurrence:'1' end occurrence:'-1' extra arg:'0' fault injection state:'triggered'  num times hit:'10000' 
+ 
+ Success: fault name:'returned_sample_row' fault type:'skip' ddl statement:'' database name:'' table name:'' start occurrence:'1' end occurrence:'-1' extra arg:'0' fault injection state:'triggered'  num times hit:'10000' 
+ 
+(3 rows)
+
+SELECT gp_inject_fault('returned_sample_row', 'reset', dbid) FROM gp_segment_configuration WHERE content != -1 AND role = 'p';
+ gp_inject_fault 
+-----------------
+ Success:        
+ Success:        
+ Success:        
+(3 rows)
+
+-- (b) With blkdir subcase
+
+CREATE INDEX ON fast_analyze_@amname@_1(i);
+CREATE INDEX
+
+SELECT gp_inject_fault_infinite('returned_sample_row', 'skip', dbid) FROM gp_segment_configuration WHERE content != -1 AND role = 'p';
+ gp_inject_fault_infinite 
+--------------------------
+ Success:                 
+ Success:                 
+ Success:                 
+(3 rows)
+
+ANALYZE fast_analyze_@amname@_1;
+ANALYZE
+
+-- We have sampled 10k live rows from each QE.
+SELECT gp_inject_fault('returned_sample_row', 'status', dbid) FROM gp_segment_configuration WHERE content != -1 AND role = 'p';
+ gp_inject_fault                                                                                                                                                                                                               
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Success: fault name:'returned_sample_row' fault type:'skip' ddl statement:'' database name:'' table name:'' start occurrence:'1' end occurrence:'-1' extra arg:'0' fault injection state:'triggered'  num times hit:'10000' 
+ 
+ Success: fault name:'returned_sample_row' fault type:'skip' ddl statement:'' database name:'' table name:'' start occurrence:'1' end occurrence:'-1' extra arg:'0' fault injection state:'triggered'  num times hit:'10000' 
+ 
+ Success: fault name:'returned_sample_row' fault type:'skip' ddl statement:'' database name:'' table name:'' start occurrence:'1' end occurrence:'-1' extra arg:'0' fault injection state:'triggered'  num times hit:'10000' 
+ 
+(3 rows)
+
+SELECT gp_inject_fault('returned_sample_row', 'reset', dbid) FROM gp_segment_configuration WHERE content != -1 AND role = 'p';
+ gp_inject_fault 
+-----------------
+ Success:        
+ Success:        
+ Success:        
+(3 rows)
+
+--------------------------------------------------------------------------------
+-- Scenario 2:
+-- We have LESS than 300 * default_statistics_target = 30k rows for a 2 int table,
+-- spread across 3 segments, with no aborted rows [2 subcases -> blkdir and
+-- non-blkdir].
+-- Expectation: We have collected number of live rows = total tupcount of table.
+--------------------------------------------------------------------------------
+
+CREATE TABLE fast_analyze_@amname@_2(i int, j int) USING @amname@ DISTRIBUTED BY (j);
+CREATE TABLE
+
+-- (a) Without blkdir subcase
+
+-- Insert 10 rows in each QE.
+1: BEGIN;
+BEGIN
+2: BEGIN;
+BEGIN
+3: BEGIN;
+BEGIN
+1: INSERT INTO fast_analyze_@amname@_2 SELECT i, 2 FROM generate_series(1, 10) i;
+INSERT 0 10
+2: INSERT INTO fast_analyze_@amname@_2 SELECT i, 1 FROM generate_series(1, 10) i;
+INSERT 0 10
+3: INSERT INTO fast_analyze_@amname@_2 SELECT i, 5 FROM generate_series(1, 10) i;
+INSERT 0 10
+1: COMMIT;
+COMMIT
+2: COMMIT;
+COMMIT
+3: COMMIT;
+COMMIT
+
+-- make sure new column does not affect the result
+ALTER TABLE fast_analyze_@amname@_2 ADD COLUMN newcol int;
+ALTER TABLE
+
+SELECT gp_inject_fault_infinite('returned_sample_row', 'skip', dbid) FROM gp_segment_configuration WHERE content != -1 AND role = 'p';
+ gp_inject_fault_infinite 
+--------------------------
+ Success:                 
+ Success:                 
+ Success:                 
+(3 rows)
+
+ANALYZE fast_analyze_@amname@_2;
+ANALYZE
+
+-- We have sampled 10 live rows from each QE.
+SELECT gp_inject_fault('returned_sample_row', 'status', dbid) FROM gp_segment_configuration WHERE content != -1 AND role = 'p';
+ gp_inject_fault                                                                                                                                                                                                            
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Success: fault name:'returned_sample_row' fault type:'skip' ddl statement:'' database name:'' table name:'' start occurrence:'1' end occurrence:'-1' extra arg:'0' fault injection state:'triggered'  num times hit:'10' 
+ 
+ Success: fault name:'returned_sample_row' fault type:'skip' ddl statement:'' database name:'' table name:'' start occurrence:'1' end occurrence:'-1' extra arg:'0' fault injection state:'triggered'  num times hit:'10' 
+ 
+ Success: fault name:'returned_sample_row' fault type:'skip' ddl statement:'' database name:'' table name:'' start occurrence:'1' end occurrence:'-1' extra arg:'0' fault injection state:'triggered'  num times hit:'10' 
+ 
+(3 rows)
+
+SELECT gp_inject_fault('returned_sample_row', 'reset', dbid) FROM gp_segment_configuration WHERE content != -1 AND role = 'p';
+ gp_inject_fault 
+-----------------
+ Success:        
+ Success:        
+ Success:        
+(3 rows)
+
+-- (b) With blkdir subcase
+
+CREATE INDEX ON fast_analyze_@amname@_2(i);
+CREATE INDEX
+
+SELECT gp_inject_fault_infinite('returned_sample_row', 'skip', dbid) FROM gp_segment_configuration WHERE content != -1 AND role = 'p';
+ gp_inject_fault_infinite 
+--------------------------
+ Success:                 
+ Success:                 
+ Success:                 
+(3 rows)
+
+ANALYZE fast_analyze_@amname@_2;
+ANALYZE
+
+-- We have sampled 10 live rows from each QE.
+SELECT gp_inject_fault('returned_sample_row', 'status', dbid) FROM gp_segment_configuration WHERE content != -1 AND role = 'p';
+ gp_inject_fault                                                                                                                                                                                                            
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Success: fault name:'returned_sample_row' fault type:'skip' ddl statement:'' database name:'' table name:'' start occurrence:'1' end occurrence:'-1' extra arg:'0' fault injection state:'triggered'  num times hit:'10' 
+ 
+ Success: fault name:'returned_sample_row' fault type:'skip' ddl statement:'' database name:'' table name:'' start occurrence:'1' end occurrence:'-1' extra arg:'0' fault injection state:'triggered'  num times hit:'10' 
+ 
+ Success: fault name:'returned_sample_row' fault type:'skip' ddl statement:'' database name:'' table name:'' start occurrence:'1' end occurrence:'-1' extra arg:'0' fault injection state:'triggered'  num times hit:'10' 
+ 
+(3 rows)
+
+SELECT gp_inject_fault('returned_sample_row', 'reset', dbid) FROM gp_segment_configuration WHERE content != -1 AND role = 'p';
+ gp_inject_fault 
+-----------------
+ Success:        
+ Success:        
+ Success:        
+(3 rows)
+
+--------------------------------------------------------------------------------
+-- Scenario 3:
+-- We have ALL aborted rows [2 subcases -> blkdir and non-blkdir].
+-- Expectation: We have not sampled any live rows.
+--------------------------------------------------------------------------------
+
+CREATE TABLE fast_analyze_@amname@_3(i int, j int) USING @amname@ DISTRIBUTED BY (j);
+CREATE TABLE
+
+-- (a) Without blkdir subcase
+
+-- Insert 10 rows in each QE.
+1: BEGIN;
+BEGIN
+2: BEGIN;
+BEGIN
+3: BEGIN;
+BEGIN
+1: INSERT INTO fast_analyze_@amname@_3 SELECT i, 2 FROM generate_series(1, 10) i;
+INSERT 0 10
+2: INSERT INTO fast_analyze_@amname@_3 SELECT i, 1 FROM generate_series(1, 10) i;
+INSERT 0 10
+3: INSERT INTO fast_analyze_@amname@_3 SELECT i, 5 FROM generate_series(1, 10) i;
+INSERT 0 10
+1: ABORT;
+ROLLBACK
+2: ABORT;
+ROLLBACK
+3: ABORT;
+ROLLBACK
+
+-- make sure new column does not affect the result
+ALTER TABLE fast_analyze_@amname@_3 ADD COLUMN newcol int;
+ALTER TABLE
+
+SELECT gp_inject_fault_infinite('returned_sample_row', 'skip', dbid) FROM gp_segment_configuration WHERE content != -1 AND role = 'p';
+ gp_inject_fault_infinite 
+--------------------------
+ Success:                 
+ Success:                 
+ Success:                 
+(3 rows)
+
+ANALYZE fast_analyze_@amname@_3;
+ANALYZE
+
+-- We have not sampled any live rows on any QE.
+SELECT gp_inject_fault('returned_sample_row', 'status', dbid) FROM gp_segment_configuration WHERE content != -1 AND role = 'p';
+ gp_inject_fault                                                                                                                                                                                                     
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Success: fault name:'returned_sample_row' fault type:'skip' ddl statement:'' database name:'' table name:'' start occurrence:'1' end occurrence:'-1' extra arg:'0' fault injection state:'set'  num times hit:'0' 
+ 
+ Success: fault name:'returned_sample_row' fault type:'skip' ddl statement:'' database name:'' table name:'' start occurrence:'1' end occurrence:'-1' extra arg:'0' fault injection state:'set'  num times hit:'0' 
+ 
+ Success: fault name:'returned_sample_row' fault type:'skip' ddl statement:'' database name:'' table name:'' start occurrence:'1' end occurrence:'-1' extra arg:'0' fault injection state:'set'  num times hit:'0' 
+ 
+(3 rows)
+
+SELECT gp_inject_fault('returned_sample_row', 'reset', dbid) FROM gp_segment_configuration WHERE content != -1 AND role = 'p';
+ gp_inject_fault 
+-----------------
+ Success:        
+ Success:        
+ Success:        
+(3 rows)
+
+-- (b) With blkdir subcase
+
+CREATE INDEX ON fast_analyze_@amname@_3(i);
+CREATE INDEX
+
+SELECT gp_inject_fault_infinite('returned_sample_row', 'skip', dbid) FROM gp_segment_configuration WHERE content != -1 AND role = 'p';
+ gp_inject_fault_infinite 
+--------------------------
+ Success:                 
+ Success:                 
+ Success:                 
+(3 rows)
+
+ANALYZE fast_analyze_@amname@_3;
+ANALYZE
+
+-- We have not sampled any live rows on any QE.
+SELECT gp_inject_fault('returned_sample_row', 'status', dbid) FROM gp_segment_configuration WHERE content != -1 AND role = 'p';
+ gp_inject_fault                                                                                                                                                                                                     
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Success: fault name:'returned_sample_row' fault type:'skip' ddl statement:'' database name:'' table name:'' start occurrence:'1' end occurrence:'-1' extra arg:'0' fault injection state:'set'  num times hit:'0' 
+ 
+ Success: fault name:'returned_sample_row' fault type:'skip' ddl statement:'' database name:'' table name:'' start occurrence:'1' end occurrence:'-1' extra arg:'0' fault injection state:'set'  num times hit:'0' 
+ 
+ Success: fault name:'returned_sample_row' fault type:'skip' ddl statement:'' database name:'' table name:'' start occurrence:'1' end occurrence:'-1' extra arg:'0' fault injection state:'set'  num times hit:'0' 
+ 
+(3 rows)
+
+SELECT gp_inject_fault('returned_sample_row', 'reset', dbid) FROM gp_segment_configuration WHERE content != -1 AND role = 'p';
+ gp_inject_fault 
+-----------------
+ Success:        
+ Success:        
+ Success:        
+(3 rows)
+
+--------------------------------------------------------------------------------
+-- Scenario 4:
+-- We have ALL deleted rows [2 subcases -> blkdir and non-blkdir].
+-- Expectation: We have not collected any live rows.
+--------------------------------------------------------------------------------
+
+CREATE TABLE fast_analyze_@amname@_4(i int, j int) USING @amname@ DISTRIBUTED BY (j);
+CREATE TABLE
+
+-- (a) Without blkdir subcase
+
+-- Insert 10 rows in each QE.
+1: BEGIN;
+BEGIN
+2: BEGIN;
+BEGIN
+3: BEGIN;
+BEGIN
+1: INSERT INTO fast_analyze_@amname@_4 SELECT i, 2 FROM generate_series(1, 10) i;
+INSERT 0 10
+2: INSERT INTO fast_analyze_@amname@_4 SELECT i, 1 FROM generate_series(1, 10) i;
+INSERT 0 10
+3: INSERT INTO fast_analyze_@amname@_4 SELECT i, 5 FROM generate_series(1, 10) i;
+INSERT 0 10
+1: COMMIT;
+COMMIT
+2: COMMIT;
+COMMIT
+3: COMMIT;
+COMMIT
+-- Delete all rows.
+DELETE FROM fast_analyze_@amname@_4;
+DELETE 30
+SELECT gp_inject_fault_infinite('returned_sample_row', 'skip', dbid) FROM gp_segment_configuration WHERE content != -1 AND role = 'p';
+ gp_inject_fault_infinite 
+--------------------------
+ Success:                 
+ Success:                 
+ Success:                 
+(3 rows)
+
+-- make sure new column does not affect the result
+ALTER TABLE fast_analyze_@amname@_4 ADD COLUMN newcol int;
+ALTER TABLE
+
+ANALYZE fast_analyze_@amname@_4;
+ANALYZE
+
+-- We have not sampled any live rows on any QE.
+SELECT gp_inject_fault('returned_sample_row', 'status', dbid) FROM gp_segment_configuration WHERE content != -1 AND role = 'p';
+ gp_inject_fault                                                                                                                                                                                                     
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Success: fault name:'returned_sample_row' fault type:'skip' ddl statement:'' database name:'' table name:'' start occurrence:'1' end occurrence:'-1' extra arg:'0' fault injection state:'set'  num times hit:'0' 
+ 
+ Success: fault name:'returned_sample_row' fault type:'skip' ddl statement:'' database name:'' table name:'' start occurrence:'1' end occurrence:'-1' extra arg:'0' fault injection state:'set'  num times hit:'0' 
+ 
+ Success: fault name:'returned_sample_row' fault type:'skip' ddl statement:'' database name:'' table name:'' start occurrence:'1' end occurrence:'-1' extra arg:'0' fault injection state:'set'  num times hit:'0' 
+ 
+(3 rows)
+
+SELECT gp_inject_fault('returned_sample_row', 'reset', dbid) FROM gp_segment_configuration WHERE content != -1 AND role = 'p';
+ gp_inject_fault 
+-----------------
+ Success:        
+ Success:        
+ Success:        
+(3 rows)
+
+-- (b) With blkdir subcase
+
+CREATE INDEX ON fast_analyze_@amname@_4(i);
+CREATE INDEX
+
+SELECT gp_inject_fault_infinite('returned_sample_row', 'skip', dbid) FROM gp_segment_configuration WHERE content != -1 AND role = 'p';
+ gp_inject_fault_infinite 
+--------------------------
+ Success:                 
+ Success:                 
+ Success:                 
+(3 rows)
+
+ANALYZE fast_analyze_@amname@_4;
+ANALYZE
+
+-- We have not sampled any live rows on any QE.
+SELECT gp_inject_fault('returned_sample_row', 'status', dbid) FROM gp_segment_configuration WHERE content != -1 AND role = 'p';
+ gp_inject_fault                                                                                                                                                                                                     
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Success: fault name:'returned_sample_row' fault type:'skip' ddl statement:'' database name:'' table name:'' start occurrence:'1' end occurrence:'-1' extra arg:'0' fault injection state:'set'  num times hit:'0' 
+ 
+ Success: fault name:'returned_sample_row' fault type:'skip' ddl statement:'' database name:'' table name:'' start occurrence:'1' end occurrence:'-1' extra arg:'0' fault injection state:'set'  num times hit:'0' 
+ 
+ Success: fault name:'returned_sample_row' fault type:'skip' ddl statement:'' database name:'' table name:'' start occurrence:'1' end occurrence:'-1' extra arg:'0' fault injection state:'set'  num times hit:'0' 
+ 
+(3 rows)
+
+SELECT gp_inject_fault('returned_sample_row', 'reset', dbid) FROM gp_segment_configuration WHERE content != -1 AND role = 'p';
+ gp_inject_fault 
+-----------------
+ Success:        
+ Success:        
+ Success:        
+(3 rows)
+
+DROP TABLE fast_analyze_@amname@_1;
+DROP TABLE
+DROP TABLE fast_analyze_@amname@_2;
+DROP TABLE
+DROP TABLE fast_analyze_@amname@_3;
+DROP TABLE
+DROP TABLE fast_analyze_@amname@_4;
+DROP TABLE
+
+--
+-- The following tests ensure fast analyze function to work
+-- with multi-segfiles tables under concurrent inserts.
+--
+
+create table analyze_@amname@ (id int, a int, b inet, c inet) using @amname@ with (compresstype=zlib, compresslevel=3);
+CREATE TABLE
+
+insert into analyze_@amname@ select 2, i, (select ((i%255)::text || '.' || (i%255)::text || '.' || (i%255)::text || '.' || (i%255)::text))::inet, (select ((i%255)::text || '.' || (i%255)::text || '.' || (i%255)::text || '.' || (i%255)::text))::inet from generate_series(1,30000)i;
+INSERT 0 30000
+
+insert into analyze_@amname@ select * from analyze_@amname@ limit 1000;
+INSERT 0 1000
+insert into analyze_@amname@ select * from analyze_@amname@ limit 1000;
+INSERT 0 1000
+
+-- test ANALYZE after concurrent inserts commit
+
+1: begin;
+BEGIN
+1: insert into analyze_@amname@ select * from analyze_@amname@ limit 1000;
+INSERT 0 1000
+
+2: begin;
+BEGIN
+2: insert into analyze_@amname@ select * from analyze_@amname@ limit 1000;
+INSERT 0 1000
+
+3: begin;
+BEGIN
+3: insert into analyze_@amname@ select * from analyze_@amname@ limit 1000;
+INSERT 0 1000
+
+4: insert into analyze_@amname@ select * from analyze_@amname@ limit 1000;
+INSERT 0 1000
+
+5: analyze analyze_@amname@;
+ANALYZE
+
+1: commit;
+COMMIT
+2: commit;
+COMMIT
+3: abort;
+ROLLBACK
+
+1: analyze analyze_@amname@;
+ANALYZE
+
+-- test aoblkdir based ANALYZE
+
+create index on analyze_@amname@(id);
+CREATE INDEX
+
+1: begin;
+BEGIN
+1: insert into analyze_@amname@ select * from analyze_@amname@ limit 1000;
+INSERT 0 1000
+
+2: begin;
+BEGIN
+2: insert into analyze_@amname@ select * from analyze_@amname@ limit 1000;
+INSERT 0 1000
+
+3: begin;
+BEGIN
+3: insert into analyze_@amname@ select * from analyze_@amname@ limit 1000;
+INSERT 0 1000
+
+4: insert into analyze_@amname@ select * from analyze_@amname@ limit 1000;
+INSERT 0 1000
+
+5: analyze analyze_@amname@;
+ANALYZE
+
+1: commit;
+COMMIT
+2: commit;
+COMMIT
+3: abort;
+ROLLBACK
+
+1: analyze analyze_@amname@;
+ANALYZE
+
+drop table analyze_@amname@;
+DROP TABLE
+
+-- test more data and stability, note, it could take a little long time
+
+create table analyze_@amname@_2 (id int, a int, b inet, c inet) using @amname@ with (compresstype=zlib, compresslevel=3);
+CREATE TABLE
+insert into analyze_@amname@_2 select 2, i, (select ((i%255)::text || '.' || (i%255)::text || '.' || (i%255)::text || '.' || (i%255)::text))::inet, (select ((i%255)::text || '.' || (i%255)::text || '.' || (i%255)::text || '.' || (i%255)::text))::inet from generate_series(1,1000)i;
+INSERT 0 1000
+
+insert into analyze_@amname@_2 select * from analyze_@amname@_2;
+INSERT 0 1000
+insert into analyze_@amname@_2 select * from analyze_@amname@_2;
+INSERT 0 2000
+insert into analyze_@amname@_2 select * from analyze_@amname@_2;
+INSERT 0 4000
+insert into analyze_@amname@_2 select * from analyze_@amname@_2;
+INSERT 0 8000
+insert into analyze_@amname@_2 select * from analyze_@amname@_2;
+INSERT 0 16000
+insert into analyze_@amname@_2 select * from analyze_@amname@_2;
+INSERT 0 32000
+insert into analyze_@amname@_2 select * from analyze_@amname@_2;
+INSERT 0 64000
+insert into analyze_@amname@_2 select * from analyze_@amname@_2;
+INSERT 0 128000
+
+1: begin;
+BEGIN
+1: insert into analyze_@amname@_2 select * from analyze_@amname@_2;
+INSERT 0 256000
+
+2: insert into analyze_@amname@_2 select * from analyze_@amname@_2;
+INSERT 0 256000
+
+1: commit;
+COMMIT
+
+1: analyze analyze_@amname@_2;
+ANALYZE
+1: analyze analyze_@amname@_2;
+ANALYZE
+1: analyze analyze_@amname@_2;
+ANALYZE
+1: analyze analyze_@amname@_2;
+ANALYZE
+1: analyze analyze_@amname@_2;
+ANALYZE
+
+1: begin;
+BEGIN
+1: insert into analyze_@amname@_2 select * from analyze_@amname@_2;
+INSERT 0 768000
+
+2: insert into analyze_@amname@_2 select * from analyze_@amname@_2;
+INSERT 0 768000
+
+1: abort;
+ROLLBACK
+
+1: analyze analyze_@amname@_2;
+ANALYZE
+1: analyze analyze_@amname@_2;
+ANALYZE
+1: analyze analyze_@amname@_2;
+ANALYZE
+1: analyze analyze_@amname@_2;
+ANALYZE
+1: analyze analyze_@amname@_2;
+ANALYZE
+
+-- test with aoblkdir
+
+create index on analyze_@amname@_2(a);
+CREATE INDEX
+
+1: begin;
+BEGIN
+1: insert into analyze_@amname@_2 select * from analyze_@amname@_2;
+INSERT 0 1536000
+
+2: insert into analyze_@amname@_2 select * from analyze_@amname@_2;
+INSERT 0 1536000
+
+1: commit;
+COMMIT
+
+1: analyze analyze_@amname@_2;
+ANALYZE
+1: analyze analyze_@amname@_2;
+ANALYZE
+1: analyze analyze_@amname@_2;
+ANALYZE
+1: analyze analyze_@amname@_2;
+ANALYZE
+1: analyze analyze_@amname@_2;
+ANALYZE
+
+1: begin;
+BEGIN
+1: insert into analyze_@amname@_2 select * from analyze_@amname@_2;
+INSERT 0 4608000
+
+2: insert into analyze_@amname@_2 select * from analyze_@amname@_2;
+INSERT 0 4608000
+
+1: abort;
+ROLLBACK
+
+1: analyze analyze_@amname@_2;
+ANALYZE
+1: analyze analyze_@amname@_2;
+ANALYZE
+1: analyze analyze_@amname@_2;
+ANALYZE
+1: analyze analyze_@amname@_2;
+ANALYZE
+1: analyze analyze_@amname@_2;
+ANALYZE
+
+drop table analyze_@amname@_2;
+DROP TABLE
+
+--
+-- The following test ensures ANALYZE won't break column correlation
+-- as well as other pg_stats values. This is because we don't allow
+-- caching minipage entry on ANALYZE AOCO table currently, misuse of
+-- caching minipage entry for a specific column in ANALYZE AOCO table
+-- could break column correlation which would impact cost estimation
+-- and then finally resut in wrong plan to be selected.
+--
+
+create table analyze_@amname@_3(inttype int, texttype text, decimaltype decimal(10,2)) using @amname@;
+CREATE TABLE
+insert into analyze_@amname@_3 select i, 'texttype'||i, i from generate_series(1,9999) i;
+INSERT 0 9999
+create index i_analyze_@amname@_3 on analyze_@amname@_3(inttype) include (texttype);
+CREATE INDEX
+analyze analyze_@amname@_3;
+ANALYZE
+select attname, correlation from pg_stats where tablename='analyze_@amname@_3';
+ attname     | correlation 
+-------------+-------------
+ inttype     | 1           
+ texttype    | 0.819043    
+ decimaltype | 1           
+(3 rows)
+
+drop table analyze_@amname@_3;
+DROP TABLE
+
+--
+-- Test dead values returned in sampling CO tuples.
+-- Non-blkdir based sampling had the following bug:
+--
+-- If you have 3 rows: (i,j) = (1, 1), (1, 2) and (1,3),
+-- if (1, 2) is deleted, then we would return (1,1) and (1,2)
+-- instead of (1,1) and (1,3) as visible.
+--
+-- This is because we missed advancing the datum streams for
+-- non-first columns when the tuple was deleted.
+--
+
+-- partially same as Case 6 of tablesample.source
+create table test_dead_values_return_@amname@(i int, j int, k int) using @amname@;
+CREATE TABLE
+insert into test_dead_values_return_@amname@ select 1, j, j from generate_series(1, 10) j;
+INSERT 0 10
+delete from test_dead_values_return_@amname@ where j % 2 = 0;
+DELETE 5
+select * from test_dead_values_return_@amname@;
+ i | j | k 
+---+---+---
+ 1 | 1 | 1 
+ 1 | 3 | 3 
+ 1 | 5 | 5 
+ 1 | 7 | 7 
+ 1 | 9 | 9 
+(5 rows)
+select * from gp_acquire_sample_rows('test_dead_values_return_@amname@'::regclass, 10000, 'f') as (totalrows pg_catalog.float8, totaldeadrows pg_catalog.float8, oversized_cols_length pg_catalog._float8, i int, j int, k int);
+ totalrows | totaldeadrows | oversized_cols_length | i | j | k 
+-----------+---------------+-----------------------+---+---+---
+ 0         | 0             |                       |   |   |   
+ 0         | 0             |                       |   |   |   
+           |               |                       | 1 | 1 | 1 
+           |               |                       | 1 | 3 | 3 
+           |               |                       | 1 | 5 | 5 
+           |               |                       | 1 | 7 | 7 
+           |               |                       | 1 | 9 | 9 
+ 5         | 5             |                       |   |   |   
+(8 rows)
+
+truncate test_dead_values_return_@amname@;
+TRUNCATE TABLE
+
+1: begin;
+BEGIN
+2: begin;
+BEGIN
+
+1: insert into test_dead_values_return_@amname@ select 2, j, j from generate_series(1, 10) j;
+INSERT 0 10
+2: insert into test_dead_values_return_@amname@ select 2, j, j from generate_series(11, 20) j;
+INSERT 0 10
+
+2: abort;
+ROLLBACK
+1: commit;
+COMMIT
+
+1: begin;
+BEGIN
+2: begin;
+BEGIN
+
+1: insert into test_dead_values_return_@amname@ select 2, j, j from generate_series(21, 30) j;
+INSERT 0 10
+2: insert into test_dead_values_return_@amname@ select 2, j, j from generate_series(31, 40) j;
+INSERT 0 10
+2: commit;
+COMMIT
+
+1: delete from test_dead_values_return_@amname@ where j % 2 = 1;
+DELETE 15
+1: commit;
+COMMIT
+
+select * from test_dead_values_return_@amname@;
+ i | j  | k  
+---+----+----
+ 2 | 2  | 2  
+ 2 | 4  | 4  
+ 2 | 6  | 6  
+ 2 | 8  | 8  
+ 2 | 10 | 10 
+ 2 | 32 | 32 
+ 2 | 34 | 34 
+ 2 | 36 | 36 
+ 2 | 38 | 38 
+ 2 | 40 | 40 
+ 2 | 22 | 22 
+ 2 | 24 | 24 
+ 2 | 26 | 26 
+ 2 | 28 | 28 
+ 2 | 30 | 30 
+(15 rows)
+select * from gp_acquire_sample_rows('test_dead_values_return_@amname@'::regclass, 10000, 'f') as (totalrows pg_catalog.float8, totaldeadrows pg_catalog.float8, oversized_cols_length pg_catalog._float8, i int, j int, k int);
+ totalrows | totaldeadrows | oversized_cols_length | i | j  | k  
+-----------+---------------+-----------------------+---+----+----
+ 0         | 0             |                       |   |    |    
+ 0         | 0             |                       |   |    |    
+           |               |                       | 2 | 2  | 2  
+           |               |                       | 2 | 4  | 4  
+           |               |                       | 2 | 6  | 6  
+           |               |                       | 2 | 8  | 8  
+           |               |                       | 2 | 10 | 10 
+           |               |                       | 2 | 32 | 32 
+           |               |                       | 2 | 34 | 34 
+           |               |                       | 2 | 36 | 36 
+           |               |                       | 2 | 38 | 38 
+           |               |                       | 2 | 40 | 40 
+           |               |                       | 2 | 22 | 22 
+           |               |                       | 2 | 24 | 24 
+           |               |                       | 2 | 26 | 26 
+           |               |                       | 2 | 28 | 28 
+           |               |                       | 2 | 30 | 30 
+ 15        | 15            |                       |   |    |    
+(18 rows)
+
+drop table test_dead_values_return_@amname@;
+DROP TABLE
+
+--
+-- Test sampling on ADD COLUMN rows.
+--
+-- Case 1, the added column row is a sample row, verify no reading exceeded EOF issue.
+drop table if exists sampling_add_column_@amname@_1;
+DROP TABLE
+create table sampling_add_column_@amname@_1 (a int) using @amname@ distributed replicated;
+CREATE TABLE
+insert into sampling_add_column_@amname@_1 values (1);
+INSERT 0 1
+alter table sampling_add_column_@amname@_1 add column b int;
+ALTER TABLE
+insert into sampling_add_column_@amname@_1 values(100, 100);
+INSERT 0 1
+
+create or replace function test_sample_add_column() returns boolean as $$ declare cnt int; /* in func */ begin cnt := 0; /* in func */ while (cnt = 0) loop select count(*) into cnt from pg_catalog.gp_acquire_sample_rows('sampling_add_column_@amname@_1'::regclass, 1, 'f') as (totalrows pg_catalog.float8, totaldeadrows pg_catalog.float8, oversized_cols_length pg_catalog._float8, a int, b int) where a = 100; /* in func */ end loop; /* in func */ return true; /* in func */ end; /* in func */ $$ language plpgsql;
+CREATE FUNCTION
+
+select test_sample_add_column();
+ test_sample_add_column 
+------------------------
+ t                      
+(1 row)
+
+-- Case 2, verify sample rows are correct after ADD COLUMN operation.
+drop table if exists sampling_add_column_@amname@_2;
+DROP TABLE
+create table sampling_add_column_@amname@_2 (a int) using @amname@;
+CREATE TABLE
+
+1: begin;
+BEGIN
+2: begin;
+BEGIN
+3: begin;
+BEGIN
+
+1: insert into sampling_add_column_@amname@_2 select * from generate_series(1, 10);
+INSERT 0 10
+2: insert into sampling_add_column_@amname@_2 select * from generate_series(11, 20);
+INSERT 0 10
+3: insert into sampling_add_column_@amname@_2 select * from generate_series(21, 30);
+INSERT 0 10
+
+1: commit;
+COMMIT
+2: commit;
+COMMIT
+3: commit;
+COMMIT
+
+alter table sampling_add_column_@amname@_2 add column b int;
+ALTER TABLE
+
+1: begin;
+BEGIN
+2: begin;
+BEGIN
+3: begin;
+BEGIN
+
+1: insert into sampling_add_column_@amname@_2 values(100, 100);
+INSERT 0 1
+2: insert into sampling_add_column_@amname@_2 values(200, 200);
+INSERT 0 1
+3: insert into sampling_add_column_@amname@_2 values(300, 300);
+INSERT 0 1
+
+1: commit;
+COMMIT
+2: commit;
+COMMIT
+3: abort;
+ROLLBACK
+
+alter table sampling_add_column_@amname@_2 add column c text;
+ALTER TABLE
+
+1: begin;
+BEGIN
+2: begin;
+BEGIN
+3: begin;
+BEGIN
+
+1: insert into sampling_add_column_@amname@_2 values (100, 100, 'c100');
+INSERT 0 1
+2: insert into sampling_add_column_@amname@_2 values (200, 200, 'c200');
+INSERT 0 1
+3: insert into sampling_add_column_@amname@_2 values (300, 300, 'c300');
+INSERT 0 1
+
+1: commit;
+COMMIT
+2: abort;
+ROLLBACK
+3: commit;
+COMMIT
+
+select * from sampling_add_column_@amname@_2;
+ a   | b   | c    
+-----+-----+------
+ 2   |     |      
+ 3   |     |      
+ 4   |     |      
+ 7   |     |      
+ 8   |     |      
+ 16  |     |      
+ 18  |     |      
+ 19  |     |      
+ 22  |     |      
+ 24  |     |      
+ 27  |     |      
+ 29  |     |      
+ 1   |     |      
+ 300 | 300 | c300 
+ 12  |     |      
+ 15  |     |      
+ 20  |     |      
+ 23  |     |      
+ 26  |     |      
+ 30  |     |      
+ 5   |     |      
+ 6   |     |      
+ 9   |     |      
+ 10  |     |      
+ 200 | 200 |      
+ 11  |     |      
+ 13  |     |      
+ 14  |     |      
+ 17  |     |      
+ 100 | 100 | c100 
+ 21  |     |      
+ 25  |     |      
+ 28  |     |      
+ 100 | 100 |      
+(34 rows)
+select * from gp_acquire_sample_rows('sampling_add_column_@amname@_2'::regclass, 32, 'f') as (totalrows pg_catalog.float8, totaldeadrows pg_catalog.float8, oversized_cols_length pg_catalog._float8, a int, b int, c text);
+ totalrows | totaldeadrows | oversized_cols_length | a   | b   | c    
+-----------+---------------+-----------------------+-----+-----+------
+           |               |                       | 2   |     |      
+           |               |                       | 3   |     |      
+           |               |                       | 4   |     |      
+           |               |                       | 7   |     |      
+           |               |                       | 8   |     |      
+           |               |                       | 16  |     |      
+           |               |                       | 18  |     |      
+           |               |                       | 19  |     |      
+           |               |                       | 22  |     |      
+           |               |                       | 24  |     |      
+           |               |                       | 27  |     |      
+           |               |                       | 29  |     |      
+ 12        | 0             |                       |     |     |      
+           |               |                       | 1   |     |      
+           |               |                       | 300 | 300 | c300 
+           |               |                       | 12  |     |      
+           |               |                       | 15  |     |      
+           |               |                       | 20  |     |      
+           |               |                       | 23  |     |      
+           |               |                       | 26  |     |      
+           |               |                       | 30  |     |      
+ 8         | 0             |                       |     |     |      
+           |               |                       | 5   |     |      
+           |               |                       | 6   |     |      
+           |               |                       | 9   |     |      
+           |               |                       | 10  |     |      
+           |               |                       | 200 | 200 |      
+           |               |                       | 11  |     |      
+           |               |                       | 13  |     |      
+           |               |                       | 14  |     |      
+           |               |                       | 17  |     |      
+           |               |                       | 100 | 100 | c100 
+           |               |                       | 21  |     |      
+           |               |                       | 25  |     |      
+           |               |                       | 28  |     |      
+           |               |                       | 100 | 100 |      
+ 14        | 0             |                       |     |     |      
+(37 rows)

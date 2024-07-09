@@ -62,7 +62,7 @@
 #include "catalog/pg_foreign_server.h"
 #include "catalog/pg_inherits.h"
 #include "utils/guc.h"
-
+#include "catalog/pg_attribute_encoding.h"
 
 /* GUC parameter */
 int			constraint_exclusion = CONSTRAINT_EXCLUSION_PARTITION;
@@ -88,6 +88,8 @@ static void set_relation_partition_info(PlannerInfo *root, RelOptInfo *rel,
 static PartitionScheme find_partition_scheme(PlannerInfo *root, Relation rel);
 static void set_baserel_partition_key_exprs(Relation relation,
 											RelOptInfo *rel);
+
+static void set_ao_storage_info(Relation relation, RelOptInfo *rel);
 
 /*
  * get_relation_info -
@@ -153,7 +155,7 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
      * CDB: Get partitioning key info for distributed relation.
      */
     rel->cdbpolicy = RelationGetPartitioningKey(relation);
-	rel->amhandler = relation->rd_amhandler;
+	rel->relam = relation->rd_rel->relam;
 
 	/*
 	 * Estimate relation size --- unless it's an inheritance parent, in which
@@ -189,6 +191,19 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 		List	   *indexoidlist;
 		LOCKMODE	lmode;
 		ListCell   *l;
+
+		/*
+		 * GPDB needs to get AO relation version from pg_appendonly catalog to
+		 * determine whether enabling IndexOnlyScan on AO or not.
+		 * GPDB supports index-only scan on AO starting from AORelationVersion_GP7.
+		 */
+		bool enable_ios_ao = false;
+		if (RelationStorageIsAO(relation))
+		{
+			Assert(relation->rd_appendonly != NULL);
+			if (AORelationVersion_Validate(relation, AORelationVersion_GP7))
+				enable_ios_ao = true;
+		}
 
 		indexoidlist = RelationGetIndexList(relation);
 
@@ -274,7 +289,12 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 			for (i = 0; i < ncolumns; i++)
 			{
 				info->indexkeys[i] = index->indkey.values[i];
-				info->canreturn[i] = index_can_return(indexRelation, i + 1);
+
+				/* GPDB: This AO table might not have met the requirement for IOScan. */
+				if (RelationIsAppendOptimized(relation) && !enable_ios_ao)
+					info->canreturn[i] = false;
+				else
+					info->canreturn[i] = index_can_return(indexRelation, i + 1);
 			}
 
 			for (i = 0; i < nkeycolumns; i++)
@@ -296,6 +316,8 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 			info->amhasgettuple = (amroutine->amgettuple != NULL);
 			info->amhasgetbitmap = amroutine->amgetbitmap != NULL &&
 				relation->rd_tableam->scan_bitmap_next_block != NULL;
+			info->amcanmarkpos = (amroutine->ammarkpos != NULL &&
+								  amroutine->amrestrpos != NULL);
 			info->amcostestimate = amroutine->amcostestimate;
 			Assert(info->amcostestimate != NULL);
 
@@ -474,6 +496,10 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 	if (inhparent && relation->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
 		set_relation_partition_info(root, rel, relation);
 
+	/* GPDB: Set AO/CO specific information */
+	if (RelationIsAppendOptimized(relation))
+		set_ao_storage_info(relation, rel);
+
 	table_close(relation, NoLock);
 
 	/*
@@ -611,7 +637,12 @@ cdb_estimate_rel_size(RelOptInfo   *relOptInfo,
 	 * pages added since the last VACUUM are most likely not marked
 	 * all-visible.  But costsize.c wants it converted to a fraction.
 	 */
-	if (relallvisible == 0 || curpages <= 0)
+	if (RelationIsAppendOptimized(rel))
+	{
+		/* see appendonly_estimate_rel_size()/aoco_estimate_rel_size() */
+		*allvisfrac = 1;
+	}
+	else if (relallvisible == 0 || curpages <= 0)
 		*allvisfrac = 0;
 	else if ((double) relallvisible >= curpages)
 		*allvisfrac = 1;
@@ -643,9 +674,12 @@ cdb_estimate_partitioned_numtuples(Relation rel)
 	if (rel->rd_rel->reltuples > 0)
 		return rel->rd_rel->reltuples;
 
-	inheritors = find_all_inheritors(RelationGetRelid(rel),
-									 AccessShareLock,
-									 NULL);
+	// To avoid blocking concurrent transactions on leaf partitions
+	// throughout the entire transition, we refrain from acquiring locks on
+	// the leaf partitions. Instead, we acquire locks only on the
+	// partitions that need to be scanned when ORCA writes the plan,
+	// although it may lead to less accurate stats.
+	inheritors = find_all_inheritors(RelationGetRelid(rel), NoLock, NULL);
 	totaltuples = 0;
 	foreach(lc, inheritors)
 	{
@@ -654,9 +688,14 @@ cdb_estimate_partitioned_numtuples(Relation rel)
 		double		childtuples;
 
 		if (childid != RelationGetRelid(rel))
-			childrel = try_table_open(childid, NoLock, false);
+			childrel = RelationIdGetRelation(childid);
 		else
 			childrel = rel;
+
+		// If childrel is NULL, continue by assuming the child relation
+		// has 0 tuples.
+		if (childrel == NULL)
+			continue;
 
 		childtuples = childrel->rd_rel->reltuples;
 
@@ -687,6 +726,57 @@ cdb_estimate_partitioned_numtuples(Relation rel)
 			heap_close(childrel, NoLock);
 	}
 	return totaltuples;
+}
+
+/*
+ * Get the total pages of a partitioned table, including all partitions.
+ *
+ * Only used with ORCA, currently.
+ */
+PageEstimate
+cdb_estimate_partitioned_numpages(Relation rel)
+{
+	List	   *inheritors;
+	ListCell   *lc;
+
+	PageEstimate estimate = {
+		.totalpages = rel->rd_rel->relpages,
+		.totalallvisiblepages = rel->rd_rel->relallvisible
+	};
+
+	if (estimate.totalpages > 0)
+		return estimate;
+
+	// To avoid blocking concurrent transactions on leaf partitions
+	// throughout the entire transition, we refrain from acquiring locks on
+	// the leaf partitions. Instead, we acquire locks only on the
+	// partitions that need to be scanned when ORCA writes the plan,
+	// although it may lead to less accurate stats.
+	inheritors = find_all_inheritors(RelationGetRelid(rel),
+									 NoLock,
+									 NULL);
+	foreach(lc, inheritors)
+	{
+		Oid			childid = lfirst_oid(lc);
+		Relation	childrel;
+
+		if (childid != RelationGetRelid(rel))
+			childrel = RelationIdGetRelation(childid);
+		else
+			childrel = rel;
+
+		// If childrel is NULL, continue by assuming the child relation
+		// has 0 pages.
+		if (childrel == NULL)
+			continue;
+
+		estimate.totalpages += childrel->rd_rel->relpages;
+		estimate.totalallvisiblepages += childrel->rd_rel->relallvisible;
+
+		if (childrel != rel)
+			heap_close(childrel, NoLock);
+	}
+	return estimate;
 }
 
 /*
@@ -1515,6 +1605,79 @@ get_relation_constraints(PlannerInfo *root,
 	table_close(relation, NoLock);
 
 	return result;
+}
+
+/*
+ * GetExtStatisticsName
+ *		Retrieve the name of an extended statistic object
+ */
+char *
+GetExtStatisticsName(Oid statOid)
+{
+	Form_pg_statistic_ext staForm;
+	HeapTuple	htup;
+
+	htup = SearchSysCache1(STATEXTOID, ObjectIdGetDatum(statOid));
+	if (!HeapTupleIsValid(htup))
+		elog(ERROR, "cache lookup failed for statistics object %u", statOid);
+
+	staForm = (Form_pg_statistic_ext) GETSTRUCT(htup);
+	ReleaseSysCache(htup);
+	return NameStr(staForm->stxname);
+}
+
+/*
+ *	GetExtStatisticsKinds
+ *
+ * Retrieve the kinds of an extended statistic object
+ */
+List *
+GetExtStatisticsKinds(Oid statOid)
+{
+	Form_pg_statistic_ext staForm;
+	HeapTuple	htup;
+	Datum		datum;
+	bool		isnull;
+	ArrayType  *arr;
+	char	   *enabled;
+
+	List	  *types = NULL;
+	int			i;
+
+	htup = SearchSysCache1(STATEXTOID, ObjectIdGetDatum(statOid));
+	if (!HeapTupleIsValid(htup))
+		elog(ERROR, "cache lookup failed for statistics object %u", statOid);
+
+	staForm = (Form_pg_statistic_ext) GETSTRUCT(htup);
+
+	datum = SysCacheGetAttr(STATEXTOID, htup,
+							Anum_pg_statistic_ext_stxkind, &isnull);
+	arr = DatumGetArrayTypeP(datum);
+	if (ARR_NDIM(arr) != 1 ||
+		ARR_HASNULL(arr) ||
+		ARR_ELEMTYPE(arr) != CHAROID)
+		elog(ERROR, "stxkind is not a 1-D char array");
+	enabled = (char *) ARR_DATA_PTR(arr);
+	for (i = 0; i < ARR_DIMS(arr)[0]; i++)
+	{
+		types = lappend_int(types, (int) enabled[i]);
+	}
+
+	ReleaseSysCache(htup);
+
+	return types;
+}
+
+/*
+ * GetRelationExtStatistics
+ *		GPDB: Interface to get_relation_statistics.
+ *
+ * Used by ORCA to access function without PLANNER objects (e.g. RelOptInfo).
+ */
+List *
+GetRelationExtStatistics(Relation relation)
+{
+	return get_relation_statistics(NULL, relation);
 }
 
 /*
@@ -2414,7 +2577,7 @@ set_relation_partition_info(PlannerInfo *root, RelOptInfo *rel,
 static PartitionScheme
 find_partition_scheme(PlannerInfo *root, Relation relation)
 {
-	PartitionKey partkey = RelationGetPartitionKey(relation);
+	PartitionKey partkey = RelationRetrievePartitionKey(relation);
 	ListCell   *lc;
 	int			partnatts,
 				i;
@@ -2523,7 +2686,7 @@ static void
 set_baserel_partition_key_exprs(Relation relation,
 								RelOptInfo *rel)
 {
-	PartitionKey partkey = RelationGetPartitionKey(relation);
+	PartitionKey partkey = RelationRetrievePartitionKey(relation);
 	int			partnatts;
 	int			cnt;
 	List	  **partexprs;
@@ -2577,4 +2740,134 @@ set_baserel_partition_key_exprs(Relation relation,
 	 * match_expr_to_partition_keys().
 	 */
 	rel->nullable_partexprs = (List **) palloc0(sizeof(List *) * partnatts);
+}
+
+/*
+ * set_ao_storage_info
+ *
+ * GPDB: Sets storage attribute related information for append-optimized tables.
+ * Currently, we only capture the compression type and level information. For
+ * column-oriented tables, the information is also recorded per-column.
+ */
+static void
+set_ao_storage_info(Relation relation, RelOptInfo *rel)
+{
+	AOStorageInfo *ao_storage_info;
+
+	Assert(RelationIsAppendOptimized(relation));
+
+	rel->ao_storage_info = palloc0(sizeof(AOStorageInfo));
+	ao_storage_info = rel->ao_storage_info;
+
+	ao_storage_info->compresslevel = RelationGetCompressLevel(relation,
+															  DEFAULT_COMPRESS_LEVEL);
+	strncpy(ao_storage_info->compresstype,
+			RelationGetCompressType(relation, DEFAULT_COMPRESS_TYPE),
+			NAMEDATALEN);
+
+	ao_storage_info->col_storage_infos = NULL;
+
+	/*
+	 * If it is a CO table, there will be attribute level encodings (even if
+	 * storage settings are declared at the table level).
+	 */
+	if (RelationIsAoCols(relation))
+	{
+		StdRdOptions 	**opts;
+		int 			relnatts = RelationGetNumberOfAttributes(relation);
+
+		opts = RelationGetAttributeOptions(relation);
+		ao_storage_info->col_storage_infos = palloc0(sizeof(AOStorageInfo) * relnatts);
+		for (int i = 0; i < relnatts; i++)
+		{
+			Assert(opts[i]);
+			ao_storage_info->col_storage_infos[i].compresslevel = opts[i]->compresslevel;
+			strncpy(ao_storage_info->col_storage_infos[i].compresstype,
+					opts[i]->compresstype,
+					NAMEDATALEN);
+			pfree(opts[i]);
+		}
+		pfree(opts);
+	}
+}
+
+/*
+ * For the given relation, approximate the cost to decompress a single varblock.
+ * Notes:
+ * (1) We use zstd compression (level = 1) as our base. zlib is twice as
+ * expensive as seen during profiling and in literature.
+ * (2) For CO tables, we calculate a weighted average of the decompression cost,
+ * which depends on which attributes are compressed and how.
+ *
+ * XXX: We can penalize higher compression levels more.
+ *
+ * XXX: For CO tables, we could take into account column projection information,
+ * instead of estimating (once we make it available for planner).
+ */
+
+Cost
+get_ao_decompress_coefficient(RelOptInfo *rel)
+{
+	AOStorageInfo	*ao_storage_info = rel->ao_storage_info;
+	Cost 			coefficient = 0.0;
+
+	Assert(IsAccessMethodAO(rel->relam));
+	Assert(ao_storage_info);
+
+	if (IsAccessMethodAORow(rel->relam))
+	{
+		if (pg_strcasecmp(ao_storage_info->compresstype, "zstd") == 0)
+			coefficient = gp_cpu_decompress_cost; /* baseline */
+		else if (pg_strcasecmp(ao_storage_info->compresstype, "zlib") == 0)
+			coefficient = gp_cpu_decompress_cost * 2; /* 2x baseline */
+		else
+			coefficient = 0; /* no compression */
+	}
+	else
+	{
+		int		total_compression_weight = 0;
+		int 	cols_proj_est;
+
+		Assert(ao_storage_info->col_storage_infos);
+
+		for (int i = 0; i < rel->max_attr; i++)
+		{
+			AOStorageInfo *colStorageInfo = &ao_storage_info->col_storage_infos[i];
+
+			if (pg_strcasecmp(colStorageInfo->compresstype, "zstd") == 0)
+				total_compression_weight += gp_cpu_decompress_cost;
+			else if (pg_strcasecmp(colStorageInfo->compresstype, "zlib") == 0)
+				total_compression_weight += 2 * gp_cpu_decompress_cost;
+			else if (pg_strcasecmp(colStorageInfo->compresstype, "rle_type") == 0)
+			{
+				if (colStorageInfo->compresslevel == 1)
+					total_compression_weight += 0; /* no compression */
+				else if (colStorageInfo->compresslevel >= 2 &&
+						 colStorageInfo->compresslevel <= 4)
+				{
+					/* zlib compression on top of RLE: 2x baseline */
+					total_compression_weight += 2 * gp_cpu_decompress_cost;
+				}
+				else
+				{
+					/* zstd compression on top of RLE: baseline */
+					total_compression_weight += gp_cpu_decompress_cost;
+				}
+			}
+			else
+				total_compression_weight += 0; /* no compression */
+		}
+
+		/* perform a weighted average */
+		coefficient = (total_compression_weight) / rel->max_attr;
+		/*
+		 * Scale down the coefficient by number of columns projected.
+		 * XXX: For now consider that we project 1/3rd of the columns, until
+		 * we can access column projection information here.
+		 */
+		cols_proj_est = ceil(rel->max_attr * 0.33);
+		coefficient = coefficient * cols_proj_est / rel->max_attr;
+	}
+
+	return coefficient;
 }

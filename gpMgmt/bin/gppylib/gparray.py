@@ -189,7 +189,7 @@ class Segment:
         """
         Factory method, initializes a Segment object from string representation.
           - Used when importing from file format.
-          - TODO: Should be compatable with repr() formatting.
+          - Should be compatible with repr() formatting.
         """
         tup = s.strip().split('|')
 
@@ -1246,54 +1246,66 @@ class GpArray:
         return len(self.segmentPairs)
 
     # --------------------------------------------------------------------
+    def get_primary_port_list(self):
+        primary_ports = []
+        for segPair in self.segmentPairs:
+            primary = segPair.primaryDB
+            mirror = segPair.mirrorDB
+
+            if primary.preferred_role == primary.role:
+                primary_ports.append(primary.port)
+            else:
+                primary_ports.append(mirror.port)
+
+        if len(primary_ports) == 0:
+            raise Exception("No primary ports found in array.")
+
+        return primary_ports
+    # --------------------------------------------------------------------
+
+    def get_mirror_port_list(self):
+
+        if self.get_mirroring_enabled() is False:
+            raise Exception('Mirroring is not enabled')
+
+        mirror_ports = []
+        for segPair in self.segmentPairs:
+            primary = segPair.primaryDB
+            mirror = segPair.mirrorDB
+
+            if mirror.preferred_role == mirror.role:
+                mirror_ports.append(mirror.port)
+            else:
+                mirror_ports.append(primary.port)
+
+        if len(mirror_ports) == 0:
+            raise Exception("No mirror ports found in array.")
+
+        return mirror_ports
+
+    # --------------------------------------------------------------------
     def get_min_primary_port(self):
         """Returns the minimum primary segment db port"""
-        min_primary_port = self.segmentPairs[0].primaryDB.port
-        for segPair in self.segmentPairs:
-            if segPair.primaryDB.port < min_primary_port:
-                min_primary_port = segPair.primaryDB.port
-
-        return min_primary_port
+        primary_ports = self.get_primary_port_list()
+        return min(primary_ports)
 
     # --------------------------------------------------------------------
     def get_max_primary_port(self):
         """Returns the maximum primary segment db port"""
-        max_primary_port = self.segmentPairs[0].primaryDB.port
-        for segPair in self.segmentPairs:
-            if segPair.primaryDB.port > max_primary_port:
-                max_primary_port = segPair.primaryDB.port
-
-        return max_primary_port
+        primary_ports = self.get_primary_port_list()
+        return max(primary_ports)
 
     # --------------------------------------------------------------------
     def get_min_mirror_port(self):
         """Returns the minimum mirror segment db port"""
-        if self.get_mirroring_enabled() is False:
-            raise Exception('Mirroring is not enabled')
-
-        min_mirror_port = self.segmentPairs[0].mirrorDB.port
-
-        for segPair in self.segmentPairs:
-            mirror = segPair.mirrorDB
-            if mirror and mirror.port < min_mirror_port:
-                min_mirror_port = mirror.port
-
-        return min_mirror_port
+        mirror_ports = self.get_mirror_port_list()
+        return min(mirror_ports)
 
     # --------------------------------------------------------------------
     def get_max_mirror_port(self):
         """Returns the maximum mirror segment db port"""
-        if self.get_mirroring_enabled() is False:
-            raise Exception('Mirroring is not enabled')
-
-        max_mirror_port = self.segmentPairs[0].mirrorDB.port
-
-        for segPair in self.segmentPairs:
-            mirror = segPair.mirrorDB
-            if mirror and mirror.port > max_mirror_port:
-                max_mirror_port = mirror.port
-
-        return max_mirror_port
+        mirror_ports = self.get_mirror_port_list()
+        return max(mirror_ports)
 
     # --------------------------------------------------------------------
     def get_interface_numbers(self):
@@ -1399,40 +1411,6 @@ class GpArray:
         start_dir_content = self.coordinator.datadir.rfind('-')
         prefix = self.coordinator.datadir[start_last_dir:start_dir_content]
         return prefix
-
-    # --------------------------------------------------------------------
-    # If we've got recovered segments, and we have a matched-pair, we
-    # can update the catalog to "rebalance" back to our original primary.
-    def updateRoleForRecoveredSegs(self, dbURL):
-        """
-        Marks the segment role to match the configured preferred_role.
-        """
-
-        # walk our list of segments, checking to make sure that
-        # both members of the peer-group are in our recovered-list,
-        # save their content-id.
-        recovered_contents = []
-        for segPair in self.segmentPairs:
-            if segPair.primaryDB:
-                if segPair.primaryDB.dbid in self.recoveredSegmentDbids:
-                    if segPair.mirrorDB and segPair.mirrorDB.dbid in self.recoveredSegmentDbids:
-                        recovered_contents.append((segPair.primaryDB.content, segPair.primaryDB.dbid, segPair.mirrorDB.dbid))
-
-        with closing(dbconn.connect(dbURL, True, allowSystemTableMods = True)) as conn:
-            for (content_id, primary_dbid, mirror_dbid) in recovered_contents:
-                sql = "UPDATE gp_segment_configuration SET role=preferred_role where content = %d" % content_id
-                dbconn.executeUpdateOrInsert(conn, sql, 2)
-
-                # NOTE: primary-dbid (right now) is the mirror.
-                sql = "INSERT INTO gp_configuration_history VALUES (now(), %d, 'Reassigned role for content %d to MIRROR')" % (primary_dbid, content_id)
-                dbconn.executeUpdateOrInsert(conn, sql, 1)
-
-                # NOTE: mirror-dbid (right now) is the primary.
-                sql = "INSERT INTO gp_configuration_history VALUES (now(), %d, 'Reassigned role for content %d to PRIMARY')" % (mirror_dbid, content_id)
-                dbconn.executeUpdateOrInsert(conn, sql, 1)
-
-                # We could attempt to update the segments-array.
-                # But the caller will re-read the configuration from the catalog.
 
     # --------------------------------------------------------------------
     def addExpansionSeg(self, content, preferred_role, dbid, role,

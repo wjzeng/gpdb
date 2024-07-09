@@ -26,6 +26,7 @@
 #define DEFAULT_SEQ_PAGE_COST  1.0
 #define DEFAULT_RANDOM_PAGE_COST  4.0
 #define DEFAULT_CPU_TUPLE_COST	0.01
+#define DEFAULT_GP_DECOMPRESS_COST	1
 #define DEFAULT_CPU_INDEX_TUPLE_COST 0.005
 #define DEFAULT_CPU_OPERATOR_COST  0.0025
 #define DEFAULT_PARALLEL_TUPLE_COST 0.1
@@ -139,7 +140,6 @@ extern void cost_tup_split(Path *path, PlannerInfo *root,
 						   int numDQAs,
 						   Cost input_startup_cost, Cost input_total_cost,
 						   double input_tuples);
-struct HashAggTableSizes; /* defined in execHHashagg.h */
 extern void cost_agg(Path *path, PlannerInfo *root,
 					 AggStrategy aggstrategy, const AggClauseCosts *aggcosts,
 					 int numGroupCols, double numGroups,

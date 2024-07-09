@@ -55,6 +55,9 @@ SELECT * FROM temptest;
 
 CREATE TEMP TABLE temptest(col int) ON COMMIT DELETE ROWS;
 
+-- while we're here, verify successful truncation of index with SQL function
+CREATE INDEX ON temptest(bit_length(''));
+
 BEGIN;
 INSERT INTO temptest VALUES (1);
 INSERT INTO temptest VALUES (2);
@@ -152,6 +155,17 @@ select pg_temp.whoami();
 
 drop table public.whereami;
 
+-- types in temp schema
+set search_path = pg_temp, public;
+create domain pg_temp.nonempty as text check (value <> '');
+-- function-syntax invocation of types matches rules for functions
+select nonempty('');
+select pg_temp.nonempty('');
+-- other syntax matches rules for tables
+select ''::nonempty;
+
+reset search_path;
+
 -- For partitioned temp tables, ON COMMIT actions ignore storage-less
 -- partitioned tables.
 begin;
@@ -181,7 +195,7 @@ create temp table temp_parted_oncommit_test2
 insert into temp_parted_oncommit_test values (1), (2);
 commit;
 -- no relations remain in this case.
-select relname from pg_class where relname like 'temp_parted_oncommit_test%';
+select relname from pg_class where relname ~ '^temp_parted_oncommit_test';
 -- Using ON COMMIT DELETE on a partitioned table does not remove
 -- all rows if partitions preserve their data.
 begin;
@@ -199,7 +213,8 @@ commit;
 -- preserved.
 select * from temp_parted_oncommit_test;
 -- two relations remain in this case.
-select relname from pg_class where relname like 'temp_parted_oncommit_test%';
+select relname from pg_class where relname ~ '^temp_parted_oncommit_test'
+  order by relname;
 drop table temp_parted_oncommit_test;
 
 -- Check dependencies between ON COMMIT actions with inheritance trees.
@@ -211,7 +226,7 @@ create temp table temp_inh_oncommit_test1 ()
 insert into temp_inh_oncommit_test1 values (1);
 commit;
 -- no relations remain in this case
-select relname from pg_class where relname like 'temp_inh_oncommit_test%';
+select relname from pg_class where relname ~ '^temp_inh_oncommit_test';
 -- Data on the parent is removed, and the child goes away.
 begin;
 create temp table temp_inh_oncommit_test (a int) on commit delete rows;
@@ -222,7 +237,7 @@ insert into temp_inh_oncommit_test values (1);
 commit;
 select * from temp_inh_oncommit_test;
 -- one relation remains
-select relname from pg_class where relname like 'temp_inh_oncommit_test%';
+select relname from pg_class where relname ~ '^temp_inh_oncommit_test';
 drop table temp_inh_oncommit_test;
 
 -- Tests with two-phase commit
@@ -235,52 +250,52 @@ begin;
 create function pg_temp.twophase_func() returns void as
   $$ select '2pc_func'::text $$ language sql;
 prepare transaction 'twophase_func';
-rollback; -- PREPARE TRANACTION is not supported in GPDB
+rollback; -- PREPARE TRANSACTION is not supported in GPDB
 -- Function drop
 create function pg_temp.twophase_func() returns void as
   $$ select '2pc_func'::text $$ language sql;
 begin;
 drop function pg_temp.twophase_func();
 prepare transaction 'twophase_func';
-rollback; -- PREPARE TRANACTION is not supported in GPDB
+rollback; -- PREPARE TRANSACTION is not supported in GPDB
 -- Operator creation
 begin;
 create operator pg_temp.@@ (leftarg = int4, rightarg = int4, procedure = int4mi);
 prepare transaction 'twophase_operator';
-rollback; -- PREPARE TRANACTION is not supported in GPDB
+rollback; -- PREPARE TRANSACTION is not supported in GPDB
 
 -- These generate errors about temporary tables.
 begin;
 create type pg_temp.twophase_type as (a int);
 prepare transaction 'twophase_type';
-rollback; -- PREPARE TRANACTION is not supported in GPDB
+rollback; -- PREPARE TRANSACTION is not supported in GPDB
 begin;
 create view pg_temp.twophase_view as select 1;
 prepare transaction 'twophase_view';
-rollback; -- PREPARE TRANACTION is not supported in GPDB
+rollback; -- PREPARE TRANSACTION is not supported in GPDB
 begin;
 create sequence pg_temp.twophase_seq;
 prepare transaction 'twophase_sequence';
-rollback; -- PREPARE TRANACTION is not supported in GPDB
+rollback; -- PREPARE TRANSACTION is not supported in GPDB
 
 -- Temporary tables cannot be used with two-phase commit.
 create temp table twophase_tab (a int);
 begin;
 select a from twophase_tab;
 prepare transaction 'twophase_tab';
-rollback; -- PREPARE TRANACTION is not supported in GPDB
+rollback; -- PREPARE TRANSACTION is not supported in GPDB
 begin;
 insert into twophase_tab values (1);
 prepare transaction 'twophase_tab';
-rollback; -- PREPARE TRANACTION is not supported in GPDB
+rollback; -- PREPARE TRANSACTION is not supported in GPDB
 begin;
 lock twophase_tab in access exclusive mode;
 prepare transaction 'twophase_tab';
-rollback; -- PREPARE TRANACTION is not supported in GPDB
+rollback; -- PREPARE TRANSACTION is not supported in GPDB
 begin;
 drop table twophase_tab;
 prepare transaction 'twophase_tab';
-rollback; -- PREPARE TRANACTION is not supported in GPDB
+rollback; -- PREPARE TRANSACTION is not supported in GPDB
 
 -- Corner case: current_schema may create a temporary schema if namespace
 -- creation is pending, so check after that.  First reset the connection

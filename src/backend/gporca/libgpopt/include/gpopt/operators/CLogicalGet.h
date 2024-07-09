@@ -37,7 +37,7 @@ private:
 	const CName *m_pnameAlias;
 
 	// table descriptor
-	CTableDescriptor *m_ptabdesc;
+	CTableDescriptorHashSet *m_ptabdesc;
 
 	// output columns
 	CColRefArray *m_pdrgpcrOutput;
@@ -45,8 +45,11 @@ private:
 	// partition keys
 	CColRef2dArray *m_pdrgpdrgpcrPart;
 
-	// distribution columns (empty for master only tables)
+	// distribution columns (empty for coordinator only tables)
 	CColRefSet *m_pcrsDist;
+
+	// relation has row level security enabled and has security quals
+	BOOL m_has_security_quals{false};
 
 	void CreatePartCols(CMemoryPool *mp, const ULongPtrArray *pdrgpulPart);
 
@@ -58,10 +61,11 @@ public:
 	explicit CLogicalGet(CMemoryPool *mp);
 
 	CLogicalGet(CMemoryPool *mp, const CName *pnameAlias,
-				CTableDescriptor *ptabdesc);
+				CTableDescriptor *ptabdesc, BOOL hasSecurityQuals);
 
 	CLogicalGet(CMemoryPool *mp, const CName *pnameAlias,
-				CTableDescriptor *ptabdesc, CColRefArray *pdrgpcrOutput);
+				CTableDescriptor *ptabdesc, CColRefArray *pdrgpcrOutput,
+				BOOL hasSecurityQuals);
 
 	// dtor
 	~CLogicalGet() override;
@@ -105,7 +109,7 @@ public:
 	CTableDescriptor *
 	Ptabdesc() const
 	{
-		return m_ptabdesc;
+		return m_ptabdesc->First();
 	}
 
 	// partition columns
@@ -113,6 +117,12 @@ public:
 	PdrgpdrgpcrPartColumns() const
 	{
 		return m_pdrgpdrgpcrPart;
+	}
+
+	BOOL
+	HasSecurityQuals() const
+	{
+		return m_has_security_quals;
 	}
 
 	// operator specific hash function
@@ -156,7 +166,8 @@ public:
 							 CExpressionHandle &  // exprhdl
 	) const override
 	{
-		return PpcDeriveConstraintFromTable(mp, m_ptabdesc, m_pdrgpcrOutput);
+		return PpcDeriveConstraintFromTable(mp, m_ptabdesc->First(),
+											m_pdrgpcrOutput);
 	}
 
 	// derive join depth
@@ -169,11 +180,12 @@ public:
 	}
 
 	// derive table descriptor
-	CTableDescriptor *
-	DeriveTableDescriptor(CMemoryPool *,	   // mp
+	CTableDescriptorHashSet *
+	DeriveTableDescriptor(CMemoryPool *mp GPOS_UNUSED,
 						  CExpressionHandle &  // exprhdl
 	) const override
 	{
+		m_ptabdesc->AddRef();
 		return m_ptabdesc;
 	}
 
@@ -225,7 +237,7 @@ public:
 	{
 		GPOS_ASSERT(nullptr != pop);
 		GPOS_ASSERT(EopLogicalGet == pop->Eopid() ||
-					EopLogicalExternalGet == pop->Eopid());
+					EopLogicalForeignGet == pop->Eopid());
 
 		return dynamic_cast<CLogicalGet *>(pop);
 	}

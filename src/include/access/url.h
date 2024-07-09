@@ -46,6 +46,8 @@ typedef struct URL_FILE
 
 typedef struct extvar_t
 {
+	char* GP_COORDINATOR_HOST;
+	char* GP_COORDINATOR_PORT;
 	char* GP_MASTER_HOST;
 	char* GP_MASTER_PORT;
 	char* GP_DATABASE;
@@ -67,6 +69,8 @@ typedef struct extvar_t
  	char* GP_LINE_DELIM_STR;
 	char GP_LINE_DELIM_LENGTH[11];
 	char *GP_QUERY_STRING;
+
+	char *GP_SEG_LOGDIR;    /* location of the segment's log directory */
 } extvar_t;
 
 

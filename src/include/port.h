@@ -103,10 +103,12 @@ extern void pgfnames_cleanup(char **filenames);
 /* Portable locale initialization (in exec.c) */
 extern void set_pglocale_pgservice(const char *argv0, const char *app);
 
-/* Portable way to find binaries (in exec.c) */
+/* Portable way to find and execute binaries (in exec.c) */
+extern int	validate_exec(const char *path);
 extern int	find_my_exec(const char *argv0, char *retpath);
 extern int	find_other_exec(const char *argv0, const char *target,
 							const char *versionstr, char *retpath);
+extern char *pipe_read_line(char *cmd, char *line, int maxsize);
 
 /* Doesn't belong here, but this is used with find_other_exec(), so... */
 #define PG_VERSIONSTR "postgres (Greenplum Database) " PG_VERSION "\n"
@@ -439,6 +441,10 @@ extern size_t strnlen(const char *str, size_t maxlen);
 extern long random(void);
 #endif
 
+#ifndef HAVE_SETENV
+extern int setenv(const char *name, const char *value, int overwrite);
+#endif
+
 #ifndef HAVE_UNSETENV
 extern void unsetenv(const char *name);
 #endif
@@ -517,11 +523,6 @@ extern bool pg_strong_random(void *buf, size_t len);
  */
 #define pg_backend_random pg_strong_random
 
-/* port/pg_strong_random.c */
-#ifdef HAVE_STRONG_RANDOM
-extern bool pg_strong_random(void *buf, size_t len);
-#endif
-
 /* port/pgcheckdir.c */
 extern int	pg_check_dir(const char *dir);
 
@@ -531,11 +532,6 @@ extern int	pg_mkdir_p(char *path, int omode);
 /* port/pqsignal.c */
 typedef void (*pqsigfunc) (int signo);
 extern pqsigfunc pqsignal(int signo, pqsigfunc func);
-#ifndef WIN32
-extern pqsigfunc pqsignal_no_restart(int signo, pqsigfunc func);
-#else
-#define pqsignal_no_restart(signo, func) pqsignal(signo, func)
-#endif
 
 /* port/quotes.c */
 extern char *escape_single_quotes_ascii(const char *src);

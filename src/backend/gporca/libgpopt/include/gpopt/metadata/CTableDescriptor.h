@@ -27,11 +27,11 @@ using namespace gpos;
 using namespace gpmd;
 
 // dynamic array of columns -- array owns columns
-typedef CDynamicPtrArray<CColumnDescriptor, CleanupRelease>
-	CColumnDescriptorArray;
+using CColumnDescriptorArray =
+	CDynamicPtrArray<CColumnDescriptor, CleanupRelease>;
 
 // dynamic array of bitsets
-typedef CDynamicPtrArray<CBitSet, CleanupRelease> CBitSetArray;
+using CBitSetArray = CDynamicPtrArray<CBitSet, CleanupRelease>;
 
 //---------------------------------------------------------------------------
 //	@class:
@@ -63,6 +63,9 @@ private:
 	// storage type
 	IMDRelation::Erelstoragetype m_erelstoragetype;
 
+	// append only table version
+	IMDRelation::Erelaoversion m_erelaoversion;
+
 	// distribution columns for hash distribution
 	CColumnDescriptorArray *m_pdrgpcoldescDist;
 
@@ -88,6 +91,15 @@ private:
 	// lockmode from the parser
 	INT m_lockmode;
 
+	// acl mode from the parser
+	ULONG m_acl_mode;
+
+	// identifier of query to which current table belongs.
+	// This field is used for assigning current table entry with
+	// target one within DML operation. If descriptor doesn't point
+	// to the target (result) relation it has value UNASSIGNED_QUERYID
+	ULONG m_assigned_query_id_for_target_rel;
+
 public:
 	CTableDescriptor(const CTableDescriptor &) = delete;
 
@@ -96,7 +108,9 @@ public:
 					 BOOL convert_hash_to_random,
 					 IMDRelation::Ereldistrpolicy rel_distr_policy,
 					 IMDRelation::Erelstoragetype erelstoragetype,
-					 ULONG ulExecuteAsUser, INT lockmode);
+					 IMDRelation::Erelaoversion erelaoversion,
+					 ULONG ulExecuteAsUser, INT lockmode, ULONG acl_mode,
+					 ULONG assigned_query_id_for_target_rel);
 
 	// dtor
 	~CTableDescriptor() override;
@@ -144,6 +158,12 @@ public:
 		return m_lockmode;
 	}
 
+	ULONG
+	GetAclMode() const
+	{
+		return m_acl_mode;
+	}
+
 	// return the position of a particular attribute (identified by attno)
 	ULONG GetAttributePosition(INT attno) const;
 
@@ -182,8 +202,6 @@ public:
 		return m_pdrgpbsKeys;
 	}
 
-	// return the number of leaf partitions
-	ULONG PartitionCount() const;
 
 	// distribution policy
 	IMDRelation::Ereldistrpolicy
@@ -197,6 +215,13 @@ public:
 	RetrieveRelStorageType() const
 	{
 		return m_erelstoragetype;
+	}
+
+	// append only table version
+	IMDRelation::Erelaoversion
+	GetRelAOVersion() const
+	{
+		return m_erelaoversion;
 	}
 
 	BOOL
@@ -231,7 +256,27 @@ public:
 			   m_erelstoragetype == IMDRelation::ErelstorageAppendOnlyRows;
 	}
 
+	ULONG
+	GetAssignedQueryIdForTargetRel() const
+	{
+		return m_assigned_query_id_for_target_rel;
+	}
+
+	static ULONG HashValue(const CTableDescriptor *ptabdesc);
+
+	static BOOL Equals(const CTableDescriptor *ptabdescLeft,
+					   const CTableDescriptor *ptabdescRight);
+
 };	// class CTableDescriptor
+
+using CTableDescriptorHashSet =
+	CHashSet<CTableDescriptor, CTableDescriptor::HashValue,
+			 CTableDescriptor::Equals, CleanupRelease<CTableDescriptor>>;
+using CTableDescriptorHashSetIter =
+	CHashSetIter<CTableDescriptor, CTableDescriptor::HashValue,
+				 CTableDescriptor::Equals, CleanupRelease<CTableDescriptor>>;
+
+
 }  // namespace gpopt
 
 #endif	// !GPOPT_CTableDescriptor_H

@@ -732,9 +732,11 @@ objectNamesToOids(ObjectType objtype, List *objnames)
 				 * GPDB: If we the object is a partitioned relation, also
 				 * recurse to the child partitions. It is different from
 				 * PostgreSQL, but it is how GRANT has historically worked on
-				 * GPDB.
+				 * GPDB. Unless it is indicated that we should not recurse
+				 * (e.g. by specifying the 'ONLY' keyword), in which case
+				 * don't bother finding the inheritors.
 				 */
-				if (objtype == OBJECT_TABLE)
+				if (objtype == OBJECT_TABLE && relvar->inh)
 				{
 					HeapTuple	tp;
 
@@ -1515,6 +1517,9 @@ SetDefaultACL(InternalDefaultACL *iacls)
 		ReleaseSysCache(tuple);
 
 	table_close(rel, RowExclusiveLock);
+
+	/* prevent error when processing duplicate objects */
+	CommandCounterIncrement();
 }
 
 
@@ -1630,6 +1635,9 @@ RemoveRoleFromObjectACL(Oid roleid, Oid classid, Oid objid)
 			case ForeignDataWrapperRelationId:
 				istmt.objtype = OBJECT_FDW;
 				break;
+			case ExtprotocolRelationId:
+				istmt.objtype = OBJECT_EXTPROTOCOL;
+				break;
 			default:
 				elog(ERROR, "unexpected object class %u", classid);
 				break;
@@ -1742,6 +1750,11 @@ expand_all_col_privileges(Oid table_oid, Form_pg_class classForm,
 
 		/* Views don't have any system columns at all */
 		if (classForm->relkind == RELKIND_VIEW && curr_att < 0)
+			continue;
+
+		/* AO rows and columns do not have system columns: cmin, cmax, xmin, and xmax */
+		if ((classForm->relam == AO_COLUMN_TABLE_AM_OID || classForm->relam == AO_ROW_TABLE_AM_OID) &&
+			(curr_att >= -5) && (curr_att <=-2))
 			continue;
 
 		attTuple = SearchSysCache2(ATTNUM,

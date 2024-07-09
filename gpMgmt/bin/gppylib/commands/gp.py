@@ -8,6 +8,8 @@ TODO: docs!
 """
 import json
 import os, time
+import base64
+import pickle
 import shlex
 import os.path
 import pipes
@@ -40,10 +42,29 @@ COMMAND_NOT_FOUND=127
 #Default size of thread pool for gpstart and gpsegstart
 DEFAULT_GPSTART_NUM_WORKERS=64
 
+#Default size of thread pool on segment hosts
+DEFAULT_SEGHOST_NUM_WORKERS=64
+
+#max size of thread pool on segment hosts
+MAX_SEGHOST_NUM_WORKERS=128
+
+#default batch size of thread pool on coordinator
+DEFAULT_COORDINATOR_NUM_WORKERS=16
+
+#max batch size of thread pool on coordinator
+MAX_COORDINATOR_NUM_WORKERS=64
+
+# Maximum replay lag (in GBs) allowed on mirror when rebalancing the segments
+# The default value for ALLOWED_REPLAY_LAG has been decided to be 10 GBs as mirror
+# took 5 mins to replay 10 GB lag on a local demo cluster.
+ALLOWED_REPLAY_LAG = 10
+
 # Application name used by the pg_rewind instance that gprecoverseg starts
 # during incremental recovery. gpstate uses this to figure out when incremental
 # recovery is active.
 RECOVERY_REWIND_APPNAME = '__gprecoverseg_pg_rewind__'
+
+PGDATABASE_FOR_COMMON_USE= 'postgres'
 
 def get_postmaster_pid_locally(datadir):
     cmdStr = "ps -ef | grep 'postgres -D %s' | grep -v grep" % (datadir)
@@ -57,15 +78,41 @@ def get_postmaster_pid_locally(datadir):
         return -1
 
 def getPostmasterPID(hostname, datadir):
-    cmdStr="ps -ef | grep 'postgres -D %s' | grep -v grep" % (datadir)
+    cmdStr="echo 'START_CMD_OUTPUT';ps -ef | grep 'postgres -D %s' | grep -v grep" % (datadir)
     name="get postmaster pid"
     cmd=Command(name,cmdStr,ctxt=REMOTE,remoteHost=hostname)
     try:
         cmd.run(validateAfter=True)
         sout=cmd.get_results().stdout.lstrip(' ')
-        return int(sout.split()[1])
+        return int(sout.split('START_CMD_OUTPUT\n')[1].split()[1])
     except:
         return -1
+
+
+"""
+Given the segment data directory and the hostname,
+return all the postgres processes associated
+with that segment as a list.
+Returns an empty list if there is any error.
+"""
+def get_postgres_segment_processes(datadir, host):
+    postmaster_pid = getPostmasterPID(host, datadir)
+    if postmaster_pid == -1:
+        return []
+
+    postgres_pids = [postmaster_pid]
+    cmd = Command("get children pids", ("pgrep -P {0}".format(postmaster_pid)), ctxt=REMOTE, remoteHost=host)
+    cmd.run()
+
+    if cmd.get_results().rc == 0:
+        pids = cmd.get_results().stdout.split()
+        for pid in pids:
+            try:
+                postgres_pids.append(int(pid))
+            except ValueError:
+                pass # Ignore any error while converting to int from str
+
+    return postgres_pids
 
 #-----------------------------------------------
 
@@ -133,6 +180,10 @@ class CmdArgs(list):
             self.append("-D '%s'" % (cfg_array))
         return self
 
+    def set_mirror_fast_wait(self, mirrorFastWait):
+        if mirrorFastWait:
+            self.append("--gp-mirror-fast-wait")
+        return self
 
 
 class PgCtlBackendOptions(CmdArgs):
@@ -162,13 +213,8 @@ class PgCtlBackendOptions(CmdArgs):
 
     """
 
-    def __init__(self, port):
-        """
-        @param port: backend port
-        """
-        CmdArgs.__init__(self, [
-            "-p", str(port),
-        ])
+    def __init__(self):
+        CmdArgs.__init__(self, [])
 
     #
     # coordinator/segment-specific options
@@ -225,7 +271,7 @@ class PgCtlStartArgs(CmdArgs):
      '-o', '"', '-p', '5432', '--silent-mode=true', '"', 'start']
     """
 
-    def __init__(self, datadir, backend, era, wrapper, args, wait, timeout=None):
+    def __init__(self, datadir, backend, era, wrapper, args, wait, timeout=None, mirrorFastWait=False):
         """
         @param datadir: database data directory
         @param backend: backend options string from PgCtlBackendOptions
@@ -246,6 +292,7 @@ class PgCtlStartArgs(CmdArgs):
         ])
         self.set_wrapper(wrapper, args)
         self.set_wait_timeout(wait, timeout)
+        self.set_mirror_fast_wait(mirrorFastWait)
         self.extend([
             "-o", "\"", str(backend), "\"",
             "start"
@@ -291,7 +338,7 @@ class CoordinatorStart(Command):
         self.wrapper_args=wrapper_args
 
         # build backend options
-        b = PgCtlBackendOptions(port)
+        b = PgCtlBackendOptions()
         if utilityMode:
             b.set_utility()
         else:
@@ -301,7 +348,7 @@ class CoordinatorStart(Command):
 
         # build pg_ctl command
         c = PgCtlStartArgs(dataDir, b, era, wrapper, wrapper_args, wait, timeout)
-        logger.info("CoordinatorStart pg_ctl cmd is %s", c);
+        logger.info("CoordinatorStart pg_ctl cmd is %s", c)
         self.cmdStr = str(c)
 
         Command.__init__(self, name, self.cmdStr, ctxt, remoteHost)
@@ -339,7 +386,8 @@ class SegmentStart(Command):
     def __init__(self, name, gpdb, numContentsInCluster, era, mirrormode,
                  utilityMode=False, ctxt=LOCAL, remoteHost=None,
                  pg_ctl_wait=True, timeout=SEGMENT_TIMEOUT_DEFAULT,
-                 specialMode=None, wrapper=None, wrapper_args=None):
+                 specialMode=None, wrapper=None, wrapper_args=None,
+                 mirrorFastWait=False):
 
         # This is referenced from calling code
         self.segment = gpdb
@@ -349,7 +397,7 @@ class SegmentStart(Command):
         datadir = gpdb.getSegmentDataDirectory()
 
         # build backend options
-        b = PgCtlBackendOptions(port)
+        b = PgCtlBackendOptions()
         if utilityMode:
             b.set_utility()
         else:
@@ -357,8 +405,8 @@ class SegmentStart(Command):
         b.set_special(specialMode)
 
         # build pg_ctl command
-        c = PgCtlStartArgs(datadir, b, era, wrapper, wrapper_args, pg_ctl_wait, timeout)
-        logger.info("SegmentStart pg_ctl cmd is %s", c);
+        c = PgCtlStartArgs(datadir, b, era, wrapper, wrapper_args, pg_ctl_wait, timeout, mirrorFastWait)
+        logger.info("SegmentStart pg_ctl cmd is %s", c)
         self.cmdStr = str(c) + ' 2>&1'
 
         Command.__init__(self, name, self.cmdStr, ctxt, remoteHost)
@@ -413,39 +461,6 @@ class SegmentIsShutDown(Command):
         cmd=SegmentIsShutDown(name,directory)
         cmd.run(validateAfter=True)
 
-#-----------------------------------------------
-class SegmentRewind(Command):
-    """
-    SegmentRewind is used to run pg_rewind using source server.
-    """
-
-    def __init__(self, name, target_host, target_datadir,
-                 source_host, source_port, progress_file,
-                 verbose=False, ctxt=REMOTE):
-
-        # Construct the source server libpq connection string
-        # We set application_name here so gpstate can identify whether an
-        # incremental recovery is occurring.
-        source_server = "host={} port={} dbname=template1 application_name={}".format(
-            source_host, source_port, RECOVERY_REWIND_APPNAME
-        )
-
-        # Build the pg_rewind command. Do not run pg_rewind if standby.signal
-        # file exists in target data directory because the target instance can
-        # be started up normally as a mirror for WAL replication catch up.
-        rewind_cmd = '[ -f %s/standby.signal ] || PGOPTIONS="-c gp_role=utility" $GPHOME/bin/pg_rewind --write-recovery-conf --slot="internal_wal_replication_slot" --source-server="%s" --target-pgdata=%s' % (target_datadir, source_server, target_datadir)
-
-        if verbose:
-            rewind_cmd = rewind_cmd + ' --progress'
-
-        # pg_rewind prints progress updates to stdout, but it also prints
-        # errors relating to relevant failures(like it will not rewind due to
-        # a corrupted pg_control file) to stderr.
-        rewind_cmd = rewind_cmd + " > {} 2>&1".format(pipes.quote(progress_file))
-
-        self.cmdStr = rewind_cmd
-
-        Command.__init__(self, name, self.cmdStr, ctxt, target_host)
 
 #
 # list of valid segment statuses that can be requested
@@ -624,7 +639,7 @@ class GpSegStartArgs(CmdArgs):
         @param parallel - maximum size of a thread pool to start segments
         """
         if parallel is not None:
-            self.append("-B")
+            self.append("-b")
             self.append(str(parallel))
         return self
 
@@ -661,7 +676,7 @@ class GpSegStartCmd(Command):
 #-----------------------------------------------
 class GpSegStopCmd(Command):
     def __init__(self, name, gphome, version,mode,dbs,timeout=SEGMENT_STOP_TIMEOUT_DEFAULT,
-                 verbose=False, ctxt=LOCAL, remoteHost=None, logfileDirectory=False):
+                 verbose=False, ctxt=LOCAL, remoteHost=None, logfileDirectory=False, segment_batch_size=DEFAULT_SEGHOST_NUM_WORKERS):
         self.gphome=gphome
         self.dblist=dbs
         self.dirportlist=[]
@@ -678,8 +693,8 @@ class GpSegStopCmd(Command):
         else:
             setverbose=""
 
-        self.cmdStr="$GPHOME/sbin/gpsegstop.py %s -D %s -m %s -t %s -V '%s'"  %\
-                        (setverbose,dirstr,mode,timeout,version)
+        self.cmdStr="$GPHOME/sbin/gpsegstop.py %s -D %s -m %s -t %s -V '%s' -b %d" %\
+                        (setverbose,dirstr,mode,timeout,version,segment_batch_size)
 
         if (logfileDirectory):
             self.cmdStr = self.cmdStr + " -l '" + logfileDirectory + "'"
@@ -917,7 +932,7 @@ class ConfigureNewSegment(Command):
         if verbose:
             cmdStr += ' -v '
         if batchSize:
-            cmdStr += ' -B %s' % batchSize
+            cmdStr += ' -b %s' % batchSize
         if validationOnly:
             cmdStr += " --validation-only"
         if writeGpIdFileOnly:
@@ -989,6 +1004,45 @@ class ConfigureNewSegment(Command):
         return result
 
 #-----------------------------------------------
+
+
+class GpSegSetupRecovery(Command):
+    """
+    Format gpsegsetuprecovery call for running recovery setup on remoteHost for the segments passed in confinfo
+    """
+    def __init__(self, name, confinfo, logdir, batchSize, verbose, remoteHost, forceoverwrite):
+        cmdStr = _get_cmd_for_recovery_wrapper('gpsegsetuprecovery', confinfo, logdir, batchSize, verbose,forceoverwrite)
+        Command.__init__(self, name, cmdStr, REMOTE, remoteHost, start_new_session=True)
+
+
+class GpSegRecovery(Command):
+    """
+    Format gpsegrecovery call for running pg_basebackup/pg_rewind on remoteHost for the segments passed in confinfo
+    """
+    def __init__(self, name, confinfo, logdir, batchSize, verbose, remoteHost, forceoverwrite, era, maxRate):
+        cmdStr = _get_cmd_for_recovery_wrapper('gpsegrecovery', confinfo, logdir, batchSize, verbose, forceoverwrite, era, maxRate)
+        Command.__init__(self, name, cmdStr, REMOTE, remoteHost, start_new_session=True)
+
+
+def _get_cmd_for_recovery_wrapper(wrapper_filename, confinfo, logdir, batchSize, verbose, forceoverwrite, era=None, maxRate=None):
+    cmdStr = '$GPHOME/sbin/{}.py -c {} -l {}'.format(wrapper_filename, pipes.quote(confinfo), pipes.quote(logdir))
+
+    if verbose:
+        cmdStr += ' -v'
+    if batchSize:
+        cmdStr += ' -b %s' % batchSize
+    if forceoverwrite:
+        cmdStr += " --force-overwrite"
+    if era:
+        cmdStr += " --era={}".format(era)
+    if maxRate:
+        cmdStr += " --max-rate {}".format(maxRate)
+
+
+    return cmdStr
+
+
+#-----------------------------------------------
 class GpVersion(Command):
     def __init__(self,name,gphome,ctxt=LOCAL,remoteHost=None):
         # XXX this should make use of the gphome that was passed
@@ -997,11 +1051,11 @@ class GpVersion(Command):
 
         self.gphome=gphome
         #self.cmdStr="%s/bin/postgres --gp-version" % gphome
-        self.cmdStr="$GPHOME/bin/postgres --gp-version"
+        self.cmdStr="echo 'START_CMD_OUTPUT';$GPHOME/bin/postgres --gp-version"
         Command.__init__(self,name,self.cmdStr,ctxt,remoteHost)
 
     def get_version(self):
-        return self.results.stdout.strip()
+        return self.results.stdout.strip().split('START_CMD_OUTPUT\n')[1]
 
     @staticmethod
     def local(name,gphome):
@@ -1064,7 +1118,7 @@ class GpConfigHelper(Command):
 
         addParameter = (not getParameter) and (not removeParameter)
         if addParameter:
-            args = "--add-parameter %s --value %s " % (name, shlex.quote(value))
+            args = "--add-parameter %s --value %s " % (name, base64.urlsafe_b64encode(pickle.dumps(value)).decode())
         if getParameter:
             args = "--get-parameter %s" % name
         if removeParameter:
@@ -1078,7 +1132,8 @@ class GpConfigHelper(Command):
 
     # FIXME: figure out how callers of this can handle exceptions here
     def get_value(self):
-        return self.get_results().stdout
+        raw_value = self.get_results().stdout
+        return pickle.loads(base64.urlsafe_b64decode(raw_value))
 
 
 #-----------------------------------------------
@@ -1129,8 +1184,8 @@ def distribute_tarball(queue,list,tarball):
             hostname = db.getSegmentHostName()
             datadir = db.getSegmentDataDirectory()
             (head,tail)=os.path.split(datadir)
-            scp_cmd=Scp(name="copy coordinator",srcFile=tarball,dstHost=hostname,dstFile=head)
-            queue.addCommand(scp_cmd)
+            rsync_cmd=Rsync(name="copy coordinator",srcFile=tarball,dstHost=hostname,dstFile=head, ignore_times=True, whole_file=True)
+            queue.addCommand(rsync_cmd)
         queue.join()
         queue.check_results()
         logger.debug("distributeTarBall finished")
@@ -1147,16 +1202,31 @@ def get_gphome():
         raise GpError('Environment Variable GPHOME not set')
     return gphome
 
+'''
+gprecoverseg, gpstart, gpstate, gpstop, gpaddmirror have -d option to give the coordinator data directory.
+but its value was not used throughout the utilities. to fix this the best possible way is
+to set and retrieve that set coordinator dir when we call get_coordinatordatadir().
+'''
+option_coordinator_datadir = None
+def set_coordinatordatadir(coordinator_datadir=None):
+    global option_coordinator_datadir
+    option_coordinator_datadir = coordinator_datadir
 
 ######
 # Support both COORDINATOR_DATA_DIRECTORY and MASTER_DATA_DIRECTORY for backwards compatibility.
 # If both are set, the former is used and the latter is ignored.
+# if -d <coordinator_datadir> is provided with utility, it will be prioritiese over other options.
 def get_coordinatordatadir():
-    coordinator_datadir = os.environ.get('COORDINATOR_DATA_DIRECTORY')
-    if not coordinator_datadir:
-        coordinator_datadir = os.environ.get('MASTER_DATA_DIRECTORY')
+    if option_coordinator_datadir is not None:
+        coordinator_datadir = option_coordinator_datadir
+    else:
+        coordinator_datadir = os.environ.get('COORDINATOR_DATA_DIRECTORY')
+        if not coordinator_datadir:
+            coordinator_datadir = os.environ.get('MASTER_DATA_DIRECTORY')
+
     if not coordinator_datadir:
         raise GpError("Environment Variable COORDINATOR_DATA_DIRECTORY not set!")
+
     return coordinator_datadir
 
 ######
@@ -1494,7 +1564,7 @@ def chk_local_db_running(datadir, port):
 
        1) /tmp/.s.PGSQL.<PORT> and /tmp/.s.PGSQL.<PORT>.lock
        2) DATADIR/postmaster.pid
-       3) netstat
+       3) ss
 
        Returns tuple in format (postmaster_pid_file_exists, tmpfile_exists, lockfile_exists, port_active, postmaster_pid)
 
@@ -1522,12 +1592,12 @@ def chk_local_db_running(datadir, port):
     tmpfile_exists = os.path.exists("/tmp/.s.PGSQL.%d" % port)
     lockfile_exists = os.path.exists(get_lockfile_name(port))
 
-    netstat_port_active = PgPortIsActive.local('check netstat for postmaster port',"/tmp/.s.PGSQL.%d" % port, port)
+    ss_port_active = PgPortIsActive.local('check ss for postmaster port',"/tmp/.s.PGSQL.%d" % port, port)
 
-    logger.debug("postmaster_pid_exists: %s tmpfile_exists: %s lockfile_exists: %s netstat port: %s  pid: %s" %\
-                (postmaster_pid_exists, tmpfile_exists, lockfile_exists, netstat_port_active, pid_value))
+    logger.debug("postmaster_pid_exists: %s tmpfile_exists: %s lockfile_exists: %s ss port: %s  pid: %s" %\
+                (postmaster_pid_exists, tmpfile_exists, lockfile_exists, ss_port_active, pid_value))
 
-    return (postmaster_pid_exists, tmpfile_exists, lockfile_exists, netstat_port_active, pid_value)
+    return (postmaster_pid_exists, tmpfile_exists, lockfile_exists, ss_port_active, pid_value)
 
 def get_lockfile_name(port):
     return "/tmp/.s.PGSQL.%d.lock" % port
@@ -1588,6 +1658,21 @@ def createTempDirectoryName(coordinatorDataDirectory, tempDirPrefix):
                                 datetime.datetime.now().strftime('%m%d%Y'),
                                 os.getpid())
 
+"""
+Check if gprecoverseg process is running or not by
+reading the PID file inside gprecoverseg.lock directory.
+Returns True if the process is running or False otherwise.
+"""
+def is_gprecoverseg_running():
+    gprecoverseg_pidfile = os.path.join(get_coordinatordatadir(), 'gprecoverseg.lock', 'PID')
+    try:
+        with open(gprecoverseg_pidfile) as pidfile:
+            gprecoverseg_pid = pidfile.read()
+    except Exception:
+        return False
+
+    return check_pid(gprecoverseg_pid)
+
 #-------------------------------------------------------------------------
 class GpRecoverSeg(Command):
    """
@@ -1606,17 +1691,19 @@ class GpRecoverSeg(Command):
 class IfAddrs:
     @staticmethod
     def list_addrs(hostname=None, include_loopback=False):
-        cmd = ['%s/libexec/ifaddrs' % GPHOME]
+        cmd = ["echo 'START_CMD_OUTPUT'; %s/libexec/ifaddrs" % GPHOME]
         if not include_loopback:
             cmd.append('--no-loopback')
-        if hostname:
+        localhost = socket.gethostname()
+        if hostname and hostname != localhost:
             args = ['ssh', '-n', hostname]
             args.append(' '.join(cmd))
         else:
-            args = cmd
+            args = ['bash', '-c']
+            args.append(' '.join(cmd))
 
         result = subprocess.check_output(args).decode()
-        return result.splitlines()
+        return result.split('START_CMD_OUTPUT\n')[1].splitlines()
 
 if __name__ == '__main__':
 

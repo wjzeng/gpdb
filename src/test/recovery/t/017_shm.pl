@@ -3,16 +3,18 @@
 #
 use strict;
 use warnings;
-use Config;
 use IPC::Run 'run';
-use PostgresNode;
+use PostgreSQL::Test::Cluster;
 use Test::More;
-use TestLib;
+use PostgreSQL::Test::Utils;
 use Time::HiRes qw(usleep);
 
-plan tests => 5;
+if ($windows_os)
+{
+	plan skip_all => 'SysV shared memory not supported by this platform';
+}
 
-my $tempdir = TestLib::tempdir;
+my $tempdir = PostgreSQL::Test::Utils::tempdir;
 my $port;
 
 # Log "ipcs" diffs on a best-effort basis, swallowing any error.
@@ -28,7 +30,7 @@ sub log_ipcs
 # These tests need a $port such that nothing creates or removes a segment in
 # $port's IpcMemoryKey range while this test script runs.  While there's no
 # way to ensure that in general, we do ensure that if PostgreSQL tests are the
-# only actors.  With TCP, the first get_new_node picks a port number.  With
+# only actors.  With TCP, the first PostgreSQL::Test::Cluster->new picks a port number.  With
 # Unix sockets, use a postmaster, $port_holder, to represent a key space
 # reservation.  $port_holder holds a reservation on the key space of port
 # 1+$port_holder->port if it created the first IpcMemoryKey of its own port's
@@ -38,12 +40,12 @@ sub log_ipcs
 # shmget() activity, gnat starts with key 0x7d001 (512001), and flea starts
 # with key 0x7d002 (512002).
 my $port_holder;
-if (!$PostgresNode::use_tcp)
+if (!$PostgreSQL::Test::Cluster::use_tcp)
 {
 	my $lock_port;
 	for ($lock_port = 511; $lock_port < 711; $lock_port += 2)
 	{
-		$port_holder = PostgresNode->get_new_node(
+		$port_holder = PostgreSQL::Test::Cluster->new(
 			"port${lock_port}_holder",
 			port     => $lock_port,
 			own_host => 1);
@@ -66,7 +68,7 @@ if (!$PostgresNode::use_tcp)
 sub init_start
 {
 	my $name = shift;
-	my $ret = PostgresNode->get_new_node($name, port => $port, own_host => 1);
+	my $ret = PostgreSQL::Test::Cluster->new($name, port => $port, own_host => 1);
 	defined($port) or $port = $ret->port;    # same port for all nodes
 	$ret->init;
 	# Limit semaphore consumption, since we run several nodes concurrently.
@@ -97,7 +99,7 @@ log_ipcs();
 # Scenarios involving no postmaster.pid, dead postmaster, and a live backend.
 # Use a regress.c function to emulate the responsiveness of a backend working
 # through a CPU-intensive task.
-my $regress_shlib = TestLib::perl2host($ENV{REGRESS_SHLIB});
+my $regress_shlib = $ENV{REGRESS_SHLIB};
 $gnat->safe_psql('postgres', <<EOSQL);
 CREATE FUNCTION wait_pid(int)
    RETURNS void
@@ -117,7 +119,7 @@ my $slow_client = IPC::Run::start(
 	\$stdout,
 	'2>',
 	\$stderr,
-	IPC::Run::timeout(900));    # five times the poll_query_until timeout
+	IPC::Run::timeout(5 * $PostgreSQL::Test::Utils::timeout_default));
 ok( $gnat->poll_query_until(
 		'postgres',
 		"SELECT 1 FROM pg_stat_activity WHERE query = '$slow_query'", '1'),
@@ -126,12 +128,13 @@ my $slow_pid = $gnat->safe_psql('postgres',
 	"SELECT pid FROM pg_stat_activity WHERE query = '$slow_query'");
 $gnat->kill9;
 unlink($gnat->data_dir . '/postmaster.pid');
-$gnat->rotate_logfile;    # on Windows, can't open old log for writing
+$gnat->rotate_logfile;
 log_ipcs();
-# Reject ordinary startup.  Retry for the same reasons poll_start() does.
+# Reject ordinary startup.  Retry for the same reasons poll_start() does,
+# every 0.1s for at least $PostgreSQL::Test::Utils::timeout_default seconds.
 my $pre_existing_msg = qr/pre-existing shared memory block/;
 {
-	my $max_attempts = 180 * 10;    # Retry every 0.1s for at least 180s.
+	my $max_attempts = 10 * $PostgreSQL::Test::Utils::timeout_default;
 	my $attempts     = 0;
 	while ($attempts < $max_attempts)
 	{
@@ -155,16 +158,13 @@ like($single_stderr, $pre_existing_msg,
 	'single-user mode detected live backend via shared memory');
 log_ipcs();
 # Fail to reject startup if shm key N has become available and we crash while
-# using key N+1.  This is unwanted, but expected.  Windows is immune, because
-# its GetSharedMemName() use DataDir strings, not numeric keys.
+# using key N+1.  This is unwanted, but expected.
 $flea->stop;    # release first key
-is( $gnat->start(fail_ok => 1),
-	$TestLib::windows_os ? 0 : 1,
-	'key turnover fools only sysv_shmem.c');
-$gnat->stop;     # release first key (no-op on $TestLib::windows_os)
+is($gnat->start(fail_ok => 1), 1, 'key turnover fools only sysv_shmem.c');
+$gnat->stop;     # release first key
 $flea->start;    # grab first key
 # cleanup
-TestLib::system_log('pg_ctl', 'kill', 'QUIT', $slow_pid);
+PostgreSQL::Test::Utils::system_log('pg_ctl', 'kill', 'QUIT', $slow_pid);
 $slow_client->finish;    # client has detected backend termination
 log_ipcs();
 poll_start($gnat);       # recycle second key
@@ -184,7 +184,7 @@ sub poll_start
 {
 	my ($node) = @_;
 
-	my $max_attempts = 180 * 10;
+	my $max_attempts = 10 * $PostgreSQL::Test::Utils::timeout_default;
 	my $attempts     = 0;
 
 	while ($attempts < $max_attempts)
@@ -194,11 +194,16 @@ sub poll_start
 		# Wait 0.1 second before retrying.
 		usleep(100_000);
 
+		# Clean up in case the start attempt just timed out or some such.
+		$node->stop('fast', fail_ok => 1);
+
 		$attempts++;
 	}
 
-	# No success within 180 seconds.  Try one last time without fail_ok, which
-	# will BAIL_OUT unless it succeeds.
+	# Try one last time without fail_ok, which will BAIL_OUT unless it
+	# succeeds.
 	$node->start && return 1;
 	return 0;
 }
+
+done_testing();

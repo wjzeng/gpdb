@@ -17,27 +17,32 @@ mount_cgroups() {
     local basedir=$CGROUP_BASEDIR
     local options=rw,nosuid,nodev,noexec,relatime
     local groups="cpuset blkio cpuacct cpu memory"
+    local rhel8_groups="cpuset blkio cpu,cpuacct memory"
 
     if [ "$CGROUP_AUTO_MOUNTED" ]; then
         # nothing to do as cgroup is already automatically mounted
         return
     fi
 
-    ssh -t $gpdb_host_alias sudo bash -ex <<EOF
+    if [ "$TEST_OS" = rhel8 ]; then
+      ssh $gpdb_host_alias sudo -n bash -ex <<EOF
         mkdir -p $basedir
         mount -t tmpfs tmpfs $basedir
-        for group in $groups; do
+        for group in $rhel8_groups; do
                 mkdir -p $basedir/\$group
                 mount -t cgroup -o $options,\$group cgroup $basedir/\$group
         done
+        ln -s $basedir/cpu,cpuacct $basedir/cpu
+        ln -s $basedir/cpu,cpuacct $basedir/cpuacct
 EOF
+    fi
 }
 
 make_cgroups_dir() {
     local gpdb_host_alias=$1
     local basedir=$CGROUP_BASEDIR
 
-    ssh -t $gpdb_host_alias sudo bash -ex <<EOF
+    ssh $gpdb_host_alias sudo -n bash -ex <<EOF
         for comp in cpuset cpu cpuacct memory; do
             chmod -R 777 $basedir/\$comp
             mkdir -p $basedir/\$comp/gpdb
@@ -53,16 +58,16 @@ run_resgroup_test() {
     ssh $gpdb_master_alias bash -ex <<EOF
         source /usr/local/greenplum-db-devel/greenplum_path.sh
         export PGPORT=5432
-        export COORDINATOR_DATA_DIRECTORY=/data/gpdata/master/gpseg-1
+        export COORDINATOR_DATA_DIRECTORY=/data/gpdata/coordinator/gpseg-1
         export LDFLAGS="-L\${GPHOME}/lib"
         export CPPFLAGS="-I\${GPHOME}/include"
 
         cd /home/gpadmin/gpdb_src
-        PYTHON=python3 ./configure --prefix=/usr/local/greenplum-db-devel \
+        PYTHON=python3.11 ./configure --prefix=/usr/local/greenplum-db-devel \
             --without-zlib --without-rt --without-libcurl \
-            --without-libedit-preferred --without-docdir --without-readline \
+            --without-libedit-preferred --without-readline \
             --disable-gpcloud --disable-gpfdist --disable-orca \
-            --disable-pxf --without-python PKG_CONFIG_PATH="\${GPHOME}/lib/pkgconfig" ${CONFIGURE_FLAGS}
+            --without-python PKG_CONFIG_PATH="\${GPHOME}/lib/pkgconfig" ${CONFIGURE_FLAGS}
 
         make -C /home/gpadmin/gpdb_src/src/test/regress
         ssh sdw1 mkdir -p /home/gpadmin/gpdb_src/src/test/regress </dev/null
@@ -70,7 +75,7 @@ run_resgroup_test() {
         scp /home/gpadmin/gpdb_src/src/test/regress/regress.so \
             gpadmin@sdw1:/home/gpadmin/gpdb_src/src/test/regress/
 
-        make installcheck-resgroup || (
+        make PGOPTIONS="-c optimizer=off" installcheck-resgroup || (
             errcode=\$?
             find src/test/isolation2 -name regression.diffs \
             | while read diff; do
@@ -92,7 +97,7 @@ keep_minimal_cgroup_dirs() {
     local gpdb_master_alias=$1
     local basedir=$CGROUP_BASEDIR
 
-    ssh -t $gpdb_master_alias sudo bash -ex <<EOF
+    ssh $gpdb_master_alias sudo -n bash -ex <<EOF
         rmdir $basedir/memory/gpdb/*/ || :
         rmdir $basedir/memory/gpdb
         rmdir $basedir/cpuset/gpdb/*/ || :
@@ -125,7 +130,7 @@ run_binary_swap_test() {
     ssh $gpdb_master_alias bash -ex <<EOF
         source /usr/local/greenplum-db-devel/greenplum_path.sh
         export PGPORT=5432
-        export COORDINATOR_DATA_DIRECTORY=/data/gpdata/master/gpseg-1
+        export COORDINATOR_DATA_DIRECTORY=/data/gpdata/coordinator/gpseg-1
         export BINARY_SWAP_VARIANT=_resgroup
 
         cd /home/gpadmin
@@ -137,7 +142,7 @@ mount_cgroups ccp-${CLUSTER_NAME}-0
 mount_cgroups ccp-${CLUSTER_NAME}-1
 make_cgroups_dir ccp-${CLUSTER_NAME}-0
 make_cgroups_dir ccp-${CLUSTER_NAME}-1
-run_resgroup_test mdw
+run_resgroup_test cdw
 
 #
 # below is for binary swap test
@@ -150,4 +155,4 @@ keep_minimal_cgroup_dirs ccp-${CLUSTER_NAME}-1
 # deploy the binaries for binary swap test
 setup_binary_swap_test sdw1
 # run it
-run_binary_swap_test mdw
+run_binary_swap_test cdw

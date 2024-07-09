@@ -22,7 +22,9 @@
 #include "access/xact.h"
 #include "access/xlog.h"
 #include "catalog/catalog.h"
+#include "catalog/gp_partition_template.h"
 #include "catalog/namespace.h"
+#include "catalog/partition.h"
 #include "catalog/pg_inherits.h"
 #include "catalog/toasting.h"
 #include "commands/alter.h"
@@ -77,13 +79,26 @@
 #include "access/table.h"
 #include "catalog/oid_dispatch.h"
 #include "cdb/cdbdisp_query.h"
+#include "cdb/cdbendpoint.h"
 #include "cdb/cdbvars.h"
-
+#include "access/relation.h"
+#include "partitioning/partdesc.h"
 
 /* Hook for plugins to get control in ProcessUtility() */
 ProcessUtility_hook_type ProcessUtility_hook = NULL;
 
-/* local function declarations */
+/*
+ * Greenplumn specific code:
+ *   for detailed comments, please refer to the comments at the
+ *   definition of executor_run_nesting_level in execMain.c.
+ *   Greenplum now support create procedure, so auto_stats also
+ *   need to take inside a procedure as inside function call.
+ *   process_utility_nesting_level >= 2 implies in function call
+ *   when calling from procedure.
+ */
+static int process_utility_nesting_level = 0;
+
+/* Local function declarations */
 static void ProcessUtilitySlow(ParseState *pstate,
 							   PlannedStmt *pstmt,
 							   const char *queryString,
@@ -369,18 +384,33 @@ ProcessUtility(PlannedStmt *pstmt,
 	Assert(queryString != NULL);	/* required as of 8.4 */
 
 	/*
-	 * We provide a function hook variable that lets loadable plugins get
-	 * control when ProcessUtility is called.  Such a plugin would normally
-	 * call standard_ProcessUtility().
+	 * Greenplum specific code:
+	 *   Please refer to the comments at the definition of process_utility_nesting_level.
 	 */
-	if (ProcessUtility_hook)
-		(*ProcessUtility_hook) (pstmt, queryString,
-								context, params, queryEnv,
-								dest, completionTag);
-	else
-		standard_ProcessUtility(pstmt, queryString,
-								context, params, queryEnv,
-								dest, completionTag);
+	process_utility_nesting_level++;
+	PG_TRY();
+	{
+		/*
+		 * We provide a function hook variable that lets loadable plugins get
+		 * control when ProcessUtility is called.  Such a plugin would normally
+		 * call standard_ProcessUtility().
+		 */
+		if (ProcessUtility_hook)
+			(*ProcessUtility_hook) (pstmt, queryString,
+									context, params, queryEnv,
+									dest, completionTag);
+		else
+			standard_ProcessUtility(pstmt, queryString,
+									context, params, queryEnv,
+									dest, completionTag);
+		process_utility_nesting_level--;
+	}
+	PG_CATCH();
+	{
+		process_utility_nesting_level--;
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 }
 
 /*
@@ -577,7 +607,7 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 			if (Gp_role != GP_ROLE_EXECUTE)
 			{
 				/*
-				 * Don't allow master to call this in a transaction block. Segments
+				 * Don't allow coordinator to call this in a transaction block. Segments
 				 * are ok as distributed transaction participants.
 				 */
 				PreventInTransactionBlock(isTopLevel, "CREATE TABLESPACE");
@@ -590,7 +620,7 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 			if (Gp_role != GP_ROLE_EXECUTE)
 			{
 				/*
-				 * Don't allow master to call this in a transaction block.  Segments are ok as
+				 * Don't allow coordinator to call this in a transaction block.  Segments are ok as
 				 * distributed transaction participants.
 				 */
 				PreventInTransactionBlock(isTopLevel, "DROP TABLESPACE");
@@ -647,7 +677,7 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 			if (Gp_role != GP_ROLE_EXECUTE)
 			{
 				/*
-				 * Don't allow master to call this in a transaction block. Segments
+				 * Don't allow coordinator to call this in a transaction block. Segments
 				 * are ok as distributed transaction participants.
 				 */
 				PreventInTransactionBlock(isTopLevel, "CREATE DATABASE");
@@ -673,7 +703,7 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 				if (Gp_role != GP_ROLE_EXECUTE)
 				{
 					/*
-					 * Don't allow master to call this in a transaction block.  Segments are ok as
+					 * Don't allow coordinator to call this in a transaction block.  Segments are ok as
 					 * distributed transaction participants. 
 					 */
 					PreventInTransactionBlock(isTopLevel, "DROP DATABASE");
@@ -770,7 +800,7 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 				PreventCommandDuringRecovery(stmt->is_vacuumcmd ?
 											 "VACUUM" : "ANALYZE");
 				/* forbidden in parallel mode due to CommandIsReadOnly */
-				ExecVacuum(pstate, stmt, isTopLevel);
+				ExecVacuum(pstate, stmt, isTopLevel, false);
 			}
 			break;
 
@@ -945,10 +975,10 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 				switch (stmt->kind)
 				{
 					case REINDEX_OBJECT_INDEX:
-						ReindexIndex(stmt);
+						ReindexIndex(stmt, isTopLevel);
 						break;
 					case REINDEX_OBJECT_TABLE:
-						ReindexTable(stmt);
+						ReindexTable(stmt, isTopLevel);
 						break;
 					case REINDEX_OBJECT_SCHEMA:
 					case REINDEX_OBJECT_SYSTEM:
@@ -1058,6 +1088,10 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 			}
 			break;
 
+		case T_RetrieveStmt:
+			ExecRetrieveStmt((RetrieveStmt *) parsetree, dest);
+			break;
+
 		case T_CommentStmt:
 			{
 				CommentStmt *stmt = (CommentStmt *) parsetree;
@@ -1125,6 +1159,8 @@ ProcessUtilitySlow(ParseState *pstate,
 	ObjectAddress address;
 	ObjectAddress secondaryObject = InvalidObjectAddress;
 
+	List 		*deferredValidationParts = NIL;
+
 	/* All event trigger calls are done only when isCompleteQuery is true */
 	needCleanup = isCompleteQuery && EventTriggerBeginCompleteQuery();
 
@@ -1156,8 +1192,8 @@ ProcessUtilitySlow(ParseState *pstate,
 			case T_CreateForeignTableStmt:
 				{
 					List	   *stmts;
-					ListCell   *l;
 					List	   *more_stmts = NIL;
+					RangeVar   *table_rv = NULL;
 
 					/* Run parse analysis ... */
 					/*
@@ -1174,11 +1210,17 @@ ProcessUtilitySlow(ParseState *pstate,
 						stmts = transformCreateStmt((CreateStmt *) parsetree,
 													queryString);
 
-					/* ... and do it */
 			process_more_stmts:
-					foreach(l, stmts)
+					/*
+					 * ... and do it.  We can't use foreach() because we may
+					 * modify the list midway through, so pick off the
+					 * elements one at a time, the hard way.
+					 */
+					while (stmts != NIL)
 					{
-						Node	   *stmt = (Node *) lfirst(l);
+						Node	   *stmt = (Node *) linitial(stmts);
+
+						stmts = list_delete_first(stmts);
 
 						if (IsA(stmt, CreateStmt))
 						{
@@ -1186,8 +1228,6 @@ ProcessUtilitySlow(ParseState *pstate,
 							char		relKind = RELKIND_RELATION;
 							Datum		toast_options;
 							static char *validnsps[] = HEAP_RELOPT_NAMESPACES;
-							List *options = NIL;
-							char *accessmethod = NULL;
 
 							/*
 							 * If this T_CreateStmt was dispatched and we're a QE
@@ -1203,46 +1243,52 @@ ProcessUtilitySlow(ParseState *pstate,
 								cstmt->relKind = relKind;
 
 							/*
-							 * Upstream postgres does not support user specified
-							 * RelOptions and TableAM for a parent partitioned
-							 * table. The legacy Greenplum behavior is to have
-							 * the RelOptions and TableAM specified for the
-							 * parent table to be inherited by the child
-							 * partitions. Hence we need to remove these from
-							 * the parent table's CreateStmt and store them to
-							 * pass down to create the child partition's
-							 * CreateStmt. This is only done when creating
-							 * partitions with Greenplum legacy syntax.
-							 */
-							if (cstmt->partspec && cstmt->partspec->gpPartDef)
-							{
-								options = cstmt->options;
-								cstmt->options = NIL;
-								accessmethod = cstmt->accessMethod;
-								cstmt->accessMethod = NULL;
-							}
-
-							/*
 							 * GPDB: Don't dispatch it yet, as we haven't
 							 * created the toast and other auxiliary tables
 							 * yet.
 							 */
+
+							/* Remember transformed RangeVar for LIKE */
+							table_rv = cstmt->relation;
+
 							/* Create the table itself */
-							address = DefineRelation((CreateStmt *) stmt,
+							address = DefineRelation(cstmt,
 													 relKind,
 													 ((CreateStmt *) stmt)->ownerid, NULL,
-													 queryString, false, true, NULL);
+													 queryString, false, true,
+													 cstmt->intoPolicy);
 
 							if (cstmt->partspec && cstmt->partspec->gpPartDef)
 							{
 								List *parts;
+								GpPartitionDefinition *gpPartDef = cstmt->partspec->gpPartDef;
+								Oid parentrelid = address.objectId;
+								List *ancestors = get_partition_ancestors(parentrelid);
 
-								parts = generatePartitions(address.objectId,
-														   cstmt->partspec->gpPartDef,
+								if (!gpPartDef->fromCatalog)
+								{
+									gpPartDef = transformGpPartitionDefinition(parentrelid, queryString, gpPartDef);
+									if (gpPartDef->isTemplate)
+										StoreGpPartitionTemplate(ancestors ? llast_oid(ancestors) : parentrelid,
+																 list_length(ancestors), gpPartDef);
+								}
+
+								/*
+								 * Add to list of partitions for deferred
+								 * partition constraint validation, for
+								 * performance. See RelationValidatePartitionDesc()
+								 * for details on why we do this.
+								 */
+								if (pg_strcasecmp(cstmt->partspec->strategy, "range") == 0)
+									deferredValidationParts = lappend_oid(deferredValidationParts, parentrelid);
+
+								parts = generatePartitions(parentrelid,
+														   gpPartDef,
 														   cstmt->partspec->subPartSpec,
-														   queryString, options,
-														   accessmethod,
-														   cstmt->attr_encodings, false);
+														   queryString, cstmt->options,
+														   cstmt->accessMethod,
+														   cstmt->attr_encodings,
+														   ORIGIN_GP_CLASSIC_CREATE_GEN);
 								more_stmts = list_concat(more_stmts, parts);
 							}
 
@@ -1263,7 +1309,7 @@ ProcessUtilitySlow(ParseState *pstate,
 								 * table
 								 */
 								toast_options = transformRelOptions((Datum) 0,
-																	((CreateStmt *) stmt)->options,
+																	cstmt->options,
 																	"toast",
 																	validnsps,
 																	true,
@@ -1275,30 +1321,73 @@ ProcessUtilitySlow(ParseState *pstate,
 								NewRelationCreateToastTable(address.objectId,
 															toast_options);
 							}
+
 							if (Gp_role == GP_ROLE_DISPATCH)
+							{
 								CdbDispatchUtilityStatement((Node *) stmt,
 															DF_CANCEL_ON_ERROR |
 															DF_NEED_TWO_PHASE |
 															DF_WITH_SNAPSHOT,
 															GetAssignedOidsForDispatch(),
 															NULL);
+							}
+							else
+							{
+								/*
+								 * Greenplum specific behavior
+								 * If intoQuery field is set, it means this is Create Matview.
+								 * To keep catalog consistent, QEs should also store the viewquery.
+								 * The call chain is:
+								 *   create_ctas_nodata()(QD) --> create_ctas_internal()(QD) -->
+								 *   dispatch create stmt(QD) --> ProcessUtilitySlow(on QE) --> StoreViewQuery()(QE).
+								 */
+								if (cstmt->intoQuery)
+								{
+									/* StoreViewQuery scribbles on tree, so make a copy */
+									Query	   *query = (Query *) copyObject(cstmt->intoQuery);
+
+									StoreViewQuery(address.objectId, query, false);
+									CommandCounterIncrement();
+								}
+							}
 						}
 						else if (IsA(stmt, CreateForeignTableStmt))
 						{
+							CreateForeignTableStmt *cstmt = (CreateForeignTableStmt *) stmt;
+
+							/* Remember transformed RangeVar for LIKE */
+							table_rv = cstmt->base.relation;
+
 							/* Create the table itself */
-							address = DefineRelation((CreateStmt *) stmt,
+							address = DefineRelation(&cstmt->base,
 													 RELKIND_FOREIGN_TABLE,
 													 InvalidOid, NULL,
 													 queryString,
 													 true,
 													 true,
 													 NULL);
-							CreateForeignTable((CreateForeignTableStmt *) stmt,
+							CreateForeignTable(cstmt,
 											   address.objectId,
 											   false /* skip_permission_checks */);
 							EventTriggerCollectSimpleCommand(address,
 															 secondaryObject,
 															 stmt);
+						}
+						else if (IsA(stmt, TableLikeClause))
+						{
+							/*
+							 * Do delayed processing of LIKE options.  This
+							 * will result in additional sub-statements for us
+							 * to process.  Those should get done before any
+							 * remaining actions, so prepend them to "stmts".
+							 */
+							TableLikeClause *like = (TableLikeClause *) stmt;
+							List	   *morestmts;
+
+							Assert(table_rv != NULL);
+
+							morestmts = expandTableLikeClause(table_rv, like);
+							stmts = list_concat(morestmts, stmts);
 						}
 						else
 						{
@@ -1326,7 +1415,7 @@ ProcessUtilitySlow(ParseState *pstate,
 						}
 
 						/* Need CCI between commands */
-						if (lnext(l) != NULL)
+						if (stmts != NIL)
 							CommandCounterIncrement();
 					}
 					if (more_stmts)
@@ -1698,6 +1787,41 @@ ProcessUtilitySlow(ParseState *pstate,
 						list_free(inheritors);
 					}
 
+					/*
+					 * Greenplum specifi behavior:
+					 * Postgres will pass false for is_alter_table for DefineIndex.
+					 * This argument is only used at two places in DefineIndex (in original postgres code):
+					 *   1. the function index_check_primary_key
+					 *   2. print a debug log on what the statement is
+					 *
+					 * In fact when calling DefineIndex here, we can always pass
+					 * false for is_alter_table when it actually comes from expandTableLikeClause:
+					 *   for 1, we are sure relationHasPrimaryKey check will pass because we are
+					 *   building a new relation with index here.
+					 *   for 2, I do not think it will mislead the user if we print it as CreateStmt.
+					 *
+					 * But for Greenplum, is_alter_table matters a lot and has to be set false here:
+					 * DefineIndex need to dispatch, and if it is_alter_table is true, Greenplum will
+					 * take this as a sub command of AlterTable stmt, thus it will not dispatch and
+					 * lead to errors. Thus, we comment off the following code and pass false for
+					 * is_alter_table for DefineIndex here.
+					 *
+					 * See following discussion for details:
+					 * https://www.postgresql.org/message-id/CANerzActdrdFO1r4RSqK0M2d0Xtwu5t5bH%3DZOoLsAQ%3DHhZrB%3Dg%40mail.gmail.com
+					 */
+#if 0
+					/*
+					 * If the IndexStmt is already transformed, it must have
+					 * come from generateClonedIndexStmt, which in current
+					 * usage means it came from expandTableLikeClause rather
+					 * than from original parse analysis.  And that means we
+					 * must treat it like ALTER TABLE ADD INDEX, not CREATE.
+					 * (This is a bit grotty, but currently it doesn't seem
+					 * worth adding a separate bool field for the purpose.)
+					 */
+					is_alter_table = stmt->transformed;
+#endif
+
 					/* Run parse analysis ... */
 					stmt = transformIndexStmt(relid, stmt, queryString);
 
@@ -1709,7 +1833,7 @@ ProcessUtilitySlow(ParseState *pstate,
 									InvalidOid, /* no predefined OID */
 									InvalidOid, /* no parent index */
 									InvalidOid, /* no parent constraint */
-									false,	/* is_alter_table */
+									false,  /* CDB: see comments above on is_alter_table */
 									true,	/* check_rights */
 									true,	/* check_not_in_use */
 									false,	/* skip_build */
@@ -1898,6 +2022,12 @@ ProcessUtilitySlow(ParseState *pstate,
 
 			case T_CreateOpFamilyStmt:
 				address = DefineOpFamily((CreateOpFamilyStmt *) parsetree);
+
+				/*
+				 * DefineOpFamily calls EventTriggerCollectSimpleCommand
+				 * directly.
+				 */
+				commandCollected = true;
 				break;
 
 			case T_CreateTransformStmt:
@@ -2044,6 +2174,20 @@ ProcessUtilitySlow(ParseState *pstate,
 				elog(ERROR, "unrecognized node type: %d",
 					 (int) nodeTag(parsetree));
 				break;
+		}
+
+		{
+			/*
+			 * Perform deferred partition constraint validation.
+			 */
+			ListCell *lc;
+			foreach(lc, deferredValidationParts)
+			{
+				Relation rel = relation_open(lfirst_oid(lc), AccessShareLock);
+				RelationValidatePartitionDesc(rel);
+				relation_close(rel, AccessShareLock);
+			}
+			list_free(deferredValidationParts);
 		}
 
 		/*
@@ -2193,6 +2337,9 @@ UtilityReturnsTuples(Node *parsetree)
 		case T_VariableShowStmt:
 			return true;
 
+		case T_RetrieveStmt:
+			return true;
+
 		default:
 			return false;
 	}
@@ -2246,6 +2393,13 @@ UtilityTupleDescriptor(Node *parsetree)
 				VariableShowStmt *n = (VariableShowStmt *) parsetree;
 
 				return GetPGVariableResultDesc(n->name);
+			}
+
+		case T_RetrieveStmt:
+			{
+				RetrieveStmt *n = (RetrieveStmt *) parsetree;
+
+				return CreateTupleDescCopy(GetRetrieveStmtTupleDesc(n));
 			}
 
 		default:
@@ -2570,7 +2724,14 @@ CreateCommandTag(Node *parsetree)
 			break;
 
 		case T_DeclareCursorStmt:
-			tag = "DECLARE CURSOR";
+			{
+				DeclareCursorStmt *stmt = (DeclareCursorStmt *) parsetree;
+
+				if (stmt->options & CURSOR_OPT_PARALLEL_RETRIEVE)
+					tag = "DECLARE PARALLEL RETRIEVE CURSOR";
+				else
+					tag = "DECLARE CURSOR";
+			}
 			break;
 
 		case T_ClosePortalStmt:
@@ -3370,6 +3531,10 @@ CreateCommandTag(Node *parsetree)
 			tag = "ALTER TYPE";
 			break;
 
+		case T_RetrieveStmt:
+			tag = "RETRIEVE";
+			break;
+
 		default:
 			elog(WARNING, "unrecognized node type: %d",
 				 (int) nodeTag(parsetree));
@@ -3897,6 +4062,15 @@ GetCommandLogLevel(Node *parsetree)
 			}
 			break;
 
+		case T_CreateResourceGroupStmt:
+		case T_AlterResourceGroupStmt:
+		case T_DropResourceGroupStmt:
+		case T_CreateQueueStmt:
+		case T_AlterQueueStmt:
+		case T_DropQueueStmt:
+			lev = LOGSTMT_DDL;
+			break;
+
 		default:
 			elog(WARNING, "unrecognized node type: %d",
 				 (int) nodeTag(parsetree));
@@ -3905,4 +4079,10 @@ GetCommandLogLevel(Node *parsetree)
 	}
 
 	return lev;
+}
+
+bool
+utility_nested(void)
+{
+	return process_utility_nesting_level >= 2;
 }

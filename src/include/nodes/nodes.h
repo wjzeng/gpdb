@@ -69,11 +69,16 @@ typedef enum NodeTag
 	T_BitmapAnd,
 	T_BitmapOr,
 	T_SeqScan,
+	T_DynamicSeqScan,
 	T_SampleScan,
 	T_IndexScan,
+	T_DynamicIndexScan,
+	T_DynamicIndexOnlyScan,
 	T_IndexOnlyScan,
 	T_BitmapIndexScan,
+	T_DynamicBitmapIndexScan,
 	T_BitmapHeapScan,
+	T_DynamicBitmapHeapScan,
 	T_TidScan,
 	T_SubqueryScan,
 	T_FunctionScan,
@@ -84,6 +89,7 @@ typedef enum NodeTag
 	T_NamedTuplestoreScan,
 	T_WorkTableScan,
 	T_ForeignScan,
+	T_DynamicForeignScan,
 	T_CustomScan,
 	T_NestLoop,
 	T_MergeJoin,
@@ -137,11 +143,16 @@ typedef enum NodeTag
 	T_BitmapAndState,
 	T_BitmapOrState,
 	T_SeqScanState,
+	T_DynamicSeqScanState,
 	T_SampleScanState,
 	T_IndexScanState,
+	T_DynamicIndexScanState,
+	T_DynamicIndexOnlyScanState,
 	T_IndexOnlyScanState,
 	T_BitmapIndexScanState,
+	T_DynamicBitmapIndexScanState,
 	T_BitmapHeapScanState,
+	T_DynamicBitmapHeapScanState,
 	T_TidScanState,
 	T_SubqueryScanState,
 	T_FunctionScanState,
@@ -152,6 +163,7 @@ typedef enum NodeTag
 	T_NamedTuplestoreScanState,
 	T_WorkTableScanState,
 	T_ForeignScanState,
+	T_DynamicForeignScanState,
 	T_CustomScanState,
 	T_NestLoopState,
 	T_MergeJoinState,
@@ -261,7 +273,6 @@ typedef enum NodeTag
 	T_WindowFuncExprState,
 	T_SetExprState,
 	T_SubPlanState,
-	T_AlternativeSubPlanState,
 	T_DomainConstraintState,
 	T_AggExprIdState,
 	T_RowIdExprState,
@@ -627,6 +638,7 @@ typedef enum NodeTag
     /* CDB: tags for random other stuff */
     T_CdbExplain_StatHdr = 1000,             /* in cdb/cdbexplain.c */
 	T_GpPolicy,					/* in catalog/gp_distribution_policy.h */
+	T_RetrieveStmt,
 
 } NodeTag;
 
@@ -724,7 +736,7 @@ extern void outNode(struct StringInfoData *str, const void *obj);
 extern void outToken(struct StringInfoData *str, const char *s);
 extern void outBitmapset(struct StringInfoData *str,
 						 const struct Bitmapset *bms);
-extern void outDatum(struct StringInfoData *str, int64 value,
+extern void outDatum(struct StringInfoData *str, uintptr_t value,
 					 int typlen, bool typbyval);
 extern char *nodeToString(const void *obj);
 extern char *bmsToString(const struct Bitmapset *bms);
@@ -747,7 +759,7 @@ extern void *stringToNode(const char *str);
 extern void *stringToNodeWithLocations(const char *str);
 #endif
 extern struct Bitmapset *readBitmapset(void);
-extern int64 readDatum(bool typbyval);
+extern uintptr_t readDatum(bool typbyval);
 extern bool *readBoolCols(int numCols);
 extern int *readIntCols(int numCols);
 extern Oid *readOidCols(int numCols);
@@ -913,6 +925,7 @@ typedef enum AggStrategy
 #define AGGSPLITOP_DESERIALIZE	0x08	/* apply deserializefn to input */
 
 #define AGGSPLITOP_DEDUPLICATED	0x100
+#define AGGSPLITOP_DQAWITHAGG	0x200
 
 /* Supported operating modes (i.e., useful combinations of these options): */
 typedef enum AggSplit
@@ -930,6 +943,15 @@ typedef enum AggSplit
 	 * stripped away from Aggs in setrefs.c.
 	 */
 	AGGSPLIT_DEDUPLICATED = AGGSPLITOP_DEDUPLICATED,
+
+	/*
+	 * Dummy agg-split type for intermediate agg targetlist(combine + simple)
+	 * Only exist on top/final agg node of intermediate aggregation in planner
+	 * It is never set on Aggrefs.
+	 */
+	AGGSPLIT_DQAWITHAGG = AGGSPLITOP_DQAWITHAGG,
+
+    AGGSPLIT_INTERMEDIATE = AGGSPLITOP_SKIPFINAL | AGGSPLITOP_SERIALIZE | AGGSPLITOP_COMBINE | AGGSPLITOP_DESERIALIZE,
 } AggSplit;
 
 /* Test whether an AggSplit value selects each primitive option: */
@@ -939,6 +961,7 @@ typedef enum AggSplit
 #define DO_AGGSPLIT_DESERIALIZE(as) (((as) & AGGSPLITOP_DESERIALIZE) != 0)
 
 #define DO_AGGSPLIT_DEDUPLICATED(as) (((as) & AGGSPLITOP_DEDUPLICATED) != 0)
+#define DO_AGGSPLIT_DQAWITHAGG(as)  (((as) & AGGSPLITOP_DQAWITHAGG) != 0)
 
 /*
  * SetOpCmd and SetOpStrategy -

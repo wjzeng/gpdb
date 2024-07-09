@@ -63,8 +63,6 @@ const CHAR *rgszFileNames[] = {
 
 	"../data/dxl/minidump/HAWQ-TPCH-Stat-Derivation.mdp",
 	"../data/dxl/minidump/HJN-Redistribute-One-Side.mdp",
-	// GPDB_12_MERGE_FIXME Needs review: assertion failure
-	// "../data/dxl/minidump/TPCH-Q5.mdp",
 	"../data/dxl/minidump/TPCDS-39-InnerJoin-JoinEstimate.mdp",
 	"../data/dxl/minidump/TPCH-Partitioned-256GB.mdp",
 	// TODO:  - Jul 31st 2018; disabling it since new cost model picks up Indexed nested Loop Joi
@@ -76,6 +74,7 @@ const CHAR *rgszFileNames[] = {
 	// "../data/dxl/minidump/retail_28.mdp",
 	"../data/dxl/minidump/JoinNDVRemain.mdp",
 	"../data/dxl/minidump/Least-Greatest.mdp",
+	"../data/dxl/minidump/Least-Greatest-Subselect.mdp",
 };
 
 struct UnSupportedTestCase
@@ -162,8 +161,6 @@ GPOS_RESULT
 CICGTest::EresUnittest_RunTestsWithoutAdditionalTraceFlags()
 {
 	const CHAR *rgszFileNames[] = {
-		// GPDB_12_MERGE_FIXME: Needs review: Join order change
-		// "../data/dxl/minidump/Union-On-HJNs.mdp",
 		"../data/dxl/minidump/Tpcds-NonPart-Q70a.mdp"};
 	return CTestUtils::EresUnittest_RunTestsWithoutAdditionalTraceFlags(
 		rgszFileNames, &m_ulTestCounterNoAdditionTraceFlag,
@@ -289,8 +286,7 @@ CICGTest::EresUnittest_NegativeIndexApplyTests()
 		true);
 	CAutoTraceFlag atfTS(EopttraceDisableXformBase + CXform::ExfGet2TableScan,
 						 true);
-	CAutoTraceFlag atfNLJ(
-		EopttraceDisableXformBase + CXform::ExfInnerJoin2NLJoin, true);
+	CAutoTraceFlag atfNLJ(EopttraceDisableInnerNLJ, true);
 
 	CAutoMemoryPool amp(CAutoMemoryPool::ElcNone);
 	CMemoryPool *mp = amp.Pmp();
@@ -307,7 +303,7 @@ CICGTest::EresUnittest_NegativeIndexApplyTests()
 				CEnumeratorConfig::GetEnumeratorCfg(mp, 0 /*plan_id*/),
 				CStatisticsConfig::PstatsconfDefault(mp),
 				CCTEConfig::PcteconfDefault(mp), pcm, CHint::PhintDefault(mp),
-				CWindowOids::GetWindowOids(mp));
+				nullptr /* pplanhint */, CWindowOids::GetWindowOids(mp));
 			CDXLNode *pdxlnPlan = CMinidumperUtils::PdxlnExecuteMinidump(
 				mp, rgszNegativeIndexApplyFileNames[ul],
 				GPOPT_TEST_SEGMENTS /*ulSegments*/, 1 /*ulSessionId*/,

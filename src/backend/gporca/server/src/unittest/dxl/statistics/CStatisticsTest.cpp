@@ -58,6 +58,8 @@ CStatisticsTest::EresUnittest()
 	CUnittest rgutSharedOptCtxt[] = {
 		GPOS_UNITTEST_FUNC(CStatisticsTest::EresUnittest_CStatisticsBasic),
 		GPOS_UNITTEST_FUNC(CStatisticsTest::EresUnittest_UnionAll),
+		GPOS_UNITTEST_FUNC(CStatisticsTest::EresUnittest_CStatisticsCopy),
+
 		// TODO,  Mar 18 2013 temporarily disabling the test
 		// GPOS_UNITTEST_FUNC(CStatisticsTest::EresUnittest_CStatisticsSelectDerivation),
 	};
@@ -131,8 +133,8 @@ CStatisticsTest::EresUnittest_UnionAll()
 				mp, md_accessor, dxl_derived_rel_stats_array);
 		dxl_derived_rel_stats_array->Release();
 
-		GPOS_ASSERT(nullptr != pdrgpstatBefore);
-		GPOS_ASSERT(2 == pdrgpstatBefore->Size());
+		GPOS_UNITTEST_ASSERT(nullptr != pdrgpstatBefore);
+		GPOS_UNITTEST_ASSERT(2 == pdrgpstatBefore->Size());
 		CStatistics *pstats1 = (*pdrgpstatBefore)[0];
 		CStatistics *pstats2 = (*pdrgpstatBefore)[1];
 
@@ -147,7 +149,7 @@ CStatisticsTest::EresUnittest_UnionAll()
 				mp, pstats1, pstats2, pdrgpulColIdOutput, pdrgpulColIdInput1,
 				pdrgpulColIdInput2);
 
-		GPOS_ASSERT(nullptr != pstatsOutput);
+		GPOS_UNITTEST_ASSERT(nullptr != pstatsOutput);
 
 		CStatisticsArray *pdrgpstatOutput = GPOS_NEW(mp) CStatisticsArray(mp);
 		pdrgpstatOutput->Append(pstatsOutput);
@@ -311,11 +313,15 @@ CStatisticsTest::PtabdescTwoColumnSource(CMemoryPool *mp,
 										 const CWStringConst &strColB)
 {
 	CTableDescriptor *ptabdesc = GPOS_NEW(mp) CTableDescriptor(
-		mp, GPOS_NEW(mp) CMDIdGPDB(GPOPT_TEST_REL_OID1, 1, 1), nameTable,
+		mp, GPOS_NEW(mp) CMDIdGPDB(IMDId::EmdidRel, GPOPT_TEST_REL_OID1, 1, 1),
+		nameTable,
 		false,	// convert_hash_to_random
 		IMDRelation::EreldistrRandom, IMDRelation::ErelstorageHeap,
-		0,	// ulExecuteAsUser
-		-1	// lockmode
+		IMDRelation::GetCurrentAOVersion(),
+		0,	 // ulExecuteAsUser
+		-1,	 // lockmode
+		2,	 // aclmode SELECT
+		0	 // UNASSIGNED_QUERYID
 	);
 
 	for (ULONG i = 0; i < 2; i++)
@@ -394,8 +400,8 @@ CStatisticsTest::EresUnittest_CStatisticsBasic()
 	{
 		// create column references for grouping columns
 		(void) col_factory->PcrCreate(
-			pmdtypeint4, default_type_modifier, nullptr, 0 /* attno */,
-			false /*IsNullable*/, 1 /* id */, CName(&strColA),
+			pmdtypeint4, default_type_modifier, true /*mark_as_used*/, nullptr,
+			0 /* attno */, false /*IsNullable*/, 1 /* id */, CName(&strColA),
 			pexprGet->Pop()->UlOpId(), false /*IsDistCol*/
 		);
 	}
@@ -403,8 +409,8 @@ CStatisticsTest::EresUnittest_CStatisticsBasic()
 	if (nullptr == col_factory->LookupColRef(2 /*id*/))
 	{
 		(void) col_factory->PcrCreate(
-			pmdtypeint4, default_type_modifier, nullptr, 1 /* attno */,
-			false /*IsNullable*/, 2 /* id */, CName(&strColB),
+			pmdtypeint4, default_type_modifier, true /*mark_as_used*/, nullptr,
+			1 /* attno */, false /*IsNullable*/, 2 /* id */, CName(&strColB),
 			pexprGet->Pop()->UlOpId(), false /*IsDistCol*/
 		);
 	}
@@ -412,8 +418,8 @@ CStatisticsTest::EresUnittest_CStatisticsBasic()
 	if (nullptr == col_factory->LookupColRef(10 /*id*/))
 	{
 		(void) col_factory->PcrCreate(
-			pmdtypeint4, default_type_modifier, nullptr, 2 /* attno */,
-			false /*IsNullable*/, 10 /* id */, CName(&strColC),
+			pmdtypeint4, default_type_modifier, true /*mark_as_used*/, nullptr,
+			2 /* attno */, false /*IsNullable*/, 10 /* id */, CName(&strColC),
 			pexprGet->Pop()->UlOpId(), false /*IsDistCol*/
 		);
 	}
@@ -591,8 +597,8 @@ CStatisticsTest::Pdrgpstatspred2(CMemoryPool *mp)
 		GPOS_NEW(mp) CWStringDynamic(mp, GPOS_WSZ_LIT("HxEAAA=="));
 	CWStringDynamic *pstrUpperDate =
 		GPOS_NEW(mp) CWStringDynamic(mp, GPOS_WSZ_LIT("LREAAA=="));
-	LINT lLowerDate = LINT(4383);
-	LINT lUpperDate = LINT(4397);
+	LINT lLowerDate = LINT(INT64_C(378691200000000));
+	LINT lUpperDate = LINT(INT64_C(379900800000000));
 	StatsFilterGeneric(mp, 4, GPDB_DATE, pstrLowerDate, pstrUpperDate,
 					   lLowerDate, lUpperDate, pdrgpstatspred);
 
@@ -695,6 +701,59 @@ CStatisticsTest::EresUnittest_CStatisticsSelectDerivation()
 		mp, szQuerySelect, szPlanSelect,
 		true  // ignore mismatch in output dxl due to column id differences
 	);
+}
+
+// test that stats copy methods copy all fields
+GPOS_RESULT
+CStatisticsTest::EresUnittest_CStatisticsCopy()
+{
+	CAutoMemoryPool amp;
+	CMemoryPool *mp = amp.Pmp();
+
+	// create another statistics structure with a single int4 column with id 10
+	UlongToHistogramMap *phmulhist = GPOS_NEW(mp) UlongToHistogramMap(mp);
+	phmulhist->Insert(GPOS_NEW(mp) ULONG(10), PhistExampleInt4Dim(mp));
+
+	UlongToDoubleMap *phmuldoubleWidth = GPOS_NEW(mp) UlongToDoubleMap(mp);
+	phmuldoubleWidth->Insert(GPOS_NEW(mp) ULONG(10), GPOS_NEW(mp) CDouble(4.0));
+
+	CStatistics *pstats = GPOS_NEW(mp) CStatistics(
+		mp, phmulhist, phmuldoubleWidth, 100.0 /* rows */, false /* is_empty */,
+		ULONG(5) /* relpages */, ULONG(10) /* relallvisible */,
+		CDouble(100.0) /* rebinds */, ULONG(3) /* num predicates */, nullptr,
+		GPOS_NEW(mp) UlongToIntMap(mp));
+
+	IStatistics *stats_copy = pstats->CopyStats(mp);
+
+	UlongToColRefMap *colref_mapping = GPOS_NEW(mp) UlongToColRefMap(mp);
+	IStatistics *stats_copy_remap =
+		pstats->CopyStatsWithRemap(mp, colref_mapping, false);
+
+	GPOS_RESULT eres = GPOS_OK;
+	if (pstats->Width() != stats_copy->Width() ||
+		pstats->NumRebinds() != stats_copy->NumRebinds() ||
+		pstats->RelPages() != stats_copy->RelPages() ||
+		pstats->RelAllVisible() != stats_copy->RelAllVisible() ||
+		pstats->GetNumberOfPredicates() != stats_copy->GetNumberOfPredicates())
+	{
+		eres = GPOS_FAILED;
+	}
+
+	if (pstats->Width() != stats_copy_remap->Width() ||
+		pstats->NumRebinds() != stats_copy_remap->NumRebinds() ||
+		pstats->RelPages() != stats_copy_remap->RelPages() ||
+		pstats->RelAllVisible() != stats_copy_remap->RelAllVisible() ||
+		pstats->GetNumberOfPredicates() !=
+			stats_copy_remap->GetNumberOfPredicates())
+	{
+		eres = GPOS_FAILED;
+	}
+	stats_copy->Release();
+	stats_copy_remap->Release();
+	pstats->Release();
+	colref_mapping->Release();
+
+	return eres;
 }
 
 // EOF

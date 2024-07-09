@@ -11,15 +11,13 @@ import shutil
 import subprocess
 import difflib
 
-import pg
-
 from contextlib import closing
 from datetime import datetime
 from gppylib.commands.base import Command, ExecutionError, REMOTE
 from gppylib.commands.gp import chk_local_db_running, get_coordinatordatadir
 from gppylib.db import dbconn
 from gppylib.gparray import GpArray, MODE_SYNCHRONIZED
-
+from gppylib.utils import escape_string
 
 PARTITION_START_DATE = '2010-01-01'
 PARTITION_END_DATE = '2013-01-01'
@@ -131,8 +129,7 @@ def run_gpcommand(context, command, cmd_prefix=''):
 def run_gpcommand_async(context, command):
     cmd = Command(name='run %s' % command, cmdStr='$GPHOME/bin/%s' % (command))
     asyncproc = cmd.runNoWait()
-    if 'asyncproc' not in context:
-        context.asyncproc = asyncproc
+    context.asyncproc = asyncproc
 
 
 def check_stdout_msg(context, msg, escapeStr = False):
@@ -155,15 +152,27 @@ def check_string_not_present_stdout(context, msg):
         err_str = "Did not expect stdout string '%s' but found: '%s'" % (msg, context.stdout_message)
         raise Exception(err_str)
 
-
 def check_err_msg(context, err_msg):
     if not hasattr(context, 'exception'):
         raise Exception('An exception was not raised and it was expected')
     pat = re.compile(err_msg)
-    if not pat.search(context.error_message):
-        err_str = "Expected error string '%s' and found: '%s'" % (err_msg, context.error_message)
+    actual = context.error_message
+    if type(actual) is bytes:
+        actual = actual.decode()
+    if not pat.search(actual):
+        err_str = "Expected error string '%s' and found: '%s'" % (err_msg, actual)
         raise Exception(err_str)
 
+def check_string_not_present_err_msg(context, err_msg):
+    if not hasattr(context, 'exception'):
+        raise Exception('An exception was not raised and it was expected')
+    pat = re.compile(err_msg)
+    actual = context.error_message
+    if type(actual) is bytes:
+        actual = actual.decode()
+    if pat.search(actual):
+        err_str = "Did not expect error string '%s' but found: '%s'" % (err_msg, actual)
+        raise Exception(err_str)
 
 def check_return_code(context, ret_code):
     if context.ret_code != int(ret_code):
@@ -233,8 +242,8 @@ def run_gprecoverseg():
     run_cmd('gprecoverseg -a -v')
 
 
-def getRows(dbname, exec_sql):
-    with closing(dbconn.connect(dbconn.DbURL(dbname=dbname), unsetSearchPath=False)) as conn:
+def getRows(dbname, exec_sql, utility=False):
+    with closing(dbconn.connect(dbconn.DbURL(dbname=dbname), utility=utility, unsetSearchPath=False)) as conn:
         curs = dbconn.query(conn, exec_sql)
         results = curs.fetchall()
     return results
@@ -247,17 +256,12 @@ def getRow(dbname, exec_sql):
 
 
 def check_db_exists(dbname, host=None, port=0, user=None):
-    LIST_DATABASE_SQL = 'SELECT datname FROM pg_database'
-
-    results = []
     with closing(dbconn.connect(dbconn.DbURL(hostname=host, username=user, port=port, dbname='template1'), unsetSearchPath=False)) as conn:
-        curs = dbconn.query(conn, LIST_DATABASE_SQL)
-        results = curs.fetchall()
-    for result in results:
-        if result[0] == dbname:
-            return True
+        count = dbconn.querySingleton(conn, "SELECT count(*) FROM pg_database WHERE datname=\'{}\';".format(dbname))
+        if count == 0:
+            return False
 
-    return False
+    return True
 
 
 def create_database_if_not_exists(context, dbname, host=None, port=0, user=None):
@@ -294,7 +298,7 @@ def create_database(context, dbname=None, host=None, port=0, user=None):
 
 def get_segment_hostnames(context, dbname):
     sql = "SELECT DISTINCT(hostname) FROM gp_segment_configuration WHERE content != -1;"
-    return getRows(dbname, sql)
+    return getRows(dbname, sql, utility=True)
 
 
 def check_table_exists(context, dbname, table_name, table_type=None, host=None, port=0, user=None):
@@ -306,14 +310,14 @@ def check_table_exists(context, dbname, table_name, table_type=None, host=None, 
                 FROM pg_class c, pg_namespace n
                 WHERE c.relname = '%s' AND n.nspname = '%s' AND c.relnamespace = n.oid;
                 """
-            SQL = SQL_format % (escape_string(tablename, conn=conn), escape_string(schemaname, conn=conn))
+            SQL = SQL_format % (escape_string(tablename), escape_string(schemaname))
         else:
             SQL_format = """
                 SELECT oid, relkind, relam, reloptions \
                 FROM pg_class \
                 WHERE relname = E'%s';\
                 """
-            SQL = SQL_format % (escape_string(table_name, conn=conn))
+            SQL = SQL_format % (escape_string(table_name))
 
         table_row = None
         try:
@@ -426,7 +430,7 @@ def create_external_partition(context, tablename, dbname, port, filename):
 
 
 def create_partition(context, tablename, storage_type, dbname, compression_type=None, partition=True, rowcount=1094,
-                     with_data=True, host=None, port=0, user=None):
+                     with_data=True, with_desc=False, host=None, port=0, user=None):
     interval = '1 year'
 
     table_definition = 'Column1 int, Column2 varchar(20), Column3 date'
@@ -456,6 +460,11 @@ def create_partition(context, tablename, storage_type, dbname, compression_type=
 
     with closing(dbconn.connect(dbconn.DbURL(hostname=host, port=port, username=user, dbname=dbname), unsetSearchPath=False)) as conn:
         dbconn.execSQL(conn, create_table_str)
+
+    if with_desc:
+	    comment_table_str = "Comment on table " + tablename + " is 'This is a table.';"
+	    with closing(dbconn.connect(dbconn.DbURL(hostname=host, port=port, username=user, dbname=dbname), unsetSearchPath=False)) as conn:
+		    dbconn.execSQL(conn, comment_table_str)
 
     if with_data:
         populate_partition(tablename, PARTITION_START_DATE, dbname, 0, rowcount, host, port, user)
@@ -562,6 +571,14 @@ def are_segments_synchronized():
     return True
 
 
+def are_segments_synchronized_for_content_ids(content_ids):
+    gparray = GpArray.initFromCatalog(dbconn.DbURL())
+    segments = gparray.getDbList()
+    for seg in segments:
+        if seg.content in content_ids and seg.mode != MODE_SYNCHRONIZED:
+            return False
+    return True
+
 def check_row_count(context, tablename, dbname, nrows):
     NUM_ROWS_QUERY = 'select count(*) from %s' % tablename
     # We want to bubble up the exception so that if table does not exist, the test fails
@@ -578,7 +595,7 @@ def check_row_count(context, tablename, dbname, nrows):
 
 def get_coordinator_hostname(dbname='template1'):
     coordinator_hostname_sql = "SELECT DISTINCT hostname FROM gp_segment_configuration WHERE content=-1 AND role='p'"
-    return getRows(dbname, coordinator_hostname_sql)
+    return getRows(dbname, coordinator_hostname_sql, utility=True)
 
 
 def get_hosts(dbname='template1'):
@@ -642,6 +659,14 @@ def are_segments_running():
             result = False
     return result
 
+def is_segment_running(role, contentid):
+    gparray = GpArray.initFromCatalog(dbconn.DbURL())
+    segments = gparray.getDbList()
+    for seg in segments:
+        if seg.getSegmentRole() == role and seg.content == contentid and seg.status != 'u':
+            print("segment is not up - %s" % seg)
+            return False
+    return True
 
 def modify_sql_file(file, hostport):
     if os.path.isfile(file):
@@ -684,6 +709,19 @@ def get_primary_segment_host_port():
     return primary_seg_host, primary_seg_port
 
 
+def get_primary_segment_host_port_for_content(content='0'):
+    """
+    return host, port of primary segment for the content id
+    """
+    get_psegment_sql = "SELECT hostname, port FROM gp_segment_configuration WHERE content=%s AND role='p';" % content
+    with closing(dbconn.connect(dbconn.DbURL(dbname='template1'), unsetSearchPath=False)) as conn:
+        cur = dbconn.query(conn, get_psegment_sql)
+        rows = cur.fetchall()
+        primary_seg_host = rows[0][0]
+        primary_seg_port = rows[0][1]
+    return primary_seg_host, primary_seg_port
+
+
 def remove_local_path(dirname):
     list = glob.glob(os.path.join(os.path.curdir, dirname))
     for dir in list:
@@ -695,16 +733,12 @@ def validate_local_path(path):
     return len(list)
 
 
-def populate_regular_table_data(context, tabletype, table_name, compression_type, dbname, rowcount=1094,
-                                with_data=False, host=None, port=0, user=None):
+def populate_regular_table_data(context, tabletype, table_name, dbname, compression_type=None, rowcount=1094,
+                                with_data=False, with_desc=False, host=None, port=0, user=None):
     create_database_if_not_exists(context, dbname, host=host, port=port, user=user)
     drop_table_if_exists(context, table_name=table_name, dbname=dbname, host=host, port=port, user=user)
-    if compression_type == "None":
-        create_partition(context, table_name, tabletype, dbname, compression_type=None, partition=False,
-                         rowcount=rowcount, with_data=with_data, host=host, port=port, user=user)
-    else:
-        create_partition(context, table_name, tabletype, dbname, compression_type, partition=False,
-                         rowcount=rowcount, with_data=with_data, host=host, port=port, user=user)
+    create_partition(context, table_name, tabletype, dbname, compression_type=compression_type, partition=False,
+                     rowcount=rowcount, with_data=with_data, with_desc=with_desc, host=host, port=port, user=user)
 
 
 def is_process_running(proc_name, host=None):
@@ -732,11 +766,6 @@ def replace_special_char_env(str):
             str = str.replace("$%s" % var, os.environ[var])
     return str
 
-
-def escape_string(string, conn):
-    return pg.DB(db=conn).escape_string(string)
-
-
 def wait_for_unblocked_transactions(context, num_retries=150):
     """
     Tries once a second to successfully commit a transaction to the database
@@ -760,3 +789,41 @@ def wait_for_unblocked_transactions(context, num_retries=150):
 
     if attempt == num_retries:
         raise Exception('Unable to establish a connection to database !!!')
+
+
+def wait_for_desired_query_result(dburl, query, desired_result, utility=False):
+    """
+    Tries once a second to check for the desired query result on the segment.
+    Raises an Exception after failing <num_retries> times.
+    """
+    attempt = 0
+    num_retries = 600
+    actual_result = None
+    while (attempt < num_retries) and (actual_result != desired_result):
+        attempt += 1
+        try:
+            with closing(dbconn.connect(dburl, utility=utility)) as conn:
+                cursor = dbconn.query(conn, query)
+                rows = cursor.fetchall()
+                actual_result = rows[0][0]
+        except Exception as e:
+            print('could not query (%s:%s) %s' % (dburl.pghost, dburl.pgport, e))
+        time.sleep(1)
+
+    if attempt == num_retries:
+        raise Exception('Timed out after %s retries' % num_retries)
+
+
+
+def wait_for_database_dropped(dbname, remaining_attempt = 3000):
+    """
+    Tries once a decisecond to check for the database exist.
+    Raises an Exception after failing <remaining_attempt> times.
+    """
+    while remaining_attempt:
+        if not check_db_exists(dbname):
+            break
+        remaining_attempt -= 1
+        if remaining_attempt == 0:
+            raise Exception('Unable to drop the database {} !!!').format(dbname)
+        time.sleep(0.1)

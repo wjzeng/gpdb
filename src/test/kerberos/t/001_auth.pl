@@ -13,15 +13,11 @@
 
 use strict;
 use warnings;
-use TestLib;
-use PostgresNode;
+use PostgreSQL::Test::Utils;
+use PostgreSQL::Test::Cluster;
 use Test::More;
 
-if ($ENV{with_gssapi} eq 'yes')
-{
-	plan tests => 13;
-}
-else
+if ($ENV{with_gssapi} ne 'yes')
 {
 	plan skip_all => 'GSSAPI/Kerberos not supported by this build';
 }
@@ -65,14 +61,15 @@ my $host     = 'auth-test-localhost.postgresql.example.com';
 my $hostaddr = '127.0.0.1';
 my $realm    = 'EXAMPLE.COM';
 
-my $krb5_conf   = "${TestLib::tmp_check}/krb5.conf";
-my $kdc_conf    = "${TestLib::tmp_check}/kdc.conf";
-my $krb5_log    = "${TestLib::tmp_check}/krb5libs.log";
-my $kdc_log     = "${TestLib::tmp_check}/krb5kdc.log";
-my $kdc_port    = int(rand() * 16384) + 49152;
-my $kdc_datadir = "${TestLib::tmp_check}/krb5kdc";
-my $kdc_pidfile = "${TestLib::tmp_check}/krb5kdc.pid";
-my $keytab      = "${TestLib::tmp_check}/krb5.keytab";
+my $krb5_conf   = "${PostgreSQL::Test::Utils::tmp_check}/krb5.conf";
+my $kdc_conf    = "${PostgreSQL::Test::Utils::tmp_check}/kdc.conf";
+my $krb5_cache  = "${PostgreSQL::Test::Utils::tmp_check}/krb5cc";
+my $krb5_log    = "${PostgreSQL::Test::Utils::log_path}/krb5libs.log";
+my $kdc_log     = "${PostgreSQL::Test::Utils::log_path}/krb5kdc.log";
+my $kdc_port    = PostgreSQL::Test::Cluster::get_free_port();
+my $kdc_datadir = "${PostgreSQL::Test::Utils::tmp_check}/krb5kdc";
+my $kdc_pidfile = "${PostgreSQL::Test::Utils::tmp_check}/krb5kdc.pid";
+my $keytab      = "${PostgreSQL::Test::Utils::tmp_check}/krb5.keytab";
 
 note "setting up Kerberos";
 
@@ -134,8 +131,10 @@ $realm = {
 
 mkdir $kdc_datadir or die;
 
+# Ensure that we use test's config and cache files, not global ones.
 $ENV{'KRB5_CONFIG'}      = $krb5_conf;
 $ENV{'KRB5_KDC_PROFILE'} = $kdc_conf;
+$ENV{'KRB5CCNAME'}       = $krb5_cache;
 
 my $service_principal = "$ENV{with_krb_srvnam}/$host";
 
@@ -156,7 +155,7 @@ END
 
 note "setting up PostgreSQL instance";
 
-my $node = get_new_node('node');
+my $node = PostgreSQL::Test::Cluster->new('node');
 $node->init;
 $node->append_conf('postgresql.conf', "listen_addresses = '$hostaddr'");
 $node->append_conf('postgresql.conf', "krb_server_keyfile = '$keytab'");
@@ -166,32 +165,46 @@ $node->safe_psql('postgres', 'CREATE USER test1;');
 
 note "running tests";
 
+# Test connection success or failure, and if success, that query returns true.
 sub test_access
 {
-	my ($node, $role, $server_check, $expected_res, $gssencmode, $test_name)
+	my ($node, $role, $query, $expected_res, $gssencmode, $test_name,
+		$expect_log_msg)
 	  = @_;
 
 	# need to connect over TCP/IP for Kerberos
-	my ($res, $stdoutres, $stderrres) = $node->psql(
-		'postgres',
-		"$server_check",
-		extra_params => [
-			'-XAtd',
-			$node->connstr('postgres')
-			  . " host=$host hostaddr=$hostaddr $gssencmode",
-			'-U',
-			$role
-		]);
+	my $connstr = $node->connstr('postgres')
+	  . " user=$role host=$host hostaddr=$hostaddr $gssencmode";
 
-	# If we get a query result back, it should be true.
-	if ($res == $expected_res and $res eq 0)
+	if ($expected_res eq 0)
 	{
-		is($stdoutres, "t", $test_name);
+		# The result is assumed to match "true", or "t", here.
+		$node->connect_ok(
+			$connstr, $test_name,
+			sql             => $query,
+			expected_stdout => qr/t/);
 	}
 	else
 	{
-		is($res, $expected_res, $test_name);
+		$node->connect_fails($connstr, $test_name);
 	}
+	return;
+}
+
+# As above, but test for an arbitrary query result.
+sub test_query
+{
+	local $Test::Builder::Level = $Test::Builder::Level + 1;
+
+	my ($node, $role, $query, $expected, $gssencmode, $test_name) = @_;
+
+	# need to connect over TCP/IP for Kerberos
+	my $connstr = $node->connstr('postgres')
+	  . " user=$role host=$host hostaddr=$hostaddr $gssencmode";
+
+	my ($stdoutres, $stderrres);
+
+	$node->connect_ok($connstr, $test_name, $query, $expected);
 	return;
 }
 
@@ -230,6 +243,27 @@ test_access(
 	0,
 	"gssencmode=require",
 	"succeeds with GSS-encrypted access required with host hba");
+
+# Test that we can transport a reasonable amount of data.
+test_query(
+	$node,
+	"test1",
+	'SELECT * FROM generate_series(1, 100000);',
+	qr/^1\n.*\n1024\n.*\n9999\n.*\n100000$/s,
+	"gssencmode=require",
+	"receiving 100K lines works");
+
+test_query(
+	$node,
+	"test1",
+	"CREATE TABLE mytab (f1 int primary key);\n"
+	  . "COPY mytab FROM STDIN;\n"
+	  . join("\n", (1 .. 100000))
+	  . "\n\\.\n"
+	  . "SELECT COUNT(*) FROM mytab;",
+	qr/^100000$/s,
+	"gssencmode=require",
+	"sending 100K lines works");
 
 unlink($node->data_dir . '/pg_hba.conf');
 $node->append_conf('pg_hba.conf',
@@ -319,3 +353,5 @@ test_access(
 	0,
 	'',
 	'succeeds with include_realm=0 and defaults');
+
+done_testing();

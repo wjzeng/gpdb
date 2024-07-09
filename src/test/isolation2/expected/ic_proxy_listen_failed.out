@@ -1,0 +1,53 @@
+-- Test case for the scenario which ic-proxy peer listener port has been occupied
+
+-- start_matchsubs
+-- m/ic_tcp.c:\d+/
+-- s/ic_tcp.c:\d+/ic_tcp.c:LINE/
+-- end_matchsubs
+
+1:create table PR_16438 (i int);
+CREATE TABLE
+1:insert into PR_16438 select generate_series(1,100);
+INSERT 0 100
+1q: ... <quitting>
+
+-- get one port and occupy it (start_py_httpserver.sh), then restart cluster
+-- start_ignore
+!\retcode ic_proxy_port=`psql postgres -Atc "show gp_interconnect_proxy_addresses;" | awk -F ',' '{print $1}' | awk -F ':' '{print $4}'` && gpstop -ai && ./script/start_py_httpserver.sh $ic_proxy_port;
+-- start_ignore
+-- end_ignore
+(exited with code 0)
+!\retcode sleep 2 && gpstart -a;
+-- start_ignore
+-- end_ignore
+(exited with code 0)
+-- end_ignore
+
+-- execute a query (should failed)
+2&:select count(*) from PR_16438;  <waiting ...>
+FAILED:  Forked command is not blocking; got output: ERROR:  Failed to setup ic_proxy interconnect
+DETAIL:  The ic_proxy process failed to bind or listen.
+HINT:  Please check the server log for related WARNING messages.
+2<:  <... completed>
+FAILED:  Execution failed
+
+-- kill the script to release port and execute query again (should successfully)
+-- start_ignore
+!\retcode ps aux | grep http.server | grep -v grep | awk '{print $2}' | xargs kill;
+-- start_ignore
+
+-- end_ignore
+(exited with code 0)
+!\retcode sleep 2;
+-- start_ignore
+
+-- end_ignore
+(exited with code 0)
+-- end_ignore
+3:select count(*) from PR_16438;
+ count 
+-------
+ 100   
+(1 row)
+3:drop table PR_16438;
+DROP TABLE

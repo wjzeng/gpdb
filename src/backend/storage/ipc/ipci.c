@@ -68,7 +68,9 @@
 #include "executor/spi.h"
 #include "utils/workfile_mgr.h"
 #include "utils/session_state.h"
+#include "cdb/cdbendpoint.h"
 #include "replication/gp_replication.h"
+#include "cdb/ic_proxy_bgworker.h"
 
 /* GUCs */
 int			shared_memory_type = DEFAULT_SHARED_MEMORY_TYPE;
@@ -180,6 +182,7 @@ CreateSharedMemoryAndSemaphores(int port)
 		size = add_size(size, ReplicationOriginShmemSize());
 		size = add_size(size, WalSndShmemSize());
 		size = add_size(size, WalRcvShmemSize());
+		size = add_size(size, PgArchShmemSize());
 		size = add_size(size, ApplyLauncherShmemSize());
 		size = add_size(size, FTSReplicationStatusShmemSize());
 		size = add_size(size, SnapMgrShmemSize());
@@ -200,6 +203,10 @@ CreateSharedMemoryAndSemaphores(int port)
 		size = add_size(size, FaultInjector_ShmemSize());
 #endif			
 
+#ifdef ENABLE_IC_PROXY
+		size = add_size(size, ICProxyShmemSize());
+#endif
+
 		/* This elog happens before we know the name of the log file we are supposed to use */
 		elog(DEBUG1, "Size not including the buffer pool %lu",
 			 (unsigned long) size);
@@ -219,6 +226,12 @@ CreateSharedMemoryAndSemaphores(int port)
 
 		/* size of expand version */
 		size = add_size(size, GpExpandVersionShmemSize());
+
+		/* size of token and endpoint shared memory */
+		size = add_size(size, EndpointShmemSize());
+
+		/* size of parallel cursor count */
+		size = add_size(size, ParallelCursorCountSize());
 
 		elog(DEBUG3, "invoking IpcMemoryCreate(size=%zu)", size);
 
@@ -341,11 +354,16 @@ CreateSharedMemoryAndSemaphores(int port)
 	ReplicationOriginShmemInit();
 	WalSndShmemInit();
 	WalRcvShmemInit();
+	PgArchShmemInit();
 	ApplyLauncherShmemInit();
 	FTSReplicationStatusShmemInit();
 
 #ifdef FAULT_INJECTOR
 	FaultInjector_ShmemInit();
+#endif
+
+#ifdef ENABLE_IC_PROXY
+	ICProxyShmemInit();
 #endif
 
 	/*
@@ -382,6 +400,13 @@ CreateSharedMemoryAndSemaphores(int port)
 	/* Initialize dynamic shared memory facilities. */
 	if (!IsUnderPostmaster)
 		dsm_postmaster_startup(shim);
+
+	/* Initialize shared memory for parallel retrieve cursor */
+	if (!IsUnderPostmaster)
+		EndpointShmemInit();
+	
+	if (Gp_role == GP_ROLE_DISPATCH)
+		ParallelCursorCountInit();
 
 	/*
 	 * Now give loadable modules a chance to set up their shmem allocations

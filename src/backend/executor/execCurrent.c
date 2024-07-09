@@ -117,6 +117,9 @@ execCurrentOf(CurrentOfExpr *cexpr,
  * but it doesn't have to be scanning a row of that table (i.e. it can
  * be scanning a row of a different table in the same inheritance hierarchy).
  * The current table's oid is returned in *current_table_oid.
+ *
+ * GPDB calls it before dispatching to make QEs get the same current position
+ * of the cursor.
  */
 void
 getCurrentOf(CurrentOfExpr *cexpr,
@@ -186,6 +189,21 @@ getCurrentOf(CurrentOfExpr *cexpr,
 						cursor_name)));
 
 	/*
+	 * The referenced cursor must be simply updatable. This has already
+	 * been discerned by parse/analyze for the DECLARE CURSOR of the given
+	 * cursor. This flag assures us that gp_segment_id, ctid, and tableoid (if necessary)
+	 * will be available as junk metadata, courtesy of preprocess_targetlist.
+	 *
+	 * Apply simply updatable check to ordinary tables. Refer to the issue:
+	 * https://github.com/greenplum-db/gpdb/issues/9838.
+	 */
+	if (!OidIsValid(queryDesc->plannedstmt->simplyUpdatableRel))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_CURSOR_STATE),
+						errmsg("cursor \"%s\" is not a simply updatable scan of table \"%s\"",
+								cursor_name, table_name)));
+
+	/*
 	 * gpdb partition table routine is different with upstream
 	 * so we hold private updatable check method.
 	 */
@@ -199,18 +217,6 @@ getCurrentOf(CurrentOfExpr *cexpr,
 		relispartition ||
 		get_rel_persistence(table_oid) == RELPERSISTENCE_TEMP)
 	{
-		/*
-		 * The referenced cursor must be simply updatable. This has already
-		 * been discerned by parse/analyze for the DECLARE CURSOR of the given
-		 * cursor. This flag assures us that gp_segment_id, ctid, and tableoid (if necessary)
-		 * will be available as junk metadata, courtesy of preprocess_targetlist.
-		 */
-		if (!OidIsValid(queryDesc->plannedstmt->simplyUpdatableRel))
-			ereport(ERROR,
-			        (errcode(ERRCODE_INVALID_CURSOR_STATE),
-					        errmsg("cursor \"%s\" is not a simply updatable scan of table \"%s\"",
-					               cursor_name, table_name)));
-
 		/*
 		 * The target relation must directly match the cursor's relation. This throws out
 		 * the simple case in which a cursor is declared against table X and the update is
@@ -537,6 +543,10 @@ fetch_cursor_param_value(ExprContext *econtext, int paramId)
  * Search through a PlanState tree for a scan node on the specified table.
  * Return NULL if not found or multiple candidates.
  *
+ * CAUTION: this function is not charged simply with finding some candidate
+ * scan, but with ensuring that that scan returned the plan tree's current
+ * output row.  That's why we must reject multiple-match cases.
+ *
  * If a candidate is found, set *pending_rescan to true if that candidate
  * or any node above it has a pending rescan action, i.e. chgParam != NULL.
  * That indicates that we shouldn't consider the node to be positioned on a
@@ -554,9 +564,16 @@ search_plan_tree(PlanState *node, Oid table_oid,
 		return NULL;
 	switch (nodeTag(node))
 	{
-		/*
-		 * Relation scan nodes can all be treated alike
-		 */
+			/*
+			 * Relation scan nodes can all be treated alike: check to see if
+			 * they are scanning the specified table.
+			 *
+			 * ForeignScan and CustomScan might not have a currentRelation, in
+			 * which case we just ignore them.  (We dare not descend to any
+			 * child plan nodes they might have, since we do not know the
+			 * relationship of such a node's current output tuple to the
+			 * children's current outputs.)
+			 */
 		case T_SeqScanState:
 		case T_SampleScanState:
 		case T_IndexScanState:
@@ -568,14 +585,33 @@ search_plan_tree(PlanState *node, Oid table_oid,
 			{
 				ScanState  *sstate = (ScanState *) node;
 
-				if (RelationGetRelid(sstate->ss_currentRelation) == table_oid)
+				if (sstate->ss_currentRelation &&
+					RelationGetRelid(sstate->ss_currentRelation) == table_oid)
 					result = sstate;
 				break;
 			}
 
 			/*
-			 * For Append, we must look through the members; watch out for
-			 * multiple matches (possible if it was from UNION ALL)
+			 * For Append, we can check each input node.  It is safe to
+			 * descend to the inputs because only the input that resulted in
+			 * the Append's current output node could be positioned on a tuple
+			 * at all; the other inputs are either at EOF or not yet started.
+			 * Hence, if the desired table is scanned by some
+			 * currently-inactive input node, we will find that node but then
+			 * our caller will realize that it didn't emit the tuple of
+			 * interest.
+			 *
+			 * We do need to watch out for multiple matches (possible if
+			 * Append was from UNION ALL rather than an inheritance tree).
+			 *
+			 * Note: we can NOT descend through MergeAppend similarly, since
+			 * its inputs are likely all active, and we don't know which one
+			 * returned the current output tuple.  (Perhaps that could be
+			 * fixed if we were to let this code know more about MergeAppend's
+			 * internal state, but it does not seem worth the trouble.  Users
+			 * should not expect plans for ORDER BY queries to be considered
+			 * simply-updatable, since they won't be if the sorting is
+			 * implemented by a Sort node.)
 			 */
 		case T_AppendState:
 			{
@@ -585,29 +621,6 @@ search_plan_tree(PlanState *node, Oid table_oid,
 				for (i = 0; i < astate->as_nplans; i++)
 				{
 					ScanState  *elem = search_plan_tree(astate->appendplans[i],
-														table_oid,
-														pending_rescan);
-
-					if (!elem)
-						continue;
-					if (result)
-						return NULL;	/* multiple matches */
-					result = elem;
-				}
-				break;
-			}
-
-			/*
-			 * Similarly for MergeAppend
-			 */
-		case T_MergeAppendState:
-			{
-				MergeAppendState *mstate = (MergeAppendState *) node;
-				int			i;
-
-				for (i = 0; i < mstate->ms_nplans; i++)
-				{
-					ScanState  *elem = search_plan_tree(mstate->mergeplans[i],
 														table_oid,
 														pending_rescan);
 

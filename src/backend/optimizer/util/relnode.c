@@ -209,7 +209,6 @@ build_simple_rel(PlannerInfo *root, int relid, RelOptInfo *parent)
 	rel->pathlist = NIL;
 	rel->ppilist = NIL;
 	rel->partial_pathlist = NIL;
-    rel->onerow = false;
 	rel->cheapest_startup_path = NULL;
 	rel->cheapest_total_path = NULL;
 	rel->cheapest_unique_path = NULL;
@@ -626,9 +625,6 @@ build_join_rel(PlannerInfo *root,
 														   outer_rel,
 														   inner_rel);
 
-        /* CDB: Join between single-row inputs produces a single-row joinrel. */
-        Assert(joinrel->onerow == (outer_rel->onerow && inner_rel->onerow));
-
 		return joinrel;
 	}
 
@@ -647,7 +643,6 @@ build_join_rel(PlannerInfo *root,
 	joinrel->pathlist = NIL;
 	joinrel->ppilist = NIL;
 	joinrel->partial_pathlist = NIL;
-    joinrel->onerow = false;
 	joinrel->cheapest_startup_path = NULL;
 	joinrel->cheapest_total_path = NULL;
 	joinrel->cheapest_unique_path = NULL;
@@ -699,10 +694,6 @@ build_join_rel(PlannerInfo *root,
 	joinrel->nullable_partexprs = NULL;
 	joinrel->partitioned_child_rels = NIL;
 
-	/* CDB: Join between single-row inputs produces a single-row joinrel. */
-	if (outer_rel->onerow && inner_rel->onerow)
-		joinrel->onerow = true;
-
 	/* Compute information relevant to the foreign relations. */
 	set_foreign_rel_properties(joinrel, outer_rel, inner_rel);
 
@@ -729,13 +720,6 @@ build_join_rel(PlannerInfo *root,
 		bms_del_members(joinrel->direct_lateral_relids, joinrel->relids);
 	if (bms_is_empty(joinrel->direct_lateral_relids))
 		joinrel->direct_lateral_relids = NULL;
-
-	/* GPDB_96_MERGE_FIXME: The 'width' is now in joinrel->reltarget. But I
-	 * don't think this is the right place to set it. Do we actually care
-	 * about doing this? PostgreSQL doesn't bother..
-	 */
-	/* cap width of output row by sum of its inputs */
-	//joinrel->width = Min(joinrel->width, outer_rel->width + inner_rel->width);
 
 	/*
 	 * Construct restrict and join clause lists for the new joinrel. (The
@@ -891,6 +875,7 @@ build_child_join_rel(PlannerInfo *root, RelOptInfo *outer_rel,
 	/* Compute information relevant to foreign relations. */
 	set_foreign_rel_properties(joinrel, outer_rel, inner_rel);
 
+	/* Compute information needed for mapping Vars to the child rel */
 	appinfos = find_appinfos_by_relids(root, joinrel->relids, &nappinfos);
 
 	/* Set up reltarget struct */
@@ -902,7 +887,6 @@ build_child_join_rel(PlannerInfo *root, RelOptInfo *outer_rel,
 														(Node *) parent_joinrel->joininfo,
 														nappinfos,
 														appinfos);
-	pfree(appinfos);
 
 	/*
 	 * Lateral relids referred in child join will be same as that referred in
@@ -936,6 +920,19 @@ build_child_join_rel(PlannerInfo *root, RelOptInfo *outer_rel,
 
 	/* Add the relation to the PlannerInfo. */
 	add_join_rel(root, joinrel);
+
+	/*
+	 * We might need EquivalenceClass members corresponding to the child join,
+	 * so that we can represent sort pathkeys for it.  As with children of
+	 * baserels, we shouldn't need this unless there are relevant eclass joins
+	 * (implying that a merge join might be possible) or pathkeys to sort by.
+	 */
+	if (joinrel->has_eclass_joins || has_useful_pathkeys(root, parent_joinrel))
+		add_child_join_rel_equivalences(root,
+										nappinfos, appinfos,
+										parent_joinrel, joinrel);
+
+	pfree(appinfos);
 
 	return joinrel;
 }
@@ -1062,7 +1059,7 @@ build_joinrel_tlist(PlannerInfo *root, RelOptInfo *joinrel,
  *	  join paths made from this pair of sub-relations.  (It will not need to
  *	  be considered further up the join tree.)
  *
- *	  In many case we will find the same RestrictInfos in both input
+ *	  In many cases we will find the same RestrictInfos in both input
  *	  relations' joinlists, so be careful to eliminate duplicates.
  *	  Pointer equality should be a sufficient test for dups, since all
  *	  the various joinlist entries ultimately refer to RestrictInfos

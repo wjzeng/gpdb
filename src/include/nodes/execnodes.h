@@ -408,12 +408,15 @@ typedef struct OnConflictSetState
  * relation, and perhaps also fire triggers.  ResultRelInfo holds all the
  * information needed about a result relation, including indexes.
  *
- * Normally, a ResultRelInfo refers to a table that is in the query's
- * range table; then ri_RangeTableIndex is the RT index and ri_RelationDesc
- * is just a copy of the relevant es_relations[] entry.  But sometimes,
- * in ResultRelInfos used only for triggers, ri_RangeTableIndex is zero
- * and ri_RelationDesc is a separately-opened relcache pointer that needs
- * to be separately closed.  See ExecGetTriggerResultRel.
+ * Normally, a ResultRelInfo refers to a table that is in the query's range
+ * table; then ri_RangeTableIndex is the RT index and ri_RelationDesc is
+ * just a copy of the relevant es_relations[] entry.  However, in some
+ * situations we create ResultRelInfos for relations that are not in the
+ * range table, namely for targets of tuple routing in a partitioned table,
+ * and when firing triggers in tables other than the target tables (See
+ * ExecGetTriggerResultRel).  In these situations, ri_RangeTableIndex is 0
+ * and ri_RelationDesc is a separately-opened relcache pointer that needs to
+ * be separately closed.
  */
 typedef struct ResultRelInfo
 {
@@ -503,8 +506,13 @@ typedef struct ResultRelInfo
 	/* partition check expression state */
 	ExprState  *ri_PartitionCheckExpr;
 
-	/* relation descriptor for root partitioned table */
-	Relation	ri_PartitionRoot;
+	/*
+	 * RootResultRelInfo gives the target relation mentioned in the query, if
+	 * it's a partitioned table. It is not set if the target relation
+	 * mentioned in the query is an inherited table, nor when tuple routing is
+	 * not needed.
+	 */
+	struct ResultRelInfo *ri_RootResultRelInfo;
 
 	/* Additional information specific to partition tuple routing */
 	struct PartitionRoutingInfo *ri_PartitionInfo;
@@ -513,61 +521,10 @@ typedef struct ResultRelInfo
 	struct CopyMultiInsertBuffer *ri_CopyMultiInsertBuffer;
 } ResultRelInfo;
 
-/*
- * DynamicTableScanInfo
- *   Encapsulate the information that is needed to maintain the pid indexes
- * for all dynamic table scans in a plan.
- */
-/* GPDB_12_MERGE_FIXME: dead code now? */
-typedef struct DynamicTableScanInfo
-{
-	/*
-	 * The total number of unique dynamic table scans in the plan.
-	 */
-	int			numScans;
-
-	/*
-	 * List containing the number of partition selectors for every scan id.
-	 * Element #i in the list corresponds to scan id i
-	 */
-	List	   *numSelectorsPerScanId;
-
-	/*
-	 * An array of pid indexes, one for each unique dynamic table scans.
-	 * Each of these pid indexes maintains unique pids that are involved
-	 * in the scan.
-	 */
-	HTAB	  **pidIndexes;
-
-	/*
-	 * An array of Oids, for the current partition being scanned in each
-	 *  dynamic scan. (XXX: Currently only used to pass the oid from
-	 * DynamicBitmapHeapScan to DynamicBitmapIndexScans.
-	 */
-	Oid		   *curRelOids;
-
-	/*
-	 * Partitioning metadata for all relevant partition tables.
-	 */
-	List	   *partsMetadata;
-} DynamicTableScanInfo;
-
-/*
- * Number of pids used when initializing the pid-index hash table for each dynamic
- * table scan.
- */
-#define INITIAL_NUM_PIDS 1000
-
-/*
- * The initial estimate size for dynamic table scan pid-index array, and the
- * default incremental number when the array is out of space.
- */
-#define NUM_PID_INDEXES_ADDED 10
-
 /* ----------------
  *	  EState information
  *
- * Master working state for an Executor invocation
+ * Working state for an Executor invocation
  * ----------------
  */
 typedef struct EState
@@ -652,17 +609,12 @@ typedef struct EState
 	ExprContext *es_per_tuple_exprcontext;
 
 	/*
-	 * These fields are for re-evaluating plan quals when an updated tuple is
-	 * substituted in READ COMMITTED mode.  es_epqTupleSlot[] contains test
-	 * tuples that scan plan nodes should return instead of whatever they'd
-	 * normally return, or an empty slot if there is nothing to return; if
-	 * es_epqTupleSlot[] is not NULL if a particular array entry is valid; and
-	 * es_epqScanDone[] is state to remember if the tuple has been returned
-	 * already.  Arrays are of size es_range_table_size and are indexed by
-	 * scan node scanrelid - 1.
+	 * If not NULL, this is an EPQState's EState. This is a field in EState
+	 * both to allow EvalPlanQual aware executor nodes to detect that they
+	 * need to perform EPQ related work, and to provide necessary information
+	 * to do so.
 	 */
-	TupleTableSlot **es_epqTupleSlot;	/* array of EPQ substitute tuples */
-	bool	   *es_epqScanDone; /* true if EPQ tuple has been fetched */
+	struct EPQState *es_epq_active;
 
 	bool		es_use_parallel_mode;	/* can we use parallel workers? */
 
@@ -719,6 +671,16 @@ typedef struct EState
 
 	/* Should the executor skip past the alien plan nodes */
 	bool eliminateAliens;
+
+	/* partition oid that is being scanned, used by DynamicBitmapHeapScan/IndexScan */
+	int			partitionOid;
+
+	/*
+	 * GPDB: gp_bypass_unique_check is introduced so that routines, such as AO
+	 * vacuum, can avoid running uniqueness checks while inserting tuples.
+	 */
+	bool		gp_bypass_unique_check;
+
 } EState;
 
 struct PlanState;
@@ -1005,6 +967,7 @@ typedef struct SubPlanState
 	MemoryContext hashtablecxt; /* memory context containing hash tables */
 	MemoryContext hashtempcxt;	/* temp memory context for hash tables */
 	ExprContext *innerecontext; /* econtext for computing inner tuples */
+	/* each of the following fields is an array of length numCols: */
 	AttrNumber *keyColIdx;		/* control data for hash tables */
 	Oid		   *tab_eq_funcoids;	/* equality func oids for table
 									 * datatype(s) */
@@ -1014,21 +977,10 @@ typedef struct SubPlanState
 	FmgrInfo   *lhs_hash_funcs; /* hash functions for lefthand datatype(s) */
 	FmgrInfo   *cur_eq_funcs;	/* equality functions for LHS vs. table */
 	ExprState  *cur_eq_comp;	/* equality comparator for LHS vs. table */
+	int			numCols;		/* number of columns being hashed */
 
 	Tuplestorestate *ts_state;
 } SubPlanState;
-
-/* ----------------
- *		AlternativeSubPlanState node
- * ----------------
- */
-typedef struct AlternativeSubPlanState
-{
-	NodeTag		type;
-	AlternativeSubPlan *subplan;	/* expression plan node */
-	List	   *subplans;		/* SubPlanStates of alternative subplans */
-	int			active;			/* list index of the one we're using */
-} AlternativeSubPlanState;
 
 /*
  * DomainConstraintState - one item to check during CoerceToDomain
@@ -1175,6 +1127,7 @@ typedef struct PlanState
 	bool		fHadSentNodeStart;
 
 	bool		squelched;		/* has ExecSquelchNode() been called already? */
+	bool		prefetch_subplans_done;		/* prefetch_subplans already done? */
 } PlanState;
 
 extern uint64 PlanStateOperatorMemKB(const PlanState *ps);
@@ -1208,17 +1161,73 @@ extern uint64 PlanStateOperatorMemKB(const PlanState *ps);
 
 /*
  * EPQState is state for executing an EvalPlanQual recheck on a candidate
- * tuple in ModifyTable or LockRows.  The estate and planstate fields are
- * NULL if inactive.
+ * tuples e.g. in ModifyTable or LockRows.
+ *
+ * To execute EPQ a separate EState is created (stored in ->recheckestate),
+ * which shares some resources, like the rangetable, with the main query's
+ * EState (stored in ->parentestate). The (sub-)tree of the plan that needs to
+ * be rechecked (in ->plan), is separately initialized (into
+ * ->recheckplanstate), but shares plan nodes with the corresponding nodes in
+ * the main query. The scan nodes in that separate executor tree are changed
+ * to return only the current tuple of interest for the respective
+ * table. Those tuples are either provided by the caller (using
+ * EvalPlanQualSlot), and/or found using the rowmark mechanism (non-locking
+ * rowmarks by the EPQ machinery itself, locking ones by the caller).
+ *
+ * While the plan to be checked may be changed using EvalPlanQualSetPlan() -
+ * e.g. so all source plans for a ModifyTable node can be processed - all such
+ * plans need to share the same EState.
  */
 typedef struct EPQState
 {
-	EState	   *estate;			/* subsidiary EState */
-	PlanState  *planstate;		/* plan state tree ready to be executed */
-	TupleTableSlot *origslot;	/* original output tuple to be rechecked */
+	/* Initialized at EvalPlanQualInit() time: */
+
+	EState	   *parentestate;	/* main query's EState */
+	int			epqParam;		/* ID of Param to force scan node re-eval */
+
+	/*
+	 * Tuples to be substituted by scan nodes. They need to set up, before
+	 * calling EvalPlanQual()/EvalPlanQualNext(), into the slot returned by
+	 * EvalPlanQualSlot(scanrelid). The array is indexed by scanrelid - 1.
+	 */
+	List	   *tuple_table;	/* tuple table for relsubs_slot */
+	TupleTableSlot **relsubs_slot;
+
+	/*
+	 * Initialized by EvalPlanQualInit(), may be changed later with
+	 * EvalPlanQualSetPlan():
+	 */
+
 	Plan	   *plan;			/* plan tree to be executed */
 	List	   *arowMarks;		/* ExecAuxRowMarks (non-locking only) */
-	int			epqParam;		/* ID of Param to force scan node re-eval */
+
+
+	/*
+	 * The original output tuple to be rechecked.  Set by
+	 * EvalPlanQualSetSlot(), before EvalPlanQualNext() or EvalPlanQual() may
+	 * be called.
+	 */
+	TupleTableSlot *origslot;
+
+
+	/* Initialized or reset by EvalPlanQualBegin(): */
+
+	EState	   *recheckestate;	/* EState for EPQ execution, see above */
+
+	/*
+	 * Rowmarks that can be fetched on-demand using
+	 * EvalPlanQualFetchRowMark(), indexed by scanrelid - 1. Only non-locking
+	 * rowmarks.
+	 */
+	ExecAuxRowMark **relsubs_rowmark;
+
+	/*
+	 * True if a relation's EPQ tuple has been fetched for relation, indexed
+	 * by scanrelid - 1.
+	 */
+	bool	   *relsubs_done;
+
+	PlanState  *recheckplanstate;	/* EPQ specific exec nodes, for ->plan */
 } EPQState;
 
 
@@ -1384,6 +1393,7 @@ typedef struct MergeAppendState
  *
  *		recursing			T when we're done scanning the non-recursive term
  *		intermediate_empty	T if intermediate_table is currently empty
+ *		refcount 			number of WorkTableScans which will scan the working table
  *		working_table		working table (to be scanned by recursive term)
  *		intermediate_table	current recursive output (next generation of WT)
  * ----------------
@@ -1393,6 +1403,7 @@ typedef struct RecursiveUnionState
 	PlanState	ps;				/* its first field is NodeTag */
 	bool		recursing;
 	bool		intermediate_empty;
+	int			refcount;
 	Tuplestorestate *working_table;
 	Tuplestorestate *intermediate_table;
 	/* Remaining fields are unused in UNION ALL case */
@@ -1588,7 +1599,7 @@ typedef struct IndexScanState
 /* ----------------
  *	 IndexOnlyScanState information
  *
- *		indexqual		   execution state for indexqual expressions
+ *		recheckqual		   execution state for recheckqual expressions
  *		ScanKeys		   Skey structures for index quals
  *		NumScanKeys		   number of ScanKeys
  *		OrderByKeys		   Skey structures for index ordering operators
@@ -1607,7 +1618,7 @@ typedef struct IndexScanState
 typedef struct IndexOnlyScanState
 {
 	ScanState	ss;				/* its first field is NodeTag */
-	ExprState  *indexqual;
+	ExprState  *recheckqual;
 	struct ScanKeyData *ioss_ScanKeys;
 	int			ioss_NumScanKeys;
 	struct ScanKeyData *ioss_OrderByKeys;
@@ -1622,6 +1633,43 @@ typedef struct IndexOnlyScanState
 	Buffer		ioss_VMBuffer;
 	Size		ioss_PscanLen;
 } IndexOnlyScanState;
+
+/*
+ * DynamicIndexScanState
+ */
+typedef struct DynamicIndexScanState
+{
+	ScanState	ss;
+
+	int			scan_state; /* the stage of scanning */
+
+	int			eflags;
+
+	/*
+	 * IndexScanState and IndexOnlyScanState are mutually exclusive fields used
+	 * set for dynamic index scan or dynamic index only scan.
+	 */
+	IndexScanState *indexScanState;
+	IndexOnlyScanState *indexOnlyScanState;
+	List	   *tuptable;
+	ExprContext *outer_exprContext;
+
+	/*
+	 * This memory context will be reset per-partition to free
+	 * up previous partition's memory
+	 */
+	MemoryContext partitionMemoryContext;
+
+	int			nOids; /* number of oids to scan in partitioned table */
+	Oid		   *partOids; /* list of oids to scan in partitioned table */
+	int			whichPart; /* index of current partition in partOids */
+	/* The partition oid for which the current varnos are mapped */
+	Oid columnLayoutOid;
+
+	struct PartitionPruneState *as_prune_state; /* partition dynamic pruning state */
+	Bitmapset  *as_valid_subplans; /* used to determine partitions during dynamic pruning*/
+	bool 		did_pruning; /* flag that is set when */
+} DynamicIndexScanState;
 
 /* ----------------
  *	 BitmapIndexScanState information
@@ -1654,6 +1702,31 @@ typedef struct BitmapIndexScanState
 	Relation	biss_RelationDesc;
 	struct IndexScanDescData *biss_ScanDesc;
 } BitmapIndexScanState;
+
+/*
+ * DynamicBitmapIndexScanState
+ */
+typedef struct DynamicBitmapIndexScanState
+{
+	ScanState	ss;
+
+	int			scan_state; /* the stage of scanning */
+
+	int			eflags;
+	BitmapIndexScanState *bitmapIndexScanState;
+	ExprContext *outer_exprContext;
+
+	/*
+	 * This memory context will be reset per-partition to free
+	 * up previous partition's memory
+	 */
+	MemoryContext partitionMemoryContext;
+
+	/* The partition oid for which the current varnos are mapped */
+	Oid columnLayoutOid;
+
+	List	   *tuptable;
+} DynamicBitmapIndexScanState;
 
 /* ----------------
  *	 SharedBitmapState information
@@ -1747,6 +1820,45 @@ typedef struct BitmapHeapScanState
 	TBMSharedIterator *shared_prefetch_iterator;
 	ParallelBitmapHeapState *pstate;
 } BitmapHeapScanState;
+
+typedef struct DynamicBitmapHeapScanState
+{
+	ScanState	ss;				/* its first field is NodeTag */
+
+	int			scan_state; /* the stage of scanning */
+
+	int			eflags;
+	BitmapHeapScanState *bhsState;
+
+	/*
+	 * lastRelOid is the last relation that corresponds to the
+	 * varattno mapping of qual and target list. Each time we open a new partition, we will
+	 * compare the last relation with current relation by using varattnos_map()
+	 * and then convert the varattno to the new varattno
+	 */
+	Oid			lastRelOid;
+
+	/*
+	 * scanrelid is the RTE index for this scan node. It will be used to select
+	 * varno whose varattno will be remapped, if necessary
+	 */
+	Index		scanrelid;
+
+	/*
+	 * This memory context will be reset per-partition to free
+	 * up previous partition's memory
+	 */
+	MemoryContext partitionMemoryContext;
+
+
+	int			nOids; /* number of oids to scan in partitioned table */
+	Oid		   *partOids; /* list of oids to scan in partitioned table */
+	int			whichPart; /* index of current partition in partOids */
+
+	struct PartitionPruneState *as_prune_state; /* partition dynamic pruning state */
+	Bitmapset  *as_valid_subplans; /* used to determine partitions during dynamic pruning*/
+	bool 		did_pruning; /* flag that is set once dynamic pruning is performed */
+} DynamicBitmapHeapScanState;
 
 /* ----------------
  *	 TidScanState information
@@ -1855,7 +1967,8 @@ typedef struct TableFunctionState
  *
  *		rowcontext			per-expression-list context
  *		exprlists			array of expression lists being evaluated
- *		array_len			size of array
+ *		exprstatelists		array of expression state lists, for SubPlans only
+ *		array_len			size of above arrays
  *		curr_idx			current array index (0-based)
  *
  *	Note: ss.ps.ps_ExprContext is used to evaluate any qual or projection
@@ -1863,6 +1976,12 @@ typedef struct TableFunctionState
  *	rowcontext, in which to build the executor expression state for each
  *	Values sublist.  Resetting this context lets us get rid of expression
  *	state for each row, avoiding major memory leakage over a long values list.
+ *	However, that doesn't work for sublists containing SubPlans, because a
+ *	SubPlan has to be connected up to the outer plan tree to work properly.
+ *	Therefore, for only those sublists containing SubPlans, we do expression
+ *	state construction at executor start, and store those pointers in
+ *	exprstatelists[].  NULL entries in that array correspond to simple
+ *	subexpressions that are handled as described above.
  * ----------------
  */
 typedef struct ValuesScanState
@@ -1872,6 +1991,8 @@ typedef struct ValuesScanState
 	List	  **exprlists;
 	int			array_len;
 	int			curr_idx;
+	/* in back branches, put this at the end to avoid ABI break: */
+	List	  **exprstatelists;
 } ValuesScanState;
 
 /* ----------------
@@ -1946,11 +2067,22 @@ typedef struct NamedTuplestoreScanState
  *		WorkTableScan nodes are used to scan the work table created by
  *		a RecursiveUnion node.  We locate the RecursiveUnion node
  *		during executor startup.
+ *		In postgres, multiple recursive self-references is disallowed
+ *		by the SQL spec, and prevent inlining of multiply-referenced
+ *		CTEs with outer recursive refs, so they only have one WorkTable
+ *		correlate to one RecursiveUnion. But in GPDB, we don't support
+ *		CTE scan plan, if exists multiply-referenced CTEs with outer
+ *		recursive, there will be multiple WorkTable scan correlate to
+ *		one RecursiveUnion, and they share the same readptr of working
+ *		table which cause wrong results. We create a readptr for each
+ *		WorkTable scan, so that they won't influence each other.
+ *
  * ----------------
  */
 typedef struct WorkTableScanState
 {
 	ScanState	ss;				/* its first field is NodeTag */
+	int			readptr;		/* index of work table's tuplestore read pointer */
 	RecursiveUnionState *rustate;
 } WorkTableScanState;
 
@@ -1969,6 +2101,90 @@ typedef struct ForeignScanState
 	struct FdwRoutine *fdwroutine;
 	void	   *fdw_state;		/* foreign-data wrapper can keep state here */
 } ForeignScanState;
+
+/*
+ * DynamicSeqScanState
+ */
+typedef struct DynamicSeqScanState
+{
+	ScanState	ss;
+
+	int			scan_state; /* the stage of scanning */
+
+	int			eflags;
+	SeqScanState *seqScanState;
+
+	/*
+	 * lastRelOid is the last relation that corresponds to the
+	 * varattno mapping of qual and target list. Each time we open a new partition, we will
+	 * compare the last relation with current relation by using varattnos_map()
+	 * and then convert the varattno to the new varattno
+	 */
+	Oid			lastRelOid;
+
+	/*
+	 * scanrelid is the RTE index for this scan node. It will be used to select
+	 * varno whose varattno will be remapped, if necessary
+	 */
+	Index		scanrelid;
+
+	/*
+	 * This memory context will be reset per-partition to free
+	 * up previous partition's memory
+	 */
+	MemoryContext partitionMemoryContext;
+
+	int			nOids; /* number of oids to scan in partitioned table */
+	Oid		   *partOids; /* list of oids to scan in partitioned table */
+	int			whichPart; /* index of current partition in partOids */
+
+	struct PartitionPruneState *as_prune_state; /* partition dynamic pruning state */
+	Bitmapset  *as_valid_subplans; /* used to determine partitions during dynamic pruning*/
+	bool 		did_pruning; /* flag that is set once dynamic pruning is performed */
+} DynamicSeqScanState;
+
+/*
+ * DynamicForeignScanState
+ */
+typedef struct DynamicForeignScanState
+{
+	ScanState	ss;
+
+	int			scan_state; /* the stage of scanning */
+
+	int			eflags;
+	ForeignScanState *foreignScanState;
+
+	/*
+	 * lastRelOid is the last relation that corresponds to the
+	 * varattno mapping of qual and target list. Each time we open a new partition, we will
+	 * compare the last relation with current relation by using varattnos_map()
+	 * and then convert the varattno to the new varattno
+	 */
+	Oid			lastRelOid;
+
+	/*
+	 * scanrelid is the RTE index for this scan node. It will be used to select
+	 * varno whose varattno will be remapped, if necessary
+	 */
+	Index		scanrelid;
+
+	/*
+	 * This memory context will be reset per-partition to free
+	 * up previous partition's memory
+	 */
+	MemoryContext partitionMemoryContext;
+
+	int			nOids; /* number of oids to scan in partitioned table */
+	Oid		   *partOids; /* list of oids to scan in partitioned table */
+	int			whichPart; /* index of current partition in partOids */
+
+	struct PartitionPruneState *as_prune_state; /* partition dynamic pruning state */
+	Bitmapset  *as_valid_subplans; /* used to determine partitions during dynamic pruning*/
+	bool 		did_pruning; /* flag that is set once dynamic pruning is performed */
+	void 	**fdw_private_array; /* array of fdw_privates for each partition's foreign scan */
+
+} DynamicForeignScanState;
 
 /* ----------------
  *	 CustomScanState information
@@ -2030,7 +2246,6 @@ typedef struct NestLoopState
 	bool		nl_MatchedOuter;
 	bool		shared_outer;
 	bool		prefetch_inner;
-	bool		prefetch_joinqual;
 	bool		reset_inner; /*CDB-OLAP*/
 	bool		require_inner_reset; /*CDB-OLAP*/
 
@@ -2088,7 +2303,6 @@ typedef struct MergeJoinState
 	ExprContext *mj_OuterEContext;
 	ExprContext *mj_InnerEContext;
 	bool		prefetch_inner; /* MPP-3300 */
-	bool		prefetch_joinqual;
 } MergeJoinState;
 
 /* ----------------
@@ -2096,7 +2310,6 @@ typedef struct MergeJoinState
  *
  *		hashclauses				original form of the hashjoin condition
  *		hj_OuterHashKeys		the outer hash keys in the hashjoin condition
- *		hj_InnerHashKeys		the inner hash keys in the hashjoin condition
  *		hj_HashOperators		the join operators in the hashjoin condition
  *		hj_HashTable			hash table for the hashjoin
  *								(NULL if table not built yet)
@@ -2129,7 +2342,6 @@ typedef struct HashJoinState
 	ExprState  *hashclauses;
 	ExprState  *hashqualclauses;	/* CDB: ExprState node (match) */
 	List	   *hj_OuterHashKeys;	/* list of ExprState nodes */
-	List	   *hj_InnerHashKeys;	/* list of ExprState nodes */
 	List	   *hj_HashOperators;	/* list of operator OIDs */
 	List	   *hj_Collations;
 	HashJoinTable hj_HashTable;
@@ -2147,7 +2359,6 @@ typedef struct HashJoinState
 	bool		hj_OuterNotEmpty;
 	bool		hj_InnerEmpty;  /* set to true if inner side is empty */
 	bool		prefetch_inner;
-	bool		prefetch_joinqual;
 	bool		hj_nonequijoin;
 
 	/* set if the operator created workfiles */
@@ -2181,6 +2392,7 @@ typedef struct MaterialState
 	bool		ts_destroyed;	/* called destroy tuple store? */
 	bool		delayEagerFree;	/* is is safe to free memory used by this node,
 								 * when this node has outputted its last row? */
+	bool		cdb_strict;
 } MaterialState;
 
 /* ----------------
@@ -2235,9 +2447,7 @@ typedef struct SortState
 	int64		bound_Done;		/* value of bound we did the sort with */
 	void	   *tuplesortstate; /* private state of tuplesort.c */
 	bool		am_worker;		/* are we a worker? */
-	SharedSortInfo *shared_info;	/* one entry per worker */
-
-	bool		noduplicates;	/* true if discard duplicate rows */
+	SharedSortInfo *shared_info;	/* one entry per worker * Greenplum: per QE */
 
 	bool		delayEagerFree;		/* is it safe to free memory used by this node,
 									 * when this node has outputted its last row? */
@@ -2292,6 +2502,9 @@ typedef struct AggState
 	int			current_set;	/* The current grouping set being evaluated */
 	Bitmapset  *grouped_cols;	/* grouped cols in current projection */
 	List	   *all_grouped_cols;	/* list of all grouped cols in DESC order */
+	Bitmapset  *colnos_needed;	/* all columns needed from the outer plan */
+	int			max_colno_needed;	/* highest colno needed from outer plan */
+	bool		all_cols_needed;	/* are all cols from outer plan needed? */
 	/* These fields are for grouping set phase data */
 	int			maxsets;		/* The max number of sets in any phase */
 	AggStatePerPhase phases;	/* array of all phases */
@@ -2307,9 +2520,10 @@ typedef struct AggState
 	int			num_hashes;
 	MemoryContext	hash_metacxt;	/* memory for hash table itself */
 	struct HashTapeInfo *hash_tapeinfo; /* metadata for spill tapes */
-	struct HashAggSpill *hash_spills; /* HashAggSpill for each grouping set,
-										 exists only during first pass */
-	TupleTableSlot *hash_spill_slot; /* slot for reading from spill files */
+	struct HashAggSpill *hash_spills;	/* HashAggSpill for each grouping set,
+										 * exists only during first pass */
+	TupleTableSlot *hash_spill_rslot;	/* for reading spill files */
+	TupleTableSlot *hash_spill_wslot;	/* for writing spill files */
 	List	   *hash_batches;	/* hash batches remaining to be processed */
 	bool		hash_ever_spilled;	/* ever spilled during this execution? */
 	bool		hash_spill_mode;	/* we hit a limit during the current batch
@@ -2330,7 +2544,7 @@ typedef struct AggState
 										 * per-group pointers */
 
 	/* support for evaluation of agg input expressions: */
-#define FIELDNO_AGGSTATE_ALL_PERGROUPS 49
+#define FIELDNO_AGGSTATE_ALL_PERGROUPS 53
 	AggStatePerGroup *all_pergroups;	/* array of first ->pergroups, than
 										 * ->hash_pergroup */
 	ProjectionInfo *combinedproj;	/* projection machinery */
@@ -2342,6 +2556,9 @@ typedef struct AggState
 
 	/* if input tuple has an AggExprId, save the Attribute Number */
 	Index       AggExprId_AttrNum;
+
+	/* stream entries when out of memory instead of spilling to disk */
+	bool		streaming;
 } AggState;
 
 typedef struct TupleSplitState
@@ -2363,6 +2580,12 @@ typedef struct TupleSplitState
 
 	ExprState       **agg_filter_array; /* DQA filter which push down from aggref */
 	int             *dqa_id_array; /* DQA id for each each split tuple */
+
+	/*
+	 * For each splitting tuple is mapping to a bitmap set depends on vars of normal agg,
+	 * Only the input AttrNum in the bitmap set, other column set to null.
+	 */
+	Bitmapset       **agg_vars_ref;
 } TupleSplitState;
 
 typedef struct AggExprIdState
@@ -2583,7 +2806,7 @@ typedef struct HashState
 	bool		hs_hashkeys_null;	/* found an instance wherein hashkeys are all null */
 	/* hashkeys is same as parent's hj_InnerHashKeys */
 
-	SharedHashInfo *shared_info;	/* one entry per worker */
+	SharedHashInfo *shared_info;	/* one entry per worker * Greenplum: per QE */
 	HashInstrumentation *hinstrument;	/* this worker's entry */
 
 	/* Parallel hash state. */

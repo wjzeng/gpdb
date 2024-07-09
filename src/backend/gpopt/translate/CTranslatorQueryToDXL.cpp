@@ -18,6 +18,7 @@ extern "C" {
 #include "postgres.h"
 
 #include "access/sysattr.h"
+#include "catalog/heap.h"
 #include "catalog/pg_class.h"
 #include "nodes/makefuncs.h"
 #include "nodes/parsenodes.h"
@@ -47,7 +48,7 @@ extern "C" {
 #include "naucrates/dxl/operators/CDXLLogicalCTEProducer.h"
 #include "naucrates/dxl/operators/CDXLLogicalConstTable.h"
 #include "naucrates/dxl/operators/CDXLLogicalDelete.h"
-#include "naucrates/dxl/operators/CDXLLogicalExternalGet.h"
+#include "naucrates/dxl/operators/CDXLLogicalForeignGet.h"
 #include "naucrates/dxl/operators/CDXLLogicalGet.h"
 #include "naucrates/dxl/operators/CDXLLogicalGroupBy.h"
 #include "naucrates/dxl/operators/CDXLLogicalInsert.h"
@@ -86,6 +87,7 @@ using namespace gpmd;
 extern bool optimizer_enable_ctas;
 extern bool optimizer_enable_dml;
 extern bool optimizer_enable_dml_constraints;
+extern bool optimizer_enable_replicated_table;
 extern bool optimizer_enable_multiple_distinct_aggs;
 
 // OIDs of variants of LEAD window function
@@ -127,7 +129,7 @@ CTranslatorQueryToDXL::CTranslatorQueryToDXL(
 	BOOL is_top_query_dml, HMUlCTEListEntry *query_level_to_cte_map)
 	: m_context(context),
 	  m_mp(context->m_mp),
-	  m_sysid(IMDId::EmdidGPDB, GPMD_GPDB_SYSID),
+	  m_sysid(IMDId::EmdidGeneral, GPMD_GPDB_SYSID),
 	  m_md_accessor(md_accessor),
 	  m_query_level(query_level),
 	  m_is_top_query_dml(is_top_query_dml),
@@ -139,6 +141,8 @@ CTranslatorQueryToDXL::CTranslatorQueryToDXL(
 {
 	GPOS_ASSERT(nullptr != query);
 	CheckSupportedCmdType(query);
+
+	m_query_id = m_context->GetNextQueryId();
 
 	CheckRangeTable(query);
 
@@ -155,9 +159,13 @@ CTranslatorQueryToDXL::CTranslatorQueryToDXL(
 	// If this is a subquery, make a copy of the parent's mapping, otherwise
 	// initialize a new, empty, mapping.
 	if (var_colid_mapping)
+	{
 		m_var_to_colid_map = var_colid_mapping->CopyMapColId(m_mp);
+	}
 	else
+	{
 		m_var_to_colid_map = GPOS_NEW(m_mp) CMappingVarColId(m_mp);
+	}
 
 	m_query_level_to_cte_map = GPOS_NEW(m_mp) HMUlCTEListEntry(m_mp);
 	m_dxl_cte_producers = GPOS_NEW(m_mp) CDXLNodeArray(m_mp);
@@ -266,7 +274,9 @@ CTranslatorQueryToDXL::~CTranslatorQueryToDXL()
 	CRefCount::SafeRelease(m_dxl_query_output_cols);
 
 	if (m_query_level == 0)
+	{
 		GPOS_DELETE(m_context);
+	}
 }
 
 //---------------------------------------------------------------------------
@@ -283,7 +293,6 @@ CTranslatorQueryToDXL::CheckUnsupportedNodeTypes(Query *query)
 	static const SUnsupportedFeature unsupported_features[] = {
 		{T_RowExpr, GPOS_WSZ_LIT("ROW EXPRESSION")},
 		{T_RowCompareExpr, GPOS_WSZ_LIT("ROW COMPARE")},
-		{T_FieldSelect, GPOS_WSZ_LIT("FIELDSELECT")},
 		{T_FieldStore, GPOS_WSZ_LIT("FIELDSTORE")},
 		{T_CoerceToDomainValue, GPOS_WSZ_LIT("COERCETODOMAINVALUE")},
 		{T_GroupId, GPOS_WSZ_LIT("GROUPID")},
@@ -457,19 +466,100 @@ CTranslatorQueryToDXL::CheckRangeTable(Query *query)
 	{
 		RangeTblEntry *rte = (RangeTblEntry *) lfirst(lc);
 
-		if (rte->security_barrier || rte->securityQuals)
+		if (rte->security_barrier)
 		{
 			GPOS_ASSERT(RTE_SUBQUERY == rte->rtekind);
 			// otherwise ORCA most likely pushes potentially leaky filters down
 			GPOS_RAISE(gpdxl::ExmaDXL, gpdxl::ExmiQuery2DXLUnsupportedFeature,
 					   GPOS_WSZ_LIT("views with security_barrier ON"));
 		}
+
+		// In a rewritten parse tree
+		//
+		// [1] When hasRowSecurity=false and security_quals are not
+		// present in an rte, means that the relations present in a
+		// query don't have row level security enabled.
+		//
+		// [2] When hasRowSecurity=true and security_quals are present
+		// in an rte, means that the relations present in a query have
+		// row level security enabled.
+		//
+		// [3] When hasRowSecurity=true and security_quals are not
+		// present in an rte, means that the relations present in
+		// a query have row level security enabled but the query is
+		// executed by the owner of the relation.
+		//
+		// [4] When hasRowSecurity=false and security_quals are
+		// present in an rte example: A view with security barrier
+		// enabled and the view contains a relation with rules.
+		// Example query is below
+		//
+		// ```SQL
+		// CREATE TABLE foo(id int PRIMARY KEY, data text, deleted boolean);
+		// CREATE RULE foo_del_rule AS ON DELETE TO foo DO INSTEAD UPDATE foo SET deleted = true WHERE id = old.id;
+		// CREATE VIEW rw_view1 WITH (security_barrier=true) AS SELECT id, data FROM foo WHERE NOT deleted;
+		// DELETE FROM rw_view1 WHERE id = 1;
+		// ```
+		// ORCA will fallback to planner for this case [4].
+		if (!query->hasRowSecurity && nullptr != rte->securityQuals)
+		{
+			GPOS_RAISE(
+				gpdxl::ExmaDXL, gpdxl::ExmiQuery2DXLUnsupportedFeature,
+				GPOS_WSZ_LIT(
+					"Security quals present in RTE without row level security enabled"));
+		}
+
+		// ORCA will fallback to planner if row level security is
+		// enabled for a relation and the security quals contain
+		// sublinks.
+		if (query->hasRowSecurity && query->hasSubLinks &&
+			0 < gpdb::ListLength(rte->securityQuals) &&
+			CheckSublinkInSecurityQuals((Node *) rte->securityQuals, nullptr))
+		{
+			GPOS_RAISE(
+				gpdxl::ExmaDXL, gpdxl::ExmiQuery2DXLUnsupportedFeature,
+				GPOS_WSZ_LIT(
+					"Query has row level security enabled and security quals contain sublinks"));
+		}
+
 		if (rte->tablesample)
 		{
 			GPOS_RAISE(gpdxl::ExmaDXL, gpdxl::ExmiQuery2DXLUnsupportedFeature,
 					   GPOS_WSZ_LIT("TABLESAMPLE in the FROM clause"));
 		}
 	}
+}
+
+//---------------------------------------------------------------------------
+//	@function:
+//		CTranslatorQueryToDXL::CheckSublinkInSecurityQuals
+//
+//	@doc:
+//		When row level security is enabled we add the security quals
+//		while translating the table scans from DXL To Planned Statement.
+//		If the security quals consists of SUBLINKS then those queries
+//		will not have been planned as we add them at the end during
+//		translation. So falling back to planner for such cases. This walker
+// 		is used to find if we have any sublinks present in the security quals.
+//
+//---------------------------------------------------------------------------
+
+BOOL
+CTranslatorQueryToDXL::CheckSublinkInSecurityQuals(Node *node, void *context)
+{
+	if (nullptr == node)
+	{
+		return false;
+	}
+
+	if (IsA(node, SubLink))
+	{
+		return true;
+	}
+
+	return gpdb::WalkExpressionTree(
+		node, (BOOL(*)()) CTranslatorQueryToDXL::CheckSublinkInSecurityQuals,
+		context);
 }
 
 //---------------------------------------------------------------------------
@@ -519,15 +609,36 @@ CTranslatorQueryToDXL::TranslateSelectQueryToDXL()
 	// We therefore need to check permissions before we go into optimization for all RTEs, including the ones not explicitly referred in the query, e.g. views.
 	CTranslatorUtils::CheckRTEPermissions(m_query->rtable);
 
+	if (m_query->hasForUpdate)
+	{
+		int rt_len = gpdb::ListLength(m_query->rtable);
+		for (int i = 0; i < rt_len; i++)
+		{
+			const RangeTblEntry *rte =
+				(RangeTblEntry *) gpdb::ListNth(m_query->rtable, i);
+
+			if (rte->relkind == 'f' && rte->rellockmode == ExclusiveLock)
+			{
+				GPOS_RAISE(gpdxl::ExmaDXL,
+						   gpdxl::ExmiQuery2DXLUnsupportedFeature,
+						   GPOS_WSZ_LIT("Locking clause on foreign table"));
+			}
+		}
+	}
+
 	// RETURNING is not supported yet.
 	if (m_query->returningList)
+	{
 		GPOS_RAISE(gpdxl::ExmaDXL, gpdxl::ExmiQuery2DXLUnsupportedFeature,
 				   GPOS_WSZ_LIT("RETURNING clause"));
+	}
 
 	// ON CONFLICT is not supported yet.
 	if (m_query->onConflict)
+	{
 		GPOS_RAISE(gpdxl::ExmaDXL, gpdxl::ExmiQuery2DXLUnsupportedFeature,
 				   GPOS_WSZ_LIT("ON CONFLICT clause"));
+	}
 
 	CDXLNode *child_dxlnode = nullptr;
 	IntToUlongMap *sort_group_attno_to_colid_mapping =
@@ -734,10 +845,15 @@ CTranslatorQueryToDXL::TranslateInsertQueryToDXL()
 	CDXLNode *query_dxlnode = TranslateSelectQueryToDXL();
 	const RangeTblEntry *rte = (RangeTblEntry *) gpdb::ListNth(
 		m_query->rtable, m_query->resultRelation - 1);
-
+	if (rte->relkind == 'f')
+	{
+		GPOS_RAISE(gpdxl::ExmaDXL, gpdxl::ExmiQuery2DXLUnsupportedFeature,
+				   GPOS_WSZ_LIT("Inserts with foreign tables"));
+	}
 	CDXLTableDescr *table_descr = CTranslatorUtils::GetTableDescr(
-		m_mp, m_md_accessor, m_context->m_colid_counter, rte,
+		m_mp, m_md_accessor, m_context->m_colid_counter, rte, m_query_id,
 		&m_context->m_has_distributed_tables);
+
 	const IMDRelation *md_rel = m_md_accessor->RetrieveRel(table_descr->MDId());
 
 	BOOL rel_has_constraints = CTranslatorUtils::RelHasConstraints(md_rel);
@@ -745,6 +861,16 @@ CTranslatorQueryToDXL::TranslateInsertQueryToDXL()
 	{
 		GPOS_RAISE(gpdxl::ExmaDXL, gpdxl::ExmiQuery2DXLUnsupportedFeature,
 				   GPOS_WSZ_LIT("INSERT with constraints"));
+	}
+
+	BOOL contains_foreign_parts =
+		CTranslatorUtils::RelContainsForeignPartitions(md_rel, m_md_accessor);
+	if (contains_foreign_parts)
+	{
+		// Partitioned tables with external/foreign partitions
+		GPOS_RAISE(gpdxl::ExmaDXL, gpdxl::ExmiQuery2DXLUnsupportedFeature,
+				   GPOS_WSZ_LIT(
+					   "Insert with External/foreign partition storage types"));
 	}
 
 	// make note of the operator classes used in the distribution key
@@ -936,9 +1062,10 @@ CTranslatorQueryToDXL::TranslateCTASToDXL()
 				// distribution spec within ORCA, but also need
 				// the opclass to populate the distribution
 				// policy of the created table in the catalog
-				distr_opfamilies->Append(GPOS_NEW(m_mp) CMDIdGPDB(opfamily));
+				distr_opfamilies->Append(
+					GPOS_NEW(m_mp) CMDIdGPDB(IMDId::EmdidGeneral, opfamily));
 				distr_opclasses->Append(GPOS_NEW(m_mp) CMDIdGPDB(
-					m_query->intoPolicy->opclasses[ul]));
+					IMDId::EmdidGeneral, m_query->intoPolicy->opclasses[ul]));
 			}
 		}
 	}
@@ -950,7 +1077,7 @@ CTranslatorQueryToDXL::TranslateCTASToDXL()
 			nullptr);
 	}
 
-	GPOS_ASSERT(IMDRelation::EreldistrMasterOnly != rel_distr_policy);
+	GPOS_ASSERT(IMDRelation::EreldistrCoordinatorOnly != rel_distr_policy);
 	m_context->m_has_distributed_tables = true;
 
 	// TODO: Mar 5, 2014; reserve an OID
@@ -982,15 +1109,13 @@ CTranslatorQueryToDXL::TranslateCTASToDXL()
 	CDXLCtasStorageOptions::CDXLCtasOptionArray *ctas_storage_options =
 		GetDXLCtasOptionArray(NIL, &rel_storage_type);
 
-	//	BOOL has_oids = gpdb::InterpretOidsOption(into_clause->options);
-	BOOL has_oids = false;
 	BOOL fTempTable = true;
 	CDXLLogicalCTAS *ctas_dxlop = GPOS_NEW(m_mp) CDXLLogicalCTAS(
 		m_mp, mdid, md_schema_name, md_relname, dxl_col_descr_array,
 		GPOS_NEW(m_mp) CDXLCtasStorageOptions(
 			md_tablespace_name, ctas_commit_action, ctas_storage_options),
 		rel_distr_policy, distribution_colids, distr_opfamilies,
-		distr_opclasses, fTempTable, has_oids, rel_storage_type, source_array,
+		distr_opclasses, fTempTable, rel_storage_type, source_array,
 		var_typmods);
 
 	return GPOS_NEW(m_mp) CDXLNode(m_mp, ctas_dxlop, query_dxlnode);
@@ -1023,11 +1148,9 @@ CTranslatorQueryToDXL::GetDXLCtasOptionArray(
 	ListCell *lc = nullptr;
 	BOOL is_ao_table = false;
 	BOOL is_AOCO = false;
-	BOOL is_parquet = false;
 
 	CWStringConst str_append_only(GPOS_WSZ_LIT("appendonly"));
 	CWStringConst str_orientation(GPOS_WSZ_LIT("orientation"));
-	CWStringConst str_orientation_parquet(GPOS_WSZ_LIT("parquet"));
 	CWStringConst str_orientation_column(GPOS_WSZ_LIT("column"));
 
 	ForEach(lc, options)
@@ -1058,15 +1181,7 @@ CTranslatorQueryToDXL::GetDXLCtasOptionArray(
 			if (name_str->Equals(&str_orientation) &&
 				value_str->Equals(&str_orientation_column))
 			{
-				GPOS_ASSERT(!is_parquet);
 				is_AOCO = true;
-			}
-
-			if (name_str->Equals(&str_orientation) &&
-				value_str->Equals(&str_orientation_parquet))
-			{
-				GPOS_ASSERT(!is_AOCO);
-				is_parquet = true;
 			}
 		}
 
@@ -1088,10 +1203,6 @@ CTranslatorQueryToDXL::GetDXLCtasOptionArray(
 	else if (is_ao_table)
 	{
 		*storage_type = IMDRelation::ErelstorageAppendOnlyRows;
-	}
-	else if (is_parquet)
-	{
-		*storage_type = IMDRelation::ErelstorageAppendOnlyParquet;
 	}
 
 	return ctas_storage_options;
@@ -1130,16 +1241,23 @@ CTranslatorQueryToDXL::ExtractStorageOptionStr(DefElem *def_elem)
 void
 CTranslatorQueryToDXL::GetCtidAndSegmentId(ULONG *ctid, ULONG *segment_id)
 {
+	const FormData_pg_attribute *att_tup_tupid =
+		SystemAttributeDefinition(SelfItemPointerAttributeNumber);
+	const FormData_pg_attribute *att_tup_segid =
+		SystemAttributeDefinition(GpSegmentIdAttributeNumber);
+
+
 	// ctid column id
-	IMDId *mdid = CTranslatorUtils::GetSystemColType(
-		m_mp, SelfItemPointerAttributeNumber);
+	IMDId *mdid =
+		GPOS_NEW(m_mp) CMDIdGPDB(IMDId::EmdidGeneral, att_tup_tupid->atttypid);
 	*ctid = CTranslatorUtils::GetColId(m_query_level, m_query->resultRelation,
 									   SelfItemPointerAttributeNumber, mdid,
 									   m_var_to_colid_map);
 	mdid->Release();
 
 	// segmentid column id
-	mdid = CTranslatorUtils::GetSystemColType(m_mp, GpSegmentIdAttributeNumber);
+	mdid =
+		GPOS_NEW(m_mp) CMDIdGPDB(IMDId::EmdidGeneral, att_tup_segid->atttypid);
 	*segment_id = CTranslatorUtils::GetColId(
 		m_query_level, m_query->resultRelation, GpSegmentIdAttributeNumber,
 		mdid, m_var_to_colid_map);
@@ -1169,12 +1287,26 @@ CTranslatorQueryToDXL::TranslateDeleteQueryToDXL()
 	CDXLNode *query_dxlnode = TranslateSelectQueryToDXL();
 	const RangeTblEntry *rte = (RangeTblEntry *) gpdb::ListNth(
 		m_query->rtable, m_query->resultRelation - 1);
-
+	if (rte->relkind == 'f')
+	{
+		GPOS_RAISE(gpdxl::ExmaDXL, gpdxl::ExmiQuery2DXLUnsupportedFeature,
+				   GPOS_WSZ_LIT("Deletes with foreign tables"));
+	}
 	CDXLTableDescr *table_descr = CTranslatorUtils::GetTableDescr(
-		m_mp, m_md_accessor, m_context->m_colid_counter, rte,
+		m_mp, m_md_accessor, m_context->m_colid_counter, rte, m_query_id,
 		&m_context->m_has_distributed_tables);
+
 	const IMDRelation *md_rel = m_md_accessor->RetrieveRel(table_descr->MDId());
 
+	BOOL contains_foreign_parts =
+		CTranslatorUtils::RelContainsForeignPartitions(md_rel, m_md_accessor);
+	if (contains_foreign_parts)
+	{
+		// Partitioned tables with external/foreign partitions
+		GPOS_RAISE(gpdxl::ExmaDXL, gpdxl::ExmiQuery2DXLUnsupportedFeature,
+				   GPOS_WSZ_LIT(
+					   "Delete with External/foreign partition storage types"));
+	}
 	// make note of the operator classes used in the distribution key
 	NoteDistributionPolicyOpclasses(rte);
 
@@ -1230,9 +1362,15 @@ CTranslatorQueryToDXL::TranslateUpdateQueryToDXL()
 	const RangeTblEntry *rte = (RangeTblEntry *) gpdb::ListNth(
 		m_query->rtable, m_query->resultRelation - 1);
 
+	if (rte->relkind == 'f')
+	{
+		GPOS_RAISE(gpdxl::ExmaDXL, gpdxl::ExmiQuery2DXLUnsupportedFeature,
+				   GPOS_WSZ_LIT("Updates with foreign tables"));
+	}
 	CDXLTableDescr *table_descr = CTranslatorUtils::GetTableDescr(
-		m_mp, m_md_accessor, m_context->m_colid_counter, rte,
+		m_mp, m_md_accessor, m_context->m_colid_counter, rte, m_query_id,
 		&m_context->m_has_distributed_tables);
+
 	const IMDRelation *md_rel = m_md_accessor->RetrieveRel(table_descr->MDId());
 
 	if (!optimizer_enable_dml_constraints &&
@@ -1242,18 +1380,21 @@ CTranslatorQueryToDXL::TranslateUpdateQueryToDXL()
 				   GPOS_WSZ_LIT("UPDATE with constraints"));
 	}
 
+	BOOL contains_foreign_parts =
+		CTranslatorUtils::RelContainsForeignPartitions(md_rel, m_md_accessor);
+	if (contains_foreign_parts)
+	{
+		// Partitioned tables with external/foreign partitions
+		GPOS_RAISE(gpdxl::ExmaDXL, gpdxl::ExmiQuery2DXLUnsupportedFeature,
+				   GPOS_WSZ_LIT(
+					   "Update with External/foreign partition storage types"));
+	}
 	// make note of the operator classes used in the distribution key
 	NoteDistributionPolicyOpclasses(rte);
 
 	ULONG ctid_colid = 0;
 	ULONG segmentid_colid = 0;
 	GetCtidAndSegmentId(&ctid_colid, &segmentid_colid);
-
-	ULONG tuple_oid_colid = 0;
-
-
-	// GPDB_12_MERGE_FIXME: Dead code, this needs to be removed from Orca too
-	BOOL has_oids = false;
 
 	// get (resno -> colId) mapping of columns to be updated
 	IntToUlongMap *update_column_map = UpdatedColumnMapping();
@@ -1292,9 +1433,9 @@ CTranslatorQueryToDXL::TranslateUpdateQueryToDXL()
 	}
 
 	update_column_map->Release();
-	CDXLLogicalUpdate *pdxlopupdate = GPOS_NEW(m_mp) CDXLLogicalUpdate(
-		m_mp, table_descr, ctid_colid, segmentid_colid, delete_colid_array,
-		insert_colid_array, has_oids, tuple_oid_colid);
+	CDXLLogicalUpdate *pdxlopupdate = GPOS_NEW(m_mp)
+		CDXLLogicalUpdate(m_mp, table_descr, ctid_colid, segmentid_colid,
+						  delete_colid_array, insert_colid_array);
 
 	return GPOS_NEW(m_mp) CDXLNode(m_mp, pdxlopupdate, query_dxlnode);
 }
@@ -1314,7 +1455,7 @@ CTranslatorQueryToDXL::UpdatedColumnMapping()
 
 	ListCell *lc = nullptr;
 	ULONG ul = 0;
-	ULONG output_columns = 0;
+	ULONG output_columns GPOS_ASSERTS_ONLY = 0;
 	ForEach(lc, m_query->targetList)
 	{
 		TargetEntry *target_entry = (TargetEntry *) lfirst(lc);
@@ -1489,7 +1630,8 @@ CTranslatorQueryToDXL::CreateWindowFramForLeadLag(BOOL is_lead_func,
 	return GPOS_NEW(m_mp) CDXLWindowFrame(
 		EdxlfsRow,	   // frame specification
 		EdxlfesNulls,  // frame exclusion strategy is set to exclude NULLs in GPDB
-		dxl_lead_edge, dxl_trail_edge);
+		dxl_lead_edge, dxl_trail_edge, InvalidOid, InvalidOid, InvalidOid,
+		false, false);
 }
 
 
@@ -1621,7 +1763,9 @@ CTranslatorQueryToDXL::TranslateWindowSpecToDXL(
 
 		window_frame = m_scalar_translator->TranslateWindowFrameToDXL(
 			wc->frameOptions, wc->startOffset, wc->endOffset,
-			m_var_to_colid_map, project_list_dxlnode_node);
+			wc->startInRangeFunc, wc->endInRangeFunc, wc->inRangeColl,
+			wc->inRangeAsc, wc->inRangeNullsFirst, m_var_to_colid_map,
+			project_list_dxlnode_node);
 
 		CDXLWindowSpec *window_spec_dxlnode = GPOS_NEW(m_mp) CDXLWindowSpec(
 			m_mp, part_columns, mdname, sort_col_list_dxl, window_frame);
@@ -1713,8 +1857,10 @@ CTranslatorQueryToDXL::TranslateWindowToDXL(
 									  GPOS_NEW(m_mp) CMDName(
 										  m_mp, mdname_alias->GetMDName()),
 									  colid,
-									  GPOS_NEW(m_mp) CMDIdGPDB(gpdb::ExprType(
-										  (Node *) target_entry->expr)),
+									  GPOS_NEW(m_mp) CMDIdGPDB(
+										  IMDId::EmdidGeneral,
+										  gpdb::ExprType(
+											  (Node *) target_entry->expr)),
 									  gpdb::ExprTypeMod(
 										  (Node *) target_entry->expr))));
 				new_project_elem_dxlnode->AddChild(
@@ -1897,7 +2043,7 @@ CTranslatorQueryToDXL::TranslateSortColumsToDXL(
 		OID oid = sort_group_clause->sortop;
 
 		// get operator name
-		CMDIdGPDB *op_mdid = GPOS_NEW(m_mp) CMDIdGPDB(oid);
+		CMDIdGPDB *op_mdid = GPOS_NEW(m_mp) CMDIdGPDB(IMDId::EmdidGeneral, oid);
 		const IMDScalarOp *md_scalar_op = m_md_accessor->RetrieveScOp(op_mdid);
 
 		const CWStringConst *str = md_scalar_op->Mdname().GetMDName();
@@ -2013,6 +2159,41 @@ CTranslatorQueryToDXL::AddSortingGroupingColumn(
 	}
 }
 
+static BOOL
+ExpressionContainsMissingVars(const Expr *expr, CBitSet *grpby_cols_bitset)
+{
+	if (IsA(expr, Var) && !grpby_cols_bitset->Get(((Var *) expr)->varattno))
+	{
+		return true;
+	}
+	if (IsA(expr, SubLink) && IsA(((SubLink *) expr)->subselect, Query))
+	{
+		ListCell *lc = nullptr;
+		ForEach(lc, ((Query *) ((SubLink *) expr)->subselect)->targetList)
+		{
+			if (ExpressionContainsMissingVars(
+					((TargetEntry *) lfirst(lc))->expr, grpby_cols_bitset))
+			{
+				return true;
+			}
+		}
+	}
+	else if (IsA(expr, OpExpr))
+	{
+		ListCell *lc = nullptr;
+		ForEach(lc, ((OpExpr *) expr)->args)
+		{
+			if (ExpressionContainsMissingVars((Expr *) lfirst(lc),
+											  grpby_cols_bitset))
+			{
+				return true;
+			}
+		}
+	}
+
+	return false;
+}
+
 //---------------------------------------------------------------------------
 //	@function:
 //		CTranslatorQueryToDXL::CreateSimpleGroupBy
@@ -2097,6 +2278,37 @@ CTranslatorQueryToDXL::CreateSimpleGroupBy(
 				num_dqa++;
 			}
 
+			if (has_grouping_sets)
+			{
+				// If the grouping set is an ordered aggregate with direct
+				// args, then we need to ensure that every direct arg exists in
+				// the group by columns bitset. This is important when a ROLLUP
+				// uses direct args. For example, consider the followinng
+				// query:
+				//
+				// ```
+				// SELECT a, rank(a) WITHIN GROUP (order by b nulls last)
+				// FROM (values (1,1),(1,4),(1,5),(3,1),(3,2)) v(a,b)
+				// GROUP BY ROLLUP (a) ORDER BY a;
+				// ```
+				//
+				// ROLLUP (a) on values produces sets: (1), (3), ().
+				//
+				// In this case we need to ensure that () set will fetch direct
+				// arg "a" as NULL. Whereas (1) and (3) will fetch "a" off of
+				// any tuple in their respective sets.
+				ListCell *ilc = nullptr;
+				ForEach(ilc, ((Aggref *) target_entry->expr)->aggdirectargs)
+				{
+					if (ExpressionContainsMissingVars((Expr *) lfirst(ilc),
+													  grpby_cols_bitset))
+					{
+						((Aggref *) target_entry->expr)->aggdirectargs = NIL;
+						break;
+					}
+				}
+			}
+
 			// create a project element for aggregate
 			CDXLNode *project_elem_dxlnode = TranslateExprToDXLProject(
 				target_entry->expr, target_entry->resname);
@@ -2178,6 +2390,143 @@ CTranslatorQueryToDXL::IsDuplicateDqaArg(List *dqa_list, Aggref *aggref)
 
 //---------------------------------------------------------------------------
 //	@function:
+//		GroupingSetContainsValue
+//
+//	@doc:
+//		Check if value is a member of the GroupingSet content. Content for
+//		SIMPLE nodes is an integer list of ressortgroupref values. Content
+//		CUBE, ROLLUP, and SET nodes are either SIMPLE nodes or other ROLLUP or
+//		CUBE nodes. See details in parsenodes.h GroupingSet for more details.
+//---------------------------------------------------------------------------
+static BOOL
+GroupingSetContainsValue(GroupingSet *group, INT value)
+{
+	ListCell *lc = nullptr;
+	if (group->kind == GROUPING_SET_SIMPLE)
+	{
+		ForEach(lc, group->content)
+		{
+			if (lfirst_int(lc) == value)
+			{
+				return true;
+			}
+		}
+	}
+	if (group->kind == GROUPING_SET_CUBE ||
+		group->kind == GROUPING_SET_ROLLUP || group->kind == GROUPING_SET_SETS)
+	{
+		ForEach(lc, group->content)
+		{
+			if (GroupingSetContainsValue((GroupingSet *) lfirst(lc), value))
+			{
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+//---------------------------------------------------------------------------
+//	@function:
+//		CTranslatorQueryToDXL::CheckNoDuplicateAliasGroupingColumn
+//
+//	@doc:
+//		Check if there are multiple grouping set specs that reference
+//		duplicate alias columns that may produce NULL values. This can lead to
+//		a known wrong results scenario even in Postgres. Punt until a proper
+//		solution is found in Postgres. See following threads [1][2] for more
+//		details.
+//
+//		[1] https://www.postgresql.org/message-id/flat/CAHnPFjSdFx_TtNpQturPMkRSJMYaD5rGP2=8iFH9V24-OjHGiQ@mail.gmail.com
+//		[2] https://www.postgresql.org/message-id/flat/830269.1656693747@sss.pgh.pa.us
+//---------------------------------------------------------------------------
+void
+CTranslatorQueryToDXL::CheckNoDuplicateAliasGroupingColumn(List *target_list,
+														   List *group_clause,
+														   List *grouping_set)
+{
+	if (gpdb::ListLength(grouping_set) < 2)
+	{
+		// no duplicates in different grouping specs if only 1 grouping set
+		return;
+	}
+
+	if (gpdb::ListLength(group_clause) < 2)
+	{
+		// no duplicates referenced from grouping set if only 1 group clause
+		return;
+	}
+
+	// Find if there are duplicate aliases in the target list
+	ListCell *lc1 = nullptr;
+	ListCell *lc2 = nullptr;
+
+	CBitSet *bitset = GPOS_NEW(m_mp) CBitSet(m_mp);
+
+	List *processed_list = NIL;
+	ForEach(lc1, target_list)
+	{
+		TargetEntry *target_entry = (TargetEntry *) lfirst(lc1);
+
+		ForEach(lc2, processed_list)
+		{
+			TargetEntry *target_entry_inner = (TargetEntry *) lfirst(lc2);
+			if (gpdb::Equals(target_entry->expr, target_entry_inner->expr))
+			{
+				// ressortgroupref's point to alias'd columns
+				bitset->ExchangeSet(target_entry->ressortgroupref);
+				bitset->ExchangeSet(target_entry_inner->ressortgroupref);
+			}
+		}
+
+		processed_list = gpdb::LAppend(processed_list, target_entry);
+	}
+
+	if (gpdb::ListLength(processed_list) < 1)
+	{
+		// no duplicates if no duplicates found in target list
+		bitset->Release();
+		return;
+	}
+
+	int countSimple = 0;
+	int countNonSimple = 0;
+	ForEach(lc1, grouping_set)
+	{
+		GroupingSet *group = (GroupingSet *) lfirst(lc1);
+		CBitSetIter bsiter(*bitset);
+
+		while (bsiter.Advance())
+		{
+			if (GroupingSetContainsValue(group, bsiter.Bit()))
+			{
+				if (group->kind == GROUPING_SET_CUBE ||
+					group->kind == GROUPING_SET_ROLLUP ||
+					group->kind == GROUPING_SET_SETS)
+				{
+					countNonSimple += 1;
+				}
+				else if (group->kind == GROUPING_SET_SIMPLE)
+				{
+					countSimple += 1;
+				}
+
+				if (countNonSimple > 1 ||
+					(countNonSimple > 0 && countSimple > 0))
+				{
+					GPOS_RAISE(
+						gpdxl::ExmaDXL, gpdxl::ExmiQuery2DXLUnsupportedFeature,
+						GPOS_WSZ_LIT(
+							"Multiple grouping sets specifications with duplicate aliased columns"));
+				}
+			}
+		}
+	}
+	bitset->Release();
+}
+
+//---------------------------------------------------------------------------
+//	@function:
 //		CTranslatorQueryToDXL::TranslateGroupingSets
 //
 //	@doc:
@@ -2220,6 +2569,9 @@ CTranslatorQueryToDXL::TranslateGroupingSets(
 		CRefCount::SafeRelease(bitset);
 		return result_dxlnode;
 	}
+
+	CheckNoDuplicateAliasGroupingColumn(target_list, group_clause,
+										grouping_set);
 
 	// grouping functions refer to grouping col positions, so construct a map pos->grouping column
 	// while processing the grouping clause
@@ -2350,10 +2702,12 @@ CTranslatorQueryToDXL::CreateDXLUnionAllForGroupingSets(
 			CDXLNode(m_mp, GPOS_NEW(m_mp) CDXLLogicalCTEConsumer(
 							   m_mp, cte_id, colid_array_cte_consumer));
 
+		List *target_list_copy = (List *) gpdb::CopyObject(target_list);
+
 		IntToUlongMap *groupby_attno_to_colid_mapping =
 			GPOS_NEW(m_mp) IntToUlongMap(m_mp);
 		CDXLNode *groupby_dxlnode = CreateSimpleGroupBy(
-			target_list, group_clause, grouping_set_bitset, has_aggs,
+			target_list_copy, group_clause, grouping_set_bitset, has_aggs,
 			true,  // has_grouping_sets
 			cte_consumer_dxlnode, phmiulSortgrouprefColIdConsumer,
 			spj_consumer_output_attno_to_colid_mapping,
@@ -2361,19 +2715,19 @@ CTranslatorQueryToDXL::CreateDXLUnionAllForGroupingSets(
 
 		// add a project list for the NULL values
 		CDXLNode *project_dxlnode = CreateDXLProjectNullsForGroupingSets(
-			target_list, groupby_dxlnode, grouping_set_bitset,
+			target_list_copy, groupby_dxlnode, grouping_set_bitset,
 			phmiulSortgrouprefColIdConsumer, groupby_attno_to_colid_mapping,
 			grpcol_index_to_colid_mapping);
 
 		ULongPtrArray *colids_outer_array =
 			CTranslatorUtils::GetOutputColIdsArray(
-				m_mp, target_list, groupby_attno_to_colid_mapping);
+				m_mp, target_list_copy, groupby_attno_to_colid_mapping);
 		if (nullptr != unionall_dxlnode)
 		{
 			GPOS_ASSERT(nullptr != colid_array_inner);
 			CDXLColDescrArray *dxl_col_descr_array =
 				CTranslatorUtils::GetDXLColumnDescrArray(
-					m_mp, target_list, colids_outer_array,
+					m_mp, target_list_copy, colids_outer_array,
 					true /* keep_res_junked */);
 
 			colids_outer_array->AddRef();
@@ -2401,7 +2755,7 @@ CTranslatorQueryToDXL::CreateDXLUnionAllForGroupingSets(
 			// add the sortgroup columns to output map of the last column
 			ULONG te_pos = 0;
 			ListCell *lc = nullptr;
-			ForEach(lc, target_list)
+			ForEach(lc, target_list_copy)
 			{
 				TargetEntry *target_entry = (TargetEntry *) lfirst(lc);
 
@@ -2490,11 +2844,11 @@ CTranslatorQueryToDXL::DXLDummyConstTableGet() const
 	// empty column name
 	CWStringConst str_unnamed_col(GPOS_WSZ_LIT(""));
 	CMDName *mdname = GPOS_NEW(m_mp) CMDName(m_mp, &str_unnamed_col);
-	CDXLColDescr *dxl_col_descr = GPOS_NEW(m_mp)
-		CDXLColDescr(mdname, m_context->m_colid_counter->next_id(),
-					 1 /* attno */, GPOS_NEW(m_mp) CMDIdGPDB(mdid->Oid()),
-					 default_type_modifier, false /* is_dropped */
-		);
+	CDXLColDescr *dxl_col_descr = GPOS_NEW(m_mp) CDXLColDescr(
+		mdname, m_context->m_colid_counter->next_id(), 1 /* attno */,
+		GPOS_NEW(m_mp) CMDIdGPDB(IMDId::EmdidGeneral, mdid->Oid()),
+		default_type_modifier, false /* is_dropped */
+	);
 	dxl_col_descr_array->Append(dxl_col_descr);
 
 	// create the array of datum arrays
@@ -2631,7 +2985,6 @@ CTranslatorQueryToDXL::CreateDXLSetOpFromColumns(
 	CDXLNodeArray *children_dxlnodes, BOOL is_cast_across_input,
 	BOOL keep_res_junked) const
 {
-	GPOS_ASSERT(nullptr != output_target_list);
 	GPOS_ASSERT(nullptr != output_colids);
 	GPOS_ASSERT(nullptr != input_colids);
 	GPOS_ASSERT(nullptr != children_dxlnodes);
@@ -2749,7 +3102,6 @@ CTranslatorQueryToDXL::SetOpNeedsCast(List *target_list,
 									  IMdIdArray *input_col_mdids)
 {
 	GPOS_ASSERT(nullptr != input_col_mdids);
-	GPOS_ASSERT(nullptr != target_list);
 	GPOS_ASSERT(
 		input_col_mdids->Size() <=
 		gpdb::ListLength(target_list));	 // there may be resjunked columns
@@ -2790,39 +3142,6 @@ CTranslatorQueryToDXL::TranslateSetOpChild(Node *child_node,
 {
 	GPOS_ASSERT(nullptr != colids);
 	GPOS_ASSERT(nullptr != input_col_mdids);
-
-	// GPDB_12_MERGE_FIXME: We have to fallback here because otherwise we trip
-	// the following assert in ORCA:
-	//
-	// INFO:  GPORCA failed to produce a plan, falling back to planner
-	// DETAIL:  CKeyCollection.cpp:84: Failed assertion: __null != colref_array && 0 < colref_array->Size()
-	// Stack trace:
-	// 1    0x000055c239243b8a gpos::CException::Raise + 278
-	// 2    0x000055c2393ab075 gpopt::CKeyCollection::CKeyCollection + 221
-	// 3    0x000055c239449ab6 gpopt::CLogicalSetOp::DeriveKeyCollection + 98
-	// 4    0x000055c2393a5a67 gpopt::CDrvdPropRelational::DeriveKeyCollection + 135
-	// 5    0x000055c2393a4937 gpopt::CDrvdPropRelational::Derive + 197
-	// 6    0x000055c239405d9f gpopt::CExpression::PdpDerive + 703
-	// 7    0x000055c2394d1e14 gpopt::CMemo::PgroupInsert + 512
-	// 8    0x000055c2393dd734 gpopt::CEngine::PgroupInsert + 632
-	// 9    0x000055c2393dcd73 gpopt::CEngine::InitLogicalExpression + 225
-	// 10   0x000055c2393dd106 gpopt::CEngine::Init + 884
-	// 11   0x000055c23949da9f gpopt::COptimizer::PexprOptimize + 103
-	// 12   0x000055c23949d3d8 gpopt::COptimizer::PdxlnOptimize + 1414
-	// 13   0x000055c23960e55e COptTasks::OptimizeTask + 1530
-	// 14   0x000055c2392572b6 gpos::CTask::Execute + 196
-	// 15   0x000055c239259dbf gpos::CWorker::Execute + 191
-	// 16   0x000055c2392556b5 gpos::CAutoTaskProxy::Execute + 221
-	// 17   0x000055c23925c0c0 gpos_exec + 876
-	//
-	// Currently there are a lot of asserts on NULL != target_list in the
-	// translator, but most of them are unnecessary. We should instead fix ORCA
-	// to handle empty target list.
-	if (NIL == target_list)
-	{
-		GPOS_RAISE(gpdxl::ExmaDXL, gpdxl::ExmiQuery2DXLUnsupportedFeature,
-				   GPOS_WSZ_LIT("Empty target list"));
-	}
 
 	if (IsA(child_node, RangeTblRef))
 	{
@@ -3025,6 +3344,12 @@ CTranslatorQueryToDXL::TranslateFromClauseToDXL(Node *node)
 					   GPOS_WSZ_LIT("LATERAL"));
 		}
 
+		if (rte->funcordinality)
+		{
+			GPOS_RAISE(gpdxl::ExmaDXL, gpdxl::ExmiQuery2DXLUnsupportedFeature,
+					   GPOS_WSZ_LIT("WITH ORDINALITY"));
+		}
+
 		switch (rte->rtekind)
 		{
 			default:
@@ -3105,6 +3430,7 @@ CTranslatorQueryToDXL::UnsupportedRTEKind(RTEKind rtekind)
 					   GPOS_WSZ_LIT("RangeTableEntry of type Void"));
 		}
 		case RTE_TABLEFUNCTION:
+		case RTE_TABLEFUNC:
 		{
 			GPOS_RAISE(gpdxl::ExmaDXL, gpdxl::ExmiQuery2DXLUnsupportedFeature,
 					   GPOS_WSZ_LIT("RangeTableEntry of type Table Function"));
@@ -3135,21 +3461,35 @@ CTranslatorQueryToDXL::TranslateRTEToDXLLogicalGet(const RangeTblEntry *rte,
 				   GPOS_WSZ_LIT("ONLY in the FROM clause"));
 	}
 
+
+	BOOL rteHasSecurityQuals = gpdb::ListLength(rte->securityQuals) > 0;
+
+	// query_id_for_target_rel is used to tag table descriptors assigned to target
+	// (result) relations one. In case of possible nested DML subqueries it's
+	// field points to target relation of corresponding Query structure of subquery.
+	ULONG query_id_for_target_rel = UNASSIGNED_QUERYID;
+	if (m_query->resultRelation > 0 &&
+		ULONG(m_query->resultRelation) == rt_index)
+	{
+		query_id_for_target_rel = m_query_id;
+	}
+
 	// construct table descriptor for the scan node from the range table entry
 	CDXLTableDescr *dxl_table_descr = CTranslatorUtils::GetTableDescr(
 		m_mp, m_md_accessor, m_context->m_colid_counter, rte,
-		&m_context->m_has_distributed_tables);
+		query_id_for_target_rel, &m_context->m_has_distributed_tables);
 
 	CDXLLogicalGet *dxl_op = nullptr;
 	const IMDRelation *md_rel =
 		m_md_accessor->RetrieveRel(dxl_table_descr->MDId());
-	if (IMDRelation::ErelstorageExternal == md_rel->RetrieveRelStorageType())
+	if (IMDRelation::ErelstorageForeign == md_rel->RetrieveRelStorageType())
 	{
-		dxl_op = GPOS_NEW(m_mp) CDXLLogicalExternalGet(m_mp, dxl_table_descr);
+		dxl_op = GPOS_NEW(m_mp) CDXLLogicalForeignGet(m_mp, dxl_table_descr);
 	}
 	else
 	{
-		dxl_op = GPOS_NEW(m_mp) CDXLLogicalGet(m_mp, dxl_table_descr);
+		dxl_op = GPOS_NEW(m_mp)
+			CDXLLogicalGet(m_mp, dxl_table_descr, rteHasSecurityQuals);
 	}
 
 	CDXLNode *dxl_node = GPOS_NEW(m_mp) CDXLNode(m_mp, dxl_op);
@@ -3160,36 +3500,6 @@ CTranslatorQueryToDXL::TranslateRTEToDXLLogicalGet(const RangeTblEntry *rte,
 
 	// make note of the operator classes used in the distribution key
 	NoteDistributionPolicyOpclasses(rte);
-
-	IMdIdArray *partition_mdids = md_rel->ChildPartitionMdids();
-	IMDRelation::Erelstoragetype rel_storage_type =
-		IMDRelation::ErelstorageSentinel;
-	for (ULONG ul = 0; partition_mdids && ul < partition_mdids->Size(); ++ul)
-	{
-		IMDId *part_mdid = (*partition_mdids)[ul];
-		const IMDRelation *partrel = m_md_accessor->RetrieveRel(part_mdid);
-
-		if (partrel->IsPartitioned())
-		{
-			// Multi-level partitioned tables are unsupported - fall back
-			GPOS_RAISE(gpdxl::ExmaDXL, gpdxl::ExmiQuery2DXLUnsupportedFeature,
-					   GPOS_WSZ_LIT("Multi-level partitioned tables"));
-		}
-
-
-		if (partrel->RetrieveRelStorageType() != rel_storage_type)
-		{
-			if (rel_storage_type == IMDRelation::ErelstorageSentinel)
-			{
-				rel_storage_type = partrel->RetrieveRelStorageType();
-				continue;
-			}
-
-			// Multi-level partitioned tables are unsupported - fall back
-			GPOS_RAISE(gpdxl::ExmaDXL, gpdxl::ExmiQuery2DXLUnsupportedFeature,
-					   GPOS_WSZ_LIT("Heterogeneous partition storage types"));
-		}
-	}
 
 	return dxl_node;
 }
@@ -3234,10 +3544,19 @@ CTranslatorQueryToDXL::NoteDistributionPolicyOpclasses(const RangeTblEntry *rte)
 		gpdb::RelationWrapper rel = gpdb::GetRelation(rte->relid);
 		GpPolicy *policy = rel->rd_cdbpolicy;
 
-		// master-only tables
+		// coordinator-only tables
 		if (nullptr == policy)
 		{
 			return;
+		}
+
+		if (!optimizer_enable_replicated_table &&
+			policy->ptype == POLICYTYPE_REPLICATED)
+		{
+			GPOS_RAISE(
+				gpdxl::ExmaMD, gpdxl::ExmiMDObjUnsupported,
+				GPOS_WSZ_LIT(
+					"Use optimizer_enable_replicated_table to enable replicated tables"));
 		}
 
 		int policy_nattrs = policy->nattrs;
@@ -3267,9 +3586,13 @@ CTranslatorQueryToDXL::NoteDistributionPolicyOpclasses(const RangeTblEntry *rte)
 					gpdb::GetDefaultDistributionOpclassForType(typeoid);
 
 				if (opclasses[i] == default_opclass)
+				{
 					contains_default_hashops = true;
+				}
 				else
+				{
 					contains_nondefault_hashops = true;
+				}
 			}
 		}
 
@@ -3286,10 +3609,12 @@ CTranslatorQueryToDXL::NoteDistributionPolicyOpclasses(const RangeTblEntry *rte)
 		{
 			if (m_context->m_distribution_hashops !=
 				DistrHashOpsNotDeterminedYet)
+			{
 				GPOS_RAISE(
 					gpdxl::ExmaMD, gpdxl::ExmiMDObjUnsupported,
 					GPOS_WSZ_LIT(
 						"Query contains relations with a mix of default and legacy hash opclasses"));
+			}
 			m_context->m_distribution_hashops = DistrUseDefaultHashOps;
 		}
 		if (contains_legacy_hashops &&
@@ -3297,10 +3622,12 @@ CTranslatorQueryToDXL::NoteDistributionPolicyOpclasses(const RangeTblEntry *rte)
 		{
 			if (m_context->m_distribution_hashops !=
 				DistrHashOpsNotDeterminedYet)
+			{
 				GPOS_RAISE(
 					gpdxl::ExmaMD, gpdxl::ExmiMDObjUnsupported,
 					GPOS_WSZ_LIT(
 						"Query contains relations with a mix of default and legacy hash opclasses"));
+			}
 			m_context->m_distribution_hashops = DistrUseLegacyHashOps;
 		}
 	}
@@ -3398,7 +3725,8 @@ CTranslatorQueryToDXL::TranslateValueScanRTEToDXL(const RangeTblEntry *rte,
 
 				CDXLColDescr *dxl_col_descr = GPOS_NEW(m_mp) CDXLColDescr(
 					mdname, colid, col_pos_idx + 1 /* attno */,
-					GPOS_NEW(m_mp) CMDIdGPDB(const_expr->consttype),
+					GPOS_NEW(m_mp)
+						CMDIdGPDB(IMDId::EmdidGeneral, const_expr->consttype),
 					const_expr->consttypmod, false /* is_dropped */
 				);
 
@@ -3430,7 +3758,8 @@ CTranslatorQueryToDXL::TranslateValueScanRTEToDXL(const RangeTblEntry *rte,
 
 					CDXLColDescr *dxl_col_descr = GPOS_NEW(m_mp) CDXLColDescr(
 						mdname, colid, col_pos_idx + 1 /* attno */,
-						GPOS_NEW(m_mp) CMDIdGPDB(gpdb::ExprType((Node *) expr)),
+						GPOS_NEW(m_mp) CMDIdGPDB(IMDId::EmdidGeneral,
+												 gpdb::ExprType((Node *) expr)),
 						gpdb::ExprTypeMod((Node *) expr), false /* is_dropped */
 					);
 					dxl_col_descr_array->Append(dxl_col_descr);
@@ -3593,26 +3922,21 @@ CTranslatorQueryToDXL::TranslateTVFToDXL(const RangeTblEntry *rte,
 				   GPOS_WSZ_LIT("Multi-argument UNNEST() or TABLE()"));
 	}
 	RangeTblFunction *rtfunc = (RangeTblFunction *) linitial(rte->functions);
-	FuncExpr *funcexpr = (FuncExpr *) rtfunc->funcexpr;
-	GPOS_ASSERT(funcexpr);
+
+	BOOL is_composite_const =
+		CTranslatorUtils::IsCompositeConst(m_mp, m_md_accessor, rtfunc);
 
 	// if this is a folded function expression, generate a project over a CTG
-	if (!IsA(funcexpr, FuncExpr))
+	if (!IsA(rtfunc->funcexpr, FuncExpr) && !is_composite_const)
 	{
-		if (gpdb::IsCompositeType(funcexpr->funcid))
-		{
-			GPOS_RAISE(gpdxl::ExmaDXL, gpdxl::ExmiQuery2DXLUnsupportedFeature,
-					   GPOS_WSZ_LIT("Whole-row variable"));
-		}
-
 		CDXLNode *const_tbl_get_dxlnode = DXLDummyConstTableGet();
 
 		CDXLNode *project_list_dxlnode = GPOS_NEW(m_mp)
 			CDXLNode(m_mp, GPOS_NEW(m_mp) CDXLScalarProjList(m_mp));
 
-		CDXLNode *project_elem_dxlnode =
-			TranslateExprToDXLProject((Expr *) funcexpr, rte->eref->aliasname,
-									  true /* insist_new_colids */);
+		CDXLNode *project_elem_dxlnode = TranslateExprToDXLProject(
+			(Expr *) rtfunc->funcexpr, rte->eref->aliasname,
+			true /* insist_new_colids */);
 		project_list_dxlnode->AddChild(project_elem_dxlnode);
 
 		CDXLNode *project_dxlnode = GPOS_NEW(m_mp)
@@ -3636,6 +3960,29 @@ CTranslatorQueryToDXL::TranslateTVFToDXL(const RangeTblEntry *rte,
 
 	BOOL is_subquery_in_args = false;
 
+	// funcexpr evaluates to const and returns composite type
+	if (IsA(rtfunc->funcexpr, Const))
+	{
+		// If the const is NULL, the const value cannot be populated
+		// Raise exception
+		// This happens to PostGIS functions, which aren't supported
+		const Const *constant = (Const *) rtfunc->funcexpr;
+		if (constant->constisnull)
+		{
+			GPOS_RAISE(gpdxl::ExmaDXL, gpdxl::ExmiQuery2DXLUnsupportedFeature,
+					   GPOS_WSZ_LIT("Row-type variable"));
+		}
+
+		CDXLNode *constValue = m_scalar_translator->TranslateScalarToDXL(
+			(Expr *) (rtfunc->funcexpr), m_var_to_colid_map);
+		tvf_dxlnode->AddChild(constValue);
+		return tvf_dxlnode;
+	}
+
+	GPOS_ASSERT(IsA(rtfunc->funcexpr, FuncExpr));
+
+	FuncExpr *funcexpr = (FuncExpr *) rtfunc->funcexpr;
+
 	// check if arguments contain SIRV functions
 	if (NIL != funcexpr->args && HasSirvFunctions((Node *) funcexpr->args))
 	{
@@ -3656,7 +4003,8 @@ CTranslatorQueryToDXL::TranslateTVFToDXL(const RangeTblEntry *rte,
 		tvf_dxlnode->AddChild(func_expr_arg_dxlnode);
 	}
 
-	CMDIdGPDB *mdid_func = GPOS_NEW(m_mp) CMDIdGPDB(funcexpr->funcid);
+	CMDIdGPDB *mdid_func =
+		GPOS_NEW(m_mp) CMDIdGPDB(IMDId::EmdidGeneral, funcexpr->funcid);
 	const IMDFunction *pmdfunc = m_md_accessor->RetrieveFunc(mdid_func);
 	if (is_subquery_in_args &&
 		IMDFunction::EfsVolatile == pmdfunc->GetFuncStability())
@@ -3698,8 +4046,14 @@ CTranslatorQueryToDXL::TranslateCTEToDXL(const RangeTblEntry *rte,
 	const List *cte_producer_target_list =
 		cte_list_entry->GetCTEProducerTargetList(rte->ctename);
 
-	GPOS_ASSERT(nullptr != cte_producer_dxlnode &&
-				nullptr != cte_producer_target_list);
+	// fallback to Postgres optimizer in case of empty target list
+	if (NIL == cte_producer_target_list)
+	{
+		GPOS_RAISE(gpdxl::ExmaDXL, gpdxl::ExmiQuery2DXLUnsupportedFeature,
+				   GPOS_WSZ_LIT("Empty target list"));
+	}
+
+	GPOS_ASSERT(nullptr != cte_producer_dxlnode);
 
 	CDXLLogicalCTEProducer *cte_producer_dxlop =
 		CDXLLogicalCTEProducer::Cast(cte_producer_dxlnode->GetOperator());
@@ -3848,6 +4202,11 @@ CTranslatorQueryToDXL::TranslateJoinExprInFromToDXL(JoinExpr *join_expr)
 	ForBoth(lc_node, rte->joinaliasvars, lc_col_name, alias->colnames)
 	{
 		Node *join_alias_node = (Node *) lfirst(lc_node);
+		// rte->joinaliasvars may contain NULL ptrs which indicates dropped columns
+		if (!join_alias_node)
+		{
+			continue;
+		}
 		GPOS_ASSERT(IsA(join_alias_node, Var) ||
 					IsA(join_alias_node, CoalesceExpr));
 		Value *value = (Value *) lfirst(lc_col_name);
@@ -3943,17 +4302,19 @@ CTranslatorQueryToDXL::TranslateTargetListToDXLProject(
 					GPOS_WSZ_LIT("Grouping function with outer references"));
 			}
 		}
-		else if (!is_groupby || (is_groupby && is_grouping_col))
+		else if (!is_groupby || is_grouping_col)
 		{
 			// Insist projection for any outer refs to ensure any decorelation of a
 			// subquery results in a correct plan using the projected reference,
 			// instead of the outer ref directly.
 			// TODO: Remove is_grouping_col from this check once const projections in
 			// subqueries no longer prevent decorrelation
+			BOOL is_orderby_col = CTranslatorUtils::IsSortingColumn(
+				target_entry, m_query->sortClause);
 			BOOL insist_proj =
-				(IsA(target_entry->expr, Var) &&
-				 ((Var *) (target_entry->expr))->varlevelsup > 0 &&
-				 !is_grouping_col);
+				IsA(target_entry->expr, Var) &&
+				((Var *) (target_entry->expr))->varlevelsup > 0 &&
+				!is_orderby_col && !is_grouping_col;
 			CDXLNode *project_elem_dxlnode = TranslateExprToDXLProject(
 				target_entry->expr, target_entry->resname,
 				insist_proj /* insist_new_colids */);
@@ -4119,7 +4480,8 @@ CTranslatorQueryToDXL::CreateDXLProjectNullsForGroupingSets(
 
 			colid = m_context->m_colid_counter->next_id();
 
-			CMDIdGPDB *mdid = GPOS_NEW(m_mp) CMDIdGPDB(oid_type);
+			CMDIdGPDB *mdid =
+				GPOS_NEW(m_mp) CMDIdGPDB(IMDId::EmdidGeneral, oid_type);
 			CDXLNode *project_elem_dxlnode =
 				CTranslatorUtils::CreateDXLProjElemConstNULL(
 					m_mp, m_md_accessor, mdid, colid, target_entry->resname);
@@ -4295,8 +4657,8 @@ CTranslatorQueryToDXL::CreateDXLOutputCols(
 			CTranslatorUtils::GetColId(resno, attno_to_colid_mapping);
 
 		// create a column reference
-		IMDId *mdid_type = GPOS_NEW(m_mp)
-			CMDIdGPDB(gpdb::ExprType((Node *) target_entry->expr));
+		IMDId *mdid_type = GPOS_NEW(m_mp) CMDIdGPDB(
+			IMDId::EmdidGeneral, gpdb::ExprType((Node *) target_entry->expr));
 		INT type_modifier = gpdb::ExprTypeMod((Node *) target_entry->expr);
 		CDXLColRef *dxl_colref =
 			GPOS_NEW(m_mp) CDXLColRef(mdname, colid, mdid_type, type_modifier);

@@ -350,6 +350,7 @@ typedef struct
 	Index		agg_expr_id;
 	Bitmapset  *agg_args_id_bms; /* each DQA's arg indexes bitmapset */
 	Expr	   *agg_filter;		/* DQA's filter. since tuplesplit, filter have to push down */
+	Bitmapset  *agg_vars_ref;	/* vars of normal agg, which assigned to this DQAExpr */
 } DQAExpr;
 
 /*
@@ -871,6 +872,9 @@ typedef struct SubPlan
 
 /*
  * AlternativeSubPlan - expression node for a choice among SubPlans
+ *
+ * This is used only transiently during planning: by the time the plan
+ * reaches the executor, all AlternativeSubPlan nodes have been removed.
  *
  * The subplans are given as a List so that the node definition need not
  * change if there's ever more than two alternatives.  For the moment,

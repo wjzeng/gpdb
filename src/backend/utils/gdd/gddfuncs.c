@@ -58,16 +58,10 @@ lockEqual(LockInstanceData *lock1, LockInstanceData *lock2)
 static bool
 lockIsHoldTillEndXact(LockInstanceData *lock)
 {
-	LOCKTAG		*tag = &lock->locktag;
-
 	if (lock->holdTillEndXact)
 		return true;
 
-	if (tag->locktag_type == LOCKTAG_TRANSACTION)
-		return true;
-
 	/* FIXME: other types */
-
 	return false;
 }
 
@@ -106,9 +100,9 @@ gp_dist_wait_status(PG_FUNCTION_ARGS)
 		TupleDescInitEntry(tupdesc, (AttrNumber) 1, "segid",
 						   INT4OID, -1, 0);
 		TupleDescInitEntry(tupdesc, (AttrNumber) 2, "waiter_dxid",
-						   XIDOID, -1, 0);
+						   INT8OID, -1, 0);
 		TupleDescInitEntry(tupdesc, (AttrNumber) 3, "holder_dxid",
-						   XIDOID, -1, 0);
+						   INT8OID, -1, 0);
 		TupleDescInitEntry(tupdesc, (AttrNumber) 4, "holdTillEndXact",
 						   BOOLOID, -1, 0);
 		TupleDescInitEntry(tupdesc, (AttrNumber) 5, "waiter_lpid",
@@ -266,8 +260,8 @@ gp_dist_wait_status(PG_FUNCTION_ARGS)
 			h_dxid = h_lock->distribXid;
 
 			values[0] = Int32GetDatum(GpIdentity.segindex);
-			values[1] = TransactionIdGetDatum(w_dxid);
-			values[2] = TransactionIdGetDatum(h_dxid);
+			values[1] = Int64GetDatum(w_dxid);
+			values[2] = Int64GetDatum(h_dxid);
 			values[3] = BoolGetDatum(lockIsHoldTillEndXact(w_lock));
 			values[4] = Int32GetDatum(w_lock->pid);
 			values[5] = Int32GetDatum(h_lock->pid);
@@ -307,8 +301,8 @@ gp_dist_wait_status(PG_FUNCTION_ARGS)
 				int row = ctx->row++;
 
 				values[0] = Int32GetDatum(atoi(PQgetvalue(pg_result, row, 0)));
-				values[1] = TransactionIdGetDatum(atoi(PQgetvalue(pg_result, row, 1)));
-				values[2] = TransactionIdGetDatum(atoi(PQgetvalue(pg_result, row, 2)));
+				values[1] = Int64GetDatum(atol(PQgetvalue(pg_result, row, 1)));
+				values[2] = Int64GetDatum(atol(PQgetvalue(pg_result, row, 2)));
 				values[3] = BoolGetDatum(strncmp(PQgetvalue(pg_result, row, 3), "t", 1) == 0);
 				values[4] = Int32GetDatum(atoi(PQgetvalue(pg_result, row, 4)));
 				values[5] = Int32GetDatum(atoi(PQgetvalue(pg_result, row, 5)));
@@ -328,8 +322,6 @@ gp_dist_wait_status(PG_FUNCTION_ARGS)
 	}
 
 	cdbdisp_clearCdbPgResults(&ctx->cdb_pgresults);
-	if (Gp_role == GP_ROLE_DISPATCH)
-		DisconnectAndDestroyAllGangs(false);
 
 	SRF_RETURN_DONE(funcctx);
 }

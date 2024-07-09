@@ -132,6 +132,13 @@ xlog_desc(StringInfo buf, XLogReaderState *record)
 		nextGxid = *((DistributedTransactionId *) rec);
 		appendStringInfo(buf, UINT64_FORMAT, nextGxid);
 	}
+	else if (info == XLOG_LATESTCOMPLETED_GXID)
+	{
+		DistributedTransactionId gxid;
+
+		gxid = *((DistributedTransactionId *) rec);
+		appendStringInfo(buf, UINT64_FORMAT, gxid);
+	}
 	else if (info == XLOG_NEXTRELFILENODE)
 	{
 		Oid			nextRelfilenode;
@@ -205,6 +212,16 @@ xlog_desc(StringInfo buf, XLogReaderState *record)
 						 xlrec.ThisTimeLineID, xlrec.PrevTimeLineID,
 						 timestamptz_to_str(xlrec.end_time));
 	}
+	else if (info == XLOG_OVERWRITE_CONTRECORD)
+	{
+		xl_overwrite_contrecord xlrec;
+
+		memcpy(&xlrec, rec, sizeof(xl_overwrite_contrecord));
+		appendStringInfo(buf, "lsn %X/%X; time %s",
+						 (uint32) (xlrec.overwritten_lsn >> 32),
+						 (uint32) xlrec.overwritten_lsn,
+						 timestamptz_to_str(xlrec.overwrite_time));
+	}
 }
 
 const char *
@@ -229,6 +246,9 @@ xlog_identify(uint8 info)
 		case XLOG_NEXTGXID:
 			id = "NEXTGXID";
 			break;
+		case XLOG_LATESTCOMPLETED_GXID:
+			id = "XLOG_LATESTCOMPLETED_GXID";
+			break;
 		case XLOG_NEXTRELFILENODE:
 			id = "NEXTRELFILENODE";
 			break;
@@ -249,6 +269,9 @@ xlog_identify(uint8 info)
 			break;
 		case XLOG_END_OF_RECOVERY:
 			id = "END_OF_RECOVERY";
+			break;
+		case XLOG_OVERWRITE_CONTRECORD:
+			id = "OVERWRITE_CONTRECORD";
 			break;
 		case XLOG_FPI:
 			id = "FPI";

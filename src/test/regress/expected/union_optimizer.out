@@ -1,3 +1,4 @@
+set optimizer_trace_fallback = on;
 --
 -- UNION (also INTERSECT, EXCEPT)
 --
@@ -592,25 +593,29 @@ set enable_hashagg = true;
 set enable_sort = false;
 explain (costs off)
 select from generate_series(1,5) union select from generate_series(1,3);
-                           QUERY PLAN                           
-----------------------------------------------------------------
- HashAggregate
+                              QUERY PLAN                              
+----------------------------------------------------------------------
+ Aggregate
    ->  Append
-         ->  Function Scan on generate_series
-         ->  Function Scan on generate_series generate_series_1
-(4 rows)
+         ->  Aggregate
+               ->  Function Scan on generate_series
+         ->  Aggregate
+               ->  Function Scan on generate_series generate_series_1
+ Optimizer: Pivotal Optimizer (GPORCA)
+(7 rows)
 
 explain (costs off)
 select from generate_series(1,5) intersect select from generate_series(1,3);
-                              QUERY PLAN                              
-----------------------------------------------------------------------
- HashSetOp Intersect
-   ->  Append
-         ->  Subquery Scan on "*SELECT* 1"
-               ->  Function Scan on generate_series
-         ->  Subquery Scan on "*SELECT* 2"
-               ->  Function Scan on generate_series generate_series_1
-(6 rows)
+                           QUERY PLAN                           
+----------------------------------------------------------------
+ Nested Loop
+   Join Filter: true
+   ->  Aggregate
+         ->  Function Scan on generate_series generate_series_1
+   ->  Aggregate
+         ->  Function Scan on generate_series
+ Optimizer: Pivotal Optimizer (GPORCA)
+(7 rows)
 
 select from generate_series(1,5) union select from generate_series(1,3);
 --
@@ -641,25 +646,29 @@ set enable_hashagg = false;
 set enable_sort = true;
 explain (costs off)
 select from generate_series(1,5) union select from generate_series(1,3);
-                           QUERY PLAN                           
-----------------------------------------------------------------
- Unique
+                              QUERY PLAN                              
+----------------------------------------------------------------------
+ Aggregate
    ->  Append
-         ->  Function Scan on generate_series
-         ->  Function Scan on generate_series generate_series_1
-(4 rows)
+         ->  Aggregate
+               ->  Function Scan on generate_series
+         ->  Aggregate
+               ->  Function Scan on generate_series generate_series_1
+ Optimizer: Pivotal Optimizer (GPORCA)
+(7 rows)
 
 explain (costs off)
 select from generate_series(1,5) intersect select from generate_series(1,3);
-                              QUERY PLAN                              
-----------------------------------------------------------------------
- SetOp Intersect
-   ->  Append
-         ->  Subquery Scan on "*SELECT* 1"
-               ->  Function Scan on generate_series
-         ->  Subquery Scan on "*SELECT* 2"
-               ->  Function Scan on generate_series generate_series_1
-(6 rows)
+                           QUERY PLAN                           
+----------------------------------------------------------------
+ Nested Loop
+   Join Filter: true
+   ->  Aggregate
+         ->  Function Scan on generate_series generate_series_1
+   ->  Aggregate
+         ->  Function Scan on generate_series
+ Optimizer: Pivotal Optimizer (GPORCA)
+(7 rows)
 
 select from generate_series(1,5) union select from generate_series(1,3);
 --
@@ -762,7 +771,7 @@ explain (costs off)
                                  ->  Seq Scan on t1
                      ->  Index Scan using t2_pkey on t2
                            Index Cond: (ab = 'ab'::text)
- Optimizer: Pivotal Optimizer (GPORCA) version 3.83.0
+ Optimizer: Pivotal Optimizer (GPORCA)
 (14 rows)
 
 --
@@ -785,6 +794,8 @@ explain (costs off)
    UNION ALL
    SELECT ab FROM t2) t
   ORDER BY 1 LIMIT 8;
+INFO:  GPORCA failed to produce a plan, falling back to Postgres-based planner
+DETAIL:  Falling back to Postgres-based planner because GPORCA does not support the following feature: Inherited tables
                          QUERY PLAN                         
 ------------------------------------------------------------
  Limit
@@ -805,6 +816,8 @@ explain (costs off)
    UNION ALL
    SELECT ab FROM t2) t
   ORDER BY 1 LIMIT 8;
+INFO:  GPORCA failed to produce a plan, falling back to Postgres-based planner
+DETAIL:  Falling back to Postgres-based planner because GPORCA does not support the following feature: Inherited tables
  ab 
 ----
  ab
@@ -833,6 +846,8 @@ select event_id
        union all
        select event_id from other_events) ss
  order by event_id;
+INFO:  GPORCA failed to produce a plan, falling back to Postgres-based planner
+DETAIL:  Falling back to Postgres-based planner because GPORCA does not support the following feature: Inherited tables
                            QUERY PLAN                           
 ----------------------------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)
@@ -857,6 +872,8 @@ explain (costs off)
    UNION ALL
    SELECT 2 AS t, * FROM tenk1 b) c
  WHERE t = 2;
+INFO:  GPORCA failed to produce a plan, falling back to Postgres-based planner
+DETAIL:  Falling back to Postgres-based planner because GPORCA does not support the following feature: Non-default collation
                 QUERY PLAN                
 ------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)
@@ -903,23 +920,21 @@ SELECT * FROM
    SELECT 2 AS t, 4 AS x) ss
 WHERE x < 4
 ORDER BY x;
-                            QUERY PLAN                            
-------------------------------------------------------------------
- Sort
-   Sort Key: (generate_series(1, 10))
-   ->  GroupAggregate
-         Group Key: (1), (generate_series(1, 10))
-         ->  Sort
-               Sort Key: (1), (generate_series(1, 10))
-               ->  Append
-                     ->  Result
-                           Filter: ((generate_series(1, 10)) < 4)
-                           ->  ProjectSet
-                                 ->  Result
-                     ->  Result
-                           One-Time Filter: false
- Optimizer: Pivotal Optimizer (GPORCA) version 3.83.0
-(14 rows)
+                         QUERY PLAN                         
+------------------------------------------------------------
+ GroupAggregate
+   Group Key: (1), (generate_series(1, 10))
+   ->  Sort
+         Sort Key: (generate_series(1, 10)), (1)
+         ->  Append
+               ->  Result
+                     Filter: ((generate_series(1, 10)) < 4)
+                     ->  ProjectSet
+                           ->  Result
+               ->  Result
+                     One-Time Filter: false
+ Optimizer: Pivotal Optimizer (GPORCA)
+(12 rows)
 
 SELECT * FROM
   (SELECT 1 AS t, generate_series(1,10) AS x
@@ -941,6 +956,8 @@ SELECT * FROM
    SELECT 2 AS t, 4 AS x) ss
 WHERE x > 3
 ORDER BY x;
+INFO:  GPORCA failed to produce a plan, falling back to Postgres-based planner
+DETAIL:  Falling back to Postgres-based planner because GPORCA does not support the following feature: SIRV functions
                                QUERY PLAN                                
 -------------------------------------------------------------------------
  Sort
@@ -963,6 +980,8 @@ SELECT * FROM
    SELECT 2 AS t, 4 AS x) ss
 WHERE x > 3
 ORDER BY x;
+INFO:  GPORCA failed to produce a plan, falling back to Postgres-based planner
+DETAIL:  Falling back to Postgres-based planner because GPORCA does not support the following feature: SIRV functions
  t | x 
 ---+---
  2 | 4
@@ -980,24 +999,24 @@ where q2 = q2;
 ---------------------------------------------------------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)
    ->  GroupAggregate
-         Group Key: int8_tbl.q1
+         Group Key: i81.q1
          ->  Sort
-               Sort Key: int8_tbl.q1
+               Sort Key: i81.q1
                ->  Append
                      ->  GroupAggregate
-                           Group Key: int8_tbl.q1
+                           Group Key: i81.q1
                            ->  Sort
-                                 Sort Key: int8_tbl.q1
-                                 ->  Seq Scan on int8_tbl
+                                 Sort Key: i81.q1
+                                 ->  Seq Scan on int8_tbl i81
                                        Filter: (q2 = q2)
                      ->  GroupAggregate
-                           Group Key: int8_tbl_1.q1
+                           Group Key: i82.q1
                            ->  Sort
-                                 Sort Key: int8_tbl_1.q1
-                                 ->  Seq Scan on int8_tbl int8_tbl_1
+                                 Sort Key: i82.q1
+                                 ->  Seq Scan on int8_tbl i82
                                        Filter: (q2 = q2)
  Optimizer: Pivotal Optimizer (GPORCA)
-(26 rows)
+(19 rows)
 
 select distinct q1 from
   (select distinct * from int8_tbl i81
@@ -1020,24 +1039,24 @@ where -q1 = q2;
 ---------------------------------------------------------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)
    ->  GroupAggregate
-         Group Key: int8_tbl.q1
+         Group Key: i81.q1
          ->  Sort
-               Sort Key: int8_tbl.q1
+               Sort Key: i81.q1
                ->  Append
                      ->  GroupAggregate
-                           Group Key: int8_tbl.q1
+                           Group Key: i81.q1
                            ->  Sort
-                                 Sort Key: int8_tbl.q1
-                                 ->  Seq Scan on int8_tbl
+                                 Sort Key: i81.q1
+                                 ->  Seq Scan on int8_tbl i81
                                        Filter: ((- q1) = q2)
                      ->  GroupAggregate
-                           Group Key: int8_tbl_1.q1
+                           Group Key: i82.q1
                            ->  Sort
-                                 Sort Key: int8_tbl_1.q1
-                                 ->  Seq Scan on int8_tbl int8_tbl_1
+                                 Sort Key: i82.q1
+                                 ->  Seq Scan on int8_tbl i82
                                        Filter: ((- q1) = q2)
  Optimizer: Pivotal Optimizer (GPORCA)
-(26 rows)
+(19 rows)
 
 select distinct q1 from
   (select distinct * from int8_tbl i81
@@ -1065,10 +1084,10 @@ select * from
 ---------------------------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)
    ->  Hash Join
-         Hash Cond: (expensivefunc(t3.x) = int4_tbl.f1)
+         Hash Cond: (expensivefunc(a.x) = int4_tbl.f1)
          ->  Append
-               ->  Seq Scan on t3
-               ->  Seq Scan on t3 t3_1
+               ->  Seq Scan on t3 a
+               ->  Seq Scan on t3 b
          ->  Hash
                ->  Broadcast Motion 3:3  (slice2; segments: 3)
                      ->  Seq Scan on int4_tbl
@@ -1098,11 +1117,11 @@ where (x = 0) or (q1 >= q2 and q1 <= q2);
  Gather Motion 3:1  (slice1; segments: 3)
    ->  Append
          ->  Result
-               Filter: (((0) = 0) OR ((int8_tbl.q1 >= int8_tbl.q2) AND (int8_tbl.q1 <= int8_tbl.q2)))
-               ->  Seq Scan on int8_tbl
+               Filter: (((0) = 0) OR ((a.q1 >= a.q2) AND (a.q1 <= a.q2)))
+               ->  Seq Scan on int8_tbl a
          ->  Result
-               Filter: (((1) = 0) OR ((int8_tbl_1.q1 >= int8_tbl_1.q2) AND (int8_tbl_1.q1 <= int8_tbl_1.q2)))
-               ->  Seq Scan on int8_tbl int8_tbl_1
+               Filter: (((1) = 0) OR ((b.q1 >= b.q2) AND (b.q1 <= b.q2)))
+               ->  Seq Scan on int8_tbl b
  Optimizer: Pivotal Optimizer (GPORCA)
 (9 rows)
 
@@ -1121,3 +1140,4 @@ where (x = 0) or (q1 >= q2 and q1 <= q2);
  4567890123456789 |  4567890123456789 | 1
 (6 rows)
 
+reset optimizer_trace_fallback;

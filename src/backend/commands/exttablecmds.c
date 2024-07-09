@@ -39,6 +39,7 @@
 #include "cdb/cdbsreh.h"
 
 static char* transformLocationUris(List *locs, bool isweb, bool iswritable);
+static char* escape_uri(char *uri);
 static char* transformExecOnClause(List *on_clause);
 static char transformFormatType(char *formatname);
 static List * transformFormatOpts(char formattype, List *formatOpts, int numcols, bool iswritable);
@@ -47,7 +48,6 @@ static bool ExtractErrorLogPersistent(List **options);
 static List * GenerateExtTableEntryOptions(Oid tbloid,
 										   bool iswritable,
 										   bool issreh,
-										   char formattype,
 										   char rejectlimittype,
 										   char* commandString,
 										   int rejectlimit,
@@ -117,6 +117,7 @@ DefineExternalRelation(CreateExternalStmt *createExtStmt)
 	createStmt->tablespacename = NULL;
 	createStmt->distributedBy = createExtStmt->distributedBy; /* policy was set in transform */
 	createStmt->ownerid = userid;
+	createStmt->origin = ORIGIN_NO_GEN;
 
 	switch (exttypeDesc->exttabletype)
 	{
@@ -232,9 +233,9 @@ DefineExternalRelation(CreateExternalStmt *createExtStmt)
 				 nodeTag(dencoding->arg));
 	}
 
-	/* If encoding is defaulted, use database encoding */
+	/* If encoding is defaulted, use database server encoding */
 	if (encoding < 0)
-		encoding = pg_get_client_encoding();
+		encoding = GetDatabaseEncoding();
 
 	/*
 	 * If the number of locations (file or http URIs) exceed the number of
@@ -292,7 +293,6 @@ DefineExternalRelation(CreateExternalStmt *createExtStmt)
 	entryOptions = GenerateExtTableEntryOptions(reloid,
 										   iswritable,
 										   issreh,
-										   formattype,
 										   rejectlimittype,
 										   commandString,
 										   rejectlimit,
@@ -358,6 +358,7 @@ transformLocationUris(List *locs, bool isweb, bool iswritable)
 		Uri		   *uri;
 		char	   *uri_str_orig;
 		char	   *uri_str_final;
+		char	   *uri_str_escape;
 		Value	   *v = lfirst(cell);
 
 		/* get the current URI string from the command */
@@ -464,21 +465,48 @@ transformLocationUris(List *locs, bool isweb, bool iswritable)
 							uri_str_final),
 					 errhint("Specify the explicit path and file name to write into.")));
 
+		uri_str_escape = escape_uri(uri_str_final);
+		pfree(uri_str_final);
 		if (first_uri)
 		{
-			appendStringInfo(&buf, "%s", uri_str_final);
+			appendStringInfo(&buf, "%s", uri_str_escape);
 			first_uri = false;
 		}
 		else
 		{
-			appendStringInfo(&buf, "|%s", uri_str_final);
+			appendStringInfo(&buf, "|%s", uri_str_escape);
 		}
 
 		FreeExternalTableUri(uri);
-		pfree(uri_str_final);
+		pfree(uri_str_escape);
 	}
 
 	return buf.data;
+}
+
+/* Since | is used as a delimiter, need to escape the | in the data,
+ * use \ as escape, and \ itself also needs to be escaped.
+ */
+static char*
+escape_uri(char *uri)
+{
+	size_t len = strlen(uri);
+	char *output = (char *)palloc((len * 2) + 1);
+	int i, j = 0;
+	for (i = 0; uri[i] != '\0'; i++)
+	{
+		if (uri[i] == '|' || uri[i] == '\\')
+		{
+			output[j++] = '\\';
+			output[j++] = uri[i];
+		}
+		else
+		{
+			output[j++] = uri[i];
+		}
+ 	}
+	output[j] = '\0';
+	return output;
 }
 
 static char*
@@ -594,7 +622,7 @@ list_join(List *list, char delimiter)
 		const char *cellval;
 
 		cellval = strVal(lfirst(cell));
-		appendStringInfo(&buf, "%s%c", quote_identifier(cellval), delimiter);
+		appendStringInfo(&buf, "%s%c", cellval, delimiter);
 	}
 
 	/*
@@ -820,7 +848,6 @@ static List*
 GenerateExtTableEntryOptions(Oid 	tbloid,
 							 bool 	iswritable,
 							 bool	issreh,
-							 char	formattype,
 							 char	rejectlimittype,
 							 char*	commandString,
 							 int	rejectlimit,
@@ -830,8 +857,6 @@ GenerateExtTableEntryOptions(Oid 	tbloid,
 							 char*	locationUris)
 {
 	List		*entryOptions = NIL;
-
-	entryOptions = lappend(entryOptions, makeDefElem("format_type", (Node *) makeString(psprintf("%c", formattype)), -1));
 
 	if (commandString)
 	{
@@ -849,12 +874,29 @@ GenerateExtTableEntryOptions(Oid 	tbloid,
 	if (issreh)
 	{
 		entryOptions = lappend(entryOptions, makeDefElem("reject_limit", (Node *) makeString(psprintf("%d", rejectlimit)), -1));
-		entryOptions = lappend(entryOptions, makeDefElem("reject_limit_type", (Node *) makeString(psprintf("%c", rejectlimittype)), -1));
+		if (rejectlimittype == 'r')
+			entryOptions = lappend(entryOptions, makeDefElem("reject_limit_type", (Node *)makeString("rows"), -1));
+		else if (rejectlimittype == 'p')
+			entryOptions = lappend(entryOptions, makeDefElem("reject_limit_type", (Node *)makeString("percentage"), -1));
 	}
 
-	entryOptions = lappend(entryOptions, makeDefElem("log_errors", (Node *) makeString(psprintf("%c", logerrors)), -1));
-	entryOptions = lappend(entryOptions, makeDefElem("encoding", (Node *) makeString(psprintf("%d", encoding)), -1));
-	entryOptions = lappend(entryOptions, makeDefElem("is_writable", (Node *) makeString(iswritable ? pstrdup("true") : pstrdup("false")), -1));
+	/*
+	 * By default, use "enable", "disable", and "persistently" to align with
+	 * the log_errors macros in "cdbsreh.h".
+	 *
+	 * Check GetExtFromForeignTableOptions(), "true", "false", and "persistent"
+	 * also work.
+	 */
+	if (logerrors == 't')
+		entryOptions = lappend(entryOptions, makeDefElem("log_errors", (Node *) makeString("enable"), -1));
+	else if (logerrors == 'f')
+		entryOptions = lappend(entryOptions, makeDefElem("log_errors", (Node *) makeString("disable"), -1));
+	else if (logerrors == 'p')
+		entryOptions = lappend(entryOptions, makeDefElem("log_errors", (Node *) makeString("persistently"), -1));
+
+	entryOptions = lappend(entryOptions, makeDefElem("encoding", (Node *) makeString(pstrdup(pg_encoding_to_char(encoding))), -1));
+
+	entryOptions = lappend(entryOptions, makeDefElem("is_writable", (Node *) makeString(iswritable ? "true" : "false"), -1));
 
 	/*
 	 * Add the dependency of custom external table

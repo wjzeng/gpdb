@@ -29,10 +29,18 @@ STANDBYDIR=$DATADIRS/standby
 COORDINATOR_DEMO_PORT=${DEMO_PORT_BASE}
 STANDBY_DEMO_PORT=`expr ${DEMO_PORT_BASE} + 1`
 DEMO_PORT_BASE=`expr ${DEMO_PORT_BASE} + 2`
-for (( i=0; i<`expr 2 \* $NUM_PRIMARY_MIRROR_PAIRS`; i++ )); do
-  PORT_NUM=`expr $DEMO_PORT_BASE + $i`
-  DEMO_SEG_PORTS_LIST="$DEMO_SEG_PORTS_LIST $PORT_NUM"
-done
+if [ "${WITH_MIRRORS}" == "true" ]; then
+    for (( i=0; i<`expr 2 \* $NUM_PRIMARY_MIRROR_PAIRS`; i++ )); do
+        PORT_NUM=`expr $DEMO_PORT_BASE + $i`
+        DEMO_SEG_PORTS_LIST="$DEMO_SEG_PORTS_LIST $PORT_NUM"
+    done
+elif [ "${WITH_MIRRORS}" == "false" ]; then
+    for (( i=0; i<${NUM_PRIMARY_MIRROR_PAIRS}; i++ )); do
+        PORT_NUM=`expr $DEMO_PORT_BASE + $i`
+        DEMO_SEG_PORTS_LIST="$DEMO_SEG_PORTS_LIST $PORT_NUM"
+    done
+fi
+
 DEMO_SEG_PORTS_LIST=${DEMO_SEG_PORTS_LIST#* }
 
 # ======================================================================
@@ -53,7 +61,7 @@ checkDemoConfig(){
         echo " This port is needed by the Coordinator Database instance. "
         echo ">>> Edit Makefile to correct the port number (COORDINATOR_PORT). <<<" 
         echo -n " Check to see if the port is free by using : "
-        echo " 'netstat -an | grep ${COORDINATOR_DEMO_PORT}'"
+        echo " 'ss -an | grep ${COORDINATOR_DEMO_PORT}'"
         echo " If the port is not used please make sure files ${PORT_FILE}* are deleted"
         echo ""
         return 1
@@ -68,15 +76,14 @@ checkDemoConfig(){
         echo " This port is needed by the Standby Database instance. "
         echo ">>> Edit Makefile to correct the port number (STANDBY_PORT). <<<"
         echo -n " Check to see if the port is free by using : "
-        echo " 'netstat -an | grep ${STANDBY_DEMO_PORT}'."
+        echo " 'ss -an | grep ${STANDBY_DEMO_PORT}'."
         echo " If the port is not used please make sure files ${PORT_FILE}* are deleted"
         echo ""
         return 1
     fi
 
-    for (( i=0; i<`expr 4 \* $NUM_PRIMARY_MIRROR_PAIRS`; i++ )); do
-	PORT_NUM=`expr $DEMO_PORT_BASE + $i`
-
+    # Check if all Segment Ports are free
+    for PORT_NUM in ${DEMO_SEG_PORTS_LIST}; do
         echo "  Segment port check .. : ${PORT_NUM}"
         PORT_FILE="/tmp/.s.PGSQL.${PORT_NUM}"
         if [ -f ${PORT_FILE} -o -S ${PORT_FILE} ] ; then 
@@ -85,7 +92,7 @@ checkDemoConfig(){
             echo " This port is needed for segment database instance."
             echo ">>> Edit Makefile to correct the base ports (PORT_BASE). <<<"
             echo -n " Check to see if the port is free by using : "
-            echo " 'netstat -an | grep ${PORT_NUM}'"
+            echo " 'ss -an | grep ${PORT_NUM}'"
             echo " If the port is not used please make sure files ${PORT_FILE}* are deleted"
             echo ""
             return 1
@@ -124,19 +131,23 @@ cleanDemo(){
     ##
 
     if [ "${GPDEMO_DESTRUCTIVE_CLEAN}" != "false" ]; then
-        if [ -f hostfile ];  then
+        if [ -f hostfile ]; then
             echo "Deleting hostfile"
             rm -f hostfile
         fi
-        if [ -f clusterConfigFile ];  then
+        if [ -f clusterConfigFile ]; then
             echo "Deleting clusterConfigFile"
             rm -f clusterConfigFile
         fi
-        if [ -d ${DATADIRS} ];  then
+        if [ -f clusterConfigPostgresAddonsFile ]; then
+            echo "Deleting clusterConfigPostgresAddonsFile"
+            rm -f clusterConfigPostgresAddonsFile
+        fi
+        if [ -d ${DATADIRS} ]; then
             echo "Deleting ${DATADIRS}"
             rm -rf ${DATADIRS}
         fi
-        if [ -d logs ];  then
+        if [ -d logs ]; then
             rm -rf logs
         fi
         rm -f optimizer-state.log gpdemo-env.sh
@@ -188,9 +199,22 @@ cat <<-EOF
 
 	----------------------------------------------------------------------
 
-	  This is a demo of the Greenplum Database system.  We will create
-	  a cluster installation with coordinator and `expr 2 \* ${NUM_PRIMARY_MIRROR_PAIRS}` segment instances
+EOF
+
+if [ "${WITH_MIRRORS}" == "true" ]; then
+cat <<-EOF
+	  This is a MIRRORED demo of the Greenplum Database system.  We will
+	  create a cluster installation with coordinator and `expr 2 \* ${NUM_PRIMARY_MIRROR_PAIRS}` segment instances
 	  (${NUM_PRIMARY_MIRROR_PAIRS} primary & ${NUM_PRIMARY_MIRROR_PAIRS} mirror).
+EOF
+elif [ "${WITH_MIRRORS}" == "false" ]; then
+cat <<-EOF
+	  This is a MIRRORLESS demo of the Greenplum Database system.  We will create
+	  a cluster installation with coordinator and ${NUM_PRIMARY_MIRROR_PAIRS} segment instances.
+EOF
+fi
+
+cat <<-EOF
 
 	    GPHOME ................... : ${GPHOME}
 	    COORDINATOR_DATA_DIRECTORY : ${QDDIR}/${SEG_PREFIX}-1
@@ -239,9 +263,11 @@ do
   mkdir -p $PRIMARY_DIR
   PRIMARY_DIRS_LIST="$PRIMARY_DIRS_LIST $PRIMARY_DIR"
 
-  MIRROR_DIR=$DATADIRS/dbfast_mirror$i
-  mkdir -p $MIRROR_DIR
-  MIRROR_DIRS_LIST="$MIRROR_DIRS_LIST $MIRROR_DIR"
+  if [ "${WITH_MIRRORS}" == "true" ]; then
+    MIRROR_DIR=$DATADIRS/dbfast_mirror$i
+    mkdir -p $MIRROR_DIR
+    MIRROR_DIRS_LIST="$MIRROR_DIRS_LIST $MIRROR_DIR"
+  fi
 done
 PRIMARY_DIRS_LIST=${PRIMARY_DIRS_LIST#* }
 MIRROR_DIRS_LIST=${MIRROR_DIRS_LIST#* }
@@ -364,39 +390,26 @@ if [ "${BLDWRAP_POSTGRES_CONF_ADDONS}" != "__none__" ]  && \
 
     [ -f ${CLUSTER_CONFIG_POSTGRES_ADDONS} ] && chmod a+w ${CLUSTER_CONFIG_POSTGRES_ADDONS}
 
-    for addon in $( echo ${BLDWRAP_POSTGRES_CONF_ADDONS} | sed -e "s/|/ /g" ); do
-        echo "" >> ${CLUSTER_CONFIG_POSTGRES_ADDONS}
-        echo $addon >> ${CLUSTER_CONFIG_POSTGRES_ADDONS}
-	if [ "$addon" == "fsync=off" ]; then
-		echo "WARNING: fsync is off, database consistency is not guaranteed."
-	fi
-        echo "" >> ${CLUSTER_CONFIG_POSTGRES_ADDONS}
-    done
-
-    echo ""
-    echo "======================================================================"
-    echo "CLUSTER_CONFIG_POSTGRES_ADDONS: ${CLUSTER_CONFIG_POSTGRES_ADDONS}"
-    echo "----------------------------------------------------------------------"
-    cat ${CLUSTER_CONFIG_POSTGRES_ADDONS}
-    echo "======================================================================"
-    echo ""
+    echo ${BLDWRAP_POSTGRES_CONF_ADDONS} | sed -e 's/\[//g' -e 's/\]//g' | tr "," "\n" | sed -e 's/^\"//g' -e 's/\"$//g' >> ${CLUSTER_CONFIG_POSTGRES_ADDONS}
 fi
 
-if [ -f "${CLUSTER_CONFIG_POSTGRES_ADDONS}" ]; then
-    echo "=========================================================================================="
-    echo "executing:"
-    echo "  $GPPATH/gpinitsystem -a -c $CLUSTER_CONFIG -l $DATADIRS/gpAdminLogs -p ${CLUSTER_CONFIG_POSTGRES_ADDONS} ${STANDBY_INIT_OPTS} \"$@\""
-    echo "=========================================================================================="
-    echo ""
-    $GPPATH/gpinitsystem -a -c $CLUSTER_CONFIG -l $DATADIRS/gpAdminLogs -p ${CLUSTER_CONFIG_POSTGRES_ADDONS} ${STANDBY_INIT_OPTS} "$@"
-else
-    echo "=========================================================================================="
-    echo "executing:"
-    echo "  $GPPATH/gpinitsystem -a -c $CLUSTER_CONFIG -l $DATADIRS/gpAdminLogs ${STANDBY_INIT_OPTS} \"$@\""
-    echo "=========================================================================================="
-    echo ""
-    $GPPATH/gpinitsystem -a -c $CLUSTER_CONFIG -l $DATADIRS/gpAdminLogs ${STANDBY_INIT_OPTS} "$@"
-fi
+# Add fsync=off for all gpdemo deployments
+grep -q 'fsync=off' ${CLUSTER_CONFIG_POSTGRES_ADDONS} && echo "fsync=off already exists in ${CLUSTER_CONFIG_POSTGRES_ADDONS}." || echo "fsync=off" >> ${CLUSTER_CONFIG_POSTGRES_ADDONS}
+
+echo ""
+echo "======================================================================"
+echo "CLUSTER_CONFIG_POSTGRES_ADDONS: ${CLUSTER_CONFIG_POSTGRES_ADDONS}"
+echo "----------------------------------------------------------------------"
+cat ${CLUSTER_CONFIG_POSTGRES_ADDONS}
+echo "======================================================================"
+echo ""
+
+echo "=========================================================================================="
+echo "executing:"
+echo "  $GPPATH/gpinitsystem -a -c $CLUSTER_CONFIG -l $DATADIRS/gpAdminLogs -p ${CLUSTER_CONFIG_POSTGRES_ADDONS} ${STANDBY_INIT_OPTS} \"$@\""
+echo "=========================================================================================="
+echo ""
+$GPPATH/gpinitsystem -a -c $CLUSTER_CONFIG -l $DATADIRS/gpAdminLogs -p ${CLUSTER_CONFIG_POSTGRES_ADDONS} ${STANDBY_INIT_OPTS} "$@"
 RETURN=$?
 
 echo "========================================"

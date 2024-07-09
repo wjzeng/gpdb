@@ -15,6 +15,7 @@
 
 #include "gpopt/base/CDistributionSpec.h"
 #include "gpopt/operators/CPhysical.h"
+#include "gpopt/xforms/CXform.h"
 
 namespace gpopt
 {
@@ -41,9 +42,13 @@ private:
 												 ULONG ulChildIndexToTestSecond,
 												 ULONG child_index);
 
+	// xform that join order originated from
+	CXform::EXformId m_origin_xform;
+
 protected:
 	// ctor
-	explicit CPhysicalJoin(CMemoryPool *mp);
+	explicit CPhysicalJoin(CMemoryPool *mp,
+						   CXform::EXformId origin_xform = CXform::ExfSentinel);
 
 	// dtor
 	~CPhysicalJoin() override = default;
@@ -84,6 +89,11 @@ protected:
 								   CExpression *pexprInner,
 								   CExpression *pexprPredOuter,
 								   CExpression *pexprPredInner);
+
+	static CEnfdDistribution *PedInnerHashedFromOuterHashed(
+		CMemoryPool *mp, CExpressionHandle &exprhdl,
+		CEnfdDistribution::EDistributionMatching dmatch,
+		CDrvdProp *outerDrvdProp);
 
 public:
 	// match function
@@ -172,6 +182,11 @@ public:
 		return false;
 	}
 
+	CXform::EXformId
+	OriginXform()
+	{
+		return m_origin_xform;
+	}
 	//-------------------------------------------------------------------------------------
 	//-------------------------------------------------------------------------------------
 	//-------------------------------------------------------------------------------------

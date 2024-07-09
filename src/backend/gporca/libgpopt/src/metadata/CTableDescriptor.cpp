@@ -37,21 +37,25 @@ FORCE_GENERATE_DBGSTR(CTableDescriptor);
 CTableDescriptor::CTableDescriptor(
 	CMemoryPool *mp, IMDId *mdid, const CName &name,
 	BOOL convert_hash_to_random, IMDRelation::Ereldistrpolicy rel_distr_policy,
-	IMDRelation::Erelstoragetype erelstoragetype, ULONG ulExecuteAsUser,
-	INT lockmode)
+	IMDRelation::Erelstoragetype erelstoragetype,
+	IMDRelation::Erelaoversion erelaoversion, ULONG ulExecuteAsUser,
+	INT lockmode, ULONG acl_mode, ULONG assigned_query_id_for_target_rel)
 	: m_mp(mp),
 	  m_mdid(mdid),
 	  m_name(mp, name),
 	  m_pdrgpcoldesc(nullptr),
 	  m_rel_distr_policy(rel_distr_policy),
 	  m_erelstoragetype(erelstoragetype),
+	  m_erelaoversion(erelaoversion),
 	  m_pdrgpcoldescDist(nullptr),
 	  m_distr_opfamilies(nullptr),
 	  m_convert_hash_to_random(convert_hash_to_random),
 	  m_pdrgpulPart(nullptr),
 	  m_pdrgpbsKeys(nullptr),
 	  m_execute_as_user_id(ulExecuteAsUser),
-	  m_lockmode(lockmode)
+	  m_lockmode(lockmode),
+	  m_acl_mode(acl_mode),
+	  m_assigned_query_id_for_target_rel(assigned_query_id_for_target_rel)
 {
 	GPOS_ASSERT(nullptr != mp);
 	GPOS_ASSERT(mdid->IsValid());
@@ -208,13 +212,14 @@ CTableDescriptor::AddDistributionColumn(ULONG ulPos, IMDId *opfamily)
 //		CTableDescriptor::AddPartitionColumn
 //
 //	@doc:
-//		Add the column at the specified position to the array of partition column
-//		descriptors
+//		Add the column's position to the array of partition columns
 //
 //---------------------------------------------------------------------------
 void
 CTableDescriptor::AddPartitionColumn(ULONG ulPos)
 {
+	CColumnDescriptor *pcoldesc = (*m_pdrgpcoldesc)[ulPos];
+	pcoldesc->SetAsPartCol();
 	m_pdrgpulPart->Append(GPOS_NEW(m_mp) ULONG(ulPos));
 }
 
@@ -289,7 +294,7 @@ CTableDescriptor::OsPrint(IOstream &os) const
 //		CTableDescriptor::IndexCount
 //
 //	@doc:
-//		 Returns number of b-tree indices
+//		 Returns number of indices in the relation
 //
 //
 //---------------------------------------------------------------------------
@@ -307,23 +312,30 @@ CTableDescriptor::IndexCount()
 
 //---------------------------------------------------------------------------
 //	@function:
-//		CTableDescriptor::PartitionCount
+//		CTableDescriptor::HashValue
 //
 //	@doc:
-//		 Returns number of leaf partitions
+//		Returns hash value of the relation. The value is unique by MDId and
+//		relation name (or alias).
 //
 //
 //---------------------------------------------------------------------------
 ULONG
-CTableDescriptor::PartitionCount() const
+CTableDescriptor::HashValue(const CTableDescriptor *ptabdesc)
 {
-	GPOS_ASSERT(nullptr != m_mdid);
+	ULONG ulHash =
+		gpos::CombineHashes(ptabdesc->MDId()->HashValue(),
+							CWStringConst::HashValue(ptabdesc->Name().Pstr()));
 
-	CMDAccessor *md_accessor = COptCtxt::PoctxtFromTLS()->Pmda();
-	const IMDRelation *pmdrel = md_accessor->RetrieveRel(m_mdid);
-	const ULONG ulPartitions = pmdrel->PartitionCount();
+	return ulHash;
+}
 
-	return ulPartitions;
+BOOL
+CTableDescriptor::Equals(const CTableDescriptor *ptabdescLeft,
+						 const CTableDescriptor *ptabdescRight)
+{
+	return ptabdescLeft->MDId()->Equals(ptabdescRight->MDId()) &&
+		   ptabdescLeft->Name().Equals(ptabdescRight->Name());
 }
 
 

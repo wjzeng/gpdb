@@ -17,6 +17,7 @@
 #include "naucrates/dxl/parser/CParseHandlerProjList.h"
 #include "naucrates/dxl/parser/CParseHandlerProperties.h"
 #include "naucrates/dxl/parser/CParseHandlerScalarOp.h"
+#include "naucrates/dxl/parser/CParseHandlerTableDescr.h"
 #include "naucrates/dxl/parser/CParseHandlerUtils.h"
 
 using namespace gpdxl;
@@ -155,13 +156,14 @@ CParseHandlerAppend::EndElement(const XMLCh *const,	 // element_uri,
 				   str->GetBuffer());
 	}
 
+	ULONG child_index = 0;
 	// construct node from the created child nodes
 	CParseHandlerProperties *prop_parse_handler =
-		dynamic_cast<CParseHandlerProperties *>((*this)[0]);
+		dynamic_cast<CParseHandlerProperties *>((*this)[child_index++]);
 	CParseHandlerProjList *proj_list_parse_handler =
-		dynamic_cast<CParseHandlerProjList *>((*this)[1]);
+		dynamic_cast<CParseHandlerProjList *>((*this)[child_index++]);
 	CParseHandlerFilter *filter_parse_handler =
-		dynamic_cast<CParseHandlerFilter *>((*this)[2]);
+		dynamic_cast<CParseHandlerFilter *>((*this)[child_index++]);
 
 	m_dxl_node = GPOS_NEW(m_mp) CDXLNode(m_mp, m_dxl_op);
 	CParseHandlerUtils::SetProperties(m_dxl_node, prop_parse_handler);
@@ -174,10 +176,10 @@ CParseHandlerAppend::EndElement(const XMLCh *const,	 // element_uri,
 
 	const ULONG length = this->Length();
 	// an append node can have variable number of children: add them one by one from the respective parse handlers
-	for (ULONG ul = 3; ul < length; ul++)
+	for (; child_index < length; ++child_index)
 	{
 		CParseHandlerPhysicalOp *child_parse_handler =
-			dynamic_cast<CParseHandlerPhysicalOp *>((*this)[ul]);
+			dynamic_cast<CParseHandlerPhysicalOp *>((*this)[child_index]);
 		AddChildFromParseHandler(child_parse_handler);
 	}
 

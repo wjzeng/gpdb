@@ -1,6 +1,14 @@
 --
 -- Test correlated subquery in subplan with motion chooses correct scan type
 --
+--
+-- start_matchsubs
+-- m/\(cost=.*\)/
+-- s/\(cost=.*\)//
+--
+-- m/\(slice\d+; segments: \d+\)/
+-- s/\(slice\d+; segments: \d+\)//
+-- end_matchsubs
 -- Given I have two distributed tables
 create table choose_seqscan_t1(id1 int,id2 int);
 NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column named 'id1' as the Greenplum Database data distribution key for this table.
@@ -122,7 +130,7 @@ explain select t1.id1, (select count(*) from choose_seqscan_t2 t2 where t2.id1 =
 (12 rows)
 
 -- Test using a join within the subplan. It could perhaps use an Nested Loop Join +
--- Index Scan to do the join, but at the memont, the planner doesn't consider distributing
+-- Index Scan to do the join, but at the moment, the planner doesn't consider distributing
 -- the Function Scan.
 select t1.id1, (select count(*) from generate_series(1,5) g, choose_seqscan_t2 t2 where t1.id1 = t2.id1 and t2.id2 = g) from choose_seqscan_t1 t1 where t1.id1 < 10;
  id1 | count 
@@ -151,7 +159,7 @@ explain select t1.id1, (select count(*) from generate_series(1,5) g, choose_seqs
                              Filter: (t1.id1 = t2.id1)
                              ->  Materialize  (cost=0.00..4.75 rows=17 width=8)
                                    ->  Broadcast Motion 3:3  (slice2; segments: 3)  (cost=0.00..4.50 rows=17 width=8)
-                                         ->  Seq Scan on choose_seqscan_t2 t2  (cost=0.00..3.50 rows=17 width=8)
+                                         ->  Index Scan using bidx2 on choose_seqscan_t2 t2 (cost=0.00..3.50 rows=17 width=8)
                        ->  Hash  (cost=0.05..0.05 rows=2 width=4)
                              ->  Function Scan on generate_series g  (cost=0.00..0.05 rows=2 width=4)
  Optimizer: Postgres query optimizer
@@ -192,7 +200,7 @@ explain select t1.id1, (select count(*) from choose_seqscan_t3 t3, choose_seqsca
                              Filter: (t3.id1 = t1.id1)
                              ->  Materialize  (cost=0.00..4.75 rows=50 width=4)
                                    ->  Broadcast Motion 3:3  (slice2; segments: 3)  (cost=0.00..4.50 rows=17 width=4)
-                                         ->  Seq Scan on choose_seqscan_t3 t3  (cost=0.00..3.50 rows=17 width=4)
+                                         ->  Index Only Scan using bidx3 on choose_seqscan_t3 t3  (cost=0.00..3.50 rows=17 width=4)
                        ->  Materialize  (cost=0.00..5.00 rows=50 width=4)
                              ->  Result  (cost=0.00..4.75 rows=50 width=4)
                                    Filter: (t2.id1 = t1.id1)

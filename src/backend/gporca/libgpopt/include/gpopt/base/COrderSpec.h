@@ -23,7 +23,7 @@ namespace gpopt
 {
 // type definition of corresponding dynamic pointer array
 class COrderSpec;
-typedef CDynamicPtrArray<COrderSpec, CleanupRelease> COrderSpecArray;
+using COrderSpecArray = CDynamicPtrArray<COrderSpec, CleanupRelease>;
 
 using namespace gpos;
 
@@ -43,10 +43,13 @@ class COrderSpec : public CPropSpec
 public:
 	enum ENullTreatment
 	{
+		// Note: Do not change the order of keys in this enum, they are used
+		// as ints for determining index scan direction for queries with
+		// order by clause
+		EntLast,
+		EntFirst,
 		EntAuto,  // default behavior, as implemented by operator
 
-		EntFirst,
-		EntLast,
 
 		EntSentinel
 	};
@@ -116,8 +119,8 @@ private:
 	};	// class COrderExpression
 
 	// array of order expressions
-	typedef CDynamicPtrArray<COrderExpression, CleanupDelete>
-		COrderExpressionArray;
+	using COrderExpressionArray =
+		CDynamicPtrArray<COrderExpression, CleanupDelete>;
 
 
 	// memory pool

@@ -79,6 +79,7 @@ ExecInitTupleSplit(TupleSplit *node, EState *estate, int eflags)
 	tup_spl_state->numDisDQAs = list_length(node->dqa_expr_lst);
 	tup_spl_state->dqa_split_bms = palloc0(sizeof(Bitmapset *) * tup_spl_state->numDisDQAs);
 	tup_spl_state->agg_filter_array = palloc0(sizeof(ExprState *) * tup_spl_state->numDisDQAs);
+	tup_spl_state->agg_vars_ref = palloc0(sizeof(Bitmapset *) * tup_spl_state->numDisDQAs);
 	tup_spl_state->dqa_id_array = palloc0( sizeof(int) * tup_spl_state->numDisDQAs);
 
 	int i = 0;
@@ -97,13 +98,24 @@ ExecInitTupleSplit(TupleSplit *node, EState *estate, int eflags)
 				maxAttrNum = te->resno;
 		}
 
+		if (dqaExpr->agg_vars_ref != NULL)
+		{
+			j = -1;
+			while ((j = bms_next_member(dqaExpr->agg_vars_ref, j)) >= 0)
+			{
+				TargetEntry *te = get_sortgroupref_tle((Index)j, node->plan.lefttree->targetlist);
+				tup_spl_state->agg_vars_ref[i] = bms_add_member(tup_spl_state->agg_vars_ref[i], te->resno);
+
+				if (maxAttrNum < te->resno)
+					maxAttrNum = te->resno;
+			}
+		}
+
 		/* init filter expr */
 		tup_spl_state->agg_filter_array[i] = ExecInitExpr(dqaExpr->agg_filter, (PlanState *)tup_spl_state);
 		tup_spl_state->dqa_id_array[i] = dqaExpr->agg_expr_id;
 		i ++;
 	}
-
-	tup_spl_state->maxAttrNum = maxAttrNum;
 
 	/*
 	 * fetch group by expr bitmap set
@@ -118,8 +130,11 @@ ExecInitTupleSplit(TupleSplit *node, EState *estate, int eflags)
 	 * fetch all columns which is not referenced by all DQAs
 	 */
 	Bitmapset *all_input_attr_bms = NULL;
-	for (int id = 0; id < list_length(outerPlan(node)->targetlist); id++)
-		all_input_attr_bms = bms_add_member(all_input_attr_bms, id);
+	foreach(lc, outerPlan(node)->targetlist)
+	{
+		TargetEntry *te = (TargetEntry *)lfirst(lc);
+		all_input_attr_bms = bms_add_member(all_input_attr_bms, te->resno);
+	}
 
 	Bitmapset *dqa_not_used_bms = all_input_attr_bms;
 	for (int id = 0; id < tup_spl_state->numDisDQAs; id++)
@@ -142,6 +157,15 @@ ExecInitTupleSplit(TupleSplit *node, EState *estate, int eflags)
 			bms_union(orig_bms, skip_split_bms);
 		bms_free(orig_bms);
 	}
+
+	/*
+	 * Update maxAttrNum which is used to calculate projection number
+	 * of ExecTupleSplit
+	 */
+	int x = bms_prev_member(skip_split_bms, -1);
+	if (x > maxAttrNum)
+		maxAttrNum = x;
+	tup_spl_state->maxAttrNum = maxAttrNum;
 
 	bms_free(skip_split_bms);
 
@@ -202,12 +226,11 @@ ExecTupleSplit(PlanState *pstate)
 				filter_out = true;
 			}
 			else
-			{
-
 				filter_out = false;
-			}
-
 		}
+		else
+			filter_out = false;
+
 	} while(filter_out);
 
 	/* reset the isnull array to the original state */
@@ -218,6 +241,10 @@ ExecTupleSplit(PlanState *pstate)
 	{
 		/* If the column is relevant to the current dqa, keep it */
 		if (bms_is_member(attno, node->dqa_split_bms[node->currentExprId]))
+			continue;
+
+		/* If the column is relevant to normal agg, keep it */
+		if (bms_is_member(attno, node->agg_vars_ref[node->currentExprId]))
 			continue;
 
 		/* otherwise, null this column out */

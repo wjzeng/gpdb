@@ -431,9 +431,9 @@ _PG_init(void)
 	 * stdout and stderr on DeleteInterp
 	 ************************************************************/
 	if ((pltcl_hold_interp = Tcl_CreateInterp()) == NULL)
-		elog(ERROR, "could not create master Tcl interpreter");
+		elog(ERROR, "could not create dummy Tcl interpreter");
 	if (Tcl_Init(pltcl_hold_interp) == TCL_ERROR)
-		elog(ERROR, "could not initialize master Tcl interpreter");
+		elog(ERROR, "could not initialize dummy Tcl interpreter");
 
 	/************************************************************
 	 * Create the hash table for working interpreters
@@ -488,14 +488,14 @@ pltcl_init_interp(pltcl_interp_desc *interp_desc, Oid prolang, bool pltrusted)
 	char		interpname[32];
 
 	/************************************************************
-	 * Create the Tcl interpreter as a slave of pltcl_hold_interp.
+	 * Create the Tcl interpreter subsidiary to pltcl_hold_interp.
 	 * Note: Tcl automatically does Tcl_Init in the untrusted case,
 	 * and it's not wanted in the trusted case.
 	 ************************************************************/
-	snprintf(interpname, sizeof(interpname), "slave_%u", interp_desc->user_id);
+	snprintf(interpname, sizeof(interpname), "subsidiary_%u", interp_desc->user_id);
 	if ((interp = Tcl_CreateSlave(pltcl_hold_interp, interpname,
 								  pltrusted ? 1 : 0)) == NULL)
-		elog(ERROR, "could not create slave Tcl interpreter");
+		elog(ERROR, "could not create subsidiary Tcl interpreter");
 
 	/************************************************************
 	 * Initialize the query hash table associated with interpreter
@@ -592,7 +592,6 @@ call_pltcl_start_proc(Oid prolang, bool pltrusted)
 	const char *gucname;
 	ErrorContextCallback errcallback;
 	List	   *namelist;
-	Oid			fargtypes[1];	/* dummy */
 	Oid			procOid;
 	HeapTuple	procTup;
 	Form_pg_proc procStruct;
@@ -616,7 +615,7 @@ call_pltcl_start_proc(Oid prolang, bool pltrusted)
 
 	/* Parse possibly-qualified identifier and look up the function */
 	namelist = stringToQualifiedNameList(start_proc);
-	procOid = LookupFuncName(namelist, 0, fargtypes, false);
+	procOid = LookupFuncName(namelist, 0, NULL, false);
 
 	/* Current user must have permission to call function */
 	aclresult = pg_proc_aclcheck(procOid, GetUserId(), ACL_EXECUTE);
@@ -2939,7 +2938,6 @@ pltcl_commit(ClientData cdata, Tcl_Interp *interp,
 	PG_TRY();
 	{
 		SPI_commit();
-		SPI_start_transaction();
 	}
 	PG_CATCH();
 	{
@@ -2979,7 +2977,6 @@ pltcl_rollback(ClientData cdata, Tcl_Interp *interp,
 	PG_TRY();
 	{
 		SPI_rollback();
-		SPI_start_transaction();
 	}
 	PG_CATCH();
 	{

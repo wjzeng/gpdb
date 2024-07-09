@@ -47,6 +47,54 @@ typedef struct PartitionDirectoryEntry
 	PartitionDesc pd;
 } PartitionDirectoryEntry;
 
+static void RelationBuildPartitionDesc_guts(Relation rel, bool validate);
+
+/*
+ * RelationRetrievePartitionDesc -- get partition descriptor, if relation is partitioned
+ *
+ * Note: we arrange for partition descriptors to not get freed until the
+ * relcache entry's refcount goes to zero (see hacks in RelationClose,
+ * RelationClearRelation, and RelationBuildPartitionDesc).  Therefore, even
+ * though we hand back a direct pointer into the relcache entry, it's safe
+ * for callers to continue to use that pointer as long as (a) they hold the
+ * relation open, and (b) they hold a relation lock strong enough to ensure
+ * that the data doesn't become stale.
+ *
+ * GPDB FIXME: This is a one-to-one replacement of the macro RelationGetPartitionDesc. That macro
+ * is kept to prevent ABI breakage during an ABI freeze, but when possible it should be removed,
+ * and this should be renamed to RelationGetPartitionDesc to keep alignment with upstream.
+ * RelationBuildPartitionDesc can also be redefined to static, as it should only ever be accessed
+ * through here.
+ */
+PartitionDesc
+RelationRetrievePartitionDesc(Relation rel)
+{
+	if (rel->rd_rel->relkind != RELKIND_PARTITIONED_TABLE)
+		return NULL;
+
+	if (unlikely(rel->rd_partdesc == NULL))
+		RelationBuildPartitionDesc(rel);
+
+	return rel->rd_partdesc;
+}
+
+/*
+ * GPDB: Build and validate the partition descriptor. Used for deferred
+ * partition constraint validation. Deferred constraint validation comes into
+ * play when we defer bounds validation to the end of command, for range
+ * partitions created with the classic syntax. This is done to avoid
+ * constructing the partition descriptor over and over again, for each and every
+ * partition added to the hierarchy. Constructing the parent's partition desc
+ * can have very significant overhead.
+ */
+void
+RelationValidatePartitionDesc(Relation rel)
+{
+	Assert (rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE);
+
+	RelationBuildPartitionDesc_guts(rel, /* validate */ true);
+}
+
 /*
  * RelationBuildPartitionDesc
  *		Form rel's partition descriptor, and store in relcache entry
@@ -56,21 +104,69 @@ typedef struct PartitionDirectoryEntry
  * addition or removal of a partition.  Hence, code holding a lock
  * that's sufficient to prevent that can assume that rd_partdesc
  * won't change underneath it.
+ *
+ * Partition descriptor is a complex structure; to avoid complicated logic to
+ * free individual elements whenever the relcache entry is flushed, we give it
+ * its own memory context, a child of CacheMemoryContext, which can easily be
+ * deleted on its own.  To avoid leaking memory in that context in case of an
+ * error partway through this function, the context is initially created as a
+ * child of CurTransactionContext and only re-parented to CacheMemoryContext
+ * at the end, when no further errors are possible.  Also, we don't make this
+ * context the current context except in very brief code sections, out of fear
+ * that some of our callees allocate memory on their own which would be leaked
+ * permanently.
+ *
+ * GPDB: This function assumes that bounds validation was already performed
+ * beforehand for all partitions added to the hierarchy, if 'validate' is false.
+ *
+ * When 'validate' is true, perform bounds validation.
+ *
+ * See RelationValidatePartitionDesc() for details on when 'validate' is true.
  */
 void
 RelationBuildPartitionDesc(Relation rel)
+{
+	RelationBuildPartitionDesc_guts(rel, /* validate */ false);
+}
+
+static void
+RelationBuildPartitionDesc_guts(Relation rel, bool validate)
 {
 	PartitionDesc partdesc;
 	PartitionBoundInfo boundinfo = NULL;
 	List	   *inhoids;
 	PartitionBoundSpec **boundspecs = NULL;
 	Oid		   *oids = NULL;
+	bool	   *is_leaf = NULL;
 	ListCell   *cell;
 	int			i,
 				nparts;
-	PartitionKey key = RelationGetPartitionKey(rel);
+	PartitionKey key = RelationRetrievePartitionKey(rel);
+	MemoryContext new_pdcxt;
 	MemoryContext oldcxt;
+	MemoryContext rbcontext;
 	int		   *mapping;
+
+	/*
+	 * GPDB: Bring back the temporary memory context which gets removed in
+	 * upstream commit d3f48dfae42f9655425d1f58f396e495c7fb7812.
+	 * The reason is when using the GPDB's CREATE PARTITION TABLE syntax,
+	 * it'll create lots of subpartitions under the same portal and the memory
+	 * leak below will blow up the CurrentMemoryContext, upstream's syntax does
+	 * not have this issue since one portal can only create one partition table.
+	 *
+	 * Although we can set -DRECOVER_RELATION_BUILD_MEMORY=1 at compile time to
+	 * use upstream logic to free the leak for each RelationBuildDesc() call.
+	 * But seems like there is performance concern.
+	 * See https://www.postgresql.org/message-id/30380.1552657187%40sss.pgh.pa.us
+	 *
+	 * So we decide to revert part of the commit, this only affect partition
+	 * related relations, so the performance should not have much impact.
+	 */
+	rbcontext = AllocSetContextCreate(CurrentMemoryContext,
+									  "RelationBuildPartitionDesc",
+									  ALLOCSET_DEFAULT_SIZES);
+	oldcxt = MemoryContextSwitchTo(rbcontext);
 
 	/*
 	 * Get partition oids from pg_inherits.  This uses a single snapshot to
@@ -84,7 +180,8 @@ RelationBuildPartitionDesc(Relation rel)
 	/* Allocate arrays for OIDs and boundspecs. */
 	if (nparts > 0)
 	{
-		oids = palloc(nparts * sizeof(Oid));
+		oids = (Oid *) palloc(nparts * sizeof(Oid));
+		is_leaf = (bool *) palloc(nparts * sizeof(bool));
 		boundspecs = palloc(nparts * sizeof(PartitionBoundSpec *));
 	}
 
@@ -116,9 +213,9 @@ RelationBuildPartitionDesc(Relation rel)
 		 * tuple or an old one where relpartbound is NULL.  In that case, try
 		 * the table directly.  We can't just AcceptInvalidationMessages() and
 		 * retry the system cache lookup because it's possible that a
-		 * concurrent ATTACH PARTITION operation has removed itself to the
-		 * ProcArray but yet added invalidation messages to the shared queue;
-		 * InvalidateSystemCaches() would work, but seems excessive.
+		 * concurrent ATTACH PARTITION operation has removed itself from the
+		 * ProcArray but not yet added invalidation messages to the shared
+		 * queue; InvalidateSystemCaches() would work, but seems excessive.
 		 *
 		 * Note that this algorithm assumes that PartitionBoundSpec we manage
 		 * to fetch is the right one -- so this is only good enough for
@@ -174,13 +271,25 @@ RelationBuildPartitionDesc(Relation rel)
 
 		/* Save results. */
 		oids[i] = inhrelid;
+		is_leaf[i] = (get_rel_relkind(inhrelid) != RELKIND_PARTITIONED_TABLE);
 		boundspecs[i] = boundspec;
 		++i;
 	}
 
-	/* Assert we aren't about to leak any old data structure */
-	Assert(rel->rd_pdcxt == NULL);
-	Assert(rel->rd_partdesc == NULL);
+	/*
+	 * Create PartitionBoundInfo and mapping, working in the caller's context.
+	 * This could fail, but we haven't done any damage if so.
+	 */
+	if (nparts > 0)
+	{
+		if (validate)
+			boundinfo = partition_bounds_create_and_validate(boundspecs, nparts,
+															 key, &mapping,
+															 oids);
+		else
+			boundinfo = partition_bounds_create(boundspecs, nparts, key, &mapping);
+	}
+
 
 	/*
 	 * Now build the actual relcache partition descriptor.  Note that the
@@ -191,27 +300,29 @@ RelationBuildPartitionDesc(Relation rel)
 	 * rd_partdesc until the cached data structure is fully complete and
 	 * valid, so that no other code might try to use it.
 	 */
-	rel->rd_pdcxt = AllocSetContextCreate(CacheMemoryContext,
-										  "partition descriptor",
-										  ALLOCSET_SMALL_SIZES);
-	MemoryContextCopyAndSetIdentifier(rel->rd_pdcxt,
+	new_pdcxt = AllocSetContextCreate(CurTransactionContext,
+									  "partition descriptor",
+									  ALLOCSET_SMALL_SIZES);
+	MemoryContextCopyAndSetIdentifier(new_pdcxt,
 									  RelationGetRelationName(rel));
 
 	partdesc = (PartitionDescData *)
-		MemoryContextAllocZero(rel->rd_pdcxt, sizeof(PartitionDescData));
+		MemoryContextAllocZero(new_pdcxt, sizeof(PartitionDescData));
 	partdesc->nparts = nparts;
 	/* If there are no partitions, the rest of the partdesc can stay zero */
 	if (nparts > 0)
 	{
-		/* Create PartitionBoundInfo, using the caller's context. */
-		boundinfo = partition_bounds_create(boundspecs, nparts, key, &mapping);
-
 		/* Now copy all info into relcache's partdesc. */
-		oldcxt = MemoryContextSwitchTo(rel->rd_pdcxt);
+		MemoryContextSwitchTo(new_pdcxt);
 		partdesc->boundinfo = partition_bounds_copy(boundinfo, key);
+
+		/* Initialize caching fields for speeding up ExecFindPartition */
+		partdesc->last_found_datum_index = -1;
+		partdesc->last_found_part_index = -1;
+		partdesc->last_found_count = 0;
+
 		partdesc->oids = (Oid *) palloc(nparts * sizeof(Oid));
 		partdesc->is_leaf = (bool *) palloc(nparts * sizeof(bool));
-		MemoryContextSwitchTo(oldcxt);
 
 		/*
 		 * Assign OIDs from the original array into mapped indexes of the
@@ -219,21 +330,39 @@ RelationBuildPartitionDesc(Relation rel)
 		 * catalog scan that retrieved them, whereas that in the latter is
 		 * defined by canonicalized representation of the partition bounds.
 		 *
-		 * Also record leaf-ness of each partition.  For this we use
-		 * get_rel_relkind() which may leak memory, so be sure to run it in
-		 * the caller's context.
+		 * Also save leaf-ness of each partition.
 		 */
 		for (i = 0; i < nparts; i++)
 		{
 			int			index = mapping[i];
 
 			partdesc->oids[index] = oids[i];
-			partdesc->is_leaf[index] =
-				(get_rel_relkind(oids[i]) != RELKIND_PARTITIONED_TABLE);
+			partdesc->is_leaf[index] = is_leaf[i];
 		}
+		MemoryContextSwitchTo(rbcontext);
 	}
 
+	/*
+	 * We have a fully valid partdesc ready to store into the relcache.
+	 * Reparent it so it has the right lifespan.
+	 */
+	MemoryContextSetParent(new_pdcxt, CacheMemoryContext);
+
+	/*
+	 * But first, a kluge: if there's an old rd_pdcxt, it contains an old
+	 * partition descriptor that may still be referenced somewhere.  Preserve
+	 * it, while not leaking it, by reattaching it as a child context of the
+	 * new rd_pdcxt.  Eventually it will get dropped by either RelationClose
+	 * or RelationClearRelation.
+	 */
+	if (rel->rd_pdcxt != NULL)
+		MemoryContextSetParent(rel->rd_pdcxt, new_pdcxt);
+	rel->rd_pdcxt = new_pdcxt;
 	rel->rd_partdesc = partdesc;
+
+	/* Return to caller's context, and blow away the temporary context. */
+	MemoryContextSwitchTo(oldcxt);
+	MemoryContextDelete(rbcontext);
 }
 
 /*
@@ -288,7 +417,7 @@ PartitionDirectoryLookup(PartitionDirectory pdir, Relation rel)
 		 */
 		RelationIncrementReferenceCount(rel);
 		pde->rel = rel;
-		pde->pd = RelationGetPartitionDesc(rel);
+		pde->pd = RelationRetrievePartitionDesc(rel);
 		Assert(pde->pd != NULL);
 	}
 	return pde->pd;

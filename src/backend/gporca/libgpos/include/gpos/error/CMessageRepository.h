@@ -33,10 +33,10 @@ private:
 	CMemoryPool *m_mp;
 
 	// short hand for Table of Message Tables (TMT)
-	typedef CSyncHashtable<CMessageTable, ELocale> TMT;
+	using TMT = CSyncHashtable<CMessageTable, ELocale>;
 
 	// short hand for TMT accessor
-	typedef CSyncHashtableAccessByKey<CMessageTable, ELocale> TMTAccessor;
+	using TMTAccessor = CSyncHashtableAccessByKey<CMessageTable, ELocale>;
 
 	// basic hash table
 	TMT m_hash_table;
@@ -64,12 +64,12 @@ public:
 	void AddMessage(ELocale locale, CMessage *msg);
 
 	// initializer for global singleton
-	static GPOS_RESULT Init();
+	static void Init();
 
 	// accessor for global singleton
 	static CMessageRepository *GetMessageRepository();
 
-	void Shutdown();
+	static void Shutdown();
 
 };	// class CMessageRepository
 }  // namespace gpos

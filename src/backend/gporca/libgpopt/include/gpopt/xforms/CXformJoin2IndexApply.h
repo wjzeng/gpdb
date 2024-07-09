@@ -30,19 +30,16 @@ private:
 		CExpression *origJoinPred, CExpression *nodesToInsertAboveIndexGet,
 		CExpression *endOfNodesToInsertAboveIndexGet,
 		CTableDescriptor *ptabdescInner, CColRefSet *pcrsScalarExpr,
-		CColRefSet *outer_refs, CColRefSet *pcrsReqd, ULONG ulIndices,
-		CXformResult *pxfres);
+		CColRefSet *outer_refs, ULONG ulIndices, CXformResult *pxfres);
 
 	// helper to add IndexApply expression to given xform results container
 	// for homogeneous b-tree indexes
 	static void CreateAlternativesForBtreeIndex(
-		CMemoryPool *mp, COperator *joinOp, CExpression *pexprOuter,
-		CExpression *pexprInner, CExpression *origJoinPred,
-		CExpression *nodesToInsertAboveIndexGet,
-		CExpression *endOfNodesToInsertAboveIndexGet, CMDAccessor *md_accessor,
-		CExpressionArray *pdrgpexprConjuncts, CColRefSet *pcrsScalarExpr,
-		CColRefSet *outer_refs, CColRefSet *pcrsReqd, const IMDRelation *pmdrel,
-		const IMDIndex *pmdindex, CXformResult *pxfres);
+		CMemoryPool *mp, CExpression *pexprLogicalIndexGet, COperator *joinOp,
+		CExpression *pexprOuter, CExpression *pexprInner,
+		CExpression *origJoinPred, CExpression *nodesToInsertAboveIndexGet,
+		CExpression *endOfNodesToInsertAboveIndexGet, CColRefSet *outer_refs,
+		CXformResult *pxfres);
 
 	// helper to add IndexApply expression to given xform results container
 	// for homogeneous bitmap indexes

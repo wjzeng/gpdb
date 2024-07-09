@@ -57,6 +57,9 @@ private:
 	// required rewindability
 	CEnfdRewindability *m_per{nullptr};
 
+	// required partition propagation
+	CEnfdPartitionPropagation *m_pepp{nullptr};
+
 	// required ctes
 	CCTEReq *m_pcter{nullptr};
 
@@ -68,7 +71,8 @@ public:
 
 	// ctor
 	CReqdPropPlan(CColRefSet *pcrs, CEnfdOrder *peo, CEnfdDistribution *ped,
-				  CEnfdRewindability *per, CCTEReq *pcter);
+				  CEnfdRewindability *per, CEnfdPartitionPropagation *pepp,
+				  CCTEReq *pcter);
 
 	// dtor
 	~CReqdPropPlan() override;
@@ -124,6 +128,13 @@ public:
 		return m_per;
 	}
 
+	// required partition propagation accessor
+	CEnfdPartitionPropagation *
+	Pepp() const
+	{
+		return m_pepp;
+	}
+
 	// required cte accessor
 	CCTEReq *
 	Pcter() const
@@ -173,9 +184,11 @@ public:
 									  const CReqdPropPlan *prppSnd);
 
 	// map input required and derived plan properties into new required plan properties
-	static CReqdPropPlan *PrppRemap(CMemoryPool *mp, CReqdPropPlan *prppInput,
-									CDrvdPropPlan *pdpplanInput,
-									UlongToColRefMap *colref_mapping);
+	static CReqdPropPlan *PrppRemapForCTE(CMemoryPool *mp,
+										  CReqdPropPlan *prppProducer,
+										  CDrvdPropPlan *pdpplanProducer,
+										  CDrvdPropPlan *pdpplanConsumer,
+										  UlongToColRefMap *colref_mapping);
 
 	// print function
 	IOstream &OsPrint(IOstream &os) const override;

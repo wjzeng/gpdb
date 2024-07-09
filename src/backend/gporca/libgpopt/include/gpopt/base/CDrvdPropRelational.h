@@ -109,7 +109,10 @@ private:
 	// function properties
 	CFunctionProp *m_pfp;
 
-	CTableDescriptor *m_table_descriptor;
+	CTableDescriptorHashSet *m_table_descriptor{nullptr};
+
+	// relation (or alias) names
+	StringPtrArray *m_table_aliases;
 
 	// helper for getting applicable FDs from child
 	static CFunctionalDependencyArray *DeriveChildFunctionalDependencies(
@@ -167,7 +170,7 @@ protected:
 	// function properties
 	CFunctionProp *DeriveFunctionProperties(CExpressionHandle &);
 
-	CTableDescriptor *DeriveTableDescriptor(CExpressionHandle &);
+	CTableDescriptorHashSet *DeriveTableDescriptor(CExpressionHandle &);
 
 public:
 	CDrvdPropRelational(const CDrvdPropRelational &) = delete;
@@ -228,7 +231,7 @@ public:
 	// function properties
 	CFunctionProp *GetFunctionProperties() const;
 
-	CTableDescriptor *GetTableDescriptor() const;
+	CTableDescriptorHashSet *GetTableDescriptor() const;
 
 	// shorthand for conversion
 	static CDrvdPropRelational *GetRelationalProperties(CDrvdProp *pdp);

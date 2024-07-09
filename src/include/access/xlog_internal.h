@@ -79,8 +79,10 @@ typedef XLogLongPageHeaderData *XLogLongPageHeader;
 #define XLP_LONG_HEADER				0x0002
 /* This flag indicates backup blocks starting in this page are optional */
 #define XLP_BKP_REMOVABLE			0x0004
+/* Replaces a missing contrecord; see CreateOverwriteContrecordRecord */
+#define XLP_FIRST_IS_OVERWRITE_CONTRECORD 0x0008
 /* All defined flag bits in xlp_info (used for validity checking of header) */
-#define XLP_ALL_FLAGS				0x0007
+#define XLP_ALL_FLAGS				0x000F
 
 #define XLogPageHeaderSize(hdr)		\
 	(((hdr)->xlp_info & XLP_LONG_HEADER) ? SizeOfXLogLongPHD : SizeOfXLogShortPHD)
@@ -90,7 +92,13 @@ typedef XLogLongPageHeaderData *XLogLongPageHeader;
 #define WalSegMaxSize (1024 * 1024 * 1024)
 /* default number of min and max wal segments */
 #define DEFAULT_MIN_WAL_SEGS 5
-#define DEFAULT_MAX_WAL_SEGS 64
+/*
+ * gpdb: PG hardcodes this as 64. We don't expect to keep that many segment
+ * files given we use 64MB as default segment file size while PG uses 16MB,
+ * also note this value affects that checkpoint frequency. Let's just ensure
+ * the max wal segment size is same on gpdb and PG.
+ */
+#define DEFAULT_MAX_WAL_SEGS (64*(16*1024*1024)/DEFAULT_XLOG_SEG_SIZE)
 
 /* check that the given size is a valid wal_segment_size */
 #define IsPowerOf2(x) (x > 0 && ((x) & ((x)-1)) == 0)
@@ -120,6 +128,13 @@ typedef XLogLongPageHeaderData *XLogLongPageHeader;
 
 #define XLByteToPrevSeg(xlrp, logSegNo, wal_segsz_bytes) \
 	logSegNo = ((xlrp) - 1) / (wal_segsz_bytes)
+
+/*
+ * Convert values of GUCs measured in megabytes to equiv. segment count.
+ * Rounds down.
+ */
+#define XLogMBVarToSegs(mbvar, wal_segsz_bytes) \
+	((mbvar) / ((wal_segsz_bytes) / (1024 * 1024)))
 
 /*
  * Is an XLogRecPtr within a particular XLOG segment?
@@ -240,6 +255,13 @@ typedef struct xl_restore_point
 	TimestampTz rp_time;
 	char		rp_name[MAXFNAMELEN];
 } xl_restore_point;
+
+/* Overwrite of prior contrecord */
+typedef struct xl_overwrite_contrecord
+{
+	XLogRecPtr	overwritten_lsn;
+	TimestampTz overwrite_time;
+} xl_overwrite_contrecord;
 
 /* End of recovery mark, when we don't do an END_OF_RECOVERY checkpoint */
 typedef struct xl_end_of_recovery

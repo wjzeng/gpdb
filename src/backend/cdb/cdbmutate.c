@@ -338,7 +338,7 @@ cdbmutate_warn_ctid_without_segid(struct PlannerInfo *root, struct RelOptInfo *r
  * to a tree.
  *
  * Next, we will need to decide if the share is cross slices.  If the share
- * is not cross slice, we do not need the syncrhonization, and it is possible to
+ * is not cross slice, we do not need the synchronization, and it is possible to
  * keep the Material/Sort in memory to save a sort.
  *
  * It is essential that we walk the tree in the same order as the ExecProcNode start
@@ -1944,4 +1944,109 @@ contains_outer_params(Node *node, void *context)
 		}
 	}
 	return expression_tree_walker(node, contains_outer_params, context);
+}
+
+typedef struct CTEMotionSearchContext
+{
+	plan_tree_base_prefix base; /* Required prefix for plan_tree_walker/mutator */
+	bool    bellowMotion;      /* True if we are under a Motion node */
+} CTEMotionSearchContext;
+
+/*
+ * GPDB:
+ * We can not pass params by a motion.
+ * So there should not be any motion between RecursiveUnion and WorkTableScan.
+ * Check if there is a motion between RecursiveUnion and WorkTableScan.
+ */
+static bool
+cte_motion_search_walker(Node *node, CTEMotionSearchContext *context)
+{
+	if (node == NULL)
+		return false;
+
+	if (IsA(node, Motion))
+	{
+		bool savedBellowMotion = context->bellowMotion;
+		context->bellowMotion = true;
+		plan_tree_walker(node, cte_motion_search_walker, context, true);
+		context->bellowMotion = savedBellowMotion;
+		return false;
+	}
+	if (IsA(node, RecursiveUnion))
+	{
+		/*
+		 * We process RecursiveUnion recursively in create_recursiveunion_plan
+		 * here, we do not process repeatedly.
+		 */
+		return false;
+	}
+	if (IsA(node, WorkTableScan))
+	{
+		if (context->bellowMotion)
+		{
+			elog(ERROR, "Passing parameters across motion is not supported.");
+		}
+		return false;
+	}
+	return plan_tree_walker(node, cte_motion_search_walker, context, true);
+}
+
+/*
+ * GPDB does not support pass params by a motion.
+ * Check the rightplan of RecursiveUnion, wether there is a motion above WorkTableScan,
+ * If true, throw an error.
+ */
+void
+checkMotionAboveWorkTableScan(Node* node, PlannerInfo *root)
+{
+	CTEMotionSearchContext context;
+	planner_init_plan_tree_base(&context.base, root);
+	context.bellowMotion = false;
+
+	(void) cte_motion_search_walker(node, (void *) &context);
+}
+
+typedef struct MotionWithParamContext
+{
+	plan_tree_base_prefix base; /* Required prefix for plan_tree_walker/mutator */
+	Bitmapset  *nestLoopParams; /* nestloop params */
+} MotionWithParamContext;
+
+/*
+ * check whether pass params by a motion
+ */
+static bool
+checkMotionWithParamWalker(Node *node, MotionWithParamContext* motionWithParamcontext)
+{
+	if (node == NULL)
+		return false;
+
+	if (IsA(node, Motion))
+	{
+		Plan * plan = (Plan *) node;
+		Bitmapset  *finalExtParam;
+		if (!bms_is_empty(plan->extParam))
+		{
+			finalExtParam = bms_intersect(plan->extParam, motionWithParamcontext->nestLoopParams);
+			if (!bms_is_empty(finalExtParam))
+			{
+				elog(ERROR, "Passing parameters across motion is not supported.");
+			}
+		}
+	}
+
+	return plan_tree_walker(node, checkMotionWithParamWalker, motionWithParamcontext, true);
+}
+
+/*
+ * We can not deliver a param by a motion node.
+ * If there is a param on motion node, we should throw an error.
+ */
+void
+checkMotionWithParam(Node *node, Bitmapset *bmsNestParams, PlannerInfo *root)
+{
+	MotionWithParamContext motionWithParamcontext;
+	motionWithParamcontext.nestLoopParams = bmsNestParams;
+	planner_init_plan_tree_base(&motionWithParamcontext.base, root);
+	checkMotionWithParamWalker(node, &motionWithParamcontext);
 }

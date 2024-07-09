@@ -8202,6 +8202,159 @@ SELECT * FROM mpp21090_xchange_pttab_dropcol_idx_dml_numeric_candidate ORDER BY 
 DELETE FROM mpp21090_xchange_pttab_dropcol_idx_dml_numeric_candidate WHERE col3='a';
 SELECT * FROM mpp21090_xchange_pttab_dropcol_idx_dml_numeric_candidate ORDER BY 1,2,3;
 
+-- Test exchange partition contains dropped columns
+DROP TABLE IF EXISTS table_with_leaf_partition_containing_dropped_column;
+DROP TABLE IF EXISTS leaf_table_with_leaf_partition_containing_dropped_column;
+CREATE TABLE table_with_leaf_partition_containing_dropped_column(a int, b date, z int)
+DISTRIBUTED BY (a) PARTITION BY RANGE(b)
+(
+    START ('2021-04-11'::date) END ('2021-04-12'::date) WITH (tablename='prttab_leaf_containing_dropped_col_part1'),
+    START ('2021-04-12'::date) END ('2021-04-13'::date) WITH (tablename='prttab_leaf_containing_dropped_col_part2')
+);
+-- Drop a column defined on leaf partition
+CREATE TABLE leaf_table_with_leaf_partition_containing_dropped_column(a int, b date, z1 int, z int);
+ALTER TABLE leaf_table_with_leaf_partition_containing_dropped_column DROP COLUMN z1;
+ALTER TABLE table_with_leaf_partition_containing_dropped_column ALTER PARTITION FOR ('2021-04-11'::date) EXCHANGE PARTITION FOR ('2021-04-11'::date) WITH TABLE leaf_table_with_leaf_partition_containing_dropped_column;
+CREATE INDEX table_with_leaf_partition_containing_dropped_column_index ON table_with_leaf_partition_containing_dropped_column(a, b);
+
+EXPLAIN SELECT * FROM table_with_leaf_partition_containing_dropped_column WHERE a>42 and z<42;
+SELECT * FROM table_with_leaf_partition_containing_dropped_column WHERE a>42 and z<42;
+EXPLAIN SELECT * FROM prttab_leaf_containing_dropped_col_part1 WHERE a>42 and z<42;
+SELECT * FROM prttab_leaf_containing_dropped_col_part1 WHERE a>42 and z<42;
+EXPLAIN SELECT * FROM prttab_leaf_containing_dropped_col_part2 WHERE a>42 and z<42;
+SELECT * FROM prttab_leaf_containing_dropped_col_part2 WHERE a>42 and z<42;
+
+-- Test exchange partition contains dropped columns between index columns
+DROP TABLE IF EXISTS table_with_leaf_containing_dropped_column_between_index_columns;
+DROP TABLE IF EXISTS leaf_containing_dropped_column_between_index_columns;
+CREATE TABLE table_with_leaf_containing_dropped_column_between_index_columns(a int, b date, z int)
+DISTRIBUTED BY (a) PARTITION BY RANGE(b)
+(
+    START ('2021-04-11'::date) END ('2021-04-12'::date) WITH (tablename='leaf_containing_dropped_col_index_part1'),
+    START ('2021-04-12'::date) END ('2021-04-13'::date) WITH (tablename='leaf_containing_dropped_col_index_part2')
+);
+-- Drop a column defined ahead of the index column
+CREATE TABLE leaf_containing_dropped_column_between_index_columns(a int, d1  int, b date, z1 int, z int);
+ALTER TABLE leaf_containing_dropped_column_between_index_columns DROP COLUMN z1;
+ALTER TABLE leaf_containing_dropped_column_between_index_columns DROP COLUMN d1;
+
+ALTER TABLE table_with_leaf_containing_dropped_column_between_index_columns EXCHANGE PARTITION FOR ('2021-04-11'::date) WITH TABLE leaf_containing_dropped_column_between_index_columns;
+CREATE INDEX table_with_leaf_partition_dropped_col_between_index_cols_index ON table_with_leaf_containing_dropped_column_between_index_columns(a, b);
+
+EXPLAIN SELECT * FROM table_with_leaf_containing_dropped_column_between_index_columns WHERE a>42 and z<42;
+SELECT * FROM table_with_leaf_containing_dropped_column_between_index_columns WHERE a>42 and z<42;
+EXPLAIN SELECT * FROM leaf_containing_dropped_col_index_part1 WHERE a>42 and z<42;
+SELECT * FROM leaf_containing_dropped_col_index_part1 WHERE a>42 and z<42;
+EXPLAIN SELECT * FROM leaf_containing_dropped_col_index_part2 WHERE a>42 and z<42;
+SELECT * FROM leaf_containing_dropped_col_index_part2 WHERE a>42 and z<42;
+
+-- Test exchange partition where root contains dropped columns and no dropped columns on the partition
+DROP TABLE IF EXISTS table_with_root_containing_dropped_columns;
+DROP TABLE IF EXISTS leaf_containing_no_dropped_columns;
+CREATE TABLE table_with_root_containing_dropped_columns(a int, d1  int, b date, z1 int, z int)
+DISTRIBUTED BY (a) PARTITION BY RANGE(b)
+(
+    START ('2021-04-11'::date) END ('2021-04-12'::date) WITH (tablename='leaf_with_root_containing_dropped_columns_part1'),
+    START ('2021-04-12'::date) END ('2021-04-13'::date) WITH (tablename='leaf_with_root_containing_dropped_columns_part2')
+);
+-- Drop a column defined ahead of the index column
+CREATE TABLE leaf_containing_no_dropped_columns(a int,  b date, z int);
+ALTER TABLE table_with_root_containing_dropped_columns DROP COLUMN z1;
+ALTER TABLE table_with_root_containing_dropped_columns DROP COLUMN d1;
+
+ALTER TABLE table_with_root_containing_dropped_columns EXCHANGE PARTITION FOR ('2021-04-11'::date) WITH TABLE leaf_containing_no_dropped_columns;
+CREATE INDEX table_with_root_containing_dropped_columns_index ON table_with_root_containing_dropped_columns(a, b);
+
+EXPLAIN SELECT * FROM table_with_root_containing_dropped_columns WHERE a>42 and z<42;
+SELECT * FROM table_with_root_containing_dropped_columns WHERE a>42 and z<42;
+EXPLAIN SELECT * FROM leaf_with_root_containing_dropped_columns_part1 WHERE a>42 and z<42;
+SELECT * FROM leaf_with_root_containing_dropped_columns_part1 WHERE a>42 and z<42;
+EXPLAIN SELECT * FROM leaf_with_root_containing_dropped_columns_part2 WHERE a>42 and z<42;
+SELECT * FROM leaf_with_root_containing_dropped_columns_part2 WHERE a>42 and z<42;
+
+-- Test exchange partition where root and the exchanged partition have dropped columns at different locations
+DROP TABLE IF EXISTS table_with_both_containing_dropped_column;
+DROP TABLE IF EXISTS leaf_containing_dropped_columns_between_index_columns;
+CREATE TABLE table_with_both_containing_dropped_column(d1 int, a int, b date, z int)
+DISTRIBUTED BY (a) PARTITION BY RANGE(b)
+(
+    START ('2021-04-11'::date) END ('2021-04-12'::date) WITH (tablename='leaf_with_dropped_cols_index_part1'),
+    START ('2021-04-12'::date) END ('2021-04-13'::date) WITH (tablename='leaf_with_dropped_cols_index_part2')
+);
+-- Drop columns from root as well as leaf at different locations
+CREATE TABLE leaf_containing_dropped_columns_between_index_columns(a int, d1  int, z1 int, b date, z int);
+ALTER TABLE table_with_both_containing_dropped_column DROP COLUMN d1;
+ALTER TABLE leaf_containing_dropped_columns_between_index_columns DROP COLUMN z1;
+ALTER TABLE leaf_containing_dropped_columns_between_index_columns DROP COLUMN d1;
+
+ALTER TABLE table_with_both_containing_dropped_column EXCHANGE PARTITION FOR ('2021-04-11'::date) WITH TABLE leaf_containing_dropped_columns_between_index_columns;
+CREATE INDEX table_with_both_containing_dropped_column_index ON table_with_both_containing_dropped_column(a, b);
+
+EXPLAIN SELECT * FROM table_with_both_containing_dropped_column WHERE a>42 and z<42;
+SELECT * FROM table_with_both_containing_dropped_column WHERE a>42 and z<42;
+EXPLAIN SELECT * FROM leaf_with_dropped_cols_index_part1 WHERE a>42 and z<42;
+SELECT * FROM leaf_with_dropped_cols_index_part1 WHERE a>42 and z<42;
+EXPLAIN SELECT * FROM leaf_with_dropped_cols_index_part2 WHERE a>42 and z<42;
+SELECT * FROM leaf_with_dropped_cols_index_part2 WHERE a>42 and z<42;
+
+-- Exchange partitions with dropped columns and check subplan with attribute remapping into dynamicSeqscan
+-- start_ignore
+DROP TABLE if exists ds_main;
+DROP TABLE if exists ds_part1;
+DROP TABLE if exists non_part1;
+DROP TABLE if exists non_part2;
+-- end_ignore
+
+CREATE TABLE ds_main ( a INT, b INT, c INT) PARTITION BY RANGE(c)( START(1) END (10) EVERY (2), DEFAULT PARTITION deflt);
+CREATE TABLE ds_part1 (a int, a1 int, b int, c int);
+CREATE TABLE non_part1 (c INT);
+CREATE TABLE non_part2 (e INT, f INT);
+
+SET optimizer_enforce_subplans TO ON;
+
+-- drop columns to get attribute remapping
+ALTER TABLE ds_part1 drop column a1;
+ALTER TABLE ds_main exchange partition for (1) with table ds_part1;
+
+INSERT INTO non_part1 SELECT i FROM generate_series(1, 1)i;
+INSERT INTO non_part2 SELECT i, i + 1 FROM generate_series(1, 10)i;
+INSERT INTO ds_main SELECT i, i + 1, i + 2 FROM generate_series (1, 1000)i;
+
+analyze ds_main;
+analyze non_part1;
+analyze non_part2;
+
+EXPLAIN (costs off) SELECT * FROM ds_main, non_part2 WHERE ds_main.c = non_part2.e AND a IN ( SELECT a FROM non_part1) order by a;
+SELECT * FROM ds_main, non_part2 WHERE ds_main.c = non_part2.e AND a IN ( SELECT a FROM non_part1) order by a;
+
+-- Test for dropping distribution column via DROP TYPE..CASCADE
+-- ensure the distribution policy for the table is updated
+-- and the DML queries on the table work as expected for both
+-- partitioned and non-partitioned tables 
+CREATE DOMAIN int_new AS int;
+CREATE TABLE dist_key_dropped (a int_new, b int) DISTRIBUTED BY(a);
+CREATE TABLE dist_key_dropped_pt (a int_new, b int) DISTRIBUTED BY(a)
+PARTITION BY RANGE(b)
+  (PARTITION p1 START(0) END(5),
+   PARTITION p2 START(6) END(10));
+INSERT INTO dist_key_dropped VALUES(1, 1);
+INSERT INTO dist_key_dropped VALUES(2, 2);
+INSERT INTO dist_key_dropped_pt VALUES(1, 1);
+INSERT INTO dist_key_dropped_pt VALUES(2, 6);
+DROP TYPE int_new CASCADE;
+\d dist_key_dropped
+\d dist_key_dropped_pt
+\d dist_key_dropped_pt_1_prt_p1
+\d dist_key_dropped_pt_1_prt_p2
+INSERT INTO dist_key_dropped VALUES(10);
+INSERT INTO dist_key_dropped_pt VALUES(7);
+UPDATE dist_key_dropped SET b=11 where b=1;
+UPDATE dist_key_dropped_pt SET b=2 where b=1;
+SELECT * FROM dist_key_dropped;
+SELECT * FROM dist_key_dropped_pt;
+DELETE FROM dist_key_dropped WHERE b=2;
+DELETE FROM dist_key_dropped_pt WHERE b=6;
+
 -- As of this writing, pg_dump creates an invalid dump for some of the tables
 -- here. See https://github.com/greenplum-db/gpdb/issues/3598. So we must drop
 -- the tables, or the pg_upgrade test fails.

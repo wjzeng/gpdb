@@ -115,7 +115,6 @@ static void AcquireExecutorLocks(List *stmt_list, bool acquire);
 static void AcquirePlannerLocks(List *stmt_list, bool acquire);
 static void ScanQueryForLocks(Query *parsetree, bool acquire);
 static bool ScanQueryWalker(Node *node, bool *acquire);
-static bool plan_list_is_oneoff(List *stmt_list);
 static TupleDesc PlanCacheComputeResultDesc(List *stmt_list);
 static void PlanCacheRelCallback(Datum arg, Oid relid);
 static void PlanCacheObjectCallback(Datum arg, int cacheid, uint32 hashvalue);
@@ -913,8 +912,9 @@ BuildCachedPlan(CachedPlanSource *plansource, List *qlist,
 {
 	CachedPlan *plan;
 	List	   *plist;
-	bool		snapshot_set;
-	bool		is_transient;
+	bool		snapshot_set = false;
+	bool		is_transient = false;
+	bool		is_oneoff = false;
 	MemoryContext plan_context;
 	MemoryContext oldcxt = CurrentMemoryContext;
 	ListCell   *lc;
@@ -952,7 +952,6 @@ BuildCachedPlan(CachedPlanSource *plansource, List *qlist,
 	 * If a snapshot is already set (the normal case), we can just use that
 	 * for planning.  But if it isn't, and we need one, install one.
 	 */
-	snapshot_set = false;
 	if (!ActiveSnapshotSet() &&
 		plansource->raw_parse_tree &&
 		analyze_requires_snapshot(plansource->raw_parse_tree))
@@ -1007,7 +1006,6 @@ BuildCachedPlan(CachedPlanSource *plansource, List *qlist,
 	 */
 	plan->planRoleId = GetUserId();
 	plan->dependsOnRole = plansource->dependsOnRLS;
-	is_transient = false;
 	foreach(lc, plist)
 	{
 		PlannedStmt *plannedstmt = lfirst_node(PlannedStmt, lc);
@@ -1015,6 +1013,8 @@ BuildCachedPlan(CachedPlanSource *plansource, List *qlist,
 		if (plannedstmt->commandType == CMD_UTILITY)
 			continue;			/* Ignore utility statements */
 
+		if (plannedstmt->oneoffPlan)
+			is_oneoff = true;
 		if (plannedstmt->transientPlan)
 			is_transient = true;
 		if (plannedstmt->dependsOnRole)
@@ -1026,7 +1026,7 @@ BuildCachedPlan(CachedPlanSource *plansource, List *qlist,
 	 * 'one-off', and mustn't be reused. Likewise, plans for CTAS are not
 	 * reused, because the plan depends on the target data distribution.
 	 */
-	if (plan_list_is_oneoff(plist) || intoClause)
+	if (is_oneoff || intoClause)
 	{
 		plan->saved_xmin = BootstrapTransactionId;
 	}
@@ -1088,23 +1088,8 @@ choose_custom_plan(CachedPlanSource *plansource, ParamListInfo boundParams, Into
 	if (plansource->cursor_options & CURSOR_OPT_CUSTOM_PLAN)
 		return true;
 
-	/*
-	 * GPORCA doesn't support Params at all, so there's no hope of generating
-	 * a generic plan. We could generate a generic plan with the Postgres
-	 * planner, but the cost model between GPORCA and the Postgres planner is
-	 * is different, so comparing the costs between plans generated with
-	 * GPORCA and the Postgres planner would not be sensible. Therefore always
-	 * continue with custom plans if GPORCA is enabled.
-	 *
-	 * Arguably we should check if the custom plan was actually generated with
-	 * GPORCA or if GPORCA fell back to the Postgres planner. If the custom
-	 * plan was was generated with the Postgres planner, even though the
-	 * optimizer GUC was enabled, then it would be fair to compare it with a
-	 * generic plan also generated with the Postgres planner. But it seems
-	 * more straightforward that if "optimizer=on" and "plan_cache_mode=auto",
-	 * you always get custom plans.
-	 */
-	if (optimizer)
+	/* Generate custom plans if optimizer_enable_query_parameter is disabled and Orca is enabled */
+	if (optimizer && !optimizer_enable_query_parameter)
 		return true;
 
 	/* Generate custom plans until we have done at least 5 (arbitrary) */
@@ -1257,7 +1242,7 @@ cached_plan_cost(CachedPlan *plan, bool include_planner)
  * In GPDB, this function has one extra parameters: intoClause.
  * If 'intoClause' is given, the plan is to be used as part of a
  * CREATE TABLE AS statement. That affects the distribution of the output rows:
- * we cannot reuse a generic plan that fetches all the output rows into master.
+ * we cannot reuse a generic plan that fetches all the output rows into coordinator.
  * They should be distributed to the correct segments according to the
  * distribution policy of the target table, instead. A non-NULL intoClause
  * therefore also forces the plan to be re-planned on next call.
@@ -1724,48 +1709,6 @@ AcquireExecutorLocks(List *stmt_list, bool acquire)
 			 * fail if it's been dropped entirely --- we'll just transiently
 			 * acquire a non-conflicting lock.
 			 */
-/* GPDB_12_MERGE_FIXME: Where does this GPDB-specific logic belong now? */
-#if 0
-			if (list_member_int(plannedstmt->resultRelations, rt_index))
-			{
-				/*
-				 * RowExclusiveLock is acquired in PostgreSQL here.  Greenplum
-				 * acquires ExclusiveLock to avoid distributed deadlock due to
-				 * concurrent UPDATE/DELETE on the same table.  This is in
-				 * parity with CdbTryOpenRelation(). If it is heap table and
-				 * the GDD is enabled, we could acquire RowExclusiveLock here.
-				 */
-				if ((plannedstmt->commandType == CMD_UPDATE ||
-					 plannedstmt->commandType == CMD_DELETE ||
-					 IsOnConflictUpdate(plannedstmt)) &&
-					CondUpgradeRelLock(rte->relid))
-					lockmode = ExclusiveLock;
-				else
-					lockmode = RowExclusiveLock;
-			}
-			else
-			{
-				/*
-				 * Greenplum specific behavior:
-				 * The implementation of select statement with locking clause
-				 * (for update | no key update | share | key share) in postgres
-				 * is to hold RowShareLock on tables during parsing stage, and
-				 * generate a LockRows plan node for executor to lock the tuples.
-				 * It is not easy to lock tuples in Greenplum database, since
-				 * tuples may be fetched through motion nodes.
-				 *
-				 * But when Global Deadlock Detector is enabled, and the select
-				 * statement with locking clause contains only one table, we are
-				 * sure that there are no motions. For such simple cases, we could
-				 * make the behavior just the same as Postgres.
-				 */
-				rc = get_plan_rowmark(plannedstmt->rowMarks, rt_index);
-				if (rc != NULL)
-					lockmode = rc->canOptSelectLockingClause ? RowShareLock : ExclusiveLock;
-				else
-					lockmode = AccessShareLock;
-			}
-#endif
 			if (acquire)
 				LockRelationOid(rte->relid, rte->rellockmode);
 			else
@@ -1811,7 +1754,6 @@ static void
 ScanQueryForLocks(Query *parsetree, bool acquire)
 {
 	ListCell   *lc;
-	int			rt_index;
 
 	/* Shouldn't get called on utility commands */
 	Assert(parsetree->commandType != CMD_UTILITY);
@@ -1819,63 +1761,17 @@ ScanQueryForLocks(Query *parsetree, bool acquire)
 	/*
 	 * First, process RTEs of the current query level.
 	 */
-	rt_index = 0;
 	foreach(lc, parsetree->rtable)
 	{
 		RangeTblEntry *rte = (RangeTblEntry *) lfirst(lc);
-		LOCKMODE	lockmode;
 
-		rt_index++;
 		switch (rte->rtekind)
 		{
 			case RTE_RELATION:
-				/* Acquire or release the appropriate type of lock */
-				if (rt_index == parsetree->resultRelation)
-				{
-					/*
-					 * RowExclusiveLock is acquired in PostgreSQL here.  Greenplum
-					 * acquires ExclusiveLock to avoid distributed deadlock due to
-					 * concurrent UPDATE/DELETE on the same table.  This is in
-					 * parity with CdbTryOpenRelation(). If it is heap table and
-					 * the GDD is enabled, we could acquire RowExclusiveLock here.
-					 */
-					if ((parsetree->commandType == CMD_UPDATE ||
-						 parsetree->commandType == CMD_DELETE ||
-						 (parsetree->onConflict &&
-						  parsetree->onConflict->action == ONCONFLICT_UPDATE)) &&
-						CondUpgradeRelLock(rte->relid))
-						lockmode = ExclusiveLock;
-					else
-						lockmode = RowExclusiveLock;
-				}
-				else
-				{
-					/*
-					 * Greenplum specific behavior:
-					 * The implementation of select statement with locking clause
-					 * (for update | no key update | share | key share) in postgres
-					 * is to hold RowShareLock on tables during parsing stage, and
-					 * generate a LockRows plan node for executor to lock the tuples.
-					 * It is not easy to lock tuples in Greenplum database, since
-					 * tuples may be fetched through motion nodes.
-					 *
-					 * But when Global Deadlock Detector is enabled, and the select
-					 * statement with locking clause contains only one table, we are
-					 * sure that there are no motions. For such simple cases, we could
-					 * make the behavior just the same as Postgres.
-					 */
-					RowMarkClause *rc;
-
-					rc = get_parse_rowmark(parsetree, rt_index);
-					if (rc != NULL)
-						lockmode = parsetree->canOptSelectLockingClause ? RowShareLock : ExclusiveLock;
-					else
-						lockmode = AccessShareLock;
-				}
 				if (acquire)
-					LockRelationOid(rte->relid, lockmode);
+					LockRelationOid(rte->relid, rte->rellockmode);
 				else
-					UnlockRelationOid(rte->relid, lockmode);
+					UnlockRelationOid(rte->relid, rte->rellockmode);
 				break;
 
 			case RTE_SUBQUERY:
@@ -1933,33 +1829,6 @@ ScanQueryWalker(Node *node, bool *acquire)
 	 */
 	return expression_tree_walker(node, ScanQueryWalker,
 								  (void *) acquire);
-}
-
-/*
- * plan_list_is_oneoff: check if any of the plans in the list are one-off plans
- *
- *
- * GPDB_96_MERGE_FIXME: This GPDB-specific function was inspired by upstream
- * plan_list_is_transient() function. But that one was removed in PostgreSQL
- * 9.6. Should we reconsider this one too?
- */
-static bool
-plan_list_is_oneoff(List *stmt_list)
-{
-	ListCell   *lc;
-
-	foreach(lc, stmt_list)
-	{
-		PlannedStmt *plannedstmt = (PlannedStmt *) lfirst(lc);
-
-		if (!IsA(plannedstmt, PlannedStmt))
-			continue;			/* Ignore utility statements */
-
-		if (plannedstmt->oneoffPlan)
-			return true;
-	}
-
-	return false;
 }
 
 /*

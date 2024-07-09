@@ -45,7 +45,7 @@
 #include "gpopt/operators/CLogicalConstTableGet.h"
 #include "gpopt/operators/CLogicalDelete.h"
 #include "gpopt/operators/CLogicalDynamicGet.h"
-#include "gpopt/operators/CLogicalExternalGet.h"
+#include "gpopt/operators/CLogicalForeignGet.h"
 #include "gpopt/operators/CLogicalGbAgg.h"
 #include "gpopt/operators/CLogicalGbAggDeduplicate.h"
 #include "gpopt/operators/CLogicalInnerJoin.h"
@@ -54,6 +54,7 @@
 #include "gpopt/operators/CLogicalLimit.h"
 #include "gpopt/operators/CLogicalNAryJoin.h"
 #include "gpopt/operators/CLogicalProject.h"
+#include "gpopt/operators/CLogicalRightOuterJoin.h"
 #include "gpopt/operators/CLogicalSelect.h"
 #include "gpopt/operators/CLogicalSequence.h"
 #include "gpopt/operators/CLogicalSequenceProject.h"
@@ -99,7 +100,7 @@ using namespace gpopt;
 
 // static variable initialization
 // default source system id
-CSystemId CTestUtils::m_sysidDefault(IMDId::EmdidGPDB,
+CSystemId CTestUtils::m_sysidDefault(IMDId::EmdidGeneral,
 									 GPOS_WSZ_STR_LENGTH("GPDB"));
 
 
@@ -162,8 +163,8 @@ CTestUtils::CTestSetup::CTestSetup()
 void
 CTestUtils::InitProviderFile(CMemoryPool *mp)
 {
-	GPOS_ASSERT(nullptr == m_mp);
-	GPOS_ASSERT(nullptr != mp);
+	GPOS_UNITTEST_ASSERT(nullptr == m_mp);
+	GPOS_UNITTEST_ASSERT(nullptr != mp);
 
 	m_mp = mp;
 	m_pmdpf = GPOS_NEW(m_mp) CMDProviderMemory(m_mp, m_szMDFileName);
@@ -182,12 +183,12 @@ CTestUtils::InitProviderFile(CMemoryPool *mp)
 void
 CTestUtils::DestroyMDProvider()
 {
-	GPOS_ASSERT(nullptr != m_mp);
+	GPOS_UNITTEST_ASSERT(nullptr != m_mp);
 
 	CRefCount::SafeRelease(m_pmdpf);
 
 	// release local memory pool
-	CMemoryPoolManager::GetMemoryPoolMgr()->Destroy(m_mp);
+	CMemoryPoolManager::Destroy(m_mp);
 }
 
 
@@ -209,7 +210,7 @@ CTestUtils::PtabdescPlainWithColNameFormat(
 	BOOL is_nullable  // define nullable columns
 )
 {
-	GPOS_ASSERT(0 < num_cols);
+	GPOS_UNITTEST_ASSERT(0 < num_cols);
 
 	CMDAccessor *md_accessor = COptCtxt::PoctxtFromTLS()->Pmda();
 
@@ -220,8 +221,11 @@ CTestUtils::PtabdescPlainWithColNameFormat(
 		mp, mdid, nameTable,
 		false,	// convert_hash_to_random
 		IMDRelation::EreldistrRandom, IMDRelation::ErelstorageHeap,
-		0,	// ulExecuteAsUser
-		-1	// lockmode
+		IMDRelation::GetCurrentAOVersion(),
+		0,	 // ulExecuteAsUser
+		-1,	 // lockmode
+		2,	 // aclmode SELECT
+		0	 // UNASSIGNED_QUERYID
 	);
 
 	for (ULONG i = 0; i < num_cols; i++)
@@ -287,7 +291,7 @@ CTestUtils::PtabdescCreate(CMemoryPool *mp, ULONG num_cols, IMDId *mdid,
 	CBitSet *pbs = GPOS_NEW(mp) CBitSet(mp, num_cols);
 	pbs->ExchangeSet(0);
 	BOOL fSuccess GPOS_ASSERTS_ONLY = ptabdesc->FAddKeySet(pbs);
-	GPOS_ASSERT(fSuccess);
+	GPOS_UNITTEST_ASSERT(fSuccess);
 
 	return ptabdesc;
 }
@@ -304,10 +308,11 @@ CExpression *
 CTestUtils::PexprLogicalGet(CMemoryPool *mp, CTableDescriptor *ptabdesc,
 							const CWStringConst *pstrTableAlias)
 {
-	GPOS_ASSERT(nullptr != ptabdesc);
+	GPOS_UNITTEST_ASSERT(nullptr != ptabdesc);
 
-	CLogicalGet *pop = GPOS_NEW(mp) CLogicalGet(
-		mp, GPOS_NEW(mp) CName(mp, CName(pstrTableAlias)), ptabdesc);
+	CLogicalGet *pop = GPOS_NEW(mp)
+		CLogicalGet(mp, GPOS_NEW(mp) CName(mp, CName(pstrTableAlias)), ptabdesc,
+					/*hasSecurityQuals*/ false);
 
 	CExpression *result = GPOS_NEW(mp) CExpression(mp, pop);
 
@@ -335,7 +340,7 @@ CTestUtils::PexprLogicalGetNullable(CMemoryPool *mp, OID oidTable,
 									const CWStringConst *pstrTableAlias)
 {
 	CWStringConst strName(str_table_name->GetBuffer());
-	CMDIdGPDB *mdid = GPOS_NEW(mp) CMDIdGPDB(oidTable, 1, 1);
+	CMDIdGPDB *mdid = GPOS_NEW(mp) CMDIdGPDB(IMDId::EmdidRel, oidTable, 1, 1);
 	CTableDescriptor *ptabdesc = CTestUtils::PtabdescPlain(
 		mp, 3, mdid, CName(&strName), true /*is_nullable*/);
 	CWStringConst strAlias(pstrTableAlias->GetBuffer());
@@ -356,9 +361,10 @@ CExpression *
 CTestUtils::PexprLogicalGet(CMemoryPool *mp, CWStringConst *str_table_name,
 							CWStringConst *pstrTableAlias, ULONG ulTableId)
 {
-	CTableDescriptor *ptabdesc = PtabdescCreate(
-		mp, GPOPT_TEST_REL_WIDTH, GPOS_NEW(mp) CMDIdGPDB(ulTableId, 1, 1),
-		CName(str_table_name));
+	CTableDescriptor *ptabdesc =
+		PtabdescCreate(mp, GPOPT_TEST_REL_WIDTH,
+					   GPOS_NEW(mp) CMDIdGPDB(IMDId::EmdidRel, ulTableId, 1, 1),
+					   CName(str_table_name));
 
 	CWStringConst strAlias(pstrTableAlias->GetBuffer());
 	return PexprLogicalGet(mp, ptabdesc, &strAlias);
@@ -376,7 +382,8 @@ CExpression *
 CTestUtils::PexprLogicalGet(CMemoryPool *mp)
 {
 	CWStringConst strName(GPOS_WSZ_LIT("BaseTable"));
-	CMDIdGPDB *mdid = GPOS_NEW(mp) CMDIdGPDB(GPOPT_MDCACHE_TEST_OID, 1, 1);
+	CMDIdGPDB *mdid =
+		GPOS_NEW(mp) CMDIdGPDB(IMDId::EmdidRel, GPOPT_MDCACHE_TEST_OID, 1, 1);
 	CTableDescriptor *ptabdesc = PtabdescCreate(mp, 3, mdid, CName(&strName));
 	CWStringConst strAlias(GPOS_WSZ_LIT("BaseTableAlias"));
 
@@ -385,22 +392,23 @@ CTestUtils::PexprLogicalGet(CMemoryPool *mp)
 
 //---------------------------------------------------------------------------
 //	@function:
-//		CTestUtils::PexprLogicalExternalGet
+//		CTestUtils::PexprLogicalForeignGet
 //
 //	@doc:
-//		Generate a randomized external get expression
+//		Generate a randomized foreign get expression
 //
 //---------------------------------------------------------------------------
 CExpression *
-CTestUtils::PexprLogicalExternalGet(CMemoryPool *mp)
+CTestUtils::PexprLogicalForeignGet(CMemoryPool *mp)
 {
 	CWStringConst strName(GPOS_WSZ_LIT("ExternalTable"));
-	CMDIdGPDB *mdid = GPOS_NEW(mp) CMDIdGPDB(GPOPT_MDCACHE_TEST_OID, 1, 1);
+	CMDIdGPDB *mdid =
+		GPOS_NEW(mp) CMDIdGPDB(IMDId::EmdidRel, GPOPT_MDCACHE_TEST_OID, 1, 1);
 	CTableDescriptor *ptabdesc = PtabdescCreate(mp, 3, mdid, CName(&strName));
 	CWStringConst strAlias(GPOS_WSZ_LIT("ExternalTableAlias"));
 
 	return GPOS_NEW(mp)
-		CExpression(mp, GPOS_NEW(mp) CLogicalExternalGet(
+		CExpression(mp, GPOS_NEW(mp) CLogicalForeignGet(
 							mp, GPOS_NEW(mp) CName(mp, &strAlias), ptabdesc));
 }
 
@@ -417,8 +425,8 @@ CTestUtils::PexprLogicalGetPartitioned(CMemoryPool *mp)
 {
 	ULONG ulAttributes = 2;
 	CWStringConst strName(GPOS_WSZ_LIT("PartTable"));
-	CMDIdGPDB *mdid =
-		GPOS_NEW(mp) CMDIdGPDB(GPOPT_MDCACHE_TEST_OID_PARTITIONED);
+	CMDIdGPDB *mdid = GPOS_NEW(mp)
+		CMDIdGPDB(IMDId::EmdidRel, GPOPT_MDCACHE_TEST_OID_PARTITIONED);
 	CTableDescriptor *ptabdesc = PtabdescCreate(
 		mp, ulAttributes, mdid, CName(&strName), true /*fPartitioned*/);
 	CWStringConst strAlias(GPOS_WSZ_LIT("PartTableAlias"));
@@ -440,19 +448,20 @@ CTestUtils::PexprLogicalDynamicGetWithIndexes(CMemoryPool *mp)
 {
 	ULONG ulAttributes = 2;
 	CWStringConst strName(GPOS_WSZ_LIT("P1"));
-	CMDIdGPDB *mdid =
-		GPOS_NEW(mp) CMDIdGPDB(GPOPT_MDCACHE_TEST_OID_PARTITIONED_WITH_INDEXES);
+	CMDIdGPDB *mdid = GPOS_NEW(mp) CMDIdGPDB(
+		IMDId::EmdidRel, GPOPT_MDCACHE_TEST_OID_PARTITIONED_WITH_INDEXES);
 	CTableDescriptor *ptabdesc = PtabdescCreate(
 		mp, ulAttributes, mdid, CName(&strName), true /*fPartitioned*/);
 	CWStringConst strAlias(GPOS_WSZ_LIT("P1Alias"));
 
 	IMdIdArray *partition_mdids = GPOS_NEW(mp) IMdIdArray(mp);
+	IMdIdArray *foreign_mdids = GPOS_NEW(mp) IMdIdArray(mp);
 
 	return GPOS_NEW(mp) CExpression(
 		mp, GPOS_NEW(mp) CLogicalDynamicGet(
 				mp, GPOS_NEW(mp) CName(mp, CName(&strAlias)), ptabdesc,
 				0,	// ulPartIndex
-				partition_mdids));
+				partition_mdids, foreign_mdids));
 }
 
 
@@ -467,7 +476,7 @@ CTestUtils::PexprLogicalDynamicGetWithIndexes(CMemoryPool *mp)
 CExpression *
 CTestUtils::PexprLogicalSelect(CMemoryPool *mp, CExpression *pexpr)
 {
-	GPOS_ASSERT(nullptr != pexpr);
+	GPOS_UNITTEST_ASSERT(nullptr != pexpr);
 
 	// get any two columns
 	CColRefSet *pcrs = pexpr->DeriveOutputColumns();
@@ -559,10 +568,10 @@ CTestUtils::PexprLogicalSelectPartitioned(CMemoryPool *mp)
 	CLogicalGet *popGet = CLogicalGet::PopConvert(pexprGet->Pop());
 	const CColRef2dArray *pdrgpdrgpcr = popGet->PdrgpdrgpcrPartColumns();
 
-	GPOS_ASSERT(pdrgpdrgpcr != nullptr);
-	GPOS_ASSERT(0 < pdrgpdrgpcr->Size());
+	GPOS_UNITTEST_ASSERT(pdrgpdrgpcr != nullptr);
+	GPOS_UNITTEST_ASSERT(0 < pdrgpdrgpcr->Size());
 	CColRefArray *colref_array = (*pdrgpdrgpcr)[0];
-	GPOS_ASSERT(1 == colref_array->Size());
+	GPOS_UNITTEST_ASSERT(1 == colref_array->Size());
 	CColRef *pcrPartKey = (*colref_array)[0];
 
 	// construct a comparison pk = 5
@@ -653,7 +662,7 @@ CTestUtils::Pexpr4WayJoinPartitioned(CMemoryPool *mp)
 CExpression *
 CTestUtils::PexprLogicalSelectWithNestedAnd(CMemoryPool *mp)
 {
-	GPOS_ASSERT(nullptr != mp);
+	GPOS_UNITTEST_ASSERT(nullptr != mp);
 
 	CExpression *pexprGet = PexprLogicalGet(mp);
 	CExpression *pexprPred =
@@ -673,7 +682,7 @@ CTestUtils::PexprLogicalSelectWithNestedAnd(CMemoryPool *mp)
 CExpression *
 CTestUtils::PexprLogicalSelectWithNestedOr(CMemoryPool *mp)
 {
-	GPOS_ASSERT(nullptr != mp);
+	GPOS_UNITTEST_ASSERT(nullptr != mp);
 
 	CExpression *pexprGet = PexprLogicalGet(mp);
 	CExpression *pexprPred =
@@ -694,7 +703,7 @@ CTestUtils::PexprLogicalSelectWithNestedOr(CMemoryPool *mp)
 CExpression *
 CTestUtils::PexprLogicalSelectWithEvenNestedNot(CMemoryPool *mp)
 {
-	GPOS_ASSERT(nullptr != mp);
+	GPOS_UNITTEST_ASSERT(nullptr != mp);
 
 	CExpression *pexprGet = PexprLogicalGet(mp);
 	CExpression *pexprPred =
@@ -717,9 +726,9 @@ CTestUtils::PexprScIdentCmpScIdent(CMemoryPool *mp, CExpression *pexprLeft,
 								   CExpression *pexprRight,
 								   IMDType::ECmpType cmp_type)
 {
-	GPOS_ASSERT(nullptr != pexprLeft);
-	GPOS_ASSERT(nullptr != pexprRight);
-	GPOS_ASSERT(cmp_type <= IMDType::EcmptOther);
+	GPOS_UNITTEST_ASSERT(nullptr != pexprLeft);
+	GPOS_UNITTEST_ASSERT(nullptr != pexprRight);
+	GPOS_UNITTEST_ASSERT(cmp_type <= IMDType::EcmptOther);
 
 	CColRefSet *pcrsLeft = pexprLeft->DeriveOutputColumns();
 	CColRef *pcrLeft = pcrsLeft->PcrAny();
@@ -746,7 +755,7 @@ CExpression *
 CTestUtils::PexprScIdentCmpConst(CMemoryPool *mp, CExpression *pexpr,
 								 IMDType::ECmpType cmp_type, ULONG ulVal)
 {
-	GPOS_ASSERT(nullptr != pexpr);
+	GPOS_UNITTEST_ASSERT(nullptr != pexpr);
 
 	CColRefSet *pcrs = pexpr->DeriveOutputColumns();
 	CColRef *pcrLeft = pcrs->PcrAny();
@@ -839,8 +848,8 @@ CTestUtils::PexprLogicalSelectArrayCmp(CMemoryPool *mp,
 									   IMDType::ECmpType ecmptype,
 									   const IntPtrArray *pdrgpiVals)
 {
-	GPOS_ASSERT(CScalarArrayCmp::EarrcmpSentinel > earrcmptype);
-	GPOS_ASSERT(IMDType::EcmptOther > ecmptype);
+	GPOS_UNITTEST_ASSERT(CScalarArrayCmp::EarrcmpSentinel > earrcmptype);
+	GPOS_UNITTEST_ASSERT(IMDType::EcmptOther > ecmptype);
 
 	// generate a get expression
 	CExpression *pexprGet = PexprLogicalGet(mp);
@@ -878,7 +887,7 @@ CTestUtils::PexprLogicalSelectArrayCmp(CMemoryPool *mp,
 CExpression *
 CTestUtils::PexprLogicalSelectWithOddNestedNot(CMemoryPool *mp)
 {
-	GPOS_ASSERT(nullptr != mp);
+	GPOS_UNITTEST_ASSERT(nullptr != mp);
 
 	CExpression *pexprGet = PexprLogicalGet(mp);
 	CExpression *pexprPred =
@@ -902,7 +911,7 @@ CTestUtils::PexprLogicalSelectWithOddNestedNot(CMemoryPool *mp)
 CExpression *
 CTestUtils::PexprLogicalSelectWithNestedAndOrNot(CMemoryPool *mp)
 {
-	GPOS_ASSERT(nullptr != mp);
+	GPOS_UNITTEST_ASSERT(nullptr != mp);
 
 	CExpression *pexprGet = PexprLogicalGet(mp);
 	CExpression *pexprPredAnd =
@@ -936,12 +945,13 @@ CExpression *
 CTestUtils::PexprLogicalSubqueryWithConstTableGet(CMemoryPool *mp,
 												  COperator::EOperatorId op_id)
 {
-	GPOS_ASSERT(nullptr != mp);
-	GPOS_ASSERT(COperator::EopScalarSubqueryAny == op_id ||
-				COperator::EopScalarSubqueryAll == op_id);
+	GPOS_UNITTEST_ASSERT(nullptr != mp);
+	GPOS_UNITTEST_ASSERT(COperator::EopScalarSubqueryAny == op_id ||
+						 COperator::EopScalarSubqueryAll == op_id);
 
 	CWStringConst strNameR(GPOS_WSZ_LIT("Rel1"));
-	CMDIdGPDB *pmdidR = GPOS_NEW(mp) CMDIdGPDB(GPOPT_TEST_REL_OID1, 1, 1);
+	CMDIdGPDB *pmdidR =
+		GPOS_NEW(mp) CMDIdGPDB(IMDId::EmdidRel, GPOPT_TEST_REL_OID1, 1, 1);
 	CTableDescriptor *ptabdescR =
 		PtabdescCreate(mp, 3 /*num_cols*/, pmdidR, CName(&strNameR));
 
@@ -966,7 +976,9 @@ CTestUtils::PexprLogicalSubqueryWithConstTableGet(CMemoryPool *mp,
 		pexprSubquery = GPOS_NEW(mp) CExpression(
 			mp,
 			GPOS_NEW(mp) CScalarSubqueryAny(
-				mp, GPOS_NEW(mp) CMDIdGPDB(GPDB_INT4_EQ_OP), str, pcrInner),
+				mp,
+				GPOS_NEW(mp) CMDIdGPDB(IMDId::EmdidGeneral, GPDB_INT4_EQ_OP),
+				str, pcrInner),
 			pexprConstTableGet, CUtils::PexprScalarIdent(mp, pcrOuter));
 	}
 	else
@@ -975,7 +987,9 @@ CTestUtils::PexprLogicalSubqueryWithConstTableGet(CMemoryPool *mp,
 		pexprSubquery = GPOS_NEW(mp) CExpression(
 			mp,
 			GPOS_NEW(mp) CScalarSubqueryAll(
-				mp, GPOS_NEW(mp) CMDIdGPDB(GPDB_INT4_EQ_OP), str, pcrInner),
+				mp,
+				GPOS_NEW(mp) CMDIdGPDB(IMDId::EmdidGeneral, GPDB_INT4_EQ_OP),
+				str, pcrInner),
 			pexprConstTableGet, CUtils::PexprScalarIdent(mp, pcrOuter));
 	}
 
@@ -1088,7 +1102,7 @@ CTestUtils::PexprLogicalSelectCorrelated(CMemoryPool *mp,
 		PexprLogicalSelectCorrelated(mp, outer_refs, ulLevel - 1);
 
 	CColRefSet *pcrs = pexpr->DeriveOutputColumns();
-	GPOS_ASSERT(outer_refs->IsDisjoint(pcrs));
+	GPOS_UNITTEST_ASSERT(outer_refs->IsDisjoint(pcrs));
 
 	CExpressionArray *pdrgpexpr = GPOS_NEW(mp) CExpressionArray(mp);
 
@@ -1151,9 +1165,9 @@ CExpression *
 CTestUtils::PexprLogicalProject(CMemoryPool *mp, CExpression *pexpr,
 								CColRef *colref, CColRef *new_colref)
 {
-	GPOS_ASSERT(nullptr != pexpr);
-	GPOS_ASSERT(nullptr != colref);
-	GPOS_ASSERT(nullptr != new_colref);
+	GPOS_UNITTEST_ASSERT(nullptr != pexpr);
+	GPOS_UNITTEST_ASSERT(nullptr != colref);
+	GPOS_UNITTEST_ASSERT(nullptr != new_colref);
 
 	return GPOS_NEW(mp) CExpression(
 		mp, GPOS_NEW(mp) CLogicalProject(mp), pexpr,
@@ -1280,8 +1294,8 @@ CTestUtils::PexprLogicalJoinWithPartitionedAndIndexedInnerChild(CMemoryPool *mp)
 CExpression *
 CTestUtils::PexprLogicalNAryJoin(CMemoryPool *mp, CExpressionArray *pdrgpexpr)
 {
-	GPOS_ASSERT(nullptr != pdrgpexpr);
-	GPOS_ASSERT(2 < pdrgpexpr->Size());
+	GPOS_UNITTEST_ASSERT(nullptr != pdrgpexpr);
+	GPOS_UNITTEST_ASSERT(2 < pdrgpexpr->Size());
 
 	return GPOS_NEW(mp)
 		CExpression(mp, GPOS_NEW(mp) CLogicalNAryJoin(mp), pdrgpexpr);
@@ -1370,6 +1384,26 @@ CTestUtils::PexprLeftOuterJoinOnNAryJoin(CMemoryPool *mp)
 }
 
 
+CExpression *
+CTestUtils::PexprRightOuterJoin(CMemoryPool *mp)
+{
+	CExpression *pexprInnerChild = PexprLogicalGet(mp);
+	CExpression *pexprOuterChild = PexprLogicalGet(mp);
+
+	// get a random column from inner child output
+	CColRef *pcrLeft = pexprInnerChild->DeriveOutputColumns()->PcrAny();
+
+	// get a random column from outer child output
+	CColRef *pcrRight = pexprOuterChild->DeriveOutputColumns()->PcrAny();
+
+	CExpression *pexprPred = CUtils::PexprScalarEqCmp(mp, pcrLeft, pcrRight);
+
+	return GPOS_NEW(mp)
+		CExpression(mp, GPOS_NEW(mp) CLogicalRightOuterJoin(mp),
+					pexprOuterChild, pexprInnerChild, pexprPred);
+}
+
+
 //---------------------------------------------------------------------------
 //	@function:
 //		CTestUtils::PexprNAryJoinOnLeftOuterJoin
@@ -1432,9 +1466,9 @@ CExpression *
 CTestUtils::PexprLogicalLimit(CMemoryPool *mp, CExpression *pexpr, LINT iStart,
 							  LINT iRows, BOOL fGlobal, BOOL fHasCount)
 {
-	GPOS_ASSERT(nullptr != pexpr);
-	GPOS_ASSERT(0 <= iStart);
-	GPOS_ASSERT(0 <= iRows);
+	GPOS_UNITTEST_ASSERT(nullptr != pexpr);
+	GPOS_UNITTEST_ASSERT(0 <= iStart);
+	GPOS_UNITTEST_ASSERT(0 <= iRows);
 
 	COrderSpec *pos = GPOS_NEW(mp) COrderSpec(mp);
 	return GPOS_NEW(mp)
@@ -1557,7 +1591,8 @@ CTestUtils::PexprPrjElemWithSum(CMemoryPool *mp, CColRef *colref)
 	CMDAccessor *md_accessor = COptCtxt::PoctxtFromTLS()->Pmda();
 
 	// generate a SUM expression
-	CMDIdGPDB *pmdidSumAgg = GPOS_NEW(mp) CMDIdGPDB(GPDB_INT4_SUM_AGG);
+	CMDIdGPDB *pmdidSumAgg =
+		GPOS_NEW(mp) CMDIdGPDB(IMDId::EmdidGeneral, GPDB_INT4_SUM_AGG);
 	CWStringConst *pstrAggFunc =
 		GPOS_NEW(mp) CWStringConst(GPOS_WSZ_LIT("sum"));
 	CExpression *pexprScalarAgg = CUtils::PexprAggFunc(
@@ -1672,7 +1707,7 @@ CTestUtils::PexprLogicalGbAggCorrelated(CMemoryPool *mp)
 CExpression *
 CTestUtils::PexprConstTableGet(CMemoryPool *mp, ULONG ulElements)
 {
-	GPOS_ASSERT(0 < ulElements);
+	GPOS_UNITTEST_ASSERT(0 < ulElements);
 
 	CMDAccessor *md_accessor = COptCtxt::PoctxtFromTLS()->Pmda();
 
@@ -1739,7 +1774,8 @@ CTestUtils::PexprLogicalInsert(CMemoryPool *mp)
 	CColRefArray *colref_array = pcrs->Pdrgpcr(mp);
 
 	CWStringConst strName(GPOS_WSZ_LIT("BaseTable"));
-	CMDIdGPDB *mdid = GPOS_NEW(mp) CMDIdGPDB(GPOPT_MDCACHE_TEST_OID, 1, 1);
+	CMDIdGPDB *mdid =
+		GPOS_NEW(mp) CMDIdGPDB(IMDId::EmdidRel, GPOPT_MDCACHE_TEST_OID, 1, 1);
 	CTableDescriptor *ptabdesc = PtabdescCreate(mp, 1, mdid, CName(&strName));
 
 	return GPOS_NEW(mp) CExpression(
@@ -1758,7 +1794,8 @@ CExpression *
 CTestUtils::PexprLogicalDelete(CMemoryPool *mp)
 {
 	CWStringConst strName(GPOS_WSZ_LIT("BaseTable"));
-	CMDIdGPDB *mdid = GPOS_NEW(mp) CMDIdGPDB(GPOPT_MDCACHE_TEST_OID, 1, 1);
+	CMDIdGPDB *mdid =
+		GPOS_NEW(mp) CMDIdGPDB(IMDId::EmdidRel, GPOPT_MDCACHE_TEST_OID, 1, 1);
 	CTableDescriptor *ptabdesc = PtabdescCreate(mp, 1, mdid, CName(&strName));
 	CWStringConst strAlias(GPOS_WSZ_LIT("BaseTableAlias"));
 
@@ -1789,7 +1826,8 @@ CExpression *
 CTestUtils::PexprLogicalUpdate(CMemoryPool *mp)
 {
 	CWStringConst strName(GPOS_WSZ_LIT("BaseTable"));
-	CMDIdGPDB *mdid = GPOS_NEW(mp) CMDIdGPDB(GPOPT_MDCACHE_TEST_OID, 1, 1);
+	CMDIdGPDB *mdid =
+		GPOS_NEW(mp) CMDIdGPDB(IMDId::EmdidRel, GPOPT_MDCACHE_TEST_OID, 1, 1);
 	CTableDescriptor *ptabdesc = PtabdescCreate(mp, 1, mdid, CName(&strName));
 	CWStringConst strAlias(GPOS_WSZ_LIT("BaseTableAlias"));
 
@@ -1806,7 +1844,7 @@ CTestUtils::PexprLogicalUpdate(CMemoryPool *mp)
 	return GPOS_NEW(mp) CExpression(
 		mp,
 		GPOS_NEW(mp) CLogicalUpdate(mp, ptabdesc, pdrgpcrDelete, pdrgpcrInsert,
-									colref, colref, nullptr /*pcrTupleOid*/),
+									colref, colref, true),
 		pexprGet);
 }
 
@@ -1823,14 +1861,15 @@ CTestUtils::PexprLogicalDynamicGet(CMemoryPool *mp, CTableDescriptor *ptabdesc,
 								   const CWStringConst *pstrTableAlias,
 								   ULONG ulPartIndex)
 {
-	GPOS_ASSERT(nullptr != ptabdesc);
+	GPOS_UNITTEST_ASSERT(nullptr != ptabdesc);
 
 	IMdIdArray *partition_mdids = GPOS_NEW(mp) IMdIdArray(mp);
+	IMdIdArray *foreign_mdids = GPOS_NEW(mp) IMdIdArray(mp);
 
-	return GPOS_NEW(mp)
-		CExpression(mp, GPOS_NEW(mp) CLogicalDynamicGet(
-							mp, GPOS_NEW(mp) CName(mp, CName(pstrTableAlias)),
-							ptabdesc, ulPartIndex, partition_mdids));
+	return GPOS_NEW(mp) CExpression(
+		mp, GPOS_NEW(mp) CLogicalDynamicGet(
+				mp, GPOS_NEW(mp) CName(mp, CName(pstrTableAlias)), ptabdesc,
+				ulPartIndex, partition_mdids, foreign_mdids));
 }
 
 //---------------------------------------------------------------------------
@@ -1845,8 +1884,8 @@ CExpression *
 CTestUtils::PexprLogicalDynamicGet(CMemoryPool *mp)
 {
 	CWStringConst strName(GPOS_WSZ_LIT("PartTable"));
-	CMDIdGPDB *mdid =
-		GPOS_NEW(mp) CMDIdGPDB(GPOPT_MDCACHE_TEST_OID_PARTITIONED, 1, 1);
+	CMDIdGPDB *mdid = GPOS_NEW(mp)
+		CMDIdGPDB(IMDId::EmdidRel, GPOPT_MDCACHE_TEST_OID_PARTITIONED, 1, 1);
 	CTableDescriptor *ptabdesc =
 		PtabdescCreate(mp, 3, mdid, CName(&strName), true /*fPartitioned*/);
 	CWStringConst strAlias(GPOS_WSZ_LIT("PartTableAlias"));
@@ -1868,8 +1907,8 @@ CExpression *
 CTestUtils::PexprLogicalSelectWithEqPredicateOverDynamicGet(CMemoryPool *mp)
 {
 	CWStringConst strName(GPOS_WSZ_LIT("PartTable"));
-	CMDIdGPDB *mdid =
-		GPOS_NEW(mp) CMDIdGPDB(GPOPT_MDCACHE_TEST_OID_PARTITIONED, 1, 1);
+	CMDIdGPDB *mdid = GPOS_NEW(mp)
+		CMDIdGPDB(IMDId::EmdidRel, GPOPT_MDCACHE_TEST_OID_PARTITIONED, 1, 1);
 	CTableDescriptor *ptabdesc =
 		PtabdescCreate(mp, 3, mdid, CName(&strName), true /*fPartitioned*/);
 	CWStringConst strAlias(GPOS_WSZ_LIT("PartTableAlias"));
@@ -1904,8 +1943,8 @@ CExpression *
 CTestUtils::PexprLogicalSelectWithLTPredicateOverDynamicGet(CMemoryPool *mp)
 {
 	CWStringConst strName(GPOS_WSZ_LIT("PartTable"));
-	CMDIdGPDB *mdid =
-		GPOS_NEW(mp) CMDIdGPDB(GPOPT_MDCACHE_TEST_OID_PARTITIONED, 1, 1);
+	CMDIdGPDB *mdid = GPOS_NEW(mp)
+		CMDIdGPDB(IMDId::EmdidRel, GPOPT_MDCACHE_TEST_OID_PARTITIONED, 1, 1);
 	CTableDescriptor *ptabdesc =
 		PtabdescCreate(mp, 3, mdid, CName(&strName), true /*fPartitioned*/);
 	CWStringConst strAlias(GPOS_WSZ_LIT("PartTableAlias"));
@@ -1984,7 +2023,8 @@ CTestUtils::PexprLogicalTVF(CMemoryPool *mp, ULONG ulArgs)
 
 	const WCHAR *wszFuncName = GPOS_WSZ_LIT("generate_series");
 
-	IMDId *mdid = GPOS_NEW(mp) CMDIdGPDB(GPDB_INT8_GENERATE_SERIES);
+	IMDId *mdid =
+		GPOS_NEW(mp) CMDIdGPDB(IMDId::EmdidGeneral, GPDB_INT8_GENERATE_SERIES);
 	CWStringConst *str_func_name = GPOS_NEW(mp) CWStringConst(mp, wszFuncName);
 
 	const IMDTypeInt8 *pmdtypeint8 =
@@ -2103,7 +2143,7 @@ CTestUtils::PexprCTETree(CMemoryPool *mp)
 CExpression *
 CTestUtils::PexprLogicalSequence(CMemoryPool *mp, CExpressionArray *pdrgpexpr)
 {
-	GPOS_ASSERT(nullptr != pdrgpexpr);
+	GPOS_UNITTEST_ASSERT(nullptr != pdrgpexpr);
 
 	return GPOS_NEW(mp)
 		CExpression(mp, GPOS_NEW(mp) CLogicalSequence(mp), pdrgpexpr);
@@ -2181,12 +2221,13 @@ CTestUtils::PexprLogicalUnion(CMemoryPool *mp, ULONG ulDepth)
 			}
 			else
 			{
-				GPOS_ASSERT(COperator::EopLogicalUnion == pop->Eopid());
+				GPOS_UNITTEST_ASSERT(COperator::EopLogicalUnion ==
+									 pop->Eopid());
 				CLogicalUnion *popUnion = CLogicalUnion::PopConvert(pop);
 				colref_array = popUnion->PdrgpcrOutput();
 			}
 			pdrgpexprInput->Append(pexprInput);
-			GPOS_ASSERT(nullptr != colref_array);
+			GPOS_UNITTEST_ASSERT(nullptr != colref_array);
 
 			colref_array->AddRef();
 			pdrgpdrgpcrInput->Append(colref_array);
@@ -2237,7 +2278,7 @@ CTestUtils::PexprLogicalSequenceProject(CMemoryPool *mp, OID oidFunc,
 			CDistributionSpecHashed(pdrgpexpr, true /*fNullsCollocated*/),
 		pdrgpos, pdrgwf);
 
-	IMDId *mdid = GPOS_NEW(mp) CMDIdGPDB(oidFunc);
+	IMDId *mdid = GPOS_NEW(mp) CMDIdGPDB(IMDId::EmdidGeneral, oidFunc);
 	const IMDFunction *pmdfunc = md_accessor->RetrieveFunc(mdid);
 
 	IMDId *mdid_return_type = pmdfunc->GetResultTypeMdid();
@@ -2437,24 +2478,29 @@ CTestUtils::PqcGenerate(CMemoryPool *mp, CExpression *pexpr,
 
 	COrderSpec *pos = GPOS_NEW(mp) COrderSpec(mp);
 	CDistributionSpec *pds = GPOS_NEW(mp)
-		CDistributionSpecSingleton(CDistributionSpecSingleton::EstMaster);
+		CDistributionSpecSingleton(CDistributionSpecSingleton::EstCoordinator);
 
 	CRewindabilitySpec *prs = GPOS_NEW(mp) CRewindabilitySpec(
 		CRewindabilitySpec::ErtNone, CRewindabilitySpec::EmhtNoMotion);
 
+	CPartitionPropagationSpec *pps = GPOS_NEW(mp) CPartitionPropagationSpec(mp);
+
 	CEnfdOrder *peo = GPOS_NEW(mp) CEnfdOrder(pos, CEnfdOrder::EomSatisfy);
 
-	// we require exact matching on distribution since final query results must be sent to master
+	// we require exact matching on distribution since final query results must be sent to coordinator
 	CEnfdDistribution *ped =
 		GPOS_NEW(mp) CEnfdDistribution(pds, CEnfdDistribution::EdmExact);
 
 	CEnfdRewindability *per =
 		GPOS_NEW(mp) CEnfdRewindability(prs, CEnfdRewindability::ErmSatisfy);
 
+	CEnfdPartitionPropagation *pepp = GPOS_NEW(mp)
+		CEnfdPartitionPropagation(pps, CEnfdPartitionPropagation::EppmSatisfy);
+
 	CCTEReq *pcter = COptCtxt::PoctxtFromTLS()->Pcteinfo()->PcterProducers(mp);
 
 	CReqdPropPlan *prpp =
-		GPOS_NEW(mp) CReqdPropPlan(pcrs, peo, ped, per, pcter);
+		GPOS_NEW(mp) CReqdPropPlan(pcrs, peo, ped, per, pepp, pcter);
 
 	colref_array->AddRef();
 	CMDNameArray *pdrgpmdname = GPOS_NEW(mp) CMDNameArray(mp);
@@ -2509,18 +2555,18 @@ CTestUtils::PqcGenerate(CMemoryPool *mp, CExpression *pexpr)
 
 	// generate a sort order
 	COrderSpec *pos = GPOS_NEW(mp) COrderSpec(mp);
-	pos->Append(GPOS_NEW(mp) CMDIdGPDB(GPDB_INT4_LT_OP), pcrsOutput->PcrAny(),
-				COrderSpec::EntFirst);
+	pos->Append(GPOS_NEW(mp) CMDIdGPDB(IMDId::EmdidGeneral, GPDB_INT4_LT_OP),
+				pcrsOutput->PcrAny(), COrderSpec::EntFirst);
 
 	CDistributionSpec *pds = GPOS_NEW(mp)
-		CDistributionSpecSingleton(CDistributionSpecSingleton::EstMaster);
+		CDistributionSpecSingleton(CDistributionSpecSingleton::EstCoordinator);
 
 	CRewindabilitySpec *prs = GPOS_NEW(mp) CRewindabilitySpec(
 		CRewindabilitySpec::ErtNone, CRewindabilitySpec::EmhtNoMotion);
 
 	CEnfdOrder *peo = GPOS_NEW(mp) CEnfdOrder(pos, CEnfdOrder::EomSatisfy);
 
-	// we require exact matching on distribution since final query results must be sent to master
+	// we require exact matching on distribution since final query results must be sent to coordinator
 	CEnfdDistribution *ped =
 		GPOS_NEW(mp) CEnfdDistribution(pds, CEnfdDistribution::EdmExact);
 
@@ -2529,8 +2575,12 @@ CTestUtils::PqcGenerate(CMemoryPool *mp, CExpression *pexpr)
 
 	CCTEReq *pcter = COptCtxt::PoctxtFromTLS()->Pcteinfo()->PcterProducers(mp);
 
+	CPartitionPropagationSpec *pps = GPOS_NEW(mp) CPartitionPropagationSpec(mp);
+	CEnfdPartitionPropagation *pepp = GPOS_NEW(mp)
+		CEnfdPartitionPropagation(pps, CEnfdPartitionPropagation::EppmSatisfy);
+
 	CReqdPropPlan *prpp =
-		GPOS_NEW(mp) CReqdPropPlan(pcrsOutput, peo, ped, per, pcter);
+		GPOS_NEW(mp) CReqdPropPlan(pcrsOutput, peo, ped, per, pepp, pcter);
 
 	CMDNameArray *pdrgpmdname = GPOS_NEW(mp) CMDNameArray(mp);
 	const ULONG length = colref_array->Size();
@@ -2557,11 +2607,11 @@ CExpression *
 CTestUtils::PexprScalarNestedPreds(CMemoryPool *mp, CExpression *pexpr,
 								   CScalarBoolOp::EBoolOperator eboolop)
 {
-	GPOS_ASSERT(nullptr != mp);
-	GPOS_ASSERT(nullptr != pexpr);
-	GPOS_ASSERT(CScalarBoolOp::EboolopAnd == eboolop ||
-				CScalarBoolOp::EboolopOr == eboolop ||
-				CScalarBoolOp::EboolopNot == eboolop);
+	GPOS_UNITTEST_ASSERT(nullptr != mp);
+	GPOS_UNITTEST_ASSERT(nullptr != pexpr);
+	GPOS_UNITTEST_ASSERT(CScalarBoolOp::EboolopAnd == eboolop ||
+						 CScalarBoolOp::EboolopOr == eboolop ||
+						 CScalarBoolOp::EboolopNot == eboolop);
 
 	CColRefSet *pcrs = pexpr->DeriveOutputColumns();
 	CColRef *pcrLeft = pcrs->PcrAny();
@@ -2614,7 +2664,7 @@ CExpression *
 CTestUtils::PexprFindFirstExpressionWithOpId(CExpression *pexpr,
 											 COperator::EOperatorId op_id)
 {
-	GPOS_ASSERT(nullptr != pexpr);
+	GPOS_UNITTEST_ASSERT(nullptr != pexpr);
 	if (op_id == pexpr->Pop()->Eopid())
 	{
 		return pexpr;
@@ -2764,7 +2814,7 @@ CTestUtils::PexprReadQuery(CMemoryPool *mp, const CHAR *szQueryFileName)
 
 	// get md accessor
 	CMDAccessor *md_accessor = COptCtxt::PoctxtFromTLS()->Pmda();
-	GPOS_ASSERT(nullptr != md_accessor);
+	GPOS_UNITTEST_ASSERT(nullptr != md_accessor);
 
 	// translate DXL tree into CExpression
 	CTranslatorDXLToExpr trdxl2expr(mp, md_accessor);
@@ -2807,7 +2857,7 @@ CTestUtils::EresTranslate(CMemoryPool *mp, const CHAR *szQueryFileName,
 
 	// get md accessor
 	CMDAccessor *md_accessor = COptCtxt::PoctxtFromTLS()->Pmda();
-	GPOS_ASSERT(nullptr != md_accessor);
+	GPOS_UNITTEST_ASSERT(nullptr != md_accessor);
 
 	// translate DXL tree into CExpression
 	CTranslatorDXLToExpr ptrdxl2expr(mp, md_accessor);
@@ -2834,7 +2884,7 @@ CTestUtils::EresTranslate(CMemoryPool *mp, const CHAR *szQueryFileName,
 #endif	//GPOS_DEBUG
 
 	gpopt::CExpression *pexprPlan = eng.PexprExtractPlan();
-	GPOS_ASSERT(nullptr != pexprPlan);
+	GPOS_UNITTEST_ASSERT(nullptr != pexprPlan);
 
 	pexprPlan->OsPrint(oss);
 
@@ -2842,7 +2892,7 @@ CTestUtils::EresTranslate(CMemoryPool *mp, const CHAR *szQueryFileName,
 	CTranslatorExprToDXL ptrexpr2dxl(mp, md_accessor, PdrgpiSegments(mp));
 	CDXLNode *pdxlnPlan = ptrexpr2dxl.PdxlnTranslate(pexprPlan, pqc->PdrgPcr(),
 													 pqc->Pdrgpmdname());
-	GPOS_ASSERT(nullptr != pdxlnPlan);
+	GPOS_UNITTEST_ASSERT(nullptr != pdxlnPlan);
 
 	COptimizerConfig *optimizer_config =
 		COptCtxt::PoctxtFromTLS()->GetOptimizerConfig();
@@ -3021,8 +3071,8 @@ CTestUtils::FPlanMatch(CMemoryPool *mp, IOstream &os,
 		return false;
 	}
 
-	GPOS_ASSERT(nullptr != pdxlnActual);
-	GPOS_ASSERT(nullptr != pdxlnExpected);
+	GPOS_UNITTEST_ASSERT(nullptr != pdxlnActual);
+	GPOS_UNITTEST_ASSERT(nullptr != pdxlnExpected);
 
 	// plan id's and space sizes are already compared before this point,
 	// overwrite PlanId's and space sizes with zeros to pass string comparison on plan body
@@ -3155,7 +3205,7 @@ CTestUtils::PdrgpiSegments(CMemoryPool *mp)
 {
 	IntPtrArray *pdrgpiSegments = GPOS_NEW(mp) IntPtrArray(mp);
 	const ULONG ulSegments = GPOPT_SEGMENT_COUNT;
-	GPOS_ASSERT(0 < ulSegments);
+	GPOS_UNITTEST_ASSERT(0 < ulSegments);
 
 	for (ULONG ul = 0; ul < ulSegments; ul++)
 	{
@@ -3175,7 +3225,7 @@ CTestUtils::PdrgpiSegments(CMemoryPool *mp)
 CHAR *
 CTestUtils::SzMinidumpFileName(CMemoryPool *mp, const CHAR *file_name)
 {
-	GPOS_ASSERT(nullptr != file_name);
+	GPOS_UNITTEST_ASSERT(nullptr != file_name);
 
 	if (!GPOS_FTRACE(EopttraceEnableSpacePruning))
 	{
@@ -3215,7 +3265,7 @@ CTestUtils::EresRunMinidump(CMemoryPool *mp, CMDAccessor *md_accessor,
 							ULONG ulSessionId, ULONG ulCmdId, BOOL fMatchPlans,
 							INT iCmpSpaceSize, IConstExprEvaluator *pceeval)
 {
-	GPOS_ASSERT(nullptr != md_accessor);
+	GPOS_UNITTEST_ASSERT(nullptr != md_accessor);
 
 	GPOS_RESULT eres = GPOS_OK;
 
@@ -3385,8 +3435,8 @@ CTestUtils::EresRunMinidumpsUsingOneMDFile(
 	ULONG *pulTestCounter, ULONG ulSessionId, ULONG ulCmdId, BOOL fMatchPlans,
 	INT iCmpSpaceSize, IConstExprEvaluator *pceeval)
 {
-	GPOS_ASSERT(nullptr != rgszFileNames);
-	GPOS_ASSERT(nullptr != szMDFilePath);
+	GPOS_UNITTEST_ASSERT(nullptr != rgszFileNames);
+	GPOS_UNITTEST_ASSERT(nullptr != szMDFilePath);
 
 	// reset metadata cache
 	CMDCache::Reset();
@@ -3489,7 +3539,8 @@ CTestUtils::EresSamplePlans(const CHAR *rgszFileNames[], ULONG ulTests,
 					CEnumeratorConfig(mp, 0 /*plan_id*/, 1000 /*ullSamples*/),
 				CStatisticsConfig::PstatsconfDefault(mp),
 				CCTEConfig::PcteconfDefault(mp), ICostModel::PcmDefault(mp),
-				CHint::PhintDefault(mp), CWindowOids::GetWindowOids(mp));
+				CHint::PhintDefault(mp), nullptr,
+				CWindowOids::GetWindowOids(mp));
 		}
 		else
 		{
@@ -3583,7 +3634,7 @@ CTestUtils::EresCheckPlans(const CHAR *rgszFileNames[], ULONG ulTests,
 						   ULONG *pulTestCounter, ULONG ulSessionId,
 						   ULONG ulCmdId, FnPlanChecker *pfpc)
 {
-	GPOS_ASSERT(nullptr != pfpc);
+	GPOS_UNITTEST_ASSERT(nullptr != pfpc);
 
 	GPOS_RESULT eres = GPOS_OK;
 
@@ -3627,7 +3678,8 @@ CTestUtils::EresCheckPlans(const CHAR *rgszFileNames[], ULONG ulTests,
 					CEnumeratorConfig(mp, 0 /*plan_id*/, 1000 /*ullSamples*/),
 				CStatisticsConfig::PstatsconfDefault(mp),
 				CCTEConfig::PcteconfDefault(mp), ICostModel::PcmDefault(mp),
-				CHint::PhintDefault(mp), CWindowOids::GetWindowOids(mp));
+				CHint::PhintDefault(mp), nullptr,
+				CWindowOids::GetWindowOids(mp));
 		}
 		else
 		{
@@ -3683,7 +3735,7 @@ CTestUtils::EresCheckPlans(const CHAR *rgszFileNames[], ULONG ulTests,
 ULONG
 CTestUtils::UlSegments(COptimizerConfig *optimizer_config)
 {
-	GPOS_ASSERT(nullptr != optimizer_config);
+	GPOS_UNITTEST_ASSERT(nullptr != optimizer_config);
 	ULONG ulSegments = GPOPT_TEST_SEGMENTS;
 	if (nullptr != optimizer_config->GetCostModel())
 	{
@@ -3714,7 +3766,7 @@ CTestUtils::EresCheckOptimizedPlan(const CHAR *rgszFileNames[], ULONG ulTests,
 								   ULONG ulCmdId, FnDXLPlanChecker *pfdpc,
 								   ICostModelParamsArray *pdrgpcp)
 {
-	GPOS_ASSERT(nullptr != pfdpc);
+	GPOS_UNITTEST_ASSERT(nullptr != pfdpc);
 
 	GPOS_RESULT eres = GPOS_OK;
 
@@ -3750,7 +3802,7 @@ CTestUtils::EresCheckOptimizedPlan(const CHAR *rgszFileNames[], ULONG ulTests,
 		}
 
 		COptimizerConfig *optimizer_config = pdxlmd->GetOptimizerConfig();
-		GPOS_ASSERT(nullptr != optimizer_config);
+		GPOS_UNITTEST_ASSERT(nullptr != optimizer_config);
 
 		if (nullptr != pdrgpcp)
 		{
@@ -3821,23 +3873,22 @@ CTestUtils::CreateGenericDatum(CMemoryPool *mp, CMDAccessor *md_accessor,
 							   IMDId *mdid_type,
 							   CWStringDynamic *pstrEncodedValue, LINT value)
 {
-	GPOS_ASSERT(nullptr != md_accessor);
+	GPOS_UNITTEST_ASSERT(nullptr != md_accessor);
 
-	GPOS_ASSERT(!mdid_type->Equals(&CMDIdGPDB::m_mdid_numeric));
+	GPOS_UNITTEST_ASSERT(!mdid_type->Equals(&CMDIdGPDB::m_mdid_numeric));
 	const IMDType *pmdtype = md_accessor->RetrieveType(mdid_type);
 	ULONG ulbaSize = 0;
 	BYTE *data =
 		CDXLUtils::DecodeByteArrayFromString(mp, pstrEncodedValue, &ulbaSize);
 
 	CDXLDatumGeneric *dxl_datum = nullptr;
-	if (CMDTypeGenericGPDB::IsTimeRelatedTypeMappableToDouble(mdid_type))
+	if (CMDTypeGenericGPDB::IsTimeRelatedType(mdid_type))
 	{
 		dxl_datum = GPOS_NEW(mp) CDXLDatumStatsDoubleMappable(
 			mp, mdid_type, default_type_modifier, false /*is_const_null*/, data,
 			ulbaSize, CDouble(value));
 	}
-	else if (pmdtype->IsTextRelated() ||
-			 CMDTypeGenericGPDB::IsTimeRelatedTypeMappableToLint(mdid_type))
+	else if (pmdtype->IsTextRelated())
 	{
 		dxl_datum = GPOS_NEW(mp) CDXLDatumStatsLintMappable(
 			mp, mdid_type, default_type_modifier, false /*is_const_null*/, data,
@@ -3868,9 +3919,9 @@ IDatum *
 CTestUtils::CreateDoubleDatum(CMemoryPool *mp, CMDAccessor *md_accessor,
 							  IMDId *mdid_type, CDouble value)
 {
-	GPOS_ASSERT(nullptr != md_accessor);
+	GPOS_UNITTEST_ASSERT(nullptr != md_accessor);
 
-	GPOS_ASSERT(!mdid_type->Equals(&CMDIdGPDB::m_mdid_numeric));
+	GPOS_UNITTEST_ASSERT(!mdid_type->Equals(&CMDIdGPDB::m_mdid_numeric));
 	const IMDType *pmdtype = md_accessor->RetrieveType(mdid_type);
 	ULONG ulbaSize = 0;
 	CWStringDynamic *pstrW =
@@ -3907,7 +3958,7 @@ CTestUtils::PciGenericInterval(CMemoryPool *mp, CMDAccessor *md_accessor,
 							   CWStringDynamic *pstrUpper, LINT lUpper,
 							   CRange::ERangeInclusion eriRight)
 {
-	GPOS_ASSERT(nullptr != md_accessor);
+	GPOS_UNITTEST_ASSERT(nullptr != md_accessor);
 
 	IDatum *pdatumLower = CTestUtils::CreateGenericDatum(
 		mp, md_accessor, GPOS_NEW(mp) CMDIdGPDB(mdidType), pstrLower, lLower);
@@ -3935,8 +3986,8 @@ CTestUtils::PciGenericInterval(CMemoryPool *mp, CMDAccessor *md_accessor,
 CExpression *
 CTestUtils::PexprScalarCmpIdentToConstant(CMemoryPool *mp, CExpression *pexpr)
 {
-	GPOS_ASSERT(nullptr != mp);
-	GPOS_ASSERT(nullptr != pexpr);
+	GPOS_UNITTEST_ASSERT(nullptr != mp);
+	GPOS_UNITTEST_ASSERT(nullptr != pexpr);
 
 	CColRefSet *pcrs = pexpr->DeriveOutputColumns();
 	CColRef *pcrAny = pcrs->PcrAny();
@@ -3957,8 +4008,8 @@ CTestUtils::PexprScalarCmpIdentToConstant(CMemoryPool *mp, CExpression *pexpr)
 CExpression *
 CTestUtils::PexprExistsSubquery(CMemoryPool *mp, CExpression *pexprOuter)
 {
-	GPOS_ASSERT(nullptr != mp);
-	GPOS_ASSERT(nullptr != pexprOuter);
+	GPOS_UNITTEST_ASSERT(nullptr != mp);
+	GPOS_UNITTEST_ASSERT(nullptr != pexprOuter);
 
 	CExpression *pexprInner = CTestUtils::PexprLogicalGet(mp);
 
@@ -3980,8 +4031,8 @@ CTestUtils::PexprExistsSubquery(CMemoryPool *mp, CExpression *pexprOuter)
 CExpression *
 CTestUtils::PexpSubqueryAll(CMemoryPool *mp, CExpression *pexprOuter)
 {
-	GPOS_ASSERT(nullptr != mp);
-	GPOS_ASSERT(nullptr != pexprOuter);
+	GPOS_UNITTEST_ASSERT(nullptr != mp);
+	GPOS_UNITTEST_ASSERT(nullptr != pexprOuter);
 
 	CColRefSet *outer_refs = pexprOuter->DeriveOutputColumns();
 	const CColRef *pcrOuter = outer_refs->PcrAny();
@@ -3994,7 +4045,7 @@ CTestUtils::PexpSubqueryAll(CMemoryPool *mp, CExpression *pexprOuter)
 	return GPOS_NEW(mp) CExpression(
 		mp,
 		GPOS_NEW(mp) CScalarSubqueryAll(
-			mp, GPOS_NEW(mp) CMDIdGPDB(GPDB_INT4_EQ_OP),
+			mp, GPOS_NEW(mp) CMDIdGPDB(IMDId::EmdidGeneral, GPDB_INT4_EQ_OP),
 			GPOS_NEW(mp) CWStringConst(GPOS_WSZ_LIT("=")), pcrInner),
 		pexprInner, CUtils::PexprScalarIdent(mp, pcrOuter));
 }
@@ -4011,8 +4062,8 @@ CTestUtils::PexpSubqueryAll(CMemoryPool *mp, CExpression *pexprOuter)
 CExpression *
 CTestUtils::PexpSubqueryAny(CMemoryPool *mp, CExpression *pexprOuter)
 {
-	GPOS_ASSERT(nullptr != mp);
-	GPOS_ASSERT(nullptr != pexprOuter);
+	GPOS_UNITTEST_ASSERT(nullptr != mp);
+	GPOS_UNITTEST_ASSERT(nullptr != pexprOuter);
 
 	CColRefSet *outer_refs = pexprOuter->DeriveOutputColumns();
 	const CColRef *pcrOuter = outer_refs->PcrAny();
@@ -4025,7 +4076,7 @@ CTestUtils::PexpSubqueryAny(CMemoryPool *mp, CExpression *pexprOuter)
 	return GPOS_NEW(mp) CExpression(
 		mp,
 		GPOS_NEW(mp) CScalarSubqueryAny(
-			mp, GPOS_NEW(mp) CMDIdGPDB(GPDB_INT4_EQ_OP),
+			mp, GPOS_NEW(mp) CMDIdGPDB(IMDId::EmdidGeneral, GPDB_INT4_EQ_OP),
 			GPOS_NEW(mp) CWStringConst(GPOS_WSZ_LIT("=")), pcrInner),
 		pexprInner, CUtils::PexprScalarIdent(mp, pcrOuter));
 }
@@ -4042,8 +4093,8 @@ CTestUtils::PexpSubqueryAny(CMemoryPool *mp, CExpression *pexprOuter)
 CExpression *
 CTestUtils::PexprNotExistsSubquery(CMemoryPool *mp, CExpression *pexprOuter)
 {
-	GPOS_ASSERT(nullptr != mp);
-	GPOS_ASSERT(nullptr != pexprOuter);
+	GPOS_UNITTEST_ASSERT(nullptr != mp);
+	GPOS_UNITTEST_ASSERT(nullptr != pexprOuter);
 
 	CExpression *pexprInner = CTestUtils::PexprLogicalGet(mp);
 
@@ -4068,7 +4119,7 @@ CTestUtils::PexprFirst(const CExpression *pexpr,
 					   const COperator::EOperatorId op_id)
 {
 	GPOS_CHECK_STACK_SIZE;
-	GPOS_ASSERT(nullptr != pexpr);
+	GPOS_UNITTEST_ASSERT(nullptr != pexpr);
 
 	if (pexpr->Pop()->Eopid() == op_id)
 	{
@@ -4102,8 +4153,8 @@ CExpression *
 CTestUtils::PexprAnd(CMemoryPool *mp, CExpression *pexprActual,
 					 CExpression *pexprExpected)
 {
-	GPOS_ASSERT(nullptr != pexprActual);
-	GPOS_ASSERT(nullptr != pexprExpected);
+	GPOS_UNITTEST_ASSERT(nullptr != pexprActual);
+	GPOS_UNITTEST_ASSERT(nullptr != pexprExpected);
 
 	CExpressionArray *pdrgpexpr = GPOS_NEW(mp) CExpressionArray(mp);
 	pdrgpexpr->Append(pexprActual);
@@ -4125,8 +4176,8 @@ CExpression *
 CTestUtils::PexprOr(CMemoryPool *mp, CExpression *pexprActual,
 					CExpression *pexprExpected)
 {
-	GPOS_ASSERT(nullptr != pexprActual);
-	GPOS_ASSERT(nullptr != pexprExpected);
+	GPOS_UNITTEST_ASSERT(nullptr != pexprActual);
+	GPOS_UNITTEST_ASSERT(nullptr != pexprExpected);
 
 	CExpressionArray *pdrgpexpr = GPOS_NEW(mp) CExpressionArray(mp);
 	pdrgpexpr->Append(pexprActual);

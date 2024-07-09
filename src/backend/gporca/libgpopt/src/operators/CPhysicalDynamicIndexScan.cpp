@@ -17,7 +17,6 @@
 #include "gpopt/base/COptCtxt.h"
 #include "gpopt/base/CUtils.h"
 #include "gpopt/cost/ICostModel.h"
-#include "gpopt/metadata/CPartConstraint.h"
 #include "gpopt/operators/CExpressionHandle.h"
 #include "gpopt/operators/CPredicateUtils.h"
 #include "naucrates/statistics/CFilterStatsProcessor.h"
@@ -39,7 +38,8 @@ CPhysicalDynamicIndexScan::CPhysicalDynamicIndexScan(
 	ULONG ulOriginOpId, const CName *pnameAlias, CColRefArray *pdrgpcrOutput,
 	ULONG scan_id, CColRef2dArray *pdrgpdrgpcrPart, COrderSpec *pos,
 	IMdIdArray *partition_mdids,
-	ColRefToUlongMapArray *root_col_mapping_per_part)
+	ColRefToUlongMapArray *root_col_mapping_per_part,
+	ULONG ulUnindexedPredColCount)
 	: CPhysicalDynamicScan(mp, ptabdesc, ulOriginOpId, pnameAlias, scan_id,
 						   pdrgpcrOutput, pdrgpdrgpcrPart, partition_mdids,
 						   root_col_mapping_per_part),
@@ -48,6 +48,8 @@ CPhysicalDynamicIndexScan::CPhysicalDynamicIndexScan(
 {
 	GPOS_ASSERT(nullptr != pindexdesc);
 	GPOS_ASSERT(nullptr != pos);
+
+	m_ulUnindexedPredColCount = ulUnindexedPredColCount;
 }
 
 
@@ -165,13 +167,13 @@ CPhysicalDynamicIndexScan::OsPrint(IOstream &os) const
 IStatistics *
 CPhysicalDynamicIndexScan::PstatsDerive(CMemoryPool *mp,
 										CExpressionHandle &exprhdl,
-										CReqdPropPlan *prpplan GPOS_UNUSED,
+										CReqdPropPlan *prpplan,
 										IStatisticsArray *stats_ctxt) const
 {
 	GPOS_ASSERT(nullptr != prpplan);
 
-	IStatistics *pstatsBaseTable =
-		CStatisticsUtils::DeriveStatsForDynamicScan(mp, exprhdl, ScanId());
+	IStatistics *pstatsBaseTable = CStatisticsUtils::DeriveStatsForDynamicScan(
+		mp, exprhdl, ScanId(), prpplan->Pepp()->PppsRequired());
 
 	// create a conjunction of index condition and additional filters
 	CExpression *pexprScalar = exprhdl.PexprScalarRepChild(0 /*ulChidIndex*/);

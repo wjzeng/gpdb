@@ -111,6 +111,9 @@ static struct
 	XLogRecPtr	Flush;			/* last byte + 1 flushed in the standby */
 }			LogstreamResult;
 
+/* Last archived WAL segment file obtained from the primary */
+static char primary_last_archived[MAX_XFN_CHARS + 1];
+
 static StringInfoData reply_message;
 static StringInfoData incoming_message;
 
@@ -121,9 +124,11 @@ static void WalRcvDie(int code, Datum arg);
 static void XLogWalRcvProcessMsg(unsigned char type, char *buf, Size len);
 static void XLogWalRcvWrite(char *buf, Size nbytes, XLogRecPtr recptr);
 static void XLogWalRcvFlush(bool dying);
+static void XLogWalRcvClose(XLogRecPtr recptr);
 static void XLogWalRcvSendReply(bool force, bool requestReply);
 static void XLogWalRcvSendHSFeedback(bool immed);
 static void ProcessWalSndrMessage(XLogRecPtr walEnd, TimestampTz sendTime);
+static void ProcessArchivalReport(void);
 
 /* Signal handlers */
 static void WalRcvSigHupHandler(SIGNAL_ARGS);
@@ -342,8 +347,8 @@ WalReceiverMain(void)
 		/*
 		 * Get any missing history files. We do this always, even when we're
 		 * not interested in that timeline, so that if we're promoted to
-		 * become the master later on, we don't select the same timeline that
-		 * was already used in the current master. This isn't bullet-proof -
+		 * become the primary later on, we don't select the same timeline that
+		 * was already used in the current primary. This isn't bullet-proof -
 		 * you'll need some external software to manage your cluster if you
 		 * need to ensure that a unique timeline id is chosen in every case,
 		 * but let's avoid the confusion of timeline id collisions where we
@@ -371,10 +376,14 @@ WalReceiverMain(void)
 		if (walrcv_startstreaming(wrconn, &options))
 		{
 			if (first_stream)
+			{
 				ereport(LOG,
 						(errmsg("started streaming WAL from primary at %X/%X on timeline %u",
 								(uint32) (startpoint >> 32), (uint32) startpoint,
 								startpointTLI)));
+				/* indicate the postmaster that walreceiver has started streaming */
+				SendPostmasterSignal(PMSIGNAL_WALRCV_STREAMING);
+			}
 			else
 				ereport(LOG,
 						(errmsg("restarted WAL streaming at %X/%X on timeline %u",
@@ -431,7 +440,7 @@ WalReceiverMain(void)
 						if (len > 0)
 						{
 							/*
-							 * Something was received from master, so reset
+							 * Something was received from primary, so reset
 							 * timeout
 							 */
 							last_recv_timestamp = GetCurrentTimestamp();
@@ -453,7 +462,7 @@ WalReceiverMain(void)
 						len = walrcv_receive(wrconn, &buf, &wait_fd);
 					}
 
-					/* Let the master know that we received some data. */
+					/* Let the primary know that we received some data. */
 					XLogWalRcvSendReply(false, false);
 
 					/*
@@ -512,7 +521,7 @@ WalReceiverMain(void)
 					 * wal_receiver_timeout / 2, ping the server. Also, if
 					 * it's been longer than wal_receiver_status_interval
 					 * since the last update we sent, send a status update to
-					 * the master anyway, to report any progress in applying
+					 * the primary anyway, to report any progress in applying
 					 * WAL.
 					 */
 					bool		requestReply = false;
@@ -590,13 +599,19 @@ WalReceiverMain(void)
 
 			/*
 			 * Create .done file forcibly to prevent the streamed segment from
-			 * being archived later.
+			 * being archived later unless ARCHIVE_MODE_ALWAYS is set.
+			 *
+			 * GPDB: The WAL archiving status reporting will be active if the GUC
+			 * wal_sender_archiving_status_interval is non-zero and archiving is
+			 * enabled. This will enable creation of .ready files instead of .done
+			 * The .ready files will be transitioned to .done files after receiving
+			 * WAL archiving status update messages from the primary segment.
 			 */
 			XLogFileName(xlogfname, recvFileTLI, recvSegNo, wal_segment_size);
-			if (XLogArchiveMode != ARCHIVE_MODE_ALWAYS)
-				XLogArchiveForceDone(xlogfname);
-			else
+			if (XLogArchiveMode == ARCHIVE_MODE_ALWAYS || XLogArchivingStatusReportingActive())
 				XLogArchiveNotify(xlogfname);
+			else
+				XLogArchiveForceDone(xlogfname);
 		}
 		recvFile = -1;
 
@@ -709,7 +724,7 @@ WalRcvFetchTimeLineHistoryFiles(TimeLineID first, TimeLineID last)
 			walrcv_readtimelinehistoryfile(wrconn, tli, &fname, &content, &len);
 
 			/*
-			 * Check that the filename on the master matches what we
+			 * Check that the filename on the primary matches what we
 			 * calculated ourselves. This is just a sanity check, it should
 			 * always match.
 			 */
@@ -724,6 +739,15 @@ WalRcvFetchTimeLineHistoryFiles(TimeLineID first, TimeLineID last)
 			 * Write the file to pg_wal.
 			 */
 			writeTimeLineHistoryFile(tli, content, len);
+
+			/*
+			 * Mark the streamed history file as ready for archiving
+			 * if archive_mode is always.
+			 */
+			if (XLogArchiveMode != ARCHIVE_MODE_ALWAYS)
+				XLogArchiveForceDone(fname);
+			else
+				XLogArchiveNotify(fname);
 
 			pfree(fname);
 			pfree(content);
@@ -882,6 +906,26 @@ XLogWalRcvProcessMsg(unsigned char type, char *buf, Size len)
 					XLogWalRcvSendReply(true, false);
 				break;
 			}
+		case 'a':             /* Archival Report */
+			{
+				/* the content of the message is a filename */
+				if (len >= sizeof(primary_last_archived))
+					ereport(ERROR,
+							(errcode(ERRCODE_PROTOCOL_VIOLATION),
+							errmsg_internal("invalid archival report message with length %d",
+							(int) len)));
+				memcpy(primary_last_archived, buf, len);
+				primary_last_archived[len] = '\0';
+				if (strspn(buf, VALID_XFN_CHARS) != len)
+				{
+					primary_last_archived[0] = '\0';
+					ereport(ERROR,
+							(errcode(ERRCODE_PROTOCOL_VIOLATION),
+								errmsg_internal("unexpected character in primary's last archived filename")));
+				}
+				ProcessArchivalReport();
+				break;
+			}
 		default:
 			ereport(ERROR,
 					(errcode(ERRCODE_PROTOCOL_VIOLATION),
@@ -903,46 +947,16 @@ XLogWalRcvWrite(char *buf, Size nbytes, XLogRecPtr recptr)
 	{
 		int			segbytes;
 
-		if (recvFile < 0 || !XLByteInSeg(recptr, recvSegNo, wal_segment_size))
+		/* Close the current segment if it's completed */
+		if (recvFile >= 0 && !XLByteInSeg(recptr, recvSegNo, wal_segment_size))
+			XLogWalRcvClose(recptr);
+
+		if (recvFile < 0)
 		{
-			bool		use_existent;
-
-			/*
-			 * fsync() and close current file before we switch to next one. We
-			 * would otherwise have to reopen this file to fsync it later
-			 */
-			if (recvFile >= 0)
-			{
-				char		xlogfname[MAXFNAMELEN];
-
-				XLogWalRcvFlush(false);
-
-				/*
-				 * XLOG segment files will be re-read by recovery in startup
-				 * process soon, so we don't advise the OS to release cache
-				 * pages associated with the file like XLogFileClose() does.
-				 */
-				if (close(recvFile) != 0)
-					ereport(PANIC,
-							(errcode_for_file_access(),
-							 errmsg("could not close log segment %s: %m",
-									XLogFileNameP(recvFileTLI, recvSegNo))));
-
-				/*
-				 * Create .done file forcibly to prevent the streamed segment
-				 * from being archived later.
-				 */
-				XLogFileName(xlogfname, recvFileTLI, recvSegNo, wal_segment_size);
-				if (XLogArchiveMode != ARCHIVE_MODE_ALWAYS)
-					XLogArchiveForceDone(xlogfname);
-				else
-					XLogArchiveNotify(xlogfname);
-			}
-			recvFile = -1;
+			bool		use_existent = true;
 
 			/* Create/use new log file */
 			XLByteToSeg(recptr, recvSegNo, wal_segment_size);
-			use_existent = true;
 			recvFile = XLogFileInit(recvSegNo, &use_existent, true);
 			recvFileTLI = ThisTimeLineID;
 			recvOff = 0;
@@ -1003,6 +1017,15 @@ XLogWalRcvWrite(char *buf, Size nbytes, XLogRecPtr recptr)
 			   (uint32) (LogstreamResult.Write >> 32),
 			   (uint32) LogstreamResult.Write);
 	}
+
+	/*
+	 * Close the current segment if it's fully written up in the last cycle of
+	 * the loop, to create its archive notification file soon. Otherwise WAL
+	 * archiving of the segment will be delayed until any data in the next
+	 * segment is received and written.
+	 */
+	if (recvFile >= 0 && !XLByteInSeg(recptr, recvSegNo, wal_segment_size))
+		XLogWalRcvClose(recptr);
 }
 
 /*
@@ -1054,13 +1077,64 @@ XLogWalRcvFlush(bool dying)
 			set_ps_display(activitymsg, false);
 		}
 
-		/* Also let the master know that we made some progress */
+		/* Also let the primary know that we made some progress */
 		if (!dying)
 		{
 			XLogWalRcvSendReply(false, false);
 			XLogWalRcvSendHSFeedback(false);
 		}
 	}
+}
+
+/*
+ * Close the current segment.
+ *
+ * Flush the segment to disk before closing it. Otherwise we have to
+ * reopen and fsync it later.
+ *
+ * Create an archive notification file since the segment is known completed.
+ */
+static void
+XLogWalRcvClose(XLogRecPtr recptr)
+{
+	char		xlogfname[MAXFNAMELEN];
+
+	Assert(recvFile >= 0 && !XLByteInSeg(recptr, recvSegNo, wal_segment_size));
+
+	/*
+	 * fsync() and close current file before we switch to next one. We would
+	 * otherwise have to reopen this file to fsync it later
+	 */
+	XLogWalRcvFlush(false);
+
+	XLogFileName(xlogfname, recvFileTLI, recvSegNo, wal_segment_size);
+
+	/*
+	 * XLOG segment files will be re-read by recovery in startup process soon,
+	 * so we don't advise the OS to release cache pages associated with the
+	 * file like XLogFileClose() does.
+	 */
+	if (close(recvFile) != 0)
+		ereport(PANIC,
+				(errcode_for_file_access(),
+				 errmsg("could not close log segment %s: %m",
+						xlogfname)));
+
+	/* Create .done file forcibly to prevent the streamed segment from
+	 * being archived later unless ARCHIVE_MODE_ALWAYS is set.
+	 *
+	 * GPDB: The WAL archiving status reporting will be active if the GUC
+	 * wal_sender_archiving_status_interval is non-zero and archiving is
+	 * enabled. This will enable creation of .ready files instead of .done.
+	 * The .ready files will be transitioned to .done files after receiving
+	 * WAL archiving status update messages from the primary segment.
+	 */
+	if(XLogArchiveMode == ARCHIVE_MODE_ALWAYS || XLogArchivingStatusReportingActive())
+		XLogArchiveNotify (xlogfname);
+	else
+		XLogArchiveForceDone (xlogfname);
+
+	recvFile = -1;
 }
 
 /*
@@ -1086,7 +1160,7 @@ XLogWalRcvSendReply(bool force, bool requestReply)
 	TimestampTz now;
 
 	/*
-	 * If the user doesn't want status to be reported to the master, be sure
+	 * If the user doesn't want status to be reported to the primary, be sure
 	 * to exit before doing anything at all.
 	 */
 	if (!force && wal_receiver_status_interval <= 0)
@@ -1100,7 +1174,7 @@ XLogWalRcvSendReply(bool force, bool requestReply)
 	 * sent without taking any lock, but the apply position requires a spin
 	 * lock, so we don't check that unless something else has changed or 10
 	 * seconds have passed.  This means that the apply WAL location will
-	 * appear, from the master's point of view, to lag slightly, but since
+	 * appear, from the primary's point of view, to lag slightly, but since
 	 * this is only for reporting purposes and only on idle systems, that's
 	 * probably OK.
 	 */
@@ -1158,14 +1232,14 @@ XLogWalRcvSendHSFeedback(bool immed)
 	static TimestampTz sendTime = 0;
 
 	/* initially true so we always send at least one feedback message */
-	static bool master_has_standby_xmin = true;
+	static bool primary_has_standby_xmin = true;
 
 	/*
-	 * If the user doesn't want status to be reported to the master, be sure
+	 * If the user doesn't want status to be reported to the primary, be sure
 	 * to exit before doing anything at all.
 	 */
 	if ((wal_receiver_status_interval <= 0 || !hot_standby_feedback) &&
-		!master_has_standby_xmin)
+		!primary_has_standby_xmin)
 		return;
 
 	/* Get current timestamp. */
@@ -1188,7 +1262,7 @@ XLogWalRcvSendHSFeedback(bool immed)
 	 * calls.
 	 *
 	 * Bailing out here also ensures that we don't send feedback until we've
-	 * read our own replication slot state, so we don't tell the master to
+	 * read our own replication slot state, so we don't tell the primary to
 	 * discard needed xmin or catalog_xmin from any slots that may exist on
 	 * this replica.
 	 */
@@ -1250,9 +1324,9 @@ XLogWalRcvSendHSFeedback(bool immed)
 	pq_sendint32(&reply_message, catalog_xmin_epoch);
 	walrcv_send(wrconn, reply_message.data, reply_message.len);
 	if (TransactionIdIsValid(xmin) || TransactionIdIsValid(catalog_xmin))
-		master_has_standby_xmin = true;
+		primary_has_standby_xmin = true;
 	else
-		master_has_standby_xmin = false;
+		primary_has_standby_xmin = false;
 }
 
 /*
@@ -1307,11 +1381,63 @@ ProcessWalSndrMessage(XLogRecPtr walEnd, TimestampTz sendTime)
 }
 
 /*
+ * Create .done files, based on the primary's last archival report.
+ */
+static void
+ProcessArchivalReport(void)
+{
+	DIR		   *xldir;
+	struct dirent *xlde;
+
+	elog(DEBUG2, "received archival report from primary: %s", primary_last_archived);
+
+	if (wal_sender_archiving_status_interval <= 0)
+		return;
+
+	/* Check that the wal filename reported by primary looks valid */
+	if (strlen(primary_last_archived) < 24 ||
+		strspn(primary_last_archived, "0123456789ABCDEF") != 24)
+		return;
+
+	xldir = AllocateDir(XLOGDIR);
+	if (xldir == NULL)
+		ereport(ERROR,
+			(errcode_for_file_access(),
+			errmsg("could not open transaction log directory \"%s\": %m",
+				XLOGDIR)));
+	while ((xlde = ReadDir(xldir, XLOGDIR)) != NULL)
+	{
+		/*
+		 * We ignore the timeline part of the XLOG segment identifiers in
+		 * deciding whether a segment is still needed.  This ensures that we
+		 * won't prematurely remove a segment from a parent timeline.
+		 *
+		 * We use the alphanumeric sorting property of the filenames to decide
+		 * which ones are earlier than the lastoff segment.
+		 */
+		if (strlen(xlde->d_name) == 24 &&
+			strspn(xlde->d_name, "0123456789ABCDEF") == 24 &&
+			strcmp(xlde->d_name + 8, primary_last_archived + 8) <= 0)
+		{
+			XLogArchiveForceDone(xlde->d_name);
+		}
+	}
+	FreeDir(xldir);
+
+	/*
+	 * Remember this location in pgstat as well. This makes it visible in
+	 * pg_stat_archiver, and allows the location to be relayed to cascaded
+	 * standbys.
+	 */
+	pgstat_send_archiver(primary_last_archived, false);
+}
+
+/*
  * Wake up the walreceiver main loop.
  *
  * This is called by the startup process whenever interesting xlog records
  * are applied, so that walreceiver can check if it needs to send an apply
- * notification back to the master which may be waiting in a COMMIT with
+ * notification back to the primary which may be waiting in a COMMIT with
  * synchronous_commit = remote_apply.
  */
 void

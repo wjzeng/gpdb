@@ -7,6 +7,7 @@ from gppylib.commands import gp
 from gppylib.commands import base
 from gppylib.gparray import GpArray
 from gppylib.commands.gp import SEGMENT_TIMEOUT_DEFAULT
+from gppylib.mainUtils import parseStatusLine
 
 logger = get_default_logger()
 
@@ -120,8 +121,8 @@ class StartSegmentsOperation:
                 mirrorDbs = [seg for seg in segments if seg.isSegmentMirror(True)]
                 primaryDbs = [seg for seg in segments if seg.isSegmentPrimary(True)]
 
-                self.__runStartCommand(mirrorDbs, startMethod, numContentsInCluster, result, gpArray, era)
                 self.__runStartCommand(primaryDbs, startMethod, numContentsInCluster, result, gpArray, era)
+                self.__runStartCommand(mirrorDbs, startMethod, numContentsInCluster, result, gpArray, era)
 
             elif startMethod == START_AS_MIRRORLESS:
                 # bring them up in mirrorless mode
@@ -135,7 +136,7 @@ class StartSegmentsOperation:
 
     def __runStartCommand(self, segments, startMethod, numContentsInCluster, resultOut, gpArray, era):
         """
-        Putt results into the resultOut object
+        Put results into the resultOut object
         """
 
         if len(segments) == 0:
@@ -203,25 +204,7 @@ class StartSegmentsOperation:
                 lines = cmdout.split('\n')
                 for line in lines:
                     if line.startswith("STATUS"):
-                        fields=line.split('--')
-
-                        index = 1
-                        dir = fields[index].split(':')[1]
-                        index += 1
-
-                        started = fields[index].split(':')[1]
-                        index += 1
-
-                        reasonCode = gp.SEGSTART_ERROR_UNKNOWN_ERROR
-                        if fields[index].startswith("REASONCODE:"):
-                            reasonCode = int(fields[index].split(":")[1])
-                            index += 1
-
-                        # The funny join and splits are because Reason could have colons or -- in the text itself
-                        reasonStr = "--".join(fields[index:])
-                        reasonArr = reasonStr.split(':')
-                        reasonArr = reasonArr[1:]
-                        reasonStr = ":".join(reasonArr)
+                        reasonCode, reasonStr, started, dir = parseStatusLine(line, isStart=True)
 
                         if started.lower() == 'false':
                             success=False
@@ -234,7 +217,7 @@ class StartSegmentsOperation:
                                     resultOut.addSuccess(segment)
                                 else:
                                     resultOut.addFailure(segment, reasonStr, reasonCode)
-                if cmd.get_results().stderr is not None:
+                if cmd.get_results().stderr is not None and cmd.get_results().stderr.strip() != "":
                     logger.info(cmd.get_results().stderr)
             else:
                 for segment in cmd.dblist:

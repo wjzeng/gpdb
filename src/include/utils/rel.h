@@ -30,7 +30,7 @@
 #include "utils/relcache.h"
 #include "utils/reltrigger.h"
 
-#include "catalog/pg_proc.h"
+#include "catalog/pg_am.h"
 
 
 /*
@@ -69,7 +69,7 @@ typedef struct RelationData
 								 * rd_replidindex) */
 	bool		rd_statvalid;	/* is rd_statlist valid? */
 
-	/*
+	/*----------
 	 * rd_createSubid is the ID of the highest subtransaction the rel has
 	 * survived into; or zero if the rel was not created in the current top
 	 * transaction.  This can be now be relied on, whereas previously it could
@@ -79,8 +79,13 @@ typedef struct RelationData
 	 * have forgotten changing it). rd_newRelfilenodeSubid can be forgotten
 	 * when a relation has multiple new relfilenodes within a single
 	 * transaction, with one of them occurring in a subsequently aborted
-	 * subtransaction, e.g. BEGIN; TRUNCATE t; SAVEPOINT save; TRUNCATE t;
-	 * ROLLBACK TO save; -- rd_newRelfilenode is now forgotten
+	 * subtransaction, e.g.
+	 *		BEGIN;
+	 *		TRUNCATE t;
+	 *		SAVEPOINT save;
+	 *		TRUNCATE t;
+	 *		ROLLBACK TO save;
+	 *		-- rd_newRelfilenodeSubid is now forgotten
 	 */
 	SubTransactionId rd_createSubid;	/* rel was created in current xact */
 	SubTransactionId rd_newRelfilenodeSubid;	/* new relfilenode assigned in
@@ -102,10 +107,15 @@ typedef struct RelationData
 	List	   *rd_fkeylist;	/* list of ForeignKeyCacheInfo (see below) */
 	bool		rd_fkeyvalid;	/* true if list has been computed */
 
-	struct PartitionKeyData *rd_partkey;	/* partition key, or NULL */
+	/* data managed by RelationRetrievePartitionKey: */
+	PartitionKey rd_partkey;	/* partition key, or NULL */
 	MemoryContext rd_partkeycxt;	/* private context for rd_partkey, if any */
-	struct PartitionDescData *rd_partdesc;	/* partitions, or NULL */
+
+	/* data managed by RelationRetrievePartitionDesc: */
+	PartitionDesc rd_partdesc;	/* partition descriptor, or NULL */
 	MemoryContext rd_pdcxt;		/* private context for rd_partdesc, if any */
+
+	/* data managed by RelationGetPartitionQual: */
 	List	   *rd_partcheck;	/* partition CHECK quals */
 	bool		rd_partcheckvalid;	/* true if list has been computed */
 	MemoryContext rd_partcheckcxt;	/* private cxt for rd_partcheck, if any */
@@ -159,13 +169,6 @@ typedef struct RelationData
 	 * those with lefttype and righttype equal to the opclass's opcintype. The
 	 * arrays are indexed by support function number, which is a sufficient
 	 * identifier given that restriction.
-	 *
-	 * Note: rd_amcache is available for index AMs to cache private data about
-	 * an index.  This must be just a cache since it may get reset at any time
-	 * (in particular, it will get reset by a relcache inval message for the
-	 * index).  If used, it must point to a single memory chunk palloc'd in
-	 * rd_indexcxt.  A relcache reset will include freeing that chunk and
-	 * setting rd_amcache = NULL.
 	 */
 	MemoryContext rd_indexcxt;	/* private memory cxt for this stuff */
 	/* use "struct" here to avoid needing to include amapi.h: */
@@ -180,8 +183,24 @@ typedef struct RelationData
 	Oid		   *rd_exclops;		/* OIDs of exclusion operators, if any */
 	Oid		   *rd_exclprocs;	/* OIDs of exclusion ops' procs, if any */
 	uint16	   *rd_exclstrats;	/* exclusion ops' strategy numbers, if any */
-	void	   *rd_amcache;		/* available for use by index AM */
 	Oid		   *rd_indcollation;	/* OIDs of index collations */
+
+	/*
+	 * rd_amcache is available for index and table AMs to cache private data
+	 * about the relation.  This must be just a cache since it may get reset
+	 * at any time (in particular, it will get reset by a relcache inval
+	 * message for the relation).  If used, it must point to a single memory
+	 * chunk palloc'd in CacheMemoryContext, or in rd_indexcxt for an index
+	 * relation.  A relcache reset will include freeing that chunk and setting
+	 * rd_amcache = NULL.
+	 */
+	void	   *rd_amcache;		/* available for use by index/table AM */
+
+	/*
+	 * AO table support info (used only for AO and AOCS relations)
+	 */
+	Form_pg_appendonly rd_appendonly;
+	struct HeapTupleData *rd_aotuple;		/* all of pg_appendonly tuple */
 
 	/*
 	 * foreign-table support
@@ -277,6 +296,7 @@ typedef struct StdRdOptions
 	int			parallel_workers;	/* max number of parallel workers */
 	bool		vacuum_index_cleanup;	/* enables index vacuuming and cleanup */
 	bool		vacuum_truncate;	/* enables vacuum to truncate a relation */
+	bool		analyze_hll_non_part_table; 		/* force hll statistics collection on relation */
 
 	int			blocksize;		/* max varblock size (AO rels only) */
 	int			compresslevel;  /* compression level (AO rels only) */
@@ -316,6 +336,22 @@ typedef struct StdRdOptions
  */
 #define RelationGetTargetPageFreeSpace(relation, defaultff) \
 	(BLCKSZ * (100 - RelationGetFillFactor(relation, defaultff)) / 100)
+
+/*
+ * RelationGetCompressLevel
+ *		Returns an AO relation's compress level.
+ */
+#define RelationGetCompressLevel(relation, default_clevel) \
+	((relation)->rd_options ? \
+	 ((StdRdOptions *) (relation)->rd_options)->compresslevel : (default_clevel))
+
+/*
+ * RelationGetCompressType
+ *		Returns an AO relation's compress type.
+ */
+#define RelationGetCompressType(relation, default_ctype) \
+	((relation)->rd_options ? \
+	 ((StdRdOptions *) (relation)->rd_options)->compresstype : (default_ctype))
 
 /*
  * RelationIsUsedAsCatalogTable
@@ -401,12 +437,14 @@ typedef struct ViewOptions
 #define InvalidRelation ((Relation) NULL)
 
 /*
- * We do need the RelationIs* macros because the table access method API is
- * not mature enough and/or the append-optimized design is distinct enough.
+ * CAUTION: this macro is a violation of the absraction that table AM and
+ * index AM interfaces provide.  Use of this macro is discouraged.  If
+ * table/index AM API falls short for your use case, consider enhancing the
+ * interface.
+ *
  */
-
 #define RelationIsHeap(relation) \
-	((relation)->rd_amhandler == HEAP_TABLE_AM_HANDLER_OID)
+	((relation)->rd_rel->relam == HEAP_TABLE_AM_OID)
 
 /*
  * CAUTION: this macro is a violation of the absraction that table AM and
@@ -418,7 +456,11 @@ typedef struct ViewOptions
  * 		True iff relation has append only storage with row orientation
  */
 #define RelationIsAoRows(relation) \
-	((relation)->rd_amhandler == AO_ROW_TABLE_AM_HANDLER_OID)
+	((relation)->rd_rel->relam == AO_ROW_TABLE_AM_OID)
+
+#define RelationStorageIsAoRows(relation) \
+	((relation)->rd_rel->relam == AO_ROW_TABLE_AM_OID && \
+		(relation)->rd_rel->relkind != RELKIND_PARTITIONED_TABLE)
 
 /*
  * CAUTION: this macro is a violation of the absraction that table AM and
@@ -430,7 +472,11 @@ typedef struct ViewOptions
  * 		True iff relation has append only storage with column orientation
  */
 #define RelationIsAoCols(relation) \
-	((relation)->rd_amhandler == AO_COLUMN_TABLE_AM_HANDLER_OID)
+	((relation)->rd_rel->relam == AO_COLUMN_TABLE_AM_OID)
+
+#define RelationStorageIsAoCols(relation) \
+	((relation)->rd_rel->relam == AO_COLUMN_TABLE_AM_OID && \
+		(relation)->rd_rel->relkind != RELKIND_PARTITIONED_TABLE)
 
 /*
  * CAUTION: this macro is a violation of the absraction that table AM and
@@ -444,12 +490,16 @@ typedef struct ViewOptions
 #define RelationIsAppendOptimized(relation) \
 	(RelationIsAoRows(relation) || RelationIsAoCols(relation))
 
+#define RelationStorageIsAO(relation) \
+	((RelationIsAoRows(relation) || RelationIsAoCols(relation)) && \
+		(relation)->rd_rel->relkind != RELKIND_PARTITIONED_TABLE)
+
 /*
  * RelationIsBitmapIndex
  *      True iff relation is a bitmap index
  */
 #define RelationIsBitmapIndex(relation) \
-	((bool)((relation)->rd_amhandler == BITMAP_INDEXAM_HANDLER_OID))
+	((bool)((relation)->rd_rel->relam == BITMAP_AM_OID))
 
 /*
  * RelationHasReferenceCountZero
@@ -537,7 +587,7 @@ typedef struct ViewOptions
 			smgrsetowner(&((relation)->rd_smgr), \
 						 smgropen((relation)->rd_node, \
 								  (relation)->rd_backend, \
-								  RelationIsAppendOptimized(relation)?SMGR_AO:SMGR_MD)); \
+								  RelationStorageIsAO(relation)?SMGR_AO:SMGR_MD)); \
 	} while (0)
 
 /*
@@ -675,19 +725,26 @@ typedef struct ViewOptions
 /*
  * RelationGetPartitionKey
  *		Returns the PartitionKey of a relation
+ *
+ * GPDB: This should not be used anymore. It is superceded by
+ * RelationRetrievePartionKey, and is kept around only to prevent ABI 
+ * breakage. See comments on that function for more details.
  */
 #define RelationGetPartitionKey(relation) ((relation)->rd_partkey)
 
 /*
  * RelationGetPartitionDesc
  *		Returns partition descriptor for a relation.
+ *
+ * GPDB: This should not be used anymore. It is superceded by
+ * RelationRetrievePartionDesc, and is kept around only to prevent ABI 
+ * breakage. See comments on that function for more details.
  */
 #define RelationGetPartitionDesc(relation) ((relation)->rd_partdesc)
 
 /* routines in utils/cache/relcache.c */
 extern void RelationIncrementReferenceCount(Relation rel);
 extern void RelationDecrementReferenceCount(Relation rel);
-extern bool RelationHasUnloggedIndex(Relation rel);
 extern List *RelationGetRepsetList(Relation rel);
 
 #endif							/* REL_H */

@@ -22,18 +22,21 @@ PostgreSQL documentation
  <refsynopsisdiv>
 <synopsis>
 VACUUM [ ( <replaceable class="parameter">option</replaceable> [, ...] ) ] [ <replaceable class="parameter">table_and_columns</replaceable> [, ...] ]
-VACUUM [ FULL ] [ FREEZE ] [ VERBOSE ] [ ANALYZE ] [ <replaceable class="parameter">table_and_columns</replaceable> [, ...] ]
+VACUUM [ FULL ] [ FREEZE ] [ VERBOSE ] [ AO_AUX_ONLY ]  [ ANALYZE ] [ <replaceable class="parameter">table_and_columns</replaceable> [, ...] ]
 
 <phrase>where <replaceable class="parameter">option</replaceable> can be one of:</phrase>
 
     FULL [ <replaceable class="parameter">boolean</replaceable> ]
     FREEZE [ <replaceable class="parameter">boolean</replaceable> ]
     VERBOSE [ <replaceable class="parameter">boolean</replaceable> ]
+    AO_AUX_ONLY [ <replaceable class="parameter">boolean</replaceable> ]
     ANALYZE [ <replaceable class="parameter">boolean</replaceable> ]
     DISABLE_PAGE_SKIPPING [ <replaceable class="parameter">boolean</replaceable> ]
     SKIP_LOCKED [ <replaceable class="parameter">boolean</replaceable> ]
     INDEX_CLEANUP [ <replaceable class="parameter">boolean</replaceable> ]
     TRUNCATE [ <replaceable class="parameter">boolean</replaceable> ]
+    SKIP_DATABASE_STATS [ <replaceable class="parameter">boolean</replaceable> ]
+    ONLY_DATABASE_STATS [ <replaceable class="parameter">boolean</replaceable> ]
 
 <phrase>and <replaceable class="parameter">table_and_columns</replaceable> is:</phrase>
 
@@ -61,6 +64,16 @@ VACUUM [ FULL ] [ FREEZE ] [ VERBOSE ] [ ANALYZE ] [ <replaceable class="paramet
   </para>
 
   <para>
+   <command>VACUUM AO_AUX_ONLY</command> performs a <command>VACUUM</command>
+   on all auxiliary tables of an append-optimized table. It does not
+   run <command>VACUUM</command> on the append-optimized table. If no table is
+   indicated, it will <command>VACUUM</command> the auxiliary tables of all
+   append-optimized tables. If a partitioned table is indicated, it
+   will <command>VACUUM</command> the auxiliary tables of all append-optimized
+   partitions.
+  </para>
+
+  <para>
    <command>VACUUM ANALYZE</command> performs a <command>VACUUM</command>
    and then an <command>ANALYZE</command> for each selected table.  This
    is a handy combination form for routine maintenance scripts.  See
@@ -78,7 +91,8 @@ VACUUM [ FULL ] [ FREEZE ] [ VERBOSE ] [ ANALYZE ] [ <replaceable class="paramet
    same table.  <command>VACUUM FULL</command> rewrites the entire contents
    of the table into a new disk file with no extra space, allowing unused
    space to be returned to the operating system.  This form is much slower and
-   requires an exclusive lock on each table while it is being processed.
+   requires an <literal>ACCESS EXCLUSIVE</literal> lock on each table while
+   it is being processed.
   </para>
 
   <para>
@@ -219,6 +233,41 @@ VACUUM [ FULL ] [ FREEZE ] [ VERBOSE ] [ ANALYZE ] [ <replaceable class="paramet
       <literal>ACCESS EXCLUSIVE</literal> lock on the table that
       the truncation requires. This option is ignored if the
       <literal>FULL</literal> option is used.
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry>
+    <term><literal>SKIP_DATABASE_STATS</literal></term>
+    <listitem>
+     <para>
+      Specifies that <command>VACUUM</command> should skip updating the
+      database-wide statistics about oldest unfrozen XIDs.  Normally
+      <command>VACUUM</command> will update these statistics once at the
+      end of the command.  However, this can take awhile in a database
+      with a very large number of tables, and it will accomplish nothing
+      unless the table that had contained the oldest unfrozen XID was
+      among those vacuumed.  Moreover, if multiple <command>VACUUM</command>
+      commands are issued in parallel, only one of them can update the
+      database-wide statistics at a time.  Therefore, if an application
+      intends to issue a series of many <command>VACUUM</command>
+      commands, it can be helpful to set this option in all but the last
+      such command; or set it in all the commands and separately
+      issue <literal>VACUUM (ONLY_DATABASE_STATS)</literal> afterwards.
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry>
+    <term><literal>ONLY_DATABASE_STATS</literal></term>
+    <listitem>
+     <para>
+      Specifies that <command>VACUUM</command> should do nothing except
+      update the database-wide statistics about oldest unfrozen XIDs.
+      When this option is specified,
+      the <replaceable class="parameter">table_and_columns</replaceable>
+      list must be empty, and no other option may be enabled
+      except <literal>VERBOSE</literal>.
      </para>
     </listitem>
    </varlistentry>

@@ -27,6 +27,7 @@
 #include "common/controldata_utils.h"
 #include "common/file_perm.h"
 #include "common/logging.h"
+#include "common/string.h"
 #include "getopt_long.h"
 #include "utils/pidfile.h"
 
@@ -40,7 +41,6 @@ typedef long pgpid_t;
 
 /* postgres version ident string */
 #define PM_VERSIONSTR "postgres (Greenplum Database) " PG_VERSION "\n"
-
 
 typedef enum
 {
@@ -73,6 +73,28 @@ typedef enum
 	RUN_AS_SERVICE_COMMAND
 } CtlCommand;
 
+typedef enum
+{
+	IS_COORDINATOR, /* starting GPDB coordinator in distributed mode */
+	IS_STANDBY_COORDINATOR, /* starting GPDB standby coordinator in distributed mode */
+	IS_PRIMARY, /* starting GPDB primary segment */
+	IS_MIRROR, /* starting GPDB mirror segment */
+	IS_UTILITY /* starting a segment in utility mode */
+} PMStartMode;
+
+static const char *const pmReadyStatuses[] = {
+	/* IS_COORDINATOR */
+	PM_STATUS_DTM_RECOVERED,
+	/* IS_STANDBY_COORDINATOR */
+	PM_STATUS_WALRECV_STARTED_STREAMING,
+	/* IS_PRIMARY */
+	PM_STATUS_READY,
+	/* IS_MIRROR */
+	PM_STATUS_WALRECV_STARTED_STREAMING,
+	/* IS_UTILITY - multiple statuses apply, won't be used */
+	NULL
+};
+
 #define DEFAULT_WAIT	60
 
 #define USEC_PER_SEC	1000000
@@ -102,6 +124,7 @@ static char *register_password = NULL;
 static char *argv0 = NULL;
 static bool allow_core_files = false;
 static time_t start_time;
+static bool gp_mirror_fast_wait = false;
 
 static char postopts_file[MAXPGPATH];
 static char version_file[MAXPGPATH];
@@ -170,7 +193,9 @@ static pgpid_t start_postmaster(void);
 static void read_post_opts(void);
 
 static bool is_secondary_instance(const char *pg_data);
-static WaitPMResult wait_for_postmaster(pgpid_t pm_pid, bool do_checkpoint);
+static WaitPMResult wait_for_postmaster_start(pgpid_t pm_pid, bool do_checkpoint);
+static bool wait_for_postmaster_stop(void);
+static bool wait_for_postmaster_promote(void);
 static bool postmaster_is_alive(pid_t pid);
 
 #if defined(HAVE_GETRLIMIT) && defined(RLIMIT_CORE)
@@ -459,8 +484,8 @@ free_readfile(char **optlines)
 static pgpid_t
 start_postmaster(void)
 {
-	char		launcher[MAXPGPATH] = "";
-	char		cmd[MAXPGPATH];
+	char	   *launcher;
+	char	   *cmd;
 
 #ifndef WIN32
 	pgpid_t		pm_pid;
@@ -502,9 +527,13 @@ start_postmaster(void)
 	if (wrapper != NULL)
 	{
 		if (wrapper_args != NULL)
-			snprintf(launcher, MAXPGPATH, "%s %s", wrapper, wrapper_args);
+			launcher = psprintf("%s %s", wrapper, wrapper_args);
 		else
-			snprintf(launcher, MAXPGPATH, "%s", wrapper);
+			launcher = psprintf("%s", wrapper);
+	}
+	else
+	{
+		launcher = "";
 	}
 
 	/*
@@ -513,12 +542,12 @@ start_postmaster(void)
 	 * has the same PID as the current child process.
 	 */
 	if (log_file != NULL)
-		snprintf(cmd, MAXPGPATH, "exec %s \"%s\" %s%s < \"%s\" >> \"%s\" 2>&1",
-				 launcher, exec_path, pgdata_opt, post_opts,
-				 DEVNULL, log_file);
+		cmd = psprintf("exec %s \"%s\" %s%s < \"%s\" >> \"%s\" 2>&1",
+					   launcher, exec_path, pgdata_opt, post_opts,
+					   DEVNULL, log_file);
 	else
-		snprintf(cmd, MAXPGPATH, "exec %s \"%s\" %s%s < \"%s\" 2>&1",
-				 launcher, exec_path, pgdata_opt, post_opts, DEVNULL);
+		cmd = psprintf("exec %s \"%s\" %s%s < \"%s\" 2>&1",
+					   launcher, exec_path, pgdata_opt, post_opts, DEVNULL);
 
 	(void) execl("/bin/sh", "/bin/sh", "-c", cmd, (char *) NULL);
 
@@ -539,11 +568,46 @@ start_postmaster(void)
 	PROCESS_INFORMATION pi;
 
 	if (log_file != NULL)
-		snprintf(cmd, MAXPGPATH, "CMD /C \"\"%s\" %s%s < \"%s\" >> \"%s\" 2>&1\"",
-				 exec_path, pgdata_opt, post_opts, DEVNULL, log_file);
+	{
+		/*
+		 * First, open the log file if it exists.  The idea is that if the
+		 * file is still locked by a previous postmaster run, we'll wait until
+		 * it comes free, instead of failing with ERROR_SHARING_VIOLATION.
+		 * (It'd be better to open the file in a sharing-friendly mode, but we
+		 * can't use CMD.EXE to do that, so work around it.  Note that the
+		 * previous postmaster will still have the file open for a short time
+		 * after removing postmaster.pid.)
+		 *
+		 * If the log file doesn't exist, we *must not* create it here.  If we
+		 * were launched with higher privileges than the restricted process
+		 * will have, the log file might end up with permissions settings that
+		 * prevent the postmaster from writing on it.
+		 */
+		int			fd = open(log_file, O_RDWR, 0);
+
+		if (fd == -1)
+		{
+			/*
+			 * ENOENT is expectable since we didn't use O_CREAT.  Otherwise
+			 * complain.  We could just fall through and let CMD.EXE report
+			 * the problem, but its error reporting is pretty miserable.
+			 */
+			if (errno != ENOENT)
+			{
+				write_stderr(_("%s: could not open log file \"%s\": %s\n"),
+							 progname, log_file, strerror(errno));
+				exit(1);
+			}
+		}
+		else
+			close(fd);
+
+		cmd = psprintf("CMD /C \"\"%s\" %s%s < \"%s\" >> \"%s\" 2>&1\"",
+					   exec_path, pgdata_opt, post_opts, DEVNULL, log_file);
+	}
 	else
-		snprintf(cmd, MAXPGPATH, "CMD /C \"\"%s\" %s%s < \"%s\" 2>&1\"",
-				 exec_path, pgdata_opt, post_opts, DEVNULL);
+		cmd = psprintf("CMD /C \"\"%s\" %s%s < \"%s\" 2>&1\"",
+					   exec_path, pgdata_opt, post_opts, DEVNULL);
 
 	if (!CreateRestrictedProcess(cmd, &pi, false))
 	{
@@ -589,14 +653,35 @@ is_secondary_instance(const char *pg_data)
  * manager checkpoint, it's got nothing to do with database checkpoints!!
  */
 static WaitPMResult
-wait_for_postmaster(pgpid_t pm_pid, bool do_checkpoint)
+wait_for_postmaster_start(pgpid_t pm_pid, bool do_checkpoint)
 {
 	int			i;
-	bool		is_coordinator;
+	PMStartMode pmStartMode;
 
-	/* check if starting GPDB coordinator in distributed mode */
-	is_coordinator = strstr(post_opts, "gp_role=dispatch") != NULL
-                        && !is_secondary_instance(pg_data);
+	if (strstr(post_opts, "gp_role=dispatch") != NULL)
+	{
+		if (is_secondary_instance(pg_data))
+			pmStartMode = IS_STANDBY_COORDINATOR;
+		else
+			pmStartMode = IS_COORDINATOR;
+	}
+	else if (strstr(post_opts, "gp_role=execute") != NULL)
+	{
+		if (is_secondary_instance(pg_data))
+			pmStartMode = IS_MIRROR;
+		else
+			pmStartMode = IS_PRIMARY;
+	}
+	else if (strstr(post_opts, "gp_role=utility") != NULL)
+	{
+		pmStartMode = IS_UTILITY;
+	}
+	else
+	{
+		write_stderr(_("Invalid/unspecified gp_role for starting postmaster, options: %s\n"),
+			post_opts);
+		exit(1);
+	}
 
 	for (i = 0; i < wait_seconds * WAITS_PER_SEC; i++)
 	{
@@ -638,16 +723,29 @@ wait_for_postmaster(pgpid_t pm_pid, bool do_checkpoint)
 				 */
 				char	   *pmstatus = optlines[LOCK_FILE_LINE_PM_STATUS - 1];
 
-				/*
-				 * The READY status for coordinator is `dtmready`, while the READY
-				 * status is really ready for other nodes.
-				 */
-				if (strcmp(pmstatus, is_coordinator ? PM_STATUS_DTM_RECOVERED : PM_STATUS_READY) == 0 ||
-					strcmp(pmstatus, PM_STATUS_STANDBY) == 0)
+				if (pmStartMode == IS_UTILITY)
 				{
-					/* postmaster is done starting up */
-					free_readfile(optlines);
-					return POSTMASTER_READY;
+					/* utility mode, same as PG except that
+					 * a standby w/ walreceiver could also have the
+					 * GPDB-only status PM_STATUS_WALRECV_STARTED_STREAMING */
+					if (strcmp(pmstatus, PM_STATUS_READY) == 0 ||
+						strcmp(pmstatus, PM_STATUS_STANDBY) == 0 ||
+						strcmp(pmstatus, PM_STATUS_WALRECV_STARTED_STREAMING) == 0)
+					{
+						/* postmaster is done starting up */
+						free_readfile(optlines);
+						return POSTMASTER_READY;
+					}
+				}
+				else /* I'm one of coordinator, standby-coor, primary, mirror */
+				{
+					if (strcmp(pmstatus, pmReadyStatuses[pmStartMode]) == 0 ||
+						(gp_mirror_fast_wait && pmStartMode == IS_MIRROR && strcmp(pmstatus, PM_STATUS_STANDBY) == 0))
+					{
+						/* postmaster is done starting up */
+						free_readfile(optlines);
+						return POSTMASTER_READY;
+					}
 				}
 			}
 		}
@@ -705,6 +803,76 @@ wait_for_postmaster(pgpid_t pm_pid, bool do_checkpoint)
 
 	/* out of patience; report that postmaster is still starting up */
 	return POSTMASTER_STILL_STARTING;
+}
+
+
+/*
+ * Wait for the postmaster to stop.
+ *
+ * Returns true if the postmaster stopped cleanly (i.e., removed its pidfile).
+ * Returns false if the postmaster dies uncleanly, or if we time out.
+ */
+static bool
+wait_for_postmaster_stop(void)
+{
+	int			cnt;
+
+	for (cnt = 0; cnt < wait_seconds * WAITS_PER_SEC; cnt++)
+	{
+		pgpid_t		pid;
+
+		if ((pid = get_pgpid(false)) == 0)
+			return true;		/* pid file is gone */
+
+		if (kill((pid_t) pid, 0) != 0)
+		{
+			/*
+			 * Postmaster seems to have died.  Check the pid file once more to
+			 * avoid a race condition, but give up waiting.
+			 */
+			if (get_pgpid(false) == 0)
+				return true;	/* pid file is gone */
+			return false;		/* postmaster died untimely */
+		}
+
+		if (cnt % WAITS_PER_SEC == 0)
+			print_msg(".");
+		pg_usleep(USEC_PER_SEC / WAITS_PER_SEC);
+	}
+	return false;				/* timeout reached */
+}
+
+
+/*
+ * Wait for the postmaster to promote.
+ *
+ * Returns true on success, else false.
+ * To avoid waiting uselessly, we check for postmaster death here too.
+ */
+static bool
+wait_for_postmaster_promote(void)
+{
+	int			cnt;
+
+	for (cnt = 0; cnt < wait_seconds * WAITS_PER_SEC; cnt++)
+	{
+		pgpid_t		pid;
+		DBState		state;
+
+		if ((pid = get_pgpid(false)) == 0)
+			return false;		/* pid file is gone */
+		if (kill((pid_t) pid, 0) != 0)
+			return false;		/* postmaster died */
+
+		state = get_control_dbstate();
+		if (state == DB_IN_PRODUCTION)
+			return true;		/* successful promotion */
+
+		if (cnt % WAITS_PER_SEC == 0)
+			print_msg(".");
+		pg_usleep(USEC_PER_SEC / WAITS_PER_SEC);
+	}
+	return false;				/* timeout reached */
 }
 
 
@@ -837,7 +1005,7 @@ find_other_exec_or_die(const char *argv0, const char *target, const char *versio
 static void
 do_init(void)
 {
-	char		cmd[MAXPGPATH];
+	char	   *cmd;
 
 	if (exec_path == NULL)
 		exec_path = find_other_exec_or_die(argv0, "initdb", "initdb (Greenplum Database) " PG_VERSION "\n");
@@ -849,11 +1017,11 @@ do_init(void)
 		post_opts = "";
 
 	if (!silent_mode)
-		snprintf(cmd, MAXPGPATH, "\"%s\" %s%s",
-				 exec_path, pgdata_opt, post_opts);
+		cmd = psprintf("\"%s\" %s%s",
+					   exec_path, pgdata_opt, post_opts);
 	else
-		snprintf(cmd, MAXPGPATH, "\"%s\" %s%s > \"%s\"",
-				 exec_path, pgdata_opt, post_opts, DEVNULL);
+		cmd = psprintf("\"%s\" %s%s > \"%s\"",
+					   exec_path, pgdata_opt, post_opts, DEVNULL);
 
 	if (system(cmd) != 0)
 	{
@@ -923,7 +1091,7 @@ do_start(void)
 
 		print_msg(_("waiting for server to start..."));
 
-		switch (wait_for_postmaster(pm_pid, false))
+		switch (wait_for_postmaster_start(pm_pid, false))
 		{
 			case POSTMASTER_READY:
 				print_msg(_(" done\n"));
@@ -958,7 +1126,6 @@ do_start(void)
 static void
 do_stop(void)
 {
-	int			cnt;
 	pgpid_t		pid;
 	struct stat statbuf;
 
@@ -1009,19 +1176,7 @@ do_stop(void)
 
 		print_msg(_("waiting for server to shut down..."));
 
-		for (cnt = 0; cnt < wait_seconds * WAITS_PER_SEC; cnt++)
-		{
-			if ((pid = get_pgpid(false)) != 0)
-			{
-				if (cnt % WAITS_PER_SEC == 0)
-					print_msg(".");
-				pg_usleep(USEC_PER_SEC / WAITS_PER_SEC);
-			}
-			else
-				break;
-		}
-
-		if (pid != 0)			/* pid file still exists */
+		if (!wait_for_postmaster_stop())
 		{
 			print_msg(_(" failed\n"));
 
@@ -1045,7 +1200,6 @@ do_stop(void)
 static void
 do_restart(void)
 {
-	int			cnt;
 	pgpid_t		pid;
 	struct stat statbuf;
 
@@ -1099,20 +1253,7 @@ do_restart(void)
 		print_msg(_("waiting for server to shut down..."));
 
 		/* always wait for restart */
-
-		for (cnt = 0; cnt < wait_seconds * WAITS_PER_SEC; cnt++)
-		{
-			if ((pid = get_pgpid(false)) != 0)
-			{
-				if (cnt % WAITS_PER_SEC == 0)
-					print_msg(".");
-				pg_usleep(USEC_PER_SEC / WAITS_PER_SEC);
-			}
-			else
-				break;
-		}
-
-		if (pid != 0)			/* pid file still exists */
+		if (!wait_for_postmaster_stop())
 		{
 			print_msg(_(" failed\n"));
 
@@ -1237,21 +1378,8 @@ do_promote(void)
 
 	if (do_wait)
 	{
-		DBState		state = DB_STARTUP;
-		int			cnt;
-
 		print_msg(_("waiting for server to promote..."));
-		for (cnt = 0; cnt < wait_seconds * WAITS_PER_SEC; cnt++)
-		{
-			state = get_control_dbstate();
-			if (state == DB_IN_PRODUCTION)
-				break;
-
-			if (cnt % WAITS_PER_SEC == 0)
-				print_msg(".");
-			pg_usleep(USEC_PER_SEC / WAITS_PER_SEC);
-		}
-		if (state == DB_IN_PRODUCTION)
+		if (wait_for_postmaster_promote())
 		{
 			print_msg(_(" done\n"));
 			print_msg(_("server promoted\n"));
@@ -1696,7 +1824,7 @@ pgwin32_ServiceMain(DWORD argc, LPTSTR *argv)
 	if (do_wait)
 	{
 		write_eventlog(EVENTLOG_INFORMATION_TYPE, _("Waiting for server startup...\n"));
-		if (wait_for_postmaster(postmasterPID, true) != POSTMASTER_READY)
+		if (wait_for_postmaster_start(postmasterPID, true) != POSTMASTER_READY)
 		{
 			write_eventlog(EVENTLOG_ERROR_TYPE, _("Timed out waiting for server startup\n"));
 			pgwin32_SetServiceStatus(SERVICE_STOPPED);
@@ -1717,7 +1845,7 @@ pgwin32_ServiceMain(DWORD argc, LPTSTR *argv)
 			{
 				/*
 				 * status.dwCheckPoint can be incremented by
-				 * wait_for_postmaster(), so it might not start from 0.
+				 * wait_for_postmaster_start(), so it might not start from 0.
 				 */
 				int			maxShutdownCheckPoint = status.dwCheckPoint + 12;
 
@@ -2372,9 +2500,9 @@ set_starttype(char *starttypeopt)
 static void
 adjust_data_dir(void)
 {
-	char		cmd[MAXPGPATH],
-				filename[MAXPGPATH],
-			   *my_exec_path;
+	char		filename[MAXPGPATH];
+	char	   *my_exec_path,
+			   *cmd;
 	FILE	   *fd;
 
 	/* do nothing if we're working without knowledge of data dir */
@@ -2404,10 +2532,10 @@ adjust_data_dir(void)
 		my_exec_path = pg_strdup(exec_path);
 
 	/* it's important for -C to be the first option, see main.c */
-	snprintf(cmd, MAXPGPATH, "\"%s\" -C data_directory %s%s",
-			 my_exec_path,
-			 pgdata_opt ? pgdata_opt : "",
-			 post_opts ? post_opts : "");
+	cmd = psprintf("\"%s\" -C data_directory %s%s",
+				   my_exec_path,
+				   pgdata_opt ? pgdata_opt : "",
+				   post_opts ? post_opts : "");
 
 	fd = popen(cmd, "r");
 	if (fd == NULL || fgets(filename, sizeof(filename), fd) == NULL)
@@ -2418,9 +2546,8 @@ adjust_data_dir(void)
 	pclose(fd);
 	free(my_exec_path);
 
-	/* Remove trailing newline */
-	if (strchr(filename, '\n') != NULL)
-		*strchr(filename, '\n') = '\0';
+	/* strip trailing newline and carriage return */
+	(void) pg_strip_crlf(filename);
 
 	free(pg_data);
 	pg_data = pg_strdup(filename);
@@ -2464,6 +2591,7 @@ main(int argc, char **argv)
 		{"wrapper-args", optional_argument, NULL, 'Q'},
 		{"wait", no_argument, NULL, 'w'},
 		{"no-wait", no_argument, NULL, 'W'},
+		{"gp-mirror-fast-wait", no_argument, NULL, 128},
 		{NULL, 0, NULL, 0}
 	};
 
@@ -2626,6 +2754,15 @@ main(int argc, char **argv)
 					break;
 				case 'Q':
 					wrapper_args = pg_strdup(optarg);
+					break;
+				case 128:
+					/*
+					 * GPDB: Wait for mirror's postmaster.pid to show
+					 * 'standby' instead of 'wrecvstreaming'. This is useful
+					 * for utilities (e.g. gpstart) that do not care if a
+					 * mirror's wal receiver has starting streaming or not.
+					 */
+					gp_mirror_fast_wait = true;
 					break;
 				default:
 					/* getopt_long already issued a suitable error message */

@@ -115,16 +115,81 @@ Feature: gpstate tests
             | \S+             | [0-9]+ | \S+    | [0-9]+ |
         And gpstate should print "Unsynchronized Segment Pairs" to stdout
         And gpstate output looks like
-            | Current Primary | Port   | Mirror | Port   |
-            | \S+             | [0-9]+ | \S+    | [0-9]+ |
-            | \S+             | [0-9]+ | \S+    | [0-9]+ |
-            | \S+             | [0-9]+ | \S+    | [0-9]+ |
+            | Current Primary | Port   | WAL sync remaining bytes | Mirror | Port   |
+            | \S+             | [0-9]+ | Unknown                  | \S+    | [0-9]+ |
+            | \S+             | [0-9]+ | Unknown                  | \S+    | [0-9]+ |
+            | \S+             | [0-9]+ | Unknown                  | \S+    | [0-9]+ |
         And gpstate should print "Downed Segments" to stdout
         And gpstate output looks like
             | Segment | Port   | Config status | Status                |
             | \S+     | [0-9]+ | Down          | Down in configuration |
             | \S+     | [0-9]+ | Down          | Down in configuration |
             | \S+     | [0-9]+ | Down          | Down in configuration |
+
+    Scenario: gpstate show remaining bytes when mirror hasn't caught up
+        Given a standard local demo cluster is running
+        And the primary on content 0 is stopped
+        And user can start transactions
+        And sql "CREATE TABLE t AS SELECT generate_series(1,1000) AS a" is executed in "postgres" db
+        And the user suspend the walsender on the primary on content 0
+        And the user runs "gprecoverseg -a"
+        When the user runs "gpstate -e"
+        Then gpstate should print "Unsynchronized Segment Pairs" to stdout
+        And gpstate output looks like
+            | Current Primary | Port   | WAL sync remaining bytes            | Mirror | Port   |
+            | \S+             | [0-9]+ | [0-9]+                              | \S+    | [0-9]+ |
+        When the user runs "gpstate -s"
+        Then gpstate output has rows
+            |Bytes remaining to send to mirror     = [1-9]\d* |
+        And the user reset the walsender on the primary on content 0
+        And the user waits until all bytes are sent to mirror on content 0
+        When the user runs "gpstate -e"
+        Then gpstate should not print "Unsynchronized Segment Pairs" to stdout
+
+    Scenario: gpstate -s logs show WAL remaining bytes when mirror hasn't flushed wal
+        Given a standard local demo cluster is running
+        And the user skips walreceiver flushing on the mirror on content 0
+        And sql "BEGIN; CREATE TABLE t AS SELECT generate_series(1,1000) AS a; ABORT;" is executed in "postgres" db
+        And the user waits until all bytes are sent to mirror on content 0
+        When the user runs "gpstate -s"
+        Then gpstate output has rows with keys values
+            |Bytes received but remain to flush    = [1-9]\d* |
+            |Bytes received but remain to replay   = [1-9]\d* |
+
+    Scenario: gpstate -e shows information about segments with ongoing recovery
+        Given a standard local demo cluster is running
+        Given all files in gpAdminLogs directory are deleted
+        And a sample recovery_progress.file is created with ongoing recoveries in gpAdminLogs
+        And we run a sample background script to generate a pid on "coordinator" segment
+        And a sample gprecoverseg.lock directory is created using the background pid in coordinator_data_directory
+        When the user runs "gpstate -e"
+        Then gpstate should print "Segments in recovery" to stdout
+        And gpstate output contains "full,incremental" entries for mirrors of content 0,1
+        And gpstate output looks like
+            | Segment | Port   | Recovery type  | Completed bytes \(kB\) | Total bytes \(kB\) | Percentage completed |
+            | \S+     | [0-9]+ | full           | 1164848                | 1371715            | 84%                  |
+            | \S+     | [0-9]+ | incremental    | 1                      | 1371875            | 1%                   |
+        And all files in gpAdminLogs directory are deleted
+        And the background pid is killed on "coordinator" segment
+        And the gprecoverseg lock directory is removed
+
+    Scenario: gpstate -e does not show information about segments with completed recovery
+        Given a standard local demo cluster is running
+        Given all files in gpAdminLogs directory are deleted
+        And a sample recovery_progress.file is created with completed recoveries in gpAdminLogs
+        And we run a sample background script to generate a pid on "coordinator" segment
+        And a sample gprecoverseg.lock directory is created using the background pid in coordinator_data_directory
+        When the user runs "gpstate -e"
+        Then gpstate should print "Segments in recovery" to stdout
+        And gpstate output contains "full" entries for mirrors of content 1
+        And gpstate output looks like
+            | Segment | Port   | Recovery type  | Completed bytes \(kB\) | Total bytes \(kB\) | Percentage completed |
+            | \S+     | [0-9]+ | full           | 1164848                | 1371715            | 84%                  |
+        And gpstate should not print "incremental" to stdout
+        And gpstate should not print "All segments are running normally" to stdout
+        And all files in gpAdminLogs directory are deleted
+        And the background pid is killed on "coordinator" segment
+        Then the gprecoverseg lock directory is removed
 
     Scenario: gpstate -c logs cluster info for a mirrored cluster
         Given a standard local demo cluster is running
@@ -406,7 +471,7 @@ Feature: gpstate tests
                   distribution_policy_names text,
                   distribution_policy_coloids text,
                   distribution_policy_type text,
-                  root_partition_name text,
+                  root_partition_oid oid,
                   storage_options text,
                   rank int,
                   status text,
@@ -516,3 +581,96 @@ Feature: gpstate tests
          When the user runs "gpstate -x"
          Then gpstate output looks like
              | Cluster Expansion State = No Expansion Detected |
+
+    Scenario: gpstate -e -v logs no errors when the user sets PGDATABASE
+        Given a standard local demo cluster is running
+        And the user runs command "export PGDATABASE=postgres && $GPHOME/bin/gpstate -e -v"
+        Then command should print "pg_isready -q -h .* -p .* -d postgres" to stdout
+        And command should print "All segments are running normally" to stdout
+
+    Scenario: gpstate -e -v logs no fatal message in pg_log files on primary segments
+        Given a standard local demo cluster is running
+        And the user records the current timestamp in log_timestamp table
+        And the user runs command "gpstate -e -v"
+        Then command should print "PGOPTIONS=\"-c gp_role=utility\" pg_isready -q -h .* -p .* -d postgres" to stdout
+        And the pg_log files on primary segments should not contain "connections to primary segments are not allowed"
+        And the user drops log_timestamp table
+
+    Scenario: gpstate runs with given coordinator data directory option
+        Given the cluster is generated with "3" primaries only
+         And "COORDINATOR_DATA_DIRECTORY" environment variable is not set
+        Then the user runs utility "gpstate" with coordinator data directory and "-a -b"
+         And gpstate should return a return code of 0
+         And gpstate output has rows with keys values
+            | Coordinator instance                              = Active                            |
+            | Coordinator standby                               = No coordinator standby configured |
+            | Total segment instance count from metadata        = 3                                 |
+            | Primary Segment Status                                                                |
+            | Total primary segments                            = 3                                 |
+            | Total primary segment valid \(at coordinator\)    = 3                                 |
+            | Total primary segment failures \(at coordinator\) = 0                                 |
+            | Total number of postmaster.pid files missing      = 0                                 |
+            | Total number of postmaster.pid files found        = 3                                 |
+            | Total number of postmaster.pid PIDs missing       = 0                                 |
+            | Total number of postmaster.pid PIDs found         = 3                                 |
+            | Total number of /tmp lock files missing           = 0                                 |
+            | Total number of /tmp lock files found             = 3                                 |
+            | Total number postmaster processes missing         = 0                                 |
+            | Total number postmaster processes found           = 3                                 |
+            | Mirror Segment Status                                                                 |
+            | Mirrors not configured on this array
+         And "COORDINATOR_DATA_DIRECTORY" environment variable should be restored
+
+    Scenario: gpstate priorities given coordinator data directory over env option
+        Given the cluster is generated with "3" primaries only
+          And the environment variable "COORDINATOR_DATA_DIRECTORY" is set to "/tmp/"
+        Then the user runs utility "gpstate" with coordinator data directory and "-a -b"
+         And gpstate should return a return code of 0
+         And gpstate output has rows with keys values
+            | Coordinator instance                              = Active                            |
+            | Coordinator standby                               = No coordinator standby configured |
+            | Total segment instance count from metadata        = 3                                 |
+            | Primary Segment Status                                                                |
+            | Total primary segments                            = 3                                 |
+            | Total primary segment valid \(at coordinator\)    = 3                                 |
+            | Total primary segment failures \(at coordinator\) = 0                                 |
+            | Total number of postmaster.pid files missing      = 0                                 |
+            | Total number of postmaster.pid files found        = 3                                 |
+            | Total number of postmaster.pid PIDs missing       = 0                                 |
+            | Total number of postmaster.pid PIDs found         = 3                                 |
+            | Total number of /tmp lock files missing           = 0                                 |
+            | Total number of /tmp lock files found             = 3                                 |
+            | Total number postmaster processes missing         = 0                                 |
+            | Total number postmaster processes found           = 3                                 |
+            | Mirror Segment Status                                                                 |
+            | Mirrors not configured on this array
+        And "COORDINATOR_DATA_DIRECTORY" environment variable should be restored
+
+    Scenario: gpstate -e shows information about segments with ongoing differential recovery
+        Given a standard local demo cluster is running
+        Given all files in gpAdminLogs directory are deleted
+        And a sample recovery_progress.file is created with ongoing differential recoveries in gpAdminLogs
+        And we run a sample background script to generate a pid on "coordinator" segment
+        And a sample gprecoverseg.lock directory is created using the background pid in coordinator_data_directory
+        When the user runs "gpstate -e"
+        Then gpstate should print "Segments in recovery" to stdout
+        And gpstate output contains "differential,differential" entries for mirrors of content 0,1
+        And gpstate output looks like
+            | Segment | Port   | Recovery type  | Stage                                       | Completed bytes \(kB\) | Percentage completed |
+            | \S+     | [0-9]+ | differential   | Syncing pg_data of dbid 5                   | 16,454,866             | 4%                   |
+            | \S+     | [0-9]+ | differential   | Syncing tablespace of dbid 6 for oid 20516  | 8,192                  | 100%                 |
+        And all files in gpAdminLogs directory are deleted
+        And the background pid is killed on "coordinator" segment
+        And the gprecoverseg lock directory is removed
+
+
+########################### @concourse_cluster tests ###########################
+# The @concourse_cluster tag denotes the scenario that requires a remote cluster
+
+    @concourse_cluster
+    Scenario: gpstate -e -v logs no errors when the user unsets PGDATABASE
+        Given the database is running
+        And all the segments are running
+        And the user runs command "unset PGDATABASE && $GPHOME/bin/gpstate -e -v"
+        Then command should print "pg_isready -q -h .* -p .* -d postgres" to stdout
+        And command should print "All segments are running normally" to stdout

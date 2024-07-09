@@ -115,6 +115,13 @@ CPhysicalAgg::CPhysicalAgg(
 		ulDistrReqs = 2;
 	}
 
+	// Split DQA generates a 2-stage aggregate to handle the case where
+	// hash aggregate has a distinct agg func. Here we need to be careful
+	// not to prohibit distribution property enforcement.
+	m_should_enforce_distribution &= !(
+		isAggFromSplitDQA && aggStage == CLogicalGbAgg::EasTwoStageScalarDQA &&
+		colref_array->Size() > 0);
+
 	SetDistrRequests(ulDistrReqs);
 }
 
@@ -231,9 +238,25 @@ CPhysicalAgg::PdsRequiredAgg(CMemoryPool *mp, CExpressionHandle &exprhdl,
 		{
 			GPOS_ASSERT(1 == ulOptReq);
 			GPOS_ASSERT(0 < m_pdrgpcr->Size());
-			CColRefArray *grpAndDistinctCols = GPOS_NEW(mp) CColRefArray(mp);
-			grpAndDistinctCols->AppendArray(m_pdrgpcr);
-			grpAndDistinctCols->AppendArray(m_pdrgpcrArgDQA);
+
+			ULONG length = m_pdrgpcrArgDQA->Size();
+			CColRefArray *grpAndDistinctCols =
+				CUtils::PdrgpcrExactCopy(mp, m_pdrgpcr);
+
+			// add the distinct column to the group by at the first stage of
+			// the multi-level aggregation, and also deduplicate them.
+			CColRefSet *pcrs = GPOS_NEW(mp) CColRefSet(mp, m_pdrgpcr);
+			for (ULONG ul = 0; ul < length; ul++)
+			{
+				CColRef *colref = (*m_pdrgpcrArgDQA)[ul];
+				if (!pcrs->FMember(colref))
+				{
+					grpAndDistinctCols->Append(colref);
+					pcrs->Include(colref);
+				}
+			}
+			pcrs->Release();
+
 			CDistributionSpec *pdsSpec =
 				PdsMaximalHashed(mp, grpAndDistinctCols);
 			grpAndDistinctCols->Release();
@@ -380,6 +403,13 @@ CPhysicalAgg::PrsRequired(CMemoryPool *mp, CExpressionHandle &exprhdl,
 {
 	GPOS_ASSERT(0 == child_index);
 
+	if (prsRequired->IsOriginNLJoin())
+	{
+		CRewindabilitySpec *prs = GPOS_NEW(mp) CRewindabilitySpec(
+			CRewindabilitySpec::ErtNone, prsRequired->Emht());
+		return prs;
+	}
+
 	return PrsPassThru(mp, exprhdl, prsRequired, child_index);
 }
 
@@ -457,10 +487,19 @@ CPhysicalAgg::PdsDerive(CMemoryPool *mp, CExpressionHandle &exprhdl) const
 			exprhdl.DeriveScalarFunctionProperties(1)->Efs())
 	{
 		return GPOS_NEW(mp) CDistributionSpecStrictSingleton(
-			CDistributionSpecSingleton::EstMaster);
+			CDistributionSpecSingleton::EstCoordinator);
 	}
 	else if (CDistributionSpec::EdtStrictReplicated == pds->Edt())
 	{
+		// Aggregate functions that are not sensitive to the order of data (eg: sum, avg, min, max, count)
+		// can be executed safely on replicated slices and do not need to be broadcasted/gathered, allowing
+		// for more performant plans in some cases
+		if (exprhdl.DeriveContainsOnlyReplicationSafeAggFuncs(1))
+		{
+			return GPOS_NEW(mp) CDistributionSpecReplicated(
+				CDistributionSpec::EdtStrictReplicated);
+		}
+
 		// Aggregate functions which are not trivial and which are sensitive to
 		// the order of their input cannot guarantee replicated data. If the child
 		// was replicated, we can no longer guarantee that property. Therefore
@@ -502,6 +541,7 @@ CPhysicalAgg::HashValue() const
 	ULONG ulHash = COperator::HashValue();
 	const ULONG arity = m_pdrgpcr->Size();
 	ULONG ulGbaggtype = (ULONG) m_egbaggtype;
+	ULONG ulaggstage = (ULONG) m_aggStage;
 	for (ULONG ul = 0; ul < arity; ul++)
 	{
 		CColRef *colref = (*m_pdrgpcr)[ul];
@@ -509,6 +549,7 @@ CPhysicalAgg::HashValue() const
 	}
 
 	ulHash = gpos::CombineHashes(ulHash, gpos::HashValue<ULONG>(&ulGbaggtype));
+	ulHash = gpos::CombineHashes(ulHash, gpos::HashValue<ULONG>(&ulaggstage));
 
 	return gpos::CombineHashes(ulHash,
 							   gpos::HashValue<BOOL>(&m_fGeneratesDuplicates));

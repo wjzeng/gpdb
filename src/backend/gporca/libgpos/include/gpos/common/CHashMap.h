@@ -38,6 +38,7 @@ class CHashMapIter;
 template <class K, class T, ULONG (*HashFn)(const K *),
 		  BOOL (*EqFn)(const K *, const K *), void (*DestroyKFn)(K *),
 		  void (*DestroyTFn)(T *)>
+
 class CHashMap : public CRefCount
 {
 	// fwd declaration
@@ -127,12 +128,12 @@ private:
 	ULONG m_size;
 
 	// each hash chain is an array of hashmap elements
-	typedef CDynamicPtrArray<CHashMapElem, CleanupDelete> CHashSetElemArray;
+	using CHashSetElemArray = CDynamicPtrArray<CHashMapElem, CleanupDelete>;
 	CHashSetElemArray **const m_chains;
 
 	// array for keys
 	// We use CleanupNULL because the keys are owned by the hash table
-	typedef CDynamicPtrArray<K, CleanupNULL> Keys;
+	using Keys = CDynamicPtrArray<K, CleanupNULL>;
 	Keys *const m_keys;
 
 	IntPtrArray *const m_filled_chains;
@@ -292,8 +293,16 @@ public:
 		return m_size;
 	}
 
+	Keys *
+	GetKeys() const
+	{
+		return m_keys;
+	}
 };	// class CHashMap
 
+using UlongToUlongMap =
+	CHashMap<ULONG, ULONG, gpos::HashValue<ULONG>, gpos::Equals<ULONG>,
+			 CleanupDelete<ULONG>, CleanupDelete<ULONG>>;
 }  // namespace gpos
 
 #endif	// !GPOS_CHashMap_H

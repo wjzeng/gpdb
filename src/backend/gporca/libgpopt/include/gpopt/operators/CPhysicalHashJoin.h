@@ -43,12 +43,22 @@ private:
 	// Hash op families of the operators used in the join conditions
 	IMdIdArray *m_hash_opfamilies;
 
+	// if the join condition is null-aware
+	// true by default, and false if the join condition doesn't contain
+	// any INDF predicates
+	BOOL m_is_null_aware;
+
 	// array redistribute request sent to the first hash join child
 	CDistributionSpecArray *m_pdrgpdsRedistributeRequests;
 
 	// compute a distribution matching the distribution delivered by given child
 	CDistributionSpec *PdsMatch(CMemoryPool *mp, CDistributionSpec *pds,
 								ULONG ulSourceChildIndex) const;
+
+	// helper for deriving hash join distribution from hashed children
+	CDistributionSpec *PdsDeriveFromHashedChildren(
+		CMemoryPool *mp, CExpressionHandle &exprhdl,
+		CDistributionSpec *pdsOuter, CDistributionSpec *pdsInner) const;
 
 protected:
 	// compute required hashed distribution from the n-th child
@@ -65,6 +75,9 @@ protected:
 
 	// create the set of redistribute requests to send to first hash join child
 	void CreateHashRedistributeRequests(CMemoryPool *mp);
+
+	BOOL FSelfJoinWithMatchingJoinKeys(CMemoryPool *mp,
+									   CExpressionHandle &exprhdl) const;
 
 private:
 	// create (non-singleton, replicate) optimization request
@@ -109,13 +122,30 @@ protected:
 	// create optimization requests
 	virtual void CreateOptRequests(CMemoryPool *mp);
 
+	CPartitionPropagationSpec *PppsRequiredForJoins(
+		CMemoryPool *mp, CExpressionHandle &exprhdl,
+		CPartitionPropagationSpec *pppsRequired, ULONG child_index,
+		CDrvdPropArray *pdrgpdpCtxt, ULONG ulOptReq) const;
+
+	CExpression *PexprJoinPredOnPartKeys(CMemoryPool *mp,
+										 CExpression *pexprScalar,
+										 CPartKeysArray *pdrgppartkeys,
+										 CColRefSet *pcrsAllowedRefs) const;
+
+	CPartitionPropagationSpec *PppsDeriveForJoins(
+		CMemoryPool *mp, CExpressionHandle &exprhdl) const;
+
+	CDistributionSpec *PdsDeriveForOuterJoin(CMemoryPool *mp,
+											 CExpressionHandle &exprhdl) const;
+
 public:
 	CPhysicalHashJoin(const CPhysicalHashJoin &) = delete;
 
 	// ctor
 	CPhysicalHashJoin(CMemoryPool *mp, CExpressionArray *pdrgpexprOuterKeys,
 					  CExpressionArray *pdrgpexprInnerKeys,
-					  IMdIdArray *hash_opfamilies = nullptr);
+					  IMdIdArray *hash_opfamilies, BOOL is_null_aware = true,
+					  CXform::EXformId origin_xform = CXform::ExfSentinel);
 
 	// dtor
 	~CPhysicalHashJoin() override;
@@ -163,6 +193,9 @@ public:
 						   CDrvdPropArray *pdrgpdpCtxt,
 						   ULONG ulDistrReq) override;
 
+	CEnfdDistribution *PedRightOrFullJoin(
+		CMemoryPool *mp, CExpressionHandle &exprhdl, CReqdPropPlan *prppInput,
+		ULONG child_index, CDrvdPropArray *pdrgpdpCtxt, ULONG ulOptReq);
 	//-------------------------------------------------------------------------------------
 	// Derived Plan Properties
 	//-------------------------------------------------------------------------------------

@@ -24,6 +24,7 @@
 #include "storage/procsignal.h"
 #include "storage/shm_mq.h"
 #include "storage/spin.h"
+#include "utils/memutils.h"
 
 /*
  * This structure represents the actual queue, stored in shared memory.
@@ -360,6 +361,13 @@ shm_mq_sendv(shm_mq_handle *mqh, shm_mq_iovec *iov, int iovcnt, bool nowait)
 	for (i = 0; i < iovcnt; ++i)
 		nbytes += iov[i].len;
 
+	/* Prevent writing messages overwhelming the receiver. */
+	if (nbytes > MaxAllocSize)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("cannot send a message of size %zu via shared memory queue",
+						nbytes)));
+
 	/* Try to write, or finish writing, the length word into the buffer. */
 	while (!mqh->mqh_length_word_complete)
 	{
@@ -675,6 +683,17 @@ shm_mq_receive(shm_mq_handle *mqh, Size *nbytesp, void **datap, bool nowait)
 	}
 	nbytes = mqh->mqh_expected_bytes;
 
+	/*
+	 * Should be disallowed on the sending side already, but better check and
+	 * error out on the receiver side as well rather than trying to read a
+	 * prohibitively large message.
+	 */
+	if (nbytes > MaxAllocSize)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("invalid message size %zu in shared memory queue",
+						nbytes)));
+
 	if (mqh->mqh_partial_bytes == 0)
 	{
 		/*
@@ -703,8 +722,13 @@ shm_mq_receive(shm_mq_handle *mqh, Size *nbytesp, void **datap, bool nowait)
 		{
 			Size		newbuflen = Max(mqh->mqh_buflen, MQH_INITIAL_BUFSIZE);
 
+			/*
+			 * Double the buffer size until the payload fits, but limit to
+			 * MaxAllocSize.
+			 */
 			while (newbuflen < nbytes)
 				newbuflen *= 2;
+			newbuflen = Min(newbuflen, MaxAllocSize);
 
 			if (mqh->mqh_buffer != NULL)
 			{
@@ -724,8 +748,11 @@ shm_mq_receive(shm_mq_handle *mqh, Size *nbytesp, void **datap, bool nowait)
 
 		/* Copy as much as we can. */
 		Assert(mqh->mqh_partial_bytes + rb <= nbytes);
-		memcpy(&mqh->mqh_buffer[mqh->mqh_partial_bytes], rawdata, rb);
-		mqh->mqh_partial_bytes += rb;
+		if (rb > 0)
+		{
+			memcpy(&mqh->mqh_buffer[mqh->mqh_partial_bytes], rawdata, rb);
+			mqh->mqh_partial_bytes += rb;
+		}
 
 		/*
 		 * Update count of bytes that can be consumed, accounting for
@@ -927,6 +954,12 @@ shm_mq_send_bytes(shm_mq_handle *mqh, Size nbytes, const void *data,
 		}
 		else if (available == 0)
 		{
+			if (QueryFinishPending)
+			{
+				*bytes_written = sent;
+				return SHM_MQ_QUERY_FINISH;
+			}
+
 			/*
 			 * Since mq->mqh_counterparty_attached is known to be true at this
 			 * point, mq_receiver has been set, and it can't change once set.
@@ -1156,6 +1189,9 @@ shm_mq_wait_internal(shm_mq *mq, PGPROC **ptr, BackgroundWorkerHandle *handle)
 	{
 		BgwHandleStatus status;
 		pid_t		pid;
+
+		if (QueryFinishPending)
+			break;
 
 		/* Acquire the lock just long enough to check the pointer. */
 		SpinLockAcquire(&mq->mq_mutex);

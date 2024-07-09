@@ -35,6 +35,7 @@
 #include "nodes/makefuncs.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
+#include "utils/fmgrprotos.h"
 #include "utils/memutils.h"
 #include "catalog/gp_id.h"
 #include "catalog/indexing.h"
@@ -72,7 +73,7 @@
 
 #define GPSEGCONFIGDUMPFILE "gpsegconfig_dump"
 #define GPSEGCONFIGDUMPFILETMP "gpsegconfig_dump_tmp"
-#define GPSEGCONFIGNUMATTR 9 
+#define GPSEGCONFIGNUMATTR 10
 
 MemoryContext CdbComponentsContext = NULL;
 static CdbComponentDatabases *cdb_component_dbs = NULL;
@@ -89,7 +90,7 @@ static GpSegConfigEntry * readGpSegConfigFromCatalog(int *total_dbs);
 static GpSegConfigEntry * readGpSegConfigFromFTSFiles(int *total_dbs);
 
 static void getAddressesForDBid(GpSegConfigEntry *c, int elevel);
-static HTAB *hostSegsHashTableInit(void);
+static HTAB *hostPrimaryCountHashTableInit(void);
 
 static int nextQEIdentifer(CdbComponentDatabases *cdbs);
 
@@ -103,11 +104,11 @@ typedef struct SegIpEntry
 	char		hostinfo[NI_MAXHOST];
 } SegIpEntry;
 
-typedef struct HostSegsEntry
+typedef struct HostPrimaryCountEntry
 {
-	char		hostip[INET6_ADDRSTRLEN];
+	char		hostname[MAXHOSTNAMELEN];
 	int			segmentCount;
-} HostSegsEntry;
+} HostPrimaryCountEntry;
 
 /*
  * Helper functions for fetching latest gp_segment_configuration outside of
@@ -133,7 +134,8 @@ readGpSegConfigFromFTSFiles(int *total_dbs)
 
 	char	hostname[MAXHOSTNAMELEN];
 	char	address[MAXHOSTNAMELEN];
-	char	buf[MAXHOSTNAMELEN * 2 + 32];
+	char    datadir[MAXPGPATH];
+	char	buf[MAXHOSTNAMELEN * 2 + MAXPGPATH + 32];
 
 	Assert(!IsTransactionState());
 
@@ -151,9 +153,9 @@ readGpSegConfigFromFTSFiles(int *total_dbs)
 	{ 
 		config = &configs[idx];
 
-		if (sscanf(buf, "%d %d %c %c %c %c %d %s %s", (int *)&config->dbid, (int *)&config->segindex,
+		if (sscanf(buf, "%d %d %c %c %c %c %d %s %s %s", (int *)&config->dbid, (int *)&config->segindex,
 				   &config->role, &config->preferred_role, &config->mode, &config->status,
-				   &config->port, hostname, address) != GPSEGCONFIGNUMATTR)
+				   &config->port, hostname, address, datadir) != GPSEGCONFIGNUMATTR)
 		{
 			FreeFile(fd);
 			elog(ERROR, "invalid data in gp_segment_configuration dump file: %s:%m", GPSEGCONFIGDUMPFILE);
@@ -161,6 +163,7 @@ readGpSegConfigFromFTSFiles(int *total_dbs)
 
 		config->hostname = pstrdup(hostname);
 		config->address = pstrdup(address);
+		config->datadir = pstrdup(datadir);
 
 		idx++;
 		/*
@@ -211,9 +214,9 @@ writeGpSegConfigToFTSFiles(void)
 	{
 		config = &configs[idx];
 
-		if (fprintf(fd, "%d %d %c %c %c %c %d %s %s\n", config->dbid, config->segindex,
+		if (fprintf(fd, "%d %d %c %c %c %c %d %s %s %s\n", config->dbid, config->segindex,
 					config->role, config->preferred_role, config->mode, config->status,
-					config->port, config->hostname, config->address) < 0)
+					config->port, config->hostname, config->address, config->datadir) < 0)
 		{
 			FreeFile(fd);
 			elog(ERROR, "could not dump gp_segment_configuration to file: %s: %m", GPSEGCONFIGDUMPFILE);
@@ -297,7 +300,10 @@ readGpSegConfigFromCatalog(int *total_dbs)
 		Assert(!isNull);
 		config->port = DatumGetInt32(attr);
 
-		/* datadir is not dumped*/
+		/* datadir */
+		attr = heap_getattr(gp_seg_config_tuple, Anum_gp_segment_configuration_datadir, RelationGetDescr(gp_seg_config_rel), &isNull);
+		Assert(!isNull);
+		config->datadir = TextDatumGetCString(attr);
 
 		idx++;
 
@@ -340,7 +346,7 @@ getCdbComponentInfo(void)
 	int			total_dbs = 0;
 
 	bool		found;
-	HostSegsEntry *hsEntry;
+	HostPrimaryCountEntry *hsEntry;
 
 	if (!CdbComponentsContext)
 		CdbComponentsContext = AllocSetContextCreate(TopMemoryContext, "cdb components Context",
@@ -350,7 +356,7 @@ getCdbComponentInfo(void)
 
 	oldContext = MemoryContextSwitchTo(CdbComponentsContext);
 
-	HTAB	   *hostSegsHash = hostSegsHashTableInit();
+	HTAB	   *hostPrimaryCountHash = hostPrimaryCountHashTableInit();
 
 	if (IsTransactionState())
 		configs = readGpSegConfigFromCatalog(&total_dbs);
@@ -374,6 +380,19 @@ getCdbComponentInfo(void)
 	{
 		CdbComponentDatabaseInfo	*pRow;
 		GpSegConfigEntry	*config = &configs[i];
+
+		if (config->hostname == NULL || strlen(config->hostname) > MAXHOSTNAMELEN)
+		{
+			/*
+			 * We should never reach here, but add sanity check
+			 * The reason we check length is we find MAXHOSTNAMELEN might be
+			 * smaller than the ones defined in /etc/hosts. Those are rare cases.
+			 */
+			elog(ERROR,
+				 "Invalid length (%d) of hostname (%s)",
+				 config->hostname == NULL ? 0 : (int) strlen(config->hostname),
+				 config->hostname == NULL ? "" : config->hostname);
+		}
 
 		/* lookup hostip/hostaddrs cache */
 		config->hostip= NULL;
@@ -411,13 +430,14 @@ getCdbComponentInfo(void)
 		pRow->cdbs = component_databases;
 		pRow->config = config;
 		pRow->freelist = NIL;
+		pRow->activelist = NIL;
 		pRow->numIdleQEs = 0;
 		pRow->numActiveQEs = 0;
 
-		if (config->role != GP_SEGMENT_CONFIGURATION_ROLE_PRIMARY || config->hostip == NULL)
+		if (config->role != GP_SEGMENT_CONFIGURATION_ROLE_PRIMARY)
 			continue;
 
-		hsEntry = (HostSegsEntry *) hash_search(hostSegsHash, config->hostip, HASH_ENTER, &found);
+		hsEntry = (HostPrimaryCountEntry *) hash_search(hostPrimaryCountHash, config->hostname, HASH_ENTER, &found);
 		if (found)
 			hsEntry->segmentCount++;
 		else
@@ -528,27 +548,27 @@ getCdbComponentInfo(void)
 	{
 		cdbInfo = &component_databases->segment_db_info[i];
 
-		if (cdbInfo->config->role != GP_SEGMENT_CONFIGURATION_ROLE_PRIMARY || cdbInfo->config->hostip == NULL)
+		if (!IS_HOT_STANDBY_QD() && cdbInfo->config->role != GP_SEGMENT_CONFIGURATION_ROLE_PRIMARY)
 			continue;
 
-		hsEntry = (HostSegsEntry *) hash_search(hostSegsHash, cdbInfo->config->hostip, HASH_FIND, &found);
+		hsEntry = (HostPrimaryCountEntry *) hash_search(hostPrimaryCountHash, cdbInfo->config->hostname, HASH_FIND, &found);
 		Assert(found);
-		cdbInfo->hostSegs = hsEntry->segmentCount;
+		cdbInfo->hostPrimaryCount = hsEntry->segmentCount;
 	}
 
 	for (i = 0; i < component_databases->total_entry_dbs; i++)
 	{
 		cdbInfo = &component_databases->entry_db_info[i];
 
-		if (cdbInfo->config->role != GP_SEGMENT_CONFIGURATION_ROLE_PRIMARY || cdbInfo->config->hostip == NULL)
+		if (!IS_HOT_STANDBY_QD() && cdbInfo->config->role != GP_SEGMENT_CONFIGURATION_ROLE_PRIMARY)
 			continue;
 
-		hsEntry = (HostSegsEntry *) hash_search(hostSegsHash, cdbInfo->config->hostip, HASH_FIND, &found);
+		hsEntry = (HostPrimaryCountEntry *) hash_search(hostPrimaryCountHash, cdbInfo->config->hostname, HASH_FIND, &found);
 		Assert(found);
-		cdbInfo->hostSegs = hsEntry->segmentCount;
+		cdbInfo->hostPrimaryCount = hsEntry->segmentCount;
 	}
 
-	hash_destroy(hostSegsHash);
+	hash_destroy(hostPrimaryCountHash);
 
 	MemoryContextSwitchTo(oldContext);
 
@@ -751,7 +771,7 @@ cdbcomponent_destroyCdbComponents(void)
 /*
  * Allocated a segdb
  *
- * If thers is idle segdb in the freelist, return it, otherwise, initialize
+ * If there is idle segdb in the freelist, return it, otherwise, initialize
  * a new segdb.
  *
  * idle segdbs has an established connection with segment, but new segdb is
@@ -806,6 +826,15 @@ cdbcomponent_allocateIdleQE(int contentId, SegmentType segmentType)
 		/*
 		 * 1. for entrydb, it's never be writer.
 		 * 2. for first QE, it must be a writer.
+		 *
+		 * This block ignores the segmentType of the not-first QEs and
+		 * sets it as a reader, foreign tables have to workaround this
+		 * if we'd like to have more QEs writing the external data than
+		 * the segment count.
+		 *
+		 * This is too critical that we'd better not change the logic of
+		 * other kind tables.
+		 *
 		 */
 		isWriter = contentId == -1 ? false: (cdbinfo->numIdleQEs == 0 && cdbinfo->numActiveQEs == 0);
 		segdbDesc = cdbconn_createSegmentDescriptor(cdbinfo, nextQEIdentifer(cdbinfo->cdbs), isWriter);
@@ -813,6 +842,7 @@ cdbcomponent_allocateIdleQE(int contentId, SegmentType segmentType)
 
 	cdbconn_setQEIdentifier(segdbDesc, -1);
 
+	cdbinfo->activelist = lcons(segdbDesc, cdbinfo->activelist);
 	INCR_COUNT(cdbinfo, numActiveQEs);
 
 	MemoryContextSwitchTo(oldContext);
@@ -878,6 +908,8 @@ cdbcomponent_recycleIdleQE(SegmentDatabaseDescriptor *segdbDesc, bool forceDestr
 	isWriter = segdbDesc->isWriter;
 
 	/* update num of active QEs */
+	Assert(list_member_ptr(cdbinfo->activelist, segdbDesc));
+	cdbinfo->activelist = list_delete_ptr(cdbinfo->activelist, segdbDesc);
 	DECR_COUNT(cdbinfo, numActiveQEs);
 
 	oldContext = MemoryContextSwitchTo(CdbComponentsContext);
@@ -984,7 +1016,16 @@ cdbcomponent_getComponentInfo(int contentId)
 	/* entry db */
 	if (contentId == -1)
 	{
-		cdbInfo = &cdbs->entry_db_info[0];	
+		Assert(cdbs->total_entry_dbs == 1 || cdbs->total_entry_dbs == 2);
+		/*
+		 * For a standby QD, get the last entry db which can be the first (on
+		 * a replica cluster) or the second (on a mirrored cluster) entry.
+		 */
+		if (IS_HOT_STANDBY_QD())
+			cdbInfo = &cdbs->entry_db_info[cdbs->total_entry_dbs - 1];
+		else
+			cdbInfo = &cdbs->entry_db_info[0];	
+
 		return cdbInfo;
 	}
 
@@ -1001,10 +1042,10 @@ cdbcomponent_getComponentInfo(int contentId)
 		Assert(cdbs->total_segment_dbs == cdbs->total_segments * 2);
 		cdbInfo = &cdbs->segment_db_info[2 * contentId];
 
-		if (!SEGMENT_IS_ACTIVE_PRIMARY(cdbInfo))
-		{
+		/* use the other segment if it is not what the QD wants */
+		if ((IS_HOT_STANDBY_QD() && SEGMENT_IS_ACTIVE_PRIMARY(cdbInfo)) 
+						|| (!IS_HOT_STANDBY_QD() && !SEGMENT_IS_ACTIVE_PRIMARY(cdbInfo)))
 			cdbInfo = &cdbs->segment_db_info[2 * contentId + 1];
-		}
 
 		return cdbInfo;
 	}
@@ -1015,13 +1056,30 @@ cdbcomponent_getComponentInfo(int contentId)
 static void
 ensureInterconnectAddress(void)
 {
+	/*
+	 * If the address type is wildcard, there is no need to populate an unicast
+	 * address in interconnect_address.
+	 */
+	if (Gp_interconnect_address_type == INTERCONNECT_ADDRESS_TYPE_WILDCARD)
+	{
+		interconnect_address = NULL;
+		return;
+	}
+
+	Assert(Gp_interconnect_address_type == INTERCONNECT_ADDRESS_TYPE_UNICAST);
+
+	/* If the unicast address has already been assigned, exit early. */
 	if (interconnect_address)
 		return;
+
+	/*
+	 * Retrieve the segment's gp_segment_configuration.address value, in order
+	 * to setup interconnect_address
+	 */
 
 	if (GpIdentity.segindex >= 0)
 	{
 		Assert(Gp_role == GP_ROLE_EXECUTE);
-		Assert(MyProcPort != NULL);
 		Assert(MyProcPort->laddr.addr.ss_family == AF_INET
 				|| MyProcPort->laddr.addr.ss_family == AF_INET6);
 		/*
@@ -1043,20 +1101,19 @@ ensureInterconnectAddress(void)
 		 * from `cdbcomponent*`. We couldn't get it in a way as the QEs.
 		 */
 		CdbComponentDatabaseInfo *qdInfo;
-		qdInfo = cdbcomponent_getComponentInfo(MASTER_CONTENT_ID);
+		qdInfo = cdbcomponent_getComponentInfo(COORDINATOR_CONTENT_ID);
 		interconnect_address = MemoryContextStrdup(TopMemoryContext, qdInfo->config->hostip);
 	}
 	else if (qdHostname && qdHostname[0] != '\0')
 	{
 		Assert(Gp_role == GP_ROLE_EXECUTE);
 		/*
-		 * QE on the master can't get its interconnect address like that on the primary.
+		 * QE on the coordinator can't get its interconnect address like that on the primary.
 		 * The QD connects to its postmaster via the unix domain socket.
 		 */
 		interconnect_address = qdHostname;
 	}
-	else
-		Assert(false);
+	Assert(interconnect_address && strlen(interconnect_address) > 0);
 }
 /*
  * performs all necessary setup required for Greenplum Database mode.
@@ -1081,10 +1138,21 @@ cdb_setup(void)
 	 *
 	 * Ignore background worker because bgworker_should_start_mpp() already did
 	 * the check.
+	 *
+	 * Ignore if we are the standby coordinator started in hot standby mode.
+	 * We don't expect dtx recovery to have finished, as dtx recovery is
+	 * performed at the end of startup. In hot standby, we are recovering
+	 * continuously and should allow queries much earlier. Since a hot standby
+	 * won't proceed dtx, it is not required to wait for recovery of the dtx
+	 * that has been prepared but not committed (i.e. to commit them); on the
+	 * other hand, the recovery of any in-doubt transactions (i.e. not prepared)
+	 * won't bother a hot standby either, just like they can be recovered in the 
+	 * background when a primary instance is running.
 	 */
 	if (!IsBackgroundWorker &&
 		Gp_role == GP_ROLE_DISPATCH &&
-		!*shmDtmStarted)
+		!*shmDtmStarted &&
+		!IS_HOT_STANDBY_QD())
 	{
 		ereport(FATAL,
 				(errcode(ERRCODE_CANNOT_CONNECT_NOW),
@@ -1384,18 +1452,18 @@ getAddressesForDBid(GpSegConfigEntry *c, int elevel)
 }
 
 /*
- * hostSegsHashTableInit()
- *    Construct a hash table of HostSegsEntry
+ * hostPrimaryCountHashTableInit()
+ *    Construct a hash table of HostPrimaryCountEntry
  */
 static HTAB *
-hostSegsHashTableInit(void)
+hostPrimaryCountHashTableInit(void)
 {
 	HASHCTL		info;
 
 	/* Set key and entry sizes. */
 	MemSet(&info, 0, sizeof(info));
-	info.keysize = INET6_ADDRSTRLEN;
-	info.entrysize = sizeof(HostSegsEntry);
+	info.keysize = MAXHOSTNAMELEN;
+	info.entrysize = sizeof(HostPrimaryCountEntry);
 
 	return hash_create("HostSegs", 32, &info, HASH_ELEM);
 }
@@ -1443,10 +1511,10 @@ makeRandomSegMap(int total_primaries, int total_to_skip)
 }
 
 /*
- * Determine the dbid for the master standby
+ * Determine the dbid for the coordinator standby
  */
 int16
-master_standby_dbid(void)
+coordinator_standby_dbid(void)
 {
 	int16		dbid = 0;
 	HeapTuple	tup;
@@ -1455,11 +1523,11 @@ master_standby_dbid(void)
 	SysScanDesc scan;
 
 	/*
-	 * Can only run on a master node, this restriction is due to the reliance
+	 * Can only run on a coordinator node, this restriction is due to the reliance
 	 * on the gp_segment_configuration table.
 	 */
 	if (!IS_QUERY_DISPATCHER())
-		elog(ERROR, "master_standby_dbid() executed on execution segment");
+		elog(ERROR, "coordinator_standby_dbid() executed on execution segment");
 
 	/*
 	 * SELECT * FROM gp_segment_configuration WHERE content = -1 AND role =
@@ -1504,7 +1572,7 @@ dbid_get_dbinfo(int16 dbid)
 	GpSegConfigEntry *i = NULL;
 
 	/*
-	 * Can only run on a master node, this restriction is due to the reliance
+	 * Can only run on a coordinator node, this restriction is due to the reliance
 	 * on the gp_segment_configuration table.  This may be able to be relaxed
 	 * by switching to a different method of checking.
 	 */
@@ -1631,7 +1699,7 @@ contentid_get_dbid(int16 contentid, char role, bool getPreferredRoleNotCurrentRo
 	HeapTuple	tup;
 
 	/*
-	 * Can only run on a master node, this restriction is due to the reliance
+	 * Can only run on a coordinator node, this restriction is due to the reliance
 	 * on the gp_segment_configuration table.  This may be able to be relaxed
 	 * by switching to a different method of checking.
 	 */
@@ -1785,3 +1853,4 @@ AvoidCorefileGeneration()
 	}
 #endif
 }
+

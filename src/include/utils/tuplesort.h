@@ -70,16 +70,12 @@ typedef enum
 	SORT_TYPE_QUICKSORT,
 	SORT_TYPE_EXTERNAL_SORT,
 	SORT_TYPE_EXTERNAL_MERGE
-#define NUM_SORT_METHOD (SORT_TYPE_EXTERNAL_MERGE + 1)
-
 } TuplesortMethod;
 
 typedef enum
 {
 	SORT_SPACE_TYPE_DISK,
 	SORT_SPACE_TYPE_MEMORY
-#define NUM_SORT_SPACE_TYPE (SORT_SPACE_TYPE_MEMORY + 1)
-
 } TuplesortSpaceType;
 
 typedef struct TuplesortInstrumentation
@@ -88,7 +84,8 @@ typedef struct TuplesortInstrumentation
 	TuplesortSpaceType spaceType;	/* type of space spaceUsed represents */
 	long		spaceUsed;		/* space consumption, in kB */
 
-	Size		workmemused;
+	Size		workmemused;  /* Greenplum specific */
+	Size		execmemused;  /* Greenplum specific */
 } TuplesortInstrumentation;
 
 
@@ -200,6 +197,12 @@ extern Tuplesortstate *tuplesort_begin_heap(TupleDesc tupDesc,
 											bool *nullsFirstFlags,
 											int workMem, SortCoordinate coordinate,
 											bool randomAccess);
+extern Tuplesortstate *tuplesort_begin_repack(TupleDesc tupDesc,
+											  int nkeys, AttrNumber *attNums,
+											  Oid *sortOperators, Oid *sortCollations,
+											  bool *nullsFirstFlags,
+											  int workMem, SortCoordinate coordinate,
+											  bool randomAccess);
 extern Tuplesortstate *tuplesort_begin_cluster(TupleDesc tupDesc,
 											   Relation indexRel, int workMem,
 											   SortCoordinate coordinate, bool randomAccess);
@@ -248,6 +251,8 @@ extern void tuplesort_end(Tuplesortstate *state);
 
 extern void tuplesort_get_stats(Tuplesortstate *state,
 								TuplesortInstrumentation *stats);
+extern void tuplesort_finalize_stats(Tuplesortstate *state,
+								TuplesortInstrumentation *stats);
 extern const char *tuplesort_method_name(TuplesortMethod m);
 extern const char *tuplesort_space_type_name(TuplesortSpaceType t);
 
@@ -257,6 +262,10 @@ extern Size tuplesort_estimate_shared(int nworkers);
 extern void tuplesort_initialize_shared(Sharedsort *shared, int nWorkers,
 										dsm_segment *seg);
 extern void tuplesort_attach_shared(Sharedsort *shared, dsm_segment *seg);
+
+extern void tuplesort_set_instrument(Tuplesortstate            *state,
+									 struct Instrumentation    *instrument,
+									 struct StringInfoData     *explainbuf);
 
 /*
  * These routines may only be called if randomAccess was specified 'true'.

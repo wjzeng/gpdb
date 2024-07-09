@@ -39,8 +39,7 @@ struct DbgPrintMixin
 	void
 	DbgPrint() const
 	{
-		CMemoryPool *mp =
-			CMemoryPoolManager::GetMemoryPoolMgr()->GetGlobalMemoryPool();
+		CMemoryPool *mp = CMemoryPoolManager::GetGlobalMemoryPool();
 		CAutoTrace at(mp);
 		static_cast<const T *>(this)->OsPrint(at.Os());
 	}
@@ -77,7 +76,7 @@ struct DbgPrintMixin
 #if defined(GPOS_DEBUG)
 #define FORCE_GENERATE_DBGSTR(Type) template struct ::gpos::DbgPrintMixin<Type>
 #else
-#define FORCE_GENERATE_DBGSTR(Type) static_assert(true, "")
+#define FORCE_GENERATE_DBGSTR(Type) GPOS_CPL_ASSERT(true, "")
 #endif
 
 

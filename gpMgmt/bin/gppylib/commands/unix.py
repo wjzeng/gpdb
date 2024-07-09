@@ -9,9 +9,13 @@ import os
 import platform
 import psutil
 import pwd
+import shlex
 import socket
 import signal
 import uuid
+import pipes
+import re
+from pkg_resources import parse_version
 
 from gppylib.gplog import get_default_logger
 from gppylib.commands.base import *
@@ -29,44 +33,6 @@ OPENBSD = "openbsd"
 platform_list = [LINUX, DARWIN, FREEBSD, OPENBSD]
 
 curr_platform = platform.uname()[0].lower()
-
-GPHOME = os.environ.get('GPHOME', None)
-
-# ---------------command path--------------------
-CMDPATH = ['/usr/kerberos/bin', '/usr/sfw/bin', '/opt/sfw/bin', '/bin', '/usr/local/bin',
-           '/usr/bin', '/sbin', '/usr/sbin', '/usr/ucb', '/sw/bin', '/opt/Navisphere/bin']
-
-if GPHOME:
-    CMDPATH.append(GPHOME)
-
-CMD_CACHE = {}
-
-
-# ----------------------------------
-class CommandNotFoundException(Exception):
-    def __init__(self, cmd, paths):
-        self.cmd = cmd
-        self.paths = paths
-
-    def __str__(self):
-        return "Could not locate command: '%s' in this set of paths: %s" % (self.cmd, repr(self.paths))
-
-
-def findCmdInPath(cmd):
-    global CMD_CACHE
-
-    if cmd not in CMD_CACHE:
-        for p in CMDPATH:
-            f = os.path.join(p, cmd)
-            if os.path.exists(f):
-                CMD_CACHE[cmd] = f
-                return f
-
-        logger.critical('Command %s not found' % cmd)
-        search_path = CMDPATH[:]
-        raise CommandNotFoundException(cmd, search_path)
-    else:
-        return CMD_CACHE[cmd]
 
 
 # For now we'll leave some generic functions outside of the Platform framework
@@ -107,50 +73,20 @@ def check_pid(pid):
 
 
 """
-Given the data directory, port and pid for a segment, 
-kill -9 all the processes associated with that segment.
-If pid is -1, then the postmaster is already stopped, 
-so we check for any leftover processes for that segment 
-and kill -9 those processes
-E.g postgres: port 45002, logger process
-    postgres: port 45002, sweeper process
-    postgres: port 45002, checkpoint process
+Given the data directory, pid list and host,
+kill -9 all the processes from the pid list.
 """
+def kill_9_segment_processes(datadir, pids, host):
+    logger.info('Terminating processes for segment {0}'.format(datadir))
 
+    for pid in pids:
+        if check_pid_on_remotehost(pid, host):
 
-def kill_9_segment_processes(datadir, port, pid):
-    logger.info('Terminating processes for segment %s' % datadir)
+            cmd = Command("kill -9 process", ("kill -9 {0}".format(pid)), ctxt=REMOTE, remoteHost=host)
+            cmd.run()
 
-    pid_list = []
-
-    # pid is the pid of the postgres process.
-    # pid can be -1 if the process is down already
-    if pid != -1:
-        pid_list = [pid]
-
-    cmd = Command('get a list of processes to kill -9',
-                  cmdStr='ps ux | grep "[p]ostgres:\s*port\s*%s" | awk \'{print $2}\'' % (port))
-
-    try:
-        cmd.run(validateAfter=True)
-    except Exception as e:
-        logger.warning('Unable to get the pid list of processes for segment %s: (%s)' % (datadir, str(e)))
-        return
-
-    results = cmd.get_results()
-    results = results.stdout.strip().split('\n')
-
-    for result in results:
-        if result:
-            pid_list.append(int(result))
-
-    for pid in pid_list:
-        # Try to kill -9 the process.
-        # We ignore any errors 
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except Exception as e:
-            logger.error('Failed to kill processes for segment %s: (%s)' % (datadir, str(e)))
+            if cmd.get_results().rc != 0:
+                logger.error('Failed to kill process {0} for segment {1}: {2}'.format(pid, datadir, cmd.get_results().stderr))
 
 
 def logandkill(pid, sig):
@@ -201,6 +137,52 @@ def kill_sequence(pid):
     # all else failed - try SIGABRT
     logandkill(pid, signal.SIGABRT)
 
+"""
+Terminate a process tree (including grandchildren) with signal 'sig'.
+'on_terminate', if specified, is a callback function which is
+called as soon as a child terminates.
+"""
+def terminate_proc_tree(pid, sig=signal.SIGTERM, include_parent=True, timeout=None, on_terminate=None):
+    parent = psutil.Process(pid)
+
+    children = list()
+    terminated = set()
+
+    if include_parent:
+        children.append(parent)
+
+    children.extend(parent.children(recursive=True))
+    while children:
+        process = children.pop()
+        
+        try:
+            # Update the list with any new process spawned after the initial list creation
+            children.extend(process.children(recursive=True))
+            process.send_signal(sig)
+            terminated.add(process)
+        except psutil.NoSuchProcess:
+            pass
+
+    _, alive = psutil.wait_procs(terminated, timeout=timeout, callback=on_terminate)
+
+    # Forcefully terminate any remaining processes
+    for process in alive:
+        process.kill()
+
+
+def get_remote_link_path(path, host):
+    """
+      Function to get symlink target path for a given path on given host.
+      :param  path: path for which symlink has to be found
+      :param  host: host on which the given path is available
+      :return: returns symlink target path
+    """
+
+    cmdStr = """python3 -c 'import os; print(os.readlink("%s"))'""" % path
+    cmd = Command('get remote link path', cmdStr=cmdStr, ctxt=REMOTE,
+                       remoteHost=host)
+    cmd.run(validateAfter=True)
+    return cmd.get_stdout()
 
 # ---------------Platform Framework--------------------
 
@@ -220,14 +202,14 @@ class GenericPlatform():
     def get_machine_arch_cmd(self):
         return 'uname -i'
 
-    def getDiskFreeCmd(self):
-        return findCmdInPath('df') + " -k"
+    def getDiskUsageCmd(self):
+        return findCmdInPath('du') + " -ks"
 
     def getTarCmd(self):
         return findCmdInPath('tar')
 
     def getIfconfigCmd(self):
-        return findCmdInPath('ifconfig')
+        return findCmdInPath('ip') + " a"
 
 
 class LinuxPlatform(GenericPlatform):
@@ -238,7 +220,7 @@ class LinuxPlatform(GenericPlatform):
         return "linux"
 
     def getDiskFreeCmd(self):
-        # -P is for POSIX formatting.  Prevents error 
+        # -P is for POSIX formatting.  Prevents error
         # on lines that would wrap
         return findCmdInPath('df') + " -Pk"
 
@@ -330,46 +312,79 @@ class Ping(Command):
 
 
 # -------------df----------------------
+# NOTE: This purposely does not follow the similar pattern of the other commands.
+# Due to the limitations of the Command framework we created a separate python
+# script called calcualte_disk_free.py to determine the free space. This script
+# handles the case where the input directory may not have been created df will
+# fail. Thus, take each path element starting at the end and execute df until
+# it succeeds in order to find the filesystem and free space.
 class DiskFree(Command):
-    def __init__(self, name, directory, ctxt=LOCAL, remoteHost=None):
-        self.directory = directory
-        cmdStr = "%s %s" % (SYSTEM.getDiskFreeCmd(), directory)
-        Command.__init__(self, name, cmdStr, ctxt, remoteHost)
+    """
+    CalculateDiskFree executes a python script on each host to determine the
+    disk space free for each filesystem.
+    """
 
-    @staticmethod
-    def get_size(name, remote_host, directory):
-        dfCmd = DiskFree(name, directory, ctxt=REMOTE, remoteHost=remote_host)
-        dfCmd.run(validateAfter=True)
-        return dfCmd.get_bytes_free()
+    def __init__(self, remoteHost, directories):
+        name = "calculate disk space free on target host"
+        cmdStr = '$GPHOME/bin/lib/calculate_disk_free.py --directories \"%s\"' % (
+            shlex.quote(",".join(directories)))
 
-    @staticmethod
-    def get_size_local(name, directory):
-        dfCmd = DiskFree(name, directory)
-        dfCmd.run(validateAfter=True)
-        return dfCmd.get_bytes_free()
+        Command.__init__(self, name, cmdStr, ctxt=REMOTE, remoteHost=remoteHost)
 
+    # For local disk free, using plain df command since using the above script
+    # will encode the result to base64, which is not required in local host call.
     @staticmethod
     def get_disk_free_info_local(name, directory):
-        dfCmd = DiskFree(name, directory)
+        cmdStr = "%s %s" % (SYSTEM.getDiskFreeCmd(), directory)
+        dfCmd = Command(name, cmdStr, ctxt=LOCAL)
         dfCmd.run(validateAfter=True)
-        return dfCmd.get_disk_free_output()
-
-    def get_disk_free_output(self):
-        '''expected output of the form:
-           Filesystem   512-blocks      Used Available Capacity  Mounted on
-           /dev/disk0s2  194699744 158681544  35506200    82%    /
-
-           Returns data in list format:
-           ['/dev/disk0s2', '194699744', '158681544', '35506200', '82%', '/']
-        '''
-        rawIn = self.results.stdout.split('\n')[1]
+        rawIn=dfCmd.get_results().stdout.split('\n')[1]
         return rawIn.split()
 
-    def get_bytes_free(self):
-        disk_free = self.get_disk_free_output()
-        bytesFree = int(disk_free[3]) * 1024
-        return bytesFree
+# -------------du----------------------
+class DiskUsage(Command):
+    def __init__(self, name, directory, ctxt=LOCAL, remoteHostAddr=None):
+        self.directory = directory
+        cmdStr = "%s %s" % (SYSTEM.getDiskUsageCmd(), directory)
+        Command.__init__(self, name, cmdStr, ctxt, remoteHostAddr)
 
+    @staticmethod
+    def get_usage(name, remote_host, directory):
+        dfCmd = DiskUsage(name, directory, ctxt=REMOTE, remoteHostAddr=remote_host)
+        dfCmd.run(validateAfter=True)
+        return dfCmd.get_bytes_used()
+
+    @staticmethod
+    def get_usage_local(name, directory):
+        dfCmd = DiskUsage(name, directory)
+        dfCmd.run(validateAfter=True)
+        return dfCmd.get_bytes_used()
+
+    @staticmethod
+    def get_disk_usage_info_local(name, directory):
+        dfCmd = DiskUsage(name, directory)
+        dfCmd.run(validateAfter=True)
+        return dfCmd.disk_usage_output()
+
+    def disk_usage_output(self):
+        '''expected output of the form:
+           194699744  /directory/
+
+           Returns data in list format:
+           ['194699744', '/directory/']
+        '''
+        rawIn = self.results.stdout.split('\n')[0]
+        return rawIn.split()
+
+    def kbytes_used(self):
+        disk_usage = self.disk_usage_output()
+        KbytesUsed = int(disk_usage[0])
+        return KbytesUsed
+
+    def bytes_used(self):
+        disk_usage = self.disk_usage_output()
+        bytesUsed = int(disk_usage[0]) * 1024
+        return bytesUsed
 
 # -------------mkdir------------------
 class MakeDirectory(Command):
@@ -488,20 +503,20 @@ class RemoveGlob(Command):
 class FileDirExists(Command):
     def __init__(self, name, directory, ctxt=LOCAL, remoteHost=None):
         self.directory = directory
-        cmdStr = """python3  -c "import os; print(os.path.exists('%s'))" """ % directory
+        cmdStr = "[ -d '%s' ]" % directory
         Command.__init__(self, name, cmdStr, ctxt, remoteHost)
 
     @staticmethod
     def remote(name, remote_host, directory):
         cmd = FileDirExists(name, directory, ctxt=REMOTE, remoteHost=remote_host)
-        cmd.run(validateAfter=True)
+        cmd.run(validateAfter=False)
         return cmd.filedir_exists()
 
     def filedir_exists(self):
-        return self.results.stdout.strip().upper() == 'TRUE'
+        return (not self.results.rc)
 
 
-# -------------scp------------------
+# -------------rsync------------------
 
 # MPP-13617
 def canonicalize(addr):
@@ -510,22 +525,122 @@ def canonicalize(addr):
     return '[' + addr + ']'
 
 
-class Scp(Command):
-    def __init__(self, name, srcFile, dstFile, srcHost=None, dstHost=None, recursive=False, ctxt=LOCAL,
-                 remoteHost=None):
-        cmdStr = findCmdInPath('scp') + " "
+class Rsync(Command):
+    def __init__(self, name, srcFile, dstFile, srcHost=None, dstHost=None, recursive=False,
+                 verbose=True, archive_mode=True, checksum=False, delete=False, progress=False,
+                 stats=False, dry_run=False, bwlimit=None, exclude_list={}, ctxt=LOCAL,
+                 remoteHost=None, compress=False, progress_file=None, ignore_times=False, whole_file=False):
+
+        """
+            rsync options:
+                srcFile: source datadir/file
+                        If source is a directory, make sure you add a '/' at the end of its path. When using "/" at the
+                        end of source, rsync will copy the content of the last directory. When not using "/" at the end
+                        of source, rsync will copy the last directory and the content of the directory.
+                dstFile: destination datadir or file that needs to be synced
+                srcHost: source host
+                exclude_list: to exclude specified files and directories to copied or synced with target
+                delete: delete the files on target which do not exist on source
+                checksum: to skip files being synced based on checksum, not modification time and size
+                bwlimit: to control the I/O bandwidth
+                stats: give some file-transfer stats
+                dry_run: perform a trial run with no changes made
+                compress: compress file data during the transfer
+                progress: to show the progress of rsync execution, like % transferred
+                ignore_times: Not skip files that match modification time and size
+                whole_file: Copy file without rsync's delta-transfer algorithm
+        """
+
+        cmd_tokens = [findCmdInPath('rsync')]
 
         if recursive:
-            cmdStr = cmdStr + "-r "
+            cmd_tokens.append('-r')
+
+        if verbose:
+            cmd_tokens.append('-v')
+
+        if archive_mode:
+            cmd_tokens.append('-a')
+
+        # To skip the files based on checksum, not modification time and size
+        if checksum:
+            cmd_tokens.append('-c')
+
+        # To not skip files that match modification time and size
+        if ignore_times:
+            cmd_tokens.append('--ignore-times')
+
+        # Copy file without rsync's delta-transfer algorithm
+        if whole_file:
+            cmd_tokens.append('--whole-file')
+
+        # Shows the progress of the whole transfer,
+        # Note : It is only supported with rsync 3.1.0 or above
+        if progress:
+            cmd_tokens.append('--info=progress2,name0')
+
+        # To show file transfer stats
+        if stats:
+            cmd_tokens.append('--stats')
+
+        if bwlimit is not None:
+            cmd_tokens.append('--bwlimit')
+            cmd_tokens.append(bwlimit)
+
+        if dry_run:
+            cmd_tokens.append('--dry-run')
+
+        if delete:
+            cmd_tokens.append('--delete')
+
+        if compress:
+            cmd_tokens.append('--compress')
 
         if srcHost:
-            cmdStr = cmdStr + canonicalize(srcHost) + ":"
-        cmdStr = cmdStr + srcFile + " "
+            cmd_tokens.append(canonicalize(srcHost) + ":" + srcFile)
+        else:
+            cmd_tokens.append(srcFile)
 
         if dstHost:
-            cmdStr = cmdStr + canonicalize(dstHost) + ":"
-        cmdStr = cmdStr + dstFile
+            cmd_tokens.append(canonicalize(dstHost) + ":" + dstFile)
+        else:
+            cmd_tokens.append(dstFile)
 
+        exclude_str = ["--exclude={} ".format(pattern) for pattern in exclude_list]
+
+        cmd_tokens.extend(exclude_str)
+
+        # Combines output streams, uses 'sed' to find lines with 'kB/s' or 'MB/s' and appends ':%s' as suffix to the end
+        # of each line and redirects it to progress_file
+        if progress_file:
+            cmd_tokens.append('2>&1 | tr "\\r" "\\n" |sed -E "/[0-9]+%/ s/$/ :{0}/" > {1}' .format(name, pipes.quote(progress_file)))
+
+        cmdStr = ' '.join(cmd_tokens)
+        cmdStr = "set -o pipefail; {}".format(cmdStr)
+        self.command_tokens = cmd_tokens
+
+        Command.__init__(self, name, cmdStr, ctxt, remoteHost)
+
+    # Overriding validate() of Command class to handle few specific return codes of rsync which can be ignored
+    def validate(self, expected_rc=0):
+        """
+            During differential recovery, pg_wal is synced using rsync. During pg_wal sync, some of the xlogtemp files
+            are present on source when rsync builds the list of files to be transferred but are vanished before
+            transferring. In this scenario rsync gives warning "some files vanished before they could be transferred
+            (code 24)". This return code can be ignored in case of rsync command.
+        """
+        if self.results.rc != 24 and self.results.rc != expected_rc:
+            self.logger.debug(self.results)
+            raise ExecutionError("non-zero rc: %d" % self.results.rc, self)
+
+
+class RsyncFromFileList(Command):
+    def __init__(self, name, sync_list_file, local_base_dir, remote_basedir, dstHost=None, ctxt=LOCAL,
+                 remoteHost=None):
+        cmdStr = findCmdInPath('rsync') + " "
+        cmdStr += "--files-from=" + sync_list_file  + " " + local_base_dir + "/ "
+        if dstHost:
+            cmdStr += canonicalize(dstHost) + ":" + remote_basedir + "/"
         Command.__init__(self, name, cmdStr, ctxt, remoteHost)
 
 # -------------create tar------------------
@@ -581,8 +696,8 @@ class Hostname(Command):
 class PgPortIsActive(Command):
     def __init__(self, name, port, file, ctxt=LOCAL, remoteHost=None):
         self.port = port
-        cmdStr = "%s -an 2>/dev/null | %s %s | %s '{print $NF}'" % \
-                 (findCmdInPath('netstat'), findCmdInPath('grep'), file, findCmdInPath('awk'))
+        cmdStr = "%s -an 2>/dev/null |%s '{for (i =1; i<=NF ; i++) if ($i==\"%s\") print $i}'" % \
+                 (findCmdInPath('ss'), findCmdInPath('awk'), file)
         Command.__init__(self, name, cmdStr, ctxt, remoteHost)
 
     def contains_port(self):
@@ -593,8 +708,8 @@ class PgPortIsActive(Command):
 
         for r in rows:
             val = r.split('.')
-            netstatport = int(val[len(val) - 1])
-            if netstatport == self.port:
+            ssport = int(val[len(val) - 1])
+            if ssport == self.port:
                 return True
 
         return False
@@ -676,6 +791,28 @@ elif curr_platform == DARWIN:
 elif curr_platform == FREEBSD:
     SYSTEM = FreeBsdPlatform()
 elif curr_platform == OPENBSD:
-    SYSTEM = OpenBSDPlatform();
+    SYSTEM = OpenBSDPlatform()
 else:
     raise Exception("Platform %s is not supported.  Supported platforms are: %s", SYSTEM, str(platform_list))
+
+
+def validate_rsync_version(min_ver):
+    """
+    checks the version of the 'rsync' command and compares it with a required version.
+    If the current version is lower than the required version, it raises an exception
+    """
+    rsync_version_info = get_rsync_version()
+    pattern = r"version (\d+\.\d+\.\d+)"
+    match = re.search(pattern, rsync_version_info)
+    current_rsync_version = match.group(1)
+    if parse_version(current_rsync_version) < parse_version(min_ver):
+        return False
+    return True
+
+def get_rsync_version():
+    """ get the rsync current version """
+    cmdStr = findCmdInPath("rsync") + " --version"
+    cmd = Command("get rsync version", cmdStr=cmdStr)
+    cmd.run(validateAfter=True)
+    return cmd.get_stdout()
+

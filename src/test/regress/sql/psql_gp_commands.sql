@@ -96,6 +96,10 @@ CREATE EXTERNAL TABLE "dE_external_table"  (c1 integer)
   LOCATION ('file://localhost/dummy') FORMAT 'text';
 ALTER EXTERNAL TABLE "dE_external_table" OWNER TO test_psql_de_role;
 
+-- create table using user defined access method
+CREATE ACCESS METHOD bogus TYPE TABLE HANDLER heap_tableam_handler;
+CREATE TABLE d_bogus_heap(a int) USING bogus;
+ALTER TABLE "d_bogus_heap" OWNER TO test_psql_de_role;
 -- There's a GPDB-specific Storage column.
 \d
 \d+
@@ -121,6 +125,17 @@ comment on constraint dd_ichk on d_heap is 'this is a constraint';
 create operator family dd_opfamily using btree;
 comment on operator family dd_opfamily using btree is 'this is an operator family';
 \dd
+
+-- \df+ should list all exec locations
+CREATE FUNCTION foofunc_exec_on_any() RETURNS int AS 'SELECT 1' LANGUAGE SQL EXECUTE ON ANY;
+ALTER FUNCTION foofunc_exec_on_any() OWNER TO test_psql_de_role;
+CREATE FUNCTION foofunc_exec_on_coordinator() RETURNS setof int AS 'SELECT 1' LANGUAGE SQL EXECUTE ON COORDINATOR;
+ALTER FUNCTION foofunc_exec_on_coordinator() OWNER TO test_psql_de_role;
+CREATE FUNCTION foofunc_exec_on_all_segments() RETURNS setof int AS 'SELECT 1' LANGUAGE SQL EXECUTE ON ALL SEGMENTS;
+ALTER FUNCTION foofunc_exec_on_all_segments() OWNER TO test_psql_de_role;
+CREATE FUNCTION foofunc_exec_on_initplan() RETURNS setof int AS 'SELECT 1' LANGUAGE SQL EXECUTE ON INITPLAN;
+ALTER FUNCTION foofunc_exec_on_initplan() OWNER TO test_psql_de_role;
+\df+ foofunc_exec_on_*
 
 -- Clean up
 DROP OWNED BY test_psql_de_role;

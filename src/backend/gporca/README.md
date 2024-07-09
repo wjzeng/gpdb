@@ -104,10 +104,10 @@ set optimizer_enable_constant_expression_evaluation=off;
 ```
 
 2. Run the query in the same psql session. It will create a minidump file
-   under the "minidumps" directory, in the master's data directory:
+   under the "minidumps" directory, in the coordinator's data directory:
 
 ```
-$ ls -l $MASTER_DATA_DIRECTORY/minidumps/
+$ ls -l $COORDINATOR_DATA_DIRECTORY/minidumps/
 total 12
 -rw------- 1 heikki heikki 10818 Jun 10 22:02 Minidump_20160610_220222_4_14.mdp
 ```
@@ -116,7 +116,7 @@ total 12
    data/dxl/minidump directory:
 
 ```
-xmllint --format $MASTER_DATA_DIRECTORY/minidumps/Minidump_20160610_220222_4_14.mdp > data/dxl/minidump/MyTest.mdp
+xmllint --format $COORDINATOR_DATA_DIRECTORY/minidumps/Minidump_20160610_220222_4_14.mdp > data/dxl/minidump/MyTest.mdp
 ```
 
 4. Add it to the test suite, in server/src/unittest/gpopt/minidump/CICGTest.cpp
@@ -228,7 +228,7 @@ ninja -v -C build
 We accept contributions via [Github Pull requests](https://help.github.com/articles/using-pull-requests) only.
 
 
-ORCA has a [style guide](StyleGuilde.md), try to follow the existing style in your contribution to be consistent.
+ORCA has a [style guide](StyleGuide.md), try to follow the existing style in your contribution to be consistent.
 
 [clang-format]: https://clang.llvm.org/docs/ClangFormat.html
 A set of [clang-format]-based rules are enforced in CI. Your editor or IDE may automatically support it. When in doubt, check formatting locally before submitting your PR:

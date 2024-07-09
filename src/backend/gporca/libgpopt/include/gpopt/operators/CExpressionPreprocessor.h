@@ -16,13 +16,21 @@
 #include "gpos/base.h"
 
 #include "gpopt/base/CColumnFactory.h"
+#include "gpopt/base/CUtils.h"
+#include "gpopt/hints/CJoinHint.h"
 #include "gpopt/mdcache/CMDAccessor.h"
 #include "gpopt/operators/CExpression.h"
 #include "gpopt/operators/CScalarBoolOp.h"
+#include "gpopt/operators/CScalarConst.h"
+#include "gpopt/operators/CScalarIdent.h"
 
 namespace gpopt
 {
 using namespace gpos;
+
+using ExprToConstantMap =
+	CHashMap<CExpression, CExpression, CExpression::HashValue, CUtils::Equals,
+			 CleanupRelease<CExpression>, CleanupRelease<CExpression>>;
 
 //---------------------------------------------------------------------------
 //	@class:
@@ -36,16 +44,16 @@ class CExpressionPreprocessor
 {
 private:
 	// map CTE id to collected predicates
-	typedef CHashMap<ULONG, CExpressionArray, gpos::HashValue<ULONG>,
-					 gpos::Equals<ULONG>, CleanupDelete<ULONG>,
-					 CleanupRelease<CExpressionArray> >
-		CTEPredsMap;
+	using CTEPredsMap =
+		CHashMap<ULONG, CExpressionArray, gpos::HashValue<ULONG>,
+				 gpos::Equals<ULONG>, CleanupDelete<ULONG>,
+				 CleanupRelease<CExpressionArray>>;
 
 	// iterator for map of CTE id to collected predicates
-	typedef CHashMapIter<ULONG, CExpressionArray, gpos::HashValue<ULONG>,
-						 gpos::Equals<ULONG>, CleanupDelete<ULONG>,
-						 CleanupRelease<CExpressionArray> >
-		CTEPredsMapIter;
+	using CTEPredsMapIter =
+		CHashMapIter<ULONG, CExpressionArray, gpos::HashValue<ULONG>,
+					 gpos::Equals<ULONG>, CleanupDelete<ULONG>,
+					 CleanupRelease<CExpressionArray>>;
 
 	// generate a conjunction of equality predicates between the columns in the given set
 	static CExpression *PexprConjEqualityPredicates(CMemoryPool *mp,
@@ -65,16 +73,14 @@ private:
 	// constraint property
 	static CExpression *PexprScalarPredicates(
 		CMemoryPool *mp, CPropConstraint *ppc,
-		CPropConstraint *constraintsForOuterRefs, CColRefSet *pcrsNotNull,
+		CPropConstraint *constraintsForOuterRefs,
+		CPropConstraint *ppcFromFilterSubquery, CColRefSet *pcrsNotNull,
 		CColRefSet *pcrs, CColRefSet *pcrsProcessed);
 
 	// eliminate self comparisons
 	static CExpression *PexprEliminateSelfComparison(CMemoryPool *mp,
-													 CExpression *pexpr);
-
-	// remove CTE Anchor nodes
-	static CExpression *PexprRemoveCTEAnchors(CMemoryPool *mp,
-											  CExpression *pexpr);
+													 CExpression *pexpr,
+													 CColRefSet *pcrsNotNull);
 
 	// trim superfluos equality
 	static CExpression *PexprPruneSuperfluousEquality(CMemoryPool *mp,
@@ -156,6 +162,10 @@ private:
 	static CExpression *PexprRemoveUnusedCTEs(CMemoryPool *mp,
 											  CExpression *pexpr);
 
+	static CExpression *PexprReplaceColWithConst(
+		CMemoryPool *mp, CExpression *pexpr, ExprToConstantMap *phmExprToConst,
+		BOOL checkFilterForConstants);
+
 	// collect CTE predicates from consumers
 	static void CollectCTEPredicates(CMemoryPool *mp, CExpression *pexpr,
 									 CTEPredsMap *phm);
@@ -205,16 +215,20 @@ private:
 												 CColRefArray *pdrgpcrOutput,
 												 ColRefToUlongMap *col_mapping);
 
-	// private ctor
-	CExpressionPreprocessor();
+	// swap logical select over logical project
+	static CExpression *PexprTransposeSelectAndProject(CMemoryPool *mp,
+													   CExpression *pexpr);
 
-	// private dtor
-	virtual ~CExpressionPreprocessor();
-
-	// private copy ctor
-	CExpressionPreprocessor(const CExpressionPreprocessor &);
+	static CExpression *ConvertSplitUpdateToInPlaceUpdate(CMemoryPool *mp,
+														  CExpression *expr);
 
 public:
+	CExpressionPreprocessor() = delete;
+
+	virtual ~CExpressionPreprocessor() = delete;
+
+	CExpressionPreprocessor(const CExpressionPreprocessor &) = delete;
+
 	// main driver
 	static CExpression *PexprPreprocess(
 		CMemoryPool *mp, CExpression *pexpr,

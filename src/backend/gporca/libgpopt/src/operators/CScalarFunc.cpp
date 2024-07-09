@@ -39,7 +39,6 @@ CScalarFunc::CScalarFunc(CMemoryPool *mp)
 	  m_return_type_modifier(default_type_modifier),
 	  m_pstrFunc(nullptr),
 	  m_efs(IMDFunction::EfsSentinel),
-	  m_efda(IMDFunction::EfdaSentinel),
 	  m_returns_set(false),
 	  m_returns_null_on_null_input(false),
 	  m_fBoolReturnType(false)
@@ -56,7 +55,7 @@ CScalarFunc::CScalarFunc(CMemoryPool *mp)
 //---------------------------------------------------------------------------
 CScalarFunc::CScalarFunc(CMemoryPool *mp, IMDId *mdid_func,
 						 IMDId *mdid_return_type, INT return_type_modifier,
-						 const CWStringConst *pstrFunc)
+						 const CWStringConst *pstrFunc, BOOL funcvariadic)
 	: CScalar(mp),
 	  m_func_mdid(mdid_func),
 	  m_return_type_mdid(mdid_return_type),
@@ -64,7 +63,8 @@ CScalarFunc::CScalarFunc(CMemoryPool *mp, IMDId *mdid_func,
 	  m_pstrFunc(pstrFunc),
 	  m_returns_set(false),
 	  m_returns_null_on_null_input(false),
-	  m_fBoolReturnType(false)
+	  m_fBoolReturnType(false),
+	  m_funcvariadic(funcvariadic)
 {
 	GPOS_ASSERT(mdid_func->IsValid());
 	GPOS_ASSERT(mdid_return_type->IsValid());
@@ -73,14 +73,12 @@ CScalarFunc::CScalarFunc(CMemoryPool *mp, IMDId *mdid_func,
 	const IMDFunction *pmdfunc = md_accessor->RetrieveFunc(m_func_mdid);
 
 	m_efs = pmdfunc->GetFuncStability();
-	m_efda = pmdfunc->GetFuncDataAccess();
 	m_returns_set = pmdfunc->ReturnsSet();
 
 	m_returns_null_on_null_input = pmdfunc->IsStrict();
 	m_fBoolReturnType =
 		CMDAccessorUtils::FBoolType(md_accessor, m_return_type_mdid);
 }
-
 
 //---------------------------------------------------------------------------
 //	@function:
@@ -209,10 +207,9 @@ CScalarFunc::TypeModifier() const
 //
 //---------------------------------------------------------------------------
 BOOL
-CScalarFunc::FHasNonScalarFunction(CExpressionHandle &	//exprhdl
-)
+CScalarFunc::FHasNonScalarFunction(CExpressionHandle &exprhdl)
 {
-	return m_returns_set;
+	return m_returns_set || CScalar::FHasNonScalarFunction(exprhdl);
 }
 
 
@@ -251,6 +248,11 @@ CScalarFunc::Eber(ULongPtrArray *pdrgpulChildren) const
 	}
 
 	return EberAny;
+}
+BOOL
+CScalarFunc::IsFuncVariadic() const
+{
+	return m_funcvariadic;
 }
 
 

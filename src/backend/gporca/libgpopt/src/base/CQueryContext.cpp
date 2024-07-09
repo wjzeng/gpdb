@@ -51,10 +51,6 @@ CQueryContext::CQueryContext(CMemoryPool *mp, CExpression *pexpr,
 	const ULONG ulReqdColumns = m_pdrgpcr->Size();
 #endif	//GPOS_DEBUG
 
-	// mark unused CTEs
-	CCTEInfo *pcteinfo = COptCtxt::PoctxtFromTLS()->Pcteinfo();
-	pcteinfo->MarkUnusedCTEs();
-
 	CColRefSet *pcrsOutputAndOrderingCols = GPOS_NEW(mp) CColRefSet(mp);
 	CColRefSet *pcrsOrderSpec = prpp->Peo()->PosRequired()->PcrsUsed(mp);
 
@@ -79,6 +75,8 @@ CQueryContext::CQueryContext(CMemoryPool *mp, CExpression *pexpr,
 	// create the mapping between the computed column, defined in the expression
 	// and all CTEs, and its corresponding used columns
 	MapComputedToUsedCols(col_factory, m_pexpr);
+
+	CCTEInfo *pcteinfo = COptCtxt::PoctxtFromTLS()->Pcteinfo();
 	pcteinfo->MapComputedToUsedCols(col_factory);
 }
 
@@ -222,13 +220,17 @@ CQueryContext::PqcGenerate(CMemoryPool *mp, CExpression *pexpr,
 	}
 	else
 	{
-		pds = GPOS_NEW(mp)
-			CDistributionSpecSingleton(CDistributionSpecSingleton::EstMaster);
+		pds = GPOS_NEW(mp) CDistributionSpecSingleton(
+			CDistributionSpecSingleton::EstCoordinator);
 	}
 
 	// By default, no rewindability requirement needs to be satisfied at the top level
 	CRewindabilitySpec *prs = GPOS_NEW(mp) CRewindabilitySpec(
 		CRewindabilitySpec::ErtNone, CRewindabilitySpec::EmhtNoMotion);
+
+	// No partition propagation required at the top
+	CPartitionPropagationSpec *ppps =
+		GPOS_NEW(mp) CPartitionPropagationSpec(mp);
 
 	// Ensure order, distribution and rewindability meet 'satisfy' matching at the top level
 	CEnfdOrder *peo = GPOS_NEW(mp) CEnfdOrder(pos, CEnfdOrder::EomSatisfy);
@@ -236,6 +238,8 @@ CQueryContext::PqcGenerate(CMemoryPool *mp, CExpression *pexpr,
 		GPOS_NEW(mp) CEnfdDistribution(pds, CEnfdDistribution::EdmSatisfy);
 	CEnfdRewindability *per =
 		GPOS_NEW(mp) CEnfdRewindability(prs, CEnfdRewindability::ErmSatisfy);
+	CEnfdPartitionPropagation *pepp = GPOS_NEW(mp)
+		CEnfdPartitionPropagation(ppps, CEnfdPartitionPropagation::EppmSatisfy);
 
 	// Required CTEs are obtained from the CTEInfo global information in the optimizer context
 	CCTEReq *pcter = poptctxt->Pcteinfo()->PcterProducers(mp);
@@ -245,7 +249,7 @@ CQueryContext::PqcGenerate(CMemoryPool *mp, CExpression *pexpr,
 	// CReqdPropPlan::InitReqdPartitionPropagation().
 
 	CReqdPropPlan *prpp =
-		GPOS_NEW(mp) CReqdPropPlan(pcrs, peo, ped, per, pcter);
+		GPOS_NEW(mp) CReqdPropPlan(pcrs, peo, ped, per, pepp, pcter);
 
 	// Finally, create the CQueryContext
 	pdrgpmdname->AddRef();

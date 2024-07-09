@@ -1,6 +1,7 @@
 --
 -- WINDOW FUNCTIONS
 --
+SET optimizer_trace_fallback=on;
 
 CREATE TEMPORARY TABLE empsalary (
     depname varchar,
@@ -276,6 +277,8 @@ SELECT sum(unique1) over
 	unique1
 FROM tenk1 WHERE unique1 < 10;
 
+-- disable query paramters in Orca to ensure stable fallback messages
+set optimizer_enable_query_parameter=off;
 CREATE TEMP VIEW v_window AS
 	SELECT i, sum(i) over (order by i rows between 1 preceding and 1 following) as sum_rows
 	FROM generate_series(1, 10) i;
@@ -333,6 +336,7 @@ CREATE TEMP VIEW v_window AS
 
 SELECT pg_get_viewdef('v_window');
 
+reset optimizer_enable_query_parameter;
 -- RANGE offset PRECEDING/FOLLOWING tests
 
 SELECT sum(unique1) over (order by four range between 2::int8 preceding and 1::int2 preceding),
@@ -1386,3 +1390,23 @@ SELECT to_char(SUM(n::float8) OVER (ORDER BY i ROWS BETWEEN CURRENT ROW AND 1 FO
 SELECT i, b, bool_and(b) OVER w, bool_or(b) OVER w
   FROM (VALUES (1,true), (2,true), (3,false), (4,false), (5,true)) v(i,b)
   WINDOW w AS (ORDER BY i ROWS BETWEEN CURRENT ROW AND 1 FOLLOWING);
+
+-- Tests for problems with failure to walk or mutate expressions
+-- within window frame clauses.
+
+-- test walker (fails with collation error if expressions are not walked)
+SELECT array_agg(i) OVER w
+  FROM generate_series(1,5) i
+WINDOW w AS (ORDER BY i ROWS BETWEEN (('foo' < 'foobar')::integer) PRECEDING AND CURRENT ROW);
+
+-- test mutator (fails when inlined if expressions are not mutated)
+CREATE FUNCTION pg_temp.f(group_size BIGINT) RETURNS SETOF integer[]
+AS $$
+    SELECT array_agg(s) OVER w
+      FROM generate_series(1,5) s
+    WINDOW w AS (ORDER BY s ROWS BETWEEN CURRENT ROW AND GROUP_SIZE FOLLOWING)
+$$ LANGUAGE SQL STABLE;
+
+EXPLAIN (costs off) SELECT * FROM pg_temp.f(2);
+SELECT * FROM pg_temp.f(2);
+RESET optimizer_trace_fallback;

@@ -1,6 +1,8 @@
 -- start_matchsubs
 -- m/^LOG.*PartitionSelector/
 -- s/^LOG.*PartitionSelector/PartitionSelector/
+-- m/^LOG.*Feature not supported/
+-- s/^LOG.*Feature not supported/Feature not supported/
 -- end_matchsubs
 -- start_ignore
 DROP DATABASE IF EXISTS incrementalanalyze;
@@ -852,3 +854,113 @@ SELECT count(*) from pg_statistic where starelid='foo'::regclass;
 ANALYZE (verbose, fullscan on) foo;
 ANALYZE (verbose, fullscan off) foo;
 reset optimizer_analyze_root_partition;
+
+-- Test merging of stats after the last partition is analyzed. Merging should
+-- be done for root without taking a sample from root if one of the column
+-- statistics collection is turned off
+DROP TABLE IF EXISTS foo;
+CREATE TABLE foo (a int, b int, c gp_hyperloglog_estimator) PARTITION BY RANGE (b) (START (1) END (3) EVERY (1));
+SET gp_autostats_mode=none;
+ALTER TABLE foo ALTER COLUMN c SET STATISTICS 0;
+INSERT INTO foo SELECT i,i%2+1, NULL FROM generate_series(1,100)i;
+ANALYZE VERBOSE foo_1_prt_1;
+ANALYZE VERBOSE foo_1_prt_2;
+SELECT tablename, attname, null_frac, n_distinct, most_common_vals, most_common_freqs, histogram_bounds FROM pg_stats WHERE tablename like 'foo%' ORDER BY attname,tablename;
+RESET gp_autostats_mode;
+
+-- analyze in transaction should merge leaves instead of resampling
+drop table if exists foo;
+create table foo (a int, b date) distributed by (a) partition by range(b) (partition "20210101" start ('20210101'::date) end ('20210201'::date), partition "20210201" start ('20210201'::date) end ('20210301'::date), partition "20210301" start ('20210301'::date) end ('20210401'::date));
+insert into foo select a, '20210101'::date+a from (select generate_series(1,80) a) t1;
+analyze verbose foo;
+
+-- we should see "analyzing "public.foo" inheritance tree" in the output below
+begin;
+truncate foo_1_prt_20210201;
+insert into foo select a, '20210101'::date+a from (select generate_series(31,40) a) t1;
+analyze verbose foo_1_prt_20210201;
+rollback;
+
+-- test behavior of "analyze_hll_non_part_table" create table option
+create table hll_part (i int, j int) distributed by (i)
+partition by range(j)
+(start(1) end(10) every(1));
+insert into hll_part select i, i%9+1 from generate_series(1,100)i;
+analyze hll_part;
+
+create table hll_default_heap (i int, j int) distributed by (i);
+select reloptions from pg_class where relname='hll_default_heap';
+insert into hll_default_heap values (777,6);
+analyze hll_default_heap; -- hll stats should not be collected in non-partition heap table by default
+select 1 from pg_statistic where starelid='hll_default_heap'::regclass and stavalues5 is not null;
+
+create table hll_default_ao (i int, j int) with (appendonly=true) distributed by (i);
+select reloptions from pg_class where relname='hll_default_ao';
+insert into hll_default_ao values (777,6);
+analyze hll_default_ao;
+-- hll stats should not be collected in non-partition ao table by default
+select 1 from pg_statistic where starelid='hll_default_ao'::regclass and stavalues5 is not null;
+
+create table hll_off (i int, j int) with (analyze_hll_non_part_table=false) distributed by (i);
+select reloptions from pg_class where relname='hll_off';
+insert into hll_off values (777,6);
+analyze hll_off;
+-- hll stats should not be collected in non-partition table when disabled
+select 1 from pg_statistic where starelid='hll_off'::regclass and stavalues5 is not null;
+
+-- alter table, set analyze_hll_non_part_table on, ensure hll stats collected
+alter table hll_off set (analyze_hll_non_part_table=true);
+select reloptions from pg_class where relname='hll_off';
+analyze hll_off;
+select 1 from pg_statistic where starelid='hll_off'::regclass and stavalues5 is not null;
+
+-- alter table, set analyze_hll_non_part_table off, ensure hll stats not collected
+alter table hll_off set (analyze_hll_non_part_table=false);
+select reloptions from pg_class where relname='hll_off';
+analyze hll_off;
+select 1 from pg_statistic where starelid='hll_off'::regclass and stavalues5 is not null;
+
+create table hll_on_ao (i int, j int) with (analyze_hll_non_part_table=true) distributed by (i);
+select reloptions from pg_class where relname='hll_on_ao';
+insert into hll_on_ao values (777,6);
+analyze hll_on_ao;
+-- hll stats should be collected in non-partition AO table when enabled
+select 1 from pg_statistic where starelid='hll_on_ao'::regclass and stavalues5 is not null;
+
+create table hll_on_heap (i int, j int) with (analyze_hll_non_part_table=true) distributed by (i);
+select reloptions from pg_class where relname='hll_on_heap';
+insert into hll_on_heap values (777,6);
+analyze hll_on_heap;
+-- hll stats should be collected in non-partition heap table when enabled
+select 1 from pg_statistic where starelid='hll_on_heap'::regclass and stavalues5 is not null;
+
+alter table hll_part exchange partition for (6)  with table hll_on_heap;
+select reloptions from pg_class where relname='hll_part_1_prt_6';
+
+-- hll stats should be present after partition exchange of table with "analyze_hll_non_part_table" enabled
+select 1 from pg_statistic where starelid='hll_part_1_prt_6'::regclass and stavalues5 is not null;
+
+-- verify that reloption is correctly set for partitioned table
+create table hll_part_def (i int, j int) with (analyze_hll_non_part_table=false) distributed by (i)
+partition by range(j)
+(start(1) end(3) every(1));
+
+select reloptions from pg_class where relname='hll_part_def';
+select reloptions from pg_class where relname='hll_part_def_1_prt_2';
+
+-- see if altering the reloption at the partition root with the ONLY keyword
+-- only modifies the reloption for the root and future children (should NOT
+-- touch existing children)
+alter table only hll_part_def set (analyze_hll_non_part_table=true);
+select reloptions from pg_class where relname='hll_part_def';
+select reloptions from pg_class where relname='hll_part_def_1_prt_2';
+
+-- see if altering the reloption at the partition root without the ONLY keyword
+-- modifies the reloption for all existing children AND all future children
+alter table hll_part_def set (analyze_hll_non_part_table=true);
+select reloptions from pg_class where relname='hll_part_def';
+select reloptions from pg_class where relname='hll_part_def_1_prt_2';
+
+-- Sanity check to ensure that we don't leak the DatumHashTable memory context
+-- The following should be empty.
+select * from gp_backend_memory_contexts where name = 'DatumHashTable';

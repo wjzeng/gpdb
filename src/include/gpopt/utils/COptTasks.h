@@ -42,6 +42,7 @@ class CMDAccessor;
 class CQueryContext;
 class COptimizerConfig;
 class ICostModel;
+class CPlanHint;
 }  // namespace gpopt
 
 struct PlannedStmt;
@@ -88,10 +89,6 @@ struct SOptContext
 	// did the optimizer fail unexpectedly?
 	BOOL m_is_unexpected_failure{false};
 
-	// should the error be propagated to user, instead of falling back to the
-	// Postres planner?
-	BOOL m_should_error_out{false};
-
 	// buffer for optimizer error messages
 	CHAR *m_error_msg{nullptr};
 
@@ -120,12 +117,12 @@ private:
 	static void Execute(void *(*func)(void *), void *func_arg);
 
 	// map GPOS log severity level to GPDB, print error and delete the given error buffer
-	static void LogExceptionMessageAndDelete(
-		CHAR *err_buf, ULONG severity_level = CException::ExsevInvalid);
+	static void LogExceptionMessageAndDelete(CHAR *err_buf);
 
 	// create optimizer configuration object
 	static COptimizerConfig *CreateOptimizerConfig(CMemoryPool *mp,
-												   ICostModel *cost_model);
+												   ICostModel *cost_model,
+												   CPlanHint *plan_hints);
 
 	// optimize a query to a physical DXL
 	static void *OptimizeTask(void *ptr);
@@ -147,6 +144,9 @@ private:
 
 	// generate an instance of optimizer cost model
 	static ICostModel *GetCostModel(CMemoryPool *mp, ULONG num_segments);
+
+	// create optimizer plan hints
+	static CPlanHint *GetPlanHints(CMemoryPool *mp, Query *query);
 
 	// print warning messages for columns with missing statistics
 	static void PrintMissingStatsWarning(CMemoryPool *mp,

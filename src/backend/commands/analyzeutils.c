@@ -22,12 +22,14 @@
 #include "lib/binaryheap.h"
 #include "miscadmin.h"
 #include "parser/parse_oper.h"
+#include "postmaster/autovacuum.h"
 #include "utils/builtins.h"
 #include "utils/datum.h"
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
 #include "utils/hsearch.h"
+#include "catalog/partition.h"
 
 
 typedef struct MCVFreqEntry
@@ -221,6 +223,7 @@ aggregate_leaf_partition_MCVs(Oid relationOid,
 												  ndistinct, sumReltuples);
 	if (*result == NULL)
 	{
+		hash_destroy(datumHash);
 		*num_mcv = 0;
 		return mcvpairArray;
 	}
@@ -446,6 +449,7 @@ createDatumHashTable(unsigned int nEntries)
 	hash_ctl.entrysize = sizeof(MCVFreqEntry);
 	hash_ctl.hash = datumHashTableHash;
 	hash_ctl.match = datumHashTableMatch;
+	hash_ctl.hcxt = CurrentMemoryContext; /* VacAttrStats->anl_context */
 
 	return hash_create("DatumHashTable", nEntries, &hash_ctl,
 					   HASH_ELEM | HASH_FUNCTION | HASH_COMPARE);
@@ -1029,10 +1033,19 @@ getBucketSizes(const HeapTuple *heaptupleStats, const float4 *relTuples, int nPa
  *	needs_sample() -- checks if the analyze requires sampling the actual data
  */
 bool
-needs_sample(VacAttrStats **vacattrstats, int attr_cnt)
+needs_sample(Relation rel, VacAttrStats **vacattrstats, int attr_cnt)
 {
 	Assert(vacattrstats != NULL);
+	List *statext_oids;
 	int			i;
+
+	/*
+	 * Do not sample partitioned tables during autovacuum for any reason.
+	 * It can take a long time and is IO intensive, and we'd only hit this case
+	 * for collecting extended stats
+	 */
+	if (rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE && IsAutoVacuumWorkerProcess())
+		return false;
 
 	for (i = 0; i < attr_cnt; i++)
 	{
@@ -1040,6 +1053,15 @@ needs_sample(VacAttrStats **vacattrstats, int attr_cnt)
 		if (!vacattrstats[i]->merge_stats)
 			return true;
 	}
+
+	/* we must acquire sample rows to build extend statisics */
+	statext_oids = RelationGetStatExtList(rel);
+	if (statext_oids != NIL)
+	{
+		list_free(statext_oids);
+		return true;
+	}
+
 	return false;
 }
 
@@ -1174,7 +1196,7 @@ leaf_parts_analyzed(Oid attrelid, Oid relid_exclude, List *va_cols, int elevel)
 			Form_pg_attribute att = TupleDescAttr(tupdesc, i);
 			char       *attname;
 
-			if (att->attisdropped)
+			if (att->attisdropped || att->attstattarget == 0)
 				continue;
 
 			attname = pstrdup(NameStr(att->attname));
@@ -1283,4 +1305,59 @@ leaf_parts_analyzed(Oid attrelid, Oid relid_exclude, List *va_cols, int elevel)
 	}
 
 	return !all_parts_empty;
+}
+
+/*
+ * add_root_to_autoanalyze_queue()
+ * Helper function to add a table OID to the autoanalyze queue.
+ */
+void
+add_root_to_autoanalyze_queue(Relation rel)
+{
+	Oid root_parent_relid;
+	if (rel->rd_rel->relispartition)
+	{
+		/* This is a mid-level partition, get the root oid */
+		root_parent_relid = get_top_level_partition_root(rel->rd_id);
+	}
+	else
+	{
+		/* rel->rd_id is of a root oid */
+		root_parent_relid = rel->rd_id;
+	}
+
+	/*
+	 * Pass a request to do_autovacuum() using autovacuum worker, to add OID of
+	 * relation in the list of tables for vacuum/analyze.
+	 *
+	 * This will ensure that in the next iteration of autovacuum, statistics of
+	 * root are updated based on the attached/detached partition.
+	 */
+	if (AutoVacuumingActive())
+	{
+		bool	recorded;
+		recorded = AutoVacuumRequestWork(AVW_UpdateRootPartitionStats, root_parent_relid, InvalidBlockNumber);
+		if (recorded)
+		{
+			ereport(DEBUG2,
+					(errmsg(" An autovacuum request was created for \"%s\" because it is the root of recently attached partition \"%s\"",
+							get_rel_name(root_parent_relid),get_rel_name(rel->rd_id))));
+
+		}
+		else
+		{
+			ereport(LOG,
+					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					 errmsg(" Root partition was not added to the autovacuum queue. Please manually analyze root partition \"%s\" to ensure accurate statistics",
+							get_rel_name(root_parent_relid))));
+		}
+	}
+	else
+	{
+			ereport(DEBUG2,
+					(errmsg(" Root partition was not added to the autovacuum queue as autovacuum is disabled. Please manually analyze root partition \"%s\" to ensure accurate statistics",
+							get_rel_name(root_parent_relid))));
+
+	}
+
 }

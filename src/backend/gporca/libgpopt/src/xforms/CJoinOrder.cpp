@@ -27,7 +27,6 @@
 
 using namespace gpopt;
 
-FORCE_GENERATE_DBGSTR(CJoinOrder);
 FORCE_GENERATE_DBGSTR(CJoinOrder::SEdge);
 FORCE_GENERATE_DBGSTR(CJoinOrder::SComponent);
 
@@ -172,8 +171,8 @@ CJoinOrder::CJoinOrder(CMemoryPool *mp, CExpressionArray *all_components,
 	  m_ulComps(0),
 	  m_include_loj_childs(include_loj_childs)
 {
-	typedef SComponent *Pcomp;
-	typedef SEdge *Pedge;
+	using Pcomp = SComponent *;
+	using Pedge = SEdge *;
 
 	const ULONG num_of_nary_children = all_components->Size();
 	INT num_of_lojs = 0;
@@ -293,8 +292,8 @@ CJoinOrder::CJoinOrder(CMemoryPool *mp, CExpressionArray *all_components,
 	  m_ulComps(0),
 	  m_include_loj_childs(false)  // not used by CXformExpandNAryJoinDPv2
 {
-	typedef SComponent *Pcomp;
-	typedef SEdge *Pedge;
+	using Pcomp = SComponent *;
+	using Pedge = SEdge *;
 
 	const ULONG num_of_nary_children = all_components->Size();
 
@@ -462,9 +461,13 @@ CJoinOrder::PcompCombine(SComponent *comp1, SComponent *comp2)
 			CExpression *pexpr = pedge->m_pexpr;
 			pexpr->AddRef();
 			if (0 < pedge->m_loj_num)
+			{
 				loj_conjuncts->Append(pexpr);
+			}
 			else
+			{
 				other_conjuncts->Append(pexpr);
+			}
 		}
 	}
 
@@ -518,7 +521,8 @@ CJoinOrder::PcompCombine(SComponent *comp1, SComponent *comp2)
 			CExpression *loj_predicate =
 				CPredicateUtils::PexprConjunction(m_mp, loj_conjuncts);
 			pexpr = CUtils::PexprLogicalJoin<CLogicalLeftOuterJoin>(
-				m_mp, pexprLeft, pexprRight, loj_predicate);
+				m_mp, pexprLeft, pexprRight, loj_predicate,
+				this->EOriginXForm());
 
 			// remaining predicates are place on top as a filter
 			CExpression *filter_predicate =
@@ -564,7 +568,8 @@ CJoinOrder::PcompCombine(SComponent *comp1, SComponent *comp2)
 			CExpression *predicate =
 				CPredicateUtils::PexprConjunction(m_mp, loj_conjuncts);
 			pexpr = CUtils::PexprLogicalJoin<CLogicalInnerJoin>(
-				m_mp, pexprChild1, pexprChild2, predicate);
+				m_mp, pexprChild1, pexprChild2, predicate,
+				this->EOriginXForm());
 		}
 	}
 	// if the component has parent_loj_id > 0, it must be the left child or has the left child

@@ -39,9 +39,9 @@
 #include "postgres.h"
 
 #include "lib/ilist.h"
+#include "utils/gp_alloc.h"
 #include "utils/memdebug.h"
 #include "utils/memutils.h"
-
 
 #define Generation_BLOCKHDRSZ	MAXALIGN(sizeof(GenerationBlock))
 #define Generation_CHUNKHDRSZ	sizeof(GenerationChunk)
@@ -155,7 +155,8 @@ static Size GenerationGetChunkSpace(MemoryContext context, void *pointer);
 static bool GenerationIsEmpty(MemoryContext context);
 static void GenerationStats(MemoryContext context,
 							MemoryStatsPrintFunc printfunc, void *passthru,
-							MemoryContextCounters *totals);
+							MemoryContextCounters *totals,
+							bool print_to_stderr);
 
 #ifdef MEMORY_CONTEXT_CHECKING
 static void GenerationCheck(MemoryContext context);
@@ -240,7 +241,7 @@ GenerationContextCreate(MemoryContext parent,
 	 * freeing the first generation of allocations.
 	 */
 
-	set = (GenerationContext *) malloc(MAXALIGN(sizeof(GenerationContext)));
+	set = (GenerationContext *) gp_malloc(MAXALIGN(sizeof(GenerationContext)));
 	if (set == NULL)
 	{
 		MemoryContextStats(TopMemoryContext);
@@ -303,7 +304,7 @@ GenerationReset(MemoryContext context)
 		wipe_mem(block, block->blksize);
 #endif
 
-		free(block);
+		gp_free(block);
 	}
 
 	set->block = NULL;
@@ -321,7 +322,7 @@ GenerationDelete(MemoryContext context, MemoryContext parent)
 	/* Reset to release all the GenerationBlocks */
 	GenerationReset(context);
 	/* And free the context header */
-	free(context);
+	gp_free(context);
 }
 
 /*
@@ -350,7 +351,7 @@ GenerationAlloc(MemoryContext context, Size size)
 	{
 		Size		blksize = chunk_size + Generation_BLOCKHDRSZ + Generation_CHUNKHDRSZ;
 
-		block = (GenerationBlock *) malloc(blksize);
+		block = (GenerationBlock *) gp_malloc(blksize);
 		if (block == NULL)
 			return NULL;
 
@@ -406,7 +407,7 @@ GenerationAlloc(MemoryContext context, Size size)
 	{
 		Size		blksize = set->blockSize;
 
-		block = (GenerationBlock *) malloc(blksize);
+		block = (GenerationBlock *) gp_malloc(blksize);
 
 		if (block == NULL)
 			return NULL;
@@ -529,7 +530,7 @@ GenerationFree(MemoryContext context, void *pointer)
 		set->block = NULL;
 
 	context->mem_allocated -= block->blksize;
-	free(block);
+	gp_free(block);
 }
 
 /*
@@ -685,6 +686,7 @@ GenerationIsEmpty(MemoryContext context)
  * printfunc: if not NULL, pass a human-readable stats string to this.
  * passthru: pass this pointer through to printfunc.
  * totals: if not NULL, add stats about this context into *totals.
+ * print_to_stderr: print stats to stderr if true, elog otherwise.
  *
  * XXX freespace only accounts for empty space at the end of the block, not
  * space of freed chunks (which is unknown).
@@ -692,7 +694,7 @@ GenerationIsEmpty(MemoryContext context)
 static void
 GenerationStats(MemoryContext context,
 				MemoryStatsPrintFunc printfunc, void *passthru,
-				MemoryContextCounters *totals)
+				MemoryContextCounters *totals, bool print_to_stderr)
 {
 	GenerationContext *set = (GenerationContext *) context;
 	Size		nblocks = 0;
@@ -724,7 +726,7 @@ GenerationStats(MemoryContext context,
 				 "%zu total in %zd blocks (%zd chunks); %zu free (%zd chunks); %zu used",
 				 totalspace, nblocks, nchunks, freespace,
 				 nfreechunks, totalspace - freespace);
-		printfunc(context, passthru, stats_string);
+		printfunc(context, passthru, stats_string, print_to_stderr);
 	}
 
 	if (totals)

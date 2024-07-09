@@ -137,8 +137,9 @@ networksel(PG_FUNCTION_ARGS)
 	 * by MCV entries.
 	 */
 	fmgr_info(get_opcode(operator), &proc);
-	mcv_selec = mcv_selectivity(&vardata, &proc, constvalue, varonleft,
-								&sumcommon);
+	mcv_selec = mcv_selectivity_ext(&vardata, &proc, InvalidOid,
+									constvalue, varonleft,
+									&sumcommon);
 
 	/*
 	 * If we have a histogram, use it to estimate the proportion of the
@@ -223,6 +224,7 @@ networkjoinsel(PG_FUNCTION_ARGS)
 			break;
 		case JOIN_SEMI:
 		case JOIN_ANTI:
+		case JOIN_LASJ_NOTIN:
 			/* Here, it's important that we pass the outer var on the left. */
 			if (!join_is_reversed)
 				selec = networkjoinsel_semi(operator, &vardata1, &vardata2);

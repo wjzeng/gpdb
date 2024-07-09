@@ -63,6 +63,9 @@ extern bool ConditionalLockRelationForExtension(Relation relation,
 												LOCKMODE lockmode);
 extern int	RelationExtensionLockWaiterCount(Relation relation);
 
+/* Lock to recompute pg_database.datfrozenxid in the current database */
+extern void LockDatabaseFrozenIds(LOCKMODE lockmode);
+
 /* Lock a page (currently only used within indexes) */
 extern void LockPage(Relation relation, BlockNumber blkno, LOCKMODE lockmode);
 extern bool ConditionalLockPage(Relation relation, BlockNumber blkno, LOCKMODE lockmode);
@@ -114,9 +117,6 @@ extern const char *GetLockNameFromTagType(uint16 locktag_type);
 
 /* Knowledge about which locktags describe temp objects */
 extern bool LockTagIsTemp(const LOCKTAG *tag);
-
-extern bool CondUpgradeRelLock(Oid relid);
-extern int UpgradeRelLockIfNecessary(Oid relid, int lockmode, bool *lockUpgraded);
 
 extern void GxactLockTableInsert(DistributedTransactionId xid);
 extern void GxactLockTableWait(DistributedTransactionId xid);

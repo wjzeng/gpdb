@@ -52,7 +52,8 @@ public:
 
 	// return the requested metadata object
 	virtual IMDCacheObject *GetMDObj(CMemoryPool *mp, CMDAccessor *md_accessor,
-									 IMDId *mdid) const = 0;
+									 IMDId *mdid,
+									 IMDCacheObject::Emdtype mdtype) const = 0;
 
 	// return the mdid for the specified system id and type
 	virtual IMDId *MDId(CMemoryPool *mp, CSystemId sysid,
@@ -60,7 +61,7 @@ public:
 };
 
 // arrays of MD providers
-typedef CDynamicPtrArray<IMDProvider, CleanupRelease> CMDProviderArray;
+using CMDProviderArray = CDynamicPtrArray<IMDProvider, CleanupRelease>;
 
 }  // namespace gpmd
 

@@ -1,13 +1,11 @@
 use strict;
 use warnings;
 
-use Config;
-use PostgresNode;
-use TestLib;
+use PostgreSQL::Test::Cluster;
+use PostgreSQL::Test::Utils;
 use Test::More;
 
-my $tempdir       = TestLib::tempdir;
-my $tempdir_short = TestLib::tempdir_short;
+my $tempdir       = PostgreSQL::Test::Utils::tempdir;
 
 ###############################################################
 # This structure is based off of the src/bin/pg_dump/t test
@@ -26,7 +24,7 @@ my $tempdir_short = TestLib::tempdir_short;
 # the full command and arguments to run.  Note that this is run
 # using $node->command_ok(), so the port does not need to be
 # specified and is pulled from $PGPORT, which is set by the
-# PostgresNode system.
+# PostgreSQL::Test::Cluster system.
 #
 # restore_cmd is the pg_restore command to run, if any.  Note
 # that this should generally be used when the pg_dump goes to
@@ -135,6 +133,20 @@ my %pgdump_runs = (
 			"$tempdir/defaults_tar_format.tar",
 		],
 	},
+	exclude_table => {
+		dump_cmd => [
+			'pg_dump',
+			'--exclude-table=regress_table_dumpable',
+			"--file=$tempdir/exclude_table.sql",
+			'postgres',
+		],
+	},
+	extension_schema => {
+		dump_cmd => [
+			'pg_dump',                              '--schema=public',
+			"--file=$tempdir/extension_schema.sql", 'postgres',
+		],
+	},
 	pg_dumpall_globals => {
 		dump_cmd => [
 			'pg_dumpall',                             '--no-sync',
@@ -219,6 +231,7 @@ my %full_runs = (
 	clean_if_exists => 1,
 	createdb        => 1,
 	defaults        => 1,
+	exclude_table   => 1,
 	no_privs        => 1,
 	no_owner        => 1,);
 
@@ -301,8 +314,9 @@ my %tests = (
 			\n/xm,
 		like => {
 			%full_runs,
-			data_only    => 1,
-			section_data => 1,
+			data_only        => 1,
+			section_data     => 1,
+			extension_schema => 1,
 		},
 	},
 
@@ -310,9 +324,65 @@ my %tests = (
 		regexp => qr/^
 			\QCREATE TABLE public.regress_pg_dump_table (\E
 			\n\s+\Qcol1 integer NOT NULL,\E
-			\n\s+\Qcol2 integer\E
+			\n\s+\Qcol2 integer,\E
+			\n\s+\QCONSTRAINT regress_pg_dump_table_col2_check CHECK ((col2 > 0))\E
 			\n\);\n/xm,
 		like => { binary_upgrade => 1, },
+	},
+
+	'COPY public.regress_table_dumpable (col1)' => {
+		regexp => qr/^
+			\QCOPY public.regress_table_dumpable (col1) FROM stdin;\E
+			\n/xm,
+		like => {
+			%full_runs,
+			data_only        => 1,
+			section_data     => 1,
+			extension_schema => 1,
+		},
+		unlike => {
+			binary_upgrade => 1,
+			exclude_table  => 1,
+		},
+	},
+
+	'REVOKE ALL ON FUNCTION wgo_then_no_access' => {
+		create_order => 3,
+		create_sql   => q{
+			DO $$BEGIN EXECUTE format(
+				'REVOKE ALL ON FUNCTION wgo_then_no_access()
+				 FROM pg_signal_backend, public, %I',
+				(SELECT usename
+				 FROM pg_user JOIN pg_proc ON proowner = usesysid
+				 WHERE proname = 'wgo_then_no_access')); END$$;},
+		regexp => qr/^
+			\QREVOKE ALL ON FUNCTION public.wgo_then_no_access() FROM PUBLIC;\E
+			\n\QREVOKE ALL ON FUNCTION public.wgo_then_no_access() FROM \E.*;
+			\n\QREVOKE ALL ON FUNCTION public.wgo_then_no_access() FROM pg_signal_backend;\E
+			/xm,
+		like => {
+			%full_runs,
+			schema_only      => 1,
+			section_pre_data => 1,
+		},
+		unlike => { no_privs => 1, },
+	},
+
+	'REVOKE GRANT OPTION FOR UPDATE ON SEQUENCE wgo_then_regular' => {
+		create_order => 3,
+		create_sql   => 'REVOKE GRANT OPTION FOR UPDATE ON SEQUENCE
+							wgo_then_regular FROM pg_signal_backend;',
+		regexp => qr/^
+			\QREVOKE ALL ON SEQUENCE public.wgo_then_regular FROM pg_signal_backend;\E
+			\n\QGRANT SELECT,UPDATE ON SEQUENCE public.wgo_then_regular TO pg_signal_backend;\E
+			\n\QGRANT USAGE ON SEQUENCE public.wgo_then_regular TO pg_signal_backend WITH GRANT OPTION;\E
+			/xm,
+		like => {
+			%full_runs,
+			schema_only      => 1,
+			section_pre_data => 1,
+		},
+		unlike => { no_privs => 1, },
 	},
 
 	'CREATE ACCESS METHOD regress_test_am' => {
@@ -436,7 +506,8 @@ my %tests = (
 		regexp => qr/^
 			\QCREATE TABLE regress_pg_dump_schema.test_table (\E
 			\n\s+\Qcol1 integer,\E
-			\n\s+\Qcol2 integer\E
+			\n\s+\Qcol2 integer,\E
+			\n\s+\QCONSTRAINT test_table_col2_check CHECK ((col2 > 0))\E
 			\n\);\n/xm,
 		like => { binary_upgrade => 1, },
 	},
@@ -523,6 +594,40 @@ my %tests = (
 		like => { binary_upgrade => 1, },
 	},
 
+	'ALTER INDEX pkey DEPENDS ON extension' => {
+		create_order => 11,
+		create_sql =>
+		  'CREATE TABLE regress_pg_dump_schema.extdependtab (col1 integer primary key, col2 int);
+		CREATE INDEX ON regress_pg_dump_schema.extdependtab (col2);
+		ALTER INDEX regress_pg_dump_schema.extdependtab_col2_idx DEPENDS ON EXTENSION test_pg_dump;
+		ALTER INDEX regress_pg_dump_schema.extdependtab_pkey DEPENDS ON EXTENSION test_pg_dump;',
+		regexp => qr/^
+		\QALTER INDEX regress_pg_dump_schema.extdependtab_pkey DEPENDS ON EXTENSION test_pg_dump;\E\n
+		/xms,
+		like   => {%pgdump_runs},
+		unlike => {
+			data_only          => 1,
+			extension_schema   => 1,
+			pg_dumpall_globals => 1,
+			section_data       => 1,
+			section_pre_data   => 1,
+		},
+	},
+
+	'ALTER INDEX idx DEPENDS ON extension' => {
+		regexp => qr/^
+			\QALTER INDEX regress_pg_dump_schema.extdependtab_col2_idx DEPENDS ON EXTENSION test_pg_dump;\E\n
+			/xms,
+		like   => {%pgdump_runs},
+		unlike => {
+			data_only          => 1,
+			extension_schema   => 1,
+			pg_dumpall_globals => 1,
+			section_data       => 1,
+			section_pre_data   => 1,
+		},
+	},
+
 	# Objects not included in extension, part of schema created by extension
 	'CREATE TABLE regress_pg_dump_schema.external_tab' => {
 		create_order => 4,
@@ -542,49 +647,11 @@ my %tests = (
 #########################################
 # Create a PG instance to test actually dumping from
 
-my $node = get_new_node('main');
+my $node = PostgreSQL::Test::Cluster->new('main');
 $node->init;
 $node->start;
 
 my $port = $node->port;
-
-my $num_tests = 0;
-
-foreach my $run (sort keys %pgdump_runs)
-{
-	my $test_key = $run;
-
-	# Each run of pg_dump is a test itself
-	$num_tests++;
-
-	# If there is a restore cmd, that's another test
-	if ($pgdump_runs{$run}->{restore_cmd})
-	{
-		$num_tests++;
-	}
-
-	if ($pgdump_runs{$run}->{test_key})
-	{
-		$test_key = $pgdump_runs{$run}->{test_key};
-	}
-
-	# Then count all the tests run against each run
-	foreach my $test (sort keys %tests)
-	{
-		# If there is a like entry, but no unlike entry, then we will test the like case
-		if ($tests{$test}->{like}->{$test_key}
-			&& !defined($tests{$test}->{unlike}->{$test_key}))
-		{
-			$num_tests++;
-		}
-		else
-		{
-			# We will test everything that isn't a 'like'
-			$num_tests++;
-		}
-	}
-}
-plan tests => $num_tests;
 
 #########################################
 # Set up schemas, tables, etc, to be dumped.
@@ -677,3 +744,5 @@ foreach my $run (sort keys %pgdump_runs)
 # Stop the database instance, which will be removed at the end of the tests.
 
 $node->stop('fast');
+
+done_testing();

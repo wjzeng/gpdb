@@ -1,4 +1,11 @@
 --  MPP-21536: Duplicated rows inserted when ORCA is turned on
+-- start_matchsubs
+-- m/\(cost=.*\)/
+-- s/\(cost=.*\)//
+-- end_matchsubs
+
+create schema bfv_dml;
+set search_path=bfv_dml;
 
 -- create test table
 create table m();
@@ -50,7 +57,7 @@ drop table yyy;
 -- Now repeat all the above tests, but using a hacked master-only 'm' table
 drop table m;
 
-set optimizer_enable_master_only_queries=on;
+set optimizer_enable_coordinator_only_queries=on;
 
 
 -- create master-only table
@@ -198,3 +205,230 @@ rollback;
 select * from execinsert_test;
 
 drop table execinsert_test;
+
+--
+-- Verify that DELETE properly redistributes in the case of joins
+--
+
+drop table if exists foo;
+drop table if exists bar;
+
+create table foo (a int, b int);
+create table bar(a int, b int);
+insert into foo select generate_series(1,10);
+insert into bar select generate_series(1,10);
+-- Previously, table foo is defined as  randomly distributed and 
+-- that might lead to flaky result of the explain statement
+-- since random cost. We set policy to random without move the
+-- data after data is all inserted. This method can both have
+-- a random dist table and a stable test result.
+-- Following cases are using the same skill here.
+alter table foo set with(REORGANIZE=false) distributed randomly;
+analyze foo;
+analyze bar;
+explain delete from foo using bar where foo.a=bar.a;
+delete from foo using bar where foo.a=bar.a;
+select * from foo;
+drop table foo;
+drop table bar;
+
+create table foo (a int, b int);
+create table bar(a int, b int);
+insert into foo select generate_series(1,10);
+insert into bar select generate_series(1,10);
+alter table foo set with(REORGANIZE=false) distributed randomly;
+analyze foo;
+analyze bar;
+explain delete from foo using bar where foo.a = bar.a returning foo.*;
+delete from foo using bar where foo.a = bar.a returning foo.*;
+select * from foo;
+drop table foo;
+drop table bar;
+
+create table foo (a int, b int);
+insert into foo select generate_series(1,10);
+alter table foo set with(REORGANIZE=false) distributed randomly;
+analyze foo;
+explain delete from foo where foo.a=1;
+delete from foo where foo.a=1;
+drop table foo;
+
+create table foo (a int, b int);
+create table bar(a int, b int);
+insert into foo select generate_series(1,10);
+insert into bar select generate_series(1,10);
+alter table foo set with(REORGANIZE=false) distributed randomly;
+analyze foo;
+analyze bar;
+explain delete from foo using bar where foo.a=bar.b;
+delete from foo using bar where foo.a=bar.b;
+drop table foo;
+drop table bar;
+
+create table foo (a int, b int);
+insert into foo select generate_series(1,10);
+alter table foo set with(REORGANIZE=false) distributed randomly;
+analyze foo;
+-- Turn off redistribute motion for ORCA just for this case.
+-- This is to get a broadcast motion over foo_1 so that no
+-- motion is above the resultrelation foo thus no ExplicitMotion.
+set optimizer_enable_motion_redistribute = off;
+explain delete from foo using foo foo_1 where foo_1.a=foo.a;
+delete from foo using foo foo_1 where foo_1.a=foo.a;
+reset optimizer_enable_motion_redistribute;
+drop table foo;
+
+create table foo (a int, b int);
+insert into foo select generate_series(1,10);
+alter table foo set with(REORGANIZE=false) distributed randomly;
+analyze foo;
+explain delete from foo;
+delete from foo;
+drop table foo;
+
+create table foo (a int, b int);
+create table bar(a int, b int);
+insert into foo select generate_series(1,10);
+insert into bar select generate_series(1,10);
+alter table foo set with(REORGANIZE=false) distributed randomly;
+alter table bar set with(REORGANIZE=false) distributed randomly;
+analyze foo;
+analyze bar;
+explain delete from foo using bar;
+delete from foo using bar;
+drop table foo;
+drop table bar;
+
+create table foo (a int, b int);
+create table bar(a int, b int);
+insert into bar select i, i from generate_series(1, 1000)i;
+insert into foo select i,i from generate_series(1, 10)i;
+alter table foo set with(REORGANIZE=false) distributed randomly;
+alter table bar set with(REORGANIZE=false) distributed randomly;
+analyze	foo;
+analyze	bar;
+set optimizer_enable_motion_redistribute=off;
+explain delete from foo using bar where foo.b=bar.b;
+delete from foo using bar where foo.b=bar.b;
+drop table foo;
+drop table bar;
+reset optimizer_enable_motion_redistribute;
+
+create table foo (a int, b int) distributed randomly;
+create table bar (a int, b int) distributed randomly;
+insert into foo (a, b) values (1, 2);
+explain insert into bar select * from foo;
+insert into bar select * from foo;
+select * from bar;
+drop table foo;
+drop table bar;
+
+create table foo (a int, b int) distributed randomly;
+create table bar (a int, b int) distributed randomly;
+insert into foo (a, b) values (1, 2);
+insert into bar (a, b) values (1, 2);
+explain update foo set a=4 from bar where foo.a=bar.a;
+update foo set a=4 from bar where foo.a=bar.a;
+select * from foo;
+drop table foo;
+drop table bar;
+
+create table foo (a int, b int) distributed randomly;
+create table bar (a int, b int) distributed randomly;
+create table jazz (a int, b int) distributed randomly;
+insert into foo (a, b) values (1, 2);
+insert into bar (a, b) values (1, 2);
+insert into jazz (a, b) values (1, 2);
+explain insert into foo select bar.a from bar, jazz where bar.a=jazz.a;
+insert into foo select bar.a from bar, jazz where bar.a=jazz.a;
+select * from foo;
+drop table foo;
+drop table bar;
+drop table jazz;
+
+create table foo (a int);
+create table bar (b int);
+insert into foo select i from generate_series(1, 10)i;
+insert into bar select i from generate_series(1, 10)i;
+alter table foo set with(REORGANIZE=false) distributed randomly;
+alter table bar set with(REORGANIZE=false) distributed randomly;
+analyze foo;
+analyze bar;
+explain delete from foo using (select a from foo union all select b from bar) v;
+delete from foo using (select a from foo union all select b from bar) v;
+select * from foo;
+drop table foo;
+drop table bar;
+
+-- This test is to verify ORCA can generate plans with empty
+-- target lists. This can happen when inserting rows with no
+-- columns into a table with no columns
+create table test();
+explain (analyze, costs off, timing off, summary off) insert into test default values;
+
+-- Test delete on partition table with dropped/added columns
+CREATE TABLE part (
+    a int,
+    b int,
+    c text,
+    d numeric)
+DISTRIBUTED BY (b)
+partition by range(a) (
+    start(1) end(6) every(2),
+    default partition def);
+alter table part add column e int;
+insert into part select i, i, 'abc', i*1.01,i from generate_series(1,10)i;
+alter table part drop column b;
+alter table part set WITH (reorganize=true) distributed by (e);
+-- test delete with dropped column
+explain delete from part where d>9;
+delete from part where d>9;
+select count(*) from part;
+-- test delete with added partition key
+explain delete from part where e=3;
+delete from part where e=3;
+select count(*) from part;
+-- test delete from default partition
+explain delete from part where a=8;
+delete from part where a=8;
+select count(*) from part;
+
+DROP TABLE IF EXISTS part;
+CREATE TABLE part (
+    a int,
+    b int,
+    partkey int,
+    c text,
+    d numeric)
+DISTRIBUTED BY (b)
+partition by range(partkey) (
+    start(1) end(6) every(2),
+    default partition def);
+alter table part add column e int;
+insert into part select i, i, i, 'abc', i*1.01,i from generate_series(1,10)i;
+alter table part drop column b;
+alter table part set WITH (reorganize=true) distributed by (e);
+-- test delete with column order change
+explain delete from part where d>9;
+delete from part where d>9;
+select count(*) from part;
+
+-- Test delete on mid-level partitions. Ensure Orca properly handles tuple routing
+create table deep_part (
+  i int,
+  j int,
+  k int,
+  s char(5)
+) distributed by (i) partition by list(s) subpartition by range (j) subpartition template (
+  start(1) end(3) every(1)
+) (
+  partition p1
+  values
+    ('A'),
+    partition p2
+  values
+    ('B')
+);
+
+insert into deep_part values (1,1,1,'A');
+delete from deep_part_1_prt_p1 where j=1;

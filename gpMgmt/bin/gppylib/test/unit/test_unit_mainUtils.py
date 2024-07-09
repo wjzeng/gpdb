@@ -2,6 +2,7 @@ import os
 
 from gppylib.test.unit.gp_unittest import *
 from gppylib.mainUtils import PIDLockFile, PIDLockHeld
+from gppylib.mainUtils import parseStatusLine
 
 
 class MainUtilsTestCase(GpTestCase):
@@ -14,18 +15,18 @@ class MainUtilsTestCase(GpTestCase):
 
     def test_release_removes_lock(self):
         self.lock.acquire()
-        self.assertEquals(True,os.path.exists(self.lockfile))
+        self.assertEqual(True,os.path.exists(self.lockfile))
         self.lock.release()
-        self.assertEquals(False, os.path.exists(self.lockfile))
+        self.assertEqual(False, os.path.exists(self.lockfile))
 
     def test_with_block_removes_lock(self):
         with self.lock:
-            self.assertEquals(True,os.path.exists(self.lockfile))
-        self.assertEquals(False, os.path.exists(self.lockfile))
+            self.assertEqual(True,os.path.exists(self.lockfile))
+        self.assertEqual(False, os.path.exists(self.lockfile))
 
     def test_lock_owned_by_parent(self):
         with self.lock as l:
-            self.assertEquals(l.read_pid(), self.ppid)
+            self.assertEqual(l.read_pid(), self.ppid)
 
 
     def test_exceptionPIDLockHeld_if_same_pid(self):
@@ -37,7 +38,7 @@ class MainUtilsTestCase(GpTestCase):
         with self.lock as l:
             pid = os.fork()
             if pid == 0:
-                self.assertEquals(l.read_pid(), self.ppid)
+                self.assertEqual(l.read_pid(), self.ppid)
                 os._exit(0)
             else:
                 os.wait()
@@ -54,6 +55,27 @@ class MainUtilsTestCase(GpTestCase):
             os.wait()
             self.lock.release()
 
+    def test_accept_double_dash_in_data_dir_name_for_start(self):
+        line = 'STATUS--DIR:/Users/shrakesh/workspace/gpdb/gpAux/gpdemo/datadirs/dbfast2/demoData--Dir1--STARTED:True--REASONCODE:0--REASON:Start Succeeded'
+        reasonStr, started = parseStatusLine(line, isStart=True)[1:3]
+        self.assertTrue(started)
+        self.assertEqual(reasonStr, 'Start Succeeded')
+
+
+    def test_accept_double_dash_in_data_dir_name_for_stop(self):
+        line = 'STATUS--DIR:/Users/shrakesh/workspace/gpdb/gpAux/gpdemo/datadirs/dbfast2/demoData--Dir1--STOPPED:True--REASON:Shutdown Succeeded'
+        reasonStr, stopped = parseStatusLine(line, isStop=True)[1:3]
+        self.assertTrue(stopped)
+        self.assertEqual(reasonStr, 'Shutdown Succeeded')
+
+
+    def test_accept_double_dash_in_data_dir_name_for_excep(self):
+        line = 'STATUS--DIR:/Users/shrakesh/workspace/gpdb/gpAux/gpdemo/datadirs/dbfast2/demoData--Dir1--STOPPED:True--REASON:Shutdown Succeeded'
+
+        with self.assertRaises(Exception):
+            parseStatusLine(line)
+
+
     def test_childPID_can_not_remove_parent_lock(self):
         with self.lock:
             pid = os.fork()
@@ -68,7 +90,7 @@ class MainUtilsTestCase(GpTestCase):
                 # we expect the the acquire to fail
                 except:
                     pass
-                self.assertEquals(True, os.path.exists(self.lockfile))
+                self.assertEqual(True, os.path.exists(self.lockfile))
                 os._exit(0)
             else:
                 os.wait()

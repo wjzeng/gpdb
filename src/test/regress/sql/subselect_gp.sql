@@ -1,8 +1,15 @@
+-- start_matchsubs
+-- m/\(cost=.*\)/
+-- s/\(cost=.*\)//
+--
+-- m/\(slice.*\)/
+-- s/\(slice.*\)//
+-- end_matchsubs
 -- start_ignore
 create schema subselect_gp;
 set search_path to subselect_gp, public;
 -- end_ignore
-set optimizer_enable_master_only_queries = on;
+set optimizer_enable_coordinator_only_queries = on;
 set optimizer_segments = 3;
 set optimizer_nestloop_factor = 1.0;
 
@@ -144,7 +151,7 @@ explain select array(select x from csq_d1); -- initplan
 select array(select x from csq_d1); -- {1}
 
 --
--- CSQs involving master-only and distributed tables
+-- CSQs involving coordinator-only and distributed tables
 --
 
 drop table if exists t3cozlib;
@@ -180,7 +187,7 @@ ORDER BY a.attnum
 ; -- expect to see 2 rows
 
 --
--- More CSQs involving master-only and distributed relations
+-- More CSQs involving coordinator-only and distributed relations
 --
 
 drop table if exists csq_m1;
@@ -202,14 +209,14 @@ select * from csq_m1;
 select * from csq_d1;
 
 --
--- outer plan node is master-only and CSQ has distributed relation
+-- outer plan node is coordinator-only and CSQ has distributed relation
 --
 
 explain select * from csq_m1 where x not in (select x from csq_d1) or x < -100; -- gather motion
 select * from csq_m1 where x not in (select x from csq_d1) or x < -100; -- (3)
 
 --
--- outer plan node is master-only and CSQ has distributed relation
+-- outer plan node is coordinator-only and CSQ has distributed relation
 --
 
 explain select * from csq_d1 where x not in (select x from csq_m1) or x < -100; -- broadcast motion
@@ -673,9 +680,6 @@ SELECT bar_s.c FROM bar_s, foo_s WHERE foo_s.b = (SELECT max(i) FROM baz_s WHERE
 
 -- Same as above, but with another subquery, so it must use a SubPlan. There
 -- are two references to the same SubPlan in the plan, on different slices.
--- GPDB_96_MERGE_FIXME: this EXPLAIN output should become nicer-looking once we
--- merge upstream commit 4d042999f9, to suppress the SubPlans from being
--- printed twice.
 explain SELECT bar_s.c FROM bar_s, foo_s WHERE foo_s.b = (SELECT max(i) FROM baz_s WHERE bar_s.c = 9) AND foo_s.b = (select bar_s.d::int4);
 SELECT bar_s.c FROM bar_s, foo_s WHERE foo_s.b = (SELECT max(i) FROM baz_s WHERE bar_s.c = 9) AND foo_s.b = (select bar_s.d::int4);
 
@@ -745,6 +749,24 @@ EXPLAIN SELECT '' AS five, f1 AS "Correlated Field"
   WHERE (f1, f2) IN (SELECT f2, CAST(f3 AS int4) FROM SUBSELECT_TBL
                      WHERE f3 IS NOT NULL) ORDER BY 2;
 
+-- Test simplify group-by/order-by inside subquery if sublink pull-up is possible
+EXPLAIN SELECT '' AS six, f1 AS "Correlated Field", f2 AS "Second Field"
+  FROM SUBSELECT_TBL upper
+  WHERE f1 IN (SELECT f2 FROM SUBSELECT_TBL WHERE f1 = upper.f1 GROUP BY f2);
+
+EXPLAIN SELECT '' AS six, f1 AS "Correlated Field", f2 AS "Second Field"
+  FROM SUBSELECT_TBL upper
+  WHERE f1 IN (SELECT f2 FROM SUBSELECT_TBL WHERE f1 = upper.f1  GROUP BY f2 LIMIT 3);
+
+EXPLAIN SELECT '' AS six, f1 AS "Correlated Field", f2 AS "Second Field"
+  FROM SUBSELECT_TBL upper
+  WHERE f1 IN (SELECT f2 FROM SUBSELECT_TBL WHERE f1 = upper.f1 ORDER BY f2);
+
+EXPLAIN SELECT '' AS six, f1 AS "Correlated Field", f2 AS "Second Field"
+  FROM SUBSELECT_TBL upper
+  WHERE f1 IN (SELECT f2 FROM SUBSELECT_TBL WHERE f1 = upper.f1  ORDER BY f2 LIMIT 3);
+
+
 --
 -- Test cases to catch unpleasant interactions between IN-join processing
 -- and subquery pullup.
@@ -764,10 +786,8 @@ EXPLAIN select count(distinct ss.ten) from
    where unique1 IN (select distinct hundred from tenk1 b)) ss;
 
 --
--- In case of simple exists query, planner can generate alternative
--- subplans and choose one of them during execution based on the cost.
--- The below test check that we are generating alternative subplans,
--- we should see 2 subplans in the explain
+-- Commit 41efb83 remove unused subplans in planner stage, it
+-- will shows only the subplan actually be used.
 --
 EXPLAIN SELECT EXISTS(SELECT * FROM tenk1 WHERE tenk1.unique1 = tenk2.unique1) FROM tenk2 LIMIT 1;
 
@@ -1044,3 +1064,418 @@ select * from foo where
 select * from foo where
   (case when foo.i in (select a.i from baz a) then foo.i else null end) in
   (select b.i from baz b);
+
+-- When creating plan with subquery and CTE, it sets the useless flow for the plan.
+-- But we only need flow for the topmost plan and child of the motion. See commit
+-- https://github.com/greenplum-db/gpdb/commit/93abe741cd67f04958e2951edff02b45ab6e280f for detail
+-- The extra flow will cause subplan set wrong motionType and cause an ERROR
+-- unexpected gang size: XX
+-- This related to issue: https://github.com/greenplum-db/gpdb/issues/12371
+create table extra_flow_dist(a int, b int, c date);
+create table extra_flow_dist1(a int, b int);
+
+insert into extra_flow_dist select i, i, '1949-10-01'::date from generate_series(1, 10)i;
+insert into extra_flow_dist1 select i, i from generate_series(20, 22)i;
+
+-- case 1 subplan with outer general locus (CTE and subquery)
+explain (verbose, costs off) with run_dt as (
+	select
+	(
+	  select c from extra_flow_dist where b = x  -- subplan's outer is the below general locus path
+	) dt
+	from (select ( max(1) ) x) a  -- general locus
+)
+select * from run_dt, extra_flow_dist1
+where dt < '2010-01-01'::date;
+
+with run_dt as (
+	select
+	(
+	  select c from extra_flow_dist where b = x
+	) dt
+	from (select ( max(1) ) x) a
+)
+select * from run_dt, extra_flow_dist1
+where dt < '2010-01-01'::date;
+
+create table extra_flow_rand(a int) distributed replicated;
+insert into extra_flow_rand values (1);
+
+-- case 2 for subplan with outer segment general locus (CTE and subquery)
+explain (verbose, costs off) with run_dt as (
+	select
+	(
+		select c from extra_flow_dist where b = x  -- subplan's outer is the below segment general locus path
+	) dt
+	from (select a x from extra_flow_rand) a  -- segment general locus
+)
+select * from run_dt, extra_flow_dist1
+where dt < '2010-01-01'::date;
+
+with run_dt as (
+	select
+	(
+		select c from extra_flow_dist where b = x
+	) dt
+	from (select a x from extra_flow_rand) a
+)
+select * from run_dt, extra_flow_dist1
+where dt < '2010-01-01'::date;
+
+-- case 3 for subplan with outer entry locus (CTE and subquery)
+explain (verbose, costs off) with run_dt as (
+	select
+	(
+		select c from extra_flow_dist where b = x  -- subplan's outer is the below entry locus path
+	) dt
+	from (select 1 x from pg_class limit 1) a  -- entry locus
+)
+select * from run_dt, extra_flow_dist1
+where dt < '2010-01-01'::date;
+
+with run_dt as (
+	select
+	(
+		select c from extra_flow_dist where b = x  -- subplan's outer is the below entry locus path
+	) dt
+	from (select 1 x from pg_class limit 1) a  -- entry locus
+)
+select * from run_dt, extra_flow_dist1
+where dt < '2010-01-01'::date;
+
+-- case 4 subplan with outer segment general locus without param in subplan (CTE and subquery)
+explain (verbose, costs off) with run_dt as (
+	select x, y dt
+	from (select a x from extra_flow_rand ) a  -- segment general locus
+	left join (select max(1) y) aaa
+	on a.x > any (select random() from extra_flow_dist)  -- subplan's outer is the above segment general locus path
+)
+select * from run_dt, extra_flow_dist1
+where dt < extra_flow_dist1.a;
+
+-- case 5 for subplan with outer entry locus without param in subplan (CTE and subquery)
+explain (verbose, costs off) with run_dt as (
+	select x, y dt
+	from (select relnatts x from pg_class ) a  -- entry locus
+	left join (select max(1) y) aaa
+	on a.x > any (select random() from extra_flow_dist)  -- subplan's outer is the above entry loucs
+)
+select * from run_dt, extra_flow_dist1
+where dt < extra_flow_dist1.a;
+
+-- case 6 without CTE, nested subquery should not add extral flow
+explain (verbose, costs off) select * from (
+	select dt from (
+		select
+		(
+			select c from extra_flow_dist where b = x  -- subplan's outer is the below general locus path
+		) dt
+		from (select ( max(1) ) x) a  -- general locus
+		union
+		select
+		(
+			select c from extra_flow_dist where b = x  -- subplan's outer is the below general locus path
+		) dt
+		from (select ( max(1) ) x) aa  -- general locus
+	) tbl
+) run_dt,
+extra_flow_dist1
+where dt < '2010-01-01'::date;
+
+-- Check DISTINCT ON clause and ORDER BY clause in SubLink, See https://github.com/greenplum-db/gpdb/issues/12656.
+-- For EXISTS SubLink, we don’t need to care about the data deduplication problem, we can delete DISTINCT ON clause and
+-- ORDER BY clause with confidence, because we only care about whether the data exists.
+-- But for ANY SubLink, wo can't do this, because we not only care about the existence of data, but also the content of
+-- the data.
+create table issue_12656 (
+    i int,
+    j int
+) distributed by (i);
+
+insert into issue_12656 values (1, 10001), (1, 10002);
+
+-- case 1, check basic DISTINCT ON
+explain (costs off, verbose)
+select * from issue_12656 where (i, j) in (select distinct on (i) i, j from issue_12656);
+
+select * from issue_12656 where (i, j) in (select distinct on (i) i, j from issue_12656);
+
+-- case 2, check DISTINCT ON and ORDER BY
+explain (costs off, verbose)
+select * from issue_12656 where (i, j) in (select distinct on (i) i, j from issue_12656 order by i, j asc);
+
+select * from issue_12656 where (i, j) in (select distinct on (i) i, j from issue_12656 order by i, j asc);
+
+explain (costs off, verbose)
+select * from issue_12656 where (i, j) in (select distinct on (i) i, j from issue_12656 order by i, j desc);
+
+select * from issue_12656 where (i, j) in (select distinct on (i) i, j from issue_12656 order by i, j desc);
+
+-- case 3, check correlated DISTINCT ON
+explain select * from issue_12656 a where (i, j) in
+(select distinct on (i) i, j from issue_12656 b where a.i=b.i order by i, j asc);
+
+select * from issue_12656 a where (i, j) in
+(select distinct on (i) i, j from issue_12656 b where a.i=b.i order by i, j asc);
+
+---
+--- Test param info is preserved when bringing a path to OuterQuery locus
+---
+drop table if exists param_t;
+
+create table param_t (i int, j int);
+insert into param_t select i, i from generate_series(1,10)i;
+analyze param_t;
+
+explain (costs off)
+select * from param_t a where a.i in
+	(select count(b.j) from param_t b, param_t c,
+		lateral (select * from param_t d where d.j = c.j limit 10) s
+	where s.i = a.i
+	);
+select * from param_t a where a.i in
+	(select count(b.j) from param_t b, param_t c,
+		lateral (select * from param_t d where d.j = c.j limit 10) s
+	where s.i = a.i
+	);
+
+
+drop table if exists param_t;
+
+-- A guard test case for gpexpand's populate SQL
+-- Some simple notes and background is: we want to compute
+-- table size efficiently, it is better to avoid invoke
+-- pg_relation_size() in serial on QD, since this function
+-- will dispatch for each tuple. The bad pattern SQL is like
+--   select pg_relation_size(oid) from pg_class where xxx
+-- The idea is force pg_relations_size is evaluated on each
+-- segment and the sum the result together to get the final
+-- result. To make sure correctness, we have to evaluate
+-- pg_relation_size before any motion. The skill here is
+-- to wrap this in a subquery, due to volatile of pg_relation_size,
+-- this subquery won't be pulled up. Plus the skill of
+-- gp_dist_random('pg_class') we can achieve this goal.
+
+-- the below test is to verify the plan, we should see pg_relation_size
+-- is evaludated on each segment and then motion then sum together. The
+-- SQL pattern is a catalog join a table size "dict".
+
+set gp_enable_multiphase_agg = on;
+-- force nestloop join to make test stable since we
+-- are testing plan and do not care about where we
+-- put hash table.
+set enable_hashjoin = off;
+set enable_nestloop = on;
+set enable_indexscan = off;
+set enable_bitmapscan = off;
+
+explain (verbose on, costs off)
+with cte(table_oid, size) as
+(
+   select
+     table_oid,
+     sum(size) size
+   from (
+     select oid,
+          pg_relation_size(oid)
+     from gp_dist_random('pg_class')
+   ) x(table_oid, size)
+  group by table_oid
+)
+select pc.relname, ts.size
+from pg_class pc, cte ts
+where pc.oid = ts.table_oid;
+
+set gp_enable_multiphase_agg = off;
+
+explain (verbose on, costs off)
+with cte(table_oid, size) as
+(
+   select
+     table_oid,
+     sum(size) size
+   from (
+     select oid,
+          pg_relation_size(oid)
+     from gp_dist_random('pg_class')
+   ) x(table_oid, size)
+  group by table_oid
+)
+select pc.relname, ts.size
+from pg_class pc, cte ts
+where pc.oid = ts.table_oid;
+
+reset gp_enable_multiphase_agg;
+reset enable_hashjoin;
+reset enable_nestloop;
+reset enable_indexscan;
+reset enable_bitmapscan;
+create table sublink_outer_table(a int, b int) distributed by(b);
+create table sublink_inner_table(x int, y bigint) distributed by(y);
+
+set optimizer to off;
+explain select t.* from sublink_outer_table t join (select y ,10*avg(x) s from sublink_inner_table group by y) RR on RR.y = t.b and t.a > rr.s;
+explain select * from sublink_outer_table T where a > (select 10*avg(x) from sublink_inner_table R where T.b=R.y);
+
+set enable_hashagg to off;
+explain select t.* from sublink_outer_table t join (select y ,10*avg(x) s from sublink_inner_table group by y) RR on RR.y = t.b and t.a > rr.s;
+explain select * from sublink_outer_table T where a > (select 10*avg(x) from sublink_inner_table R where T.b=R.y);
+drop table sublink_outer_table;
+drop table sublink_inner_table;
+reset optimizer;
+reset enable_hashagg;
+
+-- Ensure sub-queries with order by outer reference can be decorrelated and executed correctly.
+create table r(a int, b int, c int) distributed by (a);
+create table s(a int, b int, c int) distributed by (a);
+insert into r values (1,2,3);
+insert into s values (1,2,10);
+explain (costs off) select * from r where b in (select b from s where c=10 order by r.c);
+select * from r where b in (select b from s where c=10 order by r.c);
+explain (costs off) select * from r where b in (select b from s where c=10 order by r.c limit 2);
+select * from r where b in (select b from s where c=10 order by r.c limit 2);
+explain (costs off) select * from r where b in (select b from s where c=10 order by r.c, b);
+select * from r where b in (select b from s where c=10 order by r.c, b);
+explain (costs off) select * from r where b in (select b from s where c=10 order by r.c, b limit 2);
+select * from r where b in (select b from s where c=10 order by r.c, b limit 2);
+explain (costs off) select * from r where b in (select b from s where c=10 order by c);
+select * from r where b in (select b from s where c=10 order by c);
+explain (costs off) select * from r where b in (select b from s where c=10 order by c limit 2);
+select * from r where b in (select b from s where c=10 order by c limit 2);
+
+-- Test nested query with aggregate inside a sublink,
+-- ORCA should correctly normalize the aggregate expression inside the
+-- sublink's nested query and the column variable accessed in aggregate should
+-- be accessible to the aggregate after the normalization of query.
+-- If the query is not supported, ORCA should gracefully fallback to postgres
+explain (COSTS OFF) with t0 AS (
+    SELECT
+       ROW_TO_JSON((SELECT x FROM (SELECT max(t.b)) x))
+       AS c
+    FROM r
+        JOIN s ON true
+        JOIN s as t ON  true
+   )
+SELECT c FROM t0;
+
+-- Test push predicate into subquery
+-- more details could be found at https://github.com/greenplum-db/gpdb/issues/8429
+CREATE TABLE foo_predicate_pushdown (a int, b  int);
+CREATE TABLE bar_predicate_pushdown (c int, d int);
+explain (costs off) select * from (   
+ select distinct (select bar.c from bar_predicate_pushdown bar where c = foo.b) as ss from foo_predicate_pushdown foo
+) ABC where ABC.ss = 5;
+DROP TABLE foo_predicate_pushdown;
+DROP TABLE bar_predicate_pushdown;
+
+--
+-- Test case for ORCA semi join with random table
+-- See https://github.com/greenplum-db/gpdb/issues/16611
+--
+--- case for random distribute 
+create table table_left (l1 int, l2 int) distributed by (l1);
+create table table_right (r1 int, r2 int) distributed randomly;
+create index table_right_idx on table_right(r1);
+insert into table_left values (1,1);
+insert into table_right select i, i from generate_series(1, 300) i;
+insert into table_right select 1, 1 from generate_series(1, 100) i;
+
+--- make sure the same value (1,1) rows are inserted into different segments
+select count(distinct gp_segment_id) > 1 from table_right where r1 = 1;
+analyze table_left;
+analyze table_right;
+
+-- two types of semi join tests
+explain (costs off) select * from table_left where exists (select 1 from table_right where l1 = r1);
+select * from table_left where exists (select 1 from table_right where l1 = r1);
+explain (costs off) select * from table_left where l1 in (select r1 from table_right);
+select * from table_left where exists (select 1 from table_right where l1 = r1);
+
+--- case for replicate distribute
+alter table table_right set distributed replicated;
+explain (costs off) select * from table_left where exists (select 1 from table_right where l1 = r1);
+select * from table_left where exists (select 1 from table_right where l1 = r1);
+explain (costs off) select * from table_left where l1 in (select r1 from table_right);
+select * from table_left where exists (select 1 from table_right where l1 = r1);
+
+--- case for partition table with random distribute
+drop table table_right;
+create table table_right (r1 int, r2 int) distributed randomly partition by range (r1) ( start (0) end (300) every (100));
+create index table_right_idx on table_right(r1);
+insert into table_right select i, i from generate_series(1, 299) i;
+insert into table_right select 1, 1 from generate_series(1, 100) i;
+analyze table_right;
+explain (costs off) select * from table_left where exists (select 1 from table_right where l1 = r1);
+select * from table_left where exists (select 1 from table_right where l1 = r1);
+explain (costs off) select * from table_left where l1 in (select r1 from table_right);
+select * from table_left where exists (select 1 from table_right where l1 = r1);
+
+-- clean up
+drop table table_left;
+drop table table_right;
+-- test cross params of initplan
+-- https://github.com/greenplum-db/gpdb/issues/16268
+create table tmp (a varchar, b varchar, c varchar);
+select (SELECT EXISTS
+                 (SELECT
+                  FROM pg_views
+                  WHERE schemaname = a)) from tmp;
+drop table tmp;
+
+-- Test LEAST() and GREATEST() with an embedded subquery
+drop table if exists foo;
+
+create table foo (a int, b int) distributed by(a);
+insert into foo values (1, 2), (2, 3), (3, 4);
+analyze foo;
+
+explain (costs off) select foo.a from foo where foo.a <= LEAST(foo.b, (SELECT 1), NULL);
+select foo.a from foo where foo.a <= LEAST(foo.b, (SELECT 1), NULL);
+
+explain (costs off) select foo.a from foo where foo.a <= GREATEST(foo.b, (SELECT 1), NULL);
+select foo.a from foo where foo.a <= GREATEST(foo.b, (SELECT 1), NULL);
+
+explain (costs off) select least((select 5), greatest(b, NULL, (select 1)), a) from foo;
+select least((select 5), greatest(b, NULL, (select 1)), a) from foo;
+
+drop table foo;
+-- Test subquery within ScalarArrayRef or ScalarArrayRefIndexList
+drop table if exists bar;
+
+create table bar (a int[], b int[][]) distributed by(a);
+insert into bar values (ARRAY[1, 2, 3], ARRAY[[1, 2, 3], [4, 5, 6]]);
+analyze bar;
+
+explain (costs off) select (select a from bar)[1] from bar;
+select (select a from bar)[1] from bar;
+
+explain (costs off) select (select a from bar)[(select 1)] from bar;
+select (select a from bar)[(select 1)] from bar;
+
+explain (costs off) select (select b from bar)[1][1:3] from bar;
+select (select b from bar)[1][1:3] from bar;
+
+explain (costs off) select (select b from bar)[(select 1)][1:3] from bar;
+select (select b from bar)[(select 1)][1:3] from bar;
+drop table bar;
+
+create table outer_foo(a int primary key, b int);
+create table inner_bar(a int, b int) distributed randomly;
+insert into outer_foo values (generate_series(1,20), generate_series(11,30));
+insert into inner_bar values (generate_series(1,20), generate_series(25,44));
+set optimizer to off;
+explain (costs off) select t1.a from outer_foo t1,  LATERAL(SELECT  distinct t2.a from inner_bar t2 where t1.b=t2.b) q order by 1;
+explain (costs off) select t1.a from outer_foo t1,  LATERAL(SELECT  distinct t2.a from inner_bar t2 where t1.b=t2.b) q;
+select t1.a from outer_foo t1,  LATERAL(SELECT  distinct t2.a from inner_bar t2 where t1.b=t2.b) q order by 1;
+
+create table t(a int, b int);
+explain (costs off) with cte(x) as (select t1.a from outer_foo t1, LATERAL(SELECT distinct t2.a from inner_bar t2 where t1.b=t2.b) q order by 1)
+select * from t where a > (select count(1) from cte where x > t.a + random());
+
+with cte(x) as (select t1.a from outer_foo t1, LATERAL(SELECT distinct t2.a from inner_bar t2 where t1.b=t2.b) q order by 1)
+select * from t where a > (select count(1) from cte where x > t.a + random());
+
+reset optimizer;
+drop table outer_foo;
+drop table inner_bar;
+drop table t;

@@ -4,6 +4,13 @@ set search_path=bfv_aggregate;
 --
 -- Window function with outer references in PARTITION BY/ORDER BY clause
 --
+-- start_matchsubs
+-- m/\(cost=.*\)/
+-- s/\(cost=.*\)//
+--
+-- m/\(slice\d+; segments: \d+\)/
+-- s/\(slice\d+; segments: \d+\)//
+-- end_matchsubs
 
 -- SETUP
 create table x_outer (a int, b int, c int);
@@ -127,16 +134,14 @@ select count_operator('select count(*) from multi_stage_test group by b;','Group
 reset optimizer_segments;
 reset optimizer_force_multistage_agg;
 
---
 -- Testing not picking HashAgg for aggregates without combine functions
---
--- GPDB_12_MERGE_FIXME: The reason that we tested that a HashAggregate is
--- not chosen when an aggregate is missing combine functions is that in
--- GPDB Hybrid Hash Agg, a HashAggregate can spill to disk, and it requires
--- the combine function for that. But that got reverted with the v12 merge.
--- Currently, this does choose a Hash Agg, and as long as we don't do the
--- spilling like we used to, that's OK. But if we resurrect the Hybrid Hash
--- Agg spilling, then this test becomes relevant again.
+
+-- In previous version, a HashAggregate is not chosen when an aggregate misses
+-- combine functions in GPDB Hybrid Hash Agg. HashAggregate can spill to disk,
+-- and it requires the combine function for that(combine function is used to
+-- deserialize the aggregate states loaded from the spill file). But that got
+-- reverted in current version. Currently, this does choose a Hash Agg, because
+-- we spill the raw tuple rather than transvalue to disk now.
 
 -- SETUP
 set optimizer_print_missing_stats = off;
@@ -182,7 +187,7 @@ select string_agg(b, '') over (partition by a) from foo order by 1;
 select string_agg(b, '') over (partition by a,b) from foo order by 1;
 -- should not fall back
 select max(b) over (partition by a) from foo order by 1;
-select count_operator('select max(b) over (partition by a) from foo order by 1;', 'Pivotal Optimizer (GPORCA)');
+select count_operator('select max(b) over (partition by a) from foo order by 1;', 'GPORCA');
 -- fall back
 select string_agg(b, '') over (partition by a+1) from foo order by 1;
 select string_agg(b || 'txt', '') over (partition by a) from foo order by 1;
@@ -223,11 +228,13 @@ insert into mtup1 values
 -- to detect duplicate AggRefs, so this starts to get really slow as you add more
 -- aggregates.
 
--- GPDB_12_MERGE_FIXME: we use MinimalTuples in Motions now, and a MinimalTuple
--- has a limit of 1600 columns. With the default plan, you now get an error from
--- exceeding that limit. Are we OK with that limitation? Does the single-phase
--- plan exercise the original bug?
+-- we use MinimalTuples in Motions now, and the support for passing around MemTuples
+-- in TupleTableSlots was removed, so it no longer can exercise the original bug.
+-- In GPDB6, it generates a multiphase agg plan in default, but it will get an error
+-- from exceeding the limit in GPDB7 with that plan(a MinimalTuple has a limit of 1600
+-- columns). So set the parameter to off to prevent error happens.
 set gp_enable_multiphase_agg=off;
+set optimizer_force_multistage_agg=off;
 
 
 select c0, c1, array_length(ARRAY[
@@ -1368,6 +1375,7 @@ select c0, c1, array_length(ARRAY[
  SUM(c4 % 5670), SUM(c4 % 5671)], 1)
 from mtup1 where c0 = 'foo' group by c0, c1 limit 10;
 
+reset optimizer_force_multistage_agg;
 reset gp_enable_multiphase_agg;
 
 -- MPP-29042 Multistage aggregation plans should have consistent targetlists in
@@ -1398,9 +1406,9 @@ select array_agg(a order by b desc nulls first) from aggordertest;
 select array_agg(a order by b desc nulls last) from aggordertest;
 
 -- begin MPP-14125: if combine function is missing, do not choose hash agg.
--- GPDB_12_MERGE_FIXME: Like in the 'attribute_table' and 'concat' test earlier in this
--- file, a Hash Agg is currently OK, since we lost the Hybrid Hash Agg spilling
--- code in the merge.
+-- Like in the 'attribute_table' and 'concat' test earlier in this file, a
+-- Hash Agg is currently OK, since we lost the Hybrid Hash Agg spilling code
+-- in the merge.
 create temp table mpp14125 as select repeat('a', a) a, a % 10 b from generate_series(1, 100)a;
 explain select string_agg(a, '') from mpp14125 group by b;
 -- end MPP-14125
@@ -1469,6 +1477,87 @@ select 1, sum(col1) from group_by_const group by 1;
 explain (costs off)
 select 1, median(col1) from group_by_const group by 1;
 select 1, median(col1) from group_by_const group by 1;
+
+-- Test GROUP BY with a RelabelType
+create table tx (c1 text);
+insert into tx values('hello');
+EXPLAIN (COSTS OFF, VERBOSE ON)
+SELECT MIN(tx.c1) FROM tx GROUP BY (tx.c1)::VARCHAR;
+SELECT MIN(tx.c1) FROM tx GROUP BY (tx.c1)::VARCHAR;
+drop table tx;
+
+-- Eliminate unuseful columns of targetlist in multistage-agg
+create table ex1(a int, b int, c int);
+create table ex2(a int, b int, c int);
+insert into ex1 select i,i,i from generate_series(1, 10) i;
+insert into ex2 select i,i,i from generate_series(1, 10) i;
+explain (verbose on, costs off) select ex2.b/2, sum(ex1.a) from ex1, (select a, coalesce(b, 1) b from ex2) ex2 where ex1.a = ex2.a group by ex2.b/2;
+select ex2.b/2, sum(ex1.a) from ex1, (select a, coalesce(b, 1) b from ex2) ex2 where ex1.a = ex2.a group by ex2.b/2;
+explain (verbose on, costs off) SELECT b/2, sum(b) * (b/2) FROM ex1  GROUP BY b/2;
+SELECT b/2, sum(b) * (b/2) FROM ex1  GROUP BY b/2;
+
+-- ORCA should pick singlestage-agg plan when multistage-agg guc is true
+-- and distribution type is universal/replicated
+
+set optimizer_force_multistage_agg to on;
+
+create table t1_replicated(a int, b int, c float, d float) distributed replicated;
+create table t2_replicated(a int, b int) distributed replicated;
+
+explain select distinct b from t1_replicated;
+explain select sum(a), avg(b) from t1_replicated;
+explain select count(distinct b)  from t1_replicated group by a;
+explain select a, sum(mc) from (select a, b, max(c) mc from t1_replicated group by a,b) t group by a;
+explain SELECT t1.a, sum(c) from t1_replicated as t1 join t2_replicated as t2 on t1.a = t2.a group by t1.a;
+explain select count(a) from t1_replicated where c < (select sum(b) from t2_replicated);
+
+explain SELECT DISTINCT g%10 FROM generate_series(0, 100) g;
+explain select count(*) from generate_series(0, 100) g;
+explain select g%10 as c1, sum(g::numeric)as c2, count(*) as c3 from generate_series(1, 99) g group by g%10;
+
+reset optimizer_force_multistage_agg;
+
+-- Test if Motion is placed between the "group by clauses"
+drop table if exists t;
+create table t(a int, b int, c int) distributed by (a);
+insert into t select 1, i, i from generate_series(1, 10)i;
+insert into t select 1, i, i from generate_series(1, 10)i;
+insert into t select 1, i, i from generate_series(1, 10)i;
+insert into t select 1, i, i from generate_series(1, 10)i;
+analyze t;
+
+explain (costs off) select count(distinct(b)), gp_segment_id from t group by gp_segment_id;
+select count(distinct(b)), gp_segment_id from t group by gp_segment_id;
+
+drop table t;
+
+-- Test defferral keyword on primary/unique key
+-- When the grouping columns include a key, the GbAgg operator can be transformed to a Select,
+-- resulting in the dropping of grouping columns. However, it is important to note that if a primary
+-- or unique key has the deferral keyword, ORCA should not optimize (drop grouping columns) in such cases.
+
+drop table if exists t1, t2, t3, t4, t5, t6;
+create table t1 (a int, b int, c int, primary key(a, b));
+create table t2 (a int, b int, c int, primary key(a, b) deferrable);
+create table t3 (a int, b int, c int, primary key(a, b) deferrable initially deferred);
+create table t4 (a int, b int, c int, unique(a, b));
+create table t5 (a int, b int, c int, unique(a, b) deferrable);
+create table t6 (a int, b int, c int, unique(a, b) deferrable initially deferred);
+
+explain (costs off) select * from t1 group by a, b, c;
+explain (costs off) select * from t2 group by a, b, c;
+explain (costs off) select * from t3 group by a, b, c;
+explain (costs off) select * from t4 group by a, b, c;
+explain (costs off) select * from t5 group by a, b, c;
+explain (costs off) select * from t6 group by a, b, c;
+explain (costs off) with cte1 as (select * from t3 group by a, b, c) select * from cte1;
+
+begin;
+insert into t3 values (1, 1, 1), (1, 1, 1), (1, 2, 1), (1, 3, 1), (1, 2, 1);
+select * from t3 group by a, b, c;
+commit;
+
+drop table  t1, t2, t3, t4, t5, t6;
 
 -- CLEANUP
 set client_min_messages='warning';

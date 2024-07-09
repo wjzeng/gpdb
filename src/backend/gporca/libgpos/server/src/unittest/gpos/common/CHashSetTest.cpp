@@ -65,21 +65,20 @@ CHashSetTest::EresUnittest_Basic()
 
 	const ULONG ulCnt = GPOS_ARRAY_SIZE(rgul);
 
-	typedef CHashSet<ULONG_PTR, HashPtr<ULONG_PTR>, Equals<ULONG_PTR>,
-					 CleanupNULL<ULONG_PTR> >
-		UlongPtrHashSet;
+	using UlongPtrHashSet = CHashSet<ULONG_PTR, HashPtr<ULONG_PTR>,
+									 Equals<ULONG_PTR>, CleanupNULL<ULONG_PTR>>;
 
 	UlongPtrHashSet *phs = GPOS_NEW(mp) UlongPtrHashSet(mp, 128);
 	for (ULONG ul = 0; ul < ulCnt; ul++)
 	{
 		BOOL fSuccess GPOS_ASSERTS_ONLY = phs->Insert(&rgul[ul]);
-		GPOS_ASSERT(fSuccess);
+		GPOS_UNITTEST_ASSERT(fSuccess);
 	}
-	GPOS_ASSERT(ulCnt == phs->Size());
+	GPOS_UNITTEST_ASSERT(ulCnt == phs->Size());
 
 	for (ULONG ul = 0; ul < ulCnt; ul++)
 	{
-		GPOS_ASSERT(phs->Contains(&rgul[ul]));
+		GPOS_UNITTEST_ASSERT(phs->Contains(&rgul[ul]));
 	}
 
 	phs->Release();
@@ -105,9 +104,9 @@ CHashSetTest::EresUnittest_Ownership()
 
 	ULONG ulCnt = 256;
 
-	typedef CHashSet<ULONG_PTR, HashPtr<ULONG_PTR>, Equals<ULONG_PTR>,
-					 CleanupDelete<ULONG_PTR> >
-		UlongPtrHashSet;
+	using UlongPtrHashSet =
+		CHashSet<ULONG_PTR, HashPtr<ULONG_PTR>, Equals<ULONG_PTR>,
+				 CleanupDelete<ULONG_PTR>>;
 
 	UlongPtrHashSet *phs = GPOS_NEW(mp) UlongPtrHashSet(mp, 32);
 	for (ULONG ul = 0; ul < ulCnt; ul++)
@@ -116,11 +115,11 @@ CHashSetTest::EresUnittest_Ownership()
 
 		BOOL fSuccess GPOS_ASSERTS_ONLY = phs->Insert(pulp);
 
-		GPOS_ASSERT(fSuccess);
-		GPOS_ASSERT(phs->Contains(pulp));
+		GPOS_UNITTEST_ASSERT(fSuccess);
+		GPOS_UNITTEST_ASSERT(phs->Contains(pulp));
 
 		// can't insert existing keys
-		GPOS_ASSERT(!phs->Insert(pulp));
+		GPOS_UNITTEST_ASSERT(!phs->Insert(pulp));
 	}
 
 	phs->Release();

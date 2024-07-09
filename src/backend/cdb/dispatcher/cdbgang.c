@@ -44,6 +44,9 @@
 
 #include "utils/guc_tables.h"
 
+#include "funcapi.h"
+#include "utils/builtins.h"
+
 /*
  * All QEs are managed by cdb_component_dbs in QD, QD assigned
  * a unique identifier for each QE, when a QE is created, this
@@ -56,9 +59,11 @@
 int			qe_identifier = 0;
 
 /*
- * number of primary segments on this host
+ * Number of primary segments on this host.
+ * Note: This is only set on the segments and not on the coordinator. It is
+ * used primarily by resource groups.
  */
-int			host_segments = 0;
+int			host_primary_segment_count = 0;
 
 /*
  * size of hash table of interconnect connections
@@ -72,8 +77,10 @@ CreateGangFunc pCreateGangFunc = cdbgang_createGang_async;
 
 static bool NeedResetSession = false;
 static Oid	OldTempNamespace = InvalidOid;
+static Oid	OldTempToastNamespace = InvalidOid;
 
-static void resetSessionForPrimaryGangLoss(void);
+/* WaitEventSet for dispatch */
+WaitEventSet *DispWaitSet = NULL;
 
 /*
  * cdbgang_createGang:
@@ -181,6 +188,10 @@ segment_failure_due_to_recovery(const char *error_message)
 	ptr = strstr(error_message, fatal);
 	if ((ptr != NULL) && ptr[fatal_len] == ':')
 	{
+		if (strstr(error_message, _(POSTMASTER_IN_RESET_MSG)))
+		{
+			return true;
+		}
 		if (strstr(error_message, _(POSTMASTER_IN_STARTUP_MSG)))
 		{
 			return true;
@@ -216,6 +227,29 @@ segment_failure_due_to_missing_writer(const char *error_message)
 
 	return false;
 }
+
+#ifdef FAULT_INJECTOR
+bool
+segment_failure_due_to_fault_injector(const char *error_message)
+{
+	char	   *fatal = NULL,
+			   *ptr = NULL;
+	int			fatal_len = 0;
+
+	if (error_message == NULL)
+		return false;
+
+	fatal = _("FATAL");
+	fatal_len = strlen(fatal);
+
+	ptr = strstr(error_message, fatal);
+	if ((ptr != NULL) && ptr[fatal_len] == ':' &&
+		strstr(error_message, "fault triggered"))
+		return true;
+
+	return false;
+}
+#endif
 
 
 /*
@@ -274,7 +308,7 @@ buildGangDefinition(List *segments, SegmentType segmentType)
  * Add one GUC to the option string.
  */
 static void
-addOneOption(StringInfo string, struct config_generic *guc)
+addOneOption(StringInfo option, StringInfo diff, struct config_generic *guc)
 {
 	Assert(guc && (guc->flags & GUC_GPDB_NEED_SYNC));
 	switch (guc->vartype)
@@ -283,52 +317,74 @@ addOneOption(StringInfo string, struct config_generic *guc)
 			{
 				struct config_bool *bguc = (struct config_bool *) guc;
 
-				appendStringInfo(string, " -c %s=%s", guc->name, *(bguc->variable) ? "true" : "false");
+				appendStringInfo(option, " -c %s=%s", guc->name, (bguc->reset_val) ? "true" : "false");
+				if (bguc->reset_val != *bguc->variable)
+					appendStringInfo(diff, " %s=%s", guc->name, *(bguc->variable) ? "true" : "false");
 				break;
 			}
 		case PGC_INT:
 			{
 				struct config_int *iguc = (struct config_int *) guc;
 
-				appendStringInfo(string, " -c %s=%d", guc->name, *iguc->variable);
+				appendStringInfo(option, " -c %s=%d", guc->name, iguc->reset_val);
+				if (iguc->reset_val != *iguc->variable)
+					appendStringInfo(diff, " %s=%d", guc->name, *iguc->variable);
 				break;
 			}
 		case PGC_REAL:
 			{
 				struct config_real *rguc = (struct config_real *) guc;
 
-				appendStringInfo(string, " -c %s=%f", guc->name, *rguc->variable);
+				appendStringInfo(option, " -c %s=%f", guc->name, rguc->reset_val);
+				if (rguc->reset_val != *rguc->variable)
+					appendStringInfo(diff, " %s=%f", guc->name, *rguc->variable);
 				break;
 			}
 		case PGC_STRING:
 			{
+				/*
+				 * We should be more wary about NULL values for GUC string variables.
+				 * See PR #16694 for the details.
+				 */
 				struct config_string *sguc = (struct config_string *) guc;
-				const char *str = *sguc->variable;
+				const char *reset_val = sguc->reset_val ? sguc->reset_val : "";
+				const char *variable = *sguc->variable ? *sguc->variable : "";
 				int			i;
 
-				appendStringInfo(string, " -c %s=", guc->name);
+				appendStringInfo(option, " -c %s=", guc->name);
 
 				/*
 				 * All whitespace characters must be escaped. See
 				 * pg_split_opts() in the backend.
 				 */
-				for (i = 0; str[i] != '\0'; i++)
+				for (i = 0; reset_val[i] != '\0'; i++)
 				{
-					if (isspace((unsigned char) str[i]))
-						appendStringInfoChar(string, '\\');
+					if (isspace((unsigned char) reset_val[i]))
+						appendStringInfoChar(option, '\\');
 
-					appendStringInfoChar(string, str[i]);
+					appendStringInfoChar(option, reset_val[i]);
+				}
+				if (strcmp(reset_val, variable) != 0)
+				{
+					appendStringInfo(diff, " %s=", guc->name);
+					for (i = 0; variable[i] != '\0'; i++)
+					{
+						if (isspace((unsigned char) variable[i]))
+							appendStringInfoChar(diff, '\\');
+
+						appendStringInfoChar(diff, variable[i]);
+					}
 				}
 				break;
 			}
 		case PGC_ENUM:
 			{
 				struct config_enum *eguc = (struct config_enum *) guc;
-				int			value = *eguc->variable;
+				int			value = eguc->reset_val;
 				const char *str = config_enum_lookup_by_value(eguc, value);
 				int			i;
 
-				appendStringInfo(string, " -c %s=", guc->name);
+				appendStringInfo(option, " -c %s=", guc->name);
 
 				/*
 				 * All whitespace characters must be escaped. See
@@ -338,9 +394,21 @@ addOneOption(StringInfo string, struct config_generic *guc)
 				for (i = 0; str[i] != '\0'; i++)
 				{
 					if (isspace((unsigned char) str[i]))
-						appendStringInfoChar(string, '\\');
+						appendStringInfoChar(option, '\\');
 
-					appendStringInfoChar(string, str[i]);
+					appendStringInfoChar(option, str[i]);
+				}
+				if (value != *eguc->variable)
+				{
+					const char *p = config_enum_lookup_by_value(eguc, *eguc->variable);
+					appendStringInfo(diff, " %s=", guc->name);
+					for (i = 0; p[i] != '\0'; i++)
+					{
+						if (isspace((unsigned char) p[i]))
+							appendStringInfoChar(diff, '\\');
+
+						appendStringInfoChar(diff, p[i]);
+					}
 				}
 				break;
 			}
@@ -348,24 +416,46 @@ addOneOption(StringInfo string, struct config_generic *guc)
 }
 
 /*
- * Add GUCs to option string.
+ * Add GUCs to option/diff_options string.
+ *
+ * `options` is a list of reset_val of the GUCs, not the GUC's current value.
+ * `diff_options` is a list of the GUCs' current value. If the GUC is unchanged,
+ * `diff_options` will omit it.
+ *
+ * In process_startup_options(), `options` is used to set the GUCs with
+ * PGC_S_CLIENT as its guc source. Then, `diff_options` is used to set the GUCs
+ * with PGC_S_SESSION as its guc source.
+ *
+ * With PGC_S_CLIENT, SetConfigOption() will set the GUC's reset_val
+ * when processing `options`, so the reset_val of the involved GUCs on all QD
+ * and QEs are the same.
+ *
+ * After applying `diff_options`, the GUCs' current value is set to the same
+ * value as the QD and the reset_val of the GUC will not change.
+ *
+ * At last, both the reset_val and current value of the GUC are consistent,
+ * even after RESET.
+ *
+ * See addOneOption() and process_startup_options() for more details.
  */
-char *
-makeOptions(void)
+void
+makeOptions(char **options, char **diff_options)
 {
 	struct config_generic **gucs = get_guc_variables();
 	int			ngucs = get_num_guc_variables();
 	CdbComponentDatabaseInfo *qdinfo = NULL;
-	StringInfoData string;
+	StringInfoData optionsStr;
+	StringInfoData diffStr;
 	int			i;
 
-	initStringInfo(&string);
+	initStringInfo(&optionsStr);
+	initStringInfo(&diffStr);
 
 	Assert(Gp_role == GP_ROLE_DISPATCH);
 
-	qdinfo = cdbcomponent_getComponentInfo(MASTER_CONTENT_ID); 
-	appendStringInfo(&string, " -c gp_qd_hostname=%s", qdinfo->config->hostip);
-	appendStringInfo(&string, " -c gp_qd_port=%d", qdinfo->config->port);
+	qdinfo = cdbcomponent_getComponentInfo(COORDINATOR_CONTENT_ID); 
+	appendStringInfo(&optionsStr, " -c gp_qd_hostname=%s", qdinfo->config->hostip);
+	appendStringInfo(&optionsStr, " -c gp_qd_port=%d", qdinfo->config->port);
 
 	for (i = 0; i < ngucs; ++i)
 	{
@@ -375,10 +465,11 @@ makeOptions(void)
 			(guc->context == PGC_USERSET ||
 			 guc->context == PGC_BACKEND ||
 			 IsAuthenticatedUserSuperUser()))
-			addOneOption(&string, guc);
+			addOneOption(&optionsStr, &diffStr, guc);
 	}
 
-	return string.data;
+	*options = optionsStr.data;
+	*diff_options = diffStr.data;
 }
 
 /*
@@ -471,7 +562,7 @@ cdbgang_parse_gpqeid_params(struct Port *port pg_attribute_unused(),
 
 	if (gpqeid_next_param(&cp, &np))
 	{
-		host_segments = (int) strtol(cp, NULL, 10);
+		host_primary_segment_count = (int) strtol(cp, NULL, 10);
 	}
 
 	if (gpqeid_next_param(&cp, &np))
@@ -483,7 +574,8 @@ cdbgang_parse_gpqeid_params(struct Port *port pg_attribute_unused(),
 	if (!cp || np)
 		goto bad;
 
-	if (gp_session_id <= 0 || PgStartTime <= 0 || qe_identifier < 0 || host_segments <= 0 || ic_htab_size <= 0)
+	if (gp_session_id <= 0 || PgStartTime <= 0 || qe_identifier < 0 ||
+		host_primary_segment_count <= 0 || ic_htab_size <= 0)
 		goto bad;
 
 	pfree(gpqeid);
@@ -599,26 +691,19 @@ getCdbProcessesForQD(int isPrimary)
 
 	if (!isPrimary)
 	{
-		elog(FATAL, "getCdbProcessesForQD: unsupported request for master mirror process");
+		elog(FATAL, "getCdbProcessesForQD: unsupported request for primary mirror process");
 	}
 
-	qdinfo = cdbcomponent_getComponentInfo(MASTER_CONTENT_ID);
+	qdinfo = cdbcomponent_getComponentInfo(COORDINATOR_CONTENT_ID);
 
-	Assert(qdinfo->config->segindex == -1);
-	Assert(SEGMENT_IS_ACTIVE_PRIMARY(qdinfo));
+	Assert((qdinfo->config->segindex == -1 && SEGMENT_IS_ACTIVE_PRIMARY(qdinfo)) || IS_HOT_STANDBY_QD());
 	Assert(qdinfo->config->hostip != NULL);
 
 	proc = makeNode(CdbProcess);
 
 	/*
-	 * Set QD listener address to the ADDRESS of the master, so the motions that connect to
-	 * the master knows what the interconnect address of the peer is. `adjustMasterRouting()`
-	 * is not necessary, and it could be wrong if the QD/QE on the master binds a single IP
-	 * address for interconnection instead of the wildcard address. Binding the wildcard address
-	 * for interconnection has some flaws:
-	 * 1. All the QD/QE in the same node share the same port space(for a same AF_INET/AF_INET6),
-	 *    which contributes to run out of port.
-	 * 2. When the segments have their own ADDRESS, the connection address could be confusing.
+	 * Set QD listener address to the ADDRESS of the coordinator, so the motions that connect to
+	 * the coordinator knows what the interconnect address of the peer is.
 	 */
 	proc->listenerAddr = pstrdup(qdinfo->config->hostip);
 
@@ -636,6 +721,11 @@ getCdbProcessesForQD(int isPrimary)
 	return list;
 }
 
+/*
+ * This function should not be used in the context of named portals
+ * as it destroys the CdbComponentsContext, which is accessed later
+ * during named portal cleanup.
+ */
 void
 DisconnectAndDestroyAllGangs(bool resetSession)
 {
@@ -667,81 +757,72 @@ DisconnectAndDestroyAllGangs(bool resetSession)
  * Destroy all idle (i.e available) QEs.
  * It is always safe to get rid of the reader QEs.
  *
- * If we are not in a transaction and we do not have a TempNamespace, destroy
- * writer QEs as well.
- *
  * call only from an idle session.
  */
 void DisconnectAndDestroyUnusedQEs(void)
 {
-	if (IsTransactionOrTransactionBlock() || TempNamespaceOidIsValid())
-	{
-		/*
-		 * If we are in a transaction, we can't release the writer gang,
-		 * as this will abort the transaction.
-		 *
-		 * If we have a TempNameSpace, we can't release the writer gang, as this
-		 * would drop any temp tables we own.
-		 *
-		 * Since we are idle, any reader gangs will be available but not allocated.
-		 */
-		cdbcomponent_cleanupIdleQEs(false);
-	}
-	else
-	{
-		/*
-		 * Get rid of ALL gangs... Readers and primary writer.
-		 * After this, we have no resources being consumed on the segDBs at all.
-		 *
-		 * Our session wasn't destroyed due to an fatal error or FTS action, so
-		 * we don't need to do anything special.  Specifically, we DON'T want
-		 * to act like we are now in a new session, since that would be confusing
-		 * in the log.
-		 *
-		 */
-		cdbcomponent_cleanupIdleQEs(true);
-	}
+	/*
+	 * Only release reader gangs, never writer gang. This helps to avoid the
+	 * shared snapshot collision error on next gang creation from hitting if
+	 * QE processes are slow to exit due to this cleanup.
+	 *
+	 * If we are in a transaction, we can't release the writer gang also, as
+	 * this will abort the transaction.
+	 *
+	 * If we have a TempNameSpace, we can't release the writer gang also, as
+	 * this would drop any temp tables we own.
+	 *
+	 * Since we are idle, any reader gangs will be available but not
+	 * allocated.
+	 */
+	cdbcomponent_cleanupIdleQEs(false);
 }
 
 /*
  * Drop any temporary tables associated with the current session and
  * use a new session id since we have effectively reset the session.
- *
- * Call this procedure outside of a transaction.
  */
 void
-CheckForResetSession(void)
+GpDropTempTables(void)
 {
 	int			oldSessionId = 0;
 	int			newSessionId = 0;
 	Oid			dropTempNamespaceOid;
+	Oid			dropTempToastNamespaceOid;
 
-	if (!NeedResetSession)
+	/* No need to reset session or drop temp tables */
+	if (!NeedResetSession && OldTempNamespace == InvalidOid)
 		return;
 
 	/* Do the session id change early. */
-
-	/* If we have gangs, we can't change our session ID. */
-	Assert(!cdbcomponent_qesExist());
-
-	oldSessionId = gp_session_id;
-	ProcNewMppSessionId(&newSessionId);
-
-	gp_session_id = newSessionId;
-	gp_command_count = 0;
-	pgstat_report_sessionid(newSessionId);
-
-	/* Update the slotid for our singleton reader. */
-	if (SharedLocalSnapshotSlot != NULL)
+	if (NeedResetSession)
 	{
-		LWLockAcquire(SharedLocalSnapshotSlot->slotLock, LW_EXCLUSIVE);
-		SharedLocalSnapshotSlot->slotid = gp_session_id;
-		LWLockRelease(SharedLocalSnapshotSlot->slotLock);
+		/* If we have gangs, we can't change our session ID. */
+		Assert(!cdbcomponent_qesExist());
+
+		oldSessionId = gp_session_id;
+		ProcNewMppSessionId(&newSessionId);
+
+		gp_session_id = newSessionId;
+		gp_command_count = 0;
+		pgstat_report_sessionid(newSessionId);
+
+		/* Update the slotid for our singleton reader. */
+		if (SharedLocalSnapshotSlot != NULL)
+		{
+			LWLockAcquire(SharedLocalSnapshotSlot->slotLock, LW_EXCLUSIVE);
+			SharedLocalSnapshotSlot->slotid = gp_session_id;
+			LWLockRelease(SharedLocalSnapshotSlot->slotLock);
+		}
+
+		elog(LOG, "The previous session was reset because its gang was disconnected (session id = %d). "
+			 "The new session id = %d", oldSessionId, newSessionId);
 	}
 
-	elog(LOG, "The previous session was reset because its gang was disconnected (session id = %d). "
-		 "The new session id = %d", oldSessionId, newSessionId);
-
+	/*
+	 * When it's in transaction block, need to bump the session id, e.g. retry COMMIT PREPARED,
+	 * but defer drop temp table to the main loop in PostgresMain().
+	 */
 	if (IsTransactionOrTransactionBlock())
 	{
 		NeedResetSession = false;
@@ -749,14 +830,20 @@ CheckForResetSession(void)
 	}
 
 	dropTempNamespaceOid = OldTempNamespace;
+	dropTempToastNamespaceOid = OldTempToastNamespace;
 	OldTempNamespace = InvalidOid;
+	OldTempToastNamespace = InvalidOid;
 	NeedResetSession = false;
 
 	if (dropTempNamespaceOid != InvalidOid)
 	{
+		MemoryContext oldcontext = CurrentMemoryContext;
+
 		PG_TRY();
 		{
 			DropTempTableNamespaceForResetSession(dropTempNamespaceOid);
+			/* drop pg_temp_N schema entry from pg_namespace */
+			DropTempTableNamespaceEntryForResetSession(dropTempNamespaceOid, dropTempToastNamespaceOid);
 		} PG_CATCH();
 		{
 			/*
@@ -769,15 +856,24 @@ CheckForResetSession(void)
 			}
 
 			EmitErrorReport();
+
+			MemoryContextSwitchTo(oldcontext);
 			FlushErrorState();
+			AbortCurrentTransaction();
 		} PG_END_TRY();
 	}
 }
 
-static void
+void
 resetSessionForPrimaryGangLoss(void)
 {
-	if (ProcCanSetMppSessionId())
+	/*
+ 	 * resetSessionForPrimaryGangLoss could be called twice in a transacion,
+ 	 * we need to use NeedResetSession to double check if we should do the
+ 	 * real work to avoid that OldTempToastNamespace be makred invalid before
+ 	 * cleaning up the temp namespace.
+ 	 */
+	if (ProcCanSetMppSessionId() && !NeedResetSession)
 	{
 		/*
 		 * Not too early.
@@ -793,6 +889,8 @@ resetSessionForPrimaryGangLoss(void)
 		 */
 		if (TempNamespaceOidIsValid())
 		{
+
+			OldTempToastNamespace = GetTempToastNamespace();
 			/*
 			 * Here we indicate we don't have a temporary table namespace
 			 * anymore so all temporary tables of the previous session will be
@@ -808,7 +906,10 @@ resetSessionForPrimaryGangLoss(void)
 				 gp_session_id);
 		}
 		else
+		{
 			OldTempNamespace = InvalidOid;
+			OldTempToastNamespace = InvalidOid;
+		}
 	}
 }
 
@@ -851,12 +952,40 @@ RecycleGang(Gang *gp, bool forceDestroy)
 
 	if (!gp)
 		return;
-
+	/*
+	 *
+	 * Callers of RecycleGang should not throw ERRORs by design. This is
+	 * because RecycleGang is not re-entrant: For example, an ERROR could be
+	 * thrown whilst the gang's segdbDesc is already freed. This would cause
+	 * RecycleGang to be called again during abort processing, giving rise to
+	 * potential double freeing of the gang's segdbDesc.
+	 *
+	 * Thus, we hold off interrupts until the gang is fully cleaned here to prevent
+	 * throwing an ERROR here.
+	 *
+	 * details See github issue: https://github.com/greenplum-db/gpdb/issues/13393
+	 */
+	HOLD_INTERRUPTS();
 	/*
 	 * Loop through the segment_database_descriptors array and, for each
 	 * SegmentDatabaseDescriptor: 1) discard the query results (if any), 2)
 	 * disconnect the session, and 3) discard any connection error message.
 	 */
+#ifdef FAULT_INJECTOR
+	/*
+	 * select * from gp_segment_configuration a, t13393,
+	 * gp_segment_configuration b where a.dbid = t13393.tc1 limit 0;
+	 *
+	 * above sql has 3 gangs, the first and second gangtype is ENTRYDB_READER
+	 * and the third gang is PRIMARY_READER, the second gang will be destroyed.
+	 * inject an interrupt fault during RecycleGang PRIMARY_READER gang.
+	 */
+	if (gp->size >= 3)
+	{
+		SIMPLE_FAULT_INJECTOR("cdbcomponent_recycle_idle_qe_error");
+		CHECK_FOR_INTERRUPTS();
+	}
+#endif
 	for (i = 0; i < gp->size; i++)
 	{
 		SegmentDatabaseDescriptor *segdbDesc = gp->db_descriptors[i];
@@ -865,11 +994,257 @@ RecycleGang(Gang *gp, bool forceDestroy)
 
 		cdbcomponent_recycleIdleQE(segdbDesc, forceDestroy);
 	}
+	RESUME_INTERRUPTS();
 }
 
 void
 ResetAllGangs(void)
 {
 	DisconnectAndDestroyAllGangs(true);
-	CheckForResetSession();
+	GpDropTempTables();
+}
+
+/*
+ * Used by gp_backend_info() to find a single character that represents a
+ * backend type.
+ */
+static char
+backend_type(SegmentDatabaseDescriptor *segdb)
+{
+	if (segdb->identifier == -1)
+	{
+		/* QD backend */
+		return 'Q';
+	}
+	if (segdb->segindex == -1)
+	{
+		/* Entry singleton reader. */
+		return 'R';
+	}
+
+	return (segdb->isWriter ? 'w' : 'r');
+}
+
+/*
+ * qsort comparator for SegmentDatabaseDescriptors. Sorts by descriptor ID.
+ */
+static int
+compare_segdb_id(const void *v1, const void *v2)
+{
+	SegmentDatabaseDescriptor *d1 = (SegmentDatabaseDescriptor *) lfirst(*(ListCell **) v1);
+	SegmentDatabaseDescriptor *d2 = (SegmentDatabaseDescriptor *) lfirst(*(ListCell **) v2);
+
+	return d1->identifier - d2->identifier;
+}
+
+/*
+ * Returns a list of rows, each corresponding to a connected segment backend and
+ * containing information on the role and definition of that backend (e.g. host,
+ * port, PID).
+ *
+ * SELECT * from gp_backend_info();
+ */
+Datum
+gp_backend_info(PG_FUNCTION_ARGS)
+{
+	if (Gp_role != GP_ROLE_DISPATCH)
+		ereport(ERROR, (errcode(ERRCODE_GP_COMMAND_ERROR),
+			errmsg("gp_backend_info() could only be called on QD")));
+
+	/* Our struct for funcctx->user_fctx. */
+	struct func_ctx
+	{
+		List	   *segdbs;		/* the SegmentDatabaseDescriptor entries we will output */
+		ListCell   *curpos;		/* pointer to our current position in .segdbs */
+	};
+
+	FuncCallContext *funcctx;
+	struct func_ctx *user_fctx;
+
+	/* Number of attributes we'll return per row. Must match the catalog. */
+#define BACKENDINFO_NATTR    6
+
+	if (SRF_IS_FIRSTCALL())
+	{
+		/* Standard first-call setup. */
+		MemoryContext         oldcontext;
+		TupleDesc             tupdesc;
+		CdbComponentDatabases *cdbs;
+		int                   i;
+
+		funcctx    = SRF_FIRSTCALL_INIT();
+		oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
+		funcctx->user_fctx = user_fctx = palloc0(sizeof(*user_fctx));
+
+		/* Construct the list of all known segment DB descriptors. */
+		cdbs = cdbcomponent_getCdbComponents();
+
+		for (i = 0; i < cdbs->total_entry_dbs; ++i)
+		{
+			CdbComponentDatabaseInfo *cdbinfo = &cdbs->entry_db_info[i];
+
+			user_fctx->segdbs =
+				list_concat_unique_ptr(user_fctx->segdbs, cdbinfo->activelist);
+			user_fctx->segdbs =
+				list_concat_unique_ptr(user_fctx->segdbs, cdbinfo->freelist);
+		}
+
+		for (i = 0; i < cdbs->total_segment_dbs; ++i)
+		{
+			CdbComponentDatabaseInfo *cdbinfo = &cdbs->segment_db_info[i];
+
+			user_fctx->segdbs =
+				list_concat_unique_ptr(user_fctx->segdbs, cdbinfo->activelist);
+			user_fctx->segdbs =
+				list_concat_unique_ptr(user_fctx->segdbs, cdbinfo->freelist);
+		}
+		/* Fake a segment descriptor to represent the current QD backend */
+		SegmentDatabaseDescriptor *qddesc = palloc0(sizeof(SegmentDatabaseDescriptor));
+		qddesc->segment_database_info = cdbcomponent_getComponentInfo(COORDINATOR_CONTENT_ID);
+		qddesc->segindex = -1;
+		qddesc->conn = NULL;
+		qddesc->motionListener = 0;
+		qddesc->backendPid = MyProcPid;
+		qddesc->whoami = NULL;
+		qddesc->isWriter = false;
+		qddesc->identifier = -1;
+
+		user_fctx->segdbs = lcons(qddesc, user_fctx->segdbs);
+		/*
+		 * For a slightly better default user experience, sort by descriptor ID.
+		 * Users may of course specify their own ORDER BY if they don't like it.
+		 */
+		user_fctx->segdbs = list_qsort(user_fctx->segdbs, compare_segdb_id);
+		user_fctx->curpos = list_head(user_fctx->segdbs);
+
+		/* Create a descriptor for the records we'll be returning. */
+		tupdesc = CreateTemplateTupleDesc(BACKENDINFO_NATTR);
+		TupleDescInitEntry(tupdesc, 1, "id", INT4OID, -1, 0);
+		TupleDescInitEntry(tupdesc, 2, "type", CHAROID, -1, 0);
+		TupleDescInitEntry(tupdesc, 3, "content", INT4OID, -1, 0);
+		TupleDescInitEntry(tupdesc, 4, "host", TEXTOID, -1, 0);
+		TupleDescInitEntry(tupdesc, 5, "port", INT4OID, -1, 0);
+		TupleDescInitEntry(tupdesc, 6, "pid", INT4OID, -1, 0);
+
+		funcctx->tuple_desc = BlessTupleDesc(tupdesc);
+
+		/* Tell the caller how many rows we'll return. */
+		funcctx->max_calls = list_length(user_fctx->segdbs);
+
+		MemoryContextSwitchTo(oldcontext);
+	}
+
+	funcctx = SRF_PERCALL_SETUP();
+
+	/* Construct and return a row for every entry. */
+	if (funcctx->call_cntr < funcctx->max_calls)
+	{
+		Datum                     values[BACKENDINFO_NATTR] = {0};
+		bool nulls[BACKENDINFO_NATTR]                       = {0};
+		HeapTuple                 tuple;
+		SegmentDatabaseDescriptor *dbdesc;
+		CdbComponentDatabaseInfo  *dbinfo;
+
+		user_fctx = funcctx->user_fctx;
+
+		/* Get the next descriptor. */
+		dbdesc = lfirst(user_fctx->curpos);
+		user_fctx->curpos = lnext(user_fctx->curpos);
+
+		/* Fill in the row attributes. */
+		dbinfo = dbdesc->segment_database_info;
+
+		values[0] = Int32GetDatum(dbdesc->identifier);			/* id */
+		values[1] = CharGetDatum(backend_type(dbdesc));	/* type */
+		values[2] = Int32GetDatum(dbdesc->segindex);			/* content */
+
+		if (dbinfo->config->hostname)								/* host */
+			values[3] = CStringGetTextDatum(dbinfo->config->hostname);
+		else
+			nulls[3] = true;
+
+		values[4] = Int32GetDatum(dbinfo->config->port);          /* port */
+		values[5] = Int32GetDatum(dbdesc->backendPid);            /* pid */
+
+		/* Form the new tuple using our attributes and return it. */
+		tuple = heap_form_tuple(funcctx->tuple_desc, values, nulls);
+
+		SRF_RETURN_NEXT(funcctx, HeapTupleGetDatum(tuple));
+	}
+	else
+	{
+		/* Clean up. */
+		user_fctx = funcctx->user_fctx;
+		if (user_fctx)
+		{
+			list_free(user_fctx->segdbs);
+			pfree(user_fctx);
+
+			funcctx->user_fctx = NULL;
+		}
+
+		SRF_RETURN_DONE(funcctx);
+	}
+#undef BACKENDINFO_NATTR
+}
+
+/*
+ * Print the time of create a gang.
+ * if all segDescs of the gang are cached, we regard the gang as reused.
+ * else we print the shortest time and the longest time of estabishing connection to the segDesc.
+ */
+void
+printCreateGangTime(int sliceId, Gang *gang)
+{
+	double	shortestTime = -1, longestTime = -1;
+	int		shortestSegIndex = -1, longestSegIndex = -1;
+	int		size = gang->size;
+	SegmentDatabaseDescriptor *segdbDesc;
+	for (int i = 0; i < size; i++)
+	{
+		segdbDesc = gang->db_descriptors[i];
+		/* the connection of segdbDesc is not cached */
+		if (segdbDesc->establishConnTime != -1)
+		{
+			if (longestTime == -1 || segdbDesc->establishConnTime > longestTime)
+			{
+				longestTime = segdbDesc->establishConnTime;
+				longestSegIndex = segdbDesc->segindex;
+			}
+			if (shortestTime == -1 || segdbDesc->establishConnTime < shortestTime)
+			{
+				shortestTime = segdbDesc->establishConnTime;
+				shortestSegIndex = segdbDesc->segindex;
+			}
+		}
+	}
+
+	/* All the segDescs are cached, and we regard this gang as reused gang. */
+	if (longestTime == -1)
+	{
+		if (sliceId == -1)
+		{
+			elog(INFO, "(Gang) is reused");
+		}
+		else
+		{
+			elog(INFO, "(Slice%d) is reused", sliceId);
+		}
+
+	}
+	else
+	{
+		if (sliceId == -1)
+		{
+			elog(INFO, "The shortest establish conn time: %.2f ms, segindex: %d,\n"
+				"       The longest  establish conn time: %.2f ms, segindex: %d",
+				shortestTime, shortestSegIndex, longestTime, longestSegIndex);
+			}
+		else
+		{
+			elog(INFO, "(Slice%d) The shortest establish conn time: %.2f ms, segindex: %d,\n"
+				 "                The longest  establish conn time: %.2f ms, segindex: %d",
+				sliceId, shortestTime, shortestSegIndex, longestTime, longestSegIndex);
+		}
+	}
 }

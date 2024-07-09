@@ -87,22 +87,22 @@ private:
 	};
 
 	// hash map mapping ULONG -> SConsumerCounter
-	typedef CHashMap<ULONG, SConsumerCounter, gpos::HashValue<ULONG>,
-					 gpos::Equals<ULONG>, CleanupDelete<ULONG>,
-					 CleanupDelete<SConsumerCounter> >
-		UlongToConsumerCounterMap;
+	using UlongToConsumerCounterMap =
+		CHashMap<ULONG, SConsumerCounter, gpos::HashValue<ULONG>,
+				 gpos::Equals<ULONG>, CleanupDelete<ULONG>,
+				 CleanupDelete<SConsumerCounter>>;
 
 	// map iterator
-	typedef CHashMapIter<ULONG, SConsumerCounter, gpos::HashValue<ULONG>,
-						 gpos::Equals<ULONG>, CleanupDelete<ULONG>,
-						 CleanupDelete<SConsumerCounter> >
-		UlongToConsumerCounterMapIter;
+	using UlongToConsumerCounterMapIter =
+		CHashMapIter<ULONG, SConsumerCounter, gpos::HashValue<ULONG>,
+					 gpos::Equals<ULONG>, CleanupDelete<ULONG>,
+					 CleanupDelete<SConsumerCounter>>;
 
 	// hash map mapping ULONG -> UlongToConsumerCounterMap: maps from CTE producer ID to all consumers inside this CTE
-	typedef CHashMap<ULONG, UlongToConsumerCounterMap, gpos::HashValue<ULONG>,
-					 gpos::Equals<ULONG>, CleanupDelete<ULONG>,
-					 CleanupRelease<UlongToConsumerCounterMap> >
-		UlongToProducerConsumerMap;
+	using UlongToProducerConsumerMap =
+		CHashMap<ULONG, UlongToConsumerCounterMap, gpos::HashValue<ULONG>,
+				 gpos::Equals<ULONG>, CleanupDelete<ULONG>,
+				 CleanupRelease<UlongToConsumerCounterMap>>;
 
 	//-------------------------------------------------------------------
 	//	@struct:
@@ -126,6 +126,9 @@ private:
 
 		// is this CTE used
 		BOOL m_fUsed;
+
+		// does CTE have outer references outside CTE? If so, force inlining
+		BOOL m_hasOuterReferences;
 
 	public:
 		// ctors
@@ -160,25 +163,46 @@ private:
 			m_fUsed = false;
 		}
 
+		// mark CTE as used
+		void
+		MarkUsed()
+		{
+			m_fUsed = true;
+		}
+
 		// add given columns to consumers column map
 		void AddConsumerCols(CColRefArray *colref_array);
 
 		// return position of given consumer column in consumer output
 		ULONG UlConsumerColPos(CColRef *colref);
 
+		// check if CTE entry has outer reference
+		BOOL
+		HasOuterReferences() const
+		{
+			return m_hasOuterReferences;
+		}
+
+		// mark cte entry as containing an outer reference
+		void
+		SetHasOuterReferences()
+		{
+			m_hasOuterReferences = true;
+		}
+
 	};	//class CCTEInfoEntry
 
 	// hash maps mapping ULONG -> CCTEInfoEntry
-	typedef CHashMap<ULONG, CCTEInfoEntry, gpos::HashValue<ULONG>,
-					 gpos::Equals<ULONG>, CleanupDelete<ULONG>,
-					 CleanupRelease<CCTEInfoEntry> >
-		UlongToCTEInfoEntryMap;
+	using UlongToCTEInfoEntryMap =
+		CHashMap<ULONG, CCTEInfoEntry, gpos::HashValue<ULONG>,
+				 gpos::Equals<ULONG>, CleanupDelete<ULONG>,
+				 CleanupRelease<CCTEInfoEntry>>;
 
 	// map iterator
-	typedef CHashMapIter<ULONG, CCTEInfoEntry, gpos::HashValue<ULONG>,
-						 gpos::Equals<ULONG>, CleanupDelete<ULONG>,
-						 CleanupRelease<CCTEInfoEntry> >
-		UlongToCTEInfoEntryMapIter;
+	using UlongToCTEInfoEntryMapIter =
+		CHashMapIter<ULONG, CCTEInfoEntry, gpos::HashValue<ULONG>,
+					 gpos::Equals<ULONG>, CleanupDelete<ULONG>,
+					 CleanupRelease<CCTEInfoEntry>>;
 
 	// memory pool
 	CMemoryPool *m_mp;
@@ -226,6 +250,12 @@ public:
 
 	// check if given CTE is used
 	BOOL FUsed(ULONG ulCTEId) const;
+
+	// check if given CTE has outer reference
+	BOOL HasOuterReferences(ULONG ulCTEId) const;
+
+	// mark given cte as containing an outer reference
+	void SetHasOuterReferences(ULONG ulCTEId);
 
 	// increment number of CTE consumers
 	void IncrementConsumers(ULONG ulConsumerId,

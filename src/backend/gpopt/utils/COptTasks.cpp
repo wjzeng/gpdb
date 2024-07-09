@@ -17,6 +17,8 @@
 
 extern "C" {
 #include "cdb/cdbvars.h"
+#include "optimizer/hints.h"
+#include "optimizer/orca.h"
 #include "utils/fmgroids.h"
 #include "utils/guc.h"
 }
@@ -27,6 +29,7 @@ extern "C" {
 #include "gpos/error/CException.h"
 #include "gpos/io/COstreamString.h"
 #include "gpos/memory/CAutoMemoryPool.h"
+#include "gpos/memory/set.h"
 #include "gpos/task/CAutoTraceFlag.h"
 
 #include "gpdbcost/CCostModelGPDB.h"
@@ -39,6 +42,7 @@ extern "C" {
 #include "gpopt/eval/CConstExprEvaluatorDXL.h"
 #include "gpopt/exception.h"
 #include "gpopt/gpdbwrappers.h"
+#include "gpopt/hints/CPlanHint.h"
 #include "gpopt/mdcache/CAutoMDAccessor.h"
 #include "gpopt/mdcache/CMDCache.h"
 #include "gpopt/minidump/CMinidumperUtils.h"
@@ -82,7 +86,20 @@ using namespace gpdbcost;
 #define AUTO_MEM_POOL(amp) CAutoMemoryPool amp(CAutoMemoryPool::ElcExc)
 
 // default id for the source system
-const CSystemId default_sysid(IMDId::EmdidGPDB, GPOS_WSZ_STR_LENGTH("GPDB"));
+const CSystemId default_sysid(IMDId::EmdidGeneral, GPOS_WSZ_STR_LENGTH("GPDB"));
+
+plan_hint_hook_type plan_hint_hook = nullptr;
+
+// Check one-to-one mapping of row hint types
+GPOS_CPL_ASSERT(CRowHint::RVT_ABSOLUTE ==
+					(CRowHint::RowsValueType) RVT_ABSOLUTE,
+				"CRowHint::RVT_ABSOLUTE must equal RVT_ABSOLUTE");
+GPOS_CPL_ASSERT(CRowHint::RVT_ADD == (CRowHint::RowsValueType) RVT_ADD,
+				"CRowHint::RVT_ADD must equal RVT_ADD");
+GPOS_CPL_ASSERT(CRowHint::RVT_SUB == (CRowHint::RowsValueType) RVT_SUB,
+				"CRowHint::RVT_SUB must equal RVT_SUB");
+GPOS_CPL_ASSERT(CRowHint::RVT_MULTI == (CRowHint::RowsValueType) RVT_MULTI,
+				"CRowHint::RVT_MULTI must equal RVT_MULTI");
 
 
 //---------------------------------------------------------------------------
@@ -235,7 +252,7 @@ COptTasks::Execute(void *(*func)(void *), void *func_arg)
 	}
 	GPOS_CATCH_EX(ex)
 	{
-		LogExceptionMessageAndDelete(err_buf, ex.SeverityLevel());
+		LogExceptionMessageAndDelete(err_buf);
 		GPOS_RETHROW(ex);
 	}
 	GPOS_CATCH_END;
@@ -243,18 +260,11 @@ COptTasks::Execute(void *(*func)(void *), void *func_arg)
 }
 
 void
-COptTasks::LogExceptionMessageAndDelete(CHAR *err_buf, ULONG severity_level)
+COptTasks::LogExceptionMessageAndDelete(CHAR *err_buf)
 {
 	if ('\0' != err_buf[0])
 	{
-		int gpdb_severity_level;
-
-		if (severity_level == CException::ExsevDebug1)
-			gpdb_severity_level = DEBUG1;
-		else
-			gpdb_severity_level = LOG;
-
-		elog(gpdb_severity_level, "%s",
+		elog(LOG, "%s",
 			 CreateMultiByteCharStringFromWCString((WCHAR *) err_buf));
 	}
 
@@ -353,7 +363,8 @@ COptTasks::LoadSearchStrategy(CMemoryPool *mp, char *path)
 //
 //---------------------------------------------------------------------------
 COptimizerConfig *
-COptTasks::CreateOptimizerConfig(CMemoryPool *mp, ICostModel *cost_model)
+COptTasks::CreateOptimizerConfig(CMemoryPool *mp, ICostModel *cost_model,
+								 CPlanHint *plan_hints)
 {
 	// get chosen plan number, cost threshold
 	ULLONG plan_id = (ULLONG) optimizer_plan_id;
@@ -373,6 +384,8 @@ COptTasks::CreateOptimizerConfig(CMemoryPool *mp, ICostModel *cost_model)
 	ULONG broadcast_threshold = (ULONG) optimizer_penalize_broadcast_threshold;
 	ULONG push_group_by_below_setop_threshold =
 		(ULONG) optimizer_push_group_by_below_setop_threshold;
+	ULONG xform_bind_threshold = (ULONG) optimizer_xform_bind_threshold;
+	ULONG skew_factor = (ULONG) optimizer_skew_factor;
 
 	return GPOS_NEW(mp) COptimizerConfig(
 		GPOS_NEW(mp)
@@ -382,13 +395,14 @@ COptTasks::CreateOptimizerConfig(CMemoryPool *mp, ICostModel *cost_model)
 							  damping_factor_groupby, MAX_STATS_BUCKETS),
 		GPOS_NEW(mp) CCTEConfig(cte_inlining_cutoff), cost_model,
 		GPOS_NEW(mp)
-			CHint(gpos::int_max /* optimizer_parts_to_force_sort_on_insert */,
-				  join_arity_for_associativity_commutativity,
+			CHint(join_arity_for_associativity_commutativity,
 				  array_expansion_threshold, join_order_threshold,
 				  broadcast_threshold,
 				  false, /* don't create Assert nodes for constraints, we'll
 								      * enforce them ourselves in the executor */
-				  push_group_by_below_setop_threshold),
+				  push_group_by_below_setop_threshold, xform_bind_threshold,
+				  skew_factor),
+		plan_hints,
 		GPOS_NEW(mp) CWindowOids(OID(F_WINDOW_ROW_NUMBER), OID(F_WINDOW_RANK)));
 }
 
@@ -448,6 +462,380 @@ COptTasks::GetCostModel(CMemoryPool *mp, ULONG num_segments)
 	SetCostModelParams(cost_model);
 
 	return cost_model;
+}
+
+
+//---------------------------------------------------------------------------
+//	@function:
+//		GenerateJoinNodes
+//
+//	@doc:
+//		Converts OuterInnerRels into a JoinNode structure
+//---------------------------------------------------------------------------
+CJoinHint::JoinNode *
+GenerateJoinNodes(CMemoryPool *mp, OuterInnerRels *outer_inner,
+				  gpos::set<std::string> &aliases)
+{
+	if (nullptr == outer_inner)
+	{
+		return nullptr;
+	}
+
+	CJoinHint::JoinNode *pair = nullptr;
+
+	if (outer_inner->relation != nullptr)
+	{
+		// Base case: processing outer_inner leaf node
+		char *str_buffer =
+			GPOS_NEW_ARRAY(mp, char, strlen(outer_inner->relation) + 1);
+		memcpy(str_buffer, outer_inner->relation,
+			   strlen(outer_inner->relation));
+		str_buffer[strlen(outer_inner->relation)] = '\0';
+
+		if (aliases.count(std::string(str_buffer)) > 0)
+		{
+			// invalid leading hint if alias is specified more than once
+			return nullptr;
+		}
+		aliases.insert(std::string(str_buffer));
+
+		CWStringConst *alias = GPOS_NEW(mp)
+			CWStringConst(mp, str_buffer /*outer_inner->relation*/);
+
+		GPOS_DELETE_ARRAY(str_buffer);
+
+		pair = GPOS_NEW(mp) CJoinHint::JoinNode(alias);
+	}
+	else if (2 == list_length(outer_inner->outer_inner_pair))
+	{
+		// Recursive case: processing outer_inner branch node
+		CJoinHint::JoinNode *left_joinnode = GenerateJoinNodes(
+			mp,
+			(OuterInnerRels *) lfirst(list_head(outer_inner->outer_inner_pair)),
+			aliases);
+
+		CJoinHint::JoinNode *right_joinnode = GenerateJoinNodes(
+			mp,
+			(OuterInnerRels *) lfirst(
+				lnext(list_head(outer_inner->outer_inner_pair))),
+			aliases);
+
+		if (nullptr == left_joinnode || nullptr == right_joinnode)
+		{
+			// bad input - outer_inner may be malformed
+			CRefCount::SafeRelease(left_joinnode);
+			CRefCount::SafeRelease(right_joinnode);
+			return nullptr;
+		}
+
+		pair = GPOS_NEW(mp) CJoinHint::JoinNode(left_joinnode, right_joinnode,
+												/*is_directed*/ true);
+	}
+	else
+	{
+		// bad user input
+		//
+		// Example: "Leading(((t1 t2)))"
+	}
+
+	return pair;
+}
+
+
+//---------------------------------------------------------------------------
+//	@function:
+//		GenerateJoinNodes
+//
+//	@doc:
+//		Converts List of relation names into a JoinNode structure
+//
+//		Example:
+//			List: [t1 t2 t3 t4]
+//
+//			JoinNode:       .
+//			      x         .
+//			     / \        .
+//			    x  t4       .
+//			   / \          .
+//			  x   t3        .
+//			 / \            .
+//			t2 t1
+//---------------------------------------------------------------------------
+CJoinHint::JoinNode *
+GenerateJoinNodes(CMemoryPool *mp, List *relations)
+{
+	CJoinHint::JoinNode *pair = nullptr;
+
+	gpos::set<std::string> aliases(mp);
+
+	ListCell *l;
+	int count = 0;
+	foreach_with_count(l, relations, count)
+	{
+		char *relation = (char *) lfirst(l);
+		if (aliases.count(std::string(relation)) > 0)
+		{
+			pair->Release();
+			// invalid leading hint if alias is specified more than once
+			return nullptr;
+		}
+		aliases.insert(std::string(relation));
+
+		CWStringConst *alias = GPOS_NEW(mp) CWStringConst(mp, relation);
+
+		if (count == 0)
+		{
+			// As we traverse the input list relations, we build up the
+			// JoinNode pair. The first element is an edge case because there
+			// is no existing JoinNode pair yet.
+			pair = GPOS_NEW(mp) CJoinHint::JoinNode(alias);
+		}
+		else
+		{
+			pair = GPOS_NEW(mp) CJoinHint::JoinNode(
+				pair, GPOS_NEW(mp) CJoinHint::JoinNode(alias),
+				/*is_directed*/ false);
+		}
+	}
+
+	return pair;
+}
+
+
+//---------------------------------------------------------------------------
+//      @function:
+//			COptTasks::GetPlanHints
+//
+//      @doc:
+//			Generate an instance of plan hints by parsing the query tree.
+//
+//---------------------------------------------------------------------------
+CPlanHint *
+COptTasks::GetPlanHints(CMemoryPool *mp, Query *query)
+{
+	HintState *hintstate = nullptr;
+	if (plan_hint_hook != nullptr)
+	{
+		// Calling plan_hint_hook creates pg_hint_plan hint structures
+		// (see optimizer/hints.h).
+		hintstate = (HintState *) plan_hint_hook(query);
+		if (hintstate != nullptr && hintstate->log_level > 0)
+		{
+			GPOS_SET_TRACE(EopttracePrintPgHintPlanLog);
+		}
+	}
+
+	if (nullptr == hintstate)
+	{
+		return nullptr;
+	}
+
+	// Following code translates pg_hint_plan hint structures into ORCA hint
+	// structures (see gpopt/hints/CPlanHint.h).
+
+	CPlanHint *plan_hints = GPOS_NEW(mp) CPlanHint(mp);
+
+	// Translate ScanMethodHint => CScanHint
+	for (int ul = 0; ul < hintstate->num_hints[HINT_TYPE_SCAN_METHOD]; ul++)
+	{
+		ScanMethodHint *scan_hint =
+			(ScanMethodHint *) hintstate->scan_hints[ul];
+		if (nullptr == scan_hint->relname)
+		{
+			continue;
+		}
+
+		CScanHint::EType type = CScanHint::Sentinal;
+		switch (scan_hint->base.hint_keyword)
+		{
+			case HINT_KEYWORD_SEQSCAN:
+			{
+				type = CScanHint::SeqScan;
+				break;
+			}
+			case HINT_KEYWORD_NOSEQSCAN:
+			{
+				type = CScanHint::NoSeqScan;
+				break;
+			}
+			case HINT_KEYWORD_INDEXSCAN:
+			{
+				type = CScanHint::IndexScan;
+				break;
+			}
+			case HINT_KEYWORD_NOINDEXSCAN:
+			{
+				type = CScanHint::NoIndexScan;
+				break;
+			}
+			case HINT_KEYWORD_INDEXONLYSCAN:
+			{
+				type = CScanHint::IndexOnlyScan;
+				break;
+			}
+			case HINT_KEYWORD_NOINDEXONLYSCAN:
+			{
+				type = CScanHint::NoIndexOnlyScan;
+				break;
+			}
+			case HINT_KEYWORD_BITMAPSCAN:
+			{
+				type = CScanHint::BitmapScan;
+				break;
+			}
+			case HINT_KEYWORD_NOBITMAPSCAN:
+			{
+				type = CScanHint::NoBitmapScan;
+				break;
+			}
+			default:
+			{
+				CWStringDynamic *error_message = GPOS_NEW(mp) CWStringDynamic(
+					mp, GPOS_WSZ_LIT("Unsupported plan hint: "));
+				error_message->AppendFormat(GPOS_WSZ_LIT("%s"),
+											scan_hint->base.keyword);
+
+				GPOS_RAISE(gpopt::ExmaGPOPT, gpopt::ExmiUnsupportedOp,
+						   error_message->GetBuffer());
+				break;
+			}
+		}
+
+		CScanHint *hint = plan_hints->GetScanHint(scan_hint->relname);
+		if (nullptr == hint)
+		{
+			StringPtrArray *indexnames = GPOS_NEW(mp) StringPtrArray(mp);
+
+			ListCell *l;
+			foreach (l, scan_hint->indexnames)
+			{
+				char *indexname = (char *) lfirst(l);
+				indexnames->Append(GPOS_NEW(mp) CWStringConst(mp, indexname));
+			}
+
+			hint = GPOS_NEW(mp) CScanHint(
+				mp, GPOS_NEW(mp) CWStringConst(mp, scan_hint->relname),
+				indexnames);
+			plan_hints->AddHint(hint);
+		}
+		hint->AddType(type);
+	}
+
+	// Translate RowsHint => CRowHint
+
+	for (int hint_index = 0; hint_index < hintstate->num_hints[HINT_TYPE_ROWS];
+		 hint_index++)
+	{
+		RowsHint *row_hint = (RowsHint *) hintstate->rows_hints[hint_index];
+
+		StringPtrArray *aliases = GPOS_NEW(mp) StringPtrArray(mp);
+
+		for (int rel_index = 0; rel_index < row_hint->nrels; rel_index++)
+		{
+			aliases->Append(
+				GPOS_NEW(mp) CWStringConst(mp, row_hint->relnames[rel_index]));
+		}
+
+		plan_hints->AddHint(GPOS_NEW(mp) CRowHint(
+			mp, aliases, CDouble(row_hint->rows),
+			(CRowHint::RowsValueType) row_hint->value_type));
+	}
+
+
+	// Translate LeadingHint => CJoinHint
+
+	for (int hint_index = 0;
+		 hint_index < hintstate->num_hints[HINT_TYPE_LEADING]; hint_index++)
+	{
+		LeadingHint *leading_hint =
+			(LeadingHint *) hintstate->leading_hint[hint_index];
+		CJoinHint::JoinNode *joinnode = nullptr;
+
+		if (nullptr != leading_hint->outer_inner)
+		{
+			// is directed
+			gpos::set<std::string> aliases(mp);
+			joinnode =
+				GenerateJoinNodes(mp, leading_hint->outer_inner, aliases);
+			if (nullptr != joinnode)
+			{
+				plan_hints->AddHint(GPOS_NEW(mp) CJoinHint(mp, joinnode));
+			}
+		}
+		else if (nullptr != leading_hint->relations)
+		{
+			// is directed-less
+			joinnode = GenerateJoinNodes(mp, leading_hint->relations);
+			if (nullptr != joinnode)
+			{
+				plan_hints->AddHint(GPOS_NEW(mp) CJoinHint(mp, joinnode));
+			}
+		}
+	}
+
+	for (int hint_index = 0;
+		 hint_index < hintstate->num_hints[HINT_TYPE_JOIN_METHOD]; hint_index++)
+	{
+		JoinMethodHint *joinmethod_hint =
+			(JoinMethodHint *) hintstate->join_hints[hint_index];
+		StringPtrArray *aliasnames = GPOS_NEW(mp) StringPtrArray(mp);
+		for (int relname_index = 0; relname_index < joinmethod_hint->nrels;
+			 relname_index++)
+		{
+			aliasnames->Append(GPOS_NEW(mp) CWStringConst(
+				mp, joinmethod_hint->relnames[relname_index]));
+		}
+
+		CJoinTypeHint::JoinType type = CJoinTypeHint::SENTINEL;
+		switch (joinmethod_hint->base.hint_keyword)
+		{
+			case HINT_KEYWORD_NESTLOOP:
+			{
+				type = CJoinTypeHint::HINT_KEYWORD_NESTLOOP;
+				break;
+			}
+			case HINT_KEYWORD_MERGEJOIN:
+			{
+				type = CJoinTypeHint::HINT_KEYWORD_MERGEJOIN;
+				break;
+			}
+			case HINT_KEYWORD_HASHJOIN:
+			{
+				type = CJoinTypeHint::HINT_KEYWORD_HASHJOIN;
+				break;
+			}
+			case HINT_KEYWORD_NONESTLOOP:
+			{
+				type = CJoinTypeHint::HINT_KEYWORD_NONESTLOOP;
+				break;
+			}
+			case HINT_KEYWORD_NOMERGEJOIN:
+			{
+				type = CJoinTypeHint::HINT_KEYWORD_NOMERGEJOIN;
+				break;
+			}
+			case HINT_KEYWORD_NOHASHJOIN:
+			{
+				type = CJoinTypeHint::HINT_KEYWORD_NOHASHJOIN;
+				break;
+			}
+			default:
+			{
+				CWStringDynamic *error_message = GPOS_NEW(mp) CWStringDynamic(
+					mp, GPOS_WSZ_LIT("Unsupported plan hint: "));
+				error_message->AppendFormat(GPOS_WSZ_LIT("%s"),
+											joinmethod_hint->base.keyword);
+
+				GPOS_RAISE(gpopt::ExmaGPOPT, gpopt::ExmiUnsupportedOp,
+						   error_message->GetBuffer());
+				break;
+			}
+		}
+		CJoinTypeHint *hint = GPOS_NEW(mp) CJoinTypeHint(mp, type, aliasnames);
+		plan_hints->AddHint(hint);
+	}
+
+	return plan_hints;
 }
 
 //---------------------------------------------------------------------------
@@ -519,7 +907,7 @@ COptTasks::OptimizeTask(void *ptr)
 
 		// set up relcache MD provider
 		CMDProviderRelcache *relcache_provider =
-			GPOS_NEW(mp) CMDProviderRelcache(mp);
+			GPOS_NEW(mp) CMDProviderRelcache();
 
 		{
 			// scope for MD accessor
@@ -538,8 +926,9 @@ COptTasks::OptimizeTask(void *ptr)
 				mp, &mda, (Query *) opt_ctxt->m_query);
 
 			ICostModel *cost_model = GetCostModel(mp, num_segments_for_costing);
+			CPlanHint *plan_hints = GetPlanHints(mp, opt_ctxt->m_query);
 			COptimizerConfig *optimizer_config =
-				CreateOptimizerConfig(mp, cost_model);
+				CreateOptimizerConfig(mp, cost_model, plan_hints);
 			CConstExprEvaluatorProxy expr_eval_proxy(mp, &mda);
 			IConstExprEvaluator *expr_evaluator =
 				GPOS_NEW(mp) CConstExprEvaluatorDXL(mp, &mda, &expr_eval_proxy);
@@ -552,15 +941,15 @@ COptTasks::OptimizeTask(void *ptr)
 				query_to_dxl_translator->GetCTEs();
 			GPOS_ASSERT(nullptr != query_output_dxlnode_array);
 
-			BOOL is_master_only =
+			BOOL is_coordinator_only =
 				!optimizer_enable_motions ||
-				(!optimizer_enable_motions_masteronly_queries &&
+				(!optimizer_enable_motions_coordinatoronly_queries &&
 				 !query_to_dxl_translator->HasDistributedTables());
 			// See NoteDistributionPolicyOpclasses() in src/backend/gpopt/translate/CTranslatorQueryToDXL.cpp
 			BOOL use_legacy_opfamilies =
 				(query_to_dxl_translator->GetDistributionHashOpsKind() ==
 				 DistrUseLegacyHashOps);
-			CAutoTraceFlag atf1(EopttraceDisableMotions, is_master_only);
+			CAutoTraceFlag atf1(EopttraceDisableMotions, is_coordinator_only);
 			CAutoTraceFlag atf2(EopttraceUseLegacyOpfamilies,
 								use_legacy_opfamilies);
 
@@ -624,7 +1013,6 @@ COptTasks::OptimizeTask(void *ptr)
 
 		IErrorContext *errctxt = CTask::Self()->GetErrCtxt();
 
-		opt_ctxt->m_should_error_out = ShouldErrorOut(ex);
 		opt_ctxt->m_is_unexpected_failure = IsLoggableFailure(ex);
 		opt_ctxt->m_error_msg =
 			CreateMultiByteCharStringFromWCString(errctxt->GetErrorMsg());
@@ -677,7 +1065,7 @@ COptTasks::PrintMissingStatsWarning(CMemoryPool *mp, CMDAccessor *md_accessor,
 		const ULONG pos = mdid_col_stats->Position();
 		const IMDRelation *rel = md_accessor->RetrieveRel(rel_mdid);
 
-		if (IMDRelation::ErelstorageExternal != rel->RetrieveRelStorageType())
+		if (IMDRelation::ErelstorageForeign != rel->RetrieveRelStorageType())
 		{
 			if (!rel_stats->Contains(rel_mdid))
 			{

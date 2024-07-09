@@ -14,6 +14,7 @@
 #include "gpos/base.h"
 
 #include "gpopt/base/CCastUtils.h"
+#include "gpopt/base/CColRefSetIter.h"
 #include "gpopt/base/CDistributionSpec.h"
 #include "gpopt/base/CDistributionSpecRandom.h"
 #include "gpopt/base/COptCtxt.h"
@@ -21,7 +22,6 @@
 #include "gpopt/metadata/CName.h"
 #include "gpopt/metadata/CTableDescriptor.h"
 #include "gpopt/operators/CPredicateUtils.h"
-
 using namespace gpopt;
 
 
@@ -54,7 +54,8 @@ CPhysicalScan::CPhysicalScan(CMemoryPool *mp, const CName *pnameAlias,
 	}
 	else
 	{
-		m_pds = CPhysical::PdsCompute(m_mp, ptabdesc, pdrgpcrOutput);
+		m_pds = CPhysical::PdsCompute(m_mp, ptabdesc, pdrgpcrOutput,
+									  nullptr /* gp_segment_id */);
 	}
 	ComputeTableStats(m_mp);
 }
@@ -155,8 +156,10 @@ CPhysicalScan::PdsDerive(CMemoryPool *mp, CExpressionHandle &exprhdl) const
 {
 	BOOL fIndexOrBitmapScan =
 		COperator::EopPhysicalIndexScan == Eopid() ||
+		COperator::EopPhysicalIndexOnlyScan == Eopid() ||
 		COperator::EopPhysicalBitmapTableScan == Eopid() ||
 		COperator::EopPhysicalDynamicIndexScan == Eopid() ||
+		COperator::EopPhysicalDynamicIndexOnlyScan == Eopid() ||
 		COperator::EopPhysicalDynamicBitmapTableScan == Eopid();
 	if (fIndexOrBitmapScan && CDistributionSpec::EdtHashed == m_pds->Edt() &&
 		exprhdl.HasOuterRefs())
@@ -254,7 +257,6 @@ CPhysicalScan::ComputeTableStats(CMemoryPool *mp)
 
 	CColRefSet *pcrsHist = GPOS_NEW(mp) CColRefSet(mp);
 	CColRefSet *pcrsWidth = GPOS_NEW(mp) CColRefSet(mp, m_pdrgpcrOutput);
-
 	CMDAccessor *md_accessor = COptCtxt::PoctxtFromTLS()->Pmda();
 	m_pstatsBaseTable =
 		md_accessor->Pstats(mp, m_ptabdesc->MDId(), pcrsHist, pcrsWidth);

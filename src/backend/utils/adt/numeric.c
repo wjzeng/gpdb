@@ -27,6 +27,7 @@
 #include <math.h>
 
 #include "catalog/pg_type.h"
+#include "common/hashfn.h"
 #include "common/int.h"
 #include "funcapi.h"
 #include "lib/hyperloglog.h"
@@ -39,7 +40,6 @@
 #include "utils/builtins.h"
 #include "utils/float.h"
 #include "utils/guc.h"
-#include "utils/hashutils.h"
 #include "utils/int8.h"
 #include "utils/memutils.h"
 #include "utils/numeric.h"
@@ -188,6 +188,7 @@ struct NumericData
  */
 
 #define NUMERIC_DSCALE_MASK			0x3FFF
+#define NUMERIC_DSCALE_MAX			NUMERIC_DSCALE_MASK
 
 #define NUMERIC_SIGN(n) \
 	(NUMERIC_IS_SHORT(n) ? \
@@ -299,48 +300,6 @@ typedef struct
 } NumericSortSupport;
 
 
-/* ----------
- * Fast sum accumulator.
- *
- * NumericSumAccum is used to implement SUM(), and other standard aggregates
- * that track the sum of input values.  It uses 32-bit integers to store the
- * digits, instead of the normal 16-bit integers (with NBASE=10000).  This
- * way, we can safely accumulate up to NBASE - 1 values without propagating
- * carry, before risking overflow of any of the digits.  'num_uncarried'
- * tracks how many values have been accumulated without propagating carry.
- *
- * Positive and negative values are accumulated separately, in 'pos_digits'
- * and 'neg_digits'.  This is simpler and faster than deciding whether to add
- * or subtract from the current value, for each new value (see sub_var() for
- * the logic we avoid by doing this).  Both buffers are of same size, and
- * have the same weight and scale.  In accum_sum_final(), the positive and
- * negative sums are added together to produce the final result.
- *
- * When a new value has a larger ndigits or weight than the accumulator
- * currently does, the accumulator is enlarged to accommodate the new value.
- * We normally have one zero digit reserved for carry propagation, and that
- * is indicated by the 'have_carry_space' flag.  When accum_sum_carry() uses
- * up the reserved digit, it clears the 'have_carry_space' flag.  The next
- * call to accum_sum_add() will enlarge the buffer, to make room for the
- * extra digit, and set the flag again.
- *
- * To initialize a new accumulator, simply reset all fields to zeros.
- *
- * The accumulator does not handle NaNs.
- * ----------
- */
-typedef struct NumericSumAccum
-{
-	int			ndigits;
-	int			weight;
-	int			dscale;
-	int			num_uncarried;
-	bool		have_carry_space;
-	int32	   *pos_digits;
-	int32	   *neg_digits;
-} NumericSumAccum;
-
-
 /*
  * We define our own macros for packing and unpacking abbreviated-key
  * representations for numeric values in order to avoid depending on
@@ -374,16 +333,6 @@ static const NumericVar const_one =
 static const NumericDigit const_two_data[1] = {2};
 static const NumericVar const_two =
 {1, 0, NUMERIC_POS, 0, NULL, (NumericDigit *) const_two_data};
-
-#if DEC_DIGITS == 4 || DEC_DIGITS == 2
-static const NumericDigit const_ten_data[1] = {10};
-static const NumericVar const_ten =
-{1, 0, NUMERIC_POS, 0, NULL, (NumericDigit *) const_ten_data};
-#elif DEC_DIGITS == 1
-static const NumericDigit const_ten_data[1] = {1};
-static const NumericVar const_ten =
-{1, 1, NUMERIC_POS, 0, NULL, (NumericDigit *) const_ten_data};
-#endif
 
 #if DEC_DIGITS == 4
 static const NumericDigit const_zero_point_five_data[1] = {5000};
@@ -571,6 +520,7 @@ static void power_var(const NumericVar *base, const NumericVar *exp,
 					  NumericVar *result);
 static void power_var_int(const NumericVar *base, int exp, NumericVar *result,
 						  int rscale);
+static void power_ten_int(int exp, NumericVar *result);
 
 static int	cmp_abs(const NumericVar *var1, const NumericVar *var2);
 static int	cmp_abs_common(const NumericDigit *var1digits, int var1ndigits,
@@ -2613,13 +2563,20 @@ numeric_mul_opt_error(Numeric num1, Numeric num2, bool *have_error)
 	 * Unlike add_var() and sub_var(), mul_var() will round its result. In the
 	 * case of numeric_mul(), which is invoked for the * operator on numerics,
 	 * we request exact representation for the product (rscale = sum(dscale of
-	 * arg1, dscale of arg2)).
+	 * arg1, dscale of arg2)).  If the exact result has more digits after the
+	 * decimal point than can be stored in a numeric, we round it.  Rounding
+	 * after computing the exact result ensures that the final result is
+	 * correctly rounded (rounding in mul_var() using a truncated product
+	 * would not guarantee this).
 	 */
 	init_var_from_num(num1, &arg1);
 	init_var_from_num(num2, &arg2);
 
 	quick_init_var(&result);
 	mul_var(&arg1, &arg2, &result, arg1.dscale + arg2.dscale);
+
+	if (result.dscale > NUMERIC_DSCALE_MAX)
+		round_var(&result, NUMERIC_DSCALE_MAX);
 
 	res = make_result_opt_error(&result, have_error);
 
@@ -3226,19 +3183,15 @@ numeric_power(PG_FUNCTION_ARGS)
 	/*
 	 * The SQL spec requires that we emit a particular SQLSTATE error code for
 	 * certain error conditions.  Specifically, we don't return a
-	 * divide-by-zero error code for 0 ^ -1.
+	 * divide-by-zero error code for 0 ^ -1.  Raising a negative number to a
+	 * non-integer power must produce the same error code, but that case is
+	 * handled in power_var().
 	 */
 	if (cmp_var(&arg1, &const_zero) == 0 &&
 		cmp_var(&arg2, &const_zero) < 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_ARGUMENT_FOR_POWER_FUNCTION),
 				 errmsg("zero raised to a negative power is undefined")));
-
-	if (cmp_var(&arg1, &const_zero) < 0 &&
-		cmp_var(&arg2, &arg2_trunc) != 0)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_ARGUMENT_FOR_POWER_FUNCTION),
-				 errmsg("a negative number raised to a non-integer power yields a complex result")));
 
 	/*
 	 * Call power_var() to compute and return the result; note it handles
@@ -3600,11 +3553,13 @@ numericvar_to_int32(const NumericVar *var, int32 *result)
 	if (!numericvar_to_int64(var, &val))
 		return false;
 
+	if (unlikely(val < PG_INT32_MIN) || unlikely(val > PG_INT32_MAX))
+		return false;
+
 	/* Down-convert to int4 */
 	*result = (int32) val;
 
-	/* Test for overflow by reverse-conversion. */
-	return ((int64) *result == val);
+	return true;
 }
 
 Datum
@@ -3692,14 +3647,13 @@ numeric_int2(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
 				 errmsg("smallint out of range")));
 
-	/* Down-convert to int2 */
-	result = (int16) val;
-
-	/* Test for overflow by reverse-conversion. */
-	if ((int64) result != val)
+	if (unlikely(val < PG_INT16_MIN) || unlikely(val > PG_INT16_MAX))
 		ereport(ERROR,
 				(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
 				 errmsg("smallint out of range")));
+
+	/* Down-convert to int2 */
+	result = (int16) val;
 
 	PG_RETURN_INT16(result);
 }
@@ -3838,23 +3792,11 @@ numeric_float4(PG_FUNCTION_ARGS)
  * ----------------------------------------------------------------------
  */
 
-typedef struct NumericAggState
-{
-	bool		calcSumX2;		/* if true, calculate sumX2 */
-	MemoryContext agg_context;	/* context we're calculating in */
-	int64		N;				/* count of processed numbers */
-	NumericSumAccum sumX;		/* sum of processed numbers */
-	NumericSumAccum sumX2;		/* sum of squares of processed numbers */
-	int			maxScale;		/* maximum scale seen so far */
-	int64		maxScaleCount;	/* number of values seen with maximum scale */
-	int64		NaNcount;		/* count of NaN values (not included in N!) */
-} NumericAggState;
-
 /*
  * Prepare state data for a numeric aggregate function that needs to compute
  * sum, count and optionally sum of squares of the input.
  */
-static NumericAggState *
+NumericAggState *
 makeNumericAggState(FunctionCallInfo fcinfo, bool calcSumX2)
 {
 	NumericAggState *state;
@@ -3882,7 +3824,7 @@ makeNumericAggState(FunctionCallInfo fcinfo, bool calcSumX2)
  * Like makeNumericAggState(), but allocate the state in the current memory
  * context.
  */
-static NumericAggState *
+NumericAggState *
 makeNumericAggStateCurrentContext(bool calcSumX2)
 {
 	NumericAggState *state;
@@ -3897,7 +3839,7 @@ makeNumericAggStateCurrentContext(bool calcSumX2)
 /*
  * Accumulate a new input value for numeric aggregate functions.
  */
-static void
+void
 do_numeric_accum(NumericAggState *state, Numeric newval)
 {
 	NumericVar	X;
@@ -4110,11 +4052,11 @@ numeric_combine(PG_FUNCTION_ARGS)
 		PG_RETURN_POINTER(state1);
 	}
 
+	state1->N += state2->N;
+	state1->NaNcount += state2->NaNcount;
+
 	if (state2->N > 0)
 	{
-		state1->N += state2->N;
-		state1->NaNcount += state2->NaNcount;
-
 		/*
 		 * These are currently only needed for moving aggregates, but let's do
 		 * the right thing anyway...
@@ -4201,11 +4143,11 @@ numeric_avg_combine(PG_FUNCTION_ARGS)
 		PG_RETURN_POINTER(state1);
 	}
 
+	state1->N += state2->N;
+	state1->NaNcount += state2->NaNcount;
+
 	if (state2->N > 0)
 	{
-		state1->N += state2->N;
-		state1->NaNcount += state2->NaNcount;
-
 		/*
 		 * These are currently only needed for moving aggregates, but let's do
 		 * the right thing anyway...
@@ -4529,19 +4471,12 @@ numeric_accum_inv(PG_FUNCTION_ARGS)
  */
 
 #ifdef HAVE_INT128
-typedef struct Int128AggState
-{
-	bool		calcSumX2;		/* if true, calculate sumX2 */
-	int64		N;				/* count of processed numbers */
-	int128		sumX;			/* sum of processed numbers */
-	int128		sumX2;			/* sum of squares of processed numbers */
-} Int128AggState;
 
 /*
  * Prepare state data for a 128-bit aggregate function that needs to compute
  * sum, count and optionally sum of squares of the input.
  */
-static Int128AggState *
+Int128AggState *
 makeInt128AggState(FunctionCallInfo fcinfo, bool calcSumX2)
 {
 	Int128AggState *state;
@@ -4566,7 +4501,7 @@ makeInt128AggState(FunctionCallInfo fcinfo, bool calcSumX2)
  * Like makeInt128AggState(), but allocate the state in the current memory
  * context.
  */
-static Int128AggState *
+Int128AggState *
 makeInt128AggStateCurrentContext(bool calcSumX2)
 {
 	Int128AggState *state;
@@ -4602,14 +4537,6 @@ do_int128_discard(Int128AggState *state, int128 newval)
 	state->sumX -= newval;
 	state->N--;
 }
-
-typedef Int128AggState PolyNumAggState;
-#define makePolyNumAggState makeInt128AggState
-#define makePolyNumAggStateCurrentContext makeInt128AggStateCurrentContext
-#else
-typedef NumericAggState PolyNumAggState;
-#define makePolyNumAggState makeNumericAggState
-#define makePolyNumAggStateCurrentContext makeNumericAggStateCurrentContext
 #endif
 
 Datum
@@ -5793,12 +5720,6 @@ int8_sum(PG_FUNCTION_ARGS)
  * we need to count the inputs.
  */
 
-typedef struct Int8TransTypeData
-{
-	int64		count;
-	int64		sum;
-} Int8TransTypeData;
-
 Datum
 int2_avg_accum(PG_FUNCTION_ARGS)
 {
@@ -6553,9 +6474,7 @@ static char *
 get_str_from_var_sci(const NumericVar *var, int rscale)
 {
 	int32		exponent;
-	NumericVar	denominator;
-	NumericVar	significand;
-	int			denom_scale;
+	NumericVar	tmp_var;
 	size_t		len;
 	char	   *str;
 	char	   *sig_out;
@@ -6592,25 +6511,16 @@ get_str_from_var_sci(const NumericVar *var, int rscale)
 	}
 
 	/*
-	 * The denominator is set to 10 raised to the power of the exponent.
-	 *
-	 * We then divide var by the denominator to get the significand, rounding
-	 * to rscale decimal digits in the process.
+	 * Divide var by 10^exponent to get the significand, rounding to rscale
+	 * decimal digits in the process.
 	 */
-	if (exponent < 0)
-		denom_scale = -exponent;
-	else
-		denom_scale = 0;
+	init_var(&tmp_var);
 
-	init_var(&denominator);
-	init_var(&significand);
+	power_ten_int(exponent, &tmp_var);
+	div_var(var, &tmp_var, &tmp_var, rscale, true);
+	sig_out = get_str_from_var(&tmp_var);
 
-	power_var_int(&const_ten, exponent, &denominator, denom_scale);
-	div_var(var, &denominator, &significand, rscale, true);
-	sig_out = get_str_from_var(&significand);
-
-	free_var(&denominator);
-	free_var(&significand);
+	free_var(&tmp_var);
 
 	/*
 	 * Allocate space for the result.
@@ -8446,12 +8356,18 @@ exp_var(const NumericVar *arg, NumericVar *result, int rscale)
 	 */
 	val = numericvar_to_double_no_overflow(&x);
 
-	/* Guard against overflow */
+	/* Guard against overflow/underflow */
 	/* If you change this limit, see also power_var()'s limit */
 	if (Abs(val) >= NUMERIC_MAX_RESULT_SCALE * 3)
-		ereport(ERROR,
-				(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
-				 errmsg("value overflows numeric format")));
+	{
+		if (val > 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+					 errmsg("value overflows numeric format")));
+		zero_var(result);
+		result->dscale = rscale;
+		return;
+	}
 
 	/* decimal weight = log10(e^x) = x * log10(e) */
 	dweight = (int) (val * 0.434294481903252);
@@ -8547,11 +8463,19 @@ exp_var(const NumericVar *arg, NumericVar *result, int rscale)
  *
  * Essentially, we're approximating log10(abs(ln(var))).  This is used to
  * determine the appropriate rscale when computing natural logarithms.
+ *
+ * Note: many callers call this before range-checking the input.  Therefore,
+ * we must be robust against values that are invalid to apply ln() to.
+ * We don't wish to throw an error here, so just return zero in such cases.
  */
 static int
 estimate_ln_dweight(const NumericVar *var)
 {
 	int			ln_dweight;
+
+	/* Caller should fail on ln(negative), but for the moment return zero */
+	if (var->sign != NUMERIC_POS)
+		return 0;
 
 	if (cmp_var(var, &const_zero_point_nine) >= 0 &&
 		cmp_var(var, &const_one_point_one) <= 0)
@@ -8796,10 +8720,13 @@ log_var(const NumericVar *base, const NumericVar *num, NumericVar *result)
 static void
 power_var(const NumericVar *base, const NumericVar *exp, NumericVar *result)
 {
+	int			res_sign;
+	NumericVar	abs_base;
 	NumericVar	ln_base;
 	NumericVar	ln_num;
 	int			ln_dweight;
 	int			rscale;
+	int			sig_digits;
 	int			local_rscale;
 	double		val;
 
@@ -8811,10 +8738,7 @@ power_var(const NumericVar *base, const NumericVar *exp, NumericVar *result)
 
 		if (numericvar_to_int64(exp, &expval64))
 		{
-			int			expval = (int) expval64;
-
-			/* Test for overflow by reverse-conversion. */
-			if ((int64) expval == expval64)
+			if (expval64 >= PG_INT32_MIN && expval64 <= PG_INT32_MAX)
 			{
 				/* Okay, select rscale */
 				rscale = NUMERIC_MIN_SIG_DIGITS;
@@ -8822,7 +8746,7 @@ power_var(const NumericVar *base, const NumericVar *exp, NumericVar *result)
 				rscale = Max(rscale, NUMERIC_MIN_DISPLAY_SCALE);
 				rscale = Min(rscale, NUMERIC_MAX_DISPLAY_SCALE);
 
-				power_var_int(base, expval, result, rscale);
+				power_var_int(base, (int) expval64, result, rscale);
 				return;
 			}
 		}
@@ -8839,8 +8763,39 @@ power_var(const NumericVar *base, const NumericVar *exp, NumericVar *result)
 		return;
 	}
 
+	quick_init_var(&abs_base);
 	quick_init_var(&ln_base);
 	quick_init_var(&ln_num);
+
+	/*
+	 * If base is negative, insist that exp be an integer.  The result is then
+	 * positive if exp is even and negative if exp is odd.
+	 */
+	if (base->sign == NUMERIC_NEG)
+	{
+		/*
+		 * Check that exp is an integer.  This error code is defined by the
+		 * SQL standard, and matches other errors in numeric_power().
+		 */
+		if (exp->ndigits > 0 && exp->ndigits > exp->weight + 1)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_ARGUMENT_FOR_POWER_FUNCTION),
+					 errmsg("a negative number raised to a non-integer power yields a complex result")));
+
+		/* Test if exp is odd or even */
+		if (exp->ndigits > 0 && exp->ndigits == exp->weight + 1 &&
+			(exp->digits[exp->ndigits - 1] & 1))
+			res_sign = NUMERIC_NEG;
+		else
+			res_sign = NUMERIC_POS;
+
+		/* Then work with abs(base) below */
+		set_var_from_var(base, &abs_base);
+		abs_base.sign = NUMERIC_POS;
+		base = &abs_base;
+	}
+	else
+		res_sign = NUMERIC_POS;
 
 	/*----------
 	 * Decide on the scale for the ln() calculation.  For this we need an
@@ -8862,9 +8817,13 @@ power_var(const NumericVar *base, const NumericVar *exp, NumericVar *result)
 	 */
 	ln_dweight = estimate_ln_dweight(base);
 
+	/*
+	 * Set the scale for the low-precision calculation, computing ln(base) to
+	 * around 8 significant digits.  Note that ln_dweight may be as small as
+	 * -SHRT_MAX, so the scale may exceed NUMERIC_MAX_DISPLAY_SCALE here.
+	 */
 	local_rscale = 8 - ln_dweight;
 	local_rscale = Max(local_rscale, NUMERIC_MIN_DISPLAY_SCALE);
-	local_rscale = Min(local_rscale, NUMERIC_MAX_DISPLAY_SCALE);
 
 	ln_var(base, &ln_base, local_rscale);
 
@@ -8872,11 +8831,17 @@ power_var(const NumericVar *base, const NumericVar *exp, NumericVar *result)
 
 	val = numericvar_to_double_no_overflow(&ln_num);
 
-	/* initial overflow test with fuzz factor */
+	/* initial overflow/underflow test with fuzz factor */
 	if (Abs(val) > NUMERIC_MAX_RESULT_SCALE * 3.01)
-		ereport(ERROR,
-				(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
-				 errmsg("value overflows numeric format")));
+	{
+		if (val > 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+					 errmsg("value overflows numeric format")));
+		zero_var(result);
+		result->dscale = NUMERIC_MAX_DISPLAY_SCALE;
+		return;
+	}
 
 	val *= 0.434294481903252;	/* approximate decimal result weight */
 
@@ -8887,8 +8852,12 @@ power_var(const NumericVar *base, const NumericVar *exp, NumericVar *result)
 	rscale = Max(rscale, NUMERIC_MIN_DISPLAY_SCALE);
 	rscale = Min(rscale, NUMERIC_MAX_DISPLAY_SCALE);
 
+	/* significant digits required in the result */
+	sig_digits = rscale + (int) val;
+	sig_digits = Max(sig_digits, 0);
+
 	/* set the scale for the real exp * ln(base) calculation */
-	local_rscale = rscale + (int) val - ln_dweight + 8;
+	local_rscale = sig_digits - ln_dweight + 8;
 	local_rscale = Max(local_rscale, NUMERIC_MIN_DISPLAY_SCALE);
 
 	/* and do the real calculation */
@@ -8899,8 +8868,12 @@ power_var(const NumericVar *base, const NumericVar *exp, NumericVar *result)
 
 	exp_var(&ln_num, result, rscale);
 
+	if (res_sign == NUMERIC_NEG && result->ndigits > 0)
+		result->sign = NUMERIC_NEG;
+
 	free_var(&ln_num);
 	free_var(&ln_base);
+	free_var(&abs_base);
 }
 
 /*
@@ -9009,7 +8982,7 @@ power_var_int(const NumericVar *base, int exp, NumericVar *result, int rscale)
 	 * to around log10(abs(exp)) digits, so work with this many extra digits
 	 * of precision (plus a few more for good measure).
 	 */
-	sig_digits += (int) log(Abs(exp)) + 8;
+	sig_digits += (int) log(fabs((double) exp)) + 8;
 
 	/*
 	 * Now we can proceed with the multiplications.
@@ -9077,6 +9050,34 @@ power_var_int(const NumericVar *base, int exp, NumericVar *result, int rscale)
 		div_var_fast(&const_one, result, result, rscale, true);
 	else
 		round_var(result, rscale);
+}
+
+/*
+ * power_ten_int() -
+ *
+ *	Raise ten to the power of exp, where exp is an integer.  Note that unlike
+ *	power_var_int(), this does no overflow/underflow checking or rounding.
+ */
+static void
+power_ten_int(int exp, NumericVar *result)
+{
+	/* Construct the result directly, starting from 10^0 = 1 */
+	set_var_from_var(&const_one, result);
+
+	/* Scale needed to represent the result exactly */
+	result->dscale = exp < 0 ? -exp : 0;
+
+	/* Base-NBASE weight of result and remaining exponent */
+	if (exp >= 0)
+		result->weight = exp / DEC_DIGITS;
+	else
+		result->weight = (exp + 1) / DEC_DIGITS - 1;
+
+	exp -= result->weight * DEC_DIGITS;
+
+	/* Final adjustment of the result's single NBASE digit */
+	while (exp-- > 0)
+		result->digits[0] *= 10;
 }
 
 

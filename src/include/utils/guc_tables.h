@@ -82,7 +82,7 @@ enum config_group
 	WAL_RECOVERY_TARGET,
 	REPLICATION,
 	REPLICATION_SENDING,
-	REPLICATION_MASTER,
+	REPLICATION_PRIMARY,
 	REPLICATION_STANDBY,
 	REPLICATION_SUBSCRIBERS,
 	QUERY_TUNING,
@@ -96,8 +96,7 @@ enum config_group
 	LOGGING_WHAT,
 	PROCESS_TITLE,
 	STATS,
-
-    STATS_ANALYZE,                      /*CDB*/
+	STATS_ANALYZE,                      /*CDB*/
 	STATS_MONITORING,
 	STATS_COLLECTOR,
 	AUTOVACUUM,
@@ -269,6 +268,16 @@ struct config_real
 	void	   *reset_extra;
 };
 
+/*
+ * A note about string GUCs: the boot_val is allowed to be NULL, which leads
+ * to the reset_val and the actual variable value (*variable) also being NULL.
+ * However, there is no way to set a NULL value subsequently using
+ * set_config_option or any other GUC API.  Also, GUC APIs such as SHOW will
+ * display a NULL value as an empty string.  Callers that choose to use a NULL
+ * boot_val should overwrite the setting later in startup, or else be careful
+ * that NULL doesn't have semantics that are visibly different from an empty
+ * string.
+ */
 struct config_string
 {
 	struct config_generic gen;
@@ -314,6 +323,7 @@ extern void build_guc_variables(void);
 extern const char *config_enum_lookup_by_value(struct config_enum *record, int val);
 extern bool config_enum_lookup_by_name(struct config_enum *record,
 									   const char *value, int *retval);
+extern bool is_guc_modified(struct config_generic *conf);
 extern struct config_generic **get_explain_guc_options(int *num);
 
 extern bool parse_int(const char *value, int *result, int flags, const char **hintmsg);

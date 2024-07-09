@@ -68,12 +68,6 @@ private:
 		return (m_is_duplicate_sensitive || !pds->m_is_duplicate_sensitive);
 	}
 
-	// exact match against given hashed distribution
-	BOOL FMatchHashedDistribution(
-		const CDistributionSpecHashed *pdshashed) const;
-
-	BOOL FDistributionSpecHashedOnlyOnGpSegmentId() const;
-
 public:
 	CDistributionSpecHashed(const CDistributionSpecHashed &) = delete;
 
@@ -142,6 +136,10 @@ public:
 	virtual CDistributionSpecHashed *PdshashedExcludeColumns(CMemoryPool *mp,
 															 CColRefSet *pcrs);
 
+	// exact match against given hashed distribution
+	BOOL FMatchHashedDistribution(
+		const CDistributionSpecHashed *pdshashed) const;
+
 	// does this distribution match the given one
 	BOOL Matches(const CDistributionSpec *pds) const override;
 
@@ -159,6 +157,9 @@ public:
 	CDistributionSpec *PdsCopyWithRemappedColumns(
 		CMemoryPool *mp, UlongToColRefMap *colref_mapping,
 		BOOL must_exist) override;
+
+	// strip off any equivalent columns embedded in the distribution spec
+	CDistributionSpec *StripEquivColumns(CMemoryPool *) override;
 
 	// append enforcers to dynamic array for the given plan properties
 	void AppendEnforcers(CMemoryPool *mp, CExpressionHandle &exprhdl,
@@ -223,10 +224,13 @@ public:
 	// create a copy of the distribution spec
 	CDistributionSpecHashed *Copy(CMemoryPool *mp);
 
+	// create a copy of the distribution spec with given nulls colocated value
+	CDistributionSpecHashed *Copy(CMemoryPool *mp, BOOL fNullsColocated);
+
 	// get distribution expr array from the current and its equivalent spec
 	CExpressionArrays *GetAllDistributionExprs(CMemoryPool *mp);
 
-	// return a new spec created after merging the current spec with the input spec as equivalents
+	// return a new spec created by merging the current with the input spec
 	CDistributionSpecHashed *Combine(CMemoryPool *mp,
 									 CDistributionSpecHashed *other_spec);
 

@@ -172,11 +172,11 @@ get_major_server_version(ClusterInfo *cluster)
 	snprintf(ver_filename, sizeof(ver_filename), "%s/PG_VERSION",
 			 cluster->pgdata);
 	if ((version_fd = fopen(ver_filename, "r")) == NULL)
-		pg_fatal("could not open version file: %s\n", ver_filename);
+		pg_fatal("could not open version file \"%s\": %m\n", ver_filename);
 
 	if (fscanf(version_fd, "%63s", cluster->major_version_str) == 0 ||
 		sscanf(cluster->major_version_str, "%d.%d", &v1, &v2) < 1)
-		pg_fatal("could not parse PG_VERSION file from %s\n", cluster->pgdata);
+		pg_fatal("could not parse version file \"%s\"\n", ver_filename);
 
 	fclose(version_fd);
 
@@ -228,52 +228,46 @@ start_postmaster(ClusterInfo *cluster, bool report_and_exit_on_error)
 	if (cluster->sockdir)
 		snprintf(socket_string + strlen(socket_string),
 				 sizeof(socket_string) - strlen(socket_string),
-				 " -c %s='%s'",
-				 (GET_MAJOR_VERSION(cluster->major_version) < 903) ?
-				 "unix_socket_directory" : "unix_socket_directories",
+				 " -c unix_socket_directories='%s'",
 				 cluster->sockdir);
 #endif
 
 	/*
-	 * Since PG 9.1, we have used -b to disable autovacuum.  For earlier
-	 * releases, setting autovacuum=off disables cleanup vacuum and analyze,
-	 * but freeze vacuums can still happen, so we set
-	 * autovacuum_freeze_max_age to its maximum.
-	 * (autovacuum_multixact_freeze_max_age was introduced after 9.1, so there
-	 * is no need to set that.)  We assume all datfrozenxid and relfrozenxid
-	 * values are less than a gap of 2000000000 from the current xid counter,
-	 * so autovacuum will not touch them.
+	 * Use -b to disable autovacuum.
 	 *
 	 * Turn off durability requirements to improve object creation speed, and
 	 * we only modify the new cluster, so only use it there.  If there is a
 	 * crash, the new cluster has to be recreated anyway.  fsync=off is a big
 	 * win on ext4.
+	 *
+	 * Force vacuum_defer_cleanup_age to 0 on the new cluster, so that
+	 * vacuumdb --freeze actually freezes the tuples.
 	 */
 	char *version_opts = "";
 	if (GET_MAJOR_VERSION(cluster->major_version) >= 904)
-		version_opts = "-c synchronous_standby_names='' --xid_warn_limit=10000000";
+		version_opts = " -c synchronous_standby_names='' --xid_warn_limit=10000000";
 	else
 	{
 		if (is_greenplum_dispatcher_mode())
 			version_opts =
-				"-c gp_dbid=1 -c gp_contentid=-1 -c gp_num_contents_in_cluster=1";
+				" -c gp_dbid=1 -c gp_contentid=-1 -c gp_num_contents_in_cluster=1";
 		else
 			version_opts =
-				"-c gp_dbid=1 -c gp_contentid=0 -c gp_num_contents_in_cluster=1";
+				" -c gp_dbid=1 -c gp_contentid=0 -c gp_num_contents_in_cluster=1";
 	}
 
 	snprintf(cmd, sizeof(cmd),
-			 "\"%s/pg_ctl\" -w -l \"%s\" -D \"%s\" -o \"-p %d -c %s %s%s %s%s %s\" start",
-			 cluster->bindir, SERVER_LOG_FILE, cluster->pgconfig, cluster->port,
-			 (GET_MAJOR_VERSION(cluster->major_version) < 1200) ?
-			 "gp_session_role=utility" :
-			 "gp_role=utility",
-			 (cluster->controldata.cat_ver >=
-			  BINARY_UPGRADE_SERVER_FLAG_CAT_VER) ? " -b" :
-			 " -c autovacuum=off -c autovacuum_freeze_max_age=2000000000",
-			 (cluster == &new_cluster) ?
-			 " -c synchronous_commit=off -c fsync=off -c full_page_writes=off" : "",
-			 cluster->pgopts ? cluster->pgopts : "", socket_string, version_opts);
+			 "\"%s/pg_ctl\" -w -l \"%s/%s\" -D \"%s\" -o \"-p %d -c %s -b%s %s %s%s\" start",
+			 cluster->bindir,
+			 log_opts.logdir,
+			 SERVER_LOG_FILE,
+			 cluster->pgconfig,
+			 cluster->port,
+			 (GET_MAJOR_VERSION(cluster->major_version) < 1200) ? "gp_session_role=utility" : "gp_role=utility",
+			 (cluster == &new_cluster) ? " -c synchronous_commit=off -c fsync=off -c full_page_writes=off -c vacuum_defer_cleanup_age=0" : "",
+			 cluster->pgopts ? cluster->pgopts : "", 
+			 socket_string, 
+			 version_opts);
 
 	/*
 	 * Don't throw an error right away, let connecting throw the error because

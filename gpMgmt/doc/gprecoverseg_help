@@ -9,11 +9,13 @@ Synopsis
 
 gprecoverseg [-p <new_recover_host>[,...]]
              |-i <recover_config_file> 
-             [-d <coordinator_data_directory>] [-B <parallel_processes>] 
+             [-d <coordinator_data_directory>]
+             [-B <batch_size>] [-b <segment_batch_size>] [--differential]
              [-F] [-a] [-q] [-s] [--no-progress] [-l <logfile_directory>]
+             [--max-rate <max_rate>]
 
 
-gprecoverseg -r
+gprecoverseg -r [--replay-lag <replay_lag>] [--disable-replay-lag]
 
 
 gprecoverseg -o <output_recover_config_file> 
@@ -67,7 +69,14 @@ The word SPACE indicates the location of a required space. Do not
 add additional spaces.
 
 <failed_host_address>|<port>|<data_directory>SPACE
-[<recovery_host_address>|<port>|<data_directory>
+[<recovery_host_address>|<port>|<data_directory>]
+
+If hostname is not provided, host-address will be populated in the
+configuration. In case you want to have different hostname and address,
+hostname can be specified in the recovery configuration, the format
+for the config file is as follows:
+<failed_host_name>|<failed_host_address>|<port>|<data_directory>SPACE
+[<recovery_host_name>|<recovery_host_address>|<port>|<data_directory>]
 
 See the -i option below for details and examples of a recovery
 configuration file.
@@ -109,11 +118,19 @@ OPTIONS
 Do not prompt the user for confirmation.
 
 
--B parallel_processes
+-B batch_size
 
-The number of segments to recover in parallel. If not specified, 
-the utility will start up to 16 parallel processes depending 
-on how many segment instances it needs to recover.
+The number of hosts to work on in parallel. If not specified,
+the utility will start working on up to 16 hosts in parallel.
+Valid values: 1-64
+
+
+-b segment_batch_size
+
+The number of segments per host to work on in parallel. If not
+specified, the utility will start recovering up to 64 segments
+in parallel on each host it is working on.
+Valid values: 1-128
 
 
 -d coordinator_data_directory
@@ -129,6 +146,18 @@ in order to recover the failed segment. The default is to
 only copy over the incremental changes that occurred while 
 the segment was down.
 
+--differential
+
+Optional. Perform a differential copy of the active segment instance
+in order to recover the failed segment. The default is to only copy
+over the incremental changes that occurred while the segment was down.
+
+--max-rate <max_rate>
+
+Optional. Specifies the max-rate for full recovery of failed segments.
+Rate is in kB/s, suffix `k` or `M` can be used to signify kB/s or MB/s.
+Valid rate ranges from 32kB/s to 1048576kB/s(1024MB/s). The default is to use the
+entire available network bandwidth to perform full recovery of failed segment.
 
 -i <recover_config_file>
 
@@ -144,7 +173,7 @@ Lines beginning with # are treated as comments and ignored.
 
 Segments to Recover
 Each line after the first specifies a segment to recover. This line can 
-have one of two formats. In the event of in-place recovery, enter one 
+have one of three formats. In the event of in-place recovery, enter one
 group of colon delimited fields in the line:
 
 failedAddress|failedPort|failedDataDirectory
@@ -156,6 +185,17 @@ add additional spaces.
 failedAddress|failedPort|failedDataDirectorySPACEnewAddress|newPort|
 newDataDirectory
 
+To do mix recovery, include a field with values I/D/F/i/d/f on each line. Default is
+incremental recovery if recovery_type field is not provided.
+
+recoveryType|failedAddress|failedPort|failedDataDirectory
+
+recoveryType field supports below values:
+    I/i for incremental recovery
+    D/d for differential recovery
+    F/f for full recovery
+
+
 Examples
 
 In-place recovery of a single mirror
@@ -164,7 +204,20 @@ sdw1-1|50001|/data1/mirror/gpseg16
 
 Recovery of a single mirror to a new host
 
-sdw1-1|50001|/data1/mirror/gpseg16SPACE sdw4-1|50001|51001|/data1/recover1/gpseg16
+sdw1-1|50001|/data1/mirror/gpseg16 SPACE sdw4-1|50001|51001|/data1/recover1/gpseg16
+
+Recovery of a single mirror to a new host with hostname specified:
+sdw1|sdw1-1|50001|/data1/mirror/gpseg16 SPACE
+sdw4|sdw4-1|50001|51001|/data1/recover1/gpseg16
+
+In-place recovery of down mirrors with recovery type:
+sdw1-1|50001|/data1/mirror/gpseg1   // Does incremental recovery (By default)
+I|sdw1-1|50001|/data1/mirror/gpseg1   // Does incremental recovery
+i|sdw1-1|50001|/data1/mirror/gpseg1   // Does incremental recovery
+D|sdw2-1|50002|/data1/mirror/gpseg2   // Does Differential recovery
+d|sdw2-1|50002|/data1/mirror/gpseg2   // Does Differential recovery
+F|sdw3-1|50003|/data1/mirror/gpseg3   // Does Full recovery
+f|sdw3-1|50003|/data1/mirror/gpseg3   // Does Full recovery
 
 Obtaining a Sample File
 
@@ -215,6 +268,16 @@ This option rebalances primary and mirror segments by returning them to
 their preferred roles. All segments must be valid and synchronized before 
 running gprecoverseg -r. If there are any in progress queries, they will 
 be cancelled and rolled back.
+
+--replay-lag
+Replay lag(in GBs) allowed on mirror when rebalancing the segments. Default is 10 GB. If
+the replay_lag (flush_lsn-replay_lsn) is more than the value provided with this option
+then rebalance will be aborted.
+
+
+--disable-replay-lag
+Disable replay lag check when rebalancing segments
+
 
 -s
 

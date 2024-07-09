@@ -24,6 +24,7 @@
 #include "libpq/libpq-be.h"
 #include "libpq/pqformat.h"
 #include "miscadmin.h"
+#include "replication/syncrep.h"
 #include "storage/lmgr.h"
 #include "storage/pmsignal.h"
 #include "storage/s_lock.h"
@@ -58,6 +59,8 @@
 #include "utils/snapmgr.h"
 #include "utils/memutils.h"
 
+#include "nodes/plannodes.h"
+
 typedef struct TmControlBlock
 {
 	bool						DtmStarted;
@@ -85,6 +88,7 @@ uint32 *shmNextSnapshotId;
 slock_t *shmGxidGenLock;
 
 int	max_tm_gxacts = 100;
+bool needDistributedSnapshot = true;
 
 int gp_gxid_prefetch_num;
 #define GXID_PRETCH_THRESHOLD (gp_gxid_prefetch_num>>1)
@@ -117,7 +121,7 @@ int gp_gxid_prefetch_num;
  * FUNCTIONS PROTOTYPES
  */
 static void doPrepareTransaction(void);
-static void doInsertForgetCommitted(void);
+static XLogRecPtr doInsertForgetCommitted(void);
 static void doNotifyingOnePhaseCommit(void);
 static void doNotifyingCommitPrepared(void);
 static void doNotifyingAbort(void);
@@ -131,21 +135,14 @@ static void performDtxProtocolCommitPrepared(const char *gid, bool raiseErrorIfN
 static void performDtxProtocolAbortPrepared(const char *gid, bool raiseErrorIfNotFound);
 static void sendWaitGxidsToQD(List *waitGxids);
 
-extern void CheckForResetSession(void);
+extern void GpDropTempTables(void);
 
-/**
- * All assignments of the global DistributedTransactionContext should go through this function
- *   (so we can add logging here to see all assignments)
- *
- * @param context the new value for DistributedTransactionContext
- */
-static void
+void
 setDistributedTransactionContext(DtxContext context)
 {
-	/*
-	 * elog(INFO, "Setting DistributedTransactionContext to '%s'",
-	 * DtxContextToString(context));
-	 */
+	elog((Debug_print_full_dtm ? LOG : DEBUG5),
+		  "Setting DistributedTransactionContext to '%s'",
+		  DtxContextToString(context));
 	DistributedTransactionContext = context;
 }
 
@@ -266,6 +263,21 @@ static void
 currentDtxActivate(void)
 {
 	bool signal_dtx_recovery;
+
+	/*
+	 * A hot standby transaction does not have a valid gxid, so can skip 
+	 * most of the things in this function. We still explicitly set some 
+	 * fields that are irrelevant to hot standby for cleanness.
+	 */
+	if (IS_HOT_STANDBY_QD())
+	{
+		/* standby QD will stay in this state until transaction completed */
+		setCurrentDtxState(DTX_STATE_ACTIVE_DISTRIBUTED);
+		MyTmGxact->sessionId = gp_session_id;
+		MyTmGxact->gxid = InvalidDistributedTransactionId;
+		MyTmGxact->includeInCkpt = false;
+		return;
+	}
 
 	if (ShmemVariableCache->GxidCount <= GXID_PRETCH_THRESHOLD &&
 		(GetDtxRecoveryEvent() & DTX_RECOVERY_EVENT_BUMP_GXID) == 0)
@@ -501,17 +513,21 @@ doPrepareTransaction(void)
 /*
  * Insert FORGET COMMITTED into the xlog.
  */
-static void
+static XLogRecPtr
 doInsertForgetCommitted(void)
 {
+	XLogRecPtr recptr;
+
 	elog(DTM_DEBUG5, "doInsertForgetCommitted entering in state = %s", DtxStateToString(MyTmGxactLocal->state));
 
 	setCurrentDtxState(DTX_STATE_INSERTING_FORGET_COMMITTED);
 
-	RecordDistributedForgetCommitted(getDistributedTransactionId());
+	recptr = RecordDistributedForgetCommitted(getDistributedTransactionId());
 
 	setCurrentDtxState(DTX_STATE_INSERTED_FORGET_COMMITTED);
 	MyTmGxact->includeInCkpt = false;
+
+	return recptr;
 }
 
 static void
@@ -547,6 +563,7 @@ doNotifyingCommitPrepared(void)
 	MemoryContext oldcontext = CurrentMemoryContext;;
 	time_t		retry_time_start;
 	bool		retry_timedout;
+	XLogRecPtr 	recptr;
 
 	elog(DTM_DEBUG5, "doNotifyingCommitPrepared entering in state = %s", DtxStateToString(MyTmGxactLocal->state));
 
@@ -651,7 +668,7 @@ doNotifyingCommitPrepared(void)
 
 	SIMPLE_FAULT_INJECTOR("dtm_before_insert_forget_comitted");
 
-	doInsertForgetCommitted();
+	recptr = doInsertForgetCommitted();
 
 	/*
 	 * We release the TwophaseCommitLock only after writing our distributed
@@ -659,6 +676,10 @@ doNotifyingCommitPrepared(void)
 	 * their commit prepared records.
 	 */
 	LWLockRelease(TwophaseCommitLock);
+
+	/* wait for sync'ing the FORGET commit to hot standby, if remote_apply or higher is requested. */
+	if (synchronous_commit >= SYNCHRONOUS_COMMIT_REMOTE_APPLY)
+		SyncRepWaitForLSN(recptr, true);
 }
 
 static void
@@ -788,18 +809,11 @@ doNotifyingAbort(void)
 		case DTX_STATE_NOTIFYING_ABORT_PREPARED:
 			{
 				DtxProtocolCommand dtxProtocolCommand;
-				char	   *abortString;
 
 				if (MyTmGxactLocal->state == DTX_STATE_NOTIFYING_ABORT_SOME_PREPARED)
-				{
 					dtxProtocolCommand = DTX_PROTOCOL_COMMAND_ABORT_SOME_PREPARED;
-					abortString = "Abort [Prepared]";
-				}
 				else
-				{
 					dtxProtocolCommand = DTX_PROTOCOL_COMMAND_ABORT_PREPARED;
-					abortString = "Abort Prepared";
-				}
 
 				savedInterruptHoldoffCount = InterruptHoldoffCount;
 
@@ -954,13 +968,30 @@ rollbackDtxTransaction(void)
 			break;
 
 		case DTX_STATE_NOTIFYING_ABORT_NO_PREPARED:
-			/*
-			 * By deallocating the gang, we will force a new gang to connect
-			 * to all the segment instances.  And, we will abort the
-			 * transactions in the segments.
-			 */
-			elog(NOTICE, "Releasing segworker groups to finish aborting the transaction.");
-			ResetAllGangs();
+			if (!proc_exit_inprogress)
+			{
+				/*
+				 * By deallocating the gang, we will force a new gang to connect
+				 * to all the segment instances.  And, we will abort the
+				 * transactions in the segments.
+				 *
+				 * Reset session ID and drop temp tables only when process does *not* exits,
+				 * because otherwise, proc_exit will do that eventually anyway.
+				 */
+				elog(NOTICE, "Releasing segworker groups to finish aborting the transaction.");
+				ResetAllGangs();
+			}
+			else
+			{
+				/*
+				 * Destroy all gangs early, so that they won't block any other QEs due to 2PC lock
+				 * when QD might be just retrying `rollbackDtxTransaction` for a prolonged time.
+				 *
+				 * Do not reset session just yet, because we want to keep myTempNamespace untouched
+				 * and let RemoveTempRelationsCallback() drops temp tables as part of proc_exit.
+				 */
+				DisconnectAndDestroyAllGangs(false);
+			}
 			return;
 
 		case DTX_STATE_NOTIFYING_ABORT_SOME_PREPARED:
@@ -1017,11 +1048,13 @@ rollbackDtxTransaction(void)
 		Assert(MyTmGxactLocal->state == DTX_STATE_NOTIFYING_ABORT_NO_PREPARED);
 
 		/*
-		 * By deallocating the gang, we will force a new gang to connect to
-		 * all the segment instances.  And, we will abort the transactions in
-		 * the segments.
+		 * Destroy all gangs early, so that they won't block any other QEs due to 2PC lock
+		 * when QD might be just retrying `rollbackDtxTransaction` for a prolonged time.
+		 *
+		 * Do not reset session just yet, because we want to keep myTempNamespace untouched
+		 * and let RemoveTempRelationsCallback() drops temp tables as part of proc_exit.
 		 */
-		ResetAllGangs();
+		DisconnectAndDestroyAllGangs(false);
 		return;
 	}
 
@@ -1056,7 +1089,7 @@ tmShmemInit(void)
 	 *  will all use two-phase commit, so the number of global transactions is
 	 *  bound to the number of prepared.
 	 *
-	 * Note on master, it is possible that some prepared xacts just use partial
+	 * Note on coordinator, it is possible that some prepared xacts just use partial
 	 * gang so on QD the total prepared xacts might be quite large but it is
 	 * limited by max_connections since one QD should only have one 2pc one
 	 * time, so if we set max_tm_gxacts as max_prepared_transactions as before,
@@ -1064,11 +1097,11 @@ tmShmemInit(void)
 	 * not forgotten transactions (standby recovery will fail if encountering
 	 * this issue) if max_prepared_transactions is smaller than max_connections
 	 * (though this is not suggested). Not to mention that
-	 * max_prepared_transactions might be inconsistent between master/standby
+	 * max_prepared_transactions might be inconsistent between primary/standby
 	 * and segments (though this is not suggested).
 	 *
 	 * We can assign MaxBackends (MaxConnections should be fine also but let's
-	 * be conservative) to max_tm_gxacts on master/standby to tolerate various
+	 * be conservative) to max_tm_gxacts on primary/standby to tolerate various
 	 * configuration combinations of max_prepared_transactions and
 	 * max_connections. max_tm_gxacts is used on the coordinator only, and the
 	 * coordinator might be accessed in dispatch mode or utility mode.
@@ -1257,18 +1290,23 @@ doDispatchDtxProtocolCommand(DtxProtocolCommand dtxProtocolCommand,
 
 	if (qeError)
 	{
-		if (!raiseError)
+		/*
+		 * Report the ERROR under Debug_print_full_dtm, as it can be lost as we
+		 * flush below and the caller may forget to CopyErrorData(). Also, in
+		 * some cases caller may not be able to act on the copy (e.g. due to
+		 * another error).
+		 */
+		ereportif(Debug_print_full_dtm, LOG,
+				  (errmsg("error on dispatch of dtx protocol command '%s' for gid '%s'",
+						  dtxProtocolCommandStr, gid),
+				   errdetail("QE reported error: %s", qeError->message)));
+
+		if (raiseError)
 		{
-			ereport(LOG,
-					(errmsg("DTM error (gathered results from cmd '%s')", dtxProtocolCommandStr),
-					 errdetail("QE reported error: %s", qeError->message)));
-		}
-		else
-		{
+			/* flush then rethrow, to avoid overflowing the error stack */
 			FlushErrorState();
-			ReThrowError(qeError);
+			ThrowErrorData(qeError);
 		}
-		return false;
 	}
 
 	if (results == NULL)
@@ -1486,6 +1524,7 @@ insertingDistributedCommitted(void)
 void
 insertedDistributedCommitted(void)
 {
+	SIMPLE_FAULT_INJECTOR("start_insertedDistributedCommitted");
 	ereport(DTM_DEBUG5,
 			(errmsg("entering insertedDistributedCommitted"),
 			TM_ERRDETAIL));
@@ -1603,7 +1642,7 @@ isDtxQueryDispatcher(void)
 	isSharedLocalSnapshotSlotPresent = (SharedLocalSnapshotSlot != NULL);
 
 	return (Gp_role == GP_ROLE_DISPATCH &&
-			isDtmStarted &&
+			(isDtmStarted || EnableHotStandby) &&
 			isSharedLocalSnapshotSlotPresent);
 }
 
@@ -2005,11 +2044,13 @@ sendDtxExplicitBegin(void)
 }
 
 /**
- * On the QD, run the Prepare operation.
+ * On the QE, run the Prepare operation.
  */
 static void
 performDtxProtocolPrepare(const char *gid)
 {
+	SIMPLE_FAULT_INJECTOR("qe_start_prepared");
+
 	StartTransactionCommand();
 
 	elog(DTM_DEBUG5, "performDtxProtocolCommand going to call PrepareTransactionBlock for distributed transaction (id = '%s')", gid);
@@ -2089,6 +2130,7 @@ performDtxProtocolCommitOnePhase(const char *gid)
 static void
 performDtxProtocolCommitPrepared(const char *gid, bool raiseErrorIfNotFound)
 {
+	SIMPLE_FAULT_INJECTOR("qe_start_commit_prepared");
 	Assert(Gp_role == GP_ROLE_EXECUTE);
 
 	elog(DTM_DEBUG5,
@@ -2121,6 +2163,7 @@ performDtxProtocolCommitPrepared(const char *gid, bool raiseErrorIfNotFound)
 	sendWaitGxidsToQD(waitGxids);
 
 	finishDistributedTransactionContext("performDtxProtocolCommitPrepared -- Commit Prepared", false);
+	SIMPLE_FAULT_INJECTOR("finish_commit_prepared");
 }
 
 /**
@@ -2335,7 +2378,7 @@ performDtxProtocolCommand(DtxProtocolCommand dtxProtocolCommand,
 		case DTX_PROTOCOL_COMMAND_SUBTRANSACTION_ROLLBACK_INTERNAL:
 
 			/*
-			 * Rollback performs work on master and then dispatches, hence has
+			 * Rollback performs work on coordinator and then dispatches, hence has
 			 * nestingLevel its expecting post operation
 			 */
 			if ((contextInfo->nestingLevel + 1) > GetCurrentTransactionNestLevel())

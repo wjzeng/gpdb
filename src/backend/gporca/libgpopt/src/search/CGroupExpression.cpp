@@ -22,6 +22,7 @@
 #include "gpopt/base/COptimizationContext.h"
 #include "gpopt/base/CUtils.h"
 #include "gpopt/operators/CPhysicalAgg.h"
+#include "gpopt/optimizer/COptimizerConfig.h"
 #include "gpopt/search/CBinding.h"
 #include "gpopt/search/CGroupProxy.h"
 #include "gpopt/xforms/CXformFactory.h"
@@ -70,9 +71,9 @@ CGroupExpression::CGroupExpression(CMemoryPool *mp, COperator *pop,
 	{
 		m_pdrgpgroupSorted = GPOS_NEW(mp) CGroupArray(mp, pdrgpgroup->Size());
 		m_pdrgpgroupSorted->AppendArray(pdrgpgroup);
-		m_pdrgpgroupSorted->Sort();
+		m_pdrgpgroupSorted->Sort(CGroup::Compare);
 
-		GPOS_ASSERT(m_pdrgpgroupSorted->IsSorted());
+		GPOS_ASSERT(m_pdrgpgroupSorted->IsSorted(CGroup::Compare));
 	}
 
 	m_ppartialplancostmap = GPOS_NEW(mp) PartialPlanToCostMap(mp);
@@ -203,12 +204,10 @@ CGroupExpression::SetOptimizationLevel()
 			return;
 		}
 
-		// if we only want plans with multi-stage agg, we generate multi-stage agg
-		// first to avoid later optimization of one stage agg if possible
 		BOOL fMultiStage = CPhysicalAgg::PopConvert(m_pop)->FMultiStage();
 		if (fPreferMultiStageAgg && fMultiStage)
 		{
-			// optimize multi-stage agg first to allow avoiding one-stage agg if possible
+			// optimize multi-stage agg plans first and then one-stage agg plans
 			m_eol = EolHigh;
 		}
 	}
@@ -809,6 +808,9 @@ CGroupExpression::Transform(
 	CBinding binding;
 	CXformContext *pxfctxt = GPOS_NEW(mp) CXformContext(mp);
 
+	COptimizerConfig *optconfig =
+		COptCtxt::PoctxtFromTLS()->GetOptimizerConfig();
+	ULONG bindThreshold = optconfig->GetHint()->UlXformBindThreshold();
 	CExpression *pexprPattern = pxform->PexprPattern();
 	CExpression *pexpr = binding.PexprExtract(mp, this, pexprPattern, nullptr);
 	while (nullptr != pexpr)
@@ -819,7 +821,8 @@ CGroupExpression::Transform(
 		ulNumResults = pxfres->Pdrgpexpr()->Size() - ulNumResults;
 		PrintXform(mp, pxform, pexpr, pxfres, ulNumResults);
 
-		if (pxform->IsApplyOnce() ||
+		if ((bindThreshold != 0 && (*pulNumberOfBindings) > bindThreshold) ||
+			pxform->IsApplyOnce() ||
 			(0 < pxfres->Pdrgpexpr()->Size() &&
 			 !CXformUtils::FApplyToNextBinding(pxform, pexpr)))
 		{
@@ -1112,7 +1115,9 @@ CGroupExpression::ContainsCircularDependencies()
 	{
 		CGroup *child_group = (*child_groups)[ul];
 		if (child_group->FScalar())
+		{
 			continue;
+		}
 		CGroup *child_duplicate_group = child_group->PgroupDuplicate();
 		if (child_duplicate_group != nullptr)
 		{

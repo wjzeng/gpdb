@@ -46,9 +46,11 @@
 #include "rewrite/rewriteHandler.h"
 #include "storage/smgr.h"
 #include "tcop/tcopprot.h"
+#include "tcop/utility.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
+#include "utils/resgroup.h"
 #include "utils/rls.h"
 #include "utils/snapmgr.h"
 
@@ -130,6 +132,7 @@ create_ctas_internal(List *attrList, IntoClause *into, QueryDesc *queryDesc, boo
 	create->oncommit = into->onCommit;
 	create->tablespacename = into->tableSpaceName;
 	create->if_not_exists = false;
+	create->origin = ORIGIN_NO_GEN;
 
 	create->distributedBy = NULL; /* We will pass a pre-made intoPolicy instead */
 	create->partitionBy = NULL; /* CTAS does not not support partition. */
@@ -142,6 +145,9 @@ create_ctas_internal(List *attrList, IntoClause *into, QueryDesc *queryDesc, boo
 	create->ownerid = GetUserId();
 	create->accessMethod = into->accessMethod;
 	create->isCtas = true;
+
+	create->intoQuery = into->viewQuery;
+	create->intoPolicy = queryDesc->plannedstmt->intoPolicy;
   }
 	/* end of funny indentation */
 
@@ -309,19 +315,30 @@ ExecCreateTableAs(CreateTableAsStmt *stmt, const char *queryString,
 	if (stmt->if_not_exists)
 	{
 		Oid			nspid;
+		Oid			oldrelid;
 
-		nspid = RangeVarGetCreationNamespace(stmt->into->rel);
+		nspid = RangeVarGetCreationNamespace(into->rel);
 
-		if (get_relname_relid(stmt->into->rel->relname, nspid))
+		oldrelid = get_relname_relid(into->rel->relname, nspid);
+		if (OidIsValid(oldrelid))
 		{
+			/*
+			 * The relation exists and IF NOT EXISTS has been specified.
+			 *
+			 * If we are in an extension script, insist that the pre-existing
+			 * object be a member of the extension, to avoid security risks.
+			 */
+			ObjectAddressSet(address, RelationRelationId, oldrelid);
+			checkMembershipInCurrentExtension(&address);
+
+			/* OK to skip */
 			ereport(NOTICE,
 					(errcode(ERRCODE_DUPLICATE_TABLE),
 					 errmsg("relation \"%s\" already exists, skipping",
-							stmt->into->rel->relname)));
+							into->rel->relname)));
 			return InvalidObjectAddress;
 		}
 	}
-
 	/*
 	 * Create the tuple receiver object and insert info it will need
 	 */
@@ -414,7 +431,7 @@ ExecCreateTableAs(CreateTableAsStmt *stmt, const char *queryString,
 	if (query_info_collect_hook)
 		(*query_info_collect_hook)(METRICS_QUERY_SUBMIT, queryDesc);
 
-	if (into->skipData && !is_matview)
+	if (into->skipData)
 	{
 		/*
 		 * If WITH NO DATA was specified, do not go through the rewriter,
@@ -427,6 +444,7 @@ ExecCreateTableAs(CreateTableAsStmt *stmt, const char *queryString,
 	}
 	else
 	{
+		check_and_unassign_from_resgroup(queryDesc->plannedstmt);
 		queryDesc->plannedstmt->query_mem = ResourceManagerGetQueryMemoryLimit(queryDesc->plannedstmt);
 
 		/* call ExecutorStart to prepare the plan for execution */
@@ -463,7 +481,10 @@ ExecCreateTableAs(CreateTableAsStmt *stmt, const char *queryString,
 
 		/* MPP-14001: Running auto_stats */
 		if (Gp_role == GP_ROLE_DISPATCH)
-			auto_stats(cmdType, relationOid, queryDesc->es_processed, false /* inFunction */);
+		{
+			bool inFunction = already_under_executor_run() || utility_nested();
+			auto_stats(cmdType, relationOid, queryDesc->es_processed, inFunction);
+		}
 	}
 
 	{
@@ -533,19 +554,10 @@ CreateIntoRelDestReceiver(IntoClause *intoClause)
 static void
 intorel_startup_dummy(DestReceiver *self, int operation, TupleDesc typeinfo)
 {
-	/*
-	 * In PostgreSQL, this is a no-op, but in GPDB, AO relations do need some
-	 * initialization of state, because the tableam API does not provide a
-	 * good enough interface for handling with this later, we need to
-	 * specifically all the init at start up.
-	 */
-
+	Relation rel = ((DR_intorel *)self)->rel;
 	/* See intorel_initplan() for explanation */
-
-	if (RelationIsAoRows(((DR_intorel *)self)->rel))
-		appendonly_dml_init(((DR_intorel *)self)->rel, CMD_INSERT);
-	else if (RelationIsAoCols(((DR_intorel *)self)->rel))
-		aoco_dml_init(((DR_intorel *)self)->rel, CMD_INSERT);
+	if (rel->rd_tableam)
+		table_dml_init(rel);
 }
 
 /*
@@ -634,14 +646,13 @@ intorel_initplan(struct QueryDesc *queryDesc, int eflags)
 
 	/*
 	 * Actually create the target table
-	 *
 	 * We also get here with CREATE TABLE AS EXECUTE ... WITH NO DATA. In that
 	 * case, dispatch the creation of the table immediately. Normally, the table
 	 * is created in the initialization of the plan in QEs, but with NO DATA, we
-	 * don't need to dispatch the plan.
+	 * don't need to dispatch the plan during ExecutorStart().
 	 */
 	intoRelationAddr = create_ctas_internal(attrList, into, queryDesc,
-											(into->skipData && !is_matview) ? true : false);
+											into->skipData ? true : false);
 
 	/*
 	 * Finally we can open the target table
@@ -753,6 +764,9 @@ intorel_shutdown(DestReceiver *self)
 	FreeBulkInsertState(myState->bistate);
 
 	table_finish_bulk_insert(myState->rel, myState->ti_options);
+
+	if (myState->rel->rd_tableam)
+		table_dml_finish(myState->rel);
 
 	/* close rel, but keep lock until commit */
 	table_close(myState->rel, NoLock);

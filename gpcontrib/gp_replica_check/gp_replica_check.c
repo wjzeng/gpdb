@@ -1,11 +1,15 @@
 #include "postgres.h"
 
+#include "access/brin_xlog.h"
 #include "access/heapam.h"
 #include "access/heapam_xlog.h"
+#include "access/hash_xlog.h"
+#include "access/spgxlog.h"
 #include "access/nbtxlog.h"
 #include "access/gistxlog.h"
 #include "access/ginxlog.h"
 #include "commands/sequence.h"
+#include "common/hashfn.h"
 #include "postmaster/bgwriter.h"
 #include "replication/walsender_private.h"
 #include "replication/walsender.h"
@@ -15,7 +19,6 @@
 #include "storage/fd.h"
 #include "storage/lwlock.h"
 #include "utils/builtins.h"
-#include "utils/hsearch.h"
 #include "utils/relmapper.h"
 #include "utils/varlena.h"
 
@@ -23,7 +26,7 @@
  * If a file comparison fails, how many times to retry before admitting
  * that it really differs?
  */
-#define NUM_RETRIES		3
+#define NUM_RETRIES		10
 
 /*
  * How many seconds to wait for checkpoint record to be applied in standby?
@@ -69,28 +72,30 @@ typedef struct RelationTypeData
 	bool include;
 } RelationTypeData;
 
-#define MAX_INCLUDE_RELATION_TYPES 8
+#define MAX_INCLUDE_RELATION_TYPES 10
 
 /*
- * GPDB_12_MERGE_FIXME: new access methods can be defined, which cannot be
- * checked using the current way by comparing predefined access method OIDs.
- * The AM handler functions need to be looked up and compared instead.
- * E.g. to tell if it's an appendoptimized row oriented table, look up the
- * handler function for that table's AM in pg_am_handler and compare it with
- * AO_ROW_TABLE_AM_HANDLER_OID.
+ * This is a static pre-defined array for now as currently, this tool works
+ * only for pre-defined access methods. As most likely will need masking
+ * functions to perform proper comparisons for newer access methods. Plus,
+ * having on the fly access methods is not at all common phenomenon. If and
+ * when in future new access method is added, can update this array or enhance
+ * the tool to dynamically create this array based on pg_am table.
  *
- * If the tool is desired to be used against pre-defined access methods only,
- * then no change would be needed.
+ * FIXME: Consider getting rid of this array and index into RmgrTable instead.
+ *
  */
 static RelationTypeData relation_types[MAX_INCLUDE_RELATION_TYPES+1] = {
+	{"heap", false},
 	{"btree", false},
 	{"hash", false},
 	{"gist", false},
 	{"gin", false},
+	{"ao_row", false},
+	{"ao_column", false},
+	{"brin", false},
+	{"spgist", false},
 	{"bitmap", false},
-	{"heap", false},
-	{"sequence", false},
-	{"ao", false},
 	{"unknown relam", false}
 };
 
@@ -159,29 +164,28 @@ init_relation_types(char *include_relation_types)
 static RelationTypeData
 get_relation_type_data(Oid relam, int relkind)
 {
-	/* GPDB_12_MERGE_FIXME: Why doesn't this just look up the AM name from pg_am? */
 	switch(relam)
 	{
-		case BTREE_AM_OID:
-			return relation_types[0];
-		case HASH_AM_OID:
-			return relation_types[1];
-		case GIST_AM_OID:
-			return relation_types[2];
-		case GIN_AM_OID:
-			return relation_types[3];
-		case BITMAP_AM_OID:
-			return relation_types[4];
-
 		case HEAP_TABLE_AM_OID:
-			if (relkind == RELKIND_SEQUENCE)
-				return relation_types[6];
-			else
-				return relation_types[5];
+			return relation_types[0];
+		case BTREE_AM_OID:
+			return relation_types[1];
+		case HASH_AM_OID:
+			return relation_types[2];
+		case GIST_AM_OID:
+			return relation_types[3];
+		case GIN_AM_OID:
+			return relation_types[4];
 		case AO_ROW_TABLE_AM_OID:
+			return relation_types[5];
 		case AO_COLUMN_TABLE_AM_OID:
+			return relation_types[6];
+		case BRIN_AM_OID:
 			return relation_types[7];
-
+		case SPGIST_AM_OID:
+			return relation_types[8];
+		case BITMAP_AM_OID:
+			return relation_types[9];
 		default:
 			return relation_types[MAX_INCLUDE_RELATION_TYPES];
 	}
@@ -196,6 +200,18 @@ mask_block(char *pagedata, BlockNumber blockno, Oid relam, int relkind)
 			btree_mask(pagedata, blockno);
 			break;
 
+		case HASH_AM_OID:
+			hash_mask(pagedata, blockno);
+			break;
+
+		case SPGIST_AM_OID:
+			spg_mask(pagedata, blockno);
+			break;
+
+		case BRIN_AM_OID:
+			brin_mask(pagedata, blockno);
+			break;
+
 		case GIST_AM_OID:
 			gist_mask(pagedata, blockno);
 			break;
@@ -204,13 +220,26 @@ mask_block(char *pagedata, BlockNumber blockno, Oid relam, int relkind)
 			gin_mask(pagedata, blockno);
 			break;
 
-		/* heap table */
+		/* This doesn't have a masking function. Do nothing. */
+		case BITMAP_AM_OID:
+			break;
+
+		/*
+		 * These types don't follow the PG page format, so we don't expect this
+		 * function to be called with them.
+		 */
+		case AO_ROW_TABLE_AM_OID:
+		case AO_COLUMN_TABLE_AM_OID:
+			Assert(false);
+			break; /* keep compiler happy */
+
+		case HEAP_TABLE_AM_OID:
+			heap_mask(pagedata, blockno);
+			break;
+
 		default:
 			if (relkind == RELKIND_SEQUENCE)
 				seq_mask(pagedata, blockno);
-			else
-				heap_mask(pagedata, blockno);
-
 			break;
 	}
 }
@@ -390,7 +419,8 @@ retry:
 		int			mirrorFileBytesRead;
 		int			diff;
 		off_t		offset;
-		bool		do_check;
+		bool 		do_check;
+		bool 		isPGPageFormat;
 
 		do_check = true;
 
@@ -398,6 +428,9 @@ retry:
 
 		offset = (off_t) blockno * BLCKSZ;
 
+		/*
+		 * We read in chunks of BLCKSZ, even for append-optimized tables.
+		 */
 		primaryFileBytesRead = FileRead(primaryFile, primaryFileBuf, sizeof(primaryFileBuf), offset,
 										WAIT_EVENT_DATA_FILE_READ);
 		if (primaryFileBytesRead < 0)
@@ -427,11 +460,16 @@ retry:
 		if (primaryFileBytesRead == 0)
 			break; /* reached EOF */
 
-		if (rentry->relam == HEAP_TABLE_AM_OID)
+		/*
+		 * Apply sanity checks and masking that are only relevant to reltypes
+		 * adhering to PG's page format.
+		 */
+		isPGPageFormat = !IsAccessMethodAO(rentry->relam);
+		if (isPGPageFormat)
 		{
 			if (primaryFileBytesRead != BLCKSZ)
 			{
-				elog(NOTICE, "short read of %d bytes from heap file \"%s\", block %u: %m", primaryFileBytesRead, primaryfilepath, blockno);
+				elog(NOTICE, "short read of %d bytes from file \"%s\", block %u: %m", primaryFileBytesRead, primaryfilepath, blockno);
 				goto retry;
 			}
 			/*
@@ -441,12 +479,12 @@ retry:
 			 */
 			if (!PageIsVerified(primaryFileBuf, blockno))
 			{
-				elog(NOTICE, "invalid page header or checksum in heap file \"%s\", block %u", primaryfilepath, blockno);
+				elog(NOTICE, "invalid page header or checksum in file \"%s\", block %u", primaryfilepath, blockno);
 				goto retry;
 			}
 			if (!PageIsVerified(mirrorFileBuf, blockno))
 			{
-				elog(NOTICE, "invalid page header or checksum in heap file \"%s\", block %u", mirrorfilepath, blockno);
+				elog(NOTICE, "invalid page header or checksum in file \"%s\", block %u", mirrorfilepath, blockno);
 				goto retry;
 			}
 
@@ -526,15 +564,8 @@ get_relfilenode_map()
 	{
 		Form_pg_class classtuple = (Form_pg_class) GETSTRUCT(tup);
 
-		/* GPDB_12_MERGE_FIXME: What was the point of the relstorage test here? */
 		if ((classtuple->relkind == RELKIND_VIEW
-			 || classtuple->relkind == RELKIND_COMPOSITE_TYPE)
-			/* || (classtuple->relstorage != RELSTORAGE_HEAP
-			   && !relstorage_is_ao(classtuple->relstorage)) */)
-			continue;
-
-		/* unlogged tables do not propagate to replica servers */
-		if (classtuple->relpersistence == RELPERSISTENCE_UNLOGGED)
+			 || classtuple->relkind == RELKIND_COMPOSITE_TYPE))
 			continue;
 
 		/* unlogged tables do not propagate to replica servers */

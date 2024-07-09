@@ -13,10 +13,11 @@
 
 #include "gpos/base.h"
 
-#include "gpopt/metadata/CPartConstraint.h"
+#include "gpopt/hints/CHintUtils.h"
 #include "gpopt/metadata/CTableDescriptor.h"
 #include "gpopt/operators/CLogicalDynamicGet.h"
 #include "gpopt/operators/CPhysicalDynamicTableScan.h"
+#include "gpopt/optimizer/COptimizerConfig.h"
 
 using namespace gpopt;
 
@@ -37,6 +38,19 @@ CXformDynamicGet2DynamicTableScan::CXformDynamicGet2DynamicTableScan(
 {
 }
 
+// compute xform promise for a given expression handle
+CXform::EXformPromise
+CXformDynamicGet2DynamicTableScan::Exfp(CExpressionHandle &exprhdl) const
+{
+	CLogicalDynamicGet *popGet = CLogicalDynamicGet::PopConvert(exprhdl.Pop());
+	// Do not run if contains foreign partitions, instead run CXformExpandDynamicGetWithForeignPartitions
+	if (popGet->ContainsForeignParts())
+	{
+		return CXform::ExfpNone;
+	}
+
+	return CXform::ExfpHigh;
+}
 
 //---------------------------------------------------------------------------
 //	@function:
@@ -56,6 +70,13 @@ CXformDynamicGet2DynamicTableScan::Transform(CXformContext *pxfctxt,
 	GPOS_ASSERT(FCheckPattern(pexpr));
 
 	CLogicalDynamicGet *popGet = CLogicalDynamicGet::PopConvert(pexpr->Pop());
+	if (!CHintUtils::SatisfiesPlanHints(
+			popGet,
+			COptCtxt::PoctxtFromTLS()->GetOptimizerConfig()->GetPlanHint()))
+	{
+		return;
+	}
+
 	CMemoryPool *mp = pxfctxt->Pmp();
 
 	// create/extract components for alternative

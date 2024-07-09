@@ -40,10 +40,12 @@ EXTRADEFS = '-DHOST_TUPLE="$(host_tuple)"' \
 
 # Build regression test driver
 
-all: pg_regress$(X)
+all: pg_regress$(X) extended_protocol_resqueue
 
 pg_regress$(X): pg_regress.o pg_regress_main.o $(WIN32RES) | submake-libpgport
 	$(CC) $(CFLAGS) $^ $(LDFLAGS) $(LDFLAGS_EX) $(LIBS) -o $@
+extended_protocol_resqueue: extended_protocol_resqueue.c
+	$(CC) $(CPPFLAGS) -I../../../src/interfaces/libpq -L$(GPHOME)/lib -L../../../src/interfaces/libpq  -o $@ $< -lpq
 
 # dependencies ensure that path changes propagate
 pg_regress.o: pg_regress.c $(top_builddir)/src/port/pg_config_paths.h
@@ -91,6 +93,8 @@ OBJS = $(WIN32RES) regress.o
 
 OBJS += regress_gp.o
 
+SHLIB_LINK_INTERNAL = $(libpq)
+
 include $(top_srcdir)/src/Makefile.shlib
 
 all: all-lib
@@ -117,8 +121,8 @@ regress_data_files = \
 
 install-tests: all install install-lib installdirs-tests
 	$(MAKE) -C $(top_builddir)/contrib/spi install
-	for file in $(regress_data_files); do \
-	  $(INSTALL_DATA) $$file '$(DESTDIR)$(pkglibdir)/regress/'$$file || exit; \
+	for file in $(subst $(srcdir)/,,$(regress_data_files)); do \
+		$(INSTALL_DATA) $(srcdir)/$$file '$(DESTDIR)$(pkglibdir)/regress/'$$file || exit; \
 	done
 
 installdirs-tests: installdirs
@@ -127,7 +131,7 @@ installdirs-tests: installdirs
 
 # Get some extra C modules from contrib/spi
 
-all: refint$(DLSUFFIX) autoinc$(DLSUFFIX) tablespace-setup hooktest query_info_hook_test
+all: refint$(DLSUFFIX) autoinc$(DLSUFFIX) hooktest query_info_hook_test
 
 refint$(DLSUFFIX): $(top_builddir)/contrib/spi/refint$(DLSUFFIX)
 	cp $< $@
@@ -161,6 +165,11 @@ tablespace-setup:
         ./testtablespace_1111111111222222222233333333334444444444555555555566666666667777777777888888888899999999990000000000/ \
 	./testtablespace_default_tablespace \
 	./testtablespace_temp_tablespace \
+	./testtablespace_mytempsp0 \
+	./testtablespace_mytempsp1 \
+	./testtablespace_mytempsp2 \
+	./testtablespace_mytempsp3 \
+	./testtablespace_mytempsp4 \
 	./testtablespace_database_tablespace
 
 
@@ -188,10 +197,10 @@ check-tests: all tablespace-setup | temp-install
 #	$(pg_regress_installcheck) $(REGRESS_OPTS) --schedule=$(srcdir)/serial_schedule $(EXTRA_TESTS)
 installcheck: installcheck-good
 
-installcheck-small: all
+installcheck-small: all tablespace-setup
 	$(pg_regress_installcheck) $(REGRESS_OPTS) --schedule=$(srcdir)/parallel_schedule $(EXTRA_TESTS)
 
-installcheck-good: all twophase_pqexecparams hooktest query_info_hook_test
+installcheck-good: all tablespace-setup twophase_pqexecparams hooktest query_info_hook_test
 	$(pg_regress_installcheck) $(REGRESS_OPTS) --schedule=$(srcdir)/parallel_schedule --schedule=$(srcdir)/greenplum_schedule $(EXTRA_TESTS)
 
 installcheck-parallel: all tablespace-setup
@@ -209,8 +218,21 @@ installcheck-icudp: all tablespace-setup
 	$(pg_regress_installcheck) $(REGRESS_OPTS) --schedule=$(srcdir)/icudp_schedule --dbname=regression_icudp $(EXTRA_TESTS)
 endif
 
+installcheck-mirrorless: all tablespace-setup
+	$(pg_regress_installcheck) $(REGRESS_OPTS) --schedule=$(srcdir)/mirrorless_schedule --dbname=regress-mirrorless $(EXTRA_TESTS)
+
 standbycheck: all
 	$(pg_regress_installcheck) $(REGRESS_OPTS) --schedule=$(srcdir)/standby_schedule  $(EXTRA_TESTS)
+
+# GPDB: installcheck for hot standby. This is essentially same as the upstream 'standbycheck'
+# above but we just make sure that we do the primary preparation and use the desired standby port.
+# If no standby port is given, just use the demo cluster's standby port 7001. 
+ifeq ($(STANDBY_PGPORT),)
+  STANDBY_PGPORT = 7001
+endif
+installcheck-hot-standby: all
+	$(pg_regress_installcheck) $(REGRESS_OPTS) hs_primary_setup
+	$(pg_regress_installcheck) $(REGRESS_OPTS) --port=$(STANDBY_PGPORT) --use-existing --schedule=$(srcdir)/standby_schedule  $(EXTRA_TESTS)
 
 # old interfaces follow...
 

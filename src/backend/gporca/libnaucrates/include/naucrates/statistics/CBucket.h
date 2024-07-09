@@ -32,7 +32,7 @@ using namespace gpmd;
 class CBucket;
 
 // dynamic array of buckets
-typedef CDynamicPtrArray<CBucket, CleanupDelete> CBucketArray;
+using CBucketArray = CDynamicPtrArray<CBucket, CleanupDelete>;
 
 //---------------------------------------------------------------------------
 //	@class:
@@ -216,8 +216,8 @@ public:
 
 	BOOL Equals(const CBucket *bucket) const;
 
-	// generate a random data point within bucket boundaries
-	CDouble GetSample(ULONG *seed) const;
+	// generate a data point within bucket boundaries
+	CDouble GetSample(DOUBLE ratio) const;
 
 	// compare lower bucket boundaries
 	static INT CompareLowerBounds(const CBucket *bucket1,

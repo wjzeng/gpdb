@@ -34,11 +34,11 @@ HANDLE		pgwin32_initial_signal_pipe = INVALID_HANDLE_VALUE;
 static CRITICAL_SECTION pg_signal_crit_sec;
 
 /* Note that array elements 0 are unused since they correspond to signal 0 */
-static pqsigfunc pg_signal_array[PG_SIGNAL_COUNT];
+static struct sigaction pg_signal_array[PG_SIGNAL_COUNT];
 static pqsigfunc pg_signal_defaults[PG_SIGNAL_COUNT];
 
 
-/* Signal handling thread function */
+/* Signal handling thread functions */
 static DWORD WINAPI pg_signal_thread(LPVOID param);
 static BOOL WINAPI pg_console_handler(DWORD dwCtrlType);
 
@@ -75,7 +75,9 @@ pgwin32_signal_initialize(void)
 
 	for (i = 0; i < PG_SIGNAL_COUNT; i++)
 	{
-		pg_signal_array[i] = SIG_DFL;
+		pg_signal_array[i].sa_handler = SIG_DFL;
+		pg_signal_array[i].sa_mask = 0;
+		pg_signal_array[i].sa_flags = 0;
 		pg_signal_defaults[i] = SIG_IGN;
 	}
 	pg_signal_mask = 0;
@@ -102,7 +104,7 @@ pgwin32_signal_initialize(void)
 /*
  * Dispatch all signals currently queued and not blocked
  * Blocked signals are ignored, and will be fired at the time of
- * the sigsetmask() call.
+ * the pqsigprocmask() call.
  */
 void
 pgwin32_dispatch_queued_signals(void)
@@ -121,15 +123,27 @@ pgwin32_dispatch_queued_signals(void)
 			if (exec_mask & sigmask(i))
 			{
 				/* Execute this signal */
-				pqsigfunc	sig = pg_signal_array[i];
+				struct sigaction *act = &pg_signal_array[i];
+				pqsigfunc	sig = act->sa_handler;
 
 				if (sig == SIG_DFL)
 					sig = pg_signal_defaults[i];
 				pg_signal_queue &= ~sigmask(i);
 				if (sig != SIG_ERR && sig != SIG_IGN && sig != SIG_DFL)
 				{
+					sigset_t	block_mask;
+					sigset_t	save_mask;
+
 					LeaveCriticalSection(&pg_signal_crit_sec);
+
+					block_mask = act->sa_mask;
+					if ((act->sa_flags & SA_NODEFER) == 0)
+						block_mask |= sigmask(i);
+
+					sigprocmask(SIG_BLOCK, &block_mask, &save_mask);
 					sig(i);
+					sigprocmask(SIG_SETMASK, &save_mask, NULL);
+
 					EnterCriticalSection(&pg_signal_crit_sec);
 					break;		/* Restart outer loop, in case signal mask or
 								 * queue has been modified inside signal
@@ -144,12 +158,29 @@ pgwin32_dispatch_queued_signals(void)
 
 /* signal masking. Only called on main thread, no sync required */
 int
-pqsigsetmask(int mask)
+pqsigprocmask(int how, const sigset_t *set, sigset_t *oset)
 {
-	int			prevmask;
+	if (oset)
+		*oset = pg_signal_mask;
 
-	prevmask = pg_signal_mask;
-	pg_signal_mask = mask;
+	if (!set)
+		return 0;
+
+	switch (how)
+	{
+		case SIG_BLOCK:
+			pg_signal_mask |= *set;
+			break;
+		case SIG_UNBLOCK:
+			pg_signal_mask &= ~*set;
+			break;
+		case SIG_SETMASK:
+			pg_signal_mask = *set;
+			break;
+		default:
+			errno = EINVAL;
+			return -1;
+	}
 
 	/*
 	 * Dispatch any signals queued up right away, in case we have unblocked
@@ -157,25 +188,28 @@ pqsigsetmask(int mask)
 	 */
 	pgwin32_dispatch_queued_signals();
 
-	return prevmask;
+	return 0;
 }
-
 
 /*
  * Unix-like signal handler installation
  *
  * Only called on main thread, no sync required
  */
-pqsigfunc
-pqsignal(int signum, pqsigfunc handler)
+int
+pqsigaction(int signum, const struct sigaction *act,
+			struct sigaction *oldact)
 {
-	pqsigfunc	prevfunc;
-
 	if (signum >= PG_SIGNAL_COUNT || signum < 0)
-		return SIG_ERR;
-	prevfunc = pg_signal_array[signum];
-	pg_signal_array[signum] = handler;
-	return prevfunc;
+	{
+		errno = EINVAL;
+		return -1;
+	}
+	if (oldact)
+		*oldact = pg_signal_array[signum];
+	if (act)
+		pg_signal_array[signum] = *act;
+	return 0;
 }
 
 /* Create the signal listener pipe for specified PID */
@@ -208,12 +242,15 @@ pgwin32_create_signal_listener(pid_t pid)
  */
 
 
+/*
+ * Queue a signal for the main thread, by setting the flag bit and event.
+ */
 void
 pg_queue_signal(int signum)
 {
 	Assert(pgwin32_signal_event != NULL);
 	if (signum >= PG_SIGNAL_COUNT || signum <= 0)
-		return;
+		return;					/* ignore any bad signal number */
 
 	EnterCriticalSection(&pg_signal_crit_sec);
 	pg_signal_queue |= sigmask(signum);
@@ -222,7 +259,11 @@ pg_queue_signal(int signum)
 	SetEvent(pgwin32_signal_event);
 }
 
-/* Signal dispatching thread */
+/*
+ * Signal dispatching thread.  This runs after we have received a named
+ * pipe connection from a client (signal sender).   Process the request,
+ * close the pipe, and exit.
+ */
 static DWORD WINAPI
 pg_signal_dispatch_thread(LPVOID param)
 {
@@ -242,13 +283,37 @@ pg_signal_dispatch_thread(LPVOID param)
 		CloseHandle(pipe);
 		return 0;
 	}
+
+	/*
+	 * Queue the signal before responding to the client.  In this way, it's
+	 * guaranteed that once kill() has returned in the signal sender, the next
+	 * CHECK_FOR_INTERRUPTS() in the signal recipient will see the signal.
+	 * (This is a stronger guarantee than POSIX makes; maybe we don't need it?
+	 * But without it, we've seen timing bugs on Windows that do not manifest
+	 * on any known Unix.)
+	 */
+	pg_queue_signal(sigNum);
+
+	/*
+	 * Write something back to the client, allowing its CallNamedPipe() call
+	 * to terminate.
+	 */
 	WriteFile(pipe, &sigNum, 1, &bytes, NULL);	/* Don't care if it works or
 												 * not.. */
+
+	/*
+	 * We must wait for the client to read the data before we can close the
+	 * pipe, else the data will be lost.  (If the WriteFile call failed,
+	 * there'll be nothing in the buffer, so this shouldn't block.)
+	 */
 	FlushFileBuffers(pipe);
+
+	/* This is a formality, since we're about to close the pipe anyway. */
 	DisconnectNamedPipe(pipe);
+
+	/* And we're done. */
 	CloseHandle(pipe);
 
-	pg_queue_signal(sigNum);
 	return 0;
 }
 
@@ -266,6 +331,7 @@ pg_signal_thread(LPVOID param)
 		BOOL		fConnected;
 		HANDLE		hThread;
 
+		/* Create a new pipe instance if we don't have one. */
 		if (pipe == INVALID_HANDLE_VALUE)
 		{
 			pipe = CreateNamedPipe(pipename, PIPE_ACCESS_DUPLEX,
@@ -280,6 +346,11 @@ pg_signal_thread(LPVOID param)
 			}
 		}
 
+		/*
+		 * Wait for a client to connect.  If something connects before we
+		 * reach here, we'll get back a "failure" with ERROR_PIPE_CONNECTED,
+		 * which is actually a success (way to go, Microsoft).
+		 */
 		fConnected = ConnectNamedPipe(pipe, NULL) ? TRUE : (GetLastError() == ERROR_PIPE_CONNECTED);
 		if (fConnected)
 		{

@@ -9,9 +9,11 @@
 //		Implementation of DXL physical Append operator
 //---------------------------------------------------------------------------
 
-
 #include "naucrates/dxl/operators/CDXLPhysicalAppend.h"
 
+#include "gpos/common/CBitSetIter.h"
+
+#include "naucrates/dxl/CDXLUtils.h"
 #include "naucrates/dxl/operators/CDXLNode.h"
 #include "naucrates/dxl/xml/CXMLSerializer.h"
 
@@ -31,7 +33,6 @@ CDXLPhysicalAppend::CDXLPhysicalAppend(CMemoryPool *mp, BOOL fIsTarget,
 	: CDXLPhysical(mp), m_used_in_upd_del(fIsTarget), m_is_zapped(fIsZapped)
 {
 }
-
 
 //---------------------------------------------------------------------------
 //	@function:
